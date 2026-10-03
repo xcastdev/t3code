@@ -18,6 +18,7 @@ import {
   scoped,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
+import { ProjectWorkProjection } from "./ProjectWorkProjection.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import {
   makeProjectTeamDispatchJournal,
@@ -390,3 +391,125 @@ it.effect("another approved task cannot claim a writer slot held by this project
     }),
   ),
 );
+
+it.effect("projection rebuild preserves authoritative dispatch ownership and pending work", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const projection = yield* ProjectWorkProjection;
+      yield* projection.rebuild(projectId);
+      const reserved = yield* f.journal.reserve(f.request);
+      const state = yield* readCurrentState(f.sql, projectId);
+      yield* projection.rebuild(projectId);
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(state);
+      expect(yield* f.journal.inspect(f.request.dispatchId)).toEqual(reserved);
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE record_id=${reserved.intent.compiledClaim.transition?.kind === "claim" ? reserved.intent.compiledClaim.transition.binding.recordId : "missing"}`;
+      expect((yield* f.journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect((yield* f.journal.claimEffect(reserved.fence).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect(yield* f.journal.readRecoveryPage({ limit: 1 })).toEqual([reserved]);
+    }),
+  ),
+);
+
+it.effect("released writer denies replay and claiming while retaining cleanup discovery", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const reserved = yield* f.journal.reserve(f.request);
+      const state = yield* readCurrentState(f.sql, projectId);
+      const writer = state.foundationRecords?.find(
+        (r) => r.kind === "reservation" && r.recordId === reserved.intent.writableReservationId,
+      );
+      if (writer?.kind !== "reservation") return yield* Effect.die("Missing writer fixture");
+      yield* f.repository.execute(
+        yield* decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "release-writer",
+          expectedRevision: state.revision,
+          attribution,
+          committedAt: at,
+          records: [{ ...writer, revision: writer.revision + 1, status: "released" }],
+        }),
+      );
+      expect((yield* f.journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect((yield* f.journal.reserve(f.request).pipe(Effect.result))._tag).toBe("Failure");
+      expect((yield* f.journal.claimEffect(reserved.fence).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect(yield* f.journal.readRecoveryPage({ limit: 1 })).toEqual([reserved]);
+    }),
+  ),
+);
+
+for (const patch of [
+  { status: "released" },
+  { scope_key: "wrong-scope" },
+  { slot: 1 },
+  { generation: 1 },
+  { task_id: "wrong-task" },
+  { attempt_id: "wrong-attempt" },
+])
+  it.effect(`writer SQL ${Object.keys(patch)[0]} disagreement denies launch`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const reserved = yield* f.journal.reserve(f.request);
+        if (!reserved.intent.writableReservationId) return yield* Effect.die("Missing writer");
+        yield* f.sql`UPDATE project_team_reservation SET ${f.sql.update(patch)} WHERE record_id=${reserved.intent.writableReservationId}`;
+        expect((yield* f.journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect((yield* f.journal.claimEffect(reserved.fence).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* f.journal.readRecoveryPage({ limit: 1 })).toEqual([reserved]);
+      }),
+    ),
+  );
+
+for (const patch of [
+  { worktree: "/different-owner" },
+  { task_id: "wrong-task" },
+  { attempt_id: "wrong-attempt" },
+  { branch: "refs/heads/wrong" },
+  { root_maximum_tokens: 2000 },
+  { attempt_maximum_tokens: 100 },
+  { attempt_deadline_at_ms: Date.parse(at) + 999 },
+  { repair_allowance: 1 },
+  { root_deadline_at_ms: Date.parse(at) + 3000 },
+  { delegation_depth: 1 },
+  { maximum_delegation_depth: 3 },
+  { created_at: "2026-10-03T00:00:00.000Z" },
+])
+  it.effect(
+    `retained journal ${Object.keys(patch)[0]} mismatch denies authority and recovery`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const reserved = yield* f.journal.reserve(f.request);
+          const rows = yield* f.sql<Record<string, unknown>>`SELECT * FROM project_team_dispatch`;
+          const row = rows[0];
+          if (!row) return yield* Effect.die("Missing journal fixture");
+          // Restore one inconsistent snapshot with every actual migration trigger still active.
+          yield* f.sql`DELETE FROM project_team_dispatch WHERE dispatch_id=${f.request.dispatchId}`;
+          yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({ ...row, ...patch })}`;
+          expect((yield* f.journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          expect((yield* f.journal.claimEffect(reserved.fence).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          expect((yield* f.journal.readRecoveryPage({ limit: 1 }).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+        }),
+      ),
+  );

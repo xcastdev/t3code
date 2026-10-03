@@ -105,17 +105,34 @@ const Intent = Schema.Struct({
 export type ProjectTeamDispatchRequest = typeof Request.Type;
 export type ProjectTeamDispatchStage = typeof Stage.Type;
 type Binding = Extract<ProjectTeamRecord, { kind: "run-binding" }>;
-type Row = {
-  dispatch_id: string;
-  project_id: string;
-  environment_id: string;
-  binding_id: string;
-  generation: number;
-  revision: number;
-  claim_generation: number;
-  stage: ProjectTeamDispatchStage;
-  intent_json: string;
-};
+const RowSchema = Schema.Struct({
+  dispatch_id: Id,
+  project_id: Id,
+  environment_id: EnvironmentId,
+  binding_id: Id,
+  generation: Safe,
+  task_id: Id,
+  attempt_id: Id,
+  worktree: Text,
+  branch: Text,
+  root_task_id: ProjectWorkTaskId,
+  root_maximum_tokens: Positive,
+  root_deadline_at_ms: Positive,
+  attempt_maximum_tokens: Positive,
+  attempt_deadline_at_ms: Positive,
+  delegation_depth: Safe,
+  maximum_delegation_depth: Safe,
+  repair_allowance: Safe,
+  revision: Safe,
+  claim_generation: Safe,
+  stage: Stage,
+  intent_json: Schema.String.check(
+    Schema.makeFilter((value) => Buffer.byteLength(value) <= 262144),
+  ),
+  created_at: Id,
+  updated_at: Id,
+});
+type Row = typeof RowSchema.Type;
 const strict = { onExcessProperty: "error" } as const;
 const decodeRequest = Schema.decodeUnknownEffect(Request, strict);
 const decodeEnvironment = Schema.decodeUnknownEffect(EnvironmentId);
@@ -123,6 +140,8 @@ const decodeCalls = Schema.decodeUnknownEffect(Positive.check(Schema.isLessThanO
 const decodeId = Schema.decodeUnknownEffect(Id);
 const decodeRecord = Schema.decodeUnknownEffect(ProjectTeamRecordSchema);
 const decodeIntent = Schema.decodeUnknownEffect(Schema.fromJsonString(Intent), strict);
+const decodeRow = Schema.decodeUnknownEffect(RowSchema, strict);
+const decodeJsonRecord = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectTeamRecordSchema));
 const encodeIntent = Schema.encodeSync(Schema.fromJsonString(Intent));
 
 const fingerprint = (value: unknown) =>
@@ -160,20 +179,56 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     const environmentId = yield* decodeEnvironment(options.environmentId);
     const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
     const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
-      const rows = yield* sql<Row>`SELECT dispatch_id,project_id,environment_id,binding_id,
-      generation,revision,claim_generation,stage,intent_json FROM project_team_dispatch
+      const rows = yield* sql<Row>`SELECT * FROM project_team_dispatch
       WHERE dispatch_id=${dispatchId} AND environment_id=${environmentId}`;
-      const row = rows[0];
-      if (!row || rows.length !== 1) return yield* deny("Dispatch ownership is missing");
+      if (!rows[0] || rows.length !== 1) return yield* deny("Dispatch ownership is missing");
+      const row = yield* decodeRow(rows[0]).pipe(
+        Effect.mapError(() => deny("Dispatch row is invalid")),
+      );
       const intent = yield* decodeIntent(row.intent_json).pipe(
         Effect.mapError(() => deny("Dispatch intent is invalid")),
       );
+      const transition = intent.compiledClaim.transition;
+      if (transition?.kind !== "claim") return yield* deny("Dispatch claim is invalid");
+      const binding = transition.binding;
+      const limits = intent.limits;
+      const writer = transition.dispatch?.writableReservation;
       if (
         intent.request.dispatchId !== row.dispatch_id ||
         intent.compiledClaim.projectId !== row.project_id ||
-        intent.compiledClaim.transition?.kind !== "claim" ||
-        intent.compiledClaim.transition.binding.recordId !== row.binding_id ||
-        intent.compiledClaim.transition.binding.generation !== row.generation
+        binding.projectId !== row.project_id ||
+        binding.environmentId !== row.environment_id ||
+        row.environment_id !== environmentId ||
+        binding.recordId !== row.binding_id ||
+        binding.generation !== row.generation ||
+        binding.taskId !== row.task_id ||
+        binding.attemptId !== row.attempt_id ||
+        binding.worktree !== row.worktree ||
+        binding.branch !== row.branch ||
+        limits.rootTaskId !== row.root_task_id ||
+        limits.maximumTokens !== row.root_maximum_tokens ||
+        limits.rootDeadlineAtMs !== row.root_deadline_at_ms ||
+        limits.attemptMaximumTokens !== row.attempt_maximum_tokens ||
+        limits.deadlineAtMs !== row.attempt_deadline_at_ms ||
+        limits.delegationDepth !== row.delegation_depth ||
+        limits.maximumDelegationDepth !== row.maximum_delegation_depth ||
+        limits.repairAllowance !== row.repair_allowance ||
+        intent.request.claim.committedAt !== row.created_at ||
+        deadline(row.created_at) === undefined ||
+        deadline(row.updated_at) === undefined ||
+        row.claim_generation > row.revision ||
+        binding.configuration.maxTokens !== limits.attemptMaximumTokens ||
+        limits.attemptMaximumTokens > limits.maximumTokens ||
+        limits.deadlineAtMs > limits.rootDeadlineAtMs ||
+        limits.delegationDepth > limits.maximumDelegationDepth ||
+        limits.maximumDelegationDepth > intent.rootCaps.maximumDelegationDepth ||
+        limits.repairAllowance > intent.rootCaps.repairAllowance ||
+        limits.writable !== (writer !== undefined) ||
+        intent.writableReservationId !== writer?.recordId ||
+        intent.request.git.worktreePath !== row.worktree ||
+        intent.request.git.branchRef !== row.branch ||
+        intent.request.git.runId !== row.binding_id ||
+        intent.request.git.generation !== row.generation
       )
         return yield* deny("Dispatch identity does not match its retained intent");
       return { row, intent };
@@ -213,6 +268,99 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         fingerprint(binding.configuration) !== fingerprint(frozen.configuration)
       )
         return yield* deny("Frozen dispatch configuration changed");
+      const bindingRows = yield* sql<{
+        project_id: string;
+        status: string;
+        revision: number;
+        generation: number;
+        task_id: string;
+        attempt_id: string;
+        provider_instance_id: string;
+        thread_id: string;
+        session_id: string | null;
+        payload_json: string;
+      }>`SELECT project_id,status,revision,generation,task_id,attempt_id,provider_instance_id,
+        thread_id,session_id,payload_json FROM project_team_run_binding WHERE record_id=${binding.recordId}`;
+      const projectedBinding = bindingRows[0];
+      if (
+        bindingRows.length !== 1 ||
+        !projectedBinding ||
+        projectedBinding.project_id !== binding.projectId ||
+        projectedBinding.status !== binding.status ||
+        projectedBinding.revision !== binding.revision ||
+        projectedBinding.generation !== binding.generation ||
+        projectedBinding.task_id !== binding.taskId ||
+        projectedBinding.attempt_id !== binding.attemptId ||
+        projectedBinding.provider_instance_id !== binding.providerInstanceId ||
+        projectedBinding.thread_id !== binding.threadId ||
+        projectedBinding.session_id !== (binding.sessionId ?? null)
+      )
+        return yield* deny("Current binding SQL ownership is missing or inconsistent");
+      const bindingPayload = yield* decodeJsonRecord(projectedBinding.payload_json).pipe(
+        Effect.mapError(() => deny("Binding SQL payload is invalid")),
+      );
+      if (fingerprint(bindingPayload) !== fingerprint(binding))
+        return yield* deny("Binding SQL payload disagrees with current authority");
+      if (intent.limits.writable) {
+        const expected = initial.dispatch?.writableReservation;
+        const writers = records.filter(
+          (r) => r.kind === "reservation" && r.recordId === intent.writableReservationId,
+        );
+        const writer = writers[0];
+        if (
+          !expected ||
+          writers.length !== 1 ||
+          writer?.kind !== "reservation" ||
+          writer.status !== "held" ||
+          writer.environmentId !== environmentId ||
+          writer.projectId !== row.project_id ||
+          writer.runId !== row.binding_id ||
+          writer.taskId !== binding.taskId ||
+          writer.attemptId !== binding.attemptId ||
+          writer.generation !== row.generation ||
+          writer.scope !== "project" ||
+          writer.resourceKey !== "writable" ||
+          writer.slot !== expected.slot ||
+          writer.maximumTokens !== expected.maximumTokens ||
+          writer.consumedTokens !== 0
+        )
+          return yield* deny("Original writer reservation is no longer held");
+        const projected = yield* sql<{
+          record_id: string;
+          project_id: string;
+          status: string;
+          revision: number;
+          generation: number;
+          updated_at: string;
+          task_id: string;
+          attempt_id: string;
+          scope_key: string;
+          slot: number;
+          payload_json: string;
+        }>`SELECT record_id,project_id,status,revision,generation,updated_at,task_id,attempt_id,scope_key,slot,payload_json
+          FROM project_team_reservation WHERE record_id=${writer.recordId}`;
+        const held = projected[0];
+        if (
+          projected.length !== 1 ||
+          !held ||
+          held.record_id !== writer.recordId ||
+          held.project_id !== writer.projectId ||
+          held.status !== "held" ||
+          held.revision !== writer.revision ||
+          held.generation !== writer.generation ||
+          held.updated_at !== writer.updatedAt ||
+          held.task_id !== writer.taskId ||
+          held.attempt_id !== writer.attemptId ||
+          held.slot !== writer.slot ||
+          held.scope_key !== canonicalProjectWorkPayload([environmentId, "project", row.project_id])
+        )
+          return yield* deny("Writer SQL ownership disagrees with its reservation");
+        const payload = yield* decodeJsonRecord(held.payload_json).pipe(
+          Effect.mapError(() => deny("Writer SQL payload is invalid")),
+        );
+        if (fingerprint(payload) !== fingerprint(writer))
+          return yield* deny("Writer SQL payload disagrees with its reservation");
+      }
       const role = records.find(
         (r) => r.kind === "role-revision" && r.recordId === binding.roleRevisionId,
       );
@@ -504,10 +652,24 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
               environment_id: environmentId,
               binding_id: binding.recordId,
               generation: binding.generation,
+              task_id: binding.taskId,
+              attempt_id: binding.attemptId,
+              worktree: binding.worktree,
+              branch: binding.branch,
+              root_task_id: limits.rootTaskId,
+              root_maximum_tokens: limits.maximumTokens,
+              root_deadline_at_ms: limits.rootDeadlineAtMs,
+              attempt_maximum_tokens: limits.attemptMaximumTokens,
+              attempt_deadline_at_ms: limits.deadlineAtMs,
+              delegation_depth: limits.delegationDepth,
+              maximum_delegation_depth: limits.maximumDelegationDepth,
+              repair_allowance: limits.repairAllowance,
               stage: "reserved",
               revision: 0,
               claim_generation: 0,
               intent_json: encodeIntent(intent),
+              created_at: request.claim.committedAt,
+              updated_at: request.claim.committedAt,
             },
             intent,
           };

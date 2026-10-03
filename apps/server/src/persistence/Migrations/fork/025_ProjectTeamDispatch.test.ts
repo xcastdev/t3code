@@ -122,19 +122,13 @@ it.effect("commits ownership and dispatch together or rolls both back", () =>
   }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
 );
 
-it.effect("retains cleanup ownership through project history deletion only after settlement", () =>
+it.effect("retains cleanup ownership after replayable binding deletion before settlement", () =>
   Effect.gen(function* () {
     const f = yield* fixture;
     yield* f.insert();
-    expect(
-      (yield* f.sql`DELETE FROM project_team_run_binding WHERE record_id='binding'`.pipe(
-        Effect.result,
-      ))._tag,
-    ).toBe("Failure");
-    yield* f.sql`UPDATE project_team_dispatch SET stage='settled' WHERE dispatch_id='dispatch'`;
     yield* f.sql`DELETE FROM project_team_run_binding WHERE record_id='binding'`;
     expect(yield* f.sql`SELECT binding_id,stage FROM project_team_dispatch`).toEqual([
-      { binding_id: "binding", stage: "settled" },
+      { binding_id: "binding", stage: "reserved" },
     ]);
     yield* runMigrations();
     expect(yield* f.sql`SELECT binding_id FROM project_team_dispatch`).toEqual([

@@ -47,10 +47,6 @@ export default Effect.gen(function* () {
       SELECT 1 FROM project_team_run_binding WHERE record_id=NEW.binding_id
         AND project_id=NEW.project_id AND generation=NEW.generation)
     BEGIN SELECT RAISE(ABORT,'Dispatch requires its exact committed binding'); END`;
-  yield* sql`CREATE TRIGGER project_team_dispatch_binding_delete_guard
-    BEFORE DELETE ON project_team_run_binding WHEN EXISTS (
-      SELECT 1 FROM project_team_dispatch WHERE binding_id=OLD.record_id AND stage <> 'settled')
-    BEGIN SELECT RAISE(ABORT,'Active dispatch cleanup ownership must be retained'); END`;
   yield* sql`CREATE TRIGGER project_team_dispatch_immutable
     BEFORE UPDATE ON project_team_dispatch WHEN
       NEW.dispatch_id <> OLD.dispatch_id OR NEW.environment_id <> OLD.environment_id OR
