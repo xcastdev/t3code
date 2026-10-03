@@ -1,6 +1,11 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
-import { PiManagedRuntimeError, type PiManagedOperationRequest } from "./PiManagedRuntime.ts";
+import {
+  PiManagedRuntimeError,
+  type PiManagedOperationRequest,
+  type PiManagedPreparedOperation,
+  type PiManagedRuntimeInstance,
+} from "./PiManagedRuntime.ts";
 import {
   canonicalProjectWorkPayload,
   CommandId,
@@ -4174,7 +4179,20 @@ const stableReplayFixtureFor = (prompt = false) =>
         promptTemplates: [],
       }),
     );
-    return { ...f, request, op, terminal, nativeFile, bytes };
+    return {
+      ...f,
+      request,
+      op,
+      terminal,
+      nativeFile,
+      bytes,
+      get launches() {
+        return f.launches;
+      },
+      get transports() {
+        return f.transports;
+      },
+    };
   });
 for (const mode of [
   "restart",
@@ -4406,6 +4424,204 @@ for (const mode of [
         expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual(original);
         expect(yield* f.sql`SELECT * FROM project_team_pi_process`).toEqual(originalProcesses);
         expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+}
+
+for (const mode of [
+  "no-stop",
+  "explicit-stop",
+  "completed-old",
+  "canceled-old",
+  "completed-stop",
+  "completed-stopAll",
+  "repeat",
+  "held-old-new-writer",
+  "old-new-preparing",
+] as const) {
+  it.effect(`replay completion releases only its own lifetime: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor();
+        const original =
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`;
+        const originalProcess =
+          yield* f.sql`SELECT * FROM project_team_pi_process WHERE operation_id=${f.op.operation.operationId}`;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let hold = false;
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          readCatalogue: f.options.readCatalogue.pipe(
+            Effect.tap(() =>
+              hold
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void,
+            ),
+          ),
+        });
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const old = yield* instance.prepareOperation(f.request, () =>
+          Effect.die("unexpected replay event"),
+        );
+        if (mode === "canceled-old") yield* instance.requestStop(threadId);
+        else expect((yield* old.run).terminal).toEqual(f.terminal);
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+        const nextRequest: PiManagedOperationRequest = {
+          threadId,
+          kind: "prompt",
+          prompt: "Next approved assignment",
+          operationId: "root-stable-next-prompt",
+        };
+        if (mode === "repeat" || mode === "completed-stop" || mode === "completed-stopAll") {
+          expect((yield* old.run).terminal).toEqual(f.terminal);
+          expect((yield* old.run).terminal).toEqual(f.terminal);
+          if (mode === "completed-stop" || mode === "completed-stopAll") {
+            yield* mode === "completed-stop" ? instance.requestStop(threadId) : instance.stopAll;
+            yield* rejected(old.run);
+            yield* rejected(old.run);
+          }
+        } else {
+          if (mode === "explicit-stop") yield* instance.requestStop(threadId);
+          const heldRead =
+            mode === "held-old-new-writer"
+              ? yield* Effect.gen(function* () {
+                  hold = true;
+                  const running = yield* old.run.pipe(Effect.result, Effect.forkChild);
+                  yield* Effect.raceFirst(
+                    Deferred.await(entered),
+                    Fiber.join(running).pipe(
+                      Effect.flatMap(() => Effect.die("Replay returned before held read")),
+                    ),
+                  );
+                  yield* instance.requestStop(threadId);
+                  hold = false;
+                  return running;
+                })
+              : undefined;
+          let next: PiManagedPreparedOperation;
+          if (mode === "old-new-preparing") {
+            hold = true;
+            const preparing = yield* instance
+              .prepareOperation(nextRequest, () => Effect.void)
+              .pipe(Effect.forkChild);
+            yield* Effect.raceFirst(
+              Deferred.await(entered),
+              Fiber.join(preparing).pipe(
+                Effect.flatMap(() => Effect.die("Preparation returned before held read")),
+              ),
+            );
+            yield* rejected(old.run);
+            yield* Deferred.succeed(release, undefined);
+            next = yield* Fiber.join(preparing);
+          } else next = yield* instance.prepareOperation(nextRequest, () => Effect.void);
+          expect(next.operation.operationId).toBe(nextRequest.operationId);
+          expect(f.launches).toBe(1);
+          if (heldRead) {
+            yield* Deferred.succeed(release, undefined);
+            expect((yield* Fiber.join(heldRead))._tag).toBe("Failure");
+          }
+          if (
+            ["completed-old", "canceled-old", "held-old-new-writer", "old-new-preparing"].includes(
+              mode,
+            )
+          ) {
+            yield* rejected(old.run);
+            yield* rejected(old.interrupt);
+            yield* rejected(old.steer("steer", "old control"));
+            yield* rejected(
+              instance.prepareOperation(
+                { ...nextRequest, operationId: "third-root-prompt" },
+                () => Effect.void,
+              ),
+            );
+            // A cleared JavaScript slot would preallocate before SQL detects the new writer.
+            expect(f.launches).toBe(1);
+            expect(
+              (yield* f.sql`SELECT status FROM project_team_pi_operation WHERE operation_id=${nextRequest.operationId}`)[0]
+                ?.status,
+            ).toBe("prepared");
+          }
+          yield* instance.requestStop(threadId);
+        }
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`,
+        ).toEqual(original);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_process WHERE operation_id=${f.op.operation.operationId}`,
+        ).toEqual(originalProcess);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+}
+
+for (const api of ["requestStop", "stopAll"] as const) {
+  it.effect(`replay completion retains final SQL cancellation: ${api}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor();
+        const original =
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`;
+        let instance: PiManagedRuntimeInstance | undefined;
+        let armed = false;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (!statement.compile()[0].includes("ORDER BY operation_ordinal DESC LIMIT 1"))
+              return statement;
+            return statement.pipe(
+              Effect.tap(() =>
+                Effect.suspend(() => {
+                  if (!armed || !instance) return Effect.void;
+                  return api === "requestStop" ? instance.requestStop(threadId) : instance.stopAll;
+                }),
+              ),
+            );
+          },
+        });
+        const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(
+          Effect.provideService(SqlClient.SqlClient, observedSql),
+        );
+        instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const old = yield* instance
+          .prepareOperation(f.request, () => Effect.die("unexpected replay event"))
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        armed = true;
+        yield* rejected(old.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql)));
+        armed = false;
+        yield* rejected(old.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql)));
+        expect(f.launches).toBe(0);
+        const next = yield* instance
+          .prepareOperation(
+            {
+              threadId,
+              kind: "prompt",
+              prompt: "Next approved assignment",
+              operationId: "root-after-final-stop",
+            },
+            () => Effect.void,
+          )
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        expect(next.operation.operationId).toBe("root-after-final-stop");
+        expect(f.launches).toBe(1);
+        yield* instance
+          .requestStop(threadId)
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`,
+        ).toEqual(original);
         expect(f.transports).toBe(0);
       }),
     ),

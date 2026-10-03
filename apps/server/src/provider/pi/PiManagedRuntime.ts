@@ -66,7 +66,7 @@ export type PiManagedEventObserver = (
 
 export type PiManagedPreparedOperation = {
   readonly operation: PiWorkerOperation;
-  /** Single activation; receipt reuse rechecks current authority and instance cancellation. */
+  /** Single activation; receipt reads release their slot until stop or a newer preparation. */
   readonly run: Effect.Effect<
     { readonly terminal: PiSessionTerminal; readonly session: ProviderSession },
     PiManagedRuntimeError

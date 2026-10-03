@@ -872,6 +872,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
           }
         >();
         const preparing = new Map<ThreadId, Effect.Effect<void>>();
+        const replayReceipts = new Map<ThreadId, () => void>();
         const sessionFor = (
           authority: ProjectTeamAuthority,
           native?: PiNativeReference,
@@ -1043,6 +1044,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             attempted = true;
             if (active.has(request.threadId) || preparing.has(request.threadId))
               return Effect.fail(deny("Pi operation is already preparing or active", "conflict"));
+            // A new preparation supersedes the completed receipt's ephemeral lifetime.
+            replayReceipts.get(request.threadId)?.();
             const preparation = { canceled: false, done: Promise.withResolvers<void>() };
 
             const assertPreparing = () => {
@@ -1248,7 +1251,24 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     }),
                   );
                   yield* validateReplay;
-                  const run = validateReplay;
+                  const run = guard(
+                    Effect.gen(function* () {
+                      yield* preparationCurrent;
+                      const owner = active.get(request.threadId);
+                      if ((owner && owner.prepared !== prepared) || preparing.has(request.threadId))
+                        return yield* deny("Pi replay thread has a newer owner", "conflict");
+                      active.set(request.threadId, { prepared, stop });
+                      return yield* validateReplay.pipe(
+                        Effect.tap(preparationCurrent),
+                        Effect.tap(() =>
+                          Effect.sync(() => {
+                            if (active.get(request.threadId)?.prepared === prepared)
+                              active.delete(request.threadId);
+                          }),
+                        ),
+                      );
+                    }),
+                  );
                   const steer: PiManagedPreparedOperation["steer"] = () =>
                     Effect.fail(deny("Completed Pi operation cannot receive controls", "conflict"));
                   const interrupt = Effect.fail(
@@ -1265,13 +1285,17 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           interrupt,
                         }
                       : { kind: request.kind, operation: replay.operation, run, steer, interrupt };
-                  // Receipt reads remain instance-owned after preparation. Stopping them
-                  // fences publication without rewriting the original settled operation.
-                  const stop = Effect.sync(() => {
+                  // Successful reads release the work slot; one cancellation handle remains
+                  // until stop or the next preparation, without rewriting settled history.
+                  const cancelReplay = () => {
                     preparation.canceled = true;
                     if (active.get(request.threadId)?.prepared === prepared)
                       active.delete(request.threadId);
-                  });
+                    if (replayReceipts.get(request.threadId) === cancelReplay)
+                      replayReceipts.delete(request.threadId);
+                  };
+                  const stop = Effect.sync(cancelReplay);
+                  replayReceipts.set(request.threadId, cancelReplay);
                   active.set(request.threadId, { prepared, stop });
                   assertPreparing();
                   return prepared;
@@ -1977,11 +2001,13 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
         const requestStop = (threadId: ThreadId) =>
           guard(
             Effect.gen(function* () {
+              const replay = replayReceipts.get(threadId);
+              replay?.();
               const pending = preparing.get(threadId);
               if (pending) yield* pending;
               const running = active.get(threadId);
               if (!running) {
-                if (pending) return;
+                if (pending || replay) return;
                 yield* operations.current(identity(threadId));
                 return;
               }
@@ -1989,9 +2015,13 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             }),
           );
         const stopAll = Effect.suspend(() =>
-          Effect.forEach([...new Set([...preparing.keys(), ...active.keys()])], requestStop, {
-            discard: true,
-          }),
+          Effect.forEach(
+            [...new Set([...preparing.keys(), ...active.keys(), ...replayReceipts.keys()])],
+            requestStop,
+            {
+              discard: true,
+            },
+          ),
         ).pipe(Effect.asVoid);
         yield* Effect.addFinalizer(() =>
           Effect.sync(() => {
@@ -2000,7 +2030,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             Effect.andThen(
               Effect.suspend(() =>
                 Effect.forEach(
-                  [...new Set([...preparing.keys(), ...active.keys()])],
+                  [...new Set([...preparing.keys(), ...active.keys(), ...replayReceipts.keys()])],
                   (threadId) => requestStop(threadId).pipe(Effect.catch(() => Effect.void)),
                   { discard: true },
                 ),
