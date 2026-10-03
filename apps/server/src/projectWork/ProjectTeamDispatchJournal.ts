@@ -24,6 +24,15 @@ const Text = Schema.String.check(Schema.isMaxLength(4096));
 const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
 const Positive = Safe.check(Schema.isGreaterThan(0));
 const Digest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+const RecoveryPosition = Schema.Struct({
+  rowId: Schema.String.check(
+    Schema.isPattern(/^(?:0|-?[1-9][0-9]{0,18})$/),
+    Schema.isMaxLength(20),
+  ),
+  dispatchIdHash: Digest,
+});
+export type ProjectTeamDispatchRecoveryPosition = typeof RecoveryPosition.Type;
+
 const Stage = Schema.Literals([
   "reserved",
   "workspace-ready",
@@ -138,6 +147,7 @@ const decodeRequest = Schema.decodeUnknownEffect(Request, strict);
 const decodeEnvironment = Schema.decodeUnknownEffect(EnvironmentId);
 const decodeCalls = Schema.decodeUnknownEffect(Positive.check(Schema.isLessThanOrEqualTo(128)));
 const decodeId = Schema.decodeUnknownEffect(Id);
+const decodeRecoveryPosition = Schema.decodeUnknownEffect(RecoveryPosition, strict);
 const decodeRecord = Schema.decodeUnknownEffect(ProjectTeamRecordSchema);
 const decodeIntent = Schema.decodeUnknownEffect(Schema.fromJsonString(Intent), strict);
 const decodeRow = Schema.decodeUnknownEffect(RowSchema, strict);
@@ -280,6 +290,13 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         return yield* deny("Dispatch identity does not match its retained intent");
       return { row, intent };
     });
+    const assertExecutionTime = Effect.fn("ProjectTeamDispatchJournal.assertExecutionTime")(
+      function* (intent: typeof Intent.Type, leaseDeadlineAtMs: number, now: number) {
+        if (now >= intent.limits.deadlineAtMs)
+          return yield* deny("Frozen attempt deadline expired");
+        if (now >= leaseDeadlineAtMs) return yield* deny("Dispatch lease expired or changed");
+      },
+    );
     const current = Effect.fn("ProjectTeamDispatchJournal.current")(function* (
       row: Row,
       intent: typeof Intent.Type,
@@ -450,6 +467,8 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       const attempt = state.attempts.find(
         (a) => a.attemptId === binding.attemptId && a.taskId === binding.taskId,
       );
+      const leaseDeadlineAtMs =
+        attempt?.leasedUntil === undefined ? undefined : deadline(attempt.leasedUntil);
       if (
         state.tasks.find((t) => t.taskId === binding.taskId)?.activeAttemptId !==
           binding.attemptId ||
@@ -457,10 +476,14 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         (attempt.state !== "leased" && attempt.state !== "running") ||
         !attempt.leasedUntil ||
         attempt.leaseToken !== initial.claim.leaseToken ||
-        (deadline(attempt.leasedUntil) ?? 0) <= now
+        leaseDeadlineAtMs === undefined ||
+        leaseDeadlineAtMs <= now
       )
         return yield* deny("Dispatch lease expired or changed");
-      return { state, binding, role, now };
+      // Authority reads may await SQL; execution validity uses the clock after those reads.
+      const admittedAt = yield* Clock.currentTimeMillis;
+      yield* assertExecutionTime(intent, leaseDeadlineAtMs, admittedAt);
+      return { state, binding, role, now: admittedAt, leaseDeadlineAtMs };
     });
     const reserve = Effect.fn("ProjectTeamDispatchJournal.reserve")(function* (
       input: ProjectTeamDispatchRequest,
@@ -852,16 +875,118 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       },
     );
     const readRecoveryCandidates = Effect.fn("ProjectTeamDispatchJournal.readRecoveryCandidates")(
-      function* (input: { readonly afterDispatchId?: string; readonly limit: number }) {
-        // Decode one retained row at a time so a corrupt row remains visible without hiding later owners.
-        return yield* Effect.forEach(yield* recoveryIds(input), (row) =>
-          readRetained(row.dispatch_id).pipe(
-            Effect.exit,
-            Effect.map((snapshot) => ({ dispatchId: row.dispatch_id, snapshot })),
-          ),
+      function* (input: {
+        readonly afterDispatchId?: string;
+        readonly afterPosition?: ProjectTeamDispatchRecoveryPosition;
+        readonly limit: number;
+      }) {
+        if (input.afterDispatchId !== undefined && input.afterPosition !== undefined)
+          return yield* deny("Recovery continuation requires exactly one cursor");
+        const limit = yield* decodeCalls(input.limit);
+        type RecoveryRow = { dispatch_id: string | null; row_id: string };
+        return yield* sql.withTransaction(
+          Effect.gen(function* () {
+            let rows: ReadonlyArray<RecoveryRow>;
+            if (input.afterPosition !== undefined) {
+              const position = yield* decodeRecoveryPosition(input.afterPosition).pipe(
+                Effect.mapError(() => deny("Invalid recovery continuation position")),
+              );
+              const retained =
+                yield* sql<RecoveryRow>`SELECT dispatch_id,CAST(rowid AS TEXT) AS row_id
+              FROM project_team_dispatch WHERE rowid=CAST(${position.rowId} AS INTEGER)
+                AND environment_id=${environmentId}`;
+              const previous = retained[0];
+              if (
+                retained.length !== 1 ||
+                !previous ||
+                previous.row_id !== position.rowId ||
+                fingerprint(["project-team-recovery-position", previous.dispatch_id]) !==
+                  position.dispatchIdHash
+              )
+                return yield* deny("Recovery continuation owner is missing or changed");
+              rows = yield* sql<RecoveryRow>`SELECT dispatch_id,CAST(rowid AS TEXT) AS row_id
+              FROM project_team_dispatch WHERE environment_id=${environmentId} AND stage <> 'settled'
+                AND (dispatch_id > ${previous.dispatch_id}
+                  OR (dispatch_id IS ${previous.dispatch_id} AND rowid > CAST(${position.rowId} AS INTEGER))
+                  OR (${previous.dispatch_id} IS NULL AND dispatch_id IS NOT NULL))
+              ORDER BY dispatch_id,rowid LIMIT ${limit}`;
+            } else if (input.afterDispatchId !== undefined) {
+              const after = yield* decodeId(input.afterDispatchId);
+              rows = yield* sql<RecoveryRow>`SELECT dispatch_id,CAST(rowid AS TEXT) AS row_id
+              FROM project_team_dispatch WHERE environment_id=${environmentId} AND stage <> 'settled'
+                AND dispatch_id > ${after} ORDER BY dispatch_id,rowid LIMIT ${limit}`;
+            } else {
+              // Start before every raw key, including corrupt null/empty keys; diagnostics grant no authority.
+              rows = yield* sql<RecoveryRow>`SELECT dispatch_id,CAST(rowid AS TEXT) AS row_id
+              FROM project_team_dispatch WHERE environment_id=${environmentId} AND stage <> 'settled'
+              ORDER BY dispatch_id,rowid LIMIT ${limit}`;
+            }
+            return yield* Effect.forEach(rows, (row) =>
+              Effect.gen(function* () {
+                const position = yield* decodeRecoveryPosition({
+                  rowId: row.row_id,
+                  dispatchIdHash: fingerprint(["project-team-recovery-position", row.dispatch_id]),
+                });
+                const snapshot = yield* (
+                  row.dispatch_id === null
+                    ? Effect.fail(deny("Dispatch row identity is invalid"))
+                    : readRetained(row.dispatch_id)
+                ).pipe(Effect.exit);
+                return { dispatchId: row.dispatch_id, position, snapshot };
+              }),
+            );
+          }),
         );
       },
     );
+    const readStageHistory = Effect.fn("ProjectTeamDispatchJournal.readStageHistory")(function* (
+      dispatch: Row,
+    ) {
+      const rows = yield* sql`SELECT * FROM project_team_dispatch_receipt
+        WHERE dispatch_id=${dispatch.dispatch_id} ORDER BY revision LIMIT 129`;
+      if (rows.length > 128) return yield* deny("Retained stage history exceeds its bound");
+      let stage: ProjectTeamDispatchStage = "reserved";
+      let revision = dispatch.claim_generation;
+      let recordedAt = deadline(dispatch.created_at)!;
+      const updatedAt = deadline(dispatch.updated_at)!;
+      const receipts = [];
+      for (const raw of rows) {
+        const row = yield* decodeStoredStageReceipt(raw).pipe(
+          Effect.mapError(() => deny("Retained stage receipt is invalid")),
+        );
+        const timestamp = deadline(row.recorded_at);
+        const cleanup = row.stage === "stopping" || row.stage === "quarantine";
+        if (
+          dispatch.claim_generation === 0 ||
+          row.dispatch_id !== dispatch.dispatch_id ||
+          row.claim_generation !== dispatch.claim_generation ||
+          row.revision !== revision + 1 ||
+          timestamp === undefined ||
+          timestamp < recordedAt ||
+          timestamp > updatedAt ||
+          (!cleanup && nextForwardStage[stage] !== row.stage)
+        )
+          return yield* deny("Retained stage receipt does not match its ordered dispatch history");
+        const evidence = yield* decodeStageEvidence(row.evidence_json).pipe(
+          Effect.mapError(() => deny("Retained stage evidence is invalid")),
+        );
+        receipts.push({
+          receiptId: row.receipt_id,
+          revision: row.revision,
+          claimGeneration: row.claim_generation,
+          stage: row.stage,
+          evidence,
+          bindingId: dispatch.binding_id,
+          generation: dispatch.generation,
+        });
+        stage = row.stage;
+        revision = row.revision;
+        recordedAt = timestamp;
+      }
+      if (stage !== dispatch.stage || revision !== dispatch.revision)
+        return yield* deny("Current dispatch stage has no matching complete retained history");
+      return receipts;
+    });
     const advanceStage = Effect.fn("ProjectTeamDispatchJournal.advanceStage")(function* (
       expected: ProjectTeamDispatchFence,
       input: ProjectTeamDispatchStageReceipt,
@@ -877,6 +1002,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           const value = yield* read(expected.dispatchId);
+          const history = yield* readStageHistory(value.row);
           const stored =
             yield* sql`SELECT * FROM project_team_dispatch_receipt WHERE receipt_id=${receipt.receiptId}`;
           const old = yield* Effect.forEach(stored, (row) =>
@@ -912,17 +1038,16 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           )
             return yield* deny("Dispatch stage cannot advance out of order");
           if (!cleanup) yield* current(value.row, value.intent);
-          const count = yield* sql<{
-            total: number;
-          }>`SELECT COUNT(*) AS total FROM project_team_dispatch_receipt
-          WHERE dispatch_id=${expected.dispatchId}`;
-          if ((count[0]?.total ?? 128) >= 128)
+          if (history.length >= 128)
             return yield* deny("Retained stage history is full; cleanup requires attention");
           yield* verifyStage(receipt, { fence: fence(value.row), intent: value.intent });
-          // Verification may await filesystem or native services; re-read committed authority before progressing.
-          if (!cleanup) yield* current(value.row, value.intent);
+          // Verification may await filesystem or native services; re-read committed history and authority.
+          yield* readStageHistory(value.row);
+          const authority = cleanup ? undefined : yield* current(value.row, value.intent);
           const revision = value.row.revision + 1;
-          const at = time(yield* Clock.currentTimeMillis);
+          const now = yield* Clock.currentTimeMillis;
+          if (authority) yield* assertExecutionTime(value.intent, authority.leaseDeadlineAtMs, now);
+          const at = time(now);
           const updated =
             yield* sql`UPDATE project_team_dispatch SET stage=${receipt.stage},revision=${revision},updated_at=${at}
           WHERE dispatch_id=${expected.dispatchId} AND environment_id=${environmentId}
@@ -931,6 +1056,14 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           if (updated.length !== 1) return yield* deny("Stage ownership was superseded");
           yield* sql`INSERT INTO project_team_dispatch_receipt VALUES
           (${receipt.receiptId},${expected.dispatchId},${revision},${expected.claimGeneration},${receipt.stage},${evidence},${at})`;
+          yield* readStageHistory({ ...value.row, revision, stage: receipt.stage, updated_at: at });
+          // An awaited write or history read can exhaust authority; fail while both writes can still roll back.
+          if (authority)
+            yield* assertExecutionTime(
+              value.intent,
+              authority.leaseDeadlineAtMs,
+              yield* Clock.currentTimeMillis,
+            );
           return {
             fence: fence({ ...value.row, revision, stage: receipt.stage }),
             intent: value.intent,
@@ -942,43 +1075,11 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     const readStageReceipts = Effect.fn("ProjectTeamDispatchJournal.readStageReceipts")(function* (
       dispatchId: string,
     ) {
-      const value = yield* read(dispatchId);
-      const rows = yield* sql`SELECT * FROM project_team_dispatch_receipt
-        WHERE dispatch_id=${dispatchId} ORDER BY revision LIMIT 129`;
-      if (rows.length > 128) return yield* deny("Retained stage history exceeds its bound");
-      const receipts = yield* Effect.forEach(rows, (raw) =>
+      return yield* sql.withTransaction(
         Effect.gen(function* () {
-          const row = yield* decodeStoredStageReceipt(raw).pipe(
-            Effect.mapError(() => deny("Retained stage receipt is invalid")),
-          );
-          if (
-            row.dispatch_id !== value.row.dispatch_id ||
-            row.claim_generation !== value.row.claim_generation ||
-            row.revision > value.row.revision ||
-            deadline(row.recorded_at) === undefined
-          )
-            return yield* deny("Retained stage receipt does not match its dispatch");
-          const evidence = yield* decodeStageEvidence(row.evidence_json).pipe(
-            Effect.mapError(() => deny("Retained stage evidence is invalid")),
-          );
-          return {
-            receiptId: row.receipt_id,
-            revision: row.revision,
-            claimGeneration: row.claim_generation,
-            stage: row.stage,
-            evidence,
-            bindingId: value.row.binding_id,
-            generation: value.row.generation,
-          };
+          return yield* readStageHistory((yield* read(dispatchId)).row);
         }),
       );
-      const latest = receipts[receipts.length - 1];
-      if (
-        value.row.stage !== "reserved" &&
-        (!latest || latest.revision !== value.row.revision || latest.stage !== value.row.stage)
-      )
-        return yield* deny("Current dispatch stage has no matching retained receipt");
-      return receipts;
     });
     return {
       reserve,

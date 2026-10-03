@@ -837,3 +837,562 @@ for (const stage of ["stopping", "quarantine"] as const)
       }),
     ),
   );
+
+const receipt = { receiptId: "workspace", stage: "workspace-ready" as const, evidence: {} };
+
+it.effect("control: expiry reached inside verifier denies forward receipt", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () => TestClock.setTime(claimed.intent.limits.deadlineAtMs),
+      });
+      const result = yield* journal.advanceStage(claimed.fence, receipt).pipe(Effect.result);
+      const rows = yield* f.sql`SELECT stage,revision FROM project_team_dispatch`;
+      expect(result._tag).toBe("Failure");
+      expect(rows).toEqual([{ stage: "reserved", revision: 1 }]);
+    }),
+  ),
+);
+
+it.effect("forward receipt must recheck the clock after awaited final authority reads", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      let verified = false;
+      let clockChanged = false;
+      const observingSql = new Proxy(f.sql, {
+        apply(target, _receiver, args) {
+          const statement = target(args[0], ...args.slice(1));
+          if (verified && statement.compile()[0].includes("SELECT maximum_tokens,deadline_at_ms")) {
+            return statement.pipe(
+              Effect.tap(() => {
+                clockChanged = true;
+                return TestClock.setTime(claimed.intent.limits.deadlineAtMs);
+              }),
+            );
+          }
+          return statement;
+        },
+      });
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () =>
+          Effect.sync(() => {
+            verified = true;
+          }),
+      }).pipe(Effect.provideService(SqlClient.SqlClient, observingSql));
+      const result = yield* journal.advanceStage(claimed.fence, receipt).pipe(Effect.result);
+      expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+        { stage: "reserved", revision: 1 },
+      ]);
+      const receipts = yield* f.sql`SELECT stage,recorded_at FROM project_team_dispatch_receipt`;
+      expect(clockChanged).toBe(true);
+      expect(result._tag).toBe("Failure");
+      expect(receipts).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("control: stage CAS denies verifier mutation and rolls it back", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () =>
+          f.sql`UPDATE project_team_dispatch SET stage='quarantine'`.pipe(
+            Effect.asVoid,
+            Effect.mapError(
+              () => new ProjectTeamDispatchJournalError({ reason: "Control SQL failed" }),
+            ),
+          ),
+      });
+      const result = yield* journal.advanceStage(claimed.fence, receipt).pipe(Effect.result);
+      const rows = yield* f.sql`SELECT stage,revision FROM project_team_dispatch`;
+      expect(result._tag).toBe("Failure");
+      expect(rows).toEqual([{ stage: "reserved", revision: 1 }]);
+      expect(yield* f.sql`SELECT receipt_id FROM project_team_dispatch_receipt`).toEqual([]);
+    }),
+  ),
+);
+
+it.effect(
+  "control: exact replay after a later valid stage calls the verifier only once per new receipt",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        let calls = 0;
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () =>
+            Effect.sync(() => {
+              calls++;
+            }),
+        });
+        const workspace = yield* journal.advanceStage(claimed.fence, receipt);
+        const setup = yield* journal.advanceStage(workspace.fence, {
+          receiptId: "setup",
+          stage: "setup-complete",
+          evidence: {},
+        });
+        const replay = yield* journal.advanceStage(claimed.fence, receipt);
+        expect(calls).toBe(2);
+        expect(replay.duplicate).toBe(true);
+        expect(replay.fence).toEqual(setup.fence);
+      }),
+    ),
+);
+
+it.effect(
+  "retained history must reject a future-stage receipt while its dispatch is reserved",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        yield* f.sql`INSERT INTO project_team_dispatch_receipt VALUES
+    ('restored-future', 'dispatch-intent', 1, 1, 'assignment-observed', '{}', ${at})`;
+        const result = yield* f.journal.readStageReceipts(f.request.dispatchId).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect(
+  "retained history must reject an impossible older stage even if the latest stage matches",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+        });
+        const workspace = yield* journal.advanceStage(claimed.fence, receipt);
+        const setupReceipt = { receiptId: "setup", stage: "setup-complete" as const, evidence: {} };
+        const setup = yield* journal.advanceStage(workspace.fence, setupReceipt);
+        yield* f.sql`DROP TRIGGER project_team_dispatch_receipt_no_update`;
+        yield* f.sql`UPDATE project_team_dispatch_receipt SET stage='assignment-observed' WHERE receipt_id='workspace'`;
+        const read = yield* journal.readStageReceipts(f.request.dispatchId).pipe(Effect.result);
+        const duplicate = yield* journal
+          .advanceStage(workspace.fence, setupReceipt)
+          .pipe(Effect.result);
+        const progression = yield* journal
+          .advanceStage(setup.fence, { receiptId: "session", stage: "session-bound", evidence: {} })
+          .pipe(Effect.result);
+        expect({
+          read: read._tag,
+          duplicate: duplicate._tag,
+          progression: progression._tag,
+        }).toEqual({ read: "Failure", duplicate: "Failure", progression: "Failure" });
+        expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+          { stage: "setup-complete", revision: 3 },
+        ]);
+      }),
+    ),
+);
+
+it.effect("malformed row identity must not make a bounded recovery cursor unusable", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.journal.reserve(f.request);
+      const binding = (yield* f.sql<
+        Record<string, unknown>
+      >`SELECT * FROM project_team_run_binding WHERE record_id='binding'`)[0];
+      const row = (yield* f.sql<Record<string, unknown>>`SELECT * FROM project_team_dispatch`)[0];
+      if (!binding || !row) return yield* Effect.die("Missing control rows");
+      yield* f.sql`INSERT INTO project_team_run_binding ${f.sql.insert({ ...binding, record_id: "restored-binding", attempt_id: "restored-attempt" })}`;
+      const corruptId = "a".repeat(257);
+      yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({
+        ...row,
+        dispatch_id: corruptId,
+        binding_id: "restored-binding",
+        attempt_id: "restored-attempt",
+        worktree: "/restored-workspace",
+      })}`;
+      const first = yield* f.journal.readRecoveryCandidates({ limit: 1 });
+      const cursor = first[0]?.position;
+      if (!cursor) return yield* Effect.die("Missing corrupt candidate");
+      const second = yield* f.journal
+        .readRecoveryCandidates({ limit: 1, afterPosition: cursor })
+        .pipe(Effect.result);
+      expect(
+        (yield* f.journal.readRecoveryCandidates({ limit: 2 })).map(
+          (candidate) => candidate.snapshot._tag,
+        ),
+      ).toEqual(["Failure", "Success"]);
+      expect(first[0]?.snapshot._tag).toBe("Failure");
+      expect(second._tag).toBe("Success");
+      if (second._tag === "Success")
+        expect(second.success[0]?.dispatchId).toBe(f.request.dispatchId);
+    }),
+  ),
+);
+
+it.effect("control: malformed data under a valid ID allows recovery to reach the later owner", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.journal.reserve(f.request);
+      const binding = (yield* f.sql<
+        Record<string, unknown>
+      >`SELECT * FROM project_team_run_binding WHERE record_id='binding'`)[0];
+      const row = (yield* f.sql<Record<string, unknown>>`SELECT * FROM project_team_dispatch`)[0];
+      if (!binding || !row) return yield* Effect.die("Missing control rows");
+      yield* f.sql`INSERT INTO project_team_run_binding ${f.sql.insert({ ...binding, record_id: "restored-binding", attempt_id: "restored-attempt" })}`;
+      yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({
+        ...row,
+        dispatch_id: "a-corrupt",
+        binding_id: "restored-binding",
+        attempt_id: "restored-attempt",
+        worktree: "/restored-workspace",
+      })}`;
+      const first = yield* f.journal.readRecoveryCandidates({ limit: 1 });
+      const cursor = first[0]?.dispatchId;
+      if (typeof cursor !== "string") return yield* Effect.die("Missing legacy cursor");
+      const second = yield* f.journal.readRecoveryCandidates({ limit: 1, afterDispatchId: cursor });
+      expect(first[0]?.snapshot._tag).toBe("Failure");
+      expect(second[0]?.snapshot._tag).toBe("Success");
+      expect(second[0]?.dispatchId).toBe(f.request.dispatchId);
+    }),
+  ),
+);
+
+for (const boundary of ["lease-read", "receipt-write"] as const) {
+  it.effect(`late expiry at ${boundary} rolls back forward stage admission`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const transition = f.request.claim.transition;
+        if (transition?.kind !== "claim") return yield* Effect.die("Missing claim");
+        const leaseDeadline = Date.parse(at) + 500;
+        const request =
+          boundary === "lease-read"
+            ? {
+                ...f.request,
+                claim: {
+                  ...f.request.claim,
+                  transition: {
+                    ...transition,
+                    claim: { ...transition.claim, leasedUntil: "2026-01-01T00:00:00.500Z" },
+                  },
+                },
+              }
+            : f.request;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(request)).fence);
+        let verified = false;
+        let expired = false;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            const query = statement.compile()[0];
+            if (
+              verified &&
+              (boundary === "lease-read"
+                ? query.includes("SELECT maximum_tokens,deadline_at_ms")
+                : query.includes("INSERT INTO project_team_dispatch_receipt"))
+            ) {
+              return statement.pipe(
+                Effect.tap(() => {
+                  expired = true;
+                  return TestClock.setTime(
+                    boundary === "lease-read" ? leaseDeadline : claimed.intent.limits.deadlineAtMs,
+                  );
+                }),
+              );
+            }
+            return statement;
+          },
+        });
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () =>
+            Effect.sync(() => {
+              verified = true;
+            }),
+        }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const result = yield* journal.advanceStage(claimed.fence, receipt).pipe(Effect.result);
+        expect(expired).toBe(true);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure).toMatchObject({
+            reason:
+              boundary === "lease-read"
+                ? "Dispatch lease expired or changed"
+                : "Frozen attempt deadline expired",
+          });
+        expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+          { stage: "reserved", revision: 1 },
+        ]);
+        expect(yield* f.sql`SELECT receipt_id FROM project_team_dispatch_receipt`).toEqual([]);
+        // Cleanup keeps ownership after the same expiry instead of granting another forward stage.
+        expect(
+          (yield* journal.advanceStage(claimed.fence, {
+            receiptId: "expired-stop",
+            stage: "stopping",
+            evidence: {},
+          })).fence.stage,
+        ).toBe("stopping");
+      }),
+    ),
+  );
+}
+
+const restoredRecoveryFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const reserved = yield* f.journal.reserve(f.request);
+  const binding = (yield* f.sql<
+    Record<string, unknown>
+  >`SELECT * FROM project_team_run_binding WHERE record_id='binding'`)[0];
+  const row = (yield* f.sql<Record<string, unknown>>`SELECT * FROM project_team_dispatch`)[0];
+  if (!binding || !row) return yield* Effect.die("Missing restored control rows");
+  const insert = Effect.fn(function* (dispatchId: string | null, ordinal: number) {
+    const bindingId = `restored-binding-${ordinal}`;
+    const attemptId = `restored-attempt-${ordinal}`;
+    yield* f.sql`INSERT INTO project_team_run_binding ${f.sql.insert({ ...binding, record_id: bindingId, attempt_id: attemptId })}`;
+    yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({ ...row, dispatch_id: dispatchId, binding_id: bindingId, attempt_id: attemptId, worktree: `/restored-workspace-${ordinal}` })}`;
+  });
+  return { ...f, reserved, insert };
+});
+
+it.effect(
+  "private recovery positions traverse null ties, empty and oversized IDs without granting execution",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* restoredRecoveryFixture;
+        const rawIds = [null, null, "", "a".repeat(257), f.request.dispatchId];
+        for (const [ordinal, dispatchId] of rawIds.slice(0, -1).entries())
+          yield* f.insert(dispatchId, ordinal);
+        const first = yield* f.journal.readRecoveryCandidates({ limit: 1 });
+        const candidate = first[0];
+        if (!candidate) return yield* Effect.die("Missing first diagnostic");
+        const visited = [candidate];
+        for (let page = 1; page < rawIds.length; page++) {
+          const previous = visited[page - 1];
+          if (!previous) return yield* Effect.die("Missing previous recovery owner");
+          const next = yield* f.journal.readRecoveryCandidates({
+            limit: 1,
+            afterPosition: previous.position,
+          });
+          expect(next).toHaveLength(1);
+          if (!next[0]) return yield* Effect.die("Lost bounded recovery owner");
+          visited.push(next[0]);
+        }
+        expect(visited.map((value) => value.dispatchId)).toEqual(rawIds);
+        expect(visited.map((value) => value.snapshot._tag)).toEqual([
+          "Failure",
+          "Failure",
+          "Failure",
+          "Failure",
+          "Success",
+        ]);
+        expect(new Set(visited.map((value) => value.position.rowId)).size).toBe(rawIds.length);
+        expect(new Set(visited.map((value) => value.position.dispatchIdHash)).size).toBe(4);
+        const last = visited.at(-1);
+        if (!last) return yield* Effect.die("Missing final recovery owner");
+        expect(
+          yield* f.journal.readRecoveryCandidates({
+            limit: 1,
+            afterPosition: last.position,
+          }),
+        ).toEqual([]);
+        const samePage = yield* f.journal.readRecoveryCandidates({ limit: 5 });
+        expect(samePage.map((value) => value.snapshot._tag)).toEqual(
+          visited.map((value) => value.snapshot._tag),
+        );
+        for (const dispatchId of ["", "a".repeat(257)]) {
+          expect(
+            (yield* f.journal.claimEffect({ ...f.reserved.fence, dispatchId }).pipe(Effect.result))
+              ._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* f.journal
+              .readRecoveryCandidates({ limit: 1, afterDispatchId: dispatchId })
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        expect(yield* f.journal.readRetained(f.request.dispatchId)).toEqual(f.reserved);
+      }),
+    ),
+);
+
+for (const change of ["missing", "reused", "hash", "environment"] as const) {
+  it.effect(`private recovery position rejects a ${change} owner`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* restoredRecoveryFixture;
+        yield* f.insert("a".repeat(257), 0);
+        const original = (yield* f.journal.readRecoveryCandidates({ limit: 1 }))[0];
+        if (!original) return yield* Effect.die("Missing corrupt diagnostic");
+        const { position } = original;
+        if (change === "missing" || change === "reused") {
+          const previous = (yield* f.sql<
+            Record<string, unknown>
+          >`SELECT * FROM project_team_dispatch WHERE rowid=CAST(${position.rowId} AS INTEGER)`)[0];
+          if (!previous) return yield* Effect.die("Missing cursor owner");
+          yield* f.sql`DELETE FROM project_team_dispatch WHERE rowid=CAST(${position.rowId} AS INTEGER)`;
+          if (change === "reused")
+            yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({ ...previous, rowid: position.rowId, dispatch_id: "a-reused" })}`;
+        }
+        const journal =
+          change === "environment"
+            ? yield* makeProjectTeamDispatchJournal({
+                environmentId: "other-environment",
+                maximumEnvironmentModelCalls: 4,
+              })
+            : f.journal;
+        const cursor =
+          change === "hash" ? { ...position, dispatchIdHash: "0".repeat(64) } : position;
+        const result = yield* journal
+          .readRecoveryCandidates({ limit: 1, afterPosition: cursor })
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure).toMatchObject({
+            reason: "Recovery continuation owner is missing or changed",
+          });
+        if (change === "hash")
+          expect(
+            (yield* f.journal.readRecoveryCandidates({ limit: 1, afterPosition: position }))[0]
+              ?.dispatchId,
+          ).toBe(f.request.dispatchId);
+      }),
+    ),
+  );
+}
+
+it.effect("private recovery rejects ambiguous, noncanonical and unbounded cursors", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* restoredRecoveryFixture;
+      const candidate = (yield* f.journal.readRecoveryCandidates({ limit: 1 }))[0];
+      if (!candidate) return yield* Effect.die("Missing recovery owner");
+      expect(
+        (yield* f.journal
+          .readRecoveryCandidates({
+            limit: 1,
+            afterPosition: candidate.position,
+            afterDispatchId: f.request.dispatchId,
+          })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      for (const rowId of ["01", "-0", "1.0", "9223372036854775808", "999999999999999999999"]) {
+        expect(
+          (yield* f.journal
+            .readRecoveryCandidates({ limit: 1, afterPosition: { ...candidate.position, rowId } })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }
+      expect(
+        (yield* f.journal.readRecoveryCandidates({ limit: 129 }).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }),
+  ),
+);
+
+it.effect("complete forward and cleanup history remains replayable after expiry", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      let calls = 0;
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () =>
+          Effect.sync(() => {
+            calls++;
+          }),
+      });
+      let latest = claimed;
+      const stages = [
+        "workspace-ready",
+        "setup-complete",
+        "session-bound",
+        "assignment-intent",
+        "assignment-observed",
+      ] as const;
+      for (const stage of stages)
+        latest = yield* journal.advanceStage(latest.fence, {
+          receiptId: stage,
+          stage,
+          evidence: {},
+        });
+      expect(
+        (yield* journal.readStageReceipts(f.request.dispatchId)).map((value) => value.stage),
+      ).toEqual(stages);
+      const replay = yield* journal.advanceStage(claimed.fence, {
+        receiptId: stages[0],
+        stage: stages[0],
+        evidence: {},
+      });
+      expect(replay.duplicate).toBe(true);
+      expect(replay.fence).toEqual(latest.fence);
+      yield* TestClock.setTime(claimed.intent.limits.deadlineAtMs);
+      const stopped = yield* journal.advanceStage(latest.fence, {
+        receiptId: "stop",
+        stage: "stopping",
+        evidence: {},
+      });
+      const quarantine = yield* journal.advanceStage(stopped.fence, {
+        receiptId: "quarantine",
+        stage: "quarantine",
+        evidence: {},
+      });
+      expect(
+        (yield* journal.readStageReceipts(f.request.dispatchId)).map((value) => value.stage),
+      ).toEqual([...stages, "stopping", "quarantine"]);
+      expect(
+        (yield* journal.advanceStage(latest.fence, {
+          receiptId: "stop",
+          stage: "stopping",
+          evidence: {},
+        })).fence,
+      ).toEqual(quarantine.fence);
+      expect(calls).toBe(7);
+    }),
+  ),
+);
+
+it.effect("history injected during stage verification rolls back with the forward write", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () =>
+          f.sql`INSERT INTO project_team_dispatch_receipt VALUES ('injected', 'dispatch-intent', 1, 1, 'assignment-observed', '{}', ${at})`.pipe(
+            Effect.asVoid,
+            Effect.mapError(
+              () => new ProjectTeamDispatchJournalError({ reason: "Control SQL failed" }),
+            ),
+          ),
+      });
+      expect((yield* journal.advanceStage(claimed.fence, receipt).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+        { stage: "reserved", revision: 1 },
+      ]);
+      expect(yield* f.sql`SELECT receipt_id FROM project_team_dispatch_receipt`).toEqual([]);
+    }),
+  ),
+);
