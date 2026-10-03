@@ -181,23 +181,36 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
         });
         continue;
       }
-      const pending = window ?? {
+      // A retained window only selects IDs still present in this current page, using
+      // current priorities. Its keyset cursor follows the refreshed page as well.
+      const remaining =
+        window === undefined ? undefined : new Set(window.candidates.map((c) => c.taskId));
+      const pending: TaskWindow = {
         ...(afterTaskId === undefined ? {} : { afterTaskId }),
         limit: pageLimit,
-        candidates: [...candidates].sort(byPriority((c: Candidate) => c.taskId)),
+        candidates: candidates
+          .filter((c) => remaining === undefined || remaining.has(c.taskId))
+          .sort(byPriority((c: Candidate) => c.taskId)),
       };
-      if (window === undefined) {
-        if (candidates.length === pageLimit)
-          taskCursors.set(project.projectId, candidates[candidates.length - 1]!.taskId);
-        else taskCursors.delete(project.projectId);
-      }
+      // Publish before any interruptible preparation, transaction or notification.
+      // Keep the selected ID until a definitive result; the journal remains durable
+      // authority if a transaction commits without returning its result to this fiber.
+      if (pending.candidates.length > 0) windows.set(project.projectId, pending);
+      else windows.delete(project.projectId);
+      if (candidates.length === pageLimit)
+        taskCursors.set(project.projectId, candidates[candidates.length - 1]!.taskId);
+      else taskCursors.delete(project.projectId);
+      const consumeCandidate = () => {
+        pending.candidates.shift();
+        if (pending.candidates.length === 0) windows.delete(project.projectId);
+      };
       let scanned = 0;
       while (
         pending.candidates.length > 0 &&
         scanned < taskLimit &&
         committed.length < reservationLimit
       ) {
-        const candidate = pending.candidates.shift()!;
+        const candidate = pending.candidates[0]!;
         scanned++;
         tasksScanned++;
         const taskId = candidate.taskId;
@@ -220,6 +233,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             phase: "eligibility",
             reason: "inactive-managed-assignment",
           });
+          consumeCandidate();
           continue;
         }
         const grants = (state.foundationRecords ?? []).filter(
@@ -241,6 +255,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             phase: "eligibility",
             reason: "explicit-authorization-required",
           });
+          consumeCandidate();
           continue;
         }
         const prerequisite = yield* Effect.try({
@@ -258,6 +273,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
                 ? "invalid-task"
                 : (prerequisite.success.reason ?? "task-not-claimable"),
           });
+          consumeCandidate();
           continue;
         }
         const prepared = yield* ports
@@ -271,6 +287,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             reason: "request-preparation-failed",
             error: prepared.failure,
           });
+          consumeCandidate();
           continue;
         }
         if (prepared.success._tag === "Blocked") {
@@ -280,6 +297,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             phase: "prepare",
             reason: prepared.success.reason,
           });
+          consumeCandidate();
           continue;
         }
         const request = prepared.success.request;
@@ -299,6 +317,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             phase: "prepare",
             reason: "prepared-identity-mismatch",
           });
+          consumeCandidate();
           continue;
         }
         const policy = yield* Effect.try({
@@ -316,6 +335,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
                 ? policy.failure.code
                 : "invalid-prepared-claim",
           });
+          consumeCandidate();
           continue;
         }
         const reserved = yield* ports.reserve(request).pipe(Effect.result);
@@ -327,8 +347,10 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             reason: "reservation-denied",
             error: reserved.failure,
           });
+          consumeCandidate();
           continue;
         }
+        consumeCandidate();
         committed.push(reserved.success);
         if (ports.notifyCommittedDispatch !== undefined) {
           const notified = yield* ports
@@ -348,9 +370,6 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
         // A later claim must use a fresh project revision after this transaction commits.
         break;
       }
-      if (pending.candidates.length > 0) {
-        windows.set(project.projectId, pending);
-      } else windows.delete(project.projectId);
     }
     return {
       committed,

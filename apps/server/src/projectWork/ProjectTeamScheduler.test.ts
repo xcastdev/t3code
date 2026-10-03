@@ -12,6 +12,8 @@ import {
   ProjectWorkFoundationCommitCommand,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import * as TestClock from "effect/testing/TestClock";
@@ -998,6 +1000,497 @@ it.effect(
         expect(yield* f.sql`SELECT dispatch_id FROM project_team_dispatch`).toEqual([
           { dispatch_id: "scheduler-dispatch" },
         ]);
+      }),
+    ),
+);
+
+const twoTasks = Effect.gen(function* () {
+  const f = yield* fixture;
+  const original = f.request.claim.transition;
+  const state = yield* readCurrentState(f.sql, projectId);
+  const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
+  const limits = state.foundationRecords?.find((r) => r.kind === "limits");
+  const member = state.foundationRecords?.find((r) => r.kind === "member");
+  if (
+    original?.kind !== "claim" ||
+    role?.kind !== "role-revision" ||
+    limits?.kind !== "limits" ||
+    member?.kind !== "member"
+  )
+    return yield* Effect.die("Fixture lacks frozen role, limits or claim");
+  yield* f.repository.execute(
+    yield* decodeCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "two-writer-policy",
+      expectedRevision: state.revision,
+      attribution,
+      committedAt: at,
+      records: [
+        { ...limits, revision: limits.revision + 1, projectWritableWorkers: 2 },
+        { ...member, recordId: "continuation-other-member", revision: 0 },
+      ],
+    }),
+  );
+  const otherId = ProjectWorkTaskId.make("zzz-continuation-other");
+  let retained: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+  yield* createManagedAssignment({
+    taskId: otherId,
+    recordId: "continuation-other-binding",
+    attemptId: "continuation-other-attempt",
+    commandId: "continuation-other-dispatch",
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    threadId: ThreadId.make("continuation-other-thread"),
+    memberId: "continuation-other-member",
+    role,
+    status: "reserved",
+    configuration: original.binding.configuration,
+  }).pipe(
+    Effect.provideService(ProjectWorkRepository, {
+      ...f.repository,
+      execute: (command) => {
+        if (
+          command.type === "project-work.foundation.commit" &&
+          command.transition?.kind === "claim"
+        ) {
+          retained = command;
+          return Effect.fail(
+            new ProjectWorkPolicyError("invalid-state", "Retain approved continuation claim"),
+          );
+        }
+        return f.repository.execute(command);
+      },
+    }),
+    Effect.result,
+  );
+  if (!retained || retained.transition?.kind !== "claim")
+    return yield* Effect.die("Missing retained second claim");
+  const otherRequest: ProjectTeamDispatchRequest = {
+    ...f.request,
+    dispatchId: "continuation-other-dispatch",
+    claim: {
+      ...retained,
+      transition: {
+        ...retained.transition,
+        binding: {
+          ...retained.transition.binding,
+          worktree: "/workspace/continuation-other",
+          branch: "continuation-other-branch",
+        },
+      },
+    },
+    git: {
+      ...f.request.git,
+      effectId: "continuation-other-dispatch",
+      runId: "continuation-other-binding",
+      worktreePath: "/workspace/continuation-other",
+      branchRef: "continuation-other-branch",
+      ownershipToken: "continuation-other-owner",
+    },
+    setupId: "continuation-other-setup",
+    initializeOperationId: "continuation-other-initialize",
+    assignmentOperationId: "continuation-other-assignment",
+  };
+  const prepared: Array<string> = [];
+  return {
+    ...f,
+    otherId,
+    otherRequest,
+    prepared,
+    prepare: ({
+      state,
+      taskId: id,
+    }: {
+      state: ProjectWorkReducerState;
+      taskId: ProjectWorkTaskId;
+    }) =>
+      Effect.sync(() => {
+        prepared.push(id);
+        const request = id === otherId ? otherRequest : f.request;
+        return {
+          _tag: "Prepared" as const,
+          request: { ...request, claim: { ...request.claim, expectedRevision: state.revision } },
+        };
+      }),
+  };
+});
+
+const continuationPorts = (f: Effect.Success<typeof twoTasks>) => ({
+  readProjectState: ({ afterTaskId, limit }: { afterTaskId?: ProjectWorkTaskId; limit: number }) =>
+    readCurrentState(f.sql, projectId).pipe(
+      Effect.map((state) => ({
+        state,
+        candidates: [
+          { taskId, priority: 1 },
+          { taskId: f.otherId, priority: 0 },
+        ]
+          .filter((candidate) => afterTaskId === undefined || candidate.taskId > afterTaskId)
+          .slice(0, limit),
+      })),
+    ),
+  prepareRequest: f.prepare,
+  notifyCommittedDispatch: () => Effect.void,
+});
+
+it.effect("interruption after durable reserve preserves the unvisited selection window", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* twoTasks;
+      const entered = yield* Deferred.make<void>();
+      const scheduler = yield* schedulerWith(f, {
+        ...continuationPorts(f),
+        notifyCommittedDispatch: (result) =>
+          result.fence.dispatchId === f.request.dispatchId
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.void,
+      });
+      const running = yield* scheduler
+        .sweep({ tasksPerProject: 2, maximumReservations: 1 })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(1);
+      expect(
+        (yield* f.journal.readRecoveryPage({ limit: 32 })).map(
+          (result) => result.intent.request.dispatchId,
+        ),
+      ).toEqual([f.request.dispatchId]);
+      yield* Fiber.interrupt(running);
+      const next = yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 });
+      expect(next.blocked).toEqual([]);
+      expect(next.committed.map((result) => result.fence.dispatchId)).toEqual([
+        f.otherRequest.dispatchId,
+      ]);
+      expect(f.prepared).toEqual([taskId, f.otherId]);
+      expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
+      expect(
+        (yield* f.journal.readRecoveryPage({ limit: 32 }))
+          .map((result) => result.intent.request.dispatchId)
+          .sort(),
+      ).toEqual([f.request.dispatchId, f.otherRequest.dispatchId].sort());
+    }),
+  ),
+);
+
+it.effect("normal capped continuation reserves both original identities once", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* twoTasks;
+      const scheduler = yield* schedulerWith(f, continuationPorts(f));
+      expect(
+        (yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 })).committed.map(
+          (result) => result.fence.dispatchId,
+        ),
+      ).toEqual([f.request.dispatchId]);
+      expect(
+        (yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 })).committed.map(
+          (result) => result.fence.dispatchId,
+        ),
+      ).toEqual([f.otherRequest.dispatchId]);
+      expect(f.prepared).toEqual([taskId, f.otherId]);
+      expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
+    }),
+  ),
+);
+
+it.effect("a fresh candidate page excludes a retained task before preparation or reserve", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* twoTasks;
+      let includeOther = true;
+      const scheduler = yield* schedulerWith(f, {
+        ...continuationPorts(f),
+        readProjectState: ({ afterTaskId, limit }) =>
+          readCurrentState(f.sql, projectId).pipe(
+            Effect.map((state) => ({
+              state,
+              candidates: [
+                { taskId, priority: 1 },
+                ...(includeOther ? [{ taskId: f.otherId, priority: 0 }] : []),
+              ]
+                .filter((candidate) => afterTaskId === undefined || candidate.taskId > afterTaskId)
+                .slice(0, limit),
+            })),
+          ),
+      });
+      expect(
+        (yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 })).committed,
+      ).toHaveLength(1);
+      includeOther = false;
+      const next = yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 });
+      expect({
+        prepared: f.prepared,
+        committed: next.committed.length,
+        hasMore: next.hasMore,
+      }).toEqual({ prepared: [taskId], committed: 0, hasMore: false });
+      expect(
+        (yield* readCurrentState(f.sql, projectId)).tasks.find((task) => task.taskId === f.otherId)
+          ?.state,
+      ).toBe("ready");
+      expect(
+        (yield* f.journal.readRecoveryPage({ limit: 32 })).map(
+          (result) => result.intent.request.dispatchId,
+        ),
+      ).toEqual([f.request.dispatchId]);
+    }),
+  ),
+);
+
+const threeTasks = Effect.gen(function* () {
+  const f = yield* twoTasks;
+  const before = yield* readCurrentState(f.sql, projectId);
+  const role = before.foundationRecords?.find((r) => r.kind === "role-revision");
+  const member = before.foundationRecords?.find((r) => r.kind === "member");
+  const first = f.request.claim.transition;
+  if (role?.kind !== "role-revision" || member?.kind !== "member" || first?.kind !== "claim")
+    return yield* Effect.die("Missing third-task prerequisites");
+  yield* f.repository.execute(
+    yield* decodeCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "third-member",
+      expectedRevision: before.revision,
+      attribution,
+      committedAt: at,
+      records: [{ ...member, recordId: "continuation-third-member", revision: 0 }],
+    }),
+  );
+  const thirdId = ProjectWorkTaskId.make("zzz-continuation-third");
+  let retained: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+  yield* createManagedAssignment({
+    taskId: thirdId,
+    recordId: "continuation-third-binding",
+    attemptId: "continuation-third-attempt",
+    commandId: "continuation-third-dispatch",
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    threadId: ThreadId.make("continuation-third-thread"),
+    memberId: "continuation-third-member",
+    role,
+    status: "reserved",
+    configuration: first.binding.configuration,
+  }).pipe(
+    Effect.provideService(ProjectWorkRepository, {
+      ...f.repository,
+      execute: (command) => {
+        if (
+          command.type === "project-work.foundation.commit" &&
+          command.transition?.kind === "claim"
+        ) {
+          retained = command;
+          return Effect.fail(
+            new ProjectWorkPolicyError("invalid-state", "Retain third approved claim"),
+          );
+        }
+        return f.repository.execute(command);
+      },
+    }),
+    Effect.result,
+  );
+  if (!retained || retained.transition?.kind !== "claim")
+    return yield* Effect.die("Missing third claim");
+  const thirdRequest: ProjectTeamDispatchRequest = {
+    ...f.request,
+    dispatchId: "continuation-third-dispatch",
+    claim: {
+      ...retained,
+      transition: {
+        ...retained.transition,
+        binding: {
+          ...retained.transition.binding,
+          worktree: "/workspace/continuation-third",
+          branch: "continuation-third-branch",
+        },
+      },
+    },
+    git: {
+      ...f.request.git,
+      effectId: "continuation-third-dispatch",
+      runId: "continuation-third-binding",
+      worktreePath: "/workspace/continuation-third",
+      branchRef: "continuation-third-branch",
+      ownershipToken: "continuation-third-owner",
+    },
+    setupId: "continuation-third-setup",
+    initializeOperationId: "continuation-third-initialize",
+    assignmentOperationId: "continuation-third-assignment",
+  };
+
+  return { ...f, thirdId, thirdRequest };
+});
+
+for (const reprioritize of [false, true]) {
+  it.effect(
+    reprioritize
+      ? "retained candidates follow fresh priorities"
+      : "initial priorities select the same eligible third task",
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* threeTasks;
+          let changed = !reprioritize;
+          const scheduler = yield* schedulerWith(f, {
+            ...continuationPorts(f),
+            readProjectState: ({ afterTaskId, limit }) =>
+              readCurrentState(f.sql, projectId).pipe(
+                Effect.map((state) => ({
+                  state,
+                  candidates: [
+                    { taskId, priority: 100 },
+                    { taskId: f.otherId, priority: changed ? 0 : 10 },
+                    { taskId: f.thirdId, priority: changed ? 50 : 0 },
+                  ]
+                    .filter(
+                      (candidate) => afterTaskId === undefined || candidate.taskId > afterTaskId,
+                    )
+                    .slice(0, limit),
+                })),
+              ),
+            prepareRequest: ({ state, taskId: id }) =>
+              id === f.thirdId
+                ? Effect.succeed({
+                    _tag: "Prepared" as const,
+                    request: {
+                      ...f.thirdRequest,
+                      claim: { ...f.thirdRequest.claim, expectedRevision: state.revision },
+                    },
+                  })
+                : f.prepare({ state, taskId: id }),
+          });
+          expect(
+            (yield* scheduler.sweep({ tasksPerProject: 3, maximumReservations: 1 })).committed.map(
+              (result) => result.fence.dispatchId,
+            ),
+          ).toEqual([f.request.dispatchId]);
+          changed = true;
+          const next = yield* scheduler.sweep({ tasksPerProject: 3, maximumReservations: 1 });
+          expect(next.blocked).toEqual([]);
+          expect(next.committed.map((result) => result.fence.dispatchId)).toEqual([
+            f.thirdRequest.dispatchId,
+          ]);
+          expect(
+            (yield* readCurrentState(f.sql, projectId)).tasks.find(
+              (task) => task.taskId === f.otherId,
+            )?.state,
+          ).toBe("ready");
+          expect(
+            (yield* f.journal.readRecoveryPage({ limit: 32 }))
+              .map((result) => result.intent.request.dispatchId)
+              .sort(),
+          ).toEqual([f.request.dispatchId, f.thirdRequest.dispatchId].sort());
+        }),
+      ),
+  );
+}
+
+for (const phase of ["prepare", "reserve", "committed-response"] as const) {
+  it.effect(
+    `interruption during ${phase} keeps pending IDs and the original durable identity`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* twoTasks;
+          const entered = yield* Deferred.make<void>();
+          let interruptOnce = true;
+          const stop = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+          const scheduler = yield* schedulerWith(f, {
+            ...continuationPorts(f),
+            prepareRequest: (input) => {
+              if (phase === "prepare" && interruptOnce) {
+                interruptOnce = false;
+                return stop;
+              }
+              return f.prepare(input);
+            },
+            reserve: (request) => {
+              if (phase !== "prepare" && interruptOnce) {
+                interruptOnce = false;
+                return phase === "reserve"
+                  ? stop
+                  : f.journal.reserve(request).pipe(Effect.andThen(stop));
+              }
+              return f.journal.reserve(request);
+            },
+          });
+          const running = yield* scheduler
+            .sweep({ tasksPerProject: 2, maximumReservations: 1 })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(entered);
+          expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(
+            phase === "committed-response" ? 1 : 0,
+          );
+          yield* Fiber.interrupt(running);
+          const next = yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 });
+          expect(next.committed.map((result) => result.fence.dispatchId)).toEqual([
+            phase === "committed-response" ? f.otherRequest.dispatchId : f.request.dispatchId,
+          ]);
+          if (phase !== "committed-response") {
+            expect(
+              (yield* scheduler.sweep({
+                tasksPerProject: 2,
+                maximumReservations: 1,
+              })).committed.map((result) => result.fence.dispatchId),
+            ).toEqual([f.otherRequest.dispatchId]);
+          }
+          expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
+          expect(
+            (yield* f.journal.readRecoveryPage({ limit: 32 }))
+              .map((result) => result.intent.request.dispatchId)
+              .sort(),
+          ).toEqual([f.request.dispatchId, f.otherRequest.dispatchId].sort());
+        }),
+      ),
+  );
+}
+
+it.effect(
+  "a retained ID displaced from the fresh bounded page is reached by its refreshed keyset cursor",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* threeTasks;
+        let includeOther = false;
+        const scheduler = yield* schedulerWith(f, {
+          ...continuationPorts(f),
+          readProjectState: ({ afterTaskId, limit }) =>
+            readCurrentState(f.sql, projectId).pipe(
+              Effect.map((state) => ({
+                state,
+                candidates: [
+                  { taskId, priority: 100 },
+                  ...(includeOther ? [{ taskId: f.otherId, priority: 10 }] : []),
+                  { taskId: f.thirdId, priority: 0 },
+                ]
+                  .filter(
+                    (candidate) => afterTaskId === undefined || candidate.taskId > afterTaskId,
+                  )
+                  .slice(0, limit),
+              })),
+            ),
+          prepareRequest: ({ state, taskId: id }) =>
+            id === f.thirdId
+              ? Effect.succeed({
+                  _tag: "Prepared" as const,
+                  request: {
+                    ...f.thirdRequest,
+                    claim: { ...f.thirdRequest.claim, expectedRevision: state.revision },
+                  },
+                })
+              : f.prepare({ state, taskId: id }),
+        });
+        expect(
+          (yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 })).committed.map(
+            (result) => result.fence.dispatchId,
+          ),
+        ).toEqual([f.request.dispatchId]);
+        includeOther = true;
+        const displaced = yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 });
+        expect(displaced.committed).toEqual([]);
+        expect(displaced.hasMore).toBe(true);
+        expect(
+          (yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 })).committed.map(
+            (result) => result.fence.dispatchId,
+          ),
+        ).toEqual([f.thirdRequest.dispatchId]);
+        expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
       }),
     ),
 );
