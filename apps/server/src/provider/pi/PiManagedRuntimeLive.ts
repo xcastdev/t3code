@@ -7,6 +7,7 @@ import {
   SkillCatalogRevision,
   ThreadId,
   ProviderDriverKind,
+  ProjectTeamRunBinding,
   TurnId,
   type ProviderSession,
 } from "@t3tools/contracts";
@@ -76,6 +77,7 @@ const provider = ProviderDriverKind.make("piAgent");
 const routeId = "command-code-ling-free";
 const model = "inclusionai/ling-3.1-flash:free";
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeBinding = Schema.decodeUnknownSync(ProjectTeamRunBinding);
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
 const skillAbsolute = Schema.String.check(
   Schema.isMaxLength(4096),
@@ -1110,6 +1112,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 )
                   return yield* deny("Pi resume hint differs from durable native identity");
                 const context = contextFor(authority);
+                let authorityContext = context;
                 const authorizeResources = guard(
                   Effect.gen(function* () {
                     yield* preparationCurrent;
@@ -1117,7 +1120,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       identity(request.threadId),
                       request.kind === "initialize",
                     );
-                    if (contextFor(current) !== context)
+                    if (contextFor(current) !== authorityContext)
                       return yield* deny("Pi selected resource authority changed", "conflict");
                     if (
                       piManagedSkillResourceIdentity(yield* selectedSkills(current, workspace)) !==
@@ -1126,7 +1129,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       return yield* deny("Pi selected resource content changed", "conflict");
                     yield* verifyWorkspace(current, agentDirectory, workspace);
                     yield* operations.admitCurrent(identity(request.threadId), (latest) => {
-                      if (contextFor(latest) !== context)
+                      if (contextFor(latest) !== authorityContext)
                         throw deny(
                           "Pi selected resource authority changed during admission",
                           "conflict",
@@ -1486,7 +1489,39 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           yield* check(signal);
                           if (!("native" in frame.message))
                             return yield* deny("Pi native receipt absent");
-                          yield* operations.persistNative(durable, frame.message.native);
+                          const beforeNative = yield* operations.authorize(durable);
+                          if (contextFor(beforeNative) !== authorityContext)
+                            return yield* deny(
+                              "Pi native authority changed before commit",
+                              "conflict",
+                            );
+                          const committed = yield* operations.persistNative(
+                            durable,
+                            frame.message.native,
+                          );
+                          // Initial native persistence alone may advance the reserved binding.
+                          // Keep the SDK's original context, then fence the complete committed snapshot.
+                          const expected =
+                            binding.status === "reserved" && authorityContext === context
+                              ? contextFor({
+                                  ...authority,
+                                  binding: decodeBinding({
+                                    ...binding,
+                                    revision: binding.revision + 1,
+                                    status: "running",
+                                    sessionId: frame.message.native.sessionId,
+                                    updatedAt: committed.binding.updatedAt,
+                                  }),
+                                })
+                              : authorityContext;
+                          const committedContext = contextFor(committed);
+                          if (committedContext !== expected)
+                            return yield* deny(
+                              "Pi native authority changed during commit",
+                              "conflict",
+                            );
+                          authorityContext = committedContext;
+                          yield* resources.revalidate;
                           yield* check(signal);
                         }),
                       ),
@@ -1597,7 +1632,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         identity(request.threadId),
                       );
                       if (
-                        contextFor(beforePublication) !== context ||
+                        contextFor(beforePublication) !== authorityContext ||
                         piManagedSkillResourceIdentity(
                           yield* selectedSkills(beforePublication, workspace),
                         ) !== resourceHash
