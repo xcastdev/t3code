@@ -284,6 +284,8 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       row: Row,
       intent: typeof Intent.Type,
     ) {
+      if (row.stage === "stopping" || row.stage === "quarantine" || row.stage === "settled")
+        return yield* deny("Dispatch retains cleanup ownership only");
       if (yield* isProjectWorkTombstoned(sql, row.project_id))
         return yield* deny("Project is deleted");
       const now = yield* Clock.currentTimeMillis;

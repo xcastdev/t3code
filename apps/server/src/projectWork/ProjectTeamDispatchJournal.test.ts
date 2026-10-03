@@ -804,3 +804,36 @@ for (const corruption of ["generation", "revision", "time", "stage"] as const)
       }),
     ),
   );
+
+for (const stage of ["stopping", "quarantine"] as const)
+  it.effect(`cleanup stage denies current forward execution before expiry: ${stage}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+        });
+        const stopped = yield* journal.advanceStage(claimed.fence, {
+          receiptId: stage,
+          stage,
+          evidence: {},
+        });
+        expect((yield* journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect((yield* journal.reserve(f.request).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* journal.readRetained(f.request.dispatchId)).toEqual({
+          fence: stopped.fence,
+          intent: stopped.intent,
+        });
+        expect(
+          (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+            (r) => r.kind === "reservation",
+          )?.status,
+        ).toBe("held");
+      }),
+    ),
+  );
