@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ProviderDriverKind } from "@t3tools/contracts";
+import { PiSettings, ProviderDriverKind } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 import { DRIVER_OPTION_BY_VALUE } from "./providerDriverMeta";
 import {
@@ -8,6 +9,60 @@ import {
 } from "./ProviderSettingsForm";
 
 describe("ProviderSettingsForm helpers", () => {
+  it("derives only the native Pi configuration field from shared settings", () => {
+    const pi = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("piAgent")];
+    expect(pi).toBeDefined();
+
+    expect(deriveProviderSettingsFields(pi!)).toEqual([
+      {
+        key: "agentDirectory",
+        label: "Pi configuration directory",
+        description: "Directory containing this instance's native Pi settings.",
+        placeholder: "~/.pi/agent",
+        control: "text",
+        clearWhenEmpty: "omit",
+        targetable: false,
+      },
+    ]);
+  });
+
+  it("edits and clears Pi configuration through the generic form helpers", () => {
+    const pi = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("piAgent")];
+    expect(pi).toBeDefined();
+    const field = deriveProviderSettingsFields(pi!)[0]!;
+    const decode = Schema.decodeUnknownSync(PiSettings);
+
+    const configured = nextProviderConfigWithFieldValue(undefined, field, "/trusted/pi");
+    expect(decode(configured)).toEqual({ agentDirectory: "/trusted/pi" });
+
+    const cleared = nextProviderConfigWithFieldValue(configured, field, "   ");
+    expect(cleared).toBeUndefined();
+    expect(decode(cleared ?? {})).toEqual({});
+    expect(nextProviderConfigWithFieldValue({ ...configured, forkOwned: 1 }, field, "")).toEqual({
+      forkOwned: 1,
+    });
+  });
+
+  it("keeps Pi form drafts subject to shared configuration validation", () => {
+    const pi = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("piAgent")];
+    expect(pi).toBeDefined();
+    const field = deriveProviderSettingsFields(pi!)[0]!;
+    const decode = Schema.decodeUnknownSync(PiSettings);
+
+    expect(decode(nextProviderConfigWithFieldValue(undefined, field, "~/.pi/agent"))).toEqual({
+      agentDirectory: "~/.pi/agent",
+    });
+    for (const value of [" /trusted/pi", "/trusted/pi ", "/trusted/pi\0other", "x".repeat(4097)]) {
+      expect(() => decode(nextProviderConfigWithFieldValue(undefined, field, value))).toThrow();
+    }
+    const withAuthority = nextProviderConfigWithFieldValue(
+      { runtimeGrant: true },
+      field,
+      "/trusted/pi",
+    );
+    expect(() => decode(withAuthority)).toThrow();
+  });
+
   it("derives visible provider config fields from the client definition schema", () => {
     const codex = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("codex")];
 

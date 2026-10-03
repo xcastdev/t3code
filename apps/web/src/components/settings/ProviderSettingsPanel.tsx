@@ -713,9 +713,11 @@ export function EnvironmentProviderSettings({
   }
 
   const defaultSlotIdsBySource = new Set<string>(
-    visibleProviderSettings.map((providerSettings) =>
-      String(defaultInstanceIdForDriver(providerSettings.provider)),
-    ),
+    visibleProviderSettings
+      .filter((providerSettings) =>
+        Object.hasOwn(DEFAULT_UNIFIED_SETTINGS.providers, providerSettings.provider),
+      )
+      .map((providerSettings) => String(defaultInstanceIdForDriver(providerSettings.provider))),
   );
 
   const rows: InstanceRow[] = [];
@@ -738,6 +740,7 @@ export function EnvironmentProviderSettings({
     // instance or a legacy blob there is nothing to render for the slot.
     const legacyConfig = legacyProviders[providerSettings.provider];
     const defaultLegacyConfig = defaultLegacyProviders[providerSettings.provider];
+    const hasLegacyDefault = defaultLegacyConfig !== undefined;
     // The envelope is the single enabled flag: keep the legacy in-config
     // flag out of the synthesized blob, or an explicit `enabled: false`
     // would keep winning over the envelope and the Switch could never
@@ -757,7 +760,7 @@ export function EnvironmentProviderSettings({
       explicitInstance ?? synthesizedInstance();
     // Only the default slot depends on the legacy blob; custom instances for
     // the driver must still render even when the slot has nothing to show.
-    if (effectiveInstance !== undefined) {
+    if (hasLegacyDefault && effectiveInstance !== undefined) {
       const isDirty =
         explicitInstance !== undefined || !Equal.equals(legacyConfig, defaultLegacyConfig);
       rows.push({
@@ -769,7 +772,7 @@ export function EnvironmentProviderSettings({
       });
     }
     for (const [id, instance] of instancesByDriver.get(providerSettings.provider) ?? []) {
-      if (id === defaultInstanceId) continue;
+      if (hasLegacyDefault && id === defaultInstanceId) continue;
       rows.push({ instanceId: id, instance, driver: instance.driver, isDefault: false });
     }
   }
