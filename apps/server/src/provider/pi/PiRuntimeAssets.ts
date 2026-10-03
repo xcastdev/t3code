@@ -122,7 +122,7 @@ const unavailable = () =>
   new PiRuntimeAssetsError({
     phase: "unavailable",
     message:
-      "Pi runtime assets require Linux x64 GNU, compatible actual Node, Bash and a working ELF dependency inspection.",
+      "Pi runtime assets require Linux x64 GNU, compatible actual Node, Bash, bubblewrap and a working ELF dependency inspection.",
   });
 const native = <A>(run: () => Promise<A>) =>
   Effect.tryPromise({
@@ -424,11 +424,16 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
       }
     }
     // Pinned SDK getShellConfig prefers this cage target on Unix; no ambient shell selection.
-    const bashSource = yield* fs.realPath("/bin/bash").pipe(Effect.mapError(unavailable));
-    const bashStat = yield* add(bashSource, "/bin/bash");
-    if ((bashStat.mode & 0o111n) === 0n) return yield* unavailable();
-    yield* native(() => validateElf(bashSource, bashStat, path));
-    elfSources.push(bashSource);
+    for (const [installed, target] of [
+      ["/bin/bash", "/bin/bash"],
+      ["/usr/bin/bwrap", "/runtime/t3-bwrap"],
+    ] as const) {
+      const source = yield* fs.realPath(installed).pipe(Effect.mapError(unavailable));
+      const stat = yield* add(source, target);
+      if ((stat.mode & 0o111n) === 0n) return yield* unavailable();
+      yield* native(() => validateElf(source, stat, path));
+      elfSources.push(source);
+    }
     const targets = new Set<string>();
     // All fixed ELF inspections share one deadline; each child owns its pipe and exit drains.
     yield* Effect.scoped(

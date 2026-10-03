@@ -3,6 +3,7 @@ import * as Crypto from "effect/Crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -216,7 +217,7 @@ const executeCaptured = Effect.fn("assetsTest.executeCaptured")(function* (
   if (closureEvidenceDirectory) {
     const label =
       (assets.runtimeFiles.some((file) => file.target === "/runtime/t3") ? "executable" : "npm") +
-      (argv[0] === "/bin/bash" ? "-bash" : "-ffi");
+      (argv[0] === "/bin/bash" ? "-bash" : argv[0] === "/runtime/t3-bwrap" ? "-bwrap" : "-ffi");
     const files = yield* Effect.forEach(assets.runtimeFiles, (file) =>
       Effect.promise(async () => {
         const stat = await NodeFSP.stat(file.source);
@@ -400,6 +401,43 @@ const native: typeof check = (name, body, timeout) =>
     ? check(name, body, timeout)
     : it.skip(name, () => {});
 describe("required actual Linux executable closure", () => {
+  native("captures the fixed nested bubblewrap executable and its actual ELF dependencies", () =>
+    Effect.gen(function* () {
+      const result = yield* preparePiRuntimeAssets(input);
+      const binary = result.runtimeFiles.find((file) => file.target === "/runtime/t3-bwrap");
+      expect(binary).toBeDefined();
+      expect(yield* Effect.promise(() => NodeFSP.readFile(binary!.source))).toEqual(
+        yield* Effect.promise(() => NodeFSP.readFile("/usr/bin/bwrap")),
+      );
+      expect(yield* executeCaptured(result, ["/runtime/t3-bwrap", "--version"])).toMatch(
+        /^bubblewrap \d+\.\d+\.\d+\n$/,
+      );
+      yield* result.revalidate;
+    }),
+  );
+  for (const fault of ["nonexecutable", "nonelf"] as const)
+    native(`refuses ${fault} nested bubblewrap before staging`, () =>
+      Effect.gen(function* () {
+        const source = fixturePath(scratch, "invalid-bwrap");
+        yield* Effect.promise(() => NodeFSP.writeFile(source, "invalid executable"));
+        yield* Effect.promise(() => NodeFSP.chmod(source, fault === "nonelf" ? 0o700 : 0o600));
+        const fs = yield* FileSystem.FileSystem;
+        const error = yield* preparePiRuntimeAssets(input).pipe(
+          Effect.provideService(
+            FileSystem.FileSystem,
+            FileSystem.FileSystem.of({
+              ...fs,
+              realPath: (path) =>
+                path === "/usr/bin/bwrap" ? Effect.succeed(source) : fs.realPath(path),
+            }),
+          ),
+          Effect.flip,
+        );
+        expect(error.phase).toBe("unavailable");
+        expect(yield* Effect.promise(() => NodeFSP.readdir(input.stagingDirectory))).toEqual([]);
+      }),
+    );
+
   native("captures Bash and runs builtin commands using only the copied cage closure", () =>
     Effect.gen(function* () {
       const result = yield* preparePiRuntimeAssets(input);
