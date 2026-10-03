@@ -167,6 +167,52 @@ describe("PiSkillResources", () => {
         );
       }),
     );
+    for (const count of [129, 253, 254])
+      it.effect(`selected skills obey the combined bound with ${count} runtime files`, () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const f = yield* fixture();
+          const runtime = f.root + "/runtime-inputs";
+          yield* fs.makeDirectory(runtime);
+          const existingRuntimeFiles = yield* Effect.forEach(
+            Array.from({ length: count }, (_, index) => index),
+            (index) =>
+              Effect.gen(function* () {
+                const source = runtime + "/" + index;
+                yield* fs.writeFileString(source, "fixed runtime fixture");
+                return { source, target: "/runtime/fixed/" + index };
+              }),
+          );
+          const preparation = preparePiSkillResources({ ...f.options, existingRuntimeFiles });
+          if (count === 254) {
+            denied(yield* preparation.pipe(Effect.result), /combined file bound/);
+            assert.deepEqual(yield* fs.readDirectory(f.stage), []);
+            return;
+          }
+          const prepared = yield* preparation;
+          assert.equal(prepared.runtimeFiles.length, 3);
+          yield* prepared.revalidate;
+        }),
+      );
+
+    it.effect("preserves the 128-file bound for selected resources", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const f = yield* fixture();
+        for (let index = 0; index < 126; index++)
+          yield* fs.writeFileString(f.source + `/assets/extra-${index}.txt`, "bounded fixture");
+        const expectedHash = yield* hashSkillPackage(f.source);
+        denied(
+          yield* preparePiSkillResources({
+            ...f.options,
+            selection: [{ ...f.options.selection[0]!, expectedHash }],
+          }).pipe(Effect.result),
+          /combined file bound/,
+        );
+        assert.deepEqual(yield* fs.readDirectory(f.stage), []);
+      }),
+    );
+
     it.effect("empty selection touches no filesystem or unavailable platform", () =>
       Effect.gen(function* () {
         const prepared = yield* preparePiSkillResources({
@@ -462,7 +508,7 @@ describe("PiSkillResources", () => {
         denied(
           yield* preparePiSkillResources({
             ...g.options,
-            existingRuntimeFiles: Array.from({ length: 127 }, (_, i) => ({
+            existingRuntimeFiles: Array.from({ length: 254 }, (_, i) => ({
               source: runtime,
               target: "/runtime/part-" + i,
             })),

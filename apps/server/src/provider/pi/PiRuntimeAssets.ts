@@ -13,7 +13,12 @@ import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
-import type { PiManagedLaunch } from "./PiManagedProcess.ts";
+import {
+  MAX_PI_RUNTIME_FILES,
+  MAX_PI_RUNTIME_FILE_BYTES,
+  piRuntimeClosureByteLimit,
+  type PiManagedLaunch,
+} from "./PiManagedProcess.ts";
 import { isPiWorkerNodeVersionSupported } from "./PiWorkerEntrypoint.ts";
 import { PiWorkerIdentity, PiWorkerOperation } from "./PiWorkerProtocol.ts";
 
@@ -24,7 +29,7 @@ const NodeFSP = NodeFS.promises;
 const nativeStat = (source: string) => NodeFSP.lstat(source, { bigint: true });
 type BigIntStats = Awaited<ReturnType<typeof nativeStat>>;
 type FileHandle = Awaited<ReturnType<typeof NodeFSP.open>>;
-const maxBytes = 256 * 1024 * 1024;
+const maxBytes = MAX_PI_RUNTIME_FILE_BYTES;
 const directoryFlags =
   NodeFS.constants.O_RDONLY | NodeFS.constants.O_DIRECTORY | NodeFS.constants.O_NOFOLLOW;
 const readFlags =
@@ -296,6 +301,7 @@ async function inspectStage(
 
 function workerArgv(
   executable: boolean,
+  electron: boolean,
   identity: PiWorkerIdentity,
   operation: PiWorkerOperation,
   nativeStateDirectory: string,
@@ -308,10 +314,27 @@ function workerArgv(
     trustedSdkPackageDirectory: "/runtime/dist/pi-sdk",
   });
   if (Buffer.byteLength(descriptor) > 16384) throw invalid();
+  if (executable) return Object.freeze(["/runtime/t3", "__pi-worker", descriptor]);
+  const argv = [
+    "/runtime/node",
+    "--max-old-space-size=512",
+    "/runtime/dist/pi-worker.mjs",
+    descriptor,
+  ];
+  // The cage clears all environment. Set only Electron's fixed Node mode after
+  // that boundary, keeping the descriptor positional rather than shell source.
   return Object.freeze(
-    executable
-      ? ["/runtime/t3", "__pi-worker", descriptor]
-      : ["/runtime/node", "--max-old-space-size=512", "/runtime/dist/pi-worker.mjs", descriptor],
+    electron
+      ? [
+          "/bin/bash",
+          "--noprofile",
+          "--norc",
+          "-c",
+          'export ELECTRON_RUN_AS_NODE=1; exec "$@"',
+          "t3-pi-electron",
+          ...argv,
+        ]
+      : argv,
   );
 }
 
@@ -359,6 +382,8 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
     if (userId === undefined || stage.uid !== BigInt(userId) || (stage.mode & 0o022n) !== 0n)
       return yield* invalid();
     const executable = yield* HostProcessIsExecutable;
+    const electron = !executable && process.versions.electron !== undefined;
+    const closureMaxBytes = piRuntimeClosureByteLimit(electron);
     const names = executable
       ? []
       : yield* native(() =>
@@ -375,11 +400,14 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
     const files: Array<{ source: string; target: string; stat: BigIntStats }> = [];
     let totalBytes = 0n;
     const add = Effect.fn("PiRuntimeAssets.add")(function* (source: string, target: string) {
-      if (files.length >= 128 || files.some((file) => overlap(file.target, target)))
+      if (
+        files.length >= MAX_PI_RUNTIME_FILES ||
+        files.some((file) => overlap(file.target, target))
+      )
         return yield* invalid();
       const stat = yield* native(() => inspectFile(source, path));
       totalBytes += stat.size;
-      if (totalBytes > BigInt(maxBytes)) return yield* invalid();
+      if (totalBytes > BigInt(closureMaxBytes)) return yield* invalid();
       files.push({ source, target, stat });
       return stat;
     });
@@ -397,6 +425,18 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
     if ((executableStat.mode & 0o111n) === 0n) return yield* unavailable();
     yield* native(() => validateElf(executableSource, executableStat, path));
     const elfSources = [executableSource];
+    let electronFfmpegSource: string | undefined;
+    if (electron) {
+      // Node mode still needs these exact sibling assets from the host runtime.
+      // No other sibling dependency is admitted by ldd discovery.
+      const directory = path.dirname(executableSource);
+      electronFfmpegSource = path.join(directory, "libffmpeg.so");
+      const ffmpegStat = yield* add(electronFfmpegSource, "/runtime/libffmpeg.so");
+      yield* native(() => validateElf(electronFfmpegSource!, ffmpegStat, path));
+      elfSources.push(electronFfmpegSource);
+      for (const name of ["icudtl.dat", "snapshot_blob.bin", "v8_context_snapshot.bin"])
+        yield* add(path.join(directory, name), "/runtime/" + name);
+    }
     if (executable) {
       // SEA release archives stage a physical node_modules tree beside the actual
       // executable. Never search parents, activate imports or use ambient packages.
@@ -490,6 +530,7 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
       ),
     );
     for (const target of [...targets].sort()) {
+      if (target === electronFfmpegSource) continue;
       if (!/^\/(?:lib|lib64|usr\/lib|usr\/lib64)\//.test(target) || path.resolve(target) !== target)
         return yield* invalid();
       const library = yield* fs.realPath(target);
@@ -606,7 +647,7 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
         identity: PiWorkerIdentity,
         operation: PiWorkerOperation,
         nativeStateDirectory: string,
-      ) => workerArgv(executable, identity, operation, nativeStateDirectory),
+      ) => workerArgv(executable, electron, identity, operation, nativeStateDirectory),
       revalidate,
     });
   },

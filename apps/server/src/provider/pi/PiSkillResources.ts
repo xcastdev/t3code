@@ -1,5 +1,9 @@
 import { ManagedSkillKey, SkillContentHash } from "@t3tools/contracts";
-import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
+import {
+  HostProcessPlatform,
+  HostProcessUserId,
+  HostProcessIsExecutable,
+} from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -12,7 +16,12 @@ import {
   SKILL_BODY_FILE,
   SKILL_MANIFEST_FILE,
 } from "../../skills/SkillPackage.ts";
-import type { PiManagedLaunch } from "./PiManagedProcess.ts";
+import {
+  MAX_PI_RUNTIME_FILES,
+  MAX_PI_RUNTIME_FILE_BYTES,
+  piRuntimeClosureByteLimit,
+  type PiManagedLaunch,
+} from "./PiManagedProcess.ts";
 import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
 import type { PiWorkerBootstrap } from "./PiWorkerProtocol.ts";
 
@@ -28,8 +37,8 @@ const directoryFlags =
 const readFlags =
   nodeFS.constants.O_RDONLY | nodeFS.constants.O_NOFOLLOW | nodeFS.constants.O_NONBLOCK;
 const limits = DEFAULT_SKILL_PACKAGE_LIMITS;
-const maxRuntimeFiles = 128;
-const maxRuntimeBytes = 256 * 1024 * 1024;
+const maxSelectedFiles = 128;
+const maxRuntimeBytes = MAX_PI_RUNTIME_FILE_BYTES;
 const absolute = Schema.String.check(Schema.isMaxLength(4096), Schema.isPattern(/^\/[^\0\r\n]*$/));
 const inputSchema = Schema.Struct({
   selection: Schema.Array(
@@ -38,7 +47,7 @@ const inputSchema = Schema.Struct({
   stagingRoot: absolute,
   stagingDirectory: absolute,
   existingRuntimeFiles: Schema.Array(Schema.Struct({ source: absolute, target: absolute })).check(
-    Schema.isMaxLength(maxRuntimeFiles),
+    Schema.isMaxLength(MAX_PI_RUNTIME_FILES),
   ),
   protectedRoots: Schema.Array(absolute).check(Schema.isMinLength(1), Schema.isMaxLength(64)),
   writableRoots: Schema.Array(absolute).check(Schema.isMaxLength(64)),
@@ -456,6 +465,9 @@ export const preparePiSkillResources = Effect.fn("preparePiSkillResources")(func
   yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const userId = yield* HostProcessUserId;
+  const maxCombinedRuntimeBytes = piRuntimeClosureByteLimit(
+    !(yield* HostProcessIsExecutable) && process.versions.electron !== undefined,
+  );
   if (userId === undefined) return yield* rejected("Selected skill staging requires a host owner.");
   const value = yield* decodeInput(options, { onExcessProperty: "error" }).pipe(
     Effect.mapError(() => rejected("Selected skill inputs, keys or limits are invalid.")),
@@ -560,7 +572,7 @@ export const preparePiSkillResources = Effect.fn("preparePiSkillResources")(func
           ),
         );
         let totalBytes = existingStats.reduce((sum, entry) => sum + entry.size, 0n);
-        if (totalBytes > BigInt(maxRuntimeBytes))
+        if (totalBytes > BigInt(maxCombinedRuntimeBytes))
           return yield* rejected(
             "Selected skills and existing runtime exceed the combined byte bound.",
           );
@@ -589,12 +601,15 @@ export const preparePiSkillResources = Effect.fn("preparePiSkillResources")(func
         const identities: Array<readonly [ManagedSkillKey, SkillContentHash]> = [];
         for (const selected of [...value.selection].sort((a, b) => a.key.localeCompare(b.key))) {
           const original = yield* native(() => readTree(selected.packagePath));
-          if (original.files.length + targets.length > maxRuntimeFiles)
+          if (
+            runtimeFiles.length + original.files.length > maxSelectedFiles ||
+            original.files.length + targets.length > MAX_PI_RUNTIME_FILES
+          )
             return yield* rejected(
               "Selected skills and existing runtime exceed the combined file bound.",
             );
           totalBytes += original.files.reduce((sum, entry) => sum + entry.stat.size, 0n);
-          if (totalBytes > BigInt(maxRuntimeBytes))
+          if (totalBytes > BigInt(maxCombinedRuntimeBytes))
             return yield* rejected(
               "Selected skills and existing runtime exceed the combined byte bound.",
             );
