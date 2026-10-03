@@ -2447,3 +2447,127 @@ for (const kind of ["initialize", "prompt"] as const)
           }).pipe(Effect.provideService(Tracer.Tracer, tracer));
         }),
     );
+
+for (const mode of ["success", ...stopReasonModes] as const)
+  for (const interrupted of ["first", "second", "both"] as const)
+    it.effect(
+      `shutdown waiter repair ${mode} keeps ${interrupted} caller cancellation out of shared cleanup`,
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFake();
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const interruptSent = yield* Deferred.make<void>();
+          const reasons = mode === "success" ? [] : stopReasons(mode);
+          let calls = 0;
+          const runtime: PiManagedRuntimeInstance = {
+            ...fake.runtime,
+            stopAll: Effect.gen(function* () {
+              calls++;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              if (mode !== "success") return yield* Effect.failCause(Cause.fromReasons(reasons));
+            }),
+          };
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void).pipe(Effect.ignoreCause));
+          const adapter = yield* makePiAdapter({ instanceId, runtime }).pipe(
+            Effect.provideService(Scope.Scope, scope),
+          );
+          yield* adapter.startSession(startInput);
+          const first = yield* Effect.forkScoped(adapter.stopAll());
+          yield* Deferred.await(entered);
+          yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+          const second = yield* Effect.forkScoped(adapter.stopAll(), { startImmediately: true });
+          const unaffected = yield* Effect.forkScoped(Effect.exit(adapter.stopAll()), {
+            startImmediately: true,
+          });
+          const firstIds = [506801, 506802];
+          const secondIds = [506901, 506902];
+          const sent = yield* Effect.forkScoped(
+            Effect.sync(() => {
+              if (interrupted !== "second")
+                for (const id of firstIds)
+                  first.interruptUnsafe(id, Context.makeUnsafe(new Map([["caller", "first"]])));
+              if (interrupted !== "first")
+                for (const id of secondIds)
+                  second.interruptUnsafe(id, Context.makeUnsafe(new Map([["caller", "second"]])));
+            }).pipe(Effect.andThen(Deferred.succeed(interruptSent, undefined))),
+            { startImmediately: true },
+          );
+          yield* Deferred.await(interruptSent);
+          yield* Fiber.join(sent);
+          expect(first.pollUnsafe()).toBeUndefined();
+          expect(second.pollUnsafe()).toBeUndefined();
+          expect(unaffected.pollUnsafe()).toBeUndefined();
+          expect(calls).toBe(1);
+          expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
+          expect(
+            Exit.isFailure(
+              yield* Effect.exit(adapter.sendTurn({ threadId, input: "no shutdown successor" })),
+            ),
+          ).toBe(true);
+          expect(fake.requests).toHaveLength(1);
+          yield* Deferred.succeed(release, undefined);
+          const firstExit = yield* Fiber.await(first);
+          if (interrupted !== "second") {
+            expect(Exit.isFailure(firstExit)).toBe(true);
+            if (Exit.isFailure(firstExit)) {
+              expect(
+                firstExit.cause.reasons
+                  .slice(0, firstIds.length)
+                  .map((reason) => (Cause.isInterruptReason(reason) ? reason.fiberId : undefined)),
+              ).toEqual(firstIds);
+              for (const reason of firstExit.cause.reasons.slice(0, firstIds.length))
+                expect(reason.annotations.get("caller")).toBe("first");
+              if (mode === "success") expect(firstExit.cause.reasons).toHaveLength(firstIds.length);
+              else
+                expectSafeStop(
+                  Exit.failCause(Cause.fromReasons(firstExit.cause.reasons.slice(firstIds.length))),
+                  reasons,
+                  "stopAll",
+                );
+            }
+          } else if (mode === "success") expect(Exit.isSuccess(firstExit)).toBe(true);
+          else expectSafeStop(firstExit, reasons, "stopAll");
+          expect(json(firstExit)).not.toContain("private-stop");
+          const secondExit = yield* Fiber.await(second);
+          if (interrupted !== "first") {
+            expect(Exit.isFailure(secondExit)).toBe(true);
+            if (Exit.isFailure(secondExit)) {
+              expect(
+                secondExit.cause.reasons
+                  .slice(0, secondIds.length)
+                  .map((reason) => (Cause.isInterruptReason(reason) ? reason.fiberId : undefined)),
+              ).toEqual(secondIds);
+              for (const reason of secondExit.cause.reasons.slice(0, secondIds.length))
+                expect(reason.annotations.get("caller")).toBe("second");
+              if (mode === "success")
+                expect(secondExit.cause.reasons).toHaveLength(secondIds.length);
+              else
+                expectSafeStop(
+                  Exit.failCause(
+                    Cause.fromReasons(secondExit.cause.reasons.slice(secondIds.length)),
+                  ),
+                  reasons,
+                  "stopAll",
+                );
+            }
+          } else if (mode === "success") expect(Exit.isSuccess(secondExit)).toBe(true);
+          else expectSafeStop(secondExit, reasons, "stopAll");
+          expect(json(secondExit)).not.toContain("private-stop");
+          const shared = yield* Fiber.join(unaffected);
+          const repeated = yield* Effect.exit(adapter.stopAll());
+          if (mode === "success") {
+            expect(Exit.isSuccess(shared)).toBe(true);
+            expect(Exit.isSuccess(repeated)).toBe(true);
+          } else {
+            expectSafeStop(shared, reasons, "stopAll");
+            expectSafeStop(repeated, reasons, "stopAll");
+          }
+          expect(calls).toBe(1);
+          expect(fake.requests).toHaveLength(1);
+          expect(yield* adapter.hasSession(threadId)).toBe(false);
+          expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
+        }),
+    );

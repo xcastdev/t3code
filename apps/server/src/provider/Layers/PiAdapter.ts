@@ -986,8 +986,23 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     if (Exit.isFailure(stop)) return yield* Effect.failCause(stop.cause);
     sessions.clear();
   });
-  const shutdown = yield* Effect.cached(Effect.uninterruptible(stopAllWork()));
-  const stopAll = () => shutdown;
+  // Cache only cleanup's outcome; each waiter owns its cancellation after joining it.
+  const shutdown = yield* Effect.cached(Effect.exit(stopAllWork()));
+  const stopAll = Effect.fn("PiAdapter.stopAll.join")(() =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const cleanup = yield* shutdown;
+        const interrupted = yield* Effect.exit(restore(Effect.void));
+        if (Exit.isFailure(interrupted) || Exit.isFailure(cleanup))
+          return yield* Effect.failCause(
+            Cause.fromReasons([
+              ...(Exit.isFailure(interrupted) ? interrupted.cause.reasons : []),
+              ...(Exit.isFailure(cleanup) ? cleanup.cause.reasons : []),
+            ]),
+          );
+      }),
+    ),
+  );
   yield* Effect.addFinalizer(() =>
     stopAll().pipe(
       Effect.catch((error) =>
