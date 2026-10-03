@@ -1,6 +1,8 @@
 import type { AgentToolResult, BashOperations } from "@earendil-works/pi-coding-agent";
 import * as Schema from "effect/Schema";
 import { makePiBashToolIsolation } from "./PiBashToolIsolation.ts";
+import { makePiSelectedSkillRead } from "./PiSelectedSkillRead.ts";
+import type { PiWorkerBootstrap } from "./PiWorkerProtocol.ts";
 import { PI_WORKER_MAX_TOOL_BYTES, PiWorkerToolOutput } from "./PiWorkerProtocol.ts";
 
 const MAX_PATH = 4096;
@@ -116,6 +118,7 @@ function output(result: AgentToolResult<unknown>) {
 function adapt<S extends Schema.ConstraintDecoder<unknown, never>>(
   schema: S,
   execute: (args: S["Type"], signal: AbortSignal) => Promise<AgentToolResult<unknown>>,
+  assertOpen: () => void = () => {},
 ) {
   const decode = Schema.decodeUnknownSync(schema, { onExcessProperty: "error" });
   return async (args: Schema.JsonObject, signal: AbortSignal) => {
@@ -128,6 +131,7 @@ function adapt<S extends Schema.ConstraintDecoder<unknown, never>>(
     }
     if (signal.aborted) throw Error("CANCELED");
     try {
+      assertOpen();
       const result = await execute(input, signal);
       if (signal.aborted) throw Error("CANCELED");
       return output(result);
@@ -379,39 +383,64 @@ async function makeLocalTools(
   cwd: string,
   sdk: Awaited<ReturnType<typeof loadSdk>>,
   operations: BashOperations,
+  selectedRead?: Awaited<ReturnType<typeof makePiSelectedSkillRead>>["read"],
+  assertOpen: () => void = () => {},
 ) {
   const executeFile = await workspaceFiles(cwd);
   const bash = sdk.createBashTool(cwd, { operations, exposeSessionEnvironment: false });
   return Object.freeze({
     tools: piLocalToolDefinitions,
     localTools: Object.freeze({
-      read: adapt(ReadInput, (args, signal) =>
-        executeFile(args.path, "read", signal, (operations, readPath) =>
-          sdk
-            .createReadTool(cwd, {
-              autoResizeImages: false,
-              operations: {
-                ...operations,
-                detectImageMimeType: (path) =>
-                  operations.detectImageMimeType(path, sdk.detectSupportedImageMimeTypeFromFile),
-              },
-            })
-            .execute("t3-local-read", { ...args, path: readPath! }, signal),
-        ),
+      read: adapt(
+        ReadInput,
+        (args, signal) => {
+          // Route only the original canonical absolute spelling. SDK aliases never
+          // expand into selected-resource authority.
+          if (
+            selectedRead &&
+            args.path.startsWith("/runtime/skills/") &&
+            /^\/(?:[^/\\\0\r\n]+\/)*[^/\\\0\r\n]+$/.test(args.path) &&
+            !args.path.split("/").some((part) => part === "." || part === "..")
+          )
+            return selectedRead(args, signal);
+          return executeFile(args.path, "read", signal, (operations, readPath) =>
+            sdk
+              .createReadTool(cwd, {
+                autoResizeImages: false,
+                operations: {
+                  ...operations,
+                  detectImageMimeType: (path) =>
+                    operations.detectImageMimeType(path, sdk.detectSupportedImageMimeTypeFromFile),
+                },
+              })
+              .execute("t3-local-read", { ...args, path: readPath! }, signal),
+          );
+        },
+        assertOpen,
       ),
-      write: adapt(WriteInput, (args, signal) =>
-        executeFile(args.path, "write", signal, (operations) =>
-          sdk.createWriteTool(cwd, { operations }).execute("t3-local-write", args, signal),
-        ),
+      write: adapt(
+        WriteInput,
+        (args, signal) =>
+          executeFile(args.path, "write", signal, (operations) =>
+            sdk.createWriteTool(cwd, { operations }).execute("t3-local-write", args, signal),
+          ),
+        assertOpen,
       ),
-      edit: adapt(EditInput, (args, signal) =>
-        executeFile(args.path, "edit", signal, (operations) =>
-          sdk
-            .createEditTool(cwd, { operations })
-            .execute("t3-local-edit", { ...args, edits: [...args.edits] }, signal),
-        ),
+      edit: adapt(
+        EditInput,
+        (args, signal) =>
+          executeFile(args.path, "edit", signal, (operations) =>
+            sdk
+              .createEditTool(cwd, { operations })
+              .execute("t3-local-edit", { ...args, edits: [...args.edits] }, signal),
+          ),
+        assertOpen,
       ),
-      bash: adapt(BashInput, (args, signal) => bash.execute("t3-local-bash", args, signal)),
+      bash: adapt(
+        BashInput,
+        (args, signal) => bash.execute("t3-local-bash", args, signal),
+        assertOpen,
+      ),
     }),
   });
 }
@@ -490,13 +519,59 @@ export async function makePiIsolatedLocalTools() {
     workspaceAccess: await workspaceAccess(),
     protectedWorkspacePaths: ["/workspace/.git"],
   });
+  let closed = false;
+  let activated = false;
+  let selected: Awaited<ReturnType<typeof makePiSelectedSkillRead>> | undefined;
+  let initialization: Promise<void> | undefined;
+  let closing: Promise<void> | undefined;
+  const assertOpen = () => {
+    if (closed) throw Error("UNAVAILABLE");
+  };
+  // The authenticated bootstrap supplies selection, never paths or backend grants
+  // from tool callers. Revocation joins acquisition before releasing its handles.
+  const initializeLocalResources = (resources: NonNullable<PiWorkerBootstrap["resources"]>) => {
+    if (closed || activated) return Promise.reject(Error("UNAVAILABLE"));
+    activated = true;
+    initialization = (async () => {
+      selected = await makePiSelectedSkillRead(resources.skills);
+    })();
+    return initialization.then(assertOpen);
+  };
+  const close = () => {
+    closed = true;
+    return (closing ??= (async () => {
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => owner.close()),
+        (async () => {
+          let failed = false;
+          if (initialization)
+            await initialization.catch(() => {
+              failed = true;
+            });
+          await selected?.close();
+          if (failed) throw Error("TOOL_FAILURE");
+        })(),
+      ]);
+      if (results.some((result) => result.status === "rejected")) throw Error("TOOL_FAILURE");
+    })());
+  };
   try {
     return Object.freeze({
-      ...(await makeLocalTools("/workspace", sdk, owner.operations)),
-      close: owner.close,
+      ...(await makeLocalTools(
+        "/workspace",
+        sdk,
+        owner.operations,
+        (args, signal) => {
+          if (!selected) return Promise.reject(Error("UNAVAILABLE"));
+          return selected.read(args, signal);
+        },
+        assertOpen,
+      )),
+      initializeLocalResources,
+      close,
     });
   } catch (error) {
-    await owner.close();
+    await close();
     throw error;
   }
 }

@@ -29,6 +29,8 @@ const decodeReceipt = Schema.decodeUnknownSync(
     type: Schema.String,
     lifecycle: Schema.optional(Schema.Array(Schema.String)),
     closeCalls: Schema.optional(Schema.Int),
+    resourceCalls: Schema.optional(Schema.Int),
+    resourceSelection: Schema.optional(Schema.JsonObject),
     ok: Schema.optional(Schema.Boolean),
     code: Schema.optional(Schema.String),
     repeatedCode: Schema.optional(Schema.String),
@@ -41,10 +43,13 @@ const decodeReceipt = Schema.decodeUnknownSync(
     descriptorOpened: Schema.optional(Schema.Int),
     descriptorClosed: Schema.optional(Schema.Int),
     descriptorsHeld: Schema.optional(Schema.Int),
+    workspaceMount: Schema.optional(Schema.String),
+    processPolicy: Schema.optional(Schema.Array(Schema.String)),
     exitCode: Schema.optional(Schema.NullOr(Schema.Int)),
     exitSignal: Schema.optional(Schema.NullOr(Schema.String)),
     sdkEnvironmentCorrect: Schema.optional(Schema.Boolean),
     remoteCalls: Schema.optional(Schema.Int),
+    nativeSpawns: Schema.optional(Schema.Int),
     environmentUnchanged: Schema.optional(Schema.Boolean),
     listenersUnchanged: Schema.optional(Schema.Boolean),
     readerUnchanged: Schema.optional(Schema.Boolean),
@@ -228,6 +233,9 @@ async function childFixture(
   let nativeNodeHostPid: number | undefined;
   let nextFrame = Promise.withResolvers<void>();
   let receiptBytes = "";
+  let rawNativeStderr = "";
+  const fixtureFailure = Promise.withResolvers<never>();
+  fixtureFailure.promise.catch(() => {});
   let stderrBytes = Buffer.alloc(0);
   const framer = makePiWorkerLineFramer((raw) => {
     frames.push(decodePiWorkerFrame(raw));
@@ -235,12 +243,14 @@ async function childFixture(
     nextFrame = Promise.withResolvers<void>();
   });
   const nativeStderr = (bytes: Buffer) => {
+    rawNativeStderr = (rawNativeStderr + bytes.toString()).slice(-65_536);
     receiptBytes += bytes.toString();
     if (Buffer.byteLength(receiptBytes) > 65_536) throw Error("FIXTURE_RECEIPT_LIMIT");
     while (receiptBytes.includes("\n")) {
       const end = receiptBytes.indexOf("\n");
-      receive(decodeReceiptJson(receiptBytes.slice(0, end)));
+      const raw = receiptBytes.slice(0, end);
       receiptBytes = receiptBytes.slice(end + 1);
+      receive(decodeReceiptJson(raw));
     }
   };
   const ownerControl = async (message: Schema.JsonObject) => {
@@ -271,9 +281,13 @@ async function childFixture(
         const data = Buffer.from(frame.data, "base64");
         stdoutBytes += data.length;
         framer.push(data);
-      } else if (frame.type === "stderr" && frame.data !== undefined)
-        nativeStderr(Buffer.from(frame.data, "base64"));
-      else if (frame.type === "exited") ownerExited = frame.code;
+      } else if (frame.type === "stderr" && frame.data !== undefined) {
+        try {
+          nativeStderr(Buffer.from(frame.data, "base64"));
+        } catch {
+          fixtureFailure.reject(Error(`NATIVE_STDERR_NOT_RECEIPT: ${rawNativeStderr}`));
+        }
+      } else if (frame.type === "exited") ownerExited = frame.code;
       else throw Error("OWNER_FAILED");
     }
   });
@@ -343,6 +357,7 @@ async function childFixture(
         if (failure) throw Error(`UNEXPECTED_WORKER_FAILURE: ${JSON.stringify(failure.message)}`);
         await Promise.race([
           nextFrame.promise,
+          fixtureFailure.promise,
           closed.promise.then(() => {
             throw Error("CHILD_CLOSED_BEFORE_FRAME");
           }),
@@ -360,12 +375,18 @@ async function childFixture(
         child.send({ type: "release-close" }, (error) => (error ? reject(error) : resolve())),
       );
     },
+    async releaseResources() {
+      await new Promise<void>((resolve, reject) =>
+        child.send({ type: "release-resources" }, (error) => (error ? reject(error) : resolve())),
+      );
+    },
     async wait(type: string) {
       while (true) {
         const index = messages.findIndex((message) => message.type === type);
         if (index !== -1) return messages.splice(index, 1)[0]!;
         await Promise.race([
           next.promise,
+          fixtureFailure.promise,
           closed.promise.then(() => {
             throw Error(`CHILD_CLOSED_BEFORE_RECEIPT: ${stderrBytes.toString()}`);
           }),
@@ -441,6 +462,7 @@ async function childFixture(
               frames,
               stdoutBytes,
               stderr: stderrBytes.toString(),
+              rawNativeStderr,
               pipeClosed: [stdin.closed, stdout.closed, stderr.closed],
             },
             null,
@@ -520,6 +542,7 @@ async function nativeRoots(workspaceAccess: Namespace["workspaceAccess"] = "read
 async function nativeProtocol(
   f: Awaited<ReturnType<typeof childFixture>>,
   names: readonly string[],
+  resources?: NonNullable<PiWorkerBootstrap["resources"]>,
 ) {
   let sequence = 0;
   const send = (message: PiParentFrame["message"]) => f.send(sequence++, message);
@@ -542,6 +565,7 @@ async function nativeProtocol(
   await send({
     ...bootstrap(),
     expectedCwd: "/workspace",
+    ...(resources ? { resources } : {}),
     prompt: { transferId: "prompt", totalBytes: Buffer.byteLength(prompt) },
     allowedTools: selected.map((tool) => ({
       name: tool.name,
@@ -612,9 +636,11 @@ async function nativeProtocol(
     await send({ type: "end", requestId });
   };
   const request = async (requestId: number) => {
-    await f.waitFrame(
+    const frame = await f.waitFrame(
       (frame) => frame.message.type === "request" && frame.message.requestId === requestId,
     );
+    if (frame.message.type !== "request") throw Error("MISSING_REQUEST");
+    return frame.message;
   };
   const toolCall = async (callId: number) => {
     const frame = await f.waitFrame(
@@ -881,6 +907,8 @@ describe("private Pi worker entry", () => {
           expect(result.hostImports).toBe(1);
           expect(result.sdkImports).toBe(1);
           expect(result.sdkEnvironmentCorrect).toBe(true);
+          expect(result.resourceCalls).toBe(1);
+          expect(result.resourceSelection).toEqual({ skills: [] });
           expect(result.rawInputDestroyed).toBe(false);
           expect(result.rawOutputDestroyed).toBe(false);
           expect(result.rawOutputEnded).toBe(false);
@@ -965,6 +993,61 @@ describe("private Pi worker entry", () => {
     }
   });
 
+  it.each(["held-resources", "resources-error"])(
+    "joins %s activation before native persistence and tool close",
+    async (mode) => {
+      const r = await roots();
+      const f = await childFixture(mode, JSON.stringify(r.launch), r.root);
+      try {
+        assertInert(await f.wait("imported"));
+        const resources = {
+          skills: [
+            {
+              key: "example",
+              path: "/runtime/skills/example/SKILL.md",
+              description: "Selected catalogue",
+            },
+          ],
+        };
+        await f.send(0, { ...bootstrap(), resources });
+        await transfer(f);
+        const activation = await f.wait("resources-start");
+        expect(activation.resourceCalls).toBe(1);
+        expect(activation.resourceSelection).toEqual(resources);
+        expect(await NodeFSP.readdir(r.sessionDirectory)).toEqual([]);
+        expect(f.frames.some((frame) => frame.message.type === "ready")).toBe(false);
+        if (mode === "held-resources") {
+          await f.send(3, { type: "interrupt", controlId: 1 });
+          await f.waitFrame((frame) => frame.message.type === "control-receipt");
+          await f.releaseResources();
+        }
+        const result = await f.wait("result");
+        expect(result.code).toBe("PI_WORKER_OPERATION_FAILED");
+        expect(result.resourceCalls).toBe(1);
+        expect(result.lifecycle).toEqual([
+          "tools-created",
+          "resources-start",
+          ...(mode === "held-resources" ? ["resources-joined"] : []),
+          "host-joined",
+          "close-start",
+          "close-joined",
+          "transport-disposed",
+        ]);
+        expect(f.frames.at(-1)?.message).toEqual({
+          type: "worker-failure",
+          code: mode === "held-resources" ? "CANCELED" : "UNAVAILABLE",
+        });
+        expect(await NodeFSP.readdir(r.sessionDirectory)).toEqual([]);
+        assertNoCalls(result);
+        await f.endInput();
+        await f.join(1);
+      } finally {
+        await f.dispose();
+        await r.dispose();
+      }
+    },
+  );
+
   it("joins held owned close after the host and before transport disposal", async () => {
     const r = await roots();
     const f = await childFixture("held-close", JSON.stringify(r.launch), r.root);
@@ -973,12 +1056,20 @@ describe("private Pi worker entry", () => {
       await f.send(0, bootstrap());
       await transfer(f);
       const closing = await f.wait("close-start");
-      expect(closing.lifecycle).toEqual(["tools-created", "host-joined", "close-start"]);
+      expect(closing.lifecycle).toEqual([
+        "tools-created",
+        "resources-start",
+        "resources-joined",
+        "host-joined",
+        "close-start",
+      ]);
       expect(closing.closeCalls).toBe(1);
       await f.releaseClose();
       const result = await f.wait("result");
       expect(result.lifecycle).toEqual([
         "tools-created",
+        "resources-start",
+        "resources-joined",
         "host-joined",
         "close-start",
         "close-joined",
@@ -1057,6 +1148,128 @@ describe("private Pi worker entry", () => {
 });
 
 describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namespace", () => {
+  it("reads selected SKILL.md and relative assets through a readonly role with native paging and catalogue", async () => {
+    const r = await nativeRoots("readonly");
+    await NodeFSP.writeFile(
+      NodePath.join(r.workspace, "workspace-read.txt"),
+      "ordinary-workspace-read",
+    );
+    const selected = {
+      skills: [
+        {
+          key: "example",
+          path: "/runtime/skills/example/SKILL.md",
+          description: "Selected fixture catalogue",
+        },
+      ],
+    };
+    const packageDirectory = NodePath.join(r.root, "selected-package");
+    const entries = {
+      "SKILL.md":
+        "---\nname: example\ndescription: Selected fixture catalogue\n---\nRead assets/large.txt relative to this skill.\n",
+      // The SDK's first-line truncation keeps its result and replay inside the fixed wire budgets.
+      "assets/large.txt": "asset-start" + "x".repeat(60_000),
+      "assets/@notes": "literal-at-asset",
+      "assets/~scratch": "literal-tilde-asset",
+      "assets/file:report": "literal-file-asset",
+    };
+    const files = [...r.namespace.files];
+    for (const [relative, bytes] of Object.entries(entries)) {
+      const source = NodePath.join(packageDirectory, relative);
+      await NodeFSP.mkdir(NodePath.dirname(source), { recursive: true });
+      await NodeFSP.writeFile(source, bytes, { mode: 0o400 });
+      files.push({ source, target: `/runtime/skills/example/${relative}` });
+    }
+    const f = await childFixture("selected-resources-readonly", JSON.stringify(r.launch), r.root, {
+      ...r.namespace,
+      files,
+    });
+    try {
+      await assertNativeInert(f);
+      const p = await nativeProtocol(f, ["read"], selected);
+      const request = await p.request(1);
+      const body = decodeReceiptJson(request.body);
+      expect(body.tools).toEqual([
+        expect.objectContaining({
+          type: "function",
+          function: expect.objectContaining({ name: "read" }),
+        }),
+      ]);
+      expect(JSON.stringify(body.messages)).toContain("Selected fixture catalogue");
+      expect(JSON.stringify(body.messages)).toContain(selected.skills[0]!.path);
+      const paths = [
+        { path: selected.skills[0]!.path, offset: 5, limit: 1 },
+        ...Object.keys(entries)
+          .filter((relative) => relative !== "SKILL.md")
+          .map((relative) => ({ path: `/runtime/skills/example/${relative}` })),
+        { path: "/workspace/workspace-read.txt" },
+      ];
+      for (const [index, args] of paths.entries()) {
+        if (index > 0) await p.request(index + 1);
+        await p.reply(index + 1, { name: "read", args: decodeNativeArguments(args) });
+        const call = await p.toolCall(index + 1);
+        expect(call.toolName).toBe("read");
+        await p.send({ type: "tool-authorized", callId: call.callId, allowed: true });
+        await f.waitFrame(
+          (frame) =>
+            frame.message.type === "transfer-end" &&
+            frame.message.transferId === `tool-output-${call.callId}`,
+        );
+      }
+      await p.request(paths.length + 1);
+      await p.reply(paths.length + 1);
+      const result = await f.wait("result");
+      expect(result.ok).toBe(true);
+      expect(result.remoteCalls).toBe(0);
+      expect(result.sdkEnvironmentCorrect).toBe(true);
+      expect(result.workspaceMount?.split(" ")[5]?.split(",")).toContain("ro");
+      expect(result.nativeSpawns).toBe(0);
+      expect(result.processPolicy).toHaveLength(6);
+      for (const line of result.processPolicy ?? [])
+        expect(line.split(":")[1]?.trim()).toBe(
+          line.startsWith("NoNewPrivs:") ? "1" : "0000000000000000",
+        );
+      expect(result.descriptorOpened).toBeGreaterThan(10);
+      expect(result.descriptorClosed).toBe(result.descriptorOpened);
+      expect(result.descriptorsHeld).toBe(0);
+      const outputs = paths.map((_, index) => decodeReceiptJson(nativeToolOutput(f, index + 1)));
+      expect(JSON.stringify(outputs[0])).toContain("Read assets/large.txt relative to this skill.");
+      expect(JSON.stringify(outputs[0])).toContain("Use offset=6 to continue.");
+      expect(outputs[1]).toMatchObject({
+        value: {
+          details: {
+            truncation: { firstLineExceedsLimit: true, truncatedBy: "bytes", truncated: true },
+          },
+        },
+      });
+      expect(JSON.stringify(outputs[1])).toContain("exceeds 50.0KB limit");
+      for (const [index, marker] of [
+        "literal-at-asset",
+        "literal-tilde-asset",
+        "literal-file-asset",
+      ].entries())
+        expect(JSON.stringify(outputs[index + 2])).toContain(marker);
+      expect(JSON.stringify(outputs.at(-1))).toContain("ordinary-workspace-read");
+      expect(await NodeFSP.readFile(NodePath.join(r.workspace, "workspace-read.txt"), "utf8")).toBe(
+        "ordinary-workspace-read",
+      );
+      expect(f.frames.filter((frame) => frame.message.type === "tool-call")).toHaveLength(
+        paths.length,
+      );
+      expect(f.frames.at(-1)?.message).toEqual({ type: "done" });
+      await f.endInput();
+      await f.join(0);
+      const evidence = process.env.PI_WORKER_ENTRY_EVIDENCE_DIRECTORY;
+      if (evidence)
+        await NodeFSP.writeFile(
+          NodePath.join(evidence, `selected-resources-${f.pid}.json`),
+          JSON.stringify({ selected, entries, result, outputs, frames: f.frames }),
+        );
+    } finally {
+      await f.dispose();
+      await r.dispose();
+    }
+  });
   it.each(["read", "write", "edit"] as const)(
     "denies native %s access to state, runtime and file aliases",
     async (name) => {

@@ -121,6 +121,7 @@ export async function runPiWorkerEntrypoint(rawLaunchJson: string | undefined): 
         ? {}
         : { compactionKeepRecentTokens: launch.compactionKeepRecentTokens }),
       localTools: tools.localTools,
+      initializeLocalResources: tools.initializeLocalResources,
       input: transport.input,
       output: transport.output,
     });

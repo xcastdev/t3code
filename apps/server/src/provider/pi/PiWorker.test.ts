@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   makePiWorkerModelBridge,
   makePiWorkerSettings,
@@ -10,9 +11,139 @@ import {
   decodePiWorkerFrame,
   encodePiParentFrame,
   type PiWorkerFrame,
+  type PiWorkerBootstrap,
 } from "./PiWorkerProtocol.ts";
 
 describe("Pinned Pi worker effective settings", () => {
+  it.each(["unavailable", "held-empty", "held-selected"] as const)(
+    "admits resources once before native persistence and joins %s activation",
+    async (mode) => {
+      const fs = process.getBuiltinModule("fs").promises;
+      const directory = await fs.mkdtemp(
+        process.getBuiltinModule("os").tmpdir() + "/pi-worker-resources-",
+      );
+      const frames: PiWorkerFrame["message"][] = [];
+      const identity = { workerId: "resource-activation", generation: 1 };
+      const operation = {
+        operationId: "initialize-resources",
+        operationKind: "initialize" as const,
+      };
+      const entered = Promise.withResolvers<NonNullable<PiWorkerBootstrap["resources"]>>();
+      const release = Promise.withResolvers<void>();
+      const create = vi.spyOn(SessionManager, "create");
+      const open = vi.spyOn(SessionManager, "open");
+      const initializeLocalResources = vi.fn(
+        async (resources: NonNullable<PiWorkerBootstrap["resources"]>) => {
+          entered.resolve(resources);
+          if (mode === "unavailable") throw Error("UNAVAILABLE");
+          await release.promise;
+        },
+      );
+      const worker = makePiSdkWorker({
+        identity,
+        operation,
+        sessionDirectory: directory,
+        localTools: {},
+        initializeLocalResources,
+        emit: async (bytes) => {
+          frames.push(decodePiWorkerFrame(bytes.toString().slice(0, -1)).message);
+        },
+      });
+      let sequence = 0;
+      const parent = (message: Parameters<typeof encodePiParentFrame>[0]["message"]) =>
+        worker.acceptParent(
+          encodePiParentFrame({
+            version: 1,
+            ...identity,
+            ...operation,
+            sequence: sequence++,
+            message,
+          })
+            .toString()
+            .slice(0, -1),
+        );
+      const skills =
+        mode === "held-selected"
+          ? [
+              {
+                key: "example",
+                path: "/runtime/skills/example/SKILL.md",
+                description: "Selected catalogue",
+              },
+            ]
+          : [];
+      const context = "Validated context";
+      let joined = false;
+      const outcome = worker.run().then(
+        () => "unexpected success",
+        (error: unknown) => {
+          joined = true;
+          return String(error);
+        },
+      );
+      try {
+        parent({
+          type: "bootstrap",
+          executionMode: "ordinary",
+          expectedCwd: process.cwd(),
+          native: null,
+          context: { transferId: "context", totalBytes: Buffer.byteLength(context) },
+          prompt: null,
+          model: {
+            provider: "synthetic",
+            modelId: "no-inference",
+            api: "openai-completions",
+            contextWindow: 32768,
+            maxTokens: 512,
+            reasoning: false,
+          },
+          allowedTools: [],
+          ...(mode === "held-selected" ? { resources: { skills } } : {}),
+        });
+        expect(initializeLocalResources).not.toHaveBeenCalled();
+        parent({
+          type: "transfer-chunk",
+          transferId: "context",
+          index: 0,
+          offset: 0,
+          data: Buffer.from(context).toString("base64"),
+        });
+        expect(initializeLocalResources).not.toHaveBeenCalled();
+        parent({ type: "transfer-end", transferId: "context" });
+        expect(await entered.promise).toEqual({ skills });
+        expect(await fs.readdir(directory)).toEqual([]);
+        expect(create).not.toHaveBeenCalled();
+        expect(open).not.toHaveBeenCalled();
+        if (mode !== "unavailable") {
+          parent({ type: "interrupt", controlId: 1 });
+          expect(joined).toBe(false);
+          release.resolve();
+        }
+        expect(await outcome).toBe(
+          "Error: " + (mode === "unavailable" ? "UNAVAILABLE" : "CANCELED"),
+        );
+        expect(initializeLocalResources).toHaveBeenCalledExactlyOnceWith({ skills });
+        expect(create).not.toHaveBeenCalled();
+        expect(open).not.toHaveBeenCalled();
+        expect(await fs.readdir(directory)).toEqual([]);
+        expect(frames.some((frame) => frame.type === "ready" || frame.type === "request")).toBe(
+          false,
+        );
+        expect(frames.at(-1)).toEqual({
+          type: "worker-failure",
+          code: mode === "unavailable" ? "UNAVAILABLE" : "CANCELED",
+        });
+      } finally {
+        release.resolve();
+        worker.abort();
+        await outcome;
+        await worker.dispose();
+        create.mockRestore();
+        open.mockRestore();
+        await fs.rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
   it("disables SDK cache warming and image processing through the pinned public getters", () => {
     const settings = makePiWorkerSettings(512);
     expect(settings.getCacheWarmingMode()).toBe("off");
