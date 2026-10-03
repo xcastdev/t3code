@@ -4,6 +4,8 @@ import {
   ProjectTeamWriteIntent,
   ProjectTeamRunBinding,
   ProjectTeamDeliverableKind,
+  ProjectTeamEffect,
+  ProjectTeamReservation,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1328,6 +1330,12 @@ export const ProjectWorkTeamTransition = Schema.Union([
     expectedGateRevision: NonNegativeInt,
     claim: ProjectWorkTaskClaimCommand,
     binding: ProjectTeamRunBinding,
+    dispatch: Schema.optionalKey(
+      Schema.Struct({
+        effect: ProjectTeamEffect,
+        writableReservation: Schema.optionalKey(ProjectTeamReservation),
+      }),
+    ),
     repair: Schema.optionalKey(
       Schema.Struct({
         episodeId: GuidedId,

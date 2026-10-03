@@ -92,6 +92,8 @@ import ForkMigration0021 from "./Migrations/fork/021_ProjectWorkEvidenceMetadata
 import ForkMigration0022 from "./Migrations/fork/022_ProjectIssueRepositories.ts";
 import ForkMigration0023 from "./Migrations/fork/023_ProjectTeamModelRequests.ts";
 import ForkMigration0024 from "./Migrations/fork/024_ProjectTeamPiOperations.ts";
+import ForkMigration0025 from "./Migrations/fork/025_ProjectTeamDispatch.ts";
+import ForkMigration0026 from "./Migrations/fork/026_ProjectTeamTransportCapacity.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -184,6 +186,8 @@ export const forkMigrationEntries = [
   [22, "ProjectIssueRepositories", ForkMigration0022],
   [23, "ProjectTeamModelRequests", ForkMigration0023],
   [24, "ProjectTeamPiOperations", ForkMigration0024],
+  [25, "ProjectTeamDispatch", ForkMigration0025],
+  [26, "ProjectTeamTransportCapacity", ForkMigration0026],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
