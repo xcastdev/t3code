@@ -207,7 +207,12 @@ const ForwardStage = Schema.Literals([
   "assignment-intent",
   "assignment-observed",
 ]);
-const RecordedStage = Schema.Union([ForwardStage, Schema.Literals(["stopping", "quarantine"])]);
+const RecordedStage = Schema.Union([
+  ForwardStage,
+  Schema.Literals(["stopping", "quarantine", "settled"]),
+]);
+const isCleanupStage = (stage: ProjectTeamDispatchStage) =>
+  stage === "stopping" || stage === "quarantine" || stage === "settled";
 const StageReceipt = Schema.Struct({
   receiptId: Id,
   stage: RecordedStage,
@@ -416,8 +421,9 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         WHERE project_id=${row.project_id} AND command_id=${commandId} LIMIT 2`;
       if (effect.claimGeneration === 0) {
         if (
-          effect.status !== "pending" ||
-          fingerprint(effect) !== fingerprint(original) ||
+          (effect.status !== "pending" && effect.status !== "canceled") ||
+          (effect.status === "pending" && fingerprint(effect) !== fingerprint(original)) ||
+          (effect.status === "canceled" && effect.revision <= original.revision) ||
           row.claim_generation !== 0 ||
           events.length ||
           commands.length ||
@@ -1181,9 +1187,10 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           Effect.mapError(() => deny("Retained stage receipt is invalid")),
         );
         const timestamp = deadline(row.recorded_at);
-        const cleanup = row.stage === "stopping" || row.stage === "quarantine";
+        const cleanup = isCleanupStage(row.stage);
         if (
-          dispatch.claim_generation === 0 ||
+          stage === "settled" ||
+          (dispatch.claim_generation === 0 && !cleanup) ||
           row.dispatch_id !== dispatch.dispatch_id ||
           row.claim_generation !== dispatch.claim_generation ||
           row.revision !== revision + 1 ||
@@ -1248,16 +1255,15 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
             )
               return yield* deny("Stage receipt identity was reused");
             // Exact replay never grants another external effect. Forward replays still require current authority.
-            if (receipt.stage !== "stopping" && receipt.stage !== "quarantine")
-              yield* currentClaim(value.row, value.intent);
+            if (!isCleanupStage(receipt.stage)) yield* currentClaim(value.row, value.intent);
             return { fence: fence(value.row), intent: value.intent, duplicate: true };
           }
           if (
             fingerprint(fence(value.row)) !== fingerprint(expected) ||
-            value.row.claim_generation === 0
+            (value.row.claim_generation === 0 && !isCleanupStage(receipt.stage))
           )
             return yield* deny("Stage ownership fence is stale");
-          const cleanup = receipt.stage === "stopping" || receipt.stage === "quarantine";
+          const cleanup = isCleanupStage(receipt.stage);
           if (
             value.row.stage === "settled" ||
             (!cleanup && nextForwardStage[value.row.stage] !== receipt.stage)
