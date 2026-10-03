@@ -49,10 +49,11 @@ import {
   HostProcessArguments,
   HostProcessExecutablePath,
   HostProcessIsExecutable,
+  HostProcessPlatform,
 } from "@t3tools/shared/hostProcess";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
-import { PiManagedRuntime } from "./provider/pi/PiManagedRuntime.ts";
+import { PiManagedRuntime, PiManagedRuntimeError } from "./provider/pi/PiManagedRuntime.ts";
 import { PiModelCatalogue } from "./provider/pi/PiModelCatalogue.ts";
 import { makePiProductionRuntime } from "./provider/pi/PiProductionRuntime.ts";
 import * as CodexResetCredit from "./provider/Layers/codexResetCredit.ts";
@@ -665,6 +666,18 @@ const PiModelCatalogueLayerLive = PiModelCatalogue.layer.pipe(
 const PiProductionRuntimeLayerLive = Layer.effect(
   PiManagedRuntime,
   Effect.gen(function* () {
+    // Native cache and process ownership currently require the proven Linux host.
+    if ((yield* HostProcessPlatform) !== "linux") {
+      return PiManagedRuntime.of({
+        forInstance: () =>
+          Effect.fail(
+            new PiManagedRuntimeError({
+              code: "unavailable",
+              detail: "Pi managed execution requires the supported Linux isolation host.",
+            }),
+          ),
+      });
+    }
     const config = yield* ServerConfig.ServerConfig;
     const environment = yield* ServerEnvironment.ServerEnvironment;
     const path = yield* Path.Path;
@@ -706,8 +719,8 @@ const PiCatalogueActivationLive = Layer.effectDiscard(
     const catalogue = yield* PiModelCatalogue;
     const settings = yield* ServerSettings.ServerSettingsService;
     const instances = yield* ProviderInstanceRegistry;
-    const providers = yield* ProviderRegistry;
     const changes = yield* settings.subscribeChanges;
+    const instanceChanges = yield* instances.subscribeChanges;
     const refreshSelected = Effect.gen(function* () {
       const current = yield* settings.getSettings;
       if (!current.projectWorkEnabled) return;
@@ -723,13 +736,16 @@ const PiCatalogueActivationLive = Layer.effectDiscard(
           (instance) =>
             instance.driverKind === ProviderDriverKind.make("piAgent") && instance.enabled,
         ),
-        (instance) => providers.refreshInstance(instance.instanceId),
+        (instance) => instance.snapshot.refresh,
         { discard: true },
       );
     }).pipe(Effect.catch(() => Effect.logWarning("Pi model catalogue refresh is unavailable.")));
     yield* Stream.merge(
       Stream.fromEffect(Effect.void).pipe(Stream.repeat(Schedule.spaced("1 hour"))),
-      changes.pipe(Stream.map(() => undefined)),
+      Stream.merge(
+        changes.pipe(Stream.map(() => undefined)),
+        Stream.fromSubscription(instanceChanges),
+      ),
     ).pipe(
       Stream.runForEach(() => refreshSelected),
       Effect.forkScoped,
