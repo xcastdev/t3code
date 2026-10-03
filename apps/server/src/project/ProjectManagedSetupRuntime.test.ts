@@ -4,7 +4,7 @@ import {
   ProjectWorkFoundationCommitCommand,
   type ProjectScript,
 } from "@t3tools/contracts";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
@@ -61,7 +62,10 @@ const queryLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
 
 // SQL and current-service controls use real disposable files and a controlled host-control
 // response. Synthetic ownership below is never evidence of a Linux service or kernel drain.
-const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (native = false) {
+const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (
+  native = false,
+  defaultReferences = false,
+) {
   const repository = yield* ProjectWorkRepository;
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
@@ -100,8 +104,8 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (native = false)
   );
   expect(seeded._tag).toBe("Failure");
   if (!pending || pending.transition?.kind !== "claim") return yield* Effect.die("Missing claim");
-  const now = native ? yield* Clock.currentTimeMillis : Date.parse(at) + 1;
-  if (!native) yield* TestClock.setTime(now);
+  const now = native || defaultReferences ? yield* Clock.currentTimeMillis : Date.parse(at) + 1;
+  if (!native && !defaultReferences) yield* TestClock.setTime(now);
   const committedAt = DateTime.formatIso(DateTime.makeUnsafe(now));
   yield* repository.execute(
     yield* decodeCommit({
@@ -191,6 +195,7 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (native = false)
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const counts = { native: 0, controls: 0, workspace: 0, assets: 0 };
   const capturedPids: number[] = [];
+  const managerAddresses: Array<string | undefined> = [];
   const capturedHosts: Array<{
     pid: number;
     command: string;
@@ -229,6 +234,7 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (native = false)
           ),
         );
       counts.controls++;
+      managerAddresses.push(command.options.env?.DBUS_SESSION_BUS_ADDRESS);
       if (command.command === "/usr/bin/bwrap")
         return spawner.spawn(
           ChildProcess.make("/usr/bin/printf", ["controlled-unavailable\n"], { extendEnv: false }),
@@ -299,7 +305,7 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (native = false)
   for (const file of options.runtimeFiles) file.source = yield* fs.realPath(file.source);
   const make = () =>
     makeProjectManagedSetupRuntime(options).pipe(
-      Effect.provideService(HostProcessPlatform, "linux"),
+      defaultReferences ? (effect) => effect : Effect.provideService(HostProcessPlatform, "linux"),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, controlledSpawner),
     );
   const setup = yield* make();
@@ -333,6 +339,7 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (native = false)
     counts,
     capturedPids,
     capturedHosts,
+    managerAddresses,
     readProc,
     make,
     freeze,
@@ -481,6 +488,76 @@ it.effect("captures service objects and options before later caller substitution
     ),
   ),
 );
+
+it.effect("uses the execution caller's scope for borrowed asset revalidation", () =>
+  withServices(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.settings.updateSettings({
+          projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [] } },
+        });
+        let factoryScope: Scope.Scope | undefined;
+        let checks = 0;
+        let releases = 0;
+        const setup = yield* Effect.scoped(
+          Effect.gen(function* () {
+            factoryScope = yield* Scope.Scope;
+            return yield* makeProjectManagedSetupRuntime({
+              ...f.options,
+              revalidateRuntimeAssets: Effect.gen(function* () {
+                expect(yield* Scope.Scope).not.toBe(factoryScope);
+                checks++;
+                yield* Effect.addFinalizer(() => Effect.sync(() => releases++));
+              }),
+            });
+          }),
+        );
+        const receipt = yield* setup.execute(f.input);
+        expect(receipt.outcome).toBe("skipped");
+        expect(checks).toBeGreaterThan(0);
+        expect(releases).toBe(checks);
+        expect(f.counts.native).toBe(0);
+      }),
+    ),
+  ),
+);
+
+// Default Context.References must be sampled too: an absent key in Effect.context()
+// otherwise lets a later execution context replace the live clock or Linux manager identity.
+for (const reference of ["clock", "platform", "user-id"] as const)
+  it.live(`captures default ${reference} before execution overrides`, () =>
+    withServices(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture(false, true);
+          const clock = yield* Clock.Clock;
+          const uid = yield* HostProcessUserId;
+          const retained = yield* f.freeze.pipe(
+            reference === "clock"
+              ? Effect.provideService(Clock.Clock, {
+                  currentTimeNanos: clock.currentTimeNanos,
+                  currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+                  monotonicTimeNanos: clock.monotonicTimeNanos,
+                  monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+                  sleep: (duration) => clock.sleep(duration),
+                  currentTimeMillis: Effect.succeed(f.input.deadlineAtMs + 1),
+                  currentTimeMillisUnsafe: () => f.input.deadlineAtMs + 1,
+                })
+              : reference === "platform"
+                ? Effect.provideService(HostProcessPlatform, "win32")
+                : Effect.provideService(HostProcessUserId, 9999),
+          );
+          expect(retained.allocation).not.toBeNull();
+          expect(f.managerAddresses.length).toBeGreaterThan(0);
+          expect(f.managerAddresses).toEqual(
+            f.managerAddresses.map(() => `unix:path=/run/user/${uid}/bus`),
+          );
+          expect(f.counts.native).toBe(0);
+        }),
+      ),
+    ),
+  );
 
 it.effect("asset revalidation denies stale retained selection before acquisition", () =>
   withServices(
@@ -705,11 +782,18 @@ describe.runIf(process.env.PROJECT_MANAGED_SETUP_RUNTIME_NATIVE_GATE === "1")(
                   [projectId]: { defaultProjectScripts: [{ ...script, command }] },
                 },
               });
-              const receipt: ProjectManagedSetupReceipt = yield* f.setup.execute(f.input);
+              const execution = yield* f.setup.execute(f.input).pipe(Effect.result);
               const retained = yield* f.journal.read(f.input);
               const rows = yield* f.sql<{
                 started_pid: number;
               }>`SELECT * FROM project_team_setup_process`;
+              if (evidenceDirectory)
+                yield* f.fs.writeFileString(
+                  f.path.join(evidenceDirectory, "execute-result.json"),
+                  encode({ execution, retained, rows, capturedHosts: f.capturedHosts }),
+                );
+              if (execution._tag === "Failure") return yield* execution.failure;
+              const receipt: ProjectManagedSetupReceipt = execution.success;
               const namespaceDescendant = Number(
                 yield* f.fs.readFileString(f.path.join(f.worktree, "descendant")),
               );
