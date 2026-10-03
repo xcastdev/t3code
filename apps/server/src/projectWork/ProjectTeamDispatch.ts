@@ -156,6 +156,7 @@ export function makeProjectTeamDispatch<
   const drive = Effect.fn("ProjectTeamDispatch.drive")(function* (
     owner: Owner,
     initial: ProjectTeamDispatchSnapshot,
+    validateRecovery: Effect.Effect<void, ProjectTeamDispatchError> = Effect.void,
   ): Effect.fn.Return<ProjectTeamDispatchOutcome, Error | ProjectTeamDispatchError, Services> {
     let snapshot = initial;
     let assignmentMayHaveBeenSent = snapshot.fence.stage === "assignment-intent";
@@ -175,6 +176,7 @@ export function makeProjectTeamDispatch<
         committed.fence.stage !== receipt.stage
       )
         return yield* rejected("Root returned an invalid stage receipt fence");
+      if (receipt.stage === "assignment-observed") assignmentObserved = true;
       snapshot = committed;
       yield* current();
     });
@@ -183,6 +185,7 @@ export function makeProjectTeamDispatch<
         const result = yield* restore(
           Effect.gen(function* () {
             yield* current();
+            yield* validateRecovery;
             let receipt: Receipt | undefined;
             if (snapshot.fence.stage !== "reserved") {
               receipt = yield* ports.readReceipt(owner, snapshot);
@@ -224,7 +227,6 @@ export function makeProjectTeamDispatch<
               assignmentMayHaveBeenSent = true;
               const outcome = yield* ports.sendAssignment(owner, snapshot, receipt.session);
               if (outcome._tag === "Uncertain") return yield* Effect.failCause(outcome.cause);
-              assignmentObserved = true;
               yield* current();
               receipt = { ...receipt, stage: "assignment-observed", assignment: outcome.receipt };
               yield* append(receipt);
@@ -240,7 +242,6 @@ export function makeProjectTeamDispatch<
                 return yield* rejected(
                   "Assignment delivery has no exact native observation; resend is forbidden",
                 );
-              assignmentObserved = true;
               receipt = { ...receipt, stage: "assignment-observed", assignment: observation };
               yield* append(receipt);
             }
@@ -289,12 +290,15 @@ export function makeProjectTeamDispatch<
   });
   const resume = Effect.fn("ProjectTeamDispatch.resume")(function* (claim: RecoveryClaim) {
     return yield* ports.withRecoveryExecutor(claim, (owner, snapshot) =>
-      Effect.gen(function* () {
-        const checked = yield* ports.assertCurrent(owner, snapshot.fence);
-        if (!sameFence(checked.fence, snapshot.fence) || snapshot.fence.claimGeneration <= 0)
-          return yield* rejected("Root recovery claim has no current claimed dispatch");
-        return yield* drive(owner, snapshot);
-      }),
+      drive(
+        owner,
+        snapshot,
+        Effect.suspend(() =>
+          snapshot.fence.claimGeneration > 0
+            ? Effect.void
+            : rejected("Root recovery claim has no current claimed dispatch"),
+        ),
+      ),
     );
   });
   return { dispatch, resume };

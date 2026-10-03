@@ -600,3 +600,249 @@ it.effect("failed setup never initializes or sends an assignment", () =>
     }),
   ),
 );
+
+for (const recovery of [false, true]) {
+  it.effect(
+    `observation append failure retains uncertainty (${recovery ? "recovery" : "first send"})`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const h = yield* harness;
+          if (recovery) {
+            const send = h.ports.sendAssignment;
+            h.ports.sendAssignment = (...args) =>
+              send(...args).pipe(Effect.andThen(Effect.fail(h.failure)));
+            yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+            h.ports.sendAssignment = send;
+          }
+          const append = h.ports.appendStage;
+          h.ports.appendStage = (...args) =>
+            args[2].stage === "assignment-observed" ? Effect.fail(h.failure) : append(...args);
+          const before = h.events.length;
+          const exit = yield* (
+            recovery ? h.make().resume(h.recovery) : h.make().dispatch(h.request.dispatchId)
+          ).pipe(Effect.exit);
+          expect(Exit.isFailure(exit)).toBe(true);
+          expect(h.getSnapshot().fence.stage).toBe("assignment-intent");
+          expect(h.events.slice(before)).toContain("joined");
+          // Exact native observation has been seen; its durable dispatch receipt did not commit.
+          expect(h.events.slice(before)).toContain("uncertain");
+        }),
+      ),
+  );
+}
+
+it.effect("current revocation after Observed but before persistence retains uncertainty", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const send = h.ports.sendAssignment;
+      h.ports.sendAssignment = (...args) =>
+        send(...args).pipe(Effect.tap(() => Effect.sync(h.revoke)));
+      const exit = yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      expect(h.getSnapshot().fence.stage).toBe("assignment-intent");
+      expect(h.events).toContain("send");
+      expect(h.events).toContain("joined");
+      expect(h.events).toContain("uncertain");
+    }),
+  ),
+);
+
+it.effect("lost observed-stage append response enters latest-owner uncertainty recording", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const append = h.ports.appendStage;
+      h.ports.appendStage = (...args) =>
+        append(...args).pipe(
+          Effect.flatMap((value) =>
+            args[2].stage === "assignment-observed"
+              ? Effect.fail(h.failure)
+              : Effect.succeed(value),
+          ),
+        );
+      const exit = yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      expect(h.getSnapshot().fence.stage).toBe("assignment-observed");
+      expect(h.events).toContain("joined");
+      // The helper has no committed response; only Root may determine the latest receipt.
+      expect(h.events).toContain("uncertain");
+    }),
+  ),
+);
+
+it.effect(
+  "recovery denies forwarding but joins retained owner when initial current check is revoked",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const append = h.ports.appendStage;
+        h.ports.appendStage = (...args) =>
+          append(...args).pipe(Effect.andThen(Effect.fail(h.failure)));
+        yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+        h.ports.appendStage = append;
+        h.revoke();
+        const before = h.events.length;
+        expect((yield* h.make().resume(h.recovery).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(h.events.slice(before)).toEqual(["joined"]);
+      }),
+    ),
+);
+
+it.effect("concurrent recovery loser never cleans up ordinary winner", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<{ setupId: string }>();
+      h.ports.setup = () =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish)));
+      const winner = yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      expect((yield* h.make().resume(h.recovery))._tag).toBe("Busy");
+      expect(h.events).not.toContain("joined");
+      yield* Deferred.succeed(finish, { setupId: h.request.setupId });
+      expect((yield* Fiber.join(winner))._tag).toBe("Observed");
+      expect(h.events.filter((e) => e === "send")).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect(
+  "already durable observation needs no uncertainty record on later receipt-read failure",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        expect((yield* h.make().dispatch(h.request.dispatchId))._tag).toBe("Observed");
+        h.ports.readReceipt = () => Effect.fail(h.failure);
+        const before = h.events.length;
+        expect((yield* h.make().resume(h.recovery).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(h.getSnapshot().fence.stage).toBe("assignment-observed");
+        expect(h.events.slice(before)).toEqual(["joined"]);
+      }),
+    ),
+);
+
+it.effect("revocation after recovery receipt read blocks setup and joins retained cleanup", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const append = h.ports.appendStage;
+      h.ports.appendStage = (...args) =>
+        append(...args).pipe(Effect.andThen(Effect.fail(h.failure)));
+      yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+      h.ports.appendStage = append;
+      const read = h.ports.readReceipt;
+      h.ports.readReceipt = (...args) =>
+        read(...args).pipe(Effect.tap(() => Effect.sync(h.revoke)));
+      const before = h.events.length;
+      expect((yield* h.make().resume(h.recovery).pipe(Effect.exit))._tag).toBe("Failure");
+      expect(h.events.slice(before)).toEqual(["read-receipt", "joined"]);
+    }),
+  ),
+);
+
+it.effect("interruption of recovery's initial current check joins retained cleanup", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const append = h.ports.appendStage;
+      h.ports.appendStage = (...args) =>
+        append(...args).pipe(Effect.andThen(Effect.fail(h.failure)));
+      yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+      h.ports.appendStage = append;
+      const entered = yield* Deferred.make<void>();
+      h.ports.assertCurrent = () =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+      const before = h.events.length;
+      const recovery = yield* h.make().resume(h.recovery).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* Fiber.interrupt(recovery);
+      expect((yield* Fiber.await(recovery))._tag).toBe("Failure");
+      expect(h.events.slice(before)).toEqual(["joined"]);
+    }),
+  ),
+);
+
+it.effect("changed recovery fence must still join the registered retained owner", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const append = h.ports.appendStage;
+      h.ports.appendStage = (...args) =>
+        append(...args).pipe(Effect.andThen(Effect.fail(h.failure)));
+      yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+      h.ports.appendStage = append;
+      h.ports.assertCurrent = () =>
+        Effect.succeed({
+          ...h.getSnapshot(),
+          fence: { ...h.getSnapshot().fence, revision: h.getSnapshot().fence.revision + 1 },
+        });
+      const before = h.events.length;
+      expect((yield* h.make().resume(h.recovery).pipe(Effect.exit))._tag).toBe("Failure");
+      expect(h.events.slice(before)).toEqual(["joined"]);
+    }),
+  ),
+);
+
+it.effect(
+  "confirmed durable observation needs no uncertainty when the following current check is revoked",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const append = h.ports.appendStage;
+        h.ports.appendStage = (...args) =>
+          append(...args).pipe(
+            Effect.tap(() =>
+              args[2].stage === "assignment-observed" ? Effect.sync(h.revoke) : Effect.void,
+            ),
+          );
+        expect((yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit))._tag).toBe(
+          "Failure",
+        );
+        expect(h.getSnapshot().fence.stage).toBe("assignment-observed");
+        expect(h.events.at(-1)).toBe("joined");
+        expect(h.events).not.toContain("uncertain");
+      }),
+    ),
+);
+
+it.effect("invalid observation append response retains uncertainty for Root reconciliation", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const append = h.ports.appendStage;
+      h.ports.appendStage = (...args) =>
+        append(...args).pipe(
+          Effect.map((snapshot) =>
+            args[2].stage === "assignment-observed"
+              ? {
+                  ...snapshot,
+                  fence: { ...snapshot.fence, claimGeneration: snapshot.fence.claimGeneration + 1 },
+                }
+              : snapshot,
+          ),
+        );
+      expect((yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit))._tag).toBe(
+        "Failure",
+      );
+      expect(h.getSnapshot().fence.stage).toBe("assignment-observed");
+      expect(h.events.slice(-2)).toEqual(["uncertain", "joined"]);
+    }),
+  ),
+);
+
+it.effect("registered recovery cleanup still joins when the snapshot has no effect claim", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      expect((yield* h.make().resume(h.recovery).pipe(Effect.exit))._tag).toBe("Failure");
+      expect(h.getSnapshot().fence.claimGeneration).toBe(0);
+      expect(h.events).toEqual(["joined"]);
+    }),
+  ),
+);
