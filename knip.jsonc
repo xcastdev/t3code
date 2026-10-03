@@ -29,6 +29,7 @@
         "src/provider/pi/fixtures/p1-runtime-descendants.mjs",
         "src/provider/pi/fixtures/p1-runtime-linux-proof.mjs",
         "src/provider/pi/fixtures/p1-runtime-mcp.mjs",
+        "src/provider/pi/fixtures/p7-worker-entry-local-tools.mjs",
         "src/provider/pi/fixtures/p7-sdk-worker-child.mjs",
         "src/provider/pi/fixtures/p7-sdk-worker-native.mjs",
         "src/provider/pi/fixtures/p7-sdk-session-runtime-child.mjs",

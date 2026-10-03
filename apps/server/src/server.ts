@@ -45,6 +45,16 @@ import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionD
 import * as ProviderSessionRuntime from "./persistence/ProviderSessionRuntime.ts";
 import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRegistry.ts";
 import * as ModelManifest from "./provider/ModelManifest.ts";
+import {
+  HostProcessArguments,
+  HostProcessExecutablePath,
+  HostProcessIsExecutable,
+} from "@t3tools/shared/hostProcess";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import { PiManagedRuntime } from "./provider/pi/PiManagedRuntime.ts";
+import { PiModelCatalogue } from "./provider/pi/PiModelCatalogue.ts";
+import { makePiProductionRuntime } from "./provider/pi/PiProductionRuntime.ts";
 import * as CodexResetCredit from "./provider/Layers/codexResetCredit.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
@@ -647,6 +657,86 @@ const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
   Layer.provideMerge(ProjectLifecycleLive),
 );
 
+const PiModelCatalogueLayerLive = PiModelCatalogue.layer.pipe(
+  Layer.provideMerge(PersistenceLayerLive),
+  Layer.provide(FetchHttpClient.layer),
+);
+
+const PiProductionRuntimeLayerLive = Layer.effect(
+  PiManagedRuntime,
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const environment = yield* ServerEnvironment.ServerEnvironment;
+    const path = yield* Path.Path;
+    const fs = yield* FileSystem.FileSystem;
+    const executable = yield* HostProcessIsExecutable;
+    const arguments_ = yield* HostProcessArguments;
+    const entry = executable ? yield* HostProcessExecutablePath : arguments_[1];
+    if (entry === undefined) return yield* Effect.die(new Error("Missing server entry path."));
+    const canonicalEntry = yield* fs.realPath(entry);
+    const entryDirectory = path.dirname(canonicalEntry);
+    const distributionDirectory =
+      !executable && path.extname(canonicalEntry) === ".ts"
+        ? path.resolve(entryDirectory, "../dist")
+        : entryDirectory;
+    return yield* makePiProductionRuntime({
+      environmentId: yield* environment.getEnvironmentId,
+      distributionDirectory,
+      agentDirectory: path.join(process.getBuiltinModule("os").homedir(), ".pi/agent"),
+      nativeStateRoot: path.join(config.baseDir, "pi-managed-native"),
+      stagingRoot: config.providerStatusCacheDir,
+      protectedRoots: [config.stateDir, config.secretsDir],
+      memoryBytes: 536870912,
+      cleanupDeadlineMs: 3000,
+      maxInputTokens: 8192,
+      maxOutputTokens: 2048,
+    });
+  }).pipe(Effect.orDie),
+).pipe(
+  Layer.provideMerge(PiModelCatalogueLayerLive),
+  // Use the same memoized service layers as the driver and skill catalogue.
+  Layer.provide(SkillMaterializationService.layer),
+  Layer.provide(ManagedSkillRepository.layer),
+  Layer.provide(ProjectWorkGatewayLive),
+  Layer.provide(ServerEnvironmentLayerLive),
+);
+
+const PiCatalogueActivationLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const catalogue = yield* PiModelCatalogue;
+    const settings = yield* ServerSettings.ServerSettingsService;
+    const instances = yield* ProviderInstanceRegistry;
+    const providers = yield* ProviderRegistry;
+    const changes = yield* settings.subscribeChanges;
+    const refreshSelected = Effect.gen(function* () {
+      const current = yield* settings.getSettings;
+      if (!current.projectWorkEnabled) return;
+      const selected = (yield* instances.listInstances).filter(
+        (instance) =>
+          instance.driverKind === ProviderDriverKind.make("piAgent") && instance.enabled,
+      );
+      if (selected.length === 0 || (yield* catalogue.readFresh) !== undefined) return;
+      yield* catalogue.refresh;
+      const latest = yield* instances.listInstances;
+      yield* Effect.forEach(
+        latest.filter(
+          (instance) =>
+            instance.driverKind === ProviderDriverKind.make("piAgent") && instance.enabled,
+        ),
+        (instance) => providers.refreshInstance(instance.instanceId),
+        { discard: true },
+      );
+    }).pipe(Effect.catch(() => Effect.logWarning("Pi model catalogue refresh is unavailable.")));
+    yield* Stream.merge(
+      Stream.fromEffect(Effect.void).pipe(Stream.repeat(Schedule.spaced("1 hour"))),
+      changes.pipe(Stream.map(() => undefined)),
+    ).pipe(
+      Stream.runForEach(() => refreshSelected),
+      Effect.forkScoped,
+    );
+  }),
+);
+
 const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
   RelayClientLive,
   CloudManagedEndpointRuntime.layer.pipe(
@@ -695,6 +785,7 @@ const AntigravityInstallationRefreshLive = Layer.effectDiscard(
 );
 
 const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
+  Layer.provideMerge(PiCatalogueActivationLive),
   Layer.provideMerge(AntigravityInstallationRefreshLive),
   Layer.provideMerge(ProviderAuthServiceLive),
   // Core Services
@@ -742,6 +833,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // no longer transitively provides it. Exposing it at the runtime level
   // keeps a single Live for all opencode consumers.
   Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+  Layer.provideMerge(PiProductionRuntimeLayerLive),
   Layer.provideMerge(OpenCodeExternalMcpCoordinator.layer),
   Layer.provideMerge(WorkspaceLayerLive),
   Layer.provideMerge(Layer.mergeAll(NativeAppIconResolver.layer, ProjectFaviconResolverLayerLive)),
