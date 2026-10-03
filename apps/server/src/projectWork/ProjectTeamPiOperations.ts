@@ -109,6 +109,7 @@ export interface PiDurableOperation {
 export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperations")(
   function* (options: { readonly environmentId: string }) {
     const sql = yield* SqlClient.SqlClient;
+    const clock = yield* Clock.Clock;
     const authorization = yield* ProjectTeamAuthorization;
     const repository = yield* ProjectWorkRepository;
     const ownTransaction = Effect.fn("ProjectTeamPiOperations.ownTransaction")(function* () {
@@ -208,6 +209,36 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       if ((yield* Clock.currentTimeMillis) >= deadline)
         return yield* deny("Pi operation deadline expired");
     });
+    // Admission and a durable stop share the captured client's transaction order.
+    // The callback is synchronous so no receipt follows the final time/workspace fence.
+    const admitCurrent = <A>(
+      identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
+      admit: (authority: ProjectTeamAuthority) => A,
+    ) =>
+      guard(
+        ownTransaction().pipe(
+          Effect.andThen(
+            sql.withTransaction(
+              Effect.gen(function* () {
+                const authority = yield* current(identity, true);
+                const root = yield* roots(authority);
+                return yield* Effect.try({
+                  try: () => {
+                    if (clock.currentTimeMillisUnsafe() >= root.deadlineAtMs)
+                      throw deny("Pi admission deadline expired");
+                    const admitted = admit(authority);
+                    if (clock.currentTimeMillisUnsafe() >= root.deadlineAtMs)
+                      throw deny("Pi admission deadline expired during its final fence");
+                    return admitted;
+                  },
+                  catch: (error) =>
+                    isRuntimeError(error) ? error : deny("Pi admission fence unavailable"),
+                });
+              }),
+            ),
+          ),
+        ),
+      );
     const getRow = Effect.fn("ProjectTeamPiOperations.getRow")(function* (operationId: string) {
       const rows =
         yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE operation_id=${operationId} AND environment_id=${options.environmentId}`;
@@ -745,6 +776,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       assertIndependent: () => guard(ownTransaction()),
       current: (...args: Parameters<typeof current>) =>
         guard(ownTransaction().pipe(Effect.andThen(current(...args)))),
+      admitCurrent,
       prepare: (...args: Parameters<typeof prepare>) => guard(prepare(...args)),
       authorize: (operation: PiDurableOperation) => guard(authorize(operation)),
       persistence,

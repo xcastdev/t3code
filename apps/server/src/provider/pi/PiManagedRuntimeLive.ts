@@ -710,16 +710,18 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
               if (contextFor(current) !== context)
                 return yield* deny("Pi skill authority changed during admission", "conflict");
               yield* verifyWorkspace(current, agentDirectory, workspace);
-              if (
-                contextFor(yield* operations.current(identity(request.runtime.threadId), true)) !==
-                context
-              )
-                return yield* deny(
-                  "Pi skill authority changed during workspace validation",
-                  "conflict",
-                );
-              yield* finalWorkspaceFence(paths, workspace.fence);
-              return Object.freeze(selection.map((selected) => selected.key));
+              return yield* operations.admitCurrent(
+                identity(request.runtime.threadId),
+                (latest) => {
+                  if (contextFor(latest) !== context)
+                    throw deny(
+                      "Pi skill authority changed during workspace validation",
+                      "conflict",
+                    );
+                  workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                  return Object.freeze(selection.map((selected) => selected.key));
+                },
+              );
             }),
           );
         const prepareOperation: PiManagedRuntimeInstance["prepareOperation"] = (request, observe) =>
