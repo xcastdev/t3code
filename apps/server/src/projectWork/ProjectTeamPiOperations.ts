@@ -64,7 +64,17 @@ const decodeIntent = Schema.decodeEffect(
     }),
   ),
 );
-const decodeNative = Schema.decodeSync(Schema.fromJsonString(PiNativeReference));
+const decodeNative = Schema.decodeEffect(Schema.fromJsonString(PiNativeReference), {
+  onExcessProperty: "error",
+});
+const decodeReadIdentity = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    operationId: Schema.String,
+    native: PiNativeReference,
+    resourceHash: Schema.NullOr(ResourceIdentity),
+  }),
+  { onExcessProperty: "error" },
+);
 const deny = (detail: string, code: PiManagedRuntimeError["code"] = "denied") =>
   new PiManagedRuntimeError({ code, detail });
 const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -214,14 +224,61 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     const admitCurrent = <A>(
       identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
       admit: (authority: ProjectTeamAuthority) => A,
+      expectedNative?: {
+        readonly operationId: string;
+        readonly native: PiNativeReference;
+        readonly resourceHash: string | null;
+      },
     ) =>
       guard(
         ownTransaction().pipe(
           Effect.andThen(
             sql.withTransaction(
               Effect.gen(function* () {
-                const authority = yield* current(identity, true);
+                const expected = expectedNative
+                  ? yield* decodeReadIdentity({
+                      operationId: expectedNative.operationId,
+                      native: expectedNative.native,
+                      resourceHash: expectedNative.resourceHash,
+                    }).pipe(Effect.mapError(() => deny("Invalid Pi native read identity")))
+                  : undefined;
+                const authority = yield* current(identity, expected === undefined);
                 const root = yield* roots(authority);
+                if (expected) {
+                  const active = yield* sql<Row>`SELECT * FROM project_team_pi_operation
+                    WHERE environment_id=${options.environmentId}
+                      AND provider_instance_id=${identity.providerInstanceId}
+                      AND thread_id=${identity.threadId}
+                      AND status IN ('prepared','starting','running','quarantine')`;
+                  if (active.length)
+                    return yield* deny(
+                      "Pi native read has an active or uncertain writer",
+                      "uncertain",
+                    );
+                  const rows = yield* sql<Row>`SELECT * FROM project_team_pi_operation
+                    WHERE environment_id=${options.environmentId}
+                      AND binding_id=${authority.binding.recordId}
+                      AND generation=${authority.binding.generation}
+                      AND status='settled' AND native_json IS NOT NULL
+                    ORDER BY operation_ordinal DESC LIMIT 1`;
+                  const row = rows[0];
+                  if (!row?.native_json || row.operation_id !== expected.operationId)
+                    return yield* deny("Pi native read revision changed", "conflict");
+                  const native = yield* decodeNative(row.native_json).pipe(
+                    Effect.mapError(() => deny("Pi native identity unavailable", "uncertain")),
+                  );
+                  const intent = yield* decodeIntent(row.intent_json).pipe(
+                    Effect.mapError(() =>
+                      deny("Pi native resource identity unavailable", "uncertain"),
+                    ),
+                  );
+                  if (
+                    native.sessionId !== authority.binding.sessionId ||
+                    encode(native) !== encode(expected.native) ||
+                    (intent.resourceHash ?? null) !== expected.resourceHash
+                  )
+                    return yield* deny("Pi native read identity changed", "conflict");
+                }
                 return yield* Effect.try({
                   try: () => {
                     if (clock.currentTimeMillisUnsafe() >= root.deadlineAtMs)
@@ -585,7 +642,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         encode(terminal.operation) !== encode(captured.operation)
       )
         return yield* deny("Terminal Pi owner mismatch");
-      yield* sql.withTransaction(
+      const disposition = yield* sql.withTransaction(
         Effect.gen(function* () {
           const row = yield* getRow(captured.operation.operationId);
           if (row.status === "settled" || row.status === "quarantine")
@@ -668,6 +725,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               threadId: captured.authority.binding.threadId,
             });
           }
+          return uncertain ? ("uncertain" as const) : ("drained" as const);
         }),
       );
       if (terminal.outcome === "success") {
@@ -677,6 +735,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         });
         yield* clockCheck(captured.deadlineAtMs);
       }
+      return disposition;
     });
     const nativeFor = Effect.fn("ProjectTeamPiOperations.nativeFor")(function* (identity: {
       readonly providerInstanceId: ProviderInstanceId;
@@ -695,7 +754,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           const row = rows[0];
           if (!row?.native_json)
             return yield* deny("No durable Pi native reference", "unavailable");
-          const native = decodeNative(row.native_json);
+          const native = yield* decodeNative(row.native_json).pipe(
+            Effect.mapError(() => deny("Durable Pi native identity unavailable", "uncertain")),
+          );
           const intent = yield* decodeIntent(row.intent_json).pipe(
             Effect.mapError(() => deny("Durable Pi resource identity unavailable", "uncertain")),
           );

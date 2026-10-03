@@ -9,6 +9,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as TestClock from "effect/testing/TestClock";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Clock from "effect/Clock";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import { ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
 import { ProjectWorkProjection, ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
@@ -24,6 +27,8 @@ import {
 import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts";
 import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import { make as makeAccounting } from "./ProjectTeamModelAccounting.ts";
+import { PiManagedRuntimeError } from "../provider/pi/PiManagedRuntime.ts";
+import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 
 const decodeSetup = Schema.decodeUnknownEffect(ProjectTeamEffect);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -95,6 +100,516 @@ const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.result,
     Effect.map((result) => expect(result._tag).toBe("Failure")),
   );
+
+const nativeReference = {
+  sessionId: "native",
+  sessionReference: "sessions/native.jsonl",
+  leafId: "leaf",
+  persisted: true,
+};
+const settledRead = Effect.gen(function* () {
+  const f = yield* fixture;
+  const op = yield* f.operations.prepare(f.identity, { threadId, kind: "initialize" }, "read", {
+    allocation: f.allocation,
+    workerId: "worker",
+    operationId: "read",
+    resourceHash: "a".repeat(64),
+  });
+  yield* f.operations.persistNative(op, nativeReference);
+  // This settled SQL fixture exercises read identity, not operating-system drain.
+  yield* f.sql`UPDATE project_team_pi_operation SET status='settled'`;
+  const expected = yield* f.operations.nativeFor(f.identity);
+  return { ...f, op, expected };
+});
+const typedDenial = <A, R>(effect: Effect.Effect<A, PiManagedRuntimeError, R>, code?: string) =>
+  effect.pipe(
+    Effect.result,
+    Effect.map((result) => {
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toBeInstanceOf(PiManagedRuntimeError);
+        if (code) expect(result.failure.code).toBe(code);
+      }
+    }),
+  );
+
+for (const mode of [
+  "unchanged",
+  "legacy-unchanged",
+  "operation-id",
+  "leaf",
+  "path",
+  "persisted",
+  "resource-hash",
+  "new-head",
+  "binding-session",
+  "generation",
+  "malformed-native",
+  "excess-native",
+  "malformed-intent",
+  "malformed-expected",
+  "excess-expected",
+  "malformed-expected-hash",
+  "prepared",
+  "starting",
+  "running",
+  "quarantine",
+] as const) {
+  it.effect(`admits only the exact durable native read: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* settledRead;
+        let expected = f.expected;
+        switch (mode) {
+          case "legacy-unchanged":
+            yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_remove(intent_json, '$.resourceHash')`;
+            expected = { ...expected, resourceHash: null };
+            break;
+          case "operation-id":
+            expected = { ...expected, operationId: "different" };
+            break;
+          case "leaf":
+          case "path":
+          case "persisted": {
+            const native = {
+              ...nativeReference,
+              ...(mode === "leaf"
+                ? { leafId: "new-leaf" }
+                : mode === "path"
+                  ? { sessionReference: "sessions/new.jsonl" }
+                  : { persisted: false }),
+            };
+            yield* f.sql`UPDATE project_team_pi_operation SET native_json=${encodeJson(native)}`;
+            break;
+          }
+          case "resource-hash":
+            yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json, '$.resourceHash', ${"b".repeat(64)})`;
+            break;
+          case "new-head":
+            yield* f.sql`INSERT INTO project_team_pi_operation SELECT 'new-head',environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,1,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json,native_json,terminal_json FROM project_team_pi_operation`;
+            break;
+          case "binding-session":
+          case "generation": {
+            const binding = (yield* f.operations.current(f.identity)).binding;
+            yield* restoreHistoricalBinding({
+              ...binding,
+              revision: binding.revision + 1,
+              ...(mode === "binding-session"
+                ? { sessionId: "replacement" }
+                : { generation: binding.generation + 1 }),
+            });
+            break;
+          }
+          case "malformed-native":
+            yield* f.sql`UPDATE project_team_pi_operation SET native_json='{'`;
+            break;
+          case "excess-native":
+            yield* f.sql`UPDATE project_team_pi_operation SET native_json=${encodeJson({ ...nativeReference, extra: true })}`;
+            break;
+          case "malformed-intent":
+            yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json, '$.resourceHash', 'malformed')`;
+            break;
+          case "malformed-expected":
+            expected = {
+              ...expected,
+              native: { ...expected.native, sessionReference: "../outside.jsonl" },
+            };
+            break;
+          case "malformed-expected-hash":
+            expected = { ...expected, resourceHash: "invalid" };
+            break;
+          case "excess-expected": {
+            const native = { ...expected.native, extra: true };
+            expected = { ...expected, native };
+            break;
+          }
+          case "prepared":
+          case "starting":
+          case "running":
+          case "quarantine":
+            yield* f.sql`UPDATE project_team_pi_operation SET status=${mode}`;
+            break;
+        }
+        let calls = 0;
+        const admission = f.operations.admitCurrent(
+          f.identity,
+          (authority) => {
+            calls++;
+            return authority.binding.sessionId;
+          },
+          expected,
+        );
+        if (mode === "unchanged" || mode === "legacy-unchanged") {
+          expect(yield* admission).toBe(nativeReference.sessionId);
+          expect(calls).toBe(1);
+        } else {
+          yield* typedDenial(admission);
+          expect(calls).toBe(0);
+          if (
+            mode === "malformed-native" ||
+            mode === "excess-native" ||
+            mode === "malformed-intent"
+          )
+            yield* typedDenial(f.operations.nativeFor(f.identity), "uncertain");
+        }
+      }),
+    ),
+  );
+}
+
+it.effect("admits a native read before a queued durable stop and denies its successor", () =>
+  fileTest(
+    Effect.gen(function* () {
+      const f = yield* settledRead;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const stopStarted = yield* Deferred.make<void>();
+      let holdRead = true;
+      const observedSql = new Proxy(f.sql, {
+        apply(target, _receiver, args) {
+          const statement = target(args[0], ...args.slice(1));
+          if (
+            !holdRead ||
+            !statement.compile()[0].includes("ORDER BY operation_ordinal DESC LIMIT 1")
+          )
+            return statement;
+          return statement.pipe(
+            Effect.tap(() =>
+              Effect.gen(function* () {
+                holdRead = false;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }),
+            ),
+          );
+        },
+      });
+      const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" }).pipe(
+        Effect.provideService(SqlClient.SqlClient, observedSql),
+      );
+      let calls = 0;
+      const admission = () =>
+        operations
+          .admitCurrent(
+            f.identity,
+            () => {
+              calls++;
+              return "read";
+            },
+            f.expected,
+          )
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+      const pending = yield* admission().pipe(Effect.forkChild);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(pending).pipe(
+          Effect.flatMap(() => Effect.die("Native read did not reach its final SQL receipt")),
+        ),
+      );
+      let committed = false;
+      const stop = yield* Deferred.succeed(stopStarted, undefined).pipe(
+        Effect.andThen(
+          restoreHistoricalBinding({
+            ...f.expected.authority.binding,
+            revision: f.expected.authority.binding.revision + 1,
+            status: "stopping",
+          }),
+        ),
+        Effect.tap(
+          Effect.sync(() => {
+            committed = true;
+          }),
+        ),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(stopStarted);
+      expect(committed).toBe(false);
+      yield* Deferred.succeed(release, undefined);
+      expect(yield* Fiber.join(pending)).toBe("read");
+      yield* Fiber.join(stop);
+      expect(committed).toBe(true);
+      expect(calls).toBe(1);
+      yield* typedDenial(admission());
+      expect(calls).toBe(1);
+    }),
+  ),
+);
+
+for (const mode of ["unchanged", "stop-first", "expired", "expires-in-callback"] as const) {
+  it.effect(`orders durable native read against the captured transaction and clock: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* settledRead;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const queued = yield* Deferred.make<void>();
+        const clock = yield* Clock.Clock;
+        let clockOffset: number | undefined;
+        const operations = yield* makeProjectTeamPiOperations({
+          environmentId: "environment",
+        }).pipe(
+          Effect.provideService(Clock.Clock, {
+            ...clock,
+            currentTimeMillisUnsafe: () => clockOffset ?? clock.currentTimeMillisUnsafe(),
+          }),
+        );
+        let calls = 0;
+        const hold = yield* f.sql
+          .withTransaction(
+            Effect.gen(function* () {
+              if (mode === "stop-first") {
+                yield* restoreHistoricalBinding({
+                  ...f.expected.authority.binding,
+                  revision: f.expected.authority.binding.revision + 1,
+                  status: "stopping",
+                });
+              }
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+            }),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        const pending = yield* Deferred.succeed(queued, undefined).pipe(
+          Effect.andThen(
+            operations.admitCurrent(
+              f.identity,
+              () => {
+                calls++;
+                if (mode === "expires-in-callback") {
+                  // Clock services expose the same unsafe clock used by the synchronous admission fence.
+                  clockOffset = f.op.deadlineAtMs + 1000;
+                }
+                return "read";
+              },
+              f.expected,
+            ),
+          ),
+          Effect.result,
+          Effect.forkChild,
+        );
+        yield* Deferred.await(queued);
+        if (mode === "expired") yield* TestClock.setTime(f.op.deadlineAtMs + 1000);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(hold);
+        const result = yield* Fiber.join(pending);
+        expect(result._tag).toBe(mode === "unchanged" ? "Success" : "Failure");
+        expect(calls).toBe(mode === "unchanged" || mode === "expires-in-callback" ? 1 : 0);
+      }),
+    ),
+  );
+}
+
+const terminalFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const op = yield* f.prepare();
+  // Captured owner and drain metadata are synthetic SQL fixtures, not native process proof.
+  const owner = {
+    type: "owner" as const,
+    unit: f.allocation.unit,
+    nonce: f.allocation.nonce,
+    invocation: "a".repeat(32),
+    cgroup: `/sys/fs/cgroup/${f.allocation.unit}`,
+    pid: 123,
+    memoryBytes: f.allocation.policy.memoryBytes,
+    swapBytes: 0,
+    oomGroup: 1,
+  };
+  const drain = {
+    unit: owner.unit,
+    invocation: owner.invocation,
+    cgroup: owner.cgroup,
+    ownerPid: owner.pid,
+    memoryBytes: owner.memoryBytes,
+    swapBytes: 0,
+    oomGroup: 1,
+    launcherPid: 124,
+    childPid: 125,
+    childExitCode: 0,
+    kernel: "populated 0\nfrozen 0",
+  };
+  const activate = Effect.gen(function* () {
+    yield* f.operations.persistence(op).claimActivation(f.allocation);
+    yield* f.operations.persistence(op).beforeStart(owner);
+    yield* f.operations.persistNative(op, nativeReference);
+  });
+  const terminal = (outcome: PiSessionTerminal["outcome"], drained = false): PiSessionTerminal => ({
+    identity: { workerId: op.workerId, generation: 0 },
+    operation: op.operation,
+    outcome,
+    ownerCaptured: drained,
+    native: drained ? nativeReference : null,
+    drain: drained ? drain : null,
+    accountingReceipts: [],
+  });
+  return { ...f, op, owner, drain, activate, terminal };
+});
+
+for (const mode of [
+  "allocated-canceled",
+  "allocated-failed",
+  "allocated-quarantine",
+  "allocated-success",
+  "claimed-canceled",
+  "captured-failed",
+  "captured-canceled",
+  "drained-failed",
+  "drained-canceled",
+  "drained-success",
+  "drained-quarantine",
+  "wrong-drain",
+] as const) {
+  it.effect(`returns the committed SQL drain disposition: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixture;
+        const allocated = mode.startsWith("allocated");
+        if (mode === "claimed-canceled")
+          yield* f.operations.persistence(f.op).claimActivation(f.allocation);
+        else if (!allocated) yield* f.activate;
+        const outcome = mode.endsWith("success")
+          ? "success"
+          : mode.endsWith("quarantine")
+            ? "quarantine"
+            : mode.endsWith("canceled")
+              ? "canceled"
+              : "failed";
+        const terminal = f.terminal(outcome, mode.startsWith("drained") || mode === "wrong-drain");
+        const effect = f.operations.persistTerminal(
+          f.op,
+          mode === "wrong-drain"
+            ? { ...terminal, drain: { ...f.drain, invocation: "b".repeat(32) } }
+            : terminal,
+        );
+        if (mode === "allocated-success" || mode === "wrong-drain") {
+          yield* typedDenial(effect, "uncertain");
+          expect(
+            (yield* f.sql<{
+              status: string;
+              terminal_json: string | null;
+            }>`SELECT status,terminal_json FROM project_team_pi_operation`)[0],
+          ).toEqual({ status: allocated ? "prepared" : "running", terminal_json: null });
+          expect(
+            (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_process`)[0]
+              ?.status,
+          ).toBe(allocated ? "allocated" : "captured");
+        } else {
+          const expected =
+            mode.endsWith("quarantine") || mode.startsWith("claimed") || mode.startsWith("captured")
+              ? "uncertain"
+              : "drained";
+          expect(yield* effect).toBe(expected);
+          expect(
+            (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_operation`)[0]
+              ?.status,
+          ).toBe(expected === "uncertain" ? "quarantine" : "settled");
+          expect(
+            (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_process`)[0]
+              ?.status,
+          ).toBe(expected === "uncertain" ? "quarantine" : "drained");
+          yield* typedDenial(f.operations.persistTerminal(f.op, terminal), "conflict");
+        }
+      }),
+    ),
+  );
+}
+
+for (const mode of [
+  "pending",
+  "reported",
+  "failed",
+  "unknown",
+  "success-missing",
+  "success-reported",
+  "success-pending",
+  "wrong-receipt",
+] as const) {
+  it.effect(`retains or drains native state after durable model accounting: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixture;
+        yield* f.activate;
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "command-code-ling-free",
+          model,
+          acceptedReportedModels: [model],
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const request = {
+          workerId: f.op.workerId,
+          operationId: f.op.operation.operationId,
+          generation: 0,
+          requestId: 1,
+          routeId: "command-code-ling-free",
+          provider: "command-code" as const,
+          model,
+          maxInputTokens: 100,
+          maxOutputTokens: 100,
+          callCount: 1 as const,
+          deadlineAtMs: time + 10000,
+        };
+        const reservation = yield* accounting.reserve(f.op.principal, request);
+        const receipts: PiSessionTerminal["accountingReceipts"][number][] = [];
+        if (mode !== "pending" && mode !== "success-pending") {
+          const reported = mode !== "failed" && mode !== "unknown";
+          const receipt = yield* accounting.settle({
+            ...request,
+            reservationId: reservation.reservationId,
+            outcome: reported ? "reported" : mode,
+            chargedInputTokens: reported ? 10 : 100,
+            chargedOutputTokens: reported ? 20 : 100,
+            ...(reported
+              ? {
+                  reportedModel: model,
+                  reportedUsage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+                }
+              : {}),
+          });
+          if (reported && mode !== "success-missing")
+            receipts.push({
+              requestId: request.requestId,
+              routeId: request.routeId,
+              provider: request.provider,
+              model: request.model,
+              reportedModel: model,
+              usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+              reservationId: reservation.reservationId,
+              accountingReceiptId:
+                mode === "wrong-receipt" ? "different" : receipt.accountingReceiptId,
+            });
+        }
+        const terminal = {
+          ...f.terminal(mode.startsWith("success") ? "success" : "failed", true),
+          accountingReceipts: receipts,
+        };
+        const effect = f.operations.persistTerminal(f.op, terminal);
+        if (mode === "success-missing" || mode === "success-pending" || mode === "wrong-receipt") {
+          yield* typedDenial(effect, "uncertain");
+          expect(
+            (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_operation`)[0]
+              ?.status,
+          ).toBe("running");
+          expect(
+            (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_process`)[0]
+              ?.status,
+          ).toBe("captured");
+        } else {
+          const disposition = mode === "pending" ? "uncertain" : "drained";
+          expect(yield* effect).toBe(disposition);
+          expect(
+            (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_operation`)[0]
+              ?.status,
+          ).toBe(disposition === "uncertain" ? "quarantine" : "settled");
+          expect(
+            (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_process`)[0]
+              ?.status,
+          ).toBe(disposition === "uncertain" ? "quarantine" : "drained");
+        }
+      }),
+    ),
+  );
+}
 
 it.effect(
   "retains selected resource identity in durable intent and reconstructs it after restart",
