@@ -383,6 +383,7 @@ product(
             expect(f.refreshes).toBe(0);
             expect(f.fetch).not.toHaveBeenCalled();
             expect(yield* f.fs.exists(stage)).toBe(true);
+            expect(yield* f.fs.exists(f.options.stagingRoot + "/pi-selected-skills")).toBe(false);
           }),
         );
         expect(yield* f.fs.exists(stage)).toBe(false);
@@ -390,6 +391,75 @@ product(
       }),
     ),
 );
+product("allocates separate private skill stages only when the runtime requests them", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* enabledFixture;
+      yield* f.service.forInstance(instance);
+      const allocate = f.captured[0]!.allocateSkillStage!;
+      const first = yield* allocate;
+      const second = yield* allocate;
+      expect(first.stagingRoot).toBe(f.options.stagingRoot + "/pi-selected-skills");
+      expect(second.stagingRoot).toBe(first.stagingRoot);
+      expect(second.stagingDirectory).not.toBe(first.stagingDirectory);
+      for (const root of [first.stagingRoot, first.stagingDirectory, second.stagingDirectory]) {
+        const stat = yield* Effect.promise(() => nativeFS.lstat(root));
+        expect(stat.mode & 0o7777).toBe(0o700);
+        expect(stat.uid).toBe(process.getuid!());
+      }
+      expect(f.fetch).not.toHaveBeenCalled();
+      yield* first.remove();
+      yield* second.remove();
+      expect(yield* f.fs.exists(first.stagingDirectory)).toBe(false);
+      expect(yield* f.fs.exists(second.stagingDirectory)).toBe(false);
+    }),
+  ),
+);
+for (const fault of ["alias", "public-mode"] as const)
+  product(`rejects ${fault} skill cache without changing the target`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* enabledFixture;
+        yield* f.service.forInstance(instance);
+        const root = f.options.stagingRoot + "/pi-selected-skills";
+        if (fault === "alias") yield* f.fs.symlink(f.options.protectedRoots[0]!, root);
+        else yield* f.fs.makeDirectory(root, { mode: 0o755 });
+        const target = fault === "alias" ? f.options.protectedRoots[0]! : root;
+        const before = yield* Effect.promise(() => nativeFS.lstat(target));
+        yield* failure(f.captured[0]!.allocateSkillStage!);
+        const after = yield* Effect.promise(() => nativeFS.lstat(target));
+        expect([after.dev, after.ino, after.mode]).toEqual([before.dev, before.ino, before.mode]);
+        expect(yield* f.fs.readDirectory(target)).toEqual([]);
+        expect(f.fetch).not.toHaveBeenCalled();
+      }),
+    ),
+  );
+for (const status of ["drained", "quarantine"] as const)
+  product(`keeps skill mounts separate from ${status} runtime asset cleanup`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* enabledFixture;
+        const source = f.root + "/separate-skill";
+        yield* f.fs.writeFileString(source, "Selected skill resource");
+        let stage = "";
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* f.service.forInstance(instance);
+            stage = stageFrom(f);
+            yield* processRow(
+              [
+                ...f.captured[0]!.runtimeFiles,
+                { source, target: "/runtime/skills/review/SKILL.md" },
+              ],
+              status,
+            );
+          }),
+        );
+        expect(yield* f.fs.exists(stage)).toBe(status !== "drained");
+        expect(yield* f.fs.readFileString(source)).toBe("Selected skill resource");
+      }),
+    ),
+  );
 for (const status of ["allocated", "claimed", "captured", "quarantine"])
   product(`retains actual staged assets when durable ownership is ${status}`, () =>
     scoped(
@@ -862,10 +932,17 @@ product("the approved Runtime consumes factory asset revalidation before durable
         Effect.gen(function* () {
           const managed = yield* service.forInstance(instance);
           expect(f.revalidationCalls).toBe(0);
-          const prepared = yield* managed.prepareOperation(
-            { kind: "initialize", threadId },
-            () => Effect.void,
-          );
+          const request = {
+            kind: "initialize" as const,
+            threadId,
+            cwd: assigned,
+            modelSelection: { instanceId: providerInstanceId, model },
+          };
+          const preparation = managed.prepareOperation(request, () => Effect.void);
+          // The factory must preserve caller values before any asynchronous preparation.
+          request.cwd = primary;
+          request.modelSelection.model = "mutated-after-call";
+          const prepared = yield* preparation;
           expect(f.revalidationCalls).toBe(1);
           const before =
             yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
