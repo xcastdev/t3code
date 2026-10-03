@@ -136,6 +136,235 @@ function adapt<S extends Schema.ConstraintDecoder<unknown, never>>(
   };
 }
 
+/** The Linux worker admits one workspace mount, never ambient filesystem authority. */
+async function workspaceFiles(cwd: string) {
+  if (process.getBuiltinModule("os").platform() !== "linux") throw Error("UNAVAILABLE");
+  const fs = process.getBuiltinModule("fs");
+  const paths = process.getBuiltinModule("path");
+  const files = fs.promises;
+  const admitRoot = async () => {
+    const root = await files.lstat(cwd, { bigint: true });
+    if (!root.isDirectory() || (await files.realpath(cwd)) !== cwd) throw Error("TOOL_FAILURE");
+    return root;
+  };
+  let admission: ReturnType<typeof admitRoot> | undefined;
+  const same = (a: { dev: bigint; ino: bigint }, b: { dev: bigint; ino: bigint }) =>
+    a.dev === b.dev && a.ino === b.ino;
+  const fdPath = (fd: number) => `/proc/self/fd/${fd}`;
+  const checkedPath = (input: string) => {
+    // The pinned SDK expands these spellings before its ambient read-path existence
+    // probe. Admit that result before entering the SDK; every operation also checks it.
+    let normalized = input
+      .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ")
+      .replace(/^@/, "");
+    if (normalized === "~" || normalized.startsWith("~/"))
+      normalized = paths.join(process.getBuiltinModule("os").homedir(), normalized.slice(2));
+    if (normalized.startsWith("file://"))
+      normalized = process.getBuiltinModule("url").fileURLToPath(normalized);
+    const absolute = paths.resolve(cwd, normalized);
+    const relative = paths.relative(cwd, absolute);
+    if (
+      !relative ||
+      relative === ".." ||
+      relative.startsWith("../") ||
+      paths.isAbsolute(relative) ||
+      relative.split("/").includes(".git")
+    )
+      throw Error("TOOL_FAILURE");
+    return absolute;
+  };
+  return async (
+    input: string,
+    kind: "read" | "write" | "edit",
+    signal: AbortSignal,
+    run: (
+      operations: {
+        readFile: (path: string) => Promise<Buffer>;
+        access: (path: string) => Promise<void>;
+        mkdir: (path: string) => Promise<void>;
+        writeFile: (path: string, content: string) => Promise<void>;
+        detectImageMimeType: (
+          path: string,
+          detect: (descriptor: string) => Promise<string | null | undefined>,
+        ) => Promise<string | null | undefined>;
+      },
+      readPath: string | undefined,
+    ) => Promise<AgentToolResult<unknown>>,
+  ) => {
+    const absolute = checkedPath(input);
+    const components = paths.relative(cwd, absolute).split("/");
+    type Handle = Awaited<ReturnType<typeof files.open>>;
+    const handles: Handle[] = [];
+    const pending = new Set<Promise<unknown>>();
+    const checkSignal = () => {
+      if (signal.aborted) throw Error("CANCELED");
+    };
+    const missing = (error: unknown) =>
+      error instanceof Error && "code" in error && error.code === "ENOENT";
+    const load = async () => {
+      checkSignal();
+      const root = await (admission ??= admitRoot());
+      const directoryFlags =
+        fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+      let parent = await files.open(cwd, directoryFlags);
+      handles.push(parent);
+      if (!same(await parent.stat({ bigint: true }), root)) throw Error("TOOL_FAILURE");
+      for (const component of components.slice(0, -1)) {
+        checkSignal();
+        const path = `${fdPath(parent.fd)}/${component}`;
+        if (kind === "write")
+          await files.mkdir(path).catch((error: unknown) => {
+            if (!(error instanceof Error && "code" in error && error.code === "EEXIST"))
+              throw error;
+          });
+        parent = await files.open(path, directoryFlags);
+        handles.push(parent);
+      }
+      const target = `${fdPath(parent.fd)}/${components.at(-1)!}`;
+      let file: Handle | undefined;
+      try {
+        file = await files.open(
+          target,
+          (kind === "read"
+            ? fs.constants.O_RDONLY
+            : kind === "edit"
+              ? fs.constants.O_RDWR
+              : fs.constants.O_WRONLY) |
+            fs.constants.O_NOFOLLOW |
+            fs.constants.O_NONBLOCK,
+        );
+        handles.push(file);
+      } catch (error) {
+        if (kind !== "write" || !missing(error)) throw error;
+      }
+      const identity = file ? await file.stat({ bigint: true }) : undefined;
+      if (identity && (!identity.isFile() || identity.nlink !== 1n)) throw Error("TOOL_FAILURE");
+      const verify = async () => {
+        checkSignal();
+        if (
+          !same(await handles[0]!.stat({ bigint: true }), root) ||
+          (await files.realpath(fdPath(handles[0]!.fd))) !== cwd ||
+          (await files.realpath(fdPath(parent.fd))) !== paths.dirname(absolute)
+        )
+          throw Error("TOOL_FAILURE");
+        const current = await files.lstat(target, { bigint: true }).catch((error: unknown) => {
+          if (missing(error)) return undefined;
+          throw error;
+        });
+        if (
+          identity
+            ? !current || !current.isFile() || current.nlink !== 1n || !same(current, identity)
+            : current !== undefined
+        )
+          throw Error("TOOL_FAILURE");
+        if (
+          file &&
+          ((await file.stat({ bigint: true })).nlink !== 1n ||
+            (await files.realpath(fdPath(file.fd))) !== absolute)
+        )
+          throw Error("TOOL_FAILURE");
+      };
+      await verify();
+      return { parent, target, file, identity, verify };
+    };
+    // Bind after the SDK's mutation queue is acquired, so successive writes to the
+    // same path retain its native ordering. All hooks share this call's descriptors.
+    let binding: ReturnType<typeof load> | undefined;
+    const bound = () => (binding ??= load());
+    const operate = <A>(body: () => Promise<A>) => {
+      const promise = body();
+      pending.add(promise);
+      void promise.then(
+        () => pending.delete(promise),
+        () => pending.delete(promise),
+      );
+      return promise;
+    };
+    let sdkPath = absolute;
+    const assertPath = (path: string) => {
+      if (path !== sdkPath) throw Error("TOOL_FAILURE");
+    };
+    try {
+      // Read's pinned SDK resolver performs its own existence probes. Give it the
+      // admitted descriptor so even those probes cannot follow an ambient alias.
+      if (kind === "read") {
+        const file = await bound();
+        if (!file.file) throw Error("TOOL_FAILURE");
+        sdkPath = fdPath(file.file.fd);
+      }
+      return await run(
+        {
+          access: (path) =>
+            operate(async () => {
+              assertPath(path);
+              await (await bound()).verify();
+            }),
+          mkdir: (path) =>
+            operate(async () => {
+              if (path !== paths.dirname(absolute)) throw Error("TOOL_FAILURE");
+              await (await bound()).verify();
+            }),
+          readFile: (path) =>
+            operate(async () => {
+              assertPath(path);
+              const file = await bound();
+              await file.verify();
+              if (!file.file) throw Error("TOOL_FAILURE");
+              const bytes = await file.file.readFile({ signal });
+              await file.verify();
+              return bytes;
+            }),
+          detectImageMimeType: (path, detect) =>
+            operate(async () => {
+              assertPath(path);
+              const file = await bound();
+              await file.verify();
+              if (!file.file) throw Error("TOOL_FAILURE");
+              const mime = await detect(fdPath(file.file.fd));
+              await file.verify();
+              return mime;
+            }),
+          writeFile: (path, content) =>
+            operate(async () => {
+              assertPath(path);
+              const file = await bound();
+              await file.verify();
+              // Replace the directory entry instead of truncating the old inode. A hard
+              // link created after validation can never redirect this write outside cwd.
+              const temporary = `${fdPath(file.parent.fd)}/.t3-pi-${process.getBuiltinModule("crypto").randomUUID()}`;
+              const output = await files.open(
+                temporary,
+                fs.constants.O_WRONLY |
+                  fs.constants.O_CREAT |
+                  fs.constants.O_EXCL |
+                  fs.constants.O_NOFOLLOW,
+                file.identity ? Number(file.identity.mode & 0o777n) : 0o666,
+              );
+              try {
+                await output.writeFile(content, { encoding: "utf8", signal });
+                if (file.identity) await output.chmod(Number(file.identity.mode & 0o777n));
+                await file.verify();
+                await files.rename(temporary, file.target);
+              } finally {
+                await output.close();
+                await files.unlink(temporary).catch((error: unknown) => {
+                  if (!missing(error)) throw error;
+                });
+              }
+            }),
+        },
+        kind === "read" ? sdkPath : undefined,
+      );
+    } finally {
+      // SDK read cancellation rejects promptly; drain any admitted descriptor work
+      // before closing it, even when its native promise has already rejected.
+      await Promise.allSettled(pending);
+      if (binding) await binding.catch(() => undefined);
+      for (const handle of handles.toReversed()) await handle.close();
+    }
+  };
+}
+
 /**
  * Child-only tools for an explicit canonical cwd. Root supplies /workspace after
  * isolation and owns tool selection, mounts, per-call authorization and deadlines.
@@ -152,17 +381,36 @@ export async function makePiLocalTools(cwd: string) {
   if (!process.env.PI_PACKAGE_DIR) throw Error("UNAVAILABLE");
   const sdk = await import("@earendil-works/pi-coding-agent");
   if (sdk.VERSION !== "0.99.1") throw Error("UNAVAILABLE");
-  const read = sdk.createReadTool(cwd, { autoResizeImages: false });
-  const write = sdk.createWriteTool(cwd);
-  const edit = sdk.createEditTool(cwd);
+  const executeFile = await workspaceFiles(cwd);
   const bash = sdk.createBashTool(cwd, { exposeSessionEnvironment: false });
   return Object.freeze({
     tools: piLocalToolDefinitions,
     localTools: Object.freeze({
-      read: adapt(ReadInput, (args, signal) => read.execute("t3-local-read", args, signal)),
-      write: adapt(WriteInput, (args, signal) => write.execute("t3-local-write", args, signal)),
+      read: adapt(ReadInput, (args, signal) =>
+        executeFile(args.path, "read", signal, (operations, readPath) =>
+          sdk
+            .createReadTool(cwd, {
+              autoResizeImages: false,
+              operations: {
+                ...operations,
+                detectImageMimeType: (path) =>
+                  operations.detectImageMimeType(path, sdk.detectSupportedImageMimeTypeFromFile),
+              },
+            })
+            .execute("t3-local-read", { ...args, path: readPath! }, signal),
+        ),
+      ),
+      write: adapt(WriteInput, (args, signal) =>
+        executeFile(args.path, "write", signal, (operations) =>
+          sdk.createWriteTool(cwd, { operations }).execute("t3-local-write", args, signal),
+        ),
+      ),
       edit: adapt(EditInput, (args, signal) =>
-        edit.execute("t3-local-edit", { ...args, edits: [...args.edits] }, signal),
+        executeFile(args.path, "edit", signal, (operations) =>
+          sdk
+            .createEditTool(cwd, { operations })
+            .execute("t3-local-edit", { ...args, edits: [...args.edits] }, signal),
+        ),
       ),
       bash: adapt(BashInput, (args, signal) => bash.execute("t3-local-bash", args, signal)),
     }),

@@ -853,6 +853,99 @@ describe("private Pi worker entry", () => {
 });
 
 describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namespace", () => {
+  it.each(["read", "write", "edit"] as const)(
+    "denies native %s access to state, runtime and file aliases",
+    async (name) => {
+      for (const alias of [
+        "absolute-state",
+        "relative-state",
+        "file-url",
+        "at-prefix",
+        "symbolic-file",
+        "symbolic-directory",
+        "hardlink-state",
+        "protected-git",
+        "absolute-runtime",
+      ]) {
+        const r = await nativeRoots();
+        const secret = NodePath.join(r.namespace.state, "sessions/private.txt");
+        await NodeFSP.writeFile(secret, "private-original");
+        await NodeFSP.writeFile(NodePath.join(r.workspace, ".git"), "protected-original");
+        let path = "/state/sessions/private.txt";
+        if (alias === "relative-state") path = "../state/sessions/private.txt";
+        if (alias === "file-url") path = "file:///state/sessions/private.txt";
+        if (alias === "at-prefix") path = "@/state/sessions/private.txt";
+        if (alias === "symbolic-file") {
+          path = "file-alias";
+          await NodeFSP.symlink("/state/sessions/private.txt", NodePath.join(r.workspace, path));
+        }
+        if (alias === "symbolic-directory") {
+          path = "directory-alias/private.txt";
+          await NodeFSP.symlink("/state/sessions", NodePath.join(r.workspace, "directory-alias"));
+        }
+        if (alias === "hardlink-state") {
+          path = "hard-alias";
+          await NodeFSP.link(secret, NodePath.join(r.workspace, path));
+        }
+        if (alias === "protected-git") path = "/workspace/.git";
+        if (alias === "absolute-runtime") path = "/runtime/pi-sdk/package.json";
+        const f = await childFixture(
+          `file-boundary-${name}-${alias}`,
+          JSON.stringify(r.launch),
+          r.root,
+          r.namespace,
+        );
+        try {
+          await assertNativeInert(f);
+          const protocol = await nativeProtocol(f, [name]);
+          await protocol.request(1);
+          const args =
+            name === "read"
+              ? { path }
+              : name === "write"
+                ? { path, content: "altered" }
+                : { path, edits: [{ oldText: "private-original", newText: "altered" }] };
+          await protocol.reply(1, { name, args: decodeNativeArguments(args) });
+          const call = await protocol.toolCall(1);
+          await protocol.send({ type: "tool-authorized", callId: call.callId, allowed: true });
+          const result = await f.wait("result");
+          expect(result.remoteCalls).toBe(0);
+          f.stdin.end();
+          await f.join(1);
+          expect(result.ok).toBe(false);
+          expect(f.frames.at(-1)?.message).toEqual({
+            type: "worker-failure",
+            code: "TOOL_FAILURE",
+          });
+          expect(f.frames.filter((frame) => frame.message.type === "request")).toHaveLength(1);
+          expect(f.frames.some((frame) => frame.message.type === "tool-result")).toBe(false);
+          expect(await NodeFSP.readFile(secret, "utf8")).toBe("private-original");
+          expect(await NodeFSP.readFile(NodePath.join(r.workspace, ".git"), "utf8")).toBe(
+            "protected-original",
+          );
+          const evidence = process.env.PI_WORKER_ENTRY_EVIDENCE_DIRECTORY;
+          if (evidence)
+            await NodeFSP.writeFile(
+              NodePath.join(evidence, `filesystem-${name}-${alias}.json`),
+              JSON.stringify({
+                name,
+                alias,
+                path,
+                result,
+                frames: f.frames,
+                stateBytes: await NodeFSP.readFile(secret, "utf8"),
+                protectedBytes: await NodeFSP.readFile(NodePath.join(r.workspace, ".git"), "utf8"),
+              }),
+            );
+        } finally {
+          await f.dispose();
+          await r.dispose();
+        }
+      }
+    },
+    30000,
+  );
+
   it("executes selected native write/read/edit/bash through parent authorization and real SDK lifecycle", async () => {
     const r = await nativeRoots();
     const f = await childFixture("selected-native", JSON.stringify(r.launch), r.root, r.namespace);
@@ -860,11 +953,14 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
       await assertNativeInert(f);
       const p = await nativeProtocol(f, ["read", "write", "edit", "bash"]);
       const calls = [
-        { name: "write", args: { path: "selected.txt", content: "before" } },
-        { name: "read", args: { path: "selected.txt" } },
+        { name: "write", args: { path: "nested/selected.txt", content: "before" } },
+        { name: "read", args: { path: "/workspace/nested/selected.txt" } },
         {
           name: "edit",
-          args: { path: "selected.txt", edits: [{ oldText: "before", newText: "after" }] },
+          args: {
+            path: "nested/../nested/selected.txt",
+            edits: [{ oldText: "before", newText: "after" }],
+          },
         },
         { name: "bash", args: { command: "printf 'entry-native-bash-marker:%s' \"$PWD\"" } },
       ];
@@ -891,9 +987,9 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
       expect(result.sdkEnvironmentCorrect).toBe(true);
       f.stdin.end();
       await f.join(0);
-      expect(await NodeFSP.readFile(NodePath.join(r.workspace, "selected.txt"), "utf8")).toBe(
-        "after",
-      );
+      expect(
+        await NodeFSP.readFile(NodePath.join(r.workspace, "nested/selected.txt"), "utf8"),
+      ).toBe("after");
       const outputs = f.frames
         .filter(
           (frame) =>

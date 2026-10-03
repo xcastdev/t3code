@@ -46,6 +46,171 @@ const content = (result: unknown) =>
     .join("\n");
 
 describe("Pi child-local native SDK tools", () => {
+  it.effect.each(["read", "write", "edit"] as const)(
+    "confines native $0 filesystem operations to the admitted workspace",
+    (name) =>
+      Effect.gen(function* () {
+        const { fs, cwd, tools } = yield* fixture;
+        const outside = yield* fs.makeTempDirectoryScoped({ prefix: "pi-outside-file-boundary-" });
+        const secret = outside + "/private.txt";
+        yield* fs.writeFileString(secret, "private-original");
+        const nodeFS = process.getBuiltinModule("fs").promises;
+        const nodePath = process.getBuiltinModule("path");
+        yield* Effect.promise(() => nodeFS.symlink(secret, cwd + "/file-alias"));
+        yield* Effect.promise(() => nodeFS.symlink(outside, cwd + "/directory-alias"));
+        yield* Effect.promise(() => nodeFS.link(secret, cwd + "/hard-alias"));
+        yield* fs.writeFileString(cwd + "/.git", "protected-metadata");
+        const paths = [
+          secret,
+          "@" + secret,
+          process.getBuiltinModule("url").pathToFileURL(secret).href,
+          nodePath.relative(cwd, secret),
+          "file-alias",
+          "directory-alias/private.txt",
+          "hard-alias",
+          ".git",
+        ];
+        for (const path of paths) {
+          const args =
+            name === "read"
+              ? { path }
+              : name === "write"
+                ? { path, content: "altered" }
+                : { path, edits: [{ oldText: "private-original", newText: "altered" }] };
+          const outcome = yield* Effect.promise(() =>
+            tools.localTools[name](decodeInput(args), signal()).then(
+              (result) => ({ ok: true, result }),
+              (error: unknown) => ({ ok: false, error: String(error) }),
+            ),
+          );
+          const evidence = process.env.PI_LOCAL_TOOLS_EVIDENCE_DIRECTORY;
+          if (evidence)
+            yield* fs.writeFileString(
+              evidence + "/filesystem-" + name + ".json",
+              encodeJson({ name, path, outcome, outsideBytes: yield* fs.readFileString(secret) }),
+            );
+          expect(outcome.ok).toBe(false);
+          expect(yield* fs.readFileString(secret)).toBe("private-original");
+        }
+      }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect("replaces an admitted file without mutating a hardlink created after validation", () =>
+    Effect.gen(function* () {
+      const { fs, cwd, tools } = yield* fixture;
+      const outside = yield* fs.makeTempDirectoryScoped({ prefix: "pi-late-hardlink-" });
+      yield* fs.writeFileString(cwd + "/file.txt", "original");
+      const nodeFS = process.getBuiltinModule("fs").promises;
+      yield* Effect.promise(() => nodeFS.chmod(cwd + "/file.txt", 0o754));
+      const rename = nodeFS.rename;
+      let aliased = false;
+      vi.spyOn(nodeFS, "rename").mockImplementation(async (...args) => {
+        if (typeof args[0] === "string" && args[0].includes("/.t3-pi-")) {
+          await nodeFS.link(cwd + "/file.txt", outside + "/late-alias");
+          aliased = true;
+        }
+        return rename(...args);
+      });
+      yield* Effect.promise(() =>
+        tools.localTools.write({ path: cwd + "/file.txt", content: "replacement" }, signal()),
+      );
+      expect(aliased).toBe(true);
+      expect(yield* fs.readFileString(outside + "/late-alias")).toBe("original");
+      expect(yield* fs.readFileString(cwd + "/file.txt")).toBe("replacement");
+      expect((yield* Effect.promise(() => nodeFS.stat(cwd + "/file.txt"))).mode & 0o777).toBe(
+        0o754,
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect.each(["read", "write", "edit"] as const)(
+    "rejects a directory swap after native $0 opens its admitted descriptor",
+    (name) =>
+      Effect.gen(function* () {
+        const { fs, cwd, tools } = yield* fixture;
+        const outside = yield* fs.makeTempDirectoryScoped({ prefix: "pi-swapped-directory-" });
+        yield* fs.makeDirectory(cwd + "/nested");
+        yield* fs.writeFileString(cwd + "/nested/file.txt", "original");
+        yield* fs.writeFileString(outside + "/file.txt", "private");
+        const nodeFS = process.getBuiltinModule("fs").promises;
+        const open = nodeFS.open;
+        let swapped = false;
+        vi.spyOn(nodeFS, "open").mockImplementation(async (...args) => {
+          const handle = await open(...args);
+          if (
+            !swapped &&
+            typeof args[0] === "string" &&
+            args[0].startsWith("/proc/self/fd/") &&
+            args[0].endsWith("/file.txt")
+          ) {
+            swapped = true;
+            await nodeFS.rename(cwd + "/nested", cwd + "/held-original");
+            await nodeFS.symlink(outside, cwd + "/nested");
+          }
+          return handle;
+        });
+        const args =
+          name === "read"
+            ? { path: "nested/file.txt" }
+            : name === "write"
+              ? { path: "nested/file.txt", content: "altered" }
+              : { path: "nested/file.txt", edits: [{ oldText: "original", newText: "altered" }] };
+        yield* Effect.promise(() =>
+          expect(tools.localTools[name](decodeInput(args), signal())).rejects.toThrow(
+            "TOOL_FAILURE",
+          ),
+        );
+        expect(swapped).toBe(true);
+        expect(yield* fs.readFileString(outside + "/file.txt")).toBe("private");
+        expect(yield* fs.readFileString(cwd + "/held-original/file.txt")).toBe("original");
+      }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect("drains an admitted native read before cancellation releases its descriptors", () =>
+    Effect.gen(function* () {
+      const { fs, cwd, tools } = yield* fixture;
+      yield* fs.writeFileString(cwd + "/held-read.txt", "workspace-content");
+      const nodeFS = process.getBuiltinModule("fs").promises;
+      const open = nodeFS.open;
+      const entered = Promise.withResolvers<void>();
+      const released = Promise.withResolvers<void>();
+      let readDrained = false;
+      let descriptorClosed = false;
+      vi.spyOn(nodeFS, "open").mockImplementation(async (...args) => {
+        const handle = await open(...args);
+        if (typeof args[0] === "string" && args[0].endsWith("/held-read.txt")) {
+          const readFile = handle.readFile.bind(handle);
+          vi.spyOn(handle, "readFile").mockImplementation(async (...readArgs) => {
+            const bytes = await readFile(...readArgs);
+            entered.resolve();
+            await released.promise;
+            readDrained = true;
+            return bytes;
+          });
+          const close = handle.close.bind(handle);
+          vi.spyOn(handle, "close").mockImplementation(async () => {
+            expect(readDrained).toBe(true);
+            await close();
+            descriptorClosed = true;
+          });
+        }
+        return handle;
+      });
+      const controller = new AbortController();
+      const outcome = tools.localTools.read({ path: "held-read.txt" }, controller.signal).then(
+        () => "unexpected success",
+        (error: unknown) => String(error),
+      );
+      yield* Effect.promise(() => entered.promise);
+      controller.abort();
+      released.resolve();
+      expect(yield* Effect.promise(() => outcome)).toContain("CANCELED");
+      expect(readDrained).toBe(true);
+      expect(descriptorClosed).toBe(true);
+      expect(yield* fs.readFileString(cwd + "/held-read.txt")).toBe("workspace-content");
+    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
   it.effect("constructs only the four fixed capabilities without file actions or fetch", () =>
     Effect.gen(function* () {
       const { fs, cwd } = yield* fixture;

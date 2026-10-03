@@ -42,6 +42,7 @@ import {
 import { readPiNativeSession } from "./PiNativeSessionReader.ts";
 import { makePiRuntimeEventTranslator } from "./PiRuntimeEvents.ts";
 import { makePiSessionRuntime } from "./PiSessionRuntime.ts";
+import { piLocalToolDefinitions } from "./PiLocalTools.ts";
 import type { PiModelBrokerConfig, PiModelTool } from "./PiModelBroker.ts";
 import type { PiNativeReference, PiWorkerIdentity, PiWorkerOperation } from "./PiWorkerProtocol.ts";
 
@@ -650,6 +651,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 "project-work.read-project",
                 "project-work.read-task",
                 "project-work.write",
+                ...piLocalToolDefinitions.map((tool) => tool.capabilityId),
               ]);
               if (
                 binding.configuration.toolIds.some(
@@ -657,6 +659,11 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 )
               )
                 return yield* deny("Pi profile includes an unsupported tool", "unavailable");
+              const localTools = piLocalToolDefinitions.filter(
+                (tool) =>
+                  binding.configuration.toolIds.includes(tool.capabilityId) &&
+                  authority.role.tools.includes(tool.capabilityId),
+              );
               const workspace = yield* verifyWorkspace(authority, agentDirectory);
               const nativeConfig = yield* configuration(agentDirectory, authority);
               const previous =
@@ -706,7 +713,9 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 return yield* deny("Pi native state directory is not canonical");
               const launch: PiManagedLaunch = {
                 workspaceRoot: binding.worktree,
-                workspaceAccess: "readonly",
+                workspaceAccess: localTools.some((tool) => tool.name !== "read")
+                  ? "readwrite"
+                  : "readonly",
                 nativeStateRoot: nativeStateDirectory,
                 protectedWorkspaceEntries: [".git"],
                 protectedRoots: workspace.protectedRoots,
@@ -786,6 +795,21 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 });
                 toolCapabilities.push({ name, capability, execution: "bridge" });
               }
+              for (const tool of localTools) {
+                tools.push({
+                  type: "function",
+                  function: {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                  },
+                });
+                toolCapabilities.push({
+                  name: tool.name,
+                  capability: tool.capabilityId,
+                  execution: "local",
+                });
+              }
               const texts = [
                 { transferId: "context", text: context },
                 ...(request.kind === "prompt"
@@ -842,7 +866,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   },
                   allowedTools: tools.map((tool) => ({
                     name: tool.function.name,
-                    execution: "bridge",
+                    execution: toolCapabilities.find((entry) => entry.name === tool.function.name)!
+                      .execution,
                     description: tool.function.description,
                     inputSchema: descriptor(tool.function.name),
                   })),
@@ -866,6 +891,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       [
                         "beforeAcquire",
                         "beforeStart",
+                        "beforeTool",
                         "beforeToolInvoke",
                         "beforeToolReturn",
                       ].includes(input.phase),
@@ -880,10 +906,14 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                             )
                           : Effect.void,
                       ),
+                      // Capability checks can await SQL or another authority receipt.
+                      // Recheck the frozen run after that receipt, then fence the workspace.
+                      Effect.andThen(check(signal)),
                       Effect.andThen(
                         [
                           "beforeAcquire",
                           "beforeStart",
+                          "beforeTool",
                           "beforeToolInvoke",
                           "beforeToolReturn",
                         ].includes(input.phase)
