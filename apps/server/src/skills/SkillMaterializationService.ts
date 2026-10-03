@@ -1,8 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 
-import { NonNegativeInt, type ManagedSkillKey, type ProviderInstanceId } from "@t3tools/contracts";
+import { ManagedSkillKey, NonNegativeInt, type ProviderInstanceId } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -75,6 +77,45 @@ export class SkillMaterializationService extends Context.Service<
   SkillMaterializationServiceShape
 >()("t3/skills/SkillMaterializationService") {}
 
+export interface OwnedSkillMaterializationInput {
+  readonly sessionId: string;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly desiredRevision: number;
+  readonly skillKeys: ReadonlyArray<ManagedSkillKey>;
+}
+
+interface OwnedSkillMaterialization extends SkillMaterializationResult {
+  /** Valid only inside the descriptor-owning callback. */
+  readonly revalidate: Effect.Effect<void, SkillMaterializationError>;
+}
+
+type WithOwnedMaterialization = <A, E, R>(
+  input: OwnedSkillMaterializationInput,
+  use: (owned: OwnedSkillMaterialization) => Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E | SkillMaterializationError, R>;
+
+const ownedMaterializations = new WeakMap<
+  SkillMaterializationServiceShape,
+  WithOwnedMaterialization
+>();
+
+/** Admit the real service's fixed output, retaining descriptors through trusted copying. */
+export const withOwnedSkillMaterialization = <A, E, R>(
+  service: SkillMaterializationServiceShape,
+  input: OwnedSkillMaterializationInput,
+  use: (owned: OwnedSkillMaterialization) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | SkillMaterializationError, R> => {
+  const owned = ownedMaterializations.get(service);
+  return owned === undefined
+    ? Effect.fail(
+        new SkillMaterializationError({
+          code: "ownership_mismatch",
+          detail: "Owned admission requires the real configured materialization service.",
+        }),
+      )
+    : owned(input, use);
+};
+
 const cleanupOwner = Context.Reference<((cleanup: Effect.Effect<void>) => void) | undefined>(
   "t3/skills/MaterializationCleanupOwner",
   { defaultValue: () => undefined },
@@ -137,6 +178,7 @@ export const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const config = yield* ServerConfig;
+  const hostPlatform = yield* HostProcessPlatform;
 
   const lstat = (target: string) =>
     Effect.tryPromise({
@@ -612,7 +654,189 @@ export const make = Effect.gen(function* () {
     ),
   );
 
-  return SkillMaterializationService.of({ materialize, dispose, disposeSession });
+  const withOwned: WithOwnedMaterialization = (input, use) =>
+    Effect.gen(function* () {
+      const admittedInput = {
+        sessionId: input.sessionId,
+        providerInstanceId: input.providerInstanceId,
+        desiredRevision: input.desiredRevision,
+        skillKeys: [...input.skillKeys],
+      };
+      yield* assertSafeInput(admittedInput);
+      if (
+        hostPlatform !== "linux" ||
+        admittedInput.sessionId.length > 128 ||
+        admittedInput.providerInstanceId.length > 128 ||
+        admittedInput.skillKeys.length > 32 ||
+        new Set(admittedInput.skillKeys).size !== admittedInput.skillKeys.length ||
+        admittedInput.skillKeys.some((key) => !Schema.is(ManagedSkillKey)(key))
+      )
+        return yield* failure(
+          "unsafe_identity",
+          "Owned admission requires bounded Linux skill keys.",
+        );
+      const root = path.join(
+        path.resolve(config.skillRuntimeDir),
+        admittedInput.sessionId,
+        String(admittedInput.desiredRevision),
+        admittedInput.providerInstanceId,
+      );
+      const expected = expectedMarker(admittedInput);
+      const native = <A>(operation: () => Promise<A>) =>
+        Effect.tryPromise({
+          try: operation,
+          catch: (cause) =>
+            failure(
+              "ownership_mismatch",
+              "Owned materialization changed or is unavailable.",
+              cause,
+            ),
+        }).pipe(Effect.uninterruptible);
+      return yield* Effect.acquireUseRelease(
+        native(async () => {
+          const handles: Array<Awaited<ReturnType<typeof NodeFSP.open>>> = [];
+          const directories: Array<{
+            path: string;
+            handle: Awaited<ReturnType<typeof NodeFSP.open>>;
+            stat: Awaited<ReturnType<typeof directoryStat>>;
+          }> = [];
+          async function directoryStat(handle: Awaited<ReturnType<typeof NodeFSP.open>>) {
+            return handle.stat({ bigint: true });
+          }
+          const close = async () => {
+            const results = await Promise.allSettled(handles.map((handle) => handle.close()));
+            const rejected = results.find((result) => result.status === "rejected");
+            if (rejected?.status === "rejected") throw rejected.reason;
+          };
+          let active = true;
+          try {
+            const flags =
+              NodeFS.constants.O_RDONLY |
+              NodeFS.constants.O_NOFOLLOW |
+              NodeFS.constants.O_DIRECTORY;
+            let parent = await NodeFSP.open("/", flags);
+            handles.push(parent);
+            let current = "";
+            const configured = path.resolve(config.skillRuntimeDir);
+            const components = root.split("/").filter(Boolean);
+            if (components.length > 128) throw new Error("Runtime path depth exceeded");
+            for (const component of components) {
+              current += "/" + component;
+              const handle = await NodeFSP.open(`/proc/self/fd/${parent.fd}/${component}`, flags);
+              handles.push(handle);
+              const stat = await directoryStat(handle);
+              if (!stat.isDirectory()) throw new Error("Runtime component is not a directory");
+              if (
+                (current === configured || current.startsWith(configured + "/")) &&
+                (stat.uid !== BigInt(process.getuid!()) || (stat.mode & 0o022n) !== 0n)
+              )
+                throw new Error("Runtime component ownership or permissions changed");
+              directories.push({ path: current, handle, stat });
+              parent = handle;
+            }
+            const skillPaths = new Map<ManagedSkillKey, string>();
+            for (const key of admittedInput.skillKeys) {
+              const handle = await NodeFSP.open(`/proc/self/fd/${parent.fd}/${key}`, flags);
+              handles.push(handle);
+              const stat = await directoryStat(handle);
+              if (stat.uid !== BigInt(process.getuid!()) || (stat.mode & 0o022n) !== 0n)
+                throw new Error("Selected materialization ownership changed");
+              const target = path.join(root, key);
+              directories.push({ path: target, handle, stat });
+              skillPaths.set(key, target);
+            }
+            const marker = await NodeFSP.open(
+              `/proc/self/fd/${parent.fd}/${OWNERSHIP_MARKER}`,
+              NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK,
+            );
+            handles.push(marker);
+            const initial = await marker.stat({ bigint: true });
+            if (
+              !initial.isFile() ||
+              initial.nlink !== 1n ||
+              initial.size > 4096n ||
+              initial.uid !== BigInt(process.getuid!()) ||
+              (initial.mode & 0o022n) !== 0n
+            )
+              throw new Error("Runtime marker is not a bounded owned regular file");
+            const validate = async () => {
+              if (!active) throw new Error("Materialization admission has closed");
+              for (const directory of directories) {
+                const observed = await NodeFSP.lstat(directory.path, { bigint: true });
+                const held = await directoryStat(directory.handle);
+                if (
+                  observed.isSymbolicLink() ||
+                  !observed.isDirectory() ||
+                  observed.dev !== directory.stat.dev ||
+                  observed.ino !== directory.stat.ino ||
+                  held.dev !== directory.stat.dev ||
+                  held.ino !== directory.stat.ino ||
+                  observed.uid !== directory.stat.uid ||
+                  observed.gid !== directory.stat.gid ||
+                  observed.mode !== directory.stat.mode ||
+                  (await NodeFSP.realpath(`/proc/self/fd/${directory.handle.fd}`)) !==
+                    directory.path
+                )
+                  throw new Error("Runtime directory identity changed");
+              }
+              const observed = await NodeFSP.lstat(path.join(root, OWNERSHIP_MARKER), {
+                bigint: true,
+              });
+              const held = await marker.stat({ bigint: true });
+              if (
+                !observed.isFile() ||
+                observed.isSymbolicLink() ||
+                observed.dev !== initial.dev ||
+                observed.ino !== initial.ino ||
+                held.dev !== initial.dev ||
+                held.ino !== initial.ino ||
+                held.uid !== initial.uid ||
+                held.gid !== initial.gid ||
+                held.mode !== initial.mode ||
+                held.nlink !== 1n ||
+                held.size > 4096n
+              )
+                throw new Error("Runtime marker identity changed");
+              const buffer = Buffer.alloc(4097);
+              const read = await marker.read(buffer, 0, buffer.length, 0);
+              if (read.bytesRead > 4096 || BigInt(read.bytesRead) !== held.size)
+                throw new Error("Runtime marker size changed");
+              const actual = decodeMarker(buffer.subarray(0, read.bytesRead).toString("utf8"));
+              if (
+                actual.sessionId !== expected.sessionId ||
+                actual.providerInstanceId !== expected.providerInstanceId ||
+                actual.desiredRevision !== expected.desiredRevision
+              )
+                throw new Error("Runtime marker does not match the assigned materialization");
+            };
+            await validate();
+            return {
+              root,
+              skillPaths,
+              validate,
+              close: async () => {
+                active = false;
+                await close();
+              },
+            };
+          } catch (cause) {
+            active = false;
+            await close();
+            throw cause;
+          }
+        }),
+        (owned) => {
+          const revalidate = native(owned.validate);
+          return use({ root: owned.root, skillPaths: owned.skillPaths, revalidate }).pipe(
+            Effect.tap(() => revalidate),
+          );
+        },
+        (owned) => native(owned.close).pipe(Effect.orDie),
+      );
+    });
+  const service = SkillMaterializationService.of({ materialize, dispose, disposeSession });
+  ownedMaterializations.set(service, withOwned);
+  return service;
 });
 
 export const layer = Layer.effect(SkillMaterializationService, make);
