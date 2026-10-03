@@ -69,7 +69,7 @@ const validId = Schema.is(Id);
 const blocked = (reason: typeof Reason.Type) => ({ _tag: "Blocked" as const, reason });
 type Membership = Extract<ProjectTeamRecord, { kind: "task-membership" }>;
 type Run = Extract<ProjectTeamRecord, { kind: "run-binding" }>;
-const maximumLineageNodes = 8;
+const maximumLineageNodes = 9;
 
 /** A pure policy snapshot, not authorization. Root persists the root anchors and intersects
  * prior frozen depth/repair caps before admitting work or reserving model capacity. */
@@ -109,9 +109,15 @@ export const resolveProjectTeamLimits = (input: {
     (r): r is typeof ProjectTeamLimits.Type =>
       r.kind === "limits" && r.model === role.model && r.projectId === state.projectId,
   );
-  if (policies.length === 0) return blocked("missing-limits");
-  if (policies.length !== 1) return blocked("ambiguous-limits");
-  const policy = policies[0]!;
+  const configuredPolicies = policies.filter((policy) => policy.status === "configured");
+  if (configuredPolicies.length === 0)
+    return blocked(
+      policies.some((policy) => policy.status === "disabled")
+        ? "limits-disabled"
+        : "missing-limits",
+    );
+  if (configuredPolicies.length !== 1) return blocked("ambiguous-limits");
+  const policy = configuredPolicies[0]!;
   if (
     !validLimits(policy) ||
     !validId(policy.recordId) ||
@@ -157,7 +163,8 @@ export const resolveProjectTeamLimits = (input: {
       !validId(membership.recordId) ||
       membership.projectId !== state.projectId ||
       membership.status !== "active" ||
-      membership.executionKind !== "managed" ||
+      membership.executionKind === "legacy" ||
+      (lineage.length === 0 && membership.executionKind !== "managed") ||
       !validInteger(membership.revision)
     )
       return blocked("invalid-task-lineage");
@@ -167,7 +174,7 @@ export const resolveProjectTeamLimits = (input: {
   }
   const rootTaskId = currentTaskId;
   const delegationDepth = lineage.length - 1;
-  const maximumDelegationDepth = Math.min(2, role.delegationDepth, policy.delegationDepth);
+  const maximumDelegationDepth = Math.min(role.delegationDepth, policy.delegationDepth);
   if (delegationDepth > maximumDelegationDepth) return blocked("delegation-depth-exceeded");
   const membership = lineage[0]!;
   if (

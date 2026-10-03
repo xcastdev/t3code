@@ -31,7 +31,7 @@ const limits = (overrides: Partial<typeof ProjectTeamLimits.Type> = {}) =>
     environmentModelCalls: 8,
     projectWritableWorkers: 1,
     modelCalls: 3,
-    delegationDepth: 8,
+    delegationDepth: 2,
     repairAllowance: 2,
     model: "configured-model",
     tokenLimit: 1000,
@@ -52,7 +52,7 @@ const role = (overrides: Partial<typeof ProjectTeamRoleRevision.Type> = {}) =>
     tools: ["pi.write"],
     model: "configured-model",
     memoryAccess: "none",
-    delegationDepth: 8,
+    delegationDepth: 2,
     ...overrides,
   });
 const membership = (id = taskId, overrides: Partial<typeof ProjectTeamTaskMembership.Type> = {}) =>
@@ -347,7 +347,7 @@ describe("resolveProjectTeamLimits", () => {
     "legacy",
     "too-long",
   ] as const)("denies malformed task lineage: %s", (kind) => {
-    const input = childFixture(kind === "too-long" ? 8 : 1);
+    const input = childFixture(kind === "too-long" ? 9 : 1);
     if (kind === "missing-task")
       input.state.tasks = input.state.tasks.filter((entry) => entry.taskId !== taskId);
     if (kind === "missing-membership")
@@ -434,9 +434,9 @@ describe("resolveProjectTeamLimits", () => {
     if (kind === "duplicate") input.state.foundationRecords.push(binding("parent"));
     if (kind === "too-long") {
       Reflect.set(parent, "parentRunId", "run-1");
-      for (let n = 1; n <= 8; n++)
+      for (let n = 1; n <= 9; n++)
         input.state.foundationRecords.push(
-          binding(`run-${n}`, taskId, n === 8 ? undefined : `run-${n + 1}`),
+          binding(`run-${n}`, taskId, n === 9 ? undefined : `run-${n + 1}`),
         );
     }
     if (kind === "membership-disagreement")
@@ -525,6 +525,55 @@ describe("resolveProjectTeamLimits", () => {
       delegationDepth: 1,
       maximumTokens: 1000,
       rootDeadlineAtMs: 1100,
+    });
+  });
+  it("permits managed investigation beneath an active human reminder", () => {
+    const input = childFixture(1);
+    input.state.foundationRecords = input.state.foundationRecords.map((record) =>
+      record.kind === "task-membership" && record.taskId === taskId
+        ? { ...record, executionKind: "human", deliverableKind: "reminder" }
+        : record,
+    );
+    expect(eligible({ ...input, rootBudget: budget })).toMatchObject({
+      rootTaskId: taskId,
+      delegationDepth: 1,
+    });
+    expect(resolveProjectTeamLimits({ ...input, taskId, rootBudget: budget })).toEqual({
+      _tag: "Blocked",
+      reason: "invalid-task-lineage",
+    });
+  });
+  it("selects one configured model policy while ignoring disabled policy history", () => {
+    expect(
+      eligible(
+        fixture([
+          role(),
+          limits(),
+          limits({ recordId: "disabled-old", status: "disabled" }),
+          membership(),
+        ]),
+      ),
+    ).toMatchObject({ limitsRecordId: "limits", limitsRevision: 3 });
+  });
+  it.each([3, 8])("honors explicitly configured delegation depth %s", (depth) => {
+    const input = childFixture(depth);
+    input.state.foundationRecords = input.state.foundationRecords.map((record) =>
+      record.kind === "limits" || record.kind === "role-revision"
+        ? { ...record, delegationDepth: depth }
+        : record,
+    );
+    expect(eligible({ ...input, rootBudget: budget }).delegationDepth).toBe(depth);
+  });
+  it("denies ninth delegation even with maximum configured caps", () => {
+    const input = childFixture(9);
+    input.state.foundationRecords = input.state.foundationRecords.map((record) =>
+      record.kind === "limits" || record.kind === "role-revision"
+        ? { ...record, delegationDepth: 8 }
+        : record,
+    );
+    expect(resolveProjectTeamLimits({ ...input, rootBudget: budget })).toEqual({
+      _tag: "Blocked",
+      reason: "invalid-task-lineage",
     });
   });
 });
