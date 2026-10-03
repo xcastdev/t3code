@@ -53,6 +53,9 @@ import {
   type PiProductionRuntimeHooks,
 } from "./PiProductionRuntime.ts";
 
+import type { PiManagedRuntimeInstance } from "./PiManagedRuntime.ts";
+import { makeProjectTeamPiRuntime } from "../../projectWork/ProjectTeamPiRuntime.ts";
+
 const NodeFS = process.getBuiltinModule("fs");
 const nativeFS = NodeFS.promises;
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -365,6 +368,117 @@ const stageFrom = (f: Effect.Success<typeof fixture>) => {
   const source = files![0]!.source;
   return source.slice(0, source.lastIndexOf("/"));
 };
+product("published runtime and assets belong to the exact returned instance scope", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const published: Array<{
+        readonly runtime: PiManagedRuntimeInstance;
+        readonly assets: PiProductionRuntimeAssets;
+      }> = [];
+      const service = yield* construct(f, {
+        publishAssets: (id, assets, runtime) =>
+          Effect.sync(() => {
+            expect(id).toBe(providerInstanceId);
+            published.push({ runtime, assets });
+          }),
+      });
+      const firstScope = yield* Scope.make();
+      const secondScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+      const first = yield* service
+        .forInstance(instance)
+        .pipe(Effect.provideService(Scope.Scope, firstScope));
+      const second = yield* service
+        .forInstance(instance)
+        .pipe(Effect.provideService(Scope.Scope, secondScope));
+      expect(published).toHaveLength(2);
+      expect(published[0]!.runtime).toBe(first);
+      expect(published[1]!.runtime).toBe(second);
+      expect(first).not.toBe(second);
+      expect(Object.isFrozen(first)).toBe(true);
+      expect(Object.isFrozen(second)).toBe(true);
+      expect(published[0]!.assets.runtimeFiles[0]!.source).not.toBe(
+        published[1]!.assets.runtimeFiles[0]!.source,
+      );
+      yield* published[0]!.assets.borrow(Effect.void);
+      yield* published[1]!.assets.borrow(Effect.void);
+      yield* Scope.close(firstScope, Exit.void);
+      yield* failure(published[0]!.assets.revalidate);
+      yield* failure(first.prepareOperation({ kind: "initialize", threadId }, () => Effect.void));
+      expect(yield* f.fs.exists(published[0]!.assets.runtimeFiles[0]!.source)).toBe(false);
+      yield* published[1]!.assets.revalidate;
+      expect(yield* f.fs.exists(published[1]!.assets.runtimeFiles[0]!.source)).toBe(true);
+      yield* Scope.close(secondScope, Exit.void);
+      expect(yield* f.fs.exists(published[1]!.assets.runtimeFiles[0]!.source)).toBe(false);
+      expect(f.fetch).not.toHaveBeenCalled();
+    }),
+  ),
+);
+product(
+  "Root borrows only the current driver instance and old scope closure preserves its replacement",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const registry = yield* makeProjectTeamPiRuntime();
+        let calls = 0;
+        yield* failure(registry.withInstance(providerInstanceId, () => Effect.sync(() => calls++)));
+        const service = yield* construct(f, registry);
+        const firstScope = yield* Scope.make();
+        const secondScope = yield* Scope.make();
+        yield* Effect.addFinalizer(() => Scope.close(secondScope, Exit.void));
+        yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void));
+        const first = yield* service
+          .forInstance(instance)
+          .pipe(Effect.provideService(Scope.Scope, firstScope));
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let oldStage = "";
+        const borrowed = yield* registry
+          .withInstance(providerInstanceId, (owned) =>
+            Effect.gen(function* () {
+              calls++;
+              expect(owned.runtime).toBe(first);
+              oldStage = owned.assets.runtimeFiles[0]!.source;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              expect(yield* f.fs.exists(oldStage)).toBe(true);
+              yield* failure(owned.assertCurrent);
+            }),
+          )
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        const second = yield* service
+          .forInstance(instance)
+          .pipe(Effect.provideService(Scope.Scope, secondScope));
+        yield* Scope.close(firstScope, Exit.void);
+        // An active loan keeps old assets even though no new use can select its runtime.
+        expect(yield* f.fs.exists(oldStage)).toBe(true);
+        yield* registry.withInstance(providerInstanceId, (owned) =>
+          Effect.gen(function* () {
+            calls++;
+            expect(owned.runtime).toBe(second);
+            expect(owned.assets.runtimeFiles[0]!.source).not.toBe(oldStage);
+            yield* owned.assertCurrent;
+          }),
+        );
+        yield* Deferred.succeed(release, undefined);
+        expect(Exit.isFailure(yield* Fiber.join(borrowed))).toBe(true);
+        yield* registry.withInstance(providerInstanceId, (owned) =>
+          Effect.gen(function* () {
+            expect(owned.runtime).toBe(second);
+            yield* owned.assertCurrent;
+          }),
+        );
+        yield* Scope.close(secondScope, Exit.void);
+        yield* failure(registry.withInstance(providerInstanceId, () => Effect.sync(() => calls++)));
+        expect(calls).toBe(2);
+        expect(f.fetch).not.toHaveBeenCalled();
+      }),
+    ),
+);
 product("an outstanding setup loan retains actual assets after instance scope closes", () =>
   scoped(
     Effect.gen(function* () {

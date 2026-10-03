@@ -7,7 +7,11 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
-import { PiManagedRuntime, PiManagedRuntimeError } from "./PiManagedRuntime.ts";
+import {
+  PiManagedRuntime,
+  PiManagedRuntimeError,
+  type PiManagedRuntimeInstance,
+} from "./PiManagedRuntime.ts";
 import { makePiManagedRuntimeLive } from "./PiManagedRuntimeLive.ts";
 import { PiModelCatalogue } from "./PiModelCatalogue.ts";
 import { MAX_PI_RUNTIME_FILES } from "./PiManagedProcess.ts";
@@ -44,7 +48,7 @@ const Options = Schema.Struct({
   maxOutputTokens: positive,
 });
 export type PiProductionRuntimeOptions = typeof Options.Type;
-/** Private Root registry handoff. A loan retains the stage through joined setup cleanup. */
+/** Private Root handoff. Assets and runtime are owned by the same instance scope. */
 export interface PiProductionRuntimeAssets {
   readonly runtimeFiles: ReadonlyArray<{ readonly source: string; readonly target: string }>;
   readonly revalidate: Effect.Effect<void, PiManagedRuntimeError>;
@@ -56,7 +60,8 @@ export interface PiProductionRuntimeHooks {
   readonly publishAssets?: (
     instanceId: Parameters<PiManagedRuntime["Service"]["forInstance"]>[0]["instanceId"],
     assets: PiProductionRuntimeAssets,
-  ) => Effect.Effect<void, PiManagedRuntimeError>;
+    runtime: PiManagedRuntimeInstance,
+  ) => Effect.Effect<void, PiManagedRuntimeError, Scope.Scope>;
 }
 const decodeOptions = Schema.decodeEffect(Options, { onExcessProperty: "error" });
 const FileIdentity = Schema.Struct({
@@ -544,6 +549,27 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
           accepting = false;
         }),
       );
+      const ownedRuntime = Object.freeze({
+        ...managed,
+        prepareOperation: (...args: Parameters<typeof managed.prepareOperation>) => {
+          const preparation = managed.prepareOperation(...args);
+          return Effect.suspend(() => {
+            if (!accepting) return Effect.fail(closed());
+            preparing++;
+            return preparation.pipe(
+              Effect.map((prepared) => ({
+                ...prepared,
+                run: Effect.suspend(() => (accepting ? prepared.run : Effect.fail(closed()))),
+              })),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  preparing--;
+                }),
+              ),
+            );
+          });
+        },
+      });
       if (publishAssets) {
         const published: PiProductionRuntimeAssets = Object.freeze({
           runtimeFiles: Object.freeze(
@@ -568,29 +594,9 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
               );
             }),
         });
-        yield* publishAssets(instance.instanceId, published);
+        yield* publishAssets(instance.instanceId, published, ownedRuntime);
       }
-      return {
-        ...managed,
-        prepareOperation: (...args: Parameters<typeof managed.prepareOperation>) => {
-          const preparation = managed.prepareOperation(...args);
-          return Effect.suspend(() => {
-            if (!accepting) return Effect.fail(closed());
-            preparing++;
-            return preparation.pipe(
-              Effect.map((prepared) => ({
-                ...prepared,
-                run: Effect.suspend(() => (accepting ? prepared.run : Effect.fail(closed()))),
-              })),
-              Effect.ensuring(
-                Effect.sync(() => {
-                  preparing--;
-                }),
-              ),
-            );
-          });
-        },
-      };
+      return ownedRuntime;
     }).pipe(
       Effect.provide(services),
       Effect.mapError(() => unavailable()),

@@ -56,6 +56,10 @@ import * as Path from "effect/Path";
 import { PiManagedRuntime, PiManagedRuntimeError } from "./provider/pi/PiManagedRuntime.ts";
 import { PiModelCatalogue } from "./provider/pi/PiModelCatalogue.ts";
 import { makePiProductionRuntime } from "./provider/pi/PiProductionRuntime.ts";
+import {
+  ProjectTeamPiRuntime,
+  makeProjectTeamPiRuntime,
+} from "./projectWork/ProjectTeamPiRuntime.ts";
 import * as CodexResetCredit from "./provider/Layers/codexResetCredit.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
@@ -663,6 +667,11 @@ const PiModelCatalogueLayerLive = PiModelCatalogue.layer.pipe(
   Layer.provide(FetchHttpClient.layer),
 );
 
+const ProjectTeamPiRuntimeLayerLive = Layer.effect(
+  ProjectTeamPiRuntime,
+  makeProjectTeamPiRuntime(),
+);
+
 const PiProductionRuntimeLayerLive = Layer.effect(
   PiManagedRuntime,
   Effect.gen(function* () {
@@ -692,20 +701,25 @@ const PiProductionRuntimeLayerLive = Layer.effect(
       !executable && path.extname(canonicalEntry) === ".ts"
         ? path.resolve(entryDirectory, "../dist")
         : entryDirectory;
-    return yield* makePiProductionRuntime({
-      environmentId: yield* environment.getEnvironmentId,
-      distributionDirectory,
-      agentDirectory: path.join(process.getBuiltinModule("os").homedir(), ".pi/agent"),
-      nativeStateRoot: path.join(config.baseDir, "pi-managed-native"),
-      stagingRoot: config.providerStatusCacheDir,
-      protectedRoots: [config.stateDir, config.secretsDir],
-      memoryBytes: 536870912,
-      cleanupDeadlineMs: 3000,
-      maxInputTokens: 8192,
-      maxOutputTokens: 2048,
-    });
+    const teamRuntime = yield* ProjectTeamPiRuntime;
+    return yield* makePiProductionRuntime(
+      {
+        environmentId: yield* environment.getEnvironmentId,
+        distributionDirectory,
+        agentDirectory: path.join(process.getBuiltinModule("os").homedir(), ".pi/agent"),
+        nativeStateRoot: path.join(config.baseDir, "pi-managed-native"),
+        stagingRoot: config.providerStatusCacheDir,
+        protectedRoots: [config.stateDir, config.secretsDir],
+        memoryBytes: 536870912,
+        cleanupDeadlineMs: 3000,
+        maxInputTokens: 8192,
+        maxOutputTokens: 2048,
+      },
+      teamRuntime,
+    );
   }).pipe(Effect.orDie),
 ).pipe(
+  Layer.provideMerge(ProjectTeamPiRuntimeLayerLive),
   Layer.provideMerge(PiModelCatalogueLayerLive),
   // Use the same memoized service layers as the driver and skill catalogue.
   Layer.provide(SkillMaterializationService.layer),
