@@ -473,6 +473,45 @@
         "licenseId": "MIT",
         "copyrights": ["Copyright (c) 2025 opencode"]
       }
+    },
+    {
+      "repositoryUrl": "https://github.com/earendil-works/pi",
+      "version": "0.99.1",
+      "sourceUrl": "https://github.com/earendil-works/pi/blob/d86654abb8862e201933517d6f1fce9f88dd117f/LICENSE",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2025 Mario Zechner"]
+      }
+    },
+    {
+      "name": "@earendil-works/pi-mcp",
+      "version": "0.99.1",
+      "sourceUrl": "https://github.com/earendil-works/pi/tree/d86654abb8862e201933517d6f1fce9f88dd117f/packages/mcp",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2025 Mario Zechner", "Copyright (c) 2024 Anthropic, PBC"],
+        "preamble": [
+          "The OAuth implementation is adapted from the MIT-licensed Model Context Protocol TypeScript SDK v1.29.0."
+        ]
+      }
+    },
+    {
+      "name": "standardwebhooks",
+      "version": "1.1.1",
+      "sourceUrl": "https://github.com/standard-webhooks/standard-webhooks/blob/b4d2c14fc5b4ccff3ff271e3b087dff812254c59/libraries/LICENSE",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2023 Svix (https://www.svix.com)"]
+      }
+    },
+    {
+      "name": "data-uri-to-buffer",
+      "version": "4.0.1",
+      "sourceUrl": "https://github.com/TooTallNate/node-data-uri-to-buffer/blob/85cd8c854aefbf1bb636789d80364cfac8ea1583/README.md#license",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2014 Nathan Rajlich <nathan@tootallnate.net>"]
+      }
     }
   ]
 }

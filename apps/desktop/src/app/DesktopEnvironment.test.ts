@@ -138,6 +138,28 @@ describe("DesktopEnvironment", () => {
     }),
   );
 
+  for (const platform of ["linux", "darwin"] as const) {
+    it.effect(`starts the packaged ${platform} backend from its physical unpacked files`, () =>
+      Effect.gen(function* () {
+        const environment = yield* makeEnvironment({
+          platform,
+          isPackaged: true,
+          appPath: "/install/resources/app.asar",
+          resourcesPath: "/install/resources",
+        });
+        assert.equal(
+          environment.backendEntryPath,
+          "/install/resources/app.asar.unpacked/apps/server/dist/bin.mjs",
+        );
+        assert.equal(environment.serverRoot, "/install/resources/app.asar");
+        assert.equal(
+          environment.clientAssetsDir,
+          "/install/resources/app.asar/apps/server/dist/client",
+        );
+      }),
+    );
+  }
+
   it.effect("uses the stable desktop entry as the packaged Linux portal identity", () =>
     Effect.gen(function* () {
       const environment = yield* makeEnvironment({

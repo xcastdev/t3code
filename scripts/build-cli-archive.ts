@@ -498,6 +498,8 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
     path.join(serverDir, "dist-exe/pi-sdk/package.json"),
     "Rebuild the executable to stage the pinned Pi SDK metadata.",
   );
+  const piProcessOwner = path.join(serverDir, "dist-exe/pi-managed-process-owner.py");
+  yield* requireInput(piProcessOwner, "Rebuild the executable to stage the Pi process owner.");
   yield* requireInput(path.join(webClient, "index.html"), "Run `vp run --filter t3 build` first.");
   yield* requireInput(
     resourceMonitorDir,
@@ -512,6 +514,7 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
   yield* Effect.log(`[cli-archive] Staging ${stem}...`);
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
   yield* fs.copy(path.join(serverDir, "dist-exe/pi-sdk"), path.join(contentDir, "pi-sdk"));
+  yield* fs.copyFile(piProcessOwner, path.join(contentDir, "pi-managed-process-owner.py"));
   yield* stageWebClient(webClient, path.join(contentDir, "client"));
   yield* fs.copy(resourceMonitorDir, path.join(contentDir, "resource-monitor"));
   yield* stageRuntimeExternals({

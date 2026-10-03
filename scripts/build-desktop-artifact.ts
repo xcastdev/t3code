@@ -30,6 +30,7 @@ import {
 } from "./lib/brand-assets.ts";
 import { getDefaultBuildArch } from "./lib/build-target-arch.ts";
 import {
+  CLI_RUNTIME_EXTERNAL_PREFIXES,
   findInlinedExternalPackages,
   selectCliRuntimeExternalDependencies,
 } from "./lib/cli-external-packages.ts";
@@ -2653,12 +2654,18 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     directories: {
       buildResources: "apps/desktop/resources",
     },
-    // Smart unpack extracts entire native packages, including JavaScript and
-    // metadata. Windows keeps those files archived so native dependencies do
-    // not inflate the loose-file count and slow NSIS installation.
+    // Unix runs the server physically, including every external package's JS wrappers.
+    // Windows keeps its separate ASAR sidecar and native-only unpack policy.
     ...(platform === "win"
       ? { asar: { smartUnpack: false }, asarUnpack: [WINDOWS_NATIVE_ASAR_UNPACK_GLOB] }
-      : {}),
+      : {
+          asarUnpack: [
+            "apps/server/dist/**",
+            ...CLI_RUNTIME_EXTERNAL_PREFIXES.map(
+              (prefix) => `**/node_modules/${prefix}${prefix.endsWith("/") ? "**" : "*/**"}`,
+            ),
+          ],
+        }),
     extraResources: [
       ...DESKTOP_EXTRA_RESOURCES,
       ...(platform === "linux" ? LINUX_CAPTURE_EXTRA_RESOURCES : []),

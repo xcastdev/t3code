@@ -215,7 +215,13 @@ const make = Effect.fn("desktop.environment.make")(function* (
     rootDir,
     appRoot,
     serverRoot,
-    backendEntryPath: path.join(serverRoot, "apps/server/dist/bin.mjs"),
+    // The Unix server's native ownership helper cannot execute through virtual ASAR paths.
+    backendEntryPath: path.join(
+      input.isPackaged && input.platform !== "win32" && appRoot.endsWith(".asar")
+        ? `${appRoot}.unpacked`
+        : serverRoot,
+      "apps/server/dist/bin.mjs",
+    ),
     clientAssetsDir: path.join(serverRoot, "apps/server/dist/client"),
     backendCwd: input.isPackaged ? homeDirectory : appRoot,
     preloadPath: path.join(input.dirname, "preload.cjs"),
