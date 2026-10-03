@@ -16,7 +16,7 @@ import {
   type SkillMaterializationServiceShape,
   withOwnedSkillMaterialization,
 } from "../../skills/SkillMaterializationService.ts";
-import { SKILL_BODY_FILE } from "../../skills/SkillPackage.ts";
+import { hashSkillPackage, SKILL_BODY_FILE } from "../../skills/SkillPackage.ts";
 import type { PiManagedLaunch } from "./PiManagedProcess.ts";
 import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
 import type { PiManagedSkillSelection } from "./PiManagedSkillSelection.ts";
@@ -101,18 +101,21 @@ export function piManagedSkillResourceIdentity(selection: ReadonlyArray<PiManage
     .digest("hex");
 }
 
-export interface PiManagedSkillResourcesInput {
+export interface PiManagedSkillPlanInput {
   readonly selection: ReadonlyArray<PiManagedSkillSelection>;
   readonly skillPlan: ProviderSkillPlan | undefined;
   readonly materialization: SkillMaterializationServiceShape;
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
+  readonly authorizeCurrent: Effect.Effect<void, PiManagedRuntimeError>;
+}
+
+export interface PiManagedSkillResourcesInput extends PiManagedSkillPlanInput {
   readonly stagingRoot: string;
   readonly stagingDirectory: string;
   readonly existingRuntimeFiles: PiManagedLaunch["runtimeFiles"];
   readonly protectedRoots: ReadonlyArray<string>;
   readonly writableRoots: ReadonlyArray<string>;
-  readonly authorizeCurrent: Effect.Effect<void, PiManagedRuntimeError>;
 }
 
 const prepareCaptured = Effect.fn("PiManagedSkillResources.prepareCaptured")(function* (
@@ -198,6 +201,117 @@ const prepareCaptured = Effect.fn("PiManagedSkillResources.prepareCaptured")(fun
   return { ...resources, revalidate };
 });
 
+// Decode and freeze caller-owned data before any Effect execution or asynchronous admission.
+function capturePiManagedSkillPlan(input: PiManagedSkillPlanInput) {
+  const selection = Object.freeze(
+    decodeSelection(input.selection, { onExcessProperty: "error" }).map((entry) =>
+      Object.freeze({ ...entry }),
+    ),
+  );
+  const identity = decodeIdentity(
+    { threadId: input.threadId, providerInstanceId: input.providerInstanceId },
+    { onExcessProperty: "error" },
+  );
+  const decoded =
+    input.skillPlan === undefined
+      ? undefined
+      : decodePlan(input.skillPlan, { onExcessProperty: "error" });
+  const plan =
+    decoded === undefined
+      ? undefined
+      : Object.freeze({
+          ...decoded,
+          skillKeys: Object.freeze([...decoded.skillKeys]),
+          payload: Object.freeze({
+            ...decoded.payload,
+            skills: Object.freeze(
+              decoded.payload.skills.map((entry) => Object.freeze({ ...entry })),
+            ),
+          }),
+        });
+  return Object.freeze({
+    ...identity,
+    selection,
+    skillPlan: plan,
+    materialization: input.materialization,
+    authorizeCurrent: input.authorizeCurrent,
+  });
+}
+
+const validateCaptured = Effect.fn("PiManagedSkillResources.validateCaptured")(function* (
+  input: PiManagedSkillPlanInput,
+  plan: typeof planSchema.Type | undefined,
+): Effect.fn.Return<void, PiManagedRuntimeError, FileSystem.FileSystem | Path.Path> {
+  if (plan === undefined) {
+    if (input.selection.length !== 0)
+      return yield* rejected("Selected managed skills require an explicit materialization plan.");
+    return;
+  }
+  const selectedKeys = input.selection.map((entry) => entry.key).sort();
+  const planKeys = [...plan.skillKeys].sort();
+  const payloadKeys = plan.payload.skills.map((entry) => entry.key).sort();
+  if (
+    plan.providerInstanceId !== input.providerInstanceId ||
+    selectedKeys.length !== planKeys.length ||
+    selectedKeys.length !== payloadKeys.length ||
+    selectedKeys.some((key, index) => key !== planKeys[index] || key !== payloadKeys[index])
+  )
+    return yield* rejected("Managed skill plan instance or exact selected key set does not match.");
+
+  yield* input.authorizeCurrent;
+  yield* withOwnedSkillMaterialization(
+    input.materialization,
+    {
+      sessionId: `thread-${crypto.createHash("sha256").update(input.threadId).digest("hex").slice(0, 24)}`,
+      providerInstanceId: input.providerInstanceId,
+      desiredRevision: plan.desiredRevision,
+      skillKeys: selectedKeys,
+    },
+    (owned) =>
+      Effect.gen(function* () {
+        yield* input.authorizeCurrent;
+        if (
+          plan.payload.root !== owned.root ||
+          plan.payload.skills.some(
+            (entry) => entry.path !== path.join(owned.skillPaths.get(entry.key)!, SKILL_BODY_FILE),
+          )
+        )
+          return yield* rejected(
+            "Managed skill plan paths do not match the owned materialization.",
+          );
+        yield* owned.revalidate;
+        for (const entry of input.selection) {
+          const actualHash = yield* hashSkillPackage(owned.skillPaths.get(entry.key)!);
+          if (actualHash !== entry.expectedHash)
+            return yield* rejected(
+              "Owned managed skill package hash does not match current selection.",
+            );
+        }
+        yield* owned.revalidate;
+        yield* input.authorizeCurrent;
+      }),
+  ).pipe(
+    Effect.mapError((error) =>
+      error._tag === "PiManagedRuntimeError"
+        ? error
+        : rejected("Owned managed skill materialization is unavailable or changed."),
+    ),
+  );
+  yield* input.authorizeCurrent;
+});
+
+/** Validates a current owned plan without allocating or changing its resource view. */
+export function validatePiManagedSkillPlan(
+  input: PiManagedSkillPlanInput,
+): Effect.Effect<void, PiManagedRuntimeError, FileSystem.FileSystem | Path.Path> {
+  try {
+    const captured = capturePiManagedSkillPlan(input);
+    return validateCaptured(captured, captured.skillPlan);
+  } catch {
+    return Effect.fail(rejected("Managed skill plan, selection or runtime identity is invalid."));
+  }
+}
+
 /** Root supplies current authority and cache policy; plan paths never authorize source access. */
 export function preparePiManagedSkillResources(
   input: PiManagedSkillResourcesInput,
@@ -208,32 +322,7 @@ export function preparePiManagedSkillResources(
 > {
   // Capture before any asynchronous admission or authorization, including before Effect execution.
   try {
-    const selection = Object.freeze(
-      decodeSelection(input.selection, { onExcessProperty: "error" }).map((entry) =>
-        Object.freeze({ ...entry }),
-      ),
-    );
-    const identity = decodeIdentity(
-      { threadId: input.threadId, providerInstanceId: input.providerInstanceId },
-      { onExcessProperty: "error" },
-    );
-    const decoded =
-      input.skillPlan === undefined
-        ? undefined
-        : decodePlan(input.skillPlan, { onExcessProperty: "error" });
-    const plan =
-      decoded === undefined
-        ? undefined
-        : Object.freeze({
-            ...decoded,
-            skillKeys: Object.freeze([...decoded.skillKeys]),
-            payload: Object.freeze({
-              ...decoded.payload,
-              skills: Object.freeze(
-                decoded.payload.skills.map((entry) => Object.freeze({ ...entry })),
-              ),
-            }),
-          });
+    const common = capturePiManagedSkillPlan(input);
     const staging = decodeStaging(
       {
         stagingRoot: input.stagingRoot,
@@ -245,10 +334,7 @@ export function preparePiManagedSkillResources(
       { onExcessProperty: "error" },
     );
     const captured = Object.freeze({
-      ...identity,
-      selection,
-      skillPlan: plan,
-      materialization: input.materialization,
+      ...common,
       stagingRoot: staging.stagingRoot,
       stagingDirectory: staging.stagingDirectory,
       existingRuntimeFiles: Object.freeze(
@@ -258,7 +344,7 @@ export function preparePiManagedSkillResources(
       writableRoots: Object.freeze([...staging.writableRoots]),
       authorizeCurrent: input.authorizeCurrent,
     });
-    return prepareCaptured(captured, plan);
+    return prepareCaptured(captured, common.skillPlan);
   } catch {
     return Effect.fail(rejected("Managed skill plan, selection or runtime identity is invalid."));
   }
