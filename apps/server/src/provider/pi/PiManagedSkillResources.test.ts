@@ -29,6 +29,7 @@ import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
 import {
   piManagedSkillResourceIdentity,
   preparePiManagedSkillResources,
+  validatePiManagedSkillPlan,
 } from "./PiManagedSkillResources.ts";
 import { resolvePiManagedSkillSelection } from "./PiManagedSkillSelection.ts";
 
@@ -42,6 +43,7 @@ const threadId = Schema.decodeSync(ThreadId)("bridge-thread");
 const providerInstanceId = Schema.decodeSync(ProviderInstanceId)("pi-bridge");
 const decodeRevision = Schema.decodeUnknownSync(SkillCatalogRevision);
 const decodeThread = Schema.decodeUnknownSync(ThreadId);
+const decodeProvider = Schema.decodeUnknownSync(ProviderInstanceId);
 const decodePayload = Schema.decodeUnknownSync(
   Schema.Struct({
     kind: Schema.Literal("pi-managed-skills"),
@@ -863,4 +865,288 @@ describe("PiManagedSkillResources actual Linux owned staging", () => {
       );
     }).pipe(Effect.provide(TestLayer)),
   );
+});
+
+describe("PiManagedSkillResources validate-only plan", () => {
+  it.layer(NodeServices.layer)("portable validation", (it) => {
+    it.effect("absent empty selection is inert without materialization or authority work", () =>
+      Effect.gen(function* () {
+        const f = portableFixture();
+        const observed = yield* observeDescriptors();
+        yield* validatePiManagedSkillPlan({ ...f.input, selection: [], skillPlan: undefined });
+        assert.equal(observed.acquired(), 0);
+      }),
+    );
+
+    it.effect("nonempty selection requires a plan before materialization or authority work", () =>
+      Effect.gen(function* () {
+        const f = portableFixture();
+        denied(
+          yield* validatePiManagedSkillPlan({ ...f.input, skillPlan: undefined }).pipe(
+            Effect.result,
+          ),
+          /explicit/,
+        );
+      }),
+    );
+
+    it.effect("malformed explicit empty plan is denied before authority work", () =>
+      Effect.gen(function* () {
+        const f = portableFixture();
+        f.input.selection.length = 0;
+        f.plan.skillKeys.length = 0;
+        f.plan.payload.skills.length = 0;
+        Object.assign(f.plan.payload, { root: "relative" });
+        denied(yield* validatePiManagedSkillPlan(f.input).pipe(Effect.result));
+      }),
+    );
+
+    it.effect("unowned custom service cannot admit an explicit empty plan", () =>
+      Effect.gen(function* () {
+        const f = portableFixture();
+        f.input.selection.length = 0;
+        f.plan.skillKeys.length = 0;
+        f.plan.payload.skills.length = 0;
+        denied(
+          yield* validatePiManagedSkillPlan({ ...f.input, authorizeCurrent: Effect.void }).pipe(
+            Effect.result,
+          ),
+          /Owned/,
+        );
+      }),
+    );
+  });
+
+  linux(
+    "validates the complete actual owned package without stage or materialization allocation",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.fs.remove(f.input.stagingRoot, { recursive: true });
+        const materialize = vi.spyOn(f.materialization, "materialize");
+        const dispose = vi.spyOn(f.materialization, "dispose");
+        const disposeSession = vi.spyOn(f.materialization, "disposeSession");
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            materialize.mockRestore();
+            dispose.mockRestore();
+            disposeSession.mockRestore();
+          }),
+        );
+        const observed = yield* observeDescriptors();
+        yield* validatePiManagedSkillPlan(f.input);
+        assert.isAbove(observed.acquired(), 0);
+        assert.equal(observed.active.size, 0);
+        assert.isFalse(yield* f.fs.exists(f.input.stagingRoot));
+        assert.equal(materialize.mock.calls.length, 0);
+        assert.equal(dispose.mock.calls.length, 0);
+        assert.equal(disposeSession.mock.calls.length, 0);
+        assert.equal(
+          yield* hashSkillPackage(f.ownedRoot + "/selected"),
+          f.selection[0]!.expectedHash,
+        );
+      }).pipe(Effect.provide(TestLayer)),
+  );
+
+  linux("explicit empty plan validates real ownership without staging", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture(true);
+      const observed = yield* observeDescriptors();
+      yield* validatePiManagedSkillPlan(f.input);
+      assert.isAbove(observed.acquired(), 0);
+      assert.equal(observed.active.size, 0);
+      assert.isFalse(yield* f.fs.exists(f.input.stagingRoot));
+      yield* f.materialization.disposeSession({
+        sessionId: `thread-${crypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24)}`,
+        providerInstanceId,
+      });
+      denied(yield* validatePiManagedSkillPlan(f.input).pipe(Effect.result), /Owned/);
+      assert.equal(observed.active.size, 0);
+      assert.isFalse(yield* f.fs.exists(f.ownedRoot));
+    }).pipe(Effect.provide(TestLayer)),
+  );
+
+  for (const mismatch of [
+    "root",
+    "path",
+    "revision",
+    "thread",
+    "provider",
+    "key",
+    "payload-key",
+    "hash",
+  ] as const)
+    linux(`denies exact ${mismatch} mismatch against the actual owned materialization`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const payload = decodePayload(f.plan.payload);
+        const observed = yield* observeDescriptors();
+        const input = {
+          ...f.input,
+          selection: f.selection.map((entry) => ({
+            ...entry,
+            expectedHash: mismatch === "hash" ? hash("b".repeat(64)) : entry.expectedHash,
+          })),
+          threadId: mismatch === "thread" ? decodeThread("other-thread") : threadId,
+          providerInstanceId:
+            mismatch === "provider" ? decodeProvider("pi-other") : providerInstanceId,
+          skillPlan: {
+            ...f.plan,
+            desiredRevision: mismatch === "revision" ? decodeRevision(4) : revision,
+            skillKeys: mismatch === "key" ? [key("other")] : f.plan.skillKeys,
+            payload: {
+              ...payload,
+              root: mismatch === "root" ? f.root : payload.root,
+              skills: payload.skills.map((entry) => ({
+                ...entry,
+                key: mismatch === "payload-key" ? key("other") : entry.key,
+                path: mismatch === "path" ? entry.path + "/extra" : entry.path,
+              })),
+            },
+          },
+        };
+        denied(yield* validatePiManagedSkillPlan(input).pipe(Effect.result));
+        assert.equal(observed.active.size, 0);
+        assert.deepEqual(yield* f.fs.readDirectory(f.input.stagingDirectory), []);
+        assert.equal(
+          yield* hashSkillPackage(f.ownedRoot + "/selected"),
+          f.selection[0]!.expectedHash,
+        );
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
+  linux("hashes assets as part of the complete package and denies a disposed generation", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* f.fs.writeFileString(f.ownedRoot + "/selected/assets/notes.txt", "changed asset");
+      const observed = yield* observeDescriptors();
+      denied(yield* validatePiManagedSkillPlan(f.input).pipe(Effect.result), /hash/);
+      assert.equal(observed.active.size, 0);
+      assert.equal(yield* hashSkillPackage(f.skill!.packagePath), f.selection[0]!.expectedHash);
+      yield* f.materialization.dispose({
+        sessionId: `thread-${crypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24)}`,
+        providerInstanceId,
+        desiredRevision: revision,
+      });
+      denied(yield* validatePiManagedSkillPlan(f.input).pipe(Effect.result), /Owned/);
+      assert.isFalse(yield* f.fs.exists(f.ownedRoot));
+      assert.equal(observed.active.size, 0);
+    }).pipe(Effect.provide(TestLayer)),
+  );
+
+  linux(
+    "snapshots caller plan, selection and identity before execution and held authorization",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const selection = f.selection.map((entry) => ({ ...entry }));
+        const plan = {
+          ...f.plan,
+          skillKeys: [...f.plan.skillKeys],
+          payload: decodePayload(f.plan.payload),
+        };
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let calls = 0;
+        const input = {
+          ...f.input,
+          selection,
+          skillPlan: plan,
+          authorizeCurrent: Effect.gen(function* () {
+            if (++calls === 1) {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+            }
+          }),
+        };
+        const captured = validatePiManagedSkillPlan(input);
+        Object.assign(input, {
+          threadId: decodeThread("mutated-thread"),
+          providerInstanceId: "pi-other",
+          materialization: unusedService,
+        });
+        const running = yield* captured.pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        Object.assign(selection[0]!, {
+          key: key("other"),
+          skillId: id("other"),
+          packagePath: "/absent",
+          expectedHash: hash("b".repeat(64)),
+        });
+        plan.skillKeys.length = 0;
+        Object.assign(plan, { providerInstanceId: "pi-other", desiredRevision: 99 });
+        Object.assign(plan.payload, { root: "/absent" });
+        Object.assign(plan.payload.skills[0]!, { key: key("other"), path: "/absent/SKILL.md" });
+        Object.assign(input, { authorizeCurrent: Effect.die("mutated authorization") });
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(running);
+        assert.isAtLeast(calls, 3);
+        assert.deepEqual(yield* f.fs.readDirectory(f.input.stagingDirectory), []);
+      }).pipe(Effect.provide(TestLayer)),
+  );
+
+  linux("held current-authority change denies before admission", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let current = true;
+      const observed = yield* observeDescriptors();
+      const running = yield* validatePiManagedSkillPlan({
+        ...f.input,
+        authorizeCurrent: Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          if (!current)
+            return yield* new PiManagedRuntimeError({
+              code: "denied",
+              detail: "revoked current authority",
+            });
+        }),
+      }).pipe(Effect.result, Effect.forkChild);
+      yield* Deferred.await(entered);
+      current = false;
+      yield* Deferred.succeed(release, undefined);
+      denied(yield* Fiber.join(running), /revoked/);
+      assert.equal(observed.acquired(), 0);
+    }).pipe(Effect.provide(TestLayer)),
+  );
+
+  for (const boundary of ["hash", "final-release"] as const)
+    linux(`current authority change during actual ${boundary} denies and drains descriptors`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        let current = true;
+        const observed = yield* observeDescriptors(async (handle, entry) => {
+          if (boundary === "hash" && entry.endsWith("/notes.txt")) current = false;
+          if (boundary === "final-release" && entry.endsWith("/.t3-owned.json")) {
+            const close = handle.close.bind(handle);
+            handle.close = async () => {
+              await close();
+              current = false;
+            };
+          }
+        });
+        denied(
+          yield* validatePiManagedSkillPlan({
+            ...f.input,
+            authorizeCurrent: Effect.suspend(() =>
+              current
+                ? Effect.void
+                : Effect.fail(
+                    new PiManagedRuntimeError({
+                      code: "denied",
+                      detail: "revoked current authority",
+                    }),
+                  ),
+            ),
+          }).pipe(Effect.result),
+          /revoked/,
+        );
+        assert.isFalse(current);
+        assert.isAbove(observed.acquired(), 0);
+        assert.equal(observed.active.size, 0);
+        assert.deepEqual(yield* f.fs.readDirectory(f.input.stagingDirectory), []);
+      }).pipe(Effect.provide(TestLayer)),
+    );
 });
