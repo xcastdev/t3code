@@ -291,6 +291,9 @@ const validReceipt = (retained: ProjectManagedSetupRetained): boolean => {
   );
 };
 
+/** The durable parent validates the same complete receipt before accepting or replaying it. */
+export const isProjectManagedSetupReceiptValid = validReceipt;
+
 /** Owns setup lifecycle ordering; durable authority, script resolution and native launch stay in Root. */
 export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) => {
   const run = Effect.fn("ProjectManagedSetup.run")(function* (
