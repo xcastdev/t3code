@@ -36,6 +36,7 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
+import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import type { ProjectTeamDispatchSnapshot } from "./ProjectTeamDispatch.ts";
 import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
@@ -667,6 +668,159 @@ it.effect("denies delete and recreation with identical fields and creation time"
       }),
     );
   }),
+);
+
+it.effect(
+  "rejects a changed original shell before combining it with recreation after a lineage read",
+  () =>
+    withSystem((system) =>
+      Effect.gen(function* () {
+        const original = yield* system.make(() => Effect.void);
+        yield* system.run(original.ensure(snapshot(), selection));
+        yield* system.run(
+          system.engine.dispatch({
+            type: "thread.meta.update",
+            commandId: CommandId.make("changed-before-race"),
+            threadId: threadCommand().threadId,
+            title: "Changed before ensure",
+          }),
+        );
+        const before = yield* system.run(system.query.getThreadShellById(threadCommand().threadId));
+        expect(Option.isSome(before) && before.value.title).toBe("Changed before ensure");
+        const store = yield* system.run(Effect.service(OrchestrationEventStore));
+        let injected = false;
+        let dispatched = 0;
+        const factory = yield* system.run(
+          makeProjectTeamThreads({ assertCurrent: () => Effect.void }).pipe(
+            Effect.provideService(OrchestrationEngineService, {
+              ...system.engine,
+              dispatch: (command) => {
+                dispatched++;
+                return system.engine.dispatch(command);
+              },
+            }),
+            Effect.provideService(OrchestrationEventStore, {
+              ...store,
+              hasEventAfter: (input) =>
+                Effect.gen(function* () {
+                  const found = yield* store.hasEventAfter(input);
+                  if (!found && !injected && input.type === "thread.created") {
+                    injected = true;
+                    yield* system.engine.dispatch({
+                      type: "thread.delete",
+                      commandId: CommandId.make("race-delete"),
+                      threadId: threadCommand().threadId,
+                    });
+                    yield* system.engine.dispatch({
+                      ...threadCommand(),
+                      commandId: CommandId.make("race-recreate"),
+                    });
+                  }
+                  return found;
+                }),
+            }),
+          ),
+        );
+        const result = yield* system.run(Effect.exit(factory.ensure(snapshot(), selection)));
+        const creations = (yield* originalEvents(system)).filter(
+          (event) => event.type === "thread.created",
+        );
+        expect(dispatched).toBe(0);
+        // An early denial of the changed shell is valid. On the old observation order,
+        // the real query returns false before both receipt-awaited replacement commands.
+        if (injected) {
+          expect(creations).toHaveLength(2);
+          for (const commandId of ["race-delete", "race-recreate"]) {
+            const receipt = yield* system.run(
+              system.receipts.getByCommandId({ commandId: CommandId.make(commandId) }),
+            );
+            expect(Option.isSome(receipt) && receipt.value.status).toBe("accepted");
+          }
+          const after = yield* system.run(
+            system.query.getThreadShellById(threadCommand().threadId),
+          );
+          expect(Option.isSome(after) && after.value.title).toBe("Project team assignment");
+        } else {
+          expect(creations).toHaveLength(1);
+        }
+        expect(Exit.isFailure(result)).toBe(true);
+      }),
+    ),
+);
+
+it.effect("checks recreation after a matching shell read before confirming original identity", () =>
+  withSystem((system) =>
+    Effect.gen(function* () {
+      const original = yield* system.make(() => Effect.void);
+      yield* system.run(original.ensure(snapshot(), selection));
+      let injected = false;
+      const factory = yield* system.run(
+        makeProjectTeamThreads({ assertCurrent: () => Effect.void }).pipe(
+          Effect.provideService(ProjectionSnapshotQuery, {
+            ...system.query,
+            getThreadShellById: (threadId) =>
+              system.query.getThreadShellById(threadId).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    if (injected) return;
+                    injected = true;
+                    yield* system.engine.dispatch({
+                      type: "thread.delete",
+                      commandId: CommandId.make("shell-race-delete"),
+                      threadId,
+                    });
+                    yield* system.engine.dispatch({
+                      ...threadCommand(),
+                      commandId: CommandId.make("shell-race-recreate"),
+                    });
+                  }),
+                ),
+              ),
+          }),
+        ),
+      );
+      const result = yield* system.run(Effect.exit(factory.ensure(snapshot(), selection)));
+      expect(injected).toBe(true);
+      expect(
+        (yield* originalEvents(system)).filter((event) => event.type === "thread.created"),
+      ).toHaveLength(2);
+      expect(Exit.isFailure(result)).toBe(true);
+    }),
+  ),
+);
+
+it.effect("accepts ordinary concurrent history during the final lineage query", () =>
+  withSystem((system) =>
+    Effect.gen(function* () {
+      const original = yield* system.make(() => Effect.void);
+      const first = yield* system.run(original.ensure(snapshot(), selection));
+      const store = yield* system.run(Effect.service(OrchestrationEventStore));
+      let injected = false;
+      const factory = yield* system.run(
+        makeProjectTeamThreads({ assertCurrent: () => Effect.void }).pipe(
+          Effect.provideService(OrchestrationEventStore, {
+            ...store,
+            hasEventAfter: (input) =>
+              store.hasEventAfter(input).pipe(
+                Effect.tap(() => {
+                  if (injected) return Effect.void;
+                  injected = true;
+                  return system.engine.dispatch({
+                    type: "thread.meta.update",
+                    commandId: CommandId.make("concurrent-history"),
+                    threadId: threadCommand().threadId,
+                    branch: threadCommand().branch,
+                  });
+                }),
+              ),
+          }),
+        ),
+      );
+      expect(yield* system.run(factory.ensure(snapshot(), selection))).toEqual(first);
+      expect(injected).toBe(true);
+      expect(yield* originalEvents(system)).toHaveLength(2);
+    }),
+  ),
 );
 
 it.effect.each(["project", "createdAt"] as const)("denies a changed current shell %s", (field) =>

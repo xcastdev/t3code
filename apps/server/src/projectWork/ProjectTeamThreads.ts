@@ -122,19 +122,20 @@ export const makeProjectTeamThreads = <RootError, RootServices>(ports: {
       });
       const verify = Effect.fn("ProjectTeamThreads.verify")(function* () {
         const original = yield* readOriginal();
+        const thread = yield* query.getThreadShellById(command.threadId);
+        if (Option.isNone(original) || Option.isNone(thread) || !matches(thread.value))
+          return yield* deny("Original assignment thread is missing, inactive, or changed");
+        // Creation history is monotonic. Check it after the shell so an older
+        // absence cannot validate a replacement shell read later.
         if (
-          Option.isSome(original) &&
-          (yield* eventStore.hasEventAfter({
+          yield* eventStore.hasEventAfter({
             aggregateKind: "thread",
             aggregateId: command.threadId,
             sequenceExclusive: original.value,
             type: "thread.created",
-          }))
+          })
         )
           return yield* deny("Original assignment thread was recreated");
-        const thread = yield* query.getThreadShellById(command.threadId);
-        if (Option.isNone(original) || Option.isNone(thread) || !matches(thread.value))
-          return yield* deny("Original assignment thread is missing, inactive, or changed");
         yield* ports.assertCurrent(snapshot, modelSelection);
         return {
           threadId: command.threadId,
