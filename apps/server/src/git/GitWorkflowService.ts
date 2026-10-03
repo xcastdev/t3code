@@ -55,6 +55,7 @@ import {
 import * as GitManager from "./GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
+import { canonicalGitMutationKey, prepareManagedGitExecution } from "./ManagedGitExecution.ts";
 
 export function pullStrategyArgs(strategy: "merge" | "rebase" | "ff-only" | undefined): string[] {
   if (strategy === "rebase") return ["pull", "--rebase"];
@@ -309,8 +310,10 @@ export const make = Effect.gen(function* () {
     return handle;
   });
 
-  const mutationKey = (handle: VcsDriverRegistry.VcsDriverHandle) =>
-    `${handle.kind}\0${handle.repository.rootPath}`;
+  const mutationKey = (handle: VcsDriverRegistry.VcsDriverHandle, cwd: string) =>
+    handle.repository.metadataPath
+      ? canonicalGitMutationKey(handle.repository.metadataPath, cwd)
+      : Effect.succeed(`${handle.kind}\0${handle.repository.rootPath}`);
 
   const getMutationSemaphore = Effect.fn("GitWorkflowService.getMutationSemaphore")(function* (
     key: string,
@@ -334,7 +337,8 @@ export const make = Effect.gen(function* () {
   ): Effect.Effect<A, E | GitCommandError, R> =>
     ensureGitCommand(operation, cwd).pipe(
       Effect.flatMap((handle) =>
-        getMutationSemaphore(mutationKey(handle)).pipe(
+        mutationKey(handle, cwd).pipe(
+          Effect.flatMap(getMutationSemaphore),
           Effect.flatMap((semaphore) => semaphore.withPermit(mutation)),
         ),
       ),
@@ -1167,45 +1171,50 @@ export const make = Effect.gen(function* () {
         ),
       ),
     createWorktree: (input, options) =>
-      serializedMutation(
-        "GitWorkflowService.createWorktree",
-        input.cwd,
-        ensureGitCommand("GitWorkflowService.createWorktree", input.cwd).pipe(
-          Effect.andThen(
-            Effect.gen(function* () {
-              // A confirmed worktree is a mutation of the reviewed repository,
-              // so validate its captured state only after entering its queue.
-              // The optional field intentionally keeps older clients compatible.
-              if (input.precondition !== undefined) {
-                const status = yield* git.statusDetails(input.cwd);
-                const expected = input.precondition;
-                if (
-                  status.headCommit !== expected.expectedHeadCommit ||
-                  status.indexTree !== expected.expectedIndexTree ||
-                  (expected.expectedRefName !== undefined &&
-                    status.branch !== expected.expectedRefName) ||
-                  (expected.expectedMergeHeads !== undefined &&
-                    (status.pendingMergeHeads ?? []).join("\0") !==
-                      expected.expectedMergeHeads.join("\0"))
-                ) {
-                  return yield* new GitCommandError({
-                    operation: "GitWorkflowService.createWorktree.precondition",
-                    command: "git",
-                    cwd: input.cwd,
-                    detail: "Repository changed after the action was reviewed.",
-                    code: "stale_git_state",
-                  });
-                }
-              }
-              return yield* git.createWorktree(input, options);
-            }),
+      options?.managed
+        ? prepareManagedGitExecution(options.managed, input).pipe(
+            Effect.flatMap((common) => getMutationSemaphore(`git\0${common}`)),
+            Effect.flatMap((semaphore) =>
+              semaphore.withPermit(Effect.suspend(() => git.createWorktree(input, options))),
+            ),
+          )
+        : serializedMutation(
+            "GitWorkflowService.createWorktree",
+            input.cwd,
+            ensureGitCommand("GitWorkflowService.createWorktree", input.cwd).pipe(
+              Effect.andThen(
+                Effect.gen(function* () {
+                  // A confirmed worktree is a mutation of the reviewed repository,
+                  // so validate its captured state only after entering its queue.
+                  // The optional field intentionally keeps older clients compatible.
+                  if (input.precondition !== undefined) {
+                    const status = yield* git.statusDetails(input.cwd);
+                    const expected = input.precondition;
+                    if (
+                      status.headCommit !== expected.expectedHeadCommit ||
+                      status.indexTree !== expected.expectedIndexTree ||
+                      (expected.expectedRefName !== undefined &&
+                        status.branch !== expected.expectedRefName) ||
+                      (expected.expectedMergeHeads !== undefined &&
+                        (status.pendingMergeHeads ?? []).join("\0") !==
+                          expected.expectedMergeHeads.join("\0"))
+                    ) {
+                      return yield* new GitCommandError({
+                        operation: "GitWorkflowService.createWorktree.precondition",
+                        command: "git",
+                        cwd: input.cwd,
+                        detail: "Repository changed after the action was reviewed.",
+                        code: "stale_git_state",
+                      });
+                    }
+                  }
+                  return yield* git.createWorktree(input, options);
+                }),
+              ),
+            ),
           ),
-        ),
-      ),
     fetchRemote: (input) =>
-      ensureGitCommand("GitWorkflowService.fetchRemote", input.cwd).pipe(
-        Effect.andThen(git.fetchRemote(input)),
-      ),
+      serializedMutation("GitWorkflowService.fetchRemote", input.cwd, git.fetchRemote(input)),
     remoteExists: (input) =>
       ensureGitCommand("GitWorkflowService.remoteExists", input.cwd).pipe(
         Effect.andThen(git.remoteExists(input)),
@@ -1219,13 +1228,9 @@ export const make = Effect.gen(function* () {
         Effect.andThen(git.resolveRemoteTrackingCommit(input)),
       ),
     removeWorktree: (input) =>
-      ensureGitCommand("GitWorkflowService.removeWorktree", input.cwd).pipe(
-        Effect.andThen(git.removeWorktree(input)),
-      ),
+      serializedMutation("GitWorkflowService.removeWorktree", input.cwd, git.removeWorktree(input)),
     pruneWorktrees: (input) =>
-      ensureGitCommand("GitWorkflowService.pruneWorktrees", input.cwd).pipe(
-        Effect.andThen(git.pruneWorktrees(input)),
-      ),
+      serializedMutation("GitWorkflowService.pruneWorktrees", input.cwd, git.pruneWorktrees(input)),
     createRef: (input) =>
       serializedMutation("GitWorkflowService.createRef", input.cwd, git.createRef(input)),
     switchRef: (input) =>
@@ -1235,9 +1240,7 @@ export const make = Effect.gen(function* () {
         Effect.scoped(git.switchRef(input)),
       ),
     renameBranch: (input) =>
-      ensureGit("GitWorkflowService.renameBranch", input.cwd).pipe(
-        Effect.andThen(git.renameBranch(input)),
-      ),
+      serializedMutation("GitWorkflowService.renameBranch", input.cwd, git.renameBranch(input)),
   });
 });
 

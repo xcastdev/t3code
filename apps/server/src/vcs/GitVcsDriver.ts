@@ -50,6 +50,7 @@ import {
 } from "./GitVcsDriverCore.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
+import type { ManagedGitExecution } from "../git/ManagedGitExecution.ts";
 
 export interface ExecuteGitInput {
   readonly operation: string;
@@ -156,6 +157,7 @@ export interface CreateWorktreeProgress {
 }
 
 export interface CreateWorktreeOptions {
+  readonly managed?: ManagedGitExecution;
   readonly progress?: CreateWorktreeProgress;
 }
 
@@ -599,7 +601,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       vcsProcess,
       "GitVcsDriver.detectRepository.commonDir",
       cwd,
-      ["rev-parse", "--git-common-dir"],
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ).pipe(Effect.orElseSucceed(() => null));
 
     return {
