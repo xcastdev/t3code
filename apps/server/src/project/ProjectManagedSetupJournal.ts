@@ -245,6 +245,21 @@ const ownerConsistent = (owner: PiManagedProcessOwner, allocation: PiManagedProc
   owner.cgroup.endsWith(`/${allocation.unit}`) &&
   !owner.cgroup.split("/").some((part) => part === "." || part === "..");
 
+// Cleanup may lack a recovered start or child exit. Two known child identities must agree.
+const receiptMatchesStart = (receipt: typeof receiptSchema.Type, startedPid: number | null) =>
+  (startedPid === null ||
+    receipt.drain?.childPid == null ||
+    receipt.drain.childPid === startedPid) &&
+  (receipt.outcome !== "succeeded" ||
+    (startedPid !== null && receipt.drain?.childPid === startedPid)) &&
+  (receipt.outcome !== "skipped" || startedPid === null);
+const receiptStatus = (receipt: typeof receiptSchema.Type) =>
+  receipt.outcome === "skipped"
+    ? "no-script"
+    : receipt.outcome === "succeeded"
+      ? "completed"
+      : "failed";
+
 /** One authoritative SQL journal supplies setup persistence; native execution remains the isolated owner. */
 export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetupJournal")(
   function* (options: {
@@ -301,8 +316,13 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
         activation: row.activation,
         uncertain: row.status === "uncertain" || row.uncertainty_json !== null,
       };
-      if (receipt && !isProjectManagedSetupReceiptValid(retained))
-        return yield* failure("Retained setup receipt contradicts its original ownership");
+      if (
+        receipt &&
+        (!isProjectManagedSetupReceiptValid(retained) ||
+          !receiptMatchesStart(receipt, row.started_pid) ||
+          (row.status !== "uncertain" && row.status !== receiptStatus(receipt)))
+      )
+        return yield* failure("Retained setup receipt contradicts its recorded lifecycle");
       if (
         row.drain_json !== null &&
         (!receipt?.drain || !same(yield* decodeDrain(row.drain_json), receipt.drain))
@@ -516,8 +536,14 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
       yield* sql.withTransaction(
         Effect.gen(function* () {
           const old = yield* read(input);
-          if (!old || !isProjectManagedSetupReceiptValid({ ...old.retained, receipt }))
-            return yield* failure("Setup completion contradicts retained physical ownership");
+          if (
+            !old ||
+            !isProjectManagedSetupReceiptValid({ ...old.retained, receipt }) ||
+            !receiptMatchesStart(receipt, old.row.started_pid)
+          )
+            return yield* failure(
+              "Setup completion contradicts retained physical ownership or start",
+            );
           if (old.retained.receipt) {
             if (!same(old.retained.receipt, receipt))
               return yield* failure("Setup completion identity was reused");
@@ -525,18 +551,10 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
           }
           if (receipt.outcome === "succeeded" || receipt.outcome === "skipped") {
             yield* current(input, receipt.selection, "completion");
-            if (
-              old.retained.uncertain ||
-              (receipt.outcome === "succeeded" && receipt.drain?.childPid !== old.row.started_pid)
-            )
-              return yield* failure("Successful setup has no exact native start receipt");
+            if (old.retained.uncertain)
+              return yield* failure("Successful setup requires certain retained ownership");
           }
-          const status =
-            receipt.outcome === "skipped"
-              ? "no-script"
-              : receipt.outcome === "succeeded"
-                ? "completed"
-                : "failed";
+          const status = receiptStatus(receipt);
           yield* sql`UPDATE project_team_setup_process SET receipt_json=${receiptJson},drain_json=${drainJson},status=${status}
         WHERE setup_id=${input.setupId} AND receipt_json IS NULL`;
           if (!same((yield* read(input))?.retained.receipt, receipt))

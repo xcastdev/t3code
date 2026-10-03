@@ -19,13 +19,15 @@ import {
   type ProjectTeamDispatchRequest,
 } from "../projectWork/ProjectTeamDispatchJournal.ts";
 import { makeProjectManagedSetupJournal } from "./ProjectManagedSetupJournal.ts";
-import type {
-  ProjectManagedSetupReceipt,
-  ProjectManagedSetupSelection,
+import {
+  makeProjectManagedSetup,
+  type ProjectManagedSetupReceipt,
+  type ProjectManagedSetupSelection,
 } from "./ProjectManagedSetup.ts";
 import type { PiManagedProcessAllocation } from "../provider/pi/PiManagedProcess.ts";
 
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const fixture = Effect.gen(function* () {
   const repository = yield* ProjectWorkRepository;
@@ -525,3 +527,163 @@ for (const change of ["command", "protected-root", "runtime-source"] as const)
       }),
     ),
   );
+
+for (const outcome of ["failed", "canceled"] as const)
+  it.effect(`rejects ${outcome} cleanup contradicting the recorded child`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* captured;
+        yield* TestClock.setTime(f.input.deadlineAtMs);
+        const bad = {
+          ...f.receipt,
+          outcome,
+          reason: "cleanup",
+          drain: { ...f.receipt.drain!, childPid: 999 },
+        };
+        expect((yield* f.journal.persistReceipt(f.input, bad).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect((yield* f.journal.read(f.input))?.receipt).toBeNull();
+        expect((yield* f.journal.readOwnership(f.input))?.startedPid).toBe(124);
+        expect(
+          yield* f.sql`SELECT status FROM project_team_reservation WHERE status='held'`,
+        ).not.toHaveLength(0);
+      }),
+    ),
+  );
+
+for (const variant of [
+  "different-child",
+  "missing-start",
+  "failed-status",
+  "captured-status",
+] as const)
+  it.effect(`refuses retained success and execution replay with ${variant}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* variant === "missing-start" ? allocated : captured;
+        if (variant === "missing-start") {
+          yield* f.journal.claimActivation(f.input, f.selection, f.allocation);
+          yield* f.journal.persistOwner(f.input, f.allocation, f.owner);
+        }
+        const receipt =
+          variant === "different-child"
+            ? { ...f.receipt, drain: { ...f.receipt.drain!, childPid: 999 } }
+            : f.receipt;
+        const status =
+          variant === "failed-status"
+            ? "failed"
+            : variant === "captured-status"
+              ? "captured"
+              : "completed";
+        yield* f.sql`UPDATE project_team_setup_process SET receipt_json=${encodeJson(receipt)}, drain_json=${encodeJson(receipt.drain)}, status=${status}`;
+        expect((yield* f.journal.read(f.input).pipe(Effect.result))._tag).toBe("Failure");
+        let acquired = 0;
+        const managed = makeProjectManagedSetup({
+          ...f.journal,
+          resolveSelection: () => Effect.die("Replay must not select again"),
+          preallocate: () => Effect.die("Replay must not allocate again"),
+          acquire: () =>
+            Effect.sync(() => {
+              acquired++;
+              throw new Error("Replay must not acquire");
+            }),
+          reconcileProcess: () => Effect.die("Contradiction must not trigger a physical effect"),
+        });
+        expect((yield* managed.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+        expect(acquired).toBe(0);
+        expect(
+          (yield* f.sql`SELECT receipt_json FROM project_team_setup_process`)[0]?.receipt_json,
+        ).toBe(encodeJson(receipt));
+      }),
+    ),
+  );
+
+for (const outcome of ["failed", "canceled"] as const)
+  for (const knowledge of ["matching", "unknown-start", "unknown-child", "reconciled"] as const)
+    it.effect(`retains ${outcome} ${knowledge} cleanup after expiry`, () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* knowledge === "unknown-start" ? allocated : captured;
+          if (knowledge === "unknown-start") {
+            yield* f.journal.claimActivation(f.input, f.selection, f.allocation);
+            yield* f.journal.persistOwner(f.input, f.allocation, f.owner);
+          }
+          yield* TestClock.setTime(f.input.deadlineAtMs);
+          const receipt: ProjectManagedSetupReceipt = {
+            ...f.receipt,
+            outcome,
+            reason: "Script result was not retained",
+            drain:
+              knowledge === "reconciled"
+                ? null
+                : {
+                    ...f.receipt.drain!,
+                    ...(knowledge === "unknown-child"
+                      ? { childPid: null, childExitCode: null }
+                      : {}),
+                  },
+            reconciliation:
+              knowledge === "reconciled"
+                ? {
+                    state: "drained",
+                    unit: f.owner.unit,
+                    invocation: f.owner.invocation,
+                    cgroup: f.owner.cgroup,
+                    kernel: "removed",
+                  }
+                : null,
+            stdout: null,
+            stderr: null,
+          };
+          yield* f.journal.persistReceipt(f.input, receipt);
+          const value = yield* f.journal.readOwnership(f.input);
+          expect(value?.retained.receipt).toEqual(receipt);
+          expect(value?.startedPid).toBe(knowledge === "unknown-start" ? null : 124);
+          expect(
+            yield* f.sql`SELECT status FROM project_team_reservation WHERE status='held'`,
+          ).not.toHaveLength(0);
+        }),
+      ),
+    );
+
+it.effect("valid successful replay reuses the exact durable receipt without acquiring", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* captured;
+      yield* f.journal.persistReceipt(f.input, f.receipt);
+      const managed = makeProjectManagedSetup({
+        ...f.journal,
+        resolveSelection: () => Effect.die("Replay must not select"),
+        preallocate: () => Effect.die("Replay must not allocate"),
+        acquire: () => Effect.die("Replay must not acquire"),
+        reconcileProcess: () => Effect.die("Replay must not reconcile"),
+      });
+      expect(yield* managed.execute(f.input)).toEqual(f.receipt);
+      expect((yield* f.journal.readOwnership(f.input))?.startedPid).toBe(124);
+    }),
+  ),
+);
+
+it.effect("an exact receipt remains cleanup knowledge after explicit uncertainty", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* captured;
+      yield* f.journal.persistReceipt(f.input, f.receipt);
+      const retained = yield* f.journal.read(f.input);
+      if (!retained) return yield* Effect.die("Missing retained receipt");
+      const { uncertain: _uncertain, ...expected } = retained;
+      yield* f.journal.markUncertain(f.input, {
+        expected,
+        selection: f.selection,
+        allocation: f.allocation,
+        owner: f.owner,
+        drain: f.receipt.drain,
+        reconciliation: null,
+        reason: "current physical cleanup unproved",
+      });
+      expect((yield* f.journal.read(f.input))?.receipt).toEqual(f.receipt);
+      expect((yield* f.journal.read(f.input))?.uncertain).toBe(true);
+    }),
+  ),
+);
