@@ -3416,3 +3416,474 @@ it.effect(
       }),
     ).pipe(Effect.provide(selectedRuntimeLayer)),
 );
+
+for (const mode of ["stop-one", "stop-all"] as const) {
+  it.effect("stop held preparation " + mode, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* selectedRuntimeFixture();
+        const repository = yield* ManagedSkills.ManagedSkillRepository;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const stopEntered = yield* Deferred.make<void>();
+        let hold = true;
+        const observedRepository = ManagedSkills.ManagedSkillRepository.of({
+          ...repository,
+          readGlobal: (...args) =>
+            repository.readGlobal(...args).pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  if (!hold) return;
+                  hold = false;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }),
+              ),
+            ),
+        });
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          allocateSkillStage: makePiSkillStageLifetime(f.cache),
+        }).pipe(Effect.provideService(ManagedSkills.ManagedSkillRepository, observedRepository));
+        const actual = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const first = yield* actual
+          .prepareOperation({ threadId, kind: "initialize", skillPlan: f.plan }, () => Effect.void)
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(entered);
+        const stopper = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(stopEntered, undefined);
+          return yield* mode === "stop-one" ? actual.requestStop(threadId) : actual.stopAll;
+        }).pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(stopEntered);
+        expect((yield* Fiber.join(stopper))._tag).toBe("Success");
+        const result = yield* Fiber.join(first);
+        yield* Deferred.succeed(release, undefined);
+        const operations = yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation`;
+        expect(yield* f.fs.readDirectory(f.cache)).toEqual([]);
+        yield* actual.stopAll;
+        expect(result._tag).toBe("Failure");
+        expect(operations).toEqual([]);
+      }),
+    ).pipe(Effect.provide(selectedRuntimeLayer)),
+  );
+}
+it.effect("same returned preparation Effect cannot replay after its cancellation", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* selectedRuntimeFixture();
+      const pending = f.instance.prepareOperation(
+        { threadId, kind: "initialize", skillPlan: f.plan },
+        () => Effect.void,
+      );
+      const first = yield* pending;
+      yield* f.instance.requestStop(threadId);
+      const replay = yield* Effect.result(pending);
+      const operations =
+        yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_ordinal`;
+      yield* f.instance.stopAll;
+      expect(replay._tag).toBe("Failure");
+      expect(operations).toHaveLength(1);
+      const next = yield* f.instance.prepareOperation(
+        { threadId, kind: "initialize", skillPlan: f.plan },
+        () => Effect.void,
+      );
+      expect(next.operation.operationId).not.toBe(first.operation.operationId);
+      yield* f.instance.stopAll;
+    }),
+  ).pipe(Effect.provide(selectedRuntimeLayer)),
+);
+for (const mode of ["explicit-stop", "scope-close"] as const) {
+  it.effect("selected prepared resource cleanup " + mode, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* selectedRuntimeFixture();
+        let operationId = "";
+        let before: string[] = [];
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const runtime = yield* makePiManagedRuntimeLive({
+              ...f.options,
+              allocateSkillStage: makePiSkillStageLifetime(f.cache),
+            });
+            const actual = yield* runtime.forInstance({
+              instanceId: providerInstanceId,
+              enabled: true,
+              configuration: {},
+            });
+            const prepared = yield* actual.prepareOperation(
+              { threadId, kind: "initialize", skillPlan: f.plan },
+              () => Effect.void,
+            );
+            operationId = prepared.operation.operationId;
+            before = yield* f.fs.readDirectory(f.cache);
+            if (mode === "explicit-stop") yield* actual.stopAll;
+          }),
+        );
+        const stages = yield* f.fs.readDirectory(f.cache);
+        const operations =
+          yield* f.sql`SELECT operation_id,status,terminal_json FROM project_team_pi_operation`;
+        const processes =
+          yield* f.sql`SELECT unit,status,owner_json,drain_json FROM project_team_pi_process`;
+        expect(before).toHaveLength(1);
+        expect(operations[0]?.operation_id).toBe(operationId);
+        expect(operations[0]?.status).toBe("settled");
+        expect(processes[0]?.status).toBe("drained");
+        expect(stages).toEqual([]);
+      }),
+    ).pipe(Effect.provide(selectedRuntimeLayer)),
+  );
+}
+for (const view of ["session", "session-plan", "thread"] as const) {
+  for (const mode of ["unchanged", "before-hash", "after-hash"] as const) {
+    it.effect("valid selected repository update at native final fence " + view + " " + mode, () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* selectedRuntimeFixture();
+          const repository = yield* ManagedSkills.ManagedSkillRepository;
+          const originalPackageHash = yield* hashSkillPackage(f.skill.packagePath);
+          const resourceHash = piManagedSkillResourceIdentity([
+            {
+              skillId: f.skill.manifest.id,
+              key: f.skill.manifest.key,
+              packagePath: f.skill.packagePath,
+              expectedHash: originalPackageHash,
+            },
+          ]);
+          const originalNative = yield* settledNativeForRead(f, resourceHash);
+          if (view === "thread") {
+            const native = { ...originalNative, persisted: true, leafId: "retained-leaf" };
+            const root =
+              f.options.nativeStateRoot +
+              "/" +
+              NodeCrypto.createHash("sha256")
+                .update(
+                  json([
+                    "environment",
+                    providerInstanceId,
+                    threadId,
+                    f.binding.recordId,
+                    f.binding.generation,
+                  ]),
+                )
+                .digest("hex") +
+              "/sessions";
+            yield* f.fs.makeDirectory(root, { recursive: true, mode: 0o700 });
+            yield* f.fs.writeFileString(
+              root + "/native-read-fixture.jsonl",
+              json({
+                type: "session",
+                version: 3,
+                id: native.sessionId,
+                timestamp: at,
+                cwd: "/workspace",
+              }) +
+                "\n" +
+                json({
+                  type: "custom",
+                  id: "retained-leaf",
+                  parentId: null,
+                  timestamp: at,
+                  customType: "harmless-review-fixture",
+                  data: { text: "Retained native payload" },
+                }) +
+                "\n",
+            );
+            yield* f.sql`UPDATE project_team_pi_operation SET native_json=${json(native)}`;
+          }
+          let assignedChecks = 0;
+          let changed = false;
+          const filesystem = FileSystem.FileSystem.of({
+            ...f.fs,
+            realPath: (path) =>
+              f.fs.realPath(path).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    if (path !== f.worktree) return;
+                    assignedChecks++;
+                    const late = view === "session-plan" ? 11 : 3;
+                    const threshold = mode === "before-hash" ? 1 : late;
+                    if (mode !== "unchanged" && !changed && assignedChecks === threshold) {
+                      changed = true;
+                      yield* repository
+                        .updateGlobal({
+                          skillId: f.skill.manifest.id,
+                          expectedHash: originalPackageHash,
+                          content: {
+                            name: "Selected Runtime",
+                            body: "Valid repository update completed during final workspace revalidation.",
+                          },
+                        })
+                        .pipe(Effect.orDie);
+                    }
+                  }),
+                ),
+              ),
+          });
+          const runtime = yield* makePiManagedRuntimeLive({
+            ...f.options,
+            allocateSkillStage: makePiSkillStageLifetime(f.cache),
+          }).pipe(Effect.provideService(FileSystem.FileSystem, filesystem));
+          const actual = yield* runtime.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          const result =
+            view === "thread"
+              ? yield* Effect.result(actual.readThread(threadId))
+              : yield* Effect.result(
+                  actual.readSession(threadId, view === "session-plan" ? f.plan : undefined),
+                );
+          const current = yield* repository.readGlobal(f.skill.manifest.id);
+          expect(current.manifest.revision.hash !== originalPackageHash).toBe(changed);
+          expect(changed).toBe(mode !== "unchanged");
+          expect(result._tag).toBe(mode === "unchanged" ? "Success" : "Failure");
+        }),
+      ).pipe(Effect.provide(selectedRuntimeLayer)),
+    );
+  }
+}
+for (const mode of ["unchanged", "update", "tombstone"] as const) {
+  it.effect(`selected sources remain current through the final SQL receipt: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* selectedRuntimeFixture();
+        const repository = yield* ManagedSkills.ManagedSkillRepository;
+        const hash = yield* hashSkillPackage(f.skill.packagePath);
+        yield* settledNativeForRead(
+          f,
+          piManagedSkillResourceIdentity([
+            {
+              skillId: f.skill.manifest.id,
+              key: f.skill.manifest.key,
+              packagePath: f.skill.packagePath,
+              expectedHash: hash,
+            },
+          ]),
+        );
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let receipts = 0;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (
+              !statement
+                .compile()[0]
+                .includes("SELECT project_id FROM projection_projects WHERE project_id")
+            )
+              return statement;
+            return statement.pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  if (++receipts !== 3) return;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }),
+              ),
+            );
+          },
+        });
+        const authorization = yield* Authorization.ProjectTeamAuthorization.pipe(
+          Effect.provide(Layer.fresh(Authorization.layer)),
+          Effect.provideService(SqlClient.SqlClient, observedSql),
+        );
+        const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(
+          Effect.provideService(Authorization.ProjectTeamAuthorization, authorization),
+        );
+        const actual = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const pending = yield* actual.readSession(threadId).pipe(Effect.result, Effect.forkChild);
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(pending).pipe(
+            Effect.flatMap(() =>
+              Effect.die("Native admission finished before its final SQL receipt"),
+            ),
+          ),
+        );
+        if (mode === "update")
+          yield* repository.updateGlobal({
+            skillId: f.skill.manifest.id,
+            expectedHash: hash,
+            content: {
+              name: "Updated selected runtime",
+              body: "Updated at the final SQL receipt.",
+            },
+          });
+        if (mode === "tombstone")
+          yield* repository.setProjectDisabled({ projectRoot: f.main, key: f.skill.manifest.key });
+        yield* Deferred.succeed(release, undefined);
+        expect((yield* Fiber.join(pending))._tag).toBe(
+          mode === "unchanged" ? "Success" : "Failure",
+        );
+        expect(f.transports).toBe(0);
+        expect(f.launches).toBe(0);
+      }),
+    ).pipe(Effect.provide(selectedRuntimeLayer)),
+  );
+}
+it.effect(
+  "retains an uncertain terminal stage and joins repeated stop after actual SQL failure",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* selectedRuntimeFixture();
+        let fail = true;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (
+              !fail ||
+              !statement
+                .compile()[0]
+                .includes("SELECT status,owner_json FROM project_team_pi_process")
+            )
+              return statement;
+            fail = false;
+            return statement.pipe(
+              Effect.andThen(target.unsafe("SELECT * FROM missing_runtime_terminal_receipt")),
+            );
+          },
+        });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const runtime = yield* makePiManagedRuntimeLive({
+              ...f.options,
+              allocateSkillStage: makePiSkillStageLifetime(f.cache),
+            });
+            const actual = yield* runtime.forInstance({
+              instanceId: providerInstanceId,
+              enabled: true,
+              configuration: {},
+            });
+            yield* actual.prepareOperation(
+              { threadId, kind: "initialize", skillPlan: f.plan },
+              () => Effect.void,
+            );
+            yield* rejected(actual.requestStop(threadId));
+            yield* rejected(actual.requestStop(threadId));
+          }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql)),
+        );
+        expect(fail).toBe(false);
+        const stages = yield* f.fs.readDirectory(f.cache);
+        expect(stages).toHaveLength(1);
+        expect(
+          (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_operation`)[0]
+            ?.status,
+        ).toBe("prepared");
+        expect(
+          (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_process`)[0]?.status,
+        ).toBe("allocated");
+        expect(f.transports).toBe(0);
+        // Reopen only this never-launched temporary fixture for its scoped directory cleanup.
+        yield* f.fs.chmod(f.cache + "/" + stages[0], 0o700);
+        yield* f.fs.chmod(f.cache + "/" + stages[0] + "/" + f.skill.manifest.key, 0o700);
+      }),
+    ).pipe(Effect.provide(selectedRuntimeLayer)),
+);
+
+it.effect("admits multiple selected packages above one package byte limit", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const repository = yield* ManagedSkills.ManagedSkillRepository;
+      const selected = [];
+      for (const key of ["large-first", "large-second"])
+        selected.push(
+          yield* repository.createGlobal({
+            expectedRevision: 0,
+            content: { key: ManagedSkillKey.make(key), name: key, body: "x".repeat(4_050_000) },
+          }),
+        );
+      const ids = selected.map((skill) => skill.manifest.id);
+      yield* restoreHistoricalBinding({ ...f.role, revision: f.role.revision + 1, skills: ids });
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        configuration: { ...f.binding.configuration, skillIds: ids },
+      });
+      expect(
+        yield* f.instance.authorizeSkills({
+          ...catalogueRequest(f.worktree),
+          skills: selected.map((skill) => ({
+            key: skill.manifest.key,
+            packagePath: skill.packagePath,
+          })),
+        }),
+      ).toEqual(selected.map((skill) => skill.manifest.key));
+      expect(f.transports).toBe(0);
+      expect(f.launches).toBe(0);
+    }),
+  ).pipe(Effect.provide(selectedRuntimeLayer)),
+);
+
+it.effect("joins a held durable preparation receipt before canceling its never-started stage", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* selectedRuntimeFixture();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const observedSql = new Proxy(f.sql, {
+        apply(target, _receiver, args) {
+          const statement = target(args[0], ...args.slice(1));
+          if (!statement.compile()[0].includes("INSERT INTO project_team_pi_operation"))
+            return statement;
+          return statement.pipe(
+            Effect.tap(() => Deferred.succeed(entered, undefined)),
+            Effect.tap(() => Deferred.await(release)),
+          );
+        },
+      });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const runtime = yield* makePiManagedRuntimeLive({
+            ...f.options,
+            allocateSkillStage: makePiSkillStageLifetime(f.cache),
+          });
+          const actual = yield* runtime.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          const first = yield* actual
+            .prepareOperation(
+              { threadId, kind: "initialize", skillPlan: f.plan },
+              () => Effect.void,
+            )
+            .pipe(Effect.result, Effect.forkChild);
+          yield* Effect.raceFirst(
+            Deferred.await(entered),
+            Fiber.join(first).pipe(
+              Effect.flatMap(() =>
+                Effect.die("Preparation finished without its durable SQL receipt"),
+              ),
+            ),
+          );
+          // Run stop through its cancellation flag to the pending durable receipt join.
+          const stopper = yield* actual
+            .requestStop(threadId)
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          yield* Deferred.succeed(release, undefined);
+          expect((yield* Fiber.join(first))._tag).toBe("Failure");
+          yield* Fiber.join(stopper);
+        }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql)),
+      );
+      expect(
+        (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_operation`)[0]?.status,
+      ).toBe("settled");
+      expect(
+        (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_process`)[0]?.status,
+      ).toBe("drained");
+      expect(yield* f.fs.readDirectory(f.cache)).toEqual([]);
+      expect(f.transports).toBe(0);
+    }),
+  ).pipe(Effect.provide(selectedRuntimeLayer)),
+);
