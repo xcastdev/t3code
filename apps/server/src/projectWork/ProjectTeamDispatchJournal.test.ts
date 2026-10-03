@@ -1795,3 +1795,226 @@ it.effect("history injected during stage verification rolls back with the forwar
     }),
   ),
 );
+
+it.effect(
+  "settlement retains complete terminal history after expiry without releasing capacity",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        let verified = 0;
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () =>
+            Effect.sync(() => {
+              verified++;
+            }),
+        });
+        yield* TestClock.setTime(claimed.intent.limits.deadlineAtMs);
+        const stopped = yield* journal.advanceStage(claimed.fence, {
+          receiptId: "settlement-stop",
+          stage: "stopping",
+          evidence: {},
+        });
+        const terminal = {
+          receiptId: "settlement-joined",
+          stage: "settled",
+          evidence: { joined: true },
+        } as const;
+        const settled = yield* journal.advanceStage(stopped.fence, terminal);
+        expect(settled.fence.stage).toBe("settled");
+        expect(
+          (yield* journal.readStageReceipts(f.request.dispatchId)).map((r) => r.stage),
+        ).toEqual(["stopping", "settled"]);
+        expect((yield* journal.advanceStage(stopped.fence, terminal)).duplicate).toBe(true);
+        expect(verified).toBe(2);
+        expect((yield* journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* journal.readRecoveryPage({ limit: 128 })).toEqual([]);
+        expect(yield* f.sql`SELECT status FROM project_team_reservation`).toEqual([
+          { status: "held" },
+        ]);
+        for (const stage of ["stopping", "quarantine", "settled", "workspace-ready"] as const)
+          expect(
+            (yield* journal
+              .advanceStage(settled.fence, { receiptId: `after-${stage}`, stage, evidence: {} })
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        expect(verified).toBe(2);
+      }),
+    ),
+);
+
+it.effect("settlement rejects unproven drain and rolls back both header and receipt", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      let verified = 0;
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () =>
+          Effect.sync(() => {
+            verified++;
+          }).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ProjectTeamDispatchJournalError({ reason: "Writer drain is uncertain" }),
+              ),
+            ),
+          ),
+      });
+      expect(
+        (yield* journal
+          .advanceStage(claimed.fence, {
+            receiptId: "settlement-unproven",
+            stage: "settled",
+            evidence: {},
+          })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(verified).toBe(1);
+      expect((yield* f.journal.readRetained(f.request.dispatchId)).fence).toEqual(claimed.fence);
+      expect(yield* f.journal.readStageReceipts(f.request.dispatchId)).toEqual([]);
+      expect(yield* f.sql`SELECT status FROM project_team_reservation`).toEqual([
+        { status: "held" },
+      ]);
+    }),
+  ),
+);
+
+for (const canceled of [false, true]) {
+  it.effect(`settlement cleans unclaimed reservation without inventing a claim: ${canceled}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const reserved = yield* f.journal.reserve(f.request);
+        if (canceled) {
+          const state = yield* readCurrentState(f.sql, projectId);
+          const effect = state.foundationRecords?.find((r) => r.kind === "effect");
+          if (effect?.kind !== "effect") return yield* Effect.die("Missing original effect");
+          yield* f.repository.execute(
+            yield* decodeCommit({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: "cancel-before-effect-claim",
+              expectedRevision: state.revision,
+              attribution,
+              committedAt: at,
+              records: [{ ...effect, revision: effect.revision + 1, status: "canceled" }],
+            }),
+          );
+        }
+        let verified = 0;
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () =>
+            Effect.sync(() => {
+              verified++;
+            }),
+        });
+        yield* TestClock.setTime(reserved.intent.limits.deadlineAtMs);
+        const stopped = yield* journal.advanceStage(reserved.fence, {
+          receiptId: "settlement-unclaimed-stop",
+          stage: "stopping",
+          evidence: { neverClaimed: true },
+        });
+        const settled = yield* journal.advanceStage(stopped.fence, {
+          receiptId: "settlement-unclaimed-joined",
+          stage: "settled",
+          evidence: { neverClaimed: true },
+        });
+        expect(settled.fence.claimGeneration).toBe(0);
+        expect(settled.fence.revision).toBe(2);
+        expect(
+          (yield* journal.readStageReceipts(f.request.dispatchId)).map((r) => [
+            r.stage,
+            r.claimGeneration,
+          ]),
+        ).toEqual([
+          ["stopping", 0],
+          ["settled", 0],
+        ]);
+        expect((yield* journal.claimEffect(settled.fence).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE command_id LIKE '%claim-dispatch%'`,
+        ).toEqual([]);
+        expect(yield* f.sql`SELECT status FROM project_team_reservation`).toEqual([
+          { status: "held" },
+        ]);
+        expect(verified).toBe(2);
+      }),
+    ),
+  );
+}
+
+it.effect("settlement survives actual project deletion as cleanup knowledge only", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      yield* Effect.gen(function* () {
+        const lifecycle = yield* ProjectLifecycle;
+        yield* lifecycle.permanentDelete({
+          projectId,
+          commandId: CommandId.make("delete-before-settlement"),
+          workspaceRoot: "/workspace",
+          confirmation: "permanent-local-delete",
+        });
+      }).pipe(Effect.provide(ProjectLifecycleLive));
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () => Effect.void,
+      });
+      const terminal = {
+        receiptId: "settlement-deleted-joined",
+        stage: "settled",
+        evidence: {},
+      } as const;
+      const settled = yield* journal.advanceStage(claimed.fence, terminal);
+      expect((yield* journal.readRetained(f.request.dispatchId)).fence).toEqual(settled.fence);
+      expect((yield* journal.readStageReceipts(f.request.dispatchId)).map((r) => r.stage)).toEqual([
+        "settled",
+      ]);
+      expect((yield* journal.advanceStage(claimed.fence, terminal)).duplicate).toBe(true);
+      expect((yield* journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect(yield* f.sql`SELECT * FROM project_team_effect WHERE project_id=${projectId}`).toEqual(
+        [],
+      );
+    }),
+  ),
+);
+
+it.effect("settlement rejects retained cleanup appended after the terminal receipt", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () => Effect.void,
+      });
+      const settled = yield* journal.advanceStage(claimed.fence, {
+        receiptId: "settlement-terminal",
+        stage: "settled",
+        evidence: {},
+      });
+      yield* f.sql`INSERT INTO project_team_dispatch_receipt VALUES ('after-terminal',${f.request.dispatchId},${settled.fence.revision + 1},1,'stopping','{}',${at})`;
+      yield* f.sql`UPDATE project_team_dispatch SET stage='stopping',revision=${settled.fence.revision + 1} WHERE dispatch_id=${f.request.dispatchId}`;
+      expect(
+        (yield* journal.readStageReceipts(f.request.dispatchId).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }),
+  ),
+);
