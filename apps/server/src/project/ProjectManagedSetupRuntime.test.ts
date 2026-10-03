@@ -6,6 +6,7 @@ import {
 } from "@t3tools/contracts";
 import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -65,14 +66,18 @@ const queryLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
 const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (
   native = false,
   defaultReferences = false,
+  actualPlatform = false,
 ) {
   const repository = yield* ProjectWorkRepository;
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const scratch = yield* native
+  const temporary = yield* native
     ? fs.makeTempDirectory({ prefix: "setup-runtime-native-" })
     : fs.makeTempDirectoryScoped({ prefix: "setup-runtime-" });
+  const scratch = native ? temporary : yield* fs.realPath(temporary);
+  const runtimeSource = path.join(scratch, "controlled-bash");
+  if (!native) yield* fs.writeFileString(runtimeSource, "controlled runtime file; never executed");
   const primary = path.join(scratch, "primary");
   const worktree = path.join(scratch, "worktree");
   const protectedRoot = path.join(scratch, "protected");
@@ -104,8 +109,11 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (
   );
   expect(seeded._tag).toBe("Failure");
   if (!pending || pending.transition?.kind !== "claim") return yield* Effect.die("Missing claim");
-  const now = native || defaultReferences ? yield* Clock.currentTimeMillis : Date.parse(at) + 1;
-  if (!native && !defaultReferences) yield* TestClock.setTime(now);
+  const now =
+    native || defaultReferences || actualPlatform
+      ? yield* Clock.currentTimeMillis
+      : Date.parse(at) + 1;
+  if (!native && !defaultReferences && !actualPlatform) yield* TestClock.setTime(now);
   const committedAt = DateTime.formatIso(DateTime.makeUnsafe(now));
   yield* repository.execute(
     yield* decodeCommit({
@@ -205,6 +213,14 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (
   }> = [];
   const readProc = (pid: number, field: string) =>
     fs.readFileString(`/proc/${pid}/${field}`).pipe(Effect.catch(() => Effect.succeed("absent")));
+  const controlledOutput = (text: string) =>
+    spawner.spawn(
+      ChildProcess.make(
+        process.execPath,
+        ["--max-old-space-size=512", "-e", `process.stdout.write(${JSON.stringify(text)})`],
+        { env: {}, extendEnv: false },
+      ),
+    );
   const controlledSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"] = {
     ...spawner,
     spawn: (command) => {
@@ -235,19 +251,10 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (
         );
       counts.controls++;
       managerAddresses.push(command.options.env?.DBUS_SESSION_BUS_ADDRESS);
-      if (command.command === "/usr/bin/bwrap")
-        return spawner.spawn(
-          ChildProcess.make("/usr/bin/printf", ["controlled-unavailable\n"], { extendEnv: false }),
-        );
+      if (command.command === "/usr/bin/bwrap") return controlledOutput("controlled-unavailable\n");
       if (command.command === "/usr/bin/systemctl")
-        return spawner.spawn(
-          ChildProcess.make(
-            "/usr/bin/printf",
-            [
-              "LoadState=not-found\nDescription=\nInvocationID=\nControlGroup=\nActiveState=inactive\nKillMode=\nRestart=\nRuntimeMaxUSec=\nTimeoutStopUSec=\nUnsetEnvironment=\nEnvironment=\n",
-            ],
-            { extendEnv: false },
-          ),
+        return controlledOutput(
+          "LoadState=not-found\nDescription=\nInvocationID=\nControlGroup=\nActiveState=inactive\nKillMode=\nRestart=\nRuntimeMaxUSec=\nTimeoutStopUSec=\nUnsetEnvironment=\nEnvironment=\n",
         );
       return Effect.die("Default fixture refuses native service allocation");
     },
@@ -259,16 +266,18 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (
     environmentId: "environment",
     maximumEnvironmentModelCalls: 4,
     launchPolicy: { memoryBytes: 67108864, runtimeSeconds: 60 },
-    runtimeFiles: [
-      { source: "/usr/bin/bash", target: "/bin/bash" },
-      { source: "/usr/bin/sleep", target: "/bin/sleep" },
-      ...[
-        "/lib64/ld-linux-x86-64.so.2",
-        "/usr/lib/libc.so.6",
-        "/usr/lib/libreadline.so.8",
-        "/usr/lib/libncursesw.so.6",
-      ].map((source) => ({ source, target: source })),
-    ],
+    runtimeFiles: native
+      ? [
+          { source: "/usr/bin/bash", target: "/bin/bash" },
+          { source: "/usr/bin/sleep", target: "/bin/sleep" },
+          ...[
+            "/lib64/ld-linux-x86-64.so.2",
+            "/usr/lib/libc.so.6",
+            "/usr/lib/libreadline.so.8",
+            "/usr/lib/libncursesw.so.6",
+          ].map((source) => ({ source, target: source })),
+        ]
+      : [{ source: runtimeSource, target: "/bin/bash" }],
     protectedRoots: [protectedRoot],
     protectedWorkspaceEntries: [".git"],
     revalidateRuntimeAssets,
@@ -305,7 +314,10 @@ const fixture = Effect.fn("setupRuntimeTest.fixture")(function* (
   for (const file of options.runtimeFiles) file.source = yield* fs.realPath(file.source);
   const make = () =>
     makeProjectManagedSetupRuntime(options).pipe(
-      defaultReferences ? (effect) => effect : Effect.provideService(HostProcessPlatform, "linux"),
+      actualPlatform ? (effect) => effect : Effect.provideService(HostProcessPlatform, "linux"),
+      native || defaultReferences || actualPlatform
+        ? (effect) => effect
+        : Effect.provideService(HostProcessUserId, 1000),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, controlledSpawner),
     );
   const setup = yield* make();
@@ -350,403 +362,550 @@ const withServices = <A, E, R>(
   settings = ServerSettings.layerTest(),
 ) => scoped(body.pipe(Effect.provide(Layer.merge(queryLayer, settings))));
 
-it.effect("skips once and replays through current project/settings/workspace checks", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        yield* f.settings.updateSettings({
-          projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [] } },
-        });
-        const receipt = yield* f.setup.execute(f.input);
-        expect(receipt.outcome).toBe("skipped");
-        expect(yield* f.setup.execute(f.input)).toEqual(receipt);
-        expect(f.counts.native).toBe(0);
-        expect(f.counts.controls).toBe(0);
-        expect(f.counts.workspace).toBeGreaterThan(1);
-        expect(f.counts.assets).toBe(f.counts.workspace);
-      }),
-    ),
-  ),
-);
-
-it.effect("freezes full shared selection, exact Bash argv, original policy and Git entries", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        const retained = yield* f.freeze;
-        expect(retained.selection.kind).toBe("script");
-        if (retained.selection.kind !== "script") return;
-        expect(retained.selection.launch.argv).toEqual(["/bin/bash", "-c", script.command]);
-        expect(retained.selection.launch.nativeStateRoot).toBeUndefined();
-        expect(retained.selection.launch.protectedWorkspaceEntries).toEqual([".git"]);
-        expect(retained.selection.launch.workspaceRoot).toBe(f.worktree);
-        expect(retained.allocation?.policy).toEqual({ memoryBytes: 67108864, runtimeSeconds: 60 });
-        expect(retained.selection.scriptRevision).toMatch(/^[a-f0-9]{64}$/);
-        expect(f.counts.native).toBe(0);
-      }),
-    ),
-  ),
-);
-
-for (const patch of [
-  { command: "printf changed" },
-  { name: "Changed name" },
-  { async: false },
-  { runOnWorktreeCreate: false },
-  { previewUrl: "https://example.invalid/preview" },
-])
-  it.effect(`denies stale selection after ${Object.keys(patch)[0]} changes`, () =>
+describe("portable current-service checks", () => {
+  it.effect("skips once and replays through current project/settings/workspace checks", () =>
     withServices(
       Effect.scoped(
         Effect.gen(function* () {
           const f = yield* fixture();
-          yield* f.freeze;
           yield* f.settings.updateSettings({
-            projectSettingsOverrides: {
-              [projectId]: { defaultProjectScripts: [{ ...script, ...patch }] },
-            },
+            projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [] } },
           });
-          const before = f.counts.controls;
-          const result = yield* f.setup.execute(f.input).pipe(Effect.result);
-          expect(result._tag).toBe("Failure");
-          expect(f.counts.controls).toBe(before);
-          expect(f.counts.native).toBe(0);
-        }),
-      ),
-    ),
-  );
-
-for (const mode of [
-  "deleted",
-  "root-changed",
-  "recreated-primary",
-  "recreated-worktree",
-  "git-replaced",
-] as const)
-  it.effect(`denies ${mode} before host allocation`, () =>
-    withServices(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const f = yield* fixture();
-          if (mode === "deleted") yield* f.sql`UPDATE projection_projects SET deleted_at=${at}`;
-          if (mode === "root-changed")
-            yield* f.sql`UPDATE projection_projects SET workspace_root='/replacement'`;
-          if (mode === "recreated-primary") {
-            yield* f.fs.rename(f.primary, f.primary + "-retained");
-            yield* f.fs.makeDirectory(f.primary);
-          }
-          if (mode === "recreated-worktree") {
-            yield* f.fs.rename(f.worktree, f.worktree + "-retained");
-            yield* f.fs.makeDirectory(f.worktree);
-            yield* f.fs.writeFileString(f.path.join(f.worktree, ".git"), "replacement");
-          }
-          if (mode === "git-replaced") {
-            yield* f.fs.rename(
-              f.path.join(f.worktree, ".git"),
-              f.path.join(f.worktree, ".git-retained"),
-            );
-            yield* f.fs.writeFileString(f.path.join(f.worktree, ".git"), "replacement");
-          }
-          expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+          const receipt = yield* f.setup.execute(f.input);
+          expect(receipt.outcome).toBe("skipped");
+          expect(yield* f.setup.execute(f.input)).toEqual(receipt);
           expect(f.counts.native).toBe(0);
           expect(f.counts.controls).toBe(0);
+          expect(f.counts.workspace).toBeGreaterThan(1);
+          expect(f.counts.assets).toBe(f.counts.workspace);
         }),
       ),
     ),
   );
 
-it.effect("captures service objects and options before later caller substitutions", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        f.options.launchPolicy.runtimeSeconds = 3600;
-        f.options.runtimeFiles[0]!.target = "/runtime/replacement";
-        f.options.protectedWorkspaceEntries[0] = "untrusted";
-        f.options.assertWorkspace = () =>
-          Effect.fail(new ProjectManagedSetupError({ reason: "replacement callback" }));
-        const query = {
-          ...f.query,
-          getProjectShellById: () => Effect.die("replacement query used"),
-        };
-        const settings = { ...f.settings, getSettings: Effect.die("replacement settings used") };
-        const retained = yield* f.freeze.pipe(
-          Effect.provideService(ProjectionSnapshotQuery, query),
-          Effect.provideService(ServerSettings.ServerSettingsService, settings),
-          Effect.provideService(HostProcessPlatform, "win32"),
-        );
-        expect(retained.allocation?.policy.runtimeSeconds).toBe(60);
-        expect(retained.allocation?.launch.argv[0]).toBe("/bin/bash");
-        expect(
-          retained.selection.kind === "script" &&
-            retained.selection.launch.protectedWorkspaceEntries,
-        ).toEqual([".git"]);
-        expect(f.counts.native).toBe(0);
-      }),
-    ),
-  ),
-);
-
-it.effect("uses the execution caller's scope for borrowed asset revalidation", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        yield* f.settings.updateSettings({
-          projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [] } },
-        });
-        let factoryScope: Scope.Scope | undefined;
-        let checks = 0;
-        let releases = 0;
-        const setup = yield* Effect.scoped(
+  for (const mode of [
+    "deleted",
+    "root-changed",
+    "recreated-primary",
+    "recreated-worktree",
+    "git-replaced",
+  ] as const)
+    it.effect(`denies ${mode} before host allocation`, () =>
+      withServices(
+        Effect.scoped(
           Effect.gen(function* () {
-            factoryScope = yield* Scope.Scope;
-            return yield* makeProjectManagedSetupRuntime({
-              ...f.options,
-              revalidateRuntimeAssets: Effect.gen(function* () {
-                expect(yield* Scope.Scope).not.toBe(factoryScope);
-                checks++;
-                yield* Effect.addFinalizer(() => Effect.sync(() => releases++));
-              }),
-            });
+            const f = yield* fixture();
+            if (mode === "deleted") yield* f.sql`UPDATE projection_projects SET deleted_at=${at}`;
+            if (mode === "root-changed")
+              yield* f.sql`UPDATE projection_projects SET workspace_root='/replacement'`;
+            if (mode === "recreated-primary") {
+              yield* f.fs.rename(f.primary, f.primary + "-retained");
+              yield* f.fs.makeDirectory(f.primary);
+            }
+            if (mode === "recreated-worktree") {
+              yield* f.fs.rename(f.worktree, f.worktree + "-retained");
+              yield* f.fs.makeDirectory(f.worktree);
+              yield* f.fs.writeFileString(f.path.join(f.worktree, ".git"), "replacement");
+            }
+            if (mode === "git-replaced") {
+              yield* f.fs.rename(
+                f.path.join(f.worktree, ".git"),
+                f.path.join(f.worktree, ".git-retained"),
+              );
+              yield* f.fs.writeFileString(f.path.join(f.worktree, ".git"), "replacement");
+            }
+            expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+            expect(f.counts.native).toBe(0);
+            expect(f.counts.controls).toBe(0);
           }),
-        );
-        const receipt = yield* setup.execute(f.input);
-        expect(receipt.outcome).toBe("skipped");
-        expect(checks).toBeGreaterThan(0);
-        expect(releases).toBe(checks);
-        expect(f.counts.native).toBe(0);
-      }),
-    ),
-  ),
-);
-
-// Default Context.References must be sampled too: an absent key in Effect.context()
-// otherwise lets a later execution context replace the live clock or Linux manager identity.
-for (const reference of ["clock", "platform", "user-id"] as const)
-  it.live(`captures default ${reference} before execution overrides`, () =>
-    withServices(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const f = yield* fixture(false, true);
-          const clock = yield* Clock.Clock;
-          const uid = yield* HostProcessUserId;
-          const retained = yield* f.freeze.pipe(
-            reference === "clock"
-              ? Effect.provideService(Clock.Clock, {
-                  currentTimeNanos: clock.currentTimeNanos,
-                  currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
-                  monotonicTimeNanos: clock.monotonicTimeNanos,
-                  monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
-                  sleep: (duration) => clock.sleep(duration),
-                  currentTimeMillis: Effect.succeed(f.input.deadlineAtMs + 1),
-                  currentTimeMillisUnsafe: () => f.input.deadlineAtMs + 1,
-                })
-              : reference === "platform"
-                ? Effect.provideService(HostProcessPlatform, "win32")
-                : Effect.provideService(HostProcessUserId, 9999),
-          );
-          expect(retained.allocation).not.toBeNull();
-          expect(f.managerAddresses.length).toBeGreaterThan(0);
-          expect(f.managerAddresses).toEqual(
-            f.managerAddresses.map(() => `unix:path=/run/user/${uid}/bus`),
-          );
-          expect(f.counts.native).toBe(0);
-        }),
+        ),
       ),
-    ),
-  );
+    );
 
-it.effect("asset revalidation denies stale retained selection before acquisition", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        yield* f.freeze;
-        f.options.revalidateRuntimeAssets = Effect.fail(
-          new ProjectManagedSetupError({ reason: "borrowed stage changed" }),
-        );
-        const setup = yield* f.make();
-        const before = f.counts.controls;
-        expect((yield* setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
-        expect(f.counts.controls).toBe(before);
-        expect(f.counts.native).toBe(0);
-        expect(yield* f.fs.exists(f.protectedRoot)).toBe(true);
-      }),
-    ),
-  ),
-);
-
-it.effect(
-  "a lost claim response never repeats a script or treats unit absence as known history",
-  () =>
+  it.effect("uses the execution caller's scope for borrowed asset revalidation", () =>
     withServices(
       Effect.scoped(
         Effect.gen(function* () {
           const f = yield* fixture();
-          const retained = yield* f.freeze;
-          if (!retained.allocation) return;
-          yield* f.journal
-            .claimActivation(f.input, retained.selection, retained.allocation)
-            .pipe(Effect.andThen(Effect.fail("response lost")), Effect.result);
-          const before = f.counts.controls;
-          expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
-          expect(f.counts.controls).toBe(before);
-          expect((yield* f.setup.reconcile(f.input).pipe(Effect.result))._tag).toBe("Failure");
-          const current = yield* f.journal.read(f.input);
-          expect(current?.uncertain).toBe(true);
-          expect(current?.activation).toBe("claimed");
-          expect(current?.allocation).toEqual(retained.allocation);
+          yield* f.settings.updateSettings({
+            projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [] } },
+          });
+          let factoryScope: Scope.Scope | undefined;
+          let checks = 0;
+          let releases = 0;
+          const setup = yield* Effect.scoped(
+            Effect.gen(function* () {
+              factoryScope = yield* Scope.Scope;
+              return yield* makeProjectManagedSetupRuntime({
+                ...f.options,
+                revalidateRuntimeAssets: Effect.gen(function* () {
+                  expect(yield* Scope.Scope).not.toBe(factoryScope);
+                  checks++;
+                  yield* Effect.addFinalizer(() => Effect.sync(() => releases++));
+                }),
+              });
+            }),
+          );
+          const receipt = yield* setup.execute(f.input);
+          expect(receipt.outcome).toBe("skipped");
+          expect(checks).toBeGreaterThan(0);
+          expect(releases).toBe(checks);
           expect(f.counts.native).toBe(0);
         }),
       ),
     ),
-);
+  );
 
-it.effect("reconciles an original unlaunched allocation without running a script", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        const retained = yield* f.freeze;
-        const receipt = yield* f.setup.reconcile(f.input);
-        expect(receipt.outcome).toBe("failed");
-        expect(receipt.reconciliation?.state).toBe("absent");
-        expect(receipt.allocation).toEqual(retained.allocation);
-        expect(yield* f.setup.execute(f.input)).toEqual(receipt);
-        expect(f.counts.native).toBe(0);
-      }),
+  for (const [memoryBytes, runtimeSeconds] of [
+    [16777215, 60],
+    [2147483649, 60],
+    [67108864, 0],
+    [67108864, 3601],
+  ])
+    it.effect(`rejects resource policy ${memoryBytes}/${runtimeSeconds}`, () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            f.options.launchPolicy = { memoryBytes: memoryBytes!, runtimeSeconds: runtimeSeconds! };
+            expect((yield* f.make().pipe(Effect.result))._tag).toBe("Failure");
+            expect(f.counts.controls).toBe(0);
+            expect(f.counts.native).toBe(0);
+          }),
+        ),
+      ),
+    );
+
+  it.effect("a completed skip becomes stale when a setup script is selected", () =>
+    withServices(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          yield* f.settings.updateSettings({
+            projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [] } },
+          });
+          expect((yield* f.setup.execute(f.input)).outcome).toBe("skipped");
+          yield* f.settings.updateSettings({
+            projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [script] } },
+          });
+          expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+          expect(f.counts.controls).toBe(0);
+          expect(f.counts.native).toBe(0);
+        }),
+      ),
     ),
-  ),
-);
+  );
+});
 
-it.effect("legacy records retain uncertainty and never gain fresh launch permission", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        const original = yield* f.freeze;
-        yield* f.sql`DELETE FROM project_team_setup_process WHERE setup_id=${f.input.setupId}`;
-        yield* f.sql`INSERT INTO project_team_setup_process
+// These controls simulate Linux selection/preallocation on actual POSIX files.
+// Windows cannot validate Linux mount-target paths; native isolation is never inferred.
+describe.runIf(Context.get(Context.empty(), HostProcessPlatform) !== "win32")(
+  "controlled POSIX Linux allocation simulation",
+  () => {
+    it.effect(
+      "freezes full shared selection, exact Bash argv, original policy and Git entries",
+      () =>
+        withServices(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              const retained = yield* f.freeze;
+              expect(retained.selection.kind).toBe("script");
+              if (retained.selection.kind !== "script") return;
+              expect(retained.selection.launch.argv).toEqual(["/bin/bash", "-c", script.command]);
+              expect(retained.selection.launch.nativeStateRoot).toBeUndefined();
+              expect(retained.selection.launch.protectedWorkspaceEntries).toEqual([".git"]);
+              expect(retained.selection.launch.workspaceRoot).toBe(f.worktree);
+              expect(retained.allocation?.policy).toEqual({
+                memoryBytes: 67108864,
+                runtimeSeconds: 60,
+              });
+              expect(retained.selection.scriptRevision).toMatch(/^[a-f0-9]{64}$/);
+              expect(f.counts.native).toBe(0);
+            }),
+          ),
+        ),
+    );
+
+    for (const patch of [
+      { command: "printf changed" },
+      { name: "Changed name" },
+      { async: false },
+      { runOnWorktreeCreate: false },
+      { previewUrl: "https://example.invalid/preview" },
+    ])
+      it.effect(`denies stale selection after ${Object.keys(patch)[0]} changes`, () =>
+        withServices(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              yield* f.freeze;
+              yield* f.settings.updateSettings({
+                projectSettingsOverrides: {
+                  [projectId]: { defaultProjectScripts: [{ ...script, ...patch }] },
+                },
+              });
+              const before = f.counts.controls;
+              const result = yield* f.setup.execute(f.input).pipe(Effect.result);
+              expect(result._tag).toBe("Failure");
+              expect(f.counts.controls).toBe(before);
+              expect(f.counts.native).toBe(0);
+            }),
+          ),
+        ),
+      );
+
+    it.effect("captures service objects and options before later caller substitutions", () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            f.options.launchPolicy.runtimeSeconds = 3600;
+            f.options.runtimeFiles[0]!.target = "/runtime/replacement";
+            f.options.protectedWorkspaceEntries[0] = "untrusted";
+            f.options.assertWorkspace = () =>
+              Effect.fail(new ProjectManagedSetupError({ reason: "replacement callback" }));
+            const query = {
+              ...f.query,
+              getProjectShellById: () => Effect.die("replacement query used"),
+            };
+            const settings = {
+              ...f.settings,
+              getSettings: Effect.die("replacement settings used"),
+            };
+            const retained = yield* f.freeze.pipe(
+              Effect.provideService(ProjectionSnapshotQuery, query),
+              Effect.provideService(ServerSettings.ServerSettingsService, settings),
+              Effect.provideService(HostProcessPlatform, "win32"),
+            );
+            expect(retained.allocation?.policy.runtimeSeconds).toBe(60);
+            expect(retained.allocation?.launch.argv[0]).toBe("/bin/bash");
+            expect(
+              retained.selection.kind === "script" &&
+                retained.selection.launch.protectedWorkspaceEntries,
+            ).toEqual([".git"]);
+            expect(f.counts.native).toBe(0);
+          }),
+        ),
+      ),
+    );
+
+    // Default Context.References must be sampled too: an absent key in Effect.context()
+    // otherwise lets a later execution context replace the live clock or Linux manager identity.
+    for (const reference of ["clock", "platform", "user-id"] as const)
+      it.live(
+        `captures ${reference === "platform" ? "simulated Linux platform" : `default ${reference}`} before execution overrides`,
+        () =>
+          withServices(
+            Effect.scoped(
+              Effect.gen(function* () {
+                const f = yield* fixture(false, true);
+                const clock = yield* Clock.Clock;
+                const uid = yield* HostProcessUserId;
+                const retained = yield* f.freeze.pipe(
+                  reference === "clock"
+                    ? Effect.provideService(Clock.Clock, {
+                        currentTimeNanos: clock.currentTimeNanos,
+                        currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+                        monotonicTimeNanos: clock.monotonicTimeNanos,
+                        monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+                        sleep: (duration) => clock.sleep(duration),
+                        currentTimeMillis: Effect.succeed(f.input.deadlineAtMs + 1),
+                        currentTimeMillisUnsafe: () => f.input.deadlineAtMs + 1,
+                      })
+                    : reference === "platform"
+                      ? Effect.provideService(HostProcessPlatform, "win32")
+                      : Effect.provideService(HostProcessUserId, 9999),
+                );
+                expect(retained.allocation).not.toBeNull();
+                expect(f.managerAddresses.length).toBeGreaterThan(0);
+                expect(f.managerAddresses).toEqual(
+                  f.managerAddresses.map(() => `unix:path=/run/user/${uid}/bus`),
+                );
+                expect(f.counts.native).toBe(0);
+              }),
+            ),
+          ),
+      );
+
+    it.effect("asset revalidation denies stale retained selection before acquisition", () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            yield* f.freeze;
+            f.options.revalidateRuntimeAssets = Effect.fail(
+              new ProjectManagedSetupError({ reason: "borrowed stage changed" }),
+            );
+            const setup = yield* f.make();
+            const before = f.counts.controls;
+            expect((yield* setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+            expect(f.counts.controls).toBe(before);
+            expect(f.counts.native).toBe(0);
+            expect(yield* f.fs.exists(f.protectedRoot)).toBe(true);
+          }),
+        ),
+      ),
+    );
+
+    it.effect(
+      "a lost claim response never repeats a script or treats unit absence as known history",
+      () =>
+        withServices(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              const retained = yield* f.freeze;
+              if (!retained.allocation) return;
+              yield* f.journal
+                .claimActivation(f.input, retained.selection, retained.allocation)
+                .pipe(Effect.andThen(Effect.fail("response lost")), Effect.result);
+              const before = f.counts.controls;
+              expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+              expect(f.counts.controls).toBe(before);
+              expect((yield* f.setup.reconcile(f.input).pipe(Effect.result))._tag).toBe("Failure");
+              const current = yield* f.journal.read(f.input);
+              expect(current?.uncertain).toBe(true);
+              expect(current?.activation).toBe("claimed");
+              expect(current?.allocation).toEqual(retained.allocation);
+              expect(f.counts.native).toBe(0);
+            }),
+          ),
+        ),
+    );
+
+    it.effect("reconciles an original unlaunched allocation without running a script", () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            const retained = yield* f.freeze;
+            const receipt = yield* f.setup.reconcile(f.input);
+            expect(receipt.outcome).toBe("failed");
+            expect(receipt.reconciliation?.state).toBe("absent");
+            expect(receipt.allocation).toEqual(retained.allocation);
+            expect(yield* f.setup.execute(f.input)).toEqual(receipt);
+            expect(f.counts.native).toBe(0);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("legacy records retain uncertainty and never gain fresh launch permission", () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            const original = yield* f.freeze;
+            yield* f.sql`DELETE FROM project_team_setup_process WHERE setup_id=${f.input.setupId}`;
+            yield* f.sql`INSERT INTO project_team_setup_process
       (setup_id,dispatch_id,unit,selection_json,allocation_json,status,input_json,activation)
       VALUES (${f.input.setupId},${f.input.dispatchId},${original.allocation?.unit},${encode(original.selection)},${encode(original.allocation)},'uncertain',NULL,'claimed')`;
-        expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
-        expect((yield* f.setup.reconcile(f.input).pipe(Effect.result))._tag).toBe("Failure");
+            expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+            expect((yield* f.setup.reconcile(f.input).pipe(Effect.result))._tag).toBe("Failure");
+            expect(f.counts.native).toBe(0);
+            const rows =
+              yield* f.sql`SELECT status,allocation_json FROM project_team_setup_process`;
+            expect(rows[0]?.status).toBe("uncertain");
+            expect(rows[0]?.allocation_json).not.toBeNull();
+          }),
+        ),
+      ),
+    );
+
+    it.effect("folded environment defaults replace legacy aggregate scripts", () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture();
+            const selected = { ...script, id: "environment-setup", command: "printf environment" };
+            yield* f.settings.updateSettings({
+              defaultProjectScripts: [selected],
+            });
+            const frozen = yield* f.freeze;
+            expect(frozen.selection.kind === "script" && frozen.selection.scriptId).toBe(
+              selected.id,
+            );
+            expect(frozen.selection.kind === "script" && frozen.selection.launch.argv).toEqual([
+              "/bin/bash",
+              "-c",
+              selected.command,
+            ]);
+            yield* f.settings.updateSettings({ defaultProjectScripts: [] });
+            const before = f.counts.controls;
+            expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+            expect(f.counts.controls).toBe(before);
+            expect(f.counts.native).toBe(0);
+          }),
+        ),
+        ServerSettings.layerTest({ projectSettingsFolded: true }),
+      ),
+    );
+
+    it.effect(
+      "a lost owner response keeps its captured identity and reconciles without relaunch",
+      () =>
+        withServices(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              const original = yield* f.freeze;
+              if (!original.allocation) return;
+              const allocation = original.allocation;
+              const owner = {
+                type: "owner" as const,
+                unit: allocation.unit,
+                nonce: allocation.nonce,
+                invocation: "a".repeat(32),
+                cgroup: "/sys/fs/cgroup/controlled-fixture/" + allocation.unit,
+                pid: 12345,
+                memoryBytes: allocation.policy.memoryBytes,
+                swapBytes: 0,
+                oomGroup: 1,
+              };
+              yield* f.journal.claimActivation(f.input, original.selection, allocation);
+              yield* f.journal
+                .persistOwner(f.input, allocation, owner)
+                .pipe(Effect.andThen(Effect.fail("owner response lost")), Effect.result);
+              const before = f.counts.controls;
+              expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
+              expect(f.counts.controls).toBe(before);
+              expect((yield* f.journal.read(f.input))?.owner).toEqual(owner);
+              const receipt = yield* f.setup.reconcile(f.input);
+              expect(receipt.owner).toEqual(owner);
+              expect(receipt.allocation).toEqual(allocation);
+              expect(receipt.outcome).toBe("failed");
+              expect(receipt.reconciliation?.state).toBe("drained");
+              expect(f.counts.native).toBe(0);
+            }),
+          ),
+        ),
+    );
+
+    it.effect("portability control uses no distro files or host printf", () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const fs = yield* FileSystem.FileSystem;
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const absent = yield* fs.makeTempDirectoryScoped({ prefix: "setup-absent-layout-" });
+            const requested: string[] = [];
+            const executables: string[] = [];
+            const hostFiles = new Set([
+              "/usr/bin/bash",
+              "/usr/bin/sleep",
+              "/lib64/ld-linux-x86-64.so.2",
+              "/usr/lib/libc.so.6",
+              "/usr/lib/libreadline.so.8",
+              "/usr/lib/libncursesw.so.6",
+            ]);
+            const f = yield* fixture().pipe(
+              Effect.provideService(FileSystem.FileSystem, {
+                ...fs,
+                realPath: (source) => {
+                  requested.push(source);
+                  return hostFiles.has(source)
+                    ? fs.realPath(absent + "/not-installed")
+                    : fs.realPath(source);
+                },
+              }),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, {
+                ...spawner,
+                spawn: (command) => {
+                  if (command._tag !== "StandardCommand") return Effect.die("Unexpected pipeline");
+                  executables.push(command.command);
+                  if (command.command !== process.execPath)
+                    return Effect.die("Unexpected host executable");
+                  expect(command.options.env).toEqual({});
+                  return spawner.spawn(command);
+                },
+              }),
+            );
+            const retained = yield* f.freeze;
+            expect(retained.allocation).not.toBeNull();
+            expect(requested.some((source) => hostFiles.has(source))).toBe(false);
+            expect(executables).toEqual([process.execPath]);
+            expect(f.counts.native).toBe(0);
+          }),
+        ),
+      ),
+    );
+
+    it.live("captures unavailable user ID without granting caller manager transport", () =>
+      withServices(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture(false, true);
+            const setup = yield* f.make().pipe(Effect.provideService(HostProcessUserId, undefined));
+            const result = yield* setup
+              .execute(f.input)
+              .pipe(Effect.provideService(HostProcessUserId, 9999), Effect.result);
+            expect(result._tag).toBe("Failure");
+            expect((yield* f.journal.read(f.input))?.allocation).not.toBeNull();
+            expect(f.managerAddresses).toEqual([]);
+            expect(f.counts.controls).toBe(0);
+            expect(f.counts.native).toBe(0);
+          }),
+        ),
+      ),
+    );
+  },
+);
+
+it.live("captures actual default platform availability before foreign caller references", () =>
+  withServices(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const platform = yield* HostProcessPlatform;
+        const f = yield* fixture(false, true, true);
+        const result = yield* f.setup
+          .execute(f.input)
+          .pipe(
+            Effect.provideService(HostProcessPlatform, platform === "linux" ? "win32" : "linux"),
+            Effect.provideService(HostProcessUserId, 9999),
+            Effect.result,
+          );
+        expect(result._tag).toBe("Failure");
+        const retained = yield* f.journal.read(f.input);
+        expect(retained?.selection.kind).toBe("script");
+        if (platform === "linux") expect(retained?.allocation).not.toBeNull();
+        else {
+          expect(retained?.allocation).toBeNull();
+          expect(f.counts.controls).toBe(0);
+          expect(f.managerAddresses).toEqual([]);
+        }
         expect(f.counts.native).toBe(0);
-        const rows = yield* f.sql`SELECT status,allocation_json FROM project_team_setup_process`;
-        expect(rows[0]?.status).toBe("uncertain");
-        expect(rows[0]?.allocation_json).not.toBeNull();
       }),
     ),
   ),
 );
 
-for (const [memoryBytes, runtimeSeconds] of [
-  [16777215, 60],
-  [2147483649, 60],
-  [67108864, 0],
-  [67108864, 3601],
-])
-  it.effect(`rejects resource policy ${memoryBytes}/${runtimeSeconds}`, () =>
+for (const platform of ["darwin", "win32"] as const)
+  it.live(`captures simulated unsupported ${platform} before caller Linux grant`, () =>
     withServices(
       Effect.scoped(
         Effect.gen(function* () {
-          const f = yield* fixture();
-          f.options.launchPolicy = { memoryBytes: memoryBytes!, runtimeSeconds: runtimeSeconds! };
-          expect((yield* f.make().pipe(Effect.result))._tag).toBe("Failure");
+          const f = yield* fixture(false, true, true).pipe(
+            Effect.provideService(HostProcessPlatform, platform),
+          );
+          const result = yield* f.setup
+            .execute(f.input)
+            .pipe(
+              Effect.provideService(HostProcessPlatform, "linux"),
+              Effect.provideService(HostProcessUserId, 9999),
+              Effect.result,
+            );
+          expect(result._tag).toBe("Failure");
+          const retained = yield* f.journal.read(f.input);
+          expect(retained?.selection.kind).toBe("script");
+          expect(retained?.allocation).toBeNull();
           expect(f.counts.controls).toBe(0);
+          expect(f.managerAddresses).toEqual([]);
           expect(f.counts.native).toBe(0);
         }),
       ),
     ),
   );
-
-it.effect("a completed skip becomes stale when a setup script is selected", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        yield* f.settings.updateSettings({
-          projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [] } },
-        });
-        expect((yield* f.setup.execute(f.input)).outcome).toBe("skipped");
-        yield* f.settings.updateSettings({
-          projectSettingsOverrides: { [projectId]: { defaultProjectScripts: [script] } },
-        });
-        expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
-        expect(f.counts.controls).toBe(0);
-        expect(f.counts.native).toBe(0);
-      }),
-    ),
-  ),
-);
-
-it.effect("folded environment defaults replace legacy aggregate scripts", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        const selected = { ...script, id: "environment-setup", command: "printf environment" };
-        yield* f.settings.updateSettings({
-          defaultProjectScripts: [selected],
-        });
-        const frozen = yield* f.freeze;
-        expect(frozen.selection.kind === "script" && frozen.selection.scriptId).toBe(selected.id);
-        expect(frozen.selection.kind === "script" && frozen.selection.launch.argv).toEqual([
-          "/bin/bash",
-          "-c",
-          selected.command,
-        ]);
-        yield* f.settings.updateSettings({ defaultProjectScripts: [] });
-        const before = f.counts.controls;
-        expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
-        expect(f.counts.controls).toBe(before);
-        expect(f.counts.native).toBe(0);
-      }),
-    ),
-    ServerSettings.layerTest({ projectSettingsFolded: true }),
-  ),
-);
-
-it.effect("a lost owner response keeps its captured identity and reconciles without relaunch", () =>
-  withServices(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture();
-        const original = yield* f.freeze;
-        if (!original.allocation) return;
-        const allocation = original.allocation;
-        const owner = {
-          type: "owner" as const,
-          unit: allocation.unit,
-          nonce: allocation.nonce,
-          invocation: "a".repeat(32),
-          cgroup: "/sys/fs/cgroup/controlled-fixture/" + allocation.unit,
-          pid: 12345,
-          memoryBytes: allocation.policy.memoryBytes,
-          swapBytes: 0,
-          oomGroup: 1,
-        };
-        yield* f.journal.claimActivation(f.input, original.selection, allocation);
-        yield* f.journal
-          .persistOwner(f.input, allocation, owner)
-          .pipe(Effect.andThen(Effect.fail("owner response lost")), Effect.result);
-        const before = f.counts.controls;
-        expect((yield* f.setup.execute(f.input).pipe(Effect.result))._tag).toBe("Failure");
-        expect(f.counts.controls).toBe(before);
-        expect((yield* f.journal.read(f.input))?.owner).toEqual(owner);
-        const receipt = yield* f.setup.reconcile(f.input);
-        expect(receipt.owner).toEqual(owner);
-        expect(receipt.allocation).toEqual(allocation);
-        expect(receipt.outcome).toBe("failed");
-        expect(receipt.reconciliation?.state).toBe("drained");
-        expect(f.counts.native).toBe(0);
-      }),
-    ),
-  ),
-);
 
 // Root approved only this constructive command, copied from the existing benign setup gate.
 // This exercises native setup composition; the registered-Git callback remains controlled.
