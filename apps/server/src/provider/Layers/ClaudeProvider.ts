@@ -172,6 +172,8 @@ function apiProviderAuthMetadata(
 // account info. The previous 8s budget expired mid-init, so the probe returned
 // `undefined` and left the provider unverified and unselectable in the picker.
 const CAPABILITIES_PROBE_TIMEOUT_MS = 25_000;
+// Match the SDK default spawn wrapper's stderr grace after actual child exit.
+const CAPABILITIES_PROBE_PIPE_DRAIN_TIMEOUT_MS = 200;
 
 /**
  * Keep workspace-scoped command discovery intact while isolating the periodic
@@ -339,6 +341,7 @@ const probeClaudeCapabilities = (
     const abort = new AbortController();
     let q: ReturnType<typeof claudeQuery> | undefined;
     let child: NodeChildProcess.ChildProcessWithoutNullStreams | undefined;
+    let childExited: Promise<void> | undefined;
     let childClosed: Promise<void> | undefined;
     return Effect.acquireUseRelease(
       Effect.void,
@@ -375,6 +378,13 @@ const probeClaudeCapabilities = (
                   child = spawned;
                   // The custom-spawn path leaves stderr draining to its caller.
                   spawned.stderr.resume();
+                  childExited = new Promise<void>((resolve) => {
+                    spawned.once("exit", () => resolve());
+                    // Native spawn failure has no running child and never emits exit.
+                    spawned.once("error", () => {
+                      if (spawned.pid === undefined) resolve();
+                    });
+                  });
                   childClosed = new Promise<void>((resolve) =>
                     spawned.once("close", () => resolve()),
                   );
@@ -423,14 +433,34 @@ const probeClaudeCapabilities = (
             try {
               await q?.return();
             } finally {
-              // Query.return() has a bounded wait that can expire before the SDK's
-              // termination grace. Join the captured child's pipes before reporting readiness.
+              // Query.return() can finish before the SDK's termination grace.
+              // Keep actual child exit owned independently of its inherited pipe descriptors.
               // A constructor failure may leave a child without a returned query owner.
               if (q === undefined) child?.kill("SIGKILL");
-              await childClosed;
+              await childExited;
             }
           }
-        }),
+        }).pipe(
+          Effect.onExit(() => {
+            const closed = childClosed;
+            return closed === undefined
+              ? Effect.void
+              : Effect.tryPromise(() => closed).pipe(
+                  Effect.timeout(CAPABILITIES_PROBE_PIPE_DRAIN_TIMEOUT_MS),
+                  // Only the pipe wait is interruptible, after actual exit has been joined.
+                  Effect.interruptible,
+                  Effect.onExit(() =>
+                    Effect.try(() => {
+                      // A descendant may retain its inherited write ends. Close only our
+                      // own handles; a failed drain returns unavailable instead of readiness.
+                      child?.stdin.destroy();
+                      child?.stdout.destroy();
+                      child?.stderr.destroy();
+                    }),
+                  ),
+                );
+          }),
+        ),
     ).pipe(
       Effect.result,
       Effect.map((result) => (Result.isSuccess(result) ? result.success : undefined)),

@@ -5,6 +5,7 @@ import { assert, it } from "@effect/vitest";
 import { ClaudeSettings } from "@t3tools/contracts";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -286,6 +287,185 @@ it.layer(NodeServices.layer)("Claude readiness query ownership", (it) => {
       );
       assert.ok(child?.pid);
       assert.equal(requests.includes("user"), false, "no inference prompt may reach the peer");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.each([
+    { name: "ordinary readiness", held: false, interrupt: false },
+    { name: "ordinary interruption", held: false, interrupt: true },
+    { name: "inherited stderr readiness", held: true, interrupt: false },
+    { name: "inherited stderr interruption", held: true, interrupt: true },
+  ])("bounds owned pipe cleanup after direct exit: $name", (testCase) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-claude-pipe-" });
+      const executable = NodePath.join(root, "claude");
+      const leafReady = yield* Deferred.make<number>();
+      const usageStarted = yield* Deferred.make<void>();
+      const childExited = yield* Deferred.make<void>();
+      const queryReturned = yield* Deferred.make<void>();
+      let closed = false;
+      let child: NodeChildProcess.ChildProcessWithoutNullStreams | undefined;
+      let leafPid: number | undefined;
+      let closeReceipt: Promise<void> | undefined;
+      const leafSource = [
+        'const fs = require("node:fs");',
+        "const dir = process.env.T3_PIPE_RELEASE_DIR;",
+        'process.on("exit", () => fs.writeFileSync(dir + "/leaf-exit", String(process.pid)));',
+        'fs.watch(dir, () => { if (fs.existsSync(dir + "/release")) process.exit(0); });',
+        'process.stderr.write("held-leaf:" + process.pid + "\\n");',
+      ].join("\n");
+      const peer = fixtureFor("success").replace(
+        "const lines = NodeReadline.createInterface({ input: process.stdin });",
+        [
+          'import * as ChildProcess from "node:child_process";',
+          'if (process.env.T3_PIPE_RETAIN === "1") {',
+          `  ChildProcess.spawn(process.execPath, ["-e", ${encodeReceipt(leafSource)}], { stdio: ["ignore", "ignore", "inherit"], env: process.env });`,
+          "}",
+          "const lines = NodeReadline.createInterface({ input: process.stdin });",
+        ].join("\n"),
+      );
+      yield* fs.writeFileString(executable, peer);
+      yield* fs.chmod(executable, 0o755);
+      const leafExit = Promise.withResolvers<void>();
+      const watcher = NodeFS.watch(root, (_event, filename) => {
+        if (String(filename) === "leaf-exit") leafExit.resolve();
+      });
+      const actual = yield* Effect.promise(() =>
+        vi.importActual<typeof ClaudeSdk>("@anthropic-ai/claude-agent-sdk"),
+      );
+      const spy = vi.spyOn(ClaudeSdk, "query").mockImplementation((input) => {
+        const q = actual.query({
+          ...input,
+          options: {
+            ...input.options,
+            spawnClaudeCodeProcess: (options) => {
+              const spawn = input.options?.spawnClaudeCodeProcess;
+              assert.ok(spawn);
+              const spawned = spawn(options) as NodeChildProcess.ChildProcessWithoutNullStreams;
+              child = spawned;
+              spawned.once("exit", () => Deferred.doneUnsafe(childExited, Effect.void));
+              closeReceipt = new Promise<void>((resolve) =>
+                spawned.once("close", () => {
+                  closed = true;
+                  resolve();
+                }),
+              );
+              spawned.stderr.on("data", (chunk) => {
+                const match = String(chunk).match(/held-leaf:(\d+)/);
+                if (match !== null)
+                  Deferred.doneUnsafe(leafReady, Effect.succeed(Number(match[1])));
+              });
+              const write = spawned.stdin.write.bind(spawned.stdin);
+              vi.spyOn(spawned.stdin, "write").mockImplementation((...args) => {
+                if (String(args[0]).includes('"subtype":"get_usage"'))
+                  Deferred.doneUnsafe(usageStarted, Effect.void);
+                return write(...args);
+              });
+              return spawned;
+            },
+          },
+        });
+        const finish = q.return.bind(q);
+        q.return = async (...args) => {
+          try {
+            return await finish(...args);
+          } finally {
+            Deferred.doneUnsafe(queryReturned, Effect.void);
+          }
+        };
+        return q;
+      });
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          // Release only the fixture leaf; the product must already have joined its direct child.
+          if (testCase.held) {
+            yield* fs.writeFileString(NodePath.join(root, "release"), "1").pipe(Effect.orDie);
+            yield* Effect.promise(() => leafExit.promise);
+          }
+          yield* Effect.promise(async () => {
+            await closeReceipt;
+          });
+          watcher.close();
+          spy.mockRestore();
+        }),
+      );
+      const probe = yield* probeClaudeCapabilities(
+        decodeClaudeSettings({ binaryPath: executable }),
+        {
+          PATH: process.env.PATH,
+          HOME: root,
+          USERPROFILE: root,
+          CLAUDE_CONFIG_DIR: root,
+          CLAUDE_SECURESTORAGE_CONFIG_DIR: root,
+          XDG_CONFIG_HOME: root,
+          TMPDIR: root,
+          TMP: root,
+          TEMP: root,
+          T3_PIPE_RETAIN: testCase.held ? "1" : "0",
+          T3_PIPE_RELEASE_DIR: root,
+        },
+        root,
+      ).pipe(Effect.forkChild);
+      if (testCase.held) leafPid = yield* Deferred.await(leafReady);
+      yield* Deferred.await(usageStarted);
+      const interruption = testCase.interrupt
+        ? yield* Fiber.interrupt(probe).pipe(Effect.forkChild)
+        : undefined;
+      yield* Deferred.await(childExited);
+      yield* Deferred.await(queryReturned);
+      // Ordinary pipes can finish naturally before advancing the test clock.
+      if (!testCase.held)
+        yield* Effect.promise(async () => {
+          await closeReceipt;
+        });
+      yield* TestClock.adjust("1 second");
+      yield* Effect.yieldNow;
+      const settledBeforeLeafRelease = probe.pollUnsafe() !== undefined;
+      const interruptionSettledBeforeLeafRelease = interruption?.pollUnsafe() !== undefined;
+      const destroyedBeforeLeafRelease = child?.stderr.destroyed;
+      const evidence = process.env.T3_CLAUDE_PROBE_EVIDENCE_DIR;
+      if (evidence !== undefined) {
+        yield* fs.writeFileString(
+          NodePath.join(evidence, testCase.name.replaceAll(" ", "-") + ".json"),
+          encodeReceipt({
+            parent: child?.pid,
+            leaf: leafPid,
+            settledBeforeLeafRelease,
+            interruptionSettledBeforeLeafRelease,
+            destroyedBeforeLeafRelease,
+            closedBeforeLeafRelease: closed,
+            parentHome: process.env.HOME,
+          }),
+        );
+      }
+      // Release even a failing old-source control before asserting, preserving the failure without stranding it.
+      if (testCase.held) {
+        yield* fs.writeFileString(NodePath.join(root, "release"), "1");
+        yield* Effect.promise(() => leafExit.promise);
+      }
+      const exit = yield* Fiber.await(probe);
+      if (interruption !== undefined) yield* Fiber.join(interruption);
+      assert.equal(
+        settledBeforeLeafRelease,
+        true,
+        "readiness must settle without the descriptor-holding leaf exiting",
+      );
+      if (testCase.interrupt) {
+        assert.equal(interruptionSettledBeforeLeafRelease, true);
+        assert.equal(Exit.isFailure(exit), true);
+        if (Exit.isFailure(exit)) assert.equal(Cause.hasInterrupts(exit.cause), true);
+      } else {
+        assert.equal(Exit.isSuccess(exit), true);
+        if (Exit.isSuccess(exit))
+          assert.equal(exit.value?.email, testCase.held ? undefined : "test@example.com");
+      }
+      if (testCase.held)
+        assert.equal(
+          destroyedBeforeLeafRelease,
+          true,
+          "only the parent's owned read handle must be closed",
+        );
     }).pipe(Effect.scoped),
   );
 
