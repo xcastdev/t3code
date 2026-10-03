@@ -523,39 +523,39 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
       };
       context.lastOperationId = active.operation.operation.operationId;
       if (operationId !== undefined && active.operation.operation.operationId !== operationId)
-        return yield* Effect.fail(
-          requestError(
-            request.kind,
-            new PiManagedRuntimeError({
-              code: "uncertain",
-              detail: "Prepared Pi identity did not match Root's dispatch operation.",
-            }),
-          ),
-        ).pipe(
-          Effect.onExit(() =>
-            Effect.uninterruptible(
-              Effect.suspend(() => runtime.requestStop(context.threadId)).pipe(
-                Effect.catchCause((cause) =>
-                  Effect.failCause(
-                    Cause.fromReasons(
-                      cause.reasons.map((reason) => {
-                        if (Cause.isInterruptReason(reason)) return reason;
-                        const error = Cause.isFailReason(reason)
-                          ? reason.error
-                          : new PiManagedRuntimeError({
-                              code: "uncertain",
-                              detail: "Pi prepared identity cleanup failed.",
-                            });
-                        return Cause.makeFailReason(requestError("stopSession", error)).annotate(
-                          Context.makeUnsafe(reason.annotations),
-                        );
-                      }),
-                    ),
-                  ),
-                ),
+        return yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const denial = Cause.fail(
+              requestError(
+                request.kind,
+                new PiManagedRuntimeError({
+                  code: "uncertain",
+                  detail: "Prepared Pi identity did not match Root's dispatch operation.",
+                }),
               ),
-            ),
-          ),
+            );
+            const cleanup = yield* Effect.exit(
+              Effect.suspend(() => runtime.requestStop(context.threadId)),
+            );
+            const cleanupReasons = Exit.isFailure(cleanup)
+              ? cleanup.cause.reasons.map((reason) => {
+                  if (Cause.isInterruptReason(reason)) return reason;
+                  const error = Cause.isFailReason(reason)
+                    ? reason.error
+                    : new PiManagedRuntimeError({
+                        code: "uncertain",
+                        detail: "Pi prepared identity cleanup failed.",
+                      });
+                  return Cause.makeFailReason(requestError("stopSession", error)).annotate(
+                    Context.makeUnsafe(reason.annotations),
+                  );
+                })
+              : [];
+            // Equal sanitized reasons still represent separate owned cleanup occurrences.
+            return yield* Effect.failCause(
+              Cause.fromReasons([...denial.reasons, ...cleanupReasons]),
+            );
+          }),
         );
       if (prepared.kind !== request.kind || prepared.operation.operationKind !== request.kind)
         return yield* requestError(

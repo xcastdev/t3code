@@ -1954,6 +1954,11 @@ for (const kind of ["initialize", "prompt"] as const)
     "mixed",
     "interrupt-pair",
     "mixed-interrupts",
+    "unannotated-two-defects",
+    "unannotated-mixed",
+    "unannotated-same-typed",
+    "same-annotations-two-defects",
+    "same-annotations-same-typed",
   ] as const)
     it.effect(`repair R1 ${kind} cleanup preserves every ${mode} reason after join`, () =>
       Effect.gen(function* () {
@@ -1974,12 +1979,18 @@ for (const kind of ["initialize", "prompt"] as const)
           Cause.makeDieReason(new Error("private-cleanup-defect-two")),
         ];
         const interrupts = [Cause.makeInterruptReason(101), Cause.makeInterruptReason(202)];
-        const selected =
-          mode === "typed-pair"
+        const selected = mode.endsWith("same-typed")
+          ? [
+              typed[0]!,
+              Cause.makeFailReason(
+                new PiManagedRuntimeError({ code: "denied", detail: "private-cleanup-duplicate" }),
+              ),
+            ]
+          : mode === "typed-pair"
             ? typed
-            : mode === "two-defects"
+            : mode.endsWith("two-defects")
               ? defects
-              : mode === "mixed"
+              : mode === "mixed" || mode === "unannotated-mixed"
                 ? [...typed, ...defects]
                 : mode === "interrupt-pair"
                   ? interrupts
@@ -1992,14 +2003,18 @@ for (const kind of ["initialize", "prompt"] as const)
                       defects[1]!,
                     ];
         const cleanupReasons = selected.map((reason, index) =>
-          reason.annotate(
-            Context.makeUnsafe(
-              new Map<string, unknown>([
-                ["cleanupStep", index],
-                ["correlation", "owned-identity-cleanup"],
-              ]),
-            ),
-          ),
+          mode.startsWith("unannotated-")
+            ? reason
+            : reason.annotate(
+                Context.makeUnsafe(
+                  new Map<string, unknown>([
+                    ...(mode.startsWith("same-annotations-")
+                      ? []
+                      : [["cleanupStep", index] as const]),
+                    ["correlation", "owned-identity-cleanup"],
+                  ]),
+                ),
+              ),
         );
         const originalAnnotations = cleanupReasons.map((reason) => [...reason.annotations]);
         const runtime: PiManagedRuntimeInstance = {
@@ -2081,8 +2096,14 @@ for (const kind of ["initialize", "prompt"] as const)
                 );
               }
             }
-            expect(reason!.annotations.get("cleanupStep")).toBe(index);
-            expect(reason!.annotations.get("correlation")).toBe("owned-identity-cleanup");
+            for (const [key, value] of originalAnnotations[index]!)
+              expect(reason!.annotations.get(key)).toBe(value);
+            expect(reason!.annotations.has("cleanupStep")).toBe(
+              prior.annotations.has("cleanupStep"),
+            );
+            expect(reason!.annotations.has("correlation")).toBe(
+              prior.annotations.has("correlation"),
+            );
           }
         }
         expect(json(completed)).not.toContain("private-cleanup");
