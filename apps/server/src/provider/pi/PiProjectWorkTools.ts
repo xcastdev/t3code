@@ -35,7 +35,7 @@ export class PiProjectWorkToolValidationError extends Schema.TaggedError<PiProje
 const strict = { onExcessProperty: "error" } as const;
 const toolIds = Schema.Array(
   Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256), Schema.isTrimmed()),
-).check(Schema.isMaxLength(64), Schema.isUnique());
+).check(Schema.isMaxLength(64));
 const decodeToolLists = Schema.decodeUnknownSync(
   Schema.Struct({ roleTools: toolIds, bindingTools: toolIds }),
   strict,

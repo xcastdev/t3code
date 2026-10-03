@@ -119,7 +119,6 @@ sparseTools.length = 1;
 for (const malformed of [
   [""],
   [" project-work.report"],
-  ["project-work.report", "project-work.report"],
   ["x".repeat(257)],
   sparseTools,
   Array.from({ length: 65 }, (_, index) => `tool-${index}`),
@@ -244,6 +243,7 @@ for (const [toolName, arguments_, reason] of [
 const assignment = Effect.fn("piBridgeTest.assignment")(function* (
   kind: "investigation" | "planning",
   capabilities?: readonly string[],
+  bindingTools?: readonly string[],
 ) {
   yield* runMigrations();
   const sql = yield* SqlClient.SqlClient;
@@ -354,12 +354,13 @@ const assignment = Effect.fn("piBridgeTest.assignment")(function* (
   const child = current.tasks.find((task) => task.taskId !== parentId)!;
   const generated = current.foundationRecords!.find((record) => record.kind === "role-revision")!;
   if (generated.kind !== "role-revision") return yield* Effect.die("Missing generated role");
-  const role = {
+  const role = decodeRecord({
     ...generated,
     recordId: "configured-role",
     model: "fixture-model",
     tools: capabilities ?? [...generated.tools, "project-work.read-task"],
-  };
+  });
+  if (role.kind !== "role-revision") return yield* Effect.die("Invalid configured role");
   yield* repo.execute({
     type: "project-work.foundation.commit",
     projectId,
@@ -405,7 +406,7 @@ const assignment = Effect.fn("piBridgeTest.assignment")(function* (
     model: role.model,
     configuration: {
       instructionsHash: "hash",
-      toolIds: role.tools,
+      toolIds: bindingTools ?? role.tools,
       skillIds: [],
       runtimeVersion: "fixture",
       maxTokens: 1000,
@@ -491,6 +492,63 @@ const assignment = Effect.fn("piBridgeTest.assignment")(function* (
   });
   return { sql, repo, gateway, state, child, principal, buildReport, buildPlan };
 });
+
+const duplicateBaseTools = [
+  "read",
+  "search",
+  "project-work",
+  "project-work.read-task",
+  "project-work.report",
+];
+for (const [label, roleTools, bindingTools] of [
+  ["role-only", [...duplicateBaseTools, "project-work.report"], duplicateBaseTools],
+  ["binding-only", duplicateBaseTools, [...duplicateBaseTools, "project-work.report"]],
+  [
+    "both",
+    [...duplicateBaseTools, "project-work.report"],
+    [...duplicateBaseTools, "project-work.report"],
+  ],
+  ["unrelated", [...duplicateBaseTools, "read"], [...duplicateBaseTools, "search"]],
+] as const)
+  it.effect(`advertises and executes a current report with ${label} duplicate capability IDs`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* assignment("investigation", roleTools, bindingTools);
+        const authorization = yield* Authorization.ProjectTeamAuthorization;
+        const authority = yield* authorization.resolve(f.principal);
+        if (authority === undefined) return yield* Effect.die("Missing current authority");
+        expect(authority.role.tools).toEqual(roleTools);
+        expect(authority.binding.configuration.toolIds).toEqual(bindingTools);
+        yield* authorization.capability(f.principal, "project-work.report");
+        const tools = preparePiProjectWorkTools({
+          roleTools: authority.role.tools,
+          bindingTools: authority.binding.configuration.toolIds,
+        });
+        expect(tools.map((entry) => [entry.tool.function.name, entry.capability])).toEqual([
+          ["project_work_read", "project-work.read-task"],
+          ["project_work_report", "project-work.report"],
+        ]);
+        expect(Object.isFrozen(tools)).toBe(true);
+        const intent = yield* f.buildReport;
+        yield* executePiProjectWorkBridgeTool({
+          toolName: "project_work_report",
+          arguments: parameters(intent),
+          principal: f.principal,
+          source,
+        });
+        expect(
+          (yield* f.state()).evidence.find((entry) => entry.summary === intent.summary),
+        ).toMatchObject({
+          taskId: f.child.taskId,
+          attribution: { actor: f.principal.actor, source },
+        });
+        expect(
+          yield* f.sql`SELECT command_id FROM project_work_command_receipts
+        WHERE project_id=${projectId} AND command_id=${intent.commandId}`,
+        ).toHaveLength(1);
+      }),
+    ),
+  );
 
 it.effect("investigator reports persist exact managed attribution and replay one receipt", () =>
   scoped(
