@@ -2,10 +2,14 @@ import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import { it } from "@effect/vitest";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Schema from "effect/Schema";
 import { describe, expect, vi } from "vite-plus/test";
-import { makePiLocalTools, piLocalToolDefinitions } from "./PiLocalTools.ts";
+import * as BashIsolation from "./PiBashToolIsolation.ts";
+import {
+  makePiIsolatedLocalTools,
+  makePiLocalTools,
+  piLocalToolDefinitions,
+} from "./PiLocalTools.ts";
 import type { PiSdkWorkerOptions } from "./PiWorker.ts";
 
 const sdkDirectory = new URL("../", import.meta.resolve("@earendil-works/pi-coding-agent"))
@@ -271,9 +275,15 @@ describe("Pi child-local native SDK tools", () => {
             arguments: call.args,
           });
           const input = decodeValidatedInput(validated);
-          outputs.push(
-            content(yield* Effect.promise(() => tools.localTools[call.name](input, signal()))),
-          );
+          if (call.name === "bash") {
+            yield* Effect.promise(() =>
+              expect(tools.localTools.bash(input, signal())).rejects.toThrow("UNAVAILABLE"),
+            );
+          } else {
+            outputs.push(
+              content(yield* Effect.promise(() => tools.localTools[call.name](input, signal()))),
+            );
+          }
           expect(() =>
             validateToolArguments(sdkTool, {
               type: "toolCall",
@@ -284,7 +294,6 @@ describe("Pi child-local native SDK tools", () => {
           ).toThrow("Validation failed");
         }
         expect(outputs[1]).toBe("before");
-        expect(outputs[3]).toBe("parent-schema-marker");
         expect(yield* fs.readFileString(`${cwd}/parent-schema.txt`)).toBe("after");
       }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
   );
@@ -459,77 +468,130 @@ describe("Pi child-local native SDK tools", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
   );
 
-  it.effect("returns actual bash output and exit details from the explicit cwd", () =>
+  it.effect("fails Bash closed without starting an ordinary SDK shell", () =>
     Effect.gen(function* () {
       const { fs, cwd, tools } = yield* fixture;
-      const result = decodeResult(
-        yield* Effect.promise(() =>
-          tools.localTools.bash(
-            { command: "printf 'native-marker\n'; printf 'owned' > bash-created.txt; pwd" },
-            signal(),
-          ),
-        ),
-      );
-      expect(content(result)).toBe(`native-marker\n${cwd}\n`);
-      expect(result.value.structuredContent?.exit_code).toBe(0);
-      expect(result.value.structuredContent?.output).toBe(`native-marker\n${cwd}\n`);
-      expect(yield* fs.readFileString(`${cwd}/bash-created.txt`)).toBe("owned");
-    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
-  );
-
-  it.effect("refuses a native bash isError result as a successful worker tool result", () =>
-    Effect.gen(function* () {
-      const { tools } = yield* fixture;
+      const childProcess = process.getBuiltinModule("child_process");
+      const spawn = vi.spyOn(childProcess, "spawn");
       yield* Effect.promise(() =>
         expect(
-          tools.localTools.bash({ command: "printf 'secret-output'; exit 7" }, signal()),
-        ).rejects.toThrow(/^TOOL_FAILURE$/),
+          tools.localTools.bash({ command: "printf ordinary > bash-created.txt" }, signal()),
+        ).rejects.toThrow(/^UNAVAILABLE$/),
       );
+      expect(spawn).not.toHaveBeenCalled();
+      expect(yield* fs.readDirectory(cwd)).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+});
+
+// Synthetic kernel metadata exercises the fixed consumer's mode derivation; native
+// entry gates below use the unchanged process owner and its actual readonly mounts.
+const factoryFixture = Effect.gen(function* () {
+  const { fs, cwd } = yield* fixture;
+  const metadata = cwd + "/mountinfo";
+  const files = process.getBuiltinModule("fs").promises;
+  const open = files.open.bind(files);
+  const handles: Awaited<ReturnType<typeof files.open>>[] = [];
+  vi.spyOn(files, "open").mockImplementation(async (...args) => {
+    if (args[0] === "/proc/self/mountinfo") {
+      const handle = await open(metadata, args[1], args[2]);
+      handles.push(handle);
+      return handle;
+    }
+    return open(...args);
+  });
+  let closed = false;
+  const close = vi.fn(async () => {
+    closed = true;
+  });
+  const exec = vi.fn<import("@earendil-works/pi-coding-agent").BashOperations["exec"]>(
+    async (_command, _cwd, options) => {
+      if (closed) throw Error("UNAVAILABLE");
+      options.onData(Buffer.from("owned-marker"));
+      return { exitCode: 0 };
+    },
+  );
+  const isolation = vi
+    .spyOn(BashIsolation, "makePiBashToolIsolation")
+    .mockResolvedValue({ operations: { exec }, close });
+  return { fs, metadata, handles, close, exec, isolation };
+});
+
+describe("fixed Pi isolated tool factory", () => {
+  it.effect.each(["ro", "rw"] as const)(
+    "derives the actual %s mount mode and uses only owned operations",
+    (mode) =>
+      Effect.gen(function* () {
+        const f = yield* factoryFixture;
+        yield* f.fs.writeFileString(
+          f.metadata,
+          `1 9 0:1 / / ro - tmpfs tmpfs ro\n2 1 0:2 / /workspace ${mode} - tmpfs tmpfs rw\n`,
+        );
+        const tools = yield* Effect.promise(() => makePiIsolatedLocalTools());
+        expect(f.isolation).toHaveBeenCalledWith({
+          localOperations: { exec: expect.any(Function) },
+          workspaceAccess: mode === "ro" ? "readonly" : "readwrite",
+          protectedWorkspacePaths: ["/workspace/.git"],
+        });
+        expect(
+          content(
+            yield* Effect.promise(() =>
+              tools.localTools.bash({ command: "printf owned", timeout: 0.3 }, signal()),
+            ),
+          ),
+        ).toBe("owned-marker");
+        expect(f.exec).toHaveBeenCalledTimes(1);
+        expect(f.exec.mock.calls[0]?.slice(0, 2)).toEqual(["printf owned", "/workspace"]);
+        expect(f.exec.mock.calls[0]?.[2].timeout).toBe(0.3);
+        yield* Effect.promise(tools.close);
+        yield* Effect.promise(() =>
+          expect(tools.localTools.bash({ command: "printf later" }, signal())).rejects.toThrow(
+            "UNAVAILABLE",
+          ),
+        );
+        expect(f.close).toHaveBeenCalledTimes(1);
+        expect(f.handles.every((handle) => handle.fd === -1)).toBe(true);
+      }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect.each([
+    "1 9 0:1 / / ro - tmpfs tmpfs ro\n",
+    "1 9 0:1 / /workspace rw,rw - tmpfs tmpfs rw\n",
+    "1 9 0:1 / /workspace ro,rw - tmpfs tmpfs rw\n",
+    "1 9 0:1 / /workspace nosuid - tmpfs tmpfs rw\n",
+    "1 9 0:1 / /workspace rw - tmpfs tmpfs rw\n2 9 0:2 / /workspace ro - tmpfs tmpfs ro\n",
+    "1 9 0:1 / /workspace rw - tmpfs tmpfs rw\n1 9 0:2 / /other ro - tmpfs tmpfs ro\n",
+    "1 malformed workspace rw\n",
+    "x".repeat(65_537),
+    Array.from(
+      { length: 513 },
+      (_, index) => `${index + 1} 9 0:1 / /other rw - tmpfs tmpfs rw`,
+    ).join("\n"),
+  ])("rejects absent, ambiguous or unbounded mount metadata before ownership", (mountinfo) =>
+    Effect.gen(function* () {
+      const f = yield* factoryFixture;
+      yield* f.fs.writeFileString(f.metadata, mountinfo);
+      yield* Effect.promise(() =>
+        expect(makePiIsolatedLocalTools()).rejects.toThrow("UNAVAILABLE"),
+      );
+      expect(f.isolation).not.toHaveBeenCalled();
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.handles.every((handle) => handle.fd === -1)).toBe(true);
     }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
   );
 
-  it.effect.skipIf(process.env.PI_LOCAL_TOOLS_LINUX_GATE !== "1")(
-    "aborts actual native bash and its owned process-group descendant on a receipt",
-    () =>
-      Effect.gen(function* () {
-        const { fs, cwd, tools } = yield* fixture;
-        expect(yield* HostProcessPlatform).toBe("linux");
-        const canceled = new AbortController();
-        const receipt = Promise.withResolvers<void>();
-        const onReceipt = () => {
-          canceled.abort();
-          receipt.resolve();
-        };
-        process.once("SIGUSR2", onReceipt);
-        try {
-          const execution = tools.localTools.bash(
-            {
-              command: `mkfifo wait.fifo; /bin/bash -c 'read -r marker < wait.fifo' & descendant=$!; printf '%s %s\n' "$$" "$descendant" > process-receipt; kill -USR2 ${process.pid}; wait`,
-            },
-            canceled.signal,
-          );
-          const rejected = expect(execution).rejects.toThrow(/^CANCELED$/);
-          yield* Effect.promise(() => receipt.promise);
-          yield* Effect.promise(() => rejected);
-          const pids = (yield* fs.readFileString(`${cwd}/process-receipt`)).trim().split(" ");
-          expect(pids).toHaveLength(2);
-          for (const pid of pids) {
-            expect(pid).toMatch(/^[1-9][0-9]+$/);
-            const state = yield* fs.readFileString(`/proc/${pid}/stat`).pipe(
-              Effect.catchIf(
-                (error) => error.reason._tag === "NotFound",
-                () => Effect.void,
-              ),
-            );
-            // The SDK kills the group but cannot join reaping of orphaned grandchildren.
-            // A zombie is terminated, not an owned-descendant drain receipt.
-            if (state !== undefined)
-              expect(state.slice(state.lastIndexOf(")") + 2, state.lastIndexOf(")") + 3)).toBe("Z");
-          }
-        } finally {
-          process.removeListener("SIGUSR2", onReceipt);
-          canceled.abort();
-        }
-      }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  it.effect("joins owned close if file-tool construction fails after admission", () =>
+    Effect.gen(function* () {
+      const f = yield* factoryFixture;
+      yield* f.fs.writeFileString(f.metadata, "1 9 0:1 / /workspace rw - tmpfs tmpfs rw\n");
+      vi.spyOn(process.getBuiltinModule("os"), "platform").mockReturnValue("darwin");
+      yield* Effect.promise(() =>
+        expect(makePiIsolatedLocalTools()).rejects.toThrow("UNAVAILABLE"),
+      );
+      expect(f.isolation).toHaveBeenCalledTimes(1);
+      expect(f.close).toHaveBeenCalledTimes(1);
+      expect(f.exec).not.toHaveBeenCalled();
+      expect(f.handles.every((handle) => handle.fd === -1)).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
   );
 });

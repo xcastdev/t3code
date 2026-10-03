@@ -27,6 +27,8 @@ const context = "Approved assignment. Preserve decision, question and limit; no 
 const decodeReceipt = Schema.decodeUnknownSync(
   Schema.Struct({
     type: Schema.String,
+    lifecycle: Schema.optional(Schema.Array(Schema.String)),
+    closeCalls: Schema.optional(Schema.Int),
     ok: Schema.optional(Schema.Boolean),
     code: Schema.optional(Schema.String),
     repeatedCode: Schema.optional(Schema.String),
@@ -35,6 +37,10 @@ const decodeReceipt = Schema.decodeUnknownSync(
     hostImports: Schema.Int,
     sdkImports: Schema.Int,
     executable: Schema.optional(Schema.String),
+    data: Schema.optional(Schema.String),
+    descriptorOpened: Schema.optional(Schema.Int),
+    descriptorClosed: Schema.optional(Schema.Int),
+    descriptorsHeld: Schema.optional(Schema.Int),
     exitCode: Schema.optional(Schema.NullOr(Schema.Int)),
     exitSignal: Schema.optional(Schema.NullOr(Schema.String)),
     sdkEnvironmentCorrect: Schema.optional(Schema.Boolean),
@@ -78,10 +84,14 @@ const decodeClosure = Schema.decodeUnknownSync(
     }),
   ),
 );
-const decodeContainerInfo = Schema.decodeUnknownSync(
+const decodeOwnerFrame = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
-      "child-pid": Schema.Int,
+      type: Schema.String,
+      pid: Schema.optional(Schema.Int),
+      cgroup: Schema.optional(Schema.String),
+      data: Schema.optional(Schema.String),
+      code: Schema.optional(Schema.Int),
     }),
   ),
 );
@@ -90,7 +100,12 @@ type Namespace = {
   readonly workspace: string;
   readonly state: string;
   readonly files: ReturnType<typeof decodeClosure>["files"];
+  readonly workspaceAccess: "readonly" | "readwrite";
 };
+async function filesystemIdentity(path: string) {
+  const stat = await NodeFSP.stat(path);
+  return { dev: stat.dev, ino: stat.ino };
+}
 async function childFixture(
   mode: string,
   rawLaunchJson: string,
@@ -98,51 +113,63 @@ async function childFixture(
   namespace?: Namespace,
 ) {
   const childOperation: PiWorkerOperation = namespace ? promptOperation : operation;
-  const executable = namespace ? "/usr/bin/bwrap" : process.execPath;
+  const unit = `pi-entry-fixture-${process.getBuiltinModule("crypto").randomUUID()}.service`;
+  const nativeSpec = namespace
+    ? {
+        workspace: {
+          path: namespace.workspace,
+          ...(await filesystemIdentity(namespace.workspace)),
+        },
+        workspaceAccess: namespace.workspaceAccess,
+        nativeState: { path: namespace.state, ...(await filesystemIdentity(namespace.state)) },
+        runtimeFiles: await Promise.all(
+          namespace.files.map(async (file) => ({
+            ...file,
+            ...(await filesystemIdentity(file.source)),
+          })),
+        ),
+        protectedWorkspaceEntries: [
+          {
+            target: "/workspace/.git",
+            directory: false,
+            ...(await filesystemIdentity(NodePath.join(namespace.workspace, ".git"))),
+          },
+        ],
+        argv: [
+          "/runtime/node",
+          "--max-old-space-size=512",
+          "/runtime/p7-worker-entry-local-tools.mjs",
+          mode,
+          rawLaunchJson,
+        ],
+        unit,
+        memoryBytes: 2_147_483_648,
+        nonce: process.getBuiltinModule("crypto").randomUUID(),
+      }
+    : undefined;
+  const executable = namespace ? "/usr/bin/systemd-run" : process.execPath;
   const args = namespace
     ? [
-        "--unshare-all",
-        "--die-with-parent",
-        "--new-session",
-        "--cap-drop",
-        "ALL",
-        "--clearenv",
-        "--info-fd",
-        "3",
-        ...namespace.files.flatMap((file) => ["--ro-bind", file.source, file.target]),
-        "--bind",
-        namespace.workspace,
-        "/workspace",
-        "--bind",
-        namespace.state,
-        "/state",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-        "--setenv",
-        "HOME",
-        "/state/agent",
-        "--setenv",
-        "PATH",
-        "/bin",
-        "--setenv",
-        "PI_CODING_AGENT_DIR",
-        "/state/agent",
-        "--setenv",
-        "PI_PACKAGE_DIR",
-        "/invalid-ambient",
-        "--remount-ro",
-        "/",
-        "--chdir",
-        "/workspace",
-        "/runtime/node",
-        "--max-old-space-size=128",
-        "/runtime/p7-worker-entry-local-tools.mjs",
-        mode,
-        rawLaunchJson,
+        "--user",
+        "--wait",
+        "--pipe",
+        "--quiet",
+        `--unit=${unit}`,
+        "-p",
+        "MemoryMax=2147483648",
+        "-p",
+        "MemorySwapMax=0",
+        "-p",
+        "OOMPolicy=kill",
+        "-p",
+        "KillMode=control-group",
+        "-p",
+        "RuntimeMaxSec=45s",
+        "-p",
+        "TimeoutStopSec=2s",
+        "/usr/bin/python3",
+        new URL("./pi-managed-process-owner.py", import.meta.url).pathname,
+        Buffer.from(JSON.stringify(nativeSpec)).toString("base64"),
       ]
     : [
         "--max-old-space-size=128",
@@ -152,8 +179,10 @@ async function childFixture(
       ];
   const child = NodeChildProcess.spawn(executable, args, {
     cwd: process.cwd(),
-    stdio: namespace ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "ipc"],
-    env: { PATH: "", PI_CODING_AGENT_DIR: agentDirectory, PI_PACKAGE_DIR: "/invalid-ambient" },
+    stdio: namespace ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "ipc"],
+    env: namespace
+      ? process.env
+      : { PATH: "", PI_CODING_AGENT_DIR: agentDirectory, PI_PACKAGE_DIR: "/invalid-ambient" },
   });
   const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
   const closed = Promise.withResolvers<void>();
@@ -164,6 +193,11 @@ async function childFixture(
   let next = Promise.withResolvers<void>();
   const receive = (raw: unknown) => {
     const message = decodeReceipt(raw);
+    if (namespace && message.type === "result") {
+      expect(message.descriptorOpened).toBeGreaterThan(0);
+      expect(message.descriptorClosed).toBe(message.descriptorOpened);
+      expect(message.descriptorsHeld).toBe(0);
+    }
     messages.push(message);
     observed.push(message);
     next.resolve();
@@ -186,21 +220,11 @@ async function childFixture(
   let stdoutBytes = 0;
   const container = Promise.withResolvers<number>();
   container.promise.catch(() => {});
-  if (namespace) {
-    const info = child.stdio[3];
-    if (!info) throw Error("CONTAINER_INFO_UNAVAILABLE");
-    let infoBytes = "";
-    info.on("data", (bytes: Buffer) => {
-      infoBytes += bytes.toString();
-    });
-    info.once("end", () => {
-      try {
-        container.resolve(decodeContainerInfo(infoBytes)["child-pid"]);
-      } catch (error) {
-        container.reject(error);
-      }
-    });
-  }
+  let ownerCgroup: string | undefined;
+  let ownerExited: number | undefined;
+  const ownedPids = new Set<number>();
+  if (child.pid !== undefined) ownedPids.add(child.pid);
+  let ownerBytes = "";
   let nativeNodeHostPid: number | undefined;
   let nextFrame = Promise.withResolvers<void>();
   let receiptBytes = "";
@@ -210,46 +234,106 @@ async function childFixture(
     nextFrame.resolve();
     nextFrame = Promise.withResolvers<void>();
   });
+  const nativeStderr = (bytes: Buffer) => {
+    receiptBytes += bytes.toString();
+    if (Buffer.byteLength(receiptBytes) > 65_536) throw Error("FIXTURE_RECEIPT_LIMIT");
+    while (receiptBytes.includes("\n")) {
+      const end = receiptBytes.indexOf("\n");
+      receive(decodeReceiptJson(receiptBytes.slice(0, end)));
+      receiptBytes = receiptBytes.slice(end + 1);
+    }
+  };
+  const ownerControl = async (message: Schema.JsonObject) => {
+    await new Promise<void>((resolve, reject) =>
+      stdin.write(JSON.stringify(message) + "\n", (error) => (error ? reject(error) : resolve())),
+    );
+  };
   stdout.on("data", (bytes: Buffer) => {
-    stdoutBytes += bytes.length;
-    framer.push(bytes);
+    if (!namespace) {
+      stdoutBytes += bytes.length;
+      framer.push(bytes);
+      return;
+    }
+    ownerBytes += bytes.toString();
+    if (Buffer.byteLength(ownerBytes) > 65_536) throw Error("OWNER_FRAME_BOUND");
+    while (ownerBytes.includes("\n")) {
+      const end = ownerBytes.indexOf("\n");
+      const frame = decodeOwnerFrame(ownerBytes.slice(0, end));
+      ownerBytes = ownerBytes.slice(end + 1);
+      if (frame.type === "owner") {
+        ownerCgroup = frame.cgroup;
+        if (frame.pid !== undefined) ownedPids.add(frame.pid);
+        void ownerControl({ type: "start" });
+      } else if (frame.type === "started" && frame.pid !== undefined) {
+        ownedPids.add(frame.pid);
+        container.resolve(frame.pid);
+      } else if (frame.type === "stdout" && frame.data !== undefined) {
+        const data = Buffer.from(frame.data, "base64");
+        stdoutBytes += data.length;
+        framer.push(data);
+      } else if (frame.type === "stderr" && frame.data !== undefined)
+        nativeStderr(Buffer.from(frame.data, "base64"));
+      else if (frame.type === "exited") ownerExited = frame.code;
+      else throw Error("OWNER_FAILED");
+    }
   });
   stderr.on("data", (bytes: Buffer) => {
-    if (namespace) {
-      receiptBytes += bytes.toString();
-      if (Buffer.byteLength(receiptBytes) > 65_536) throw Error("FIXTURE_RECEIPT_LIMIT");
-      while (receiptBytes.includes("\n")) {
-        const end = receiptBytes.indexOf("\n");
-        receive(decodeReceiptJson(receiptBytes.slice(0, end)));
-        receiptBytes = receiptBytes.slice(end + 1);
-      }
-    } else stderrBytes = Buffer.concat([stderrBytes, bytes]).subarray(0, 65_536);
+    stderrBytes = Buffer.concat([stderrBytes, bytes]).subarray(0, 65_536);
   });
   return {
     pid: child.pid,
     containerPid: () => container.promise,
     async captureNativeNode(namespacePid: number) {
-      const ownerPid = await container.promise;
-      const children = (
-        await NodeFSP.readFile(`/proc/${ownerPid}/task/${ownerPid}/children`, "utf8")
-      )
+      await container.promise;
+      if (!ownerCgroup) throw Error("OWNER_CGROUP_UNAVAILABLE");
+      const members = (await NodeFSP.readFile(ownerCgroup + "/cgroup.procs", "utf8"))
         .trim()
         .split(/\s+/)
         .filter(Boolean)
         .map(Number);
-      expect(children).toHaveLength(1);
-      const pid = children[0];
+      members.forEach((pid) => ownedPids.add(pid));
+      const candidates = await Promise.all(
+        members.map(async (pid) => {
+          const status = await NodeFSP.readFile(`/proc/${pid}/status`, "utf8").catch(() => "");
+          const command = await NodeFSP.readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+          return status
+            .match(/^NSpid:\s+(.+)$/m)?.[1]
+            ?.trim()
+            .split(/\s+/)
+            .at(-1) === String(namespacePid) &&
+            command.includes("/runtime/p7-worker-entry-local-tools.mjs")
+            ? pid
+            : undefined;
+        }),
+      );
+      const found = candidates.filter((pid) => pid !== undefined);
+      expect(found).toHaveLength(1);
+      const pid = found[0];
       if (pid === undefined) throw Error("NATIVE_NODE_PID_UNAVAILABLE");
-      const status = await NodeFSP.readFile(`/proc/${pid}/status`, "utf8");
-      expect(
-        status
-          .match(/^NSpid:\s+(.+)$/m)?.[1]
-          ?.trim()
-          .split(/\s+/)
-          .at(-1),
-      ).toBe(String(namespacePid));
       nativeNodeHostPid = pid;
       return pid;
+    },
+    async captureNestedProcesses() {
+      if (!ownerCgroup) throw Error("OWNER_CGROUP_UNAVAILABLE");
+      const members = (await NodeFSP.readFile(ownerCgroup + "/cgroup.procs", "utf8"))
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(Number);
+      const nested: number[] = [];
+      for (const pid of members) {
+        ownedPids.add(pid);
+        const status = await NodeFSP.readFile(`/proc/${pid}/status`, "utf8").catch(() => "");
+        if (
+          (status
+            .match(/^NSpid:\s+(.+)$/m)?.[1]
+            ?.trim()
+            .split(/\s+/).length ?? 0) >= 3
+        )
+          nested.push(pid);
+      }
+      expect(nested.length).toBeGreaterThan(0);
+      return nested;
     },
     async waitFrame(predicate: (frame: ReturnType<typeof decodePiWorkerFrame>) => boolean) {
       while (true) {
@@ -267,6 +351,15 @@ async function childFixture(
     },
     stdin,
     frames,
+    async endInput() {
+      if (namespace) await ownerControl({ type: "end" });
+      else await new Promise<void>((resolve) => stdin.end(resolve));
+    },
+    async releaseClose() {
+      await new Promise<void>((resolve, reject) =>
+        child.send({ type: "release-close" }, (error) => (error ? reject(error) : resolve())),
+      );
+    },
     async wait(type: string) {
       while (true) {
         const index = messages.findIndex((message) => message.type === type);
@@ -287,26 +380,46 @@ async function childFixture(
         sequence,
         message,
       });
-      await new Promise<void>((resolve, reject) =>
-        stdin.write(bytes, (error) => (error ? reject(error) : resolve())),
-      );
+      if (namespace) {
+        for (let offset = 0; offset < bytes.length; offset += 8192)
+          await ownerControl({
+            type: "input",
+            data: Buffer.from(bytes.slice(offset, offset + 8192)).toString("base64"),
+          });
+      } else
+        await new Promise<void>((resolve, reject) =>
+          stdin.write(bytes, (error) => (error ? reject(error) : resolve())),
+        );
     },
     async join(code: number) {
       await closed.promise;
       const exit = await exited.promise;
-      expect(exit).toEqual({ code, signal: null });
+      expect(exit).toEqual({ code: namespace ? 0 : code, signal: null });
+      if (namespace) {
+        expect(ownerExited).toBe(code);
+        for (const pid of ownedPids)
+          await expect(NodeFSP.stat(`/proc/${pid}`)).rejects.toMatchObject({ code: "ENOENT" });
+        if (!ownerCgroup) throw Error("OWNER_CGROUP_UNAVAILABLE");
+        await expect(NodeFSP.stat(ownerCgroup)).rejects.toMatchObject({ code: "ENOENT" });
+      }
       expect([stdin.closed, stdout.closed, stderr.closed]).toEqual([true, true, true]);
       expect(stderrBytes.toString()).toBe("");
       expect(receiptBytes).toBe("");
       framer.finish();
-      // bwrap close does not reap its orphaned init on failed operations. The explicit
-      // native gate requires an outer subreaper that joins and asserts every captured
-      // init/Node host PID absent before reporting the capped check successful.
       return exit;
     },
     stdoutBytes: () => stdoutBytes,
     async dispose() {
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      if (child.exitCode === null && child.signalCode === null) {
+        if (namespace)
+          await new Promise<void>((resolve) => {
+            const stopped = NodeChildProcess.spawn("/usr/bin/systemctl", ["--user", "stop", unit], {
+              stdio: "ignore",
+            });
+            stopped.once("close", () => resolve());
+          });
+        else child.kill("SIGKILL");
+      }
       await closed.promise;
       const evidence = process.env.PI_WORKER_ENTRY_EVIDENCE_DIRECTORY;
       if (evidence)
@@ -320,6 +433,11 @@ async function childFixture(
               observed,
               containerPid: namespace ? await container.promise.catch(() => null) : null,
               nativeNodeHostPid,
+              unit: namespace ? unit : null,
+              ownerCgroup,
+              ownerExited,
+              ownedPids: [...ownedPids],
+              nativeSpec,
               frames,
               stdoutBytes,
               stderr: stderrBytes.toString(),
@@ -371,15 +489,15 @@ function assertNoCalls(receipt: ReturnType<typeof decodeReceipt>) {
   expect(receipt.repeatedCode).toBe("PI_WORKER_ALREADY_ACTIVATED");
 }
 
-async function nativeRoots() {
+async function nativeRoots(workspaceAccess: Namespace["workspaceAccess"] = "readwrite") {
   const closure = process.env.PI_WORKER_ENTRY_LOCAL_TOOLS_CLOSURE;
   if (!closure) throw Error("NATIVE_ENTRY_CLOSURE_REQUIRED");
-  if (!process.env.PI_WORKER_ENTRY_REAPING_OWNER_PID)
-    throw Error("NATIVE_ENTRY_REAPING_OWNER_REQUIRED");
+
   const r = await roots();
   const workspace = NodePath.join(r.root, "workspace");
   const state = NodePath.join(r.root, "state");
   await NodeFSP.mkdir(workspace);
+  await NodeFSP.writeFile(NodePath.join(workspace, ".git"), "protected-original");
   await NodeFSP.mkdir(NodePath.join(state, "sessions"), { recursive: true });
   await NodeFSP.mkdir(NodePath.join(state, "agent"));
   return {
@@ -389,6 +507,7 @@ async function nativeRoots() {
       workspace,
       state,
       files: decodeClosure(await NodeFSP.readFile(closure, "utf8")).files,
+      workspaceAccess,
     },
     launch: {
       ...r.launch,
@@ -511,6 +630,20 @@ async function nativeProtocol(
   };
   return { send, reply, request, toolCall };
 }
+function nativeToolOutput(f: Awaited<ReturnType<typeof childFixture>>, callId: number) {
+  return f.frames
+    .filter(
+      (frame) =>
+        frame.message.type === "transfer-chunk" &&
+        frame.message.transferId === `tool-output-${callId}`,
+    )
+    .map((frame) =>
+      frame.message.type === "transfer-chunk"
+        ? Buffer.from(frame.message.data, "base64").toString()
+        : "",
+    )
+    .join("");
+}
 async function assertNativeInert(f: Awaited<ReturnType<typeof childFixture>>) {
   const receipt = await f.wait("imported");
   assertInert(receipt);
@@ -622,7 +755,7 @@ describe("private Pi worker entry", () => {
           await transfer(f);
           assertInert(await f.wait("imported"));
           const result = await f.wait("result");
-          f.stdin.end();
+          await f.endInput();
           await f.join(1);
           results.push(result);
           if (result.code === "PI_WORKER_INVALID_LAUNCH") expect(f.stdoutBytes()).toBe(0);
@@ -720,7 +853,7 @@ describe("private Pi worker entry", () => {
       expect(result.rawOutputDestroyed).toBe(false);
       expect(result.rawOutputEnded).toBe(false);
       expect(f.stdoutBytes()).toBe(0);
-      f.stdin.end();
+      await f.endInput();
       await f.join(1);
       expect(await NodeFSP.readdir(r.sessionDirectory)).toEqual([]);
     } finally {
@@ -753,7 +886,7 @@ describe("private Pi worker entry", () => {
           expect(result.rawOutputEnded).toBe(false);
           expect(result.listenersUnchanged).toBe(true);
           assertNoCalls(result);
-          f.stdin.end();
+          await f.endInput();
           await f.join(0);
           expect(f.frames.map((frame) => frame.message.type)).toEqual(["ready", "initialized"]);
           expect(f.frames.map((frame) => frame.sequence)).toEqual([0, 1]);
@@ -797,12 +930,20 @@ describe("private Pi worker entry", () => {
           assertInert(await f.wait("imported"));
           await f.send(0, bootstrap());
           if (mode === "interrupt") await f.send(1, { type: "interrupt", controlId: 1 });
-          else f.stdin.end();
+          else await f.endInput();
           const result = await f.wait("result");
           expect(result.code).toBe("PI_WORKER_OPERATION_FAILED");
           expect(result.hostImports).toBe(1);
           expect(result.sdkImports).toBe(1);
           expect(result.sdkEnvironmentCorrect).toBe(true);
+          expect(result.lifecycle).toEqual([
+            "tools-created",
+            "host-joined",
+            "close-start",
+            "close-joined",
+            "transport-disposed",
+          ]);
+          expect(result.closeCalls).toBe(1);
           expect(result.rawOutputDestroyed).toBe(false);
           expect(result.rawOutputEnded).toBe(false);
           assertNoCalls(result);
@@ -811,7 +952,7 @@ describe("private Pi worker entry", () => {
               "control-receipt",
               "worker-failure",
             ]);
-            f.stdin.end();
+            await f.endInput();
           }
           await f.join(1);
           expect(await NodeFSP.readdir(r.sessionDirectory)).toEqual([]);
@@ -823,6 +964,69 @@ describe("private Pi worker entry", () => {
       await r.dispose();
     }
   });
+
+  it("joins held owned close after the host and before transport disposal", async () => {
+    const r = await roots();
+    const f = await childFixture("held-close", JSON.stringify(r.launch), r.root);
+    try {
+      assertInert(await f.wait("imported"));
+      await f.send(0, bootstrap());
+      await transfer(f);
+      const closing = await f.wait("close-start");
+      expect(closing.lifecycle).toEqual(["tools-created", "host-joined", "close-start"]);
+      expect(closing.closeCalls).toBe(1);
+      await f.releaseClose();
+      const result = await f.wait("result");
+      expect(result.lifecycle).toEqual([
+        "tools-created",
+        "host-joined",
+        "close-start",
+        "close-joined",
+        "transport-disposed",
+      ]);
+      expect(result.ok).toBe(true);
+      expect(result.closeCalls).toBe(1);
+      assertNoCalls(result);
+      await f.endInput();
+      await f.join(0);
+    } finally {
+      await f.dispose();
+      await r.dispose();
+    }
+  });
+
+  it.each(["factory-error", "host-import-error", "host-error", "close-error", "dispose-error"])(
+    "attempts transport disposal and reports operation failure for %s",
+    async (mode) => {
+      const r = await roots();
+      const f = await childFixture(mode, JSON.stringify(r.launch), r.root);
+      try {
+        assertInert(await f.wait("imported"));
+        await f.send(0, bootstrap());
+        await transfer(f);
+        const result = await f.wait("result");
+        expect(result.code).toBe("PI_WORKER_OPERATION_FAILED");
+        expect(result.lifecycle?.at(-1)).toBe("transport-disposed");
+        expect(result.closeCalls).toBe(mode === "factory-error" ? 0 : 1);
+        if (mode !== "factory-error") expect(result.lifecycle).toContain("close-start");
+        if (mode === "close-error") expect(result.lifecycle).not.toContain("close-joined");
+        if (mode === "host-error")
+          expect(result.lifecycle).toEqual([
+            "tools-created",
+            "host-joined",
+            "close-start",
+            "close-joined",
+            "transport-disposed",
+          ]);
+        assertNoCalls(result);
+        await f.endInput();
+        await f.join(1);
+      } finally {
+        await f.dispose();
+        await r.dispose();
+      }
+    },
+  );
 
   it("refuses an unavailable local tool before session creation", async () => {
     const r = await roots();
@@ -842,7 +1046,7 @@ describe("private Pi worker entry", () => {
       expect(f.frames.some((frame) => frame.message.type === "initialized")).toBe(false);
       const failure = f.frames.at(-1)?.message;
       expect(failure).toEqual({ type: "worker-failure", code: "UNAVAILABLE" });
-      f.stdin.end();
+      await f.endInput();
       await f.join(1);
       expect(await NodeFSP.readdir(r.sessionDirectory)).toEqual([]);
     } finally {
@@ -910,7 +1114,7 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
           await protocol.send({ type: "tool-authorized", callId: call.callId, allowed: true });
           const result = await f.wait("result");
           expect(result.remoteCalls).toBe(0);
-          f.stdin.end();
+          await f.endInput();
           await f.join(1);
           expect(result.ok).toBe(false);
           expect(f.frames.at(-1)?.message).toEqual({
@@ -962,7 +1166,12 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
             edits: [{ oldText: "before", newText: "after" }],
           },
         },
-        { name: "bash", args: { command: "printf 'entry-native-bash-marker:%s' \"$PWD\"" } },
+        {
+          name: "bash",
+          args: {
+            command: `printf '%s\n' 'quoted "text" $literal'; printf 'entry-native-stderr:' >&2; printf 'owned' > bash-owned.txt; printf 'entry-native-bash-marker:%s' "$PWD"`,
+          },
+        },
       ];
       for (const [index, call] of calls.entries()) {
         await p.request(index + 1);
@@ -985,7 +1194,7 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
       expect(result.ok).toBe(true);
       expect(result.remoteCalls).toBe(0);
       expect(result.sdkEnvironmentCorrect).toBe(true);
-      f.stdin.end();
+      await f.endInput();
       await f.join(0);
       expect(
         await NodeFSP.readFile(NodePath.join(r.workspace, "nested/selected.txt"), "utf8"),
@@ -1004,6 +1213,14 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
         .join("");
       expect(outputs).toContain("before");
       expect(outputs).toContain("entry-native-bash-marker:/workspace");
+      expect(decodeReceiptJson(nativeToolOutput(f, 4))).toMatchObject({
+        kind: "json",
+        value: { structuredContent: { output: expect.stringContaining('quoted "text" $literal') } },
+      });
+      expect(outputs).toContain("entry-native-stderr:");
+      expect(await NodeFSP.readFile(NodePath.join(r.workspace, "bash-owned.txt"), "utf8")).toBe(
+        "owned",
+      );
       expect(f.frames.at(-1)?.message).toEqual({ type: "done" });
       const spawned = await f.wait("native-spawn");
       const exited = await f.wait("native-exit");
@@ -1014,6 +1231,95 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
       await r.dispose();
     }
   });
+
+  it("retains the readonly role in the actual outer and nested workspace mounts", async () => {
+    const r = await nativeRoots("readonly");
+    const f = await childFixture("readonly-role", JSON.stringify(r.launch), r.root, r.namespace);
+    try {
+      await assertNativeInert(f);
+      const p = await nativeProtocol(f, ["bash"]);
+      await p.request(1);
+      await p.reply(1, {
+        name: "bash",
+        args: {
+          command: `while IFS= read -r line; do case "$line" in *' /workspace '*) printf '%s\n' "$line";; esac; done < /proc/self/mountinfo`,
+        },
+      });
+      const first = await p.toolCall(1);
+      await p.send({ type: "tool-authorized", callId: first.callId, allowed: true });
+      await f.waitFrame(
+        (frame) =>
+          frame.message.type === "transfer-end" && frame.message.transferId === "tool-output-1",
+      );
+      const output = nativeToolOutput(f, 1);
+      expect(output).toMatch(/\/workspace ro(?:,| )/);
+      await p.request(2);
+      await p.reply(2, { name: "bash", args: { command: "printf ordinary > readonly-role.txt" } });
+      const second = await p.toolCall(2);
+      await p.send({ type: "tool-authorized", callId: second.callId, allowed: true });
+      const result = await f.wait("result");
+      expect(result.code).toBe("PI_WORKER_OPERATION_FAILED");
+      expect(result.remoteCalls).toBe(0);
+      await f.endInput();
+      await f.join(1);
+      expect(await NodeFSP.readdir(r.workspace)).toEqual([".git"]);
+      expect(f.frames.at(-1)?.message).toEqual({ type: "worker-failure", code: "TOOL_FAILURE" });
+    } finally {
+      await f.dispose();
+      await r.dispose();
+    }
+  });
+
+  it.each(["nonzero", "timeout", "cancel", "background"])(
+    "joins the actual Bash owner for benign %s control",
+    async (mode) => {
+      const r = await nativeRoots();
+      const f = await childFixture(`bash-${mode}`, JSON.stringify(r.launch), r.root, r.namespace);
+      try {
+        await assertNativeInert(f);
+        const p = await nativeProtocol(f, ["bash"]);
+        await p.request(1);
+        const command =
+          mode === "nonzero"
+            ? "printf 'ordinary-nonzero'; exit 23"
+            : mode === "background"
+              ? "/runtime/mkfifo release.fifo; /runtime/sleep 300 & printf 'entry-descendant-ready\n'; IFS= read -r release < release.fifo"
+              : "/runtime/sleep 300 & printf 'entry-descendant-ready\n'; wait";
+        await p.reply(1, {
+          name: "bash",
+          args: { command, ...(mode === "timeout" ? { timeout: 2 } : {}) },
+        });
+        const call = await p.toolCall(1);
+        await p.send({ type: "tool-authorized", callId: call.callId, allowed: true });
+        let nested: number[] = [];
+        if (mode !== "nonzero") {
+          await f.wait("native-data");
+          nested = await f.captureNestedProcesses();
+          if (mode === "cancel") await p.send({ type: "interrupt", controlId: 1 });
+          if (mode === "background") {
+            await NodeFSP.writeFile(NodePath.join(r.workspace, "release.fifo"), "ack\n");
+            await p.request(2);
+            await p.reply(2);
+          }
+        }
+        const result = await f.wait("result");
+        expect(result.code).toBe(mode === "background" ? undefined : "PI_WORKER_OPERATION_FAILED");
+        expect(result.remoteCalls).toBe(0);
+        for (const pid of nested)
+          await expect(NodeFSP.stat(`/proc/${pid}`)).rejects.toMatchObject({ code: "ENOENT" });
+        await f.endInput();
+        await f.join(mode === "background" ? 0 : 1);
+        expect(f.frames.at(-1)?.message).toEqual(
+          mode === "background"
+            ? { type: "done" }
+            : { type: "worker-failure", code: mode === "cancel" ? "CANCELED" : "TOOL_FAILURE" },
+        );
+      } finally {
+        await f.dispose();
+        await r.dispose();
+      }
+    },
+  );
 
   it("does not activate an unselected native write from a deterministic completion", async () => {
     const r = await nativeRoots();
@@ -1034,9 +1340,9 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
       if (next.message.type === "request") await p.reply(2);
       const result = await f.wait("result");
       expect(result.remoteCalls).toBe(0);
-      f.stdin.end();
+      await f.endInput();
       await f.join(result.ok ? 0 : 1);
-      expect(await NodeFSP.readdir(r.workspace)).toEqual([]);
+      expect(await NodeFSP.readdir(r.workspace)).toEqual([".git"]);
       expect(f.frames.some((frame) => frame.message.type === "tool-call")).toBe(false);
       expect(
         f.frames.some(
@@ -1076,9 +1382,9 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
           });
         }
         expect((await f.wait("result")).remoteCalls).toBe(0);
-        f.stdin.end();
+        await f.endInput();
         await f.join(1);
-        expect(await NodeFSP.readdir(r.workspace)).toEqual([]);
+        expect(await NodeFSP.readdir(r.workspace)).toEqual([".git"]);
         expect(
           f.frames.some(
             (frame) =>
@@ -1117,7 +1423,7 @@ describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namesp
       const call = await p.toolCall(1);
       await p.send({ type: "tool-authorized", callId: call.callId, allowed: true });
       expect((await f.wait("result")).remoteCalls).toBe(0);
-      f.stdin.end();
+      await f.endInput();
       await f.join(1);
       expect(
         (await NodeFSP.readFile(NodePath.join(r.workspace, "wide-line.txt"), "utf8")).startsWith(
