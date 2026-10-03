@@ -144,7 +144,7 @@ export const createManagedWorktree = (
 /** Canonical common metadata is also the permit key for ordinary linked-worktree mutations. */
 export const canonicalGitMutationKey = (common: string, cwd: string) =>
   Effect.try({
-    try: () => `git\0${fs.realpathSync(common.startsWith("/") ? common : `${cwd}/${common}`)}`,
+    try: () => `git\0${fs.realpathSync(process.getBuiltinModule("path").resolve(cwd, common))}`,
     catch: (cause) =>
       error(cwd, "Cannot establish the repository's common metadata identity.", cause),
   });

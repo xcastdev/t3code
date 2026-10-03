@@ -1,4 +1,4 @@
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { GitCommandError } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -19,6 +19,7 @@ import * as Manager from "./GitManager.ts";
 import { ServerConfig } from "../config.ts";
 
 const nativeFs = process.getBuiltinModule("fs");
+const nativePath = process.getBuiltinModule("path");
 const capturedGitPids: number[] = [];
 const trackedServices = Layer.effect(
   ChildProcessSpawner.ChildProcessSpawner,
@@ -123,6 +124,95 @@ const unavailable = (cwd: string) =>
     cwd,
     detail: "Authority revoked",
   });
+
+describe("Ordinary Git common metadata identity", () => {
+  for (const entry of [
+    {
+      name: "drive-qualified",
+      resolve: nativePath.win32.resolve,
+      cwd: "C:/repo/linked",
+      common: "C:/repo/.git",
+      expected: "C:\\repo\\.git",
+    },
+    {
+      name: "UNC",
+      resolve: nativePath.win32.resolve,
+      cwd: "C:/repo/linked",
+      common: "\\\\server\\share\\repo\\.git",
+      expected: "\\\\server\\share\\repo\\.git",
+    },
+    {
+      name: "relative Windows",
+      resolve: nativePath.win32.resolve,
+      cwd: "C:/repo/linked",
+      common: "../.git",
+      expected: "C:\\repo\\.git",
+    },
+    {
+      name: "absolute POSIX",
+      resolve: nativePath.posix.resolve,
+      cwd: "/repo/linked",
+      common: "/repo/.git",
+      expected: "/repo/.git",
+    },
+    {
+      name: "relative POSIX",
+      resolve: nativePath.posix.resolve,
+      cwd: "/repo/linked",
+      common: "../.git",
+      expected: "/repo/.git",
+    },
+  ]) {
+    it.effect(
+      `resolves ${entry.name} common paths with the host resolver before canonicalization`,
+      () =>
+        Effect.gen(function* () {
+          // Emulate host path semantics only; no Windows filesystem or child is used.
+          const resolver = vi.spyOn(nativePath, "resolve").mockImplementation(entry.resolve);
+          const canonicalize = vi.spyOn(nativeFs, "realpathSync").mockReturnValue(entry.expected);
+          try {
+            expect(yield* Managed.canonicalGitMutationKey(entry.common, entry.cwd)).toBe(
+              `git\0${entry.expected}`,
+            );
+            expect(canonicalize).toHaveBeenCalledExactlyOnceWith(entry.expected);
+          } finally {
+            canonicalize.mockRestore();
+            resolver.mockRestore();
+          }
+        }),
+    );
+  }
+
+  it.effect(
+    "canonicalizes absolute and relative common paths from an ordinary registered linked worktree",
+    () =>
+      Effect.gen(function* () {
+        const firstPid = capturedGitPids.length;
+        const f = yield* fixture();
+        const linked = f.path.join(f.root, "ordinary-linked");
+        yield* nativeGit(f.primary, ["worktree", "add", "-b", "ordinary-linked", linked, f.oid]);
+        const primaryCommon = yield* nativeGit(f.primary, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ]);
+        const linkedCommon = yield* nativeGit(linked, [
+          "rev-parse",
+          "--path-format=absolute",
+          "--git-common-dir",
+        ]);
+        const key = yield* Managed.canonicalGitMutationKey(primaryCommon, f.primary);
+        expect(yield* Managed.canonicalGitMutationKey(linkedCommon, linked)).toBe(key);
+        expect(
+          yield* Managed.canonicalGitMutationKey(f.path.relative(linked, linkedCommon), linked),
+        ).toBe(key);
+        expect(key).toBe(`git\0${nativeFs.realpathSync(f.path.join(f.primary, ".git"))}`);
+        const pids = capturedGitPids.slice(firstPid);
+        expect(pids.length).toBeGreaterThan(0);
+        for (const pid of pids) expect(nativeFs.existsSync(`/proc/${pid}`)).toBe(false);
+      }).pipe(Effect.scoped, Effect.provide(trackedServices)),
+  );
+});
 
 describe("Managed Git execution", () => {
   it.effect(
