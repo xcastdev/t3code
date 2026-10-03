@@ -1,8 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off - the SDK spawn hook owns the readiness child and its exit receipt.
 import {
   type ClaudeSettings,
   type ModelCapabilities,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
+import * as NodeChildProcess from "node:child_process";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -323,7 +325,7 @@ function waitForAbortSignal(signal: AbortSignal): Promise<void> {
  * message is ever written to the subprocess stdin. This means the Claude
  * Code subprocess completes its local initialization IPC (returning
  * account info and slash commands) but never starts an API request to
- * Anthropic. We read the init data and then abort the subprocess.
+ * Anthropic. We read the init data and then close and join the subprocess.
  *
  * This is used as a fallback when `claude auth status` does not include
  * subscription type information.
@@ -332,73 +334,108 @@ const probeClaudeCapabilities = (
   claudeSettings: ClaudeSettings,
   environment?: NodeJS.ProcessEnv,
   cwd?: string,
-) => {
-  const abort = new AbortController();
-  return Effect.gen(function* () {
-    const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, environment);
-    const executablePath = yield* resolveClaudeSdkExecutablePath(
-      claudeSettings.binaryPath,
-      claudeEnvironment,
-    );
-    return yield* Effect.tryPromise(async () => {
-      const q = claudeQuery({
-        // Never yield — we only need initialization data, not a conversation.
-        // This prevents any prompt from reaching the Anthropic API.
-        // oxlint-disable-next-line require-yield
-        prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
-          await waitForAbortSignal(abort.signal);
-        })(),
-        options: buildClaudeCapabilitiesProbeQueryOptions({
-          executablePath,
-          abortController: abort,
-          environment: claudeEnvironment,
-          cwd,
+) =>
+  Effect.suspend(() => {
+    const abort = new AbortController();
+    let q: ReturnType<typeof claudeQuery> | undefined;
+    let child: NodeChildProcess.ChildProcessWithoutNullStreams | undefined;
+    let childClosed: Promise<void> | undefined;
+    return Effect.acquireUseRelease(
+      Effect.void,
+      () =>
+        Effect.gen(function* () {
+          const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, environment);
+          const executablePath = yield* resolveClaudeSdkExecutablePath(
+            claudeSettings.binaryPath,
+            claudeEnvironment,
+          );
+          const query = yield* Effect.try(() => {
+            q = claudeQuery({
+              // Never yield — we only need initialization data, not a conversation.
+              // This prevents any prompt from reaching the Anthropic API.
+              // oxlint-disable-next-line require-yield
+              prompt: (async function* (): AsyncGenerator<SDKUserMessage> {
+                await waitForAbortSignal(abort.signal);
+              })(),
+              options: {
+                ...buildClaudeCapabilitiesProbeQueryOptions({
+                  executablePath,
+                  abortController: abort,
+                  environment: claudeEnvironment,
+                  cwd,
+                }),
+                spawnClaudeCodeProcess: (options) => {
+                  const spawned = NodeChildProcess.spawn(options.command, options.args, {
+                    cwd: options.cwd,
+                    env: options.env,
+                    signal: options.signal,
+                    stdio: ["pipe", "pipe", "pipe"],
+                    windowsHide: true,
+                  });
+                  child = spawned;
+                  // The custom-spawn path leaves stderr draining to its caller.
+                  spawned.stderr.resume();
+                  childClosed = new Promise<void>((resolve) =>
+                    spawned.once("close", () => resolve()),
+                  );
+                  return spawned;
+                },
+              },
+            });
+            return q;
+          });
+          const init = yield* Effect.tryPromise(() => query.initializationResult()).pipe(
+            Effect.timeout(CAPABILITIES_PROBE_TIMEOUT_MS),
+          );
+          // Usage has its own deadline so a slow optional request cannot discard initialization.
+          const usageResult = yield* Effect.tryPromise(() =>
+            query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
+          ).pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result);
+          const usage = Result.isSuccess(usageResult)
+            ? {
+                rate_limits_available: usageResult.success.rate_limits_available,
+                rate_limits: usageResult.success.rate_limits,
+              }
+            : undefined;
+          const account = init.account as
+            | {
+                readonly email?: string;
+                readonly subscriptionType?: string;
+                readonly tokenSource?: string;
+                readonly apiProvider?: string;
+              }
+            | undefined;
+          return {
+            email: account?.email,
+            subscriptionType: account?.subscriptionType,
+            tokenSource: account?.tokenSource,
+            apiProvider: account?.apiProvider,
+            slashCommands: parseClaudeInitializationCommands(init.commands),
+            ...(usage ? { usage } : {}),
+          } satisfies ClaudeCapabilitiesProbe;
         }),
-      });
-      const init = await q.initializationResult();
-      return { q, init };
-    });
-  }).pipe(
-    Effect.timeout(CAPABILITIES_PROBE_TIMEOUT_MS),
-    Effect.flatMap(({ q, init }) =>
-      Effect.gen(function* () {
-        // Usage has its own deadline so a slow optional request cannot discard initialization.
-        const usageResult = yield* Effect.tryPromise(() =>
-          q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
-        ).pipe(Effect.timeout(DEFAULT_TIMEOUT_MS), Effect.result);
-        const usage = Result.isSuccess(usageResult)
-          ? {
-              rate_limits_available: usageResult.success.rate_limits_available,
-              rate_limits: usageResult.success.rate_limits,
+      () =>
+        Effect.tryPromise(async () => {
+          try {
+            abort.abort();
+            q?.close();
+          } finally {
+            try {
+              await q?.return();
+            } finally {
+              // Query.return() has a bounded wait that can expire before the SDK's
+              // termination grace. Join the captured child's pipes before reporting readiness.
+              // A constructor failure may leave a child without a returned query owner.
+              if (q === undefined) child?.kill("SIGKILL");
+              await childClosed;
             }
-          : undefined;
-        const account = init.account as
-          | {
-              readonly email?: string;
-              readonly subscriptionType?: string;
-              readonly tokenSource?: string;
-              readonly apiProvider?: string;
-            }
-          | undefined;
-        return {
-          email: account?.email,
-          subscriptionType: account?.subscriptionType,
-          tokenSource: account?.tokenSource,
-          apiProvider: account?.apiProvider,
-          slashCommands: parseClaudeInitializationCommands(init.commands),
-          ...(usage ? { usage } : {}),
-        } satisfies ClaudeCapabilitiesProbe;
-      }),
-    ),
-    Effect.ensuring(
-      Effect.sync(() => {
-        if (!abort.signal.aborted) abort.abort();
-      }),
-    ),
-    Effect.result,
-    Effect.map((result) => (Result.isSuccess(result) ? result.success : undefined)),
-  );
-};
+          }
+        }),
+    ).pipe(
+      Effect.result,
+      Effect.map((result) => (Result.isSuccess(result) ? result.success : undefined)),
+    );
+  });
 
 const runClaudeCommand = Effect.fn("runClaudeCommand")(function* (
   claudeSettings: ClaudeSettings,

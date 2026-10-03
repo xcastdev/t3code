@@ -60,10 +60,7 @@ it.layer(NodeServices.layer)("Claude capability probe SDK boundary", (it) => {
       const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-claude-probe-sdk-" });
       const executablePath = path.join(tempDir, "fake-claude.mjs");
       const invocationPath = path.join(tempDir, "invocation.json");
-      // The probe aborts the SDK without awaiting the child's exit, and on
-      // Windows a directory that is still some process's cwd cannot be
-      // removed. Keep the workspace outside the scoped directory and let it
-      // go with a retrying removal once the child has gone.
+      // Keep this externally allocated workspace until the probe's joined child cleanup completes.
       const workspaceCwd = yield* fs.makeTempDirectory({ prefix: "t3-claude-probe-cwd-" });
       // Node's own retry rather than an Effect schedule: it.effect runs on a
       // TestClock, so a scheduled retry would wait for time nobody advances.
@@ -204,6 +201,8 @@ it.effect("preserves initialized capabilities when optional usage times out", ()
           Deferred.doneUnsafe(usageStarted, Effect.void);
           return new Promise(() => {});
         },
+        close: () => {},
+        return: async () => ({ done: true, value: undefined }),
       } as ReturnType<typeof ClaudeSdk.query>;
     });
     yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
