@@ -30,6 +30,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import { makeSqlitePersistenceLive } from "../../persistence/Layers/Sqlite.ts";
 import * as Authorization from "../../projectWork/ProjectTeamAuthorization.ts";
 import { ProjectWorkRepositoryLive } from "../../projectWork/ProjectWorkRepository.ts";
+import { readCurrentState } from "../../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkQueryLive } from "../../projectWork/ProjectWorkQuery.ts";
 import { ProjectWorkSearchLive } from "../../projectWork/ProjectWorkSearch.ts";
 import { ProjectWorkNarrativeLive } from "../../projectWork/ProjectWorkNarrative.ts";
@@ -273,6 +274,245 @@ const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.result,
     Effect.map((result) => expect(result._tag).toBe("Failure")),
   );
+describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
+  "actual SDK guided Runtime bridge",
+  () => {
+    for (const mode of ["report", "plan"] as const) {
+      it.effect(`routes ${mode} through current durable authority`, () =>
+        scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture;
+            const manifest = process.env.PI_MANAGED_RUNTIME_TEST_CLOSURE;
+            const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+            if (!manifest || !evidence) return yield* Effect.die("SDK closure/evidence required");
+            const closure = yield* decodeClosure(yield* f.fs.readFileString(manifest));
+            for (const file of closure.files) {
+              const bytes = yield* f.fs.readFile(file.source);
+              expect(bytes.length).toBe(file.bytes);
+              expect(NodeCrypto.createHash("sha256").update(bytes).digest("hex")).toBe(file.sha256);
+            }
+            const actualAt = DateTime.formatIso(DateTime.nowUnsafe());
+            yield* TestClock.setTime(Date.parse(actualAt));
+            const capability = `project-work.${mode}`;
+            yield* restoreHistoricalBinding({
+              ...f.role,
+              revision: f.role.revision + 1,
+              role: mode === "plan" ? "coordinator" : "investigator",
+              tools: [capability],
+            });
+            yield* restoreHistoricalBinding({
+              ...f.binding,
+              revision: f.binding.revision + 1,
+              updatedAt: actualAt,
+              configuration: { ...f.binding.configuration, toolIds: [capability] },
+            });
+            yield* f.fs.writeFileString(
+              f.options.agentDirectory + "/auth.json",
+              json({ "command-code": { type: "api_key", key: "synthetic-guided-key" } }),
+            );
+            let calls = 0;
+            let toolResult = false;
+            let intentJSON = "";
+            const runtime = yield* makePiManagedRuntimeLive({
+              ...f.options,
+              memoryBytes: 536870912,
+              maxInputTokens: 18000,
+              cleanupDeadlineMs: 5000,
+              runtimeFiles: closure.files.map(({ source, target }) => ({ source, target })),
+              workerArgv: (identity, operation) => [
+                "/runtime/node",
+                "--max-old-space-size=512",
+                "/runtime/dist/worker.mjs",
+                identity.workerId,
+                String(identity.generation),
+                operation.operationId,
+                operation.operationKind,
+                "plain",
+              ],
+              readCatalogue: Effect.succeed({
+                source: "https://api.commandcode.ai/provider/v1/models",
+                fetchedAt: actualAt,
+                selectedEntry: {
+                  id: model,
+                  owned_by: "command-code",
+                  context_length: 20000,
+                  supported_endpoints: ["/chat/completions"],
+                },
+              }),
+              transport: async (_url, init) => {
+                calls++;
+                expect(calls).toBeLessThanOrEqual(2);
+                const body = parseTransportBody(init.body);
+                expect(body.tools?.map((entry) => entry.function.name)).toEqual([
+                  `project_work_${mode}`,
+                ]);
+                if (calls === 2) {
+                  expect(mode).toBe("report");
+                  toolResult = body.messages.some(
+                    (message) =>
+                      message.role === "tool" &&
+                      typeof message.content === "string" &&
+                      message.content.includes("native-guided-report"),
+                  );
+                  expect(toolResult).toBe(true);
+                }
+                const delta =
+                  calls === 1
+                    ? {
+                        role: "assistant",
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: "guided-call",
+                            type: "function",
+                            function: {
+                              name: `project_work_${mode}`,
+                              arguments: json({ intentJSON }),
+                            },
+                          },
+                        ],
+                      }
+                    : { role: "assistant", content: "Finding retained" };
+                const data = [
+                  { model, choices: [{ index: 0, delta, finish_reason: null }] },
+                  {
+                    model,
+                    choices: [
+                      { index: 0, delta: {}, finish_reason: calls === 1 ? "tool_calls" : "stop" },
+                    ],
+                  },
+                  {
+                    model,
+                    choices: [],
+                    usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+                  },
+                ];
+                return new Response(
+                  data.map((entry) => `data: ${json(entry)}\n\n`).join("") + "data: [DONE]\n\n",
+                  { headers: { "content-type": "text/event-stream" } },
+                );
+              },
+            });
+            const instance = yield* runtime.forInstance({
+              instanceId: providerInstanceId,
+              enabled: true,
+              configuration: {},
+            });
+            const initialize = yield* instance.prepareOperation(
+              { threadId, kind: "initialize" },
+              () => Effect.void,
+            );
+            yield* initialize.run;
+            const before = yield* readCurrentState(f.sql, f.binding.projectId);
+            const task = before.tasks.find((entry) => entry.taskId === f.binding.taskId)!;
+            const assignment = before.foundationRecords!.find(
+              (record) => record.kind === "task-membership" && record.taskId === task.taskId,
+            )!;
+            const plan = before.foundationRecords!.find(
+              (record) => record.kind === "plan-revision" && record.taskId === task.taskId,
+            )!;
+            const envelope = {
+              projectId: f.binding.projectId,
+              taskId: task.taskId,
+              commandId: `native-guided-${mode}`,
+              expectedRevision: before.revision,
+              expectedTaskRevision: task.revision,
+              specRevision: 1,
+            };
+            intentJSON = json(
+              mode === "report"
+                ? {
+                    ...envelope,
+                    type: "project-team.assignment.report",
+                    planRevision: 1,
+                    assignmentId: assignment.recordId,
+                    expectedAssignmentRevision: assignment.revision,
+                    summary: "The native SDK retained a sourced finding",
+                    evidenceIds: [],
+                    outputArtifactIds: [],
+                    outcome: "findings",
+                  }
+                : {
+                    ...envelope,
+                    type: "project-team.plan.propose",
+                    previousPlanId: plan.recordId,
+                    expectedPreviousPlanRevision: plan.revision,
+                    content: "New plan awaits human approval",
+                    dependencyTaskIds: [],
+                  },
+            );
+            const prompt = yield* instance.prepareOperation(
+              { threadId, kind: "prompt", prompt: "Use guided tool" },
+              () => Effect.void,
+            );
+            const outcome = yield* prompt.run.pipe(Effect.result);
+            yield* f.fs.writeFileString(
+              evidence + `/guided-${mode}-attempt.json`,
+              json({
+                calls,
+                outcome,
+                operations: yield* f.sql`SELECT * FROM project_team_pi_operation`,
+                processes: yield* f.sql`SELECT * FROM project_team_pi_process`,
+                modelRequests: yield* f.sql`SELECT * FROM project_team_model_request`,
+              }),
+            );
+            expect(outcome._tag).toBe(mode === "report" ? "Success" : "Failure");
+            expect(calls).toBe(mode === "report" ? 2 : 1);
+            const after = yield* readCurrentState(f.sql, f.binding.projectId);
+            expect(after.revision).toBeGreaterThan(before.revision);
+            const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts
+              WHERE project_id=${f.binding.projectId} AND command_id=${envelope.commandId}`;
+            expect(receipts).toHaveLength(1);
+            if (mode === "report") {
+              expect(
+                after.evidence.some(
+                  (entry) => entry.detail === "The native SDK retained a sourced finding",
+                ),
+              ).toBe(true);
+            } else {
+              expect(
+                after.foundationRecords!.some(
+                  (record) =>
+                    record.kind === "plan-revision" &&
+                    record.content === "New plan awaits human approval" &&
+                    record.status === "proposed",
+                ),
+              ).toBe(true);
+              yield* rejected(instance.readSession(threadId));
+            }
+            const owners = yield* f.sql<{
+              owner_json: string;
+              drain_json: string;
+            }>`SELECT owner_json,drain_json FROM project_team_pi_process`;
+            expect(owners).toHaveLength(2);
+            for (const row of owners) {
+              const owner = parseOwner(row.owner_json);
+              const drain = parseFullDrain(row.drain_json);
+              expect(drain.invocation).toBe(owner.invocation);
+              expect(drain.unit).toBe(owner.unit);
+              expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(true);
+              for (const pid of [drain.ownerPid, drain.launcherPid, drain.childPid])
+                expect(yield* f.fs.exists(`/proc/${pid}`)).toBe(false);
+            }
+            yield* f.fs.writeFileString(
+              evidence + `/guided-${mode}.json`,
+              json({
+                mode,
+                calls,
+                toolResult,
+                beforeRevision: before.revision,
+                afterRevision: after.revision,
+                receipts,
+                owners,
+                outcome: outcome._tag,
+              }),
+            );
+          }),
+        ),
+      );
+    }
+  },
+);
 it.effect(
   "inspection reads explicit catalogue and models without credentials, transport or process launch",
   () =>

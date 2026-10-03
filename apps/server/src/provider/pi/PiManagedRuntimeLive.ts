@@ -1,8 +1,6 @@
 import * as NodeCrypto from "node:crypto";
 import {
   IsoDateTime,
-  ProjectWorkReadIntent,
-  ProjectWorkWriteIntent,
   ProviderDriverKind,
   TurnId,
   type ProviderSession,
@@ -43,6 +41,11 @@ import { readPiNativeSession } from "./PiNativeSessionReader.ts";
 import { makePiRuntimeEventTranslator } from "./PiRuntimeEvents.ts";
 import { makePiSessionRuntime } from "./PiSessionRuntime.ts";
 import { piLocalToolDefinitions } from "./PiLocalTools.ts";
+import {
+  executePiProjectWorkBridgeTool,
+  preparePiProjectWorkTools,
+  piProjectWorkToolCapabilities,
+} from "./PiProjectWorkTools.ts";
 import type { PiModelBrokerConfig, PiModelTool } from "./PiModelBroker.ts";
 import type { PiNativeReference, PiWorkerIdentity, PiWorkerOperation } from "./PiWorkerProtocol.ts";
 
@@ -51,21 +54,6 @@ const routeId = "command-code-ling-free";
 const model = "inclusionai/ling-3.1-flash:free";
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
-const decodeReadIntent = Schema.decodeUnknownEffect(ProjectWorkReadIntent, {
-  onExcessProperty: "error",
-});
-const writeEnvelope = Schema.Struct({
-  intentJSON: Schema.String.check(Schema.isMaxLength(262144)),
-});
-const decodeWriteEnvelope = Schema.decodeUnknownEffect(writeEnvelope, {
-  onExcessProperty: "error",
-});
-const decodeWriteIntentJSON = Schema.decodeEffect(Schema.fromJsonString(ProjectWorkWriteIntent), {
-  onExcessProperty: "error",
-});
-const decodeJsonObject = Schema.decodeUnknownSync(Schema.JsonObject);
-const readParameters = decodeJsonObject(Schema.toJsonSchemaDocument(ProjectWorkReadIntent).schema);
-const writeParameters = decodeJsonObject(Schema.toJsonSchemaDocument(writeEnvelope).schema);
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 const deny = (detail: string, code: PiManagedRuntimeError["code"] = "denied") =>
   new PiManagedRuntimeError({ code, detail });
@@ -647,10 +635,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 return yield* deny("Pi frozen runtime or instructions digest mismatch");
               if (binding.configuration.skillIds.length || authority.role.skills.length)
                 return yield* deny("Pi managed skill delivery is unavailable", "unavailable");
-              const supported = new Set([
-                "project-work.read-project",
-                "project-work.read-task",
-                "project-work.write",
+              const supported = new Set<string>([
+                ...piProjectWorkToolCapabilities,
                 ...piLocalToolDefinitions.map((tool) => tool.capabilityId),
               ]);
               if (
@@ -772,28 +758,21 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
               const tools: PiModelTool[] = [];
               const toolCapabilities: import("./PiSessionRuntime.ts").PiSessionToolCapability[] =
                 [];
-              for (const [name, capability] of [
-                [
-                  "project_work_read",
-                  binding.configuration.toolIds.includes("project-work.read-project")
-                    ? "project-work.read-project"
-                    : "project-work.read-task",
-                ],
-                ["project_work_write", "project-work.write"],
-              ] as const) {
-                if (!binding.configuration.toolIds.includes(capability)) continue;
-                tools.push({
-                  type: "function",
-                  function: {
-                    name,
-                    description:
-                      name === "project_work_read"
-                        ? "Read current assigned project work"
-                        : "Write an authorized project work intent",
-                    parameters: name === "project_work_read" ? readParameters : writeParameters,
-                  },
+              const bridgeTools = yield* Effect.try({
+                try: () =>
+                  preparePiProjectWorkTools({
+                    roleTools: authority.role.tools,
+                    bindingTools: binding.configuration.toolIds,
+                  }),
+                catch: () => deny("Pi frozen bridge tool configuration is invalid"),
+              });
+              for (const { tool, capability } of bridgeTools) {
+                tools.push(tool);
+                toolCapabilities.push({
+                  name: tool.function.name,
+                  capability,
+                  execution: "bridge",
                 });
-                toolCapabilities.push({ name, capability, execution: "bridge" });
               }
               for (const tool of localTools) {
                 tools.push({
@@ -927,23 +906,12 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     guard(
                       Effect.gen(function* () {
                         yield* check(signal);
-                        let result: unknown;
-                        if (call.toolName === "project_work_read")
-                          result = yield* gateway.read(
-                            yield* decodeReadIntent(input.arguments),
-                            durable.principal,
-                          );
-                        else if (call.toolName === "project_work_write") {
-                          const envelope = yield* decodeWriteEnvelope(input.arguments);
-                          if (Buffer.byteLength(envelope.intentJSON) > 262144)
-                            return yield* deny("Pi write intent exceeds its bound");
-                          result = yield* gateway.write(
-                            yield* decodeWriteIntentJSON(envelope.intentJSON),
-                            durable.principal.actor,
-                            { kind: "mcp", id: workerId },
-                            durable.principal,
-                          );
-                        } else return yield* deny("Pi bridge tool unavailable", "unavailable");
+                        const result = yield* executePiProjectWorkBridgeTool({
+                          toolName: call.toolName,
+                          arguments: input.arguments,
+                          principal: durable.principal,
+                          source: { kind: "mcp", id: workerId },
+                        }).pipe(Effect.provideService(ProjectWorkGateway, gateway));
                         yield* check(signal);
                         return { kind: "text" as const, text: encode(result) };
                       }),
