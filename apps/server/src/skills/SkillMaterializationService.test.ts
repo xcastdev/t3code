@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import type { ManagedSkillContent, ManagedSkillKey, ProviderInstanceId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -16,6 +17,7 @@ import * as SkillMaterializationService from "./SkillMaterializationService.ts";
 import { hashSkillPackage } from "./SkillPackage.ts";
 import { makeClaudeSkillAdapter, makeCodexSkillAdapter } from "./ProviderSkillAdapters.ts";
 
+const isMaterializationError = Schema.is(SkillMaterializationService.SkillMaterializationError);
 const encodeFixtureMarker = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const encodeFixtureJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -36,182 +38,296 @@ const TestLayer = SkillMaterializationService.layer.pipe(
 
 describe("SkillMaterializationService", () => {
   it.layer(TestLayer)("owns generated session packages", (it) => {
-    it.effect("admits only fixed owned output and joins its descriptor lifetime", () =>
-      Effect.gen(function* () {
-        const service = yield* SkillMaterializationService.SkillMaterializationService;
-        const repository = yield* ManagedSkillRepository.ManagedSkillRepository;
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const created = yield* repository.createGlobal({
-          expectedRevision: 0,
-          content: { ...content, key: "admit" as ManagedSkillKey },
-        });
-        const input = {
-          sessionId: "owned-admission",
-          providerInstanceId: "pi-owned" as ProviderInstanceId,
-          desiredRevision: 2,
-          packages: [{ key: created.manifest.key, sourcePath: created.packagePath }],
-        };
-        const materialized = yield* service.materialize(input);
-        const result = yield* SkillMaterializationService.withOwnedSkillMaterialization(
-          service,
-          { ...input, skillKeys: [created.manifest.key] },
-          (owned) =>
-            Effect.gen(function* () {
-              assert.equal(owned.root, materialized.root);
-              assert.equal(
-                owned.skillPaths.get(created.manifest.key),
-                path.join(owned.root, "admit"),
-              );
-              yield* owned.revalidate;
-              return yield* fs.readFileString(path.join(owned.root, "admit", "SKILL.md"));
-            }),
-        );
-        assert.include(result, "Run the deployment.");
-        assert.equal(yield* hashSkillPackage(created.packagePath), created.manifest.revision.hash);
-      }),
+    it.effect.skipIf(HostProcessPlatform.defaultValue() !== "linux")(
+      "admits only fixed owned output and joins its descriptor lifetime",
+      () =>
+        Effect.gen(function* () {
+          const service = yield* SkillMaterializationService.SkillMaterializationService;
+          const repository = yield* ManagedSkillRepository.ManagedSkillRepository;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const created = yield* repository.createGlobal({
+            expectedRevision: 0,
+            content: { ...content, key: "admit" as ManagedSkillKey },
+          });
+          const input = {
+            sessionId: "owned-admission",
+            providerInstanceId: "pi-owned" as ProviderInstanceId,
+            desiredRevision: 2,
+            packages: [{ key: created.manifest.key, sourcePath: created.packagePath }],
+          };
+          const materialized = yield* service.materialize(input);
+          const result = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+            service,
+            { ...input, skillKeys: [created.manifest.key] },
+            (owned) =>
+              Effect.gen(function* () {
+                assert.equal(owned.root, materialized.root);
+                assert.equal(
+                  owned.skillPaths.get(created.manifest.key),
+                  path.join(owned.root, "admit"),
+                );
+                yield* owned.revalidate;
+                return yield* fs.readFileString(path.join(owned.root, "admit", "SKILL.md"));
+              }),
+          );
+          assert.include(result, "Run the deployment.");
+          assert.equal(
+            yield* hashSkillPackage(created.packagePath),
+            created.manifest.revision.hash,
+          );
+        }),
     );
 
-    it.effect("refuses a replaced owned generation and preserves both trees", () =>
-      Effect.gen(function* () {
-        const service = yield* SkillMaterializationService.SkillMaterializationService;
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const input = {
-          sessionId: "replaced-admission",
-          providerInstanceId: "pi-owned" as ProviderInstanceId,
-          desiredRevision: 2,
-          skillKeys: [],
-        };
-        const materialized = yield* service.materialize({ ...input, packages: [] });
-        const original = materialized.root + "-original";
-        const failure = yield* SkillMaterializationService.withOwnedSkillMaterialization(
-          service,
-          input,
-          (owned) =>
-            Effect.gen(function* () {
-              yield* fs.rename(owned.root, original);
-              yield* fs.copy(original, owned.root);
-              yield* fs.writeFileString(path.join(owned.root, "foreign.txt"), "Keep replacement");
-              yield* owned.revalidate;
-            }),
-        ).pipe(Effect.flip);
-        if (Schema.is(SkillMaterializationService.SkillMaterializationError)(failure))
-          assert.equal(failure.code, "ownership_mismatch");
-        else assert.fail("Expected an owned generation refusal");
-        assert.isTrue(yield* fs.exists(original));
-        assert.equal(
-          yield* fs.readFileString(path.join(materialized.root, "foreign.txt")),
-          "Keep replacement",
-        );
-      }),
-    );
-
-    it.effect("refuses changed markers and missing selected directories without cleanup", () =>
-      Effect.gen(function* () {
-        const service = yield* SkillMaterializationService.SkillMaterializationService;
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const input = {
-          sessionId: "marker-admission",
-          providerInstanceId: "pi-owned" as ProviderInstanceId,
-          desiredRevision: 3,
-          skillKeys: [],
-        };
-        const materialized = yield* service.materialize({ ...input, packages: [] });
-        const missing = yield* SkillMaterializationService.withOwnedSkillMaterialization(
-          service,
-          { ...input, skillKeys: ["missing" as ManagedSkillKey] },
-          () => Effect.void,
-        ).pipe(Effect.flip);
-        assert.equal(missing.code, "ownership_mismatch");
-        const marker = path.join(materialized.root, ".t3-owned.json");
-        yield* fs.writeFileString(marker, "{}");
-        const changed = yield* SkillMaterializationService.withOwnedSkillMaterialization(
-          service,
-          input,
-          () => Effect.void,
-        ).pipe(Effect.flip);
-        assert.equal(changed.code, "ownership_mismatch");
-        assert.equal(yield* fs.readFileString(marker), "{}");
-      }),
-    );
-
-    it.effect("refuses marker redirection and closes admission after callback failure", () =>
-      Effect.gen(function* () {
-        const service = yield* SkillMaterializationService.SkillMaterializationService;
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const input = {
-          sessionId: "redirect-marker-admission",
-          providerInstanceId: "pi-owned" as ProviderInstanceId,
-          desiredRevision: 4,
-          skillKeys: [],
-        };
-        const materialized = yield* service.materialize({ ...input, packages: [] });
-        const marker = path.join(materialized.root, ".t3-owned.json");
-        const retained = path.join(materialized.root, "original-marker");
-        const contents = yield* fs.readFileString(marker);
-        yield* fs.rename(marker, retained);
-        yield* fs.symlink(retained, marker);
-        const redirected = yield* SkillMaterializationService.withOwnedSkillMaterialization(
-          service,
-          input,
-          () => Effect.void,
-        ).pipe(Effect.flip);
-        assert.equal(redirected.code, "ownership_mismatch");
-        assert.equal(yield* fs.readFileString(retained), contents);
-        yield* fs.remove(marker);
-        yield* fs.rename(retained, marker);
-        let closed = Effect.void as Effect.Effect<
-          void,
-          SkillMaterializationService.SkillMaterializationError
-        >;
-        const failure = yield* SkillMaterializationService.withOwnedSkillMaterialization(
-          service,
-          input,
-          (owned) => {
-            closed = owned.revalidate;
-            return Effect.fail("copy failed");
-          },
-        ).pipe(Effect.flip);
-        assert.equal(failure, "copy failed");
-        assert.equal((yield* closed.pipe(Effect.flip)).code, "ownership_mismatch");
-        assert.equal(yield* fs.readFileString(marker), contents);
-      }),
-    );
-
-    it.effect("does not admit a custom service or create missing runtime directories", () =>
-      Effect.gen(function* () {
-        const service = yield* SkillMaterializationService.SkillMaterializationService;
-        const fs = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const config = yield* ServerConfig.ServerConfig;
-        const input = {
-          sessionId: "absent-admission",
-          providerInstanceId: "pi-owned" as ProviderInstanceId,
-          desiredRevision: 5,
-          skillKeys: [],
-        };
-        let called = false;
-        for (const candidate of [
-          service,
-          SkillMaterializationService.SkillMaterializationService.of({ ...service }),
-        ]) {
+    it.effect.skipIf(HostProcessPlatform.defaultValue() !== "linux")(
+      "refuses a replaced owned generation and preserves both trees",
+      () =>
+        Effect.gen(function* () {
+          const service = yield* SkillMaterializationService.SkillMaterializationService;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const input = {
+            sessionId: "replaced-admission",
+            providerInstanceId: "pi-owned" as ProviderInstanceId,
+            desiredRevision: 2,
+            skillKeys: [],
+          };
+          const materialized = yield* service.materialize({ ...input, packages: [] });
+          const original = materialized.root + "-original";
           const failure = yield* SkillMaterializationService.withOwnedSkillMaterialization(
-            candidate,
+            service,
+            input,
+            (owned) =>
+              Effect.gen(function* () {
+                yield* fs.rename(owned.root, original);
+                yield* fs.copy(original, owned.root);
+                yield* fs.writeFileString(path.join(owned.root, "foreign.txt"), "Keep replacement");
+                yield* owned.revalidate;
+              }),
+          ).pipe(Effect.flip);
+          if (isMaterializationError(failure)) assert.equal(failure.code, "ownership_mismatch");
+          else assert.fail("Expected an owned generation refusal");
+          assert.isTrue(yield* fs.exists(original));
+          assert.equal(
+            yield* fs.readFileString(path.join(materialized.root, "foreign.txt")),
+            "Keep replacement",
+          );
+        }),
+    );
+
+    it.effect.skipIf(HostProcessPlatform.defaultValue() !== "linux")(
+      "refuses changed markers and missing selected directories without cleanup",
+      () =>
+        Effect.gen(function* () {
+          const service = yield* SkillMaterializationService.SkillMaterializationService;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const input = {
+            sessionId: "marker-admission",
+            providerInstanceId: "pi-owned" as ProviderInstanceId,
+            desiredRevision: 3,
+            skillKeys: [],
+          };
+          const materialized = yield* service.materialize({ ...input, packages: [] });
+          const missing = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+            service,
+            { ...input, skillKeys: ["missing" as ManagedSkillKey] },
+            () => Effect.void,
+          ).pipe(Effect.flip);
+          assert.equal(missing.code, "ownership_mismatch");
+          const marker = path.join(materialized.root, ".t3-owned.json");
+          yield* fs.writeFileString(marker, "{}");
+          const changed = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+            service,
+            input,
+            () => Effect.void,
+          ).pipe(Effect.flip);
+          assert.equal(changed.code, "ownership_mismatch");
+          assert.equal(yield* fs.readFileString(marker), "{}");
+        }),
+    );
+
+    it.effect.skipIf(HostProcessPlatform.defaultValue() !== "linux")(
+      "refuses marker redirection and closes admission after callback failure",
+      () =>
+        Effect.gen(function* () {
+          const service = yield* SkillMaterializationService.SkillMaterializationService;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const input = {
+            sessionId: "redirect-marker-admission",
+            providerInstanceId: "pi-owned" as ProviderInstanceId,
+            desiredRevision: 4,
+            skillKeys: [],
+          };
+          const materialized = yield* service.materialize({ ...input, packages: [] });
+          const marker = path.join(materialized.root, ".t3-owned.json");
+          const retained = path.join(materialized.root, "original-marker");
+          const contents = yield* fs.readFileString(marker);
+          yield* fs.rename(marker, retained);
+          yield* fs.symlink(retained, marker);
+          const redirected = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+            service,
+            input,
+            () => Effect.void,
+          ).pipe(Effect.flip);
+          assert.equal(redirected.code, "ownership_mismatch");
+          assert.equal(yield* fs.readFileString(retained), contents);
+          yield* fs.remove(marker);
+          yield* fs.rename(retained, marker);
+          let closed = Effect.void as Effect.Effect<
+            void,
+            SkillMaterializationService.SkillMaterializationError
+          >;
+          const failure = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+            service,
+            input,
+            (owned) => {
+              closed = owned.revalidate;
+              return Effect.fail("copy failed");
+            },
+          ).pipe(Effect.flip);
+          assert.equal(failure, "copy failed");
+          assert.equal((yield* closed.pipe(Effect.flip)).code, "ownership_mismatch");
+          assert.equal(yield* fs.readFileString(marker), contents);
+        }),
+    );
+
+    it.effect.skipIf(HostProcessPlatform.defaultValue() !== "linux")(
+      "does not admit a custom service or create missing runtime directories",
+      () =>
+        Effect.gen(function* () {
+          const service = yield* SkillMaterializationService.SkillMaterializationService;
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const config = yield* ServerConfig.ServerConfig;
+          const input = {
+            sessionId: "absent-admission",
+            providerInstanceId: "pi-owned" as ProviderInstanceId,
+            desiredRevision: 5,
+            skillKeys: [],
+          };
+          let called = false;
+          for (const candidate of [
+            service,
+            SkillMaterializationService.SkillMaterializationService.of({ ...service }),
+          ]) {
+            const failure = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+              candidate,
+              input,
+              () => {
+                called = true;
+                return Effect.void;
+              },
+            ).pipe(Effect.flip);
+            assert.equal(failure.code, "ownership_mismatch");
+          }
+          assert.isFalse(called);
+          assert.isFalse(yield* fs.exists(path.join(config.skillRuntimeDir, input.sessionId)));
+        }),
+    );
+
+    it.effect.skipIf(HostProcessPlatform.defaultValue() !== "linux")(
+      "closes every held descriptor when the callback throws synchronously",
+      () =>
+        Effect.gen(function* () {
+          const service = yield* SkillMaterializationService.SkillMaterializationService;
+          const input = {
+            sessionId: "throw-admission",
+            providerInstanceId: "pi-owned" as ProviderInstanceId,
+            desiredRevision: 6,
+            skillKeys: [],
+          };
+          const materialized = yield* service.materialize({ ...input, packages: [] });
+          const native = process.getBuiltinModule("fs").promises;
+          const syncExports = process.getBuiltinModule("module").syncBuiltinESMExports;
+          const captured: Array<Awaited<ReturnType<typeof native.open>>> = [];
+          let escaped = Effect.void as Effect.Effect<
+            void,
+            SkillMaterializationService.SkillMaterializationError
+          >;
+          yield* Effect.acquireUseRelease(
+            Effect.sync(() => {
+              const original = native.open;
+              native.open = async (...args) => {
+                const handle = await original(...args);
+                captured.push(handle);
+                return handle;
+              };
+              syncExports();
+              return original;
+            }),
+            () =>
+              Effect.gen(function* () {
+                const exit = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+                  service,
+                  input,
+                  (owned): Effect.Effect<void> => {
+                    escaped = owned.revalidate;
+                    throw new Error("Throw before returning an Effect");
+                  },
+                ).pipe(Effect.exit);
+                assert.isTrue(Exit.isFailure(exit));
+                assert.equal(
+                  captured.length,
+                  materialized.root.split("/").filter(Boolean).length + 2,
+                );
+                for (const handle of captured) {
+                  const stat = yield* Effect.tryPromise(() => handle.stat()).pipe(Effect.exit);
+                  assert.isTrue(Exit.isFailure(stat));
+                }
+                assert.equal((yield* escaped.pipe(Effect.flip)).code, "ownership_mismatch");
+              }),
+            (original) =>
+              Effect.promise(async () => {
+                native.open = original;
+                syncExports();
+                await Promise.allSettled(captured.map((handle) => handle.close()));
+              }),
+          );
+        }),
+    );
+
+    for (const platform of ["darwin", "win32"] as const)
+      it.effect(`refuses ${platform} admission while preserving ordinary materialization`, () =>
+        Effect.gen(function* () {
+          const service = yield* SkillMaterializationService.make.pipe(
+            Effect.provideService(HostProcessPlatform, platform),
+          );
+          const fs = yield* FileSystem.FileSystem;
+          const input = {
+            sessionId: `portable-${platform}`,
+            providerInstanceId: "pi-owned" as ProviderInstanceId,
+            desiredRevision: 7,
+            skillKeys: [],
+          };
+          const config = yield* ServerConfig.ServerConfig;
+          const path = yield* Path.Path;
+          let called = false;
+          const failure = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+            service,
             input,
             () => {
               called = true;
               return Effect.void;
             },
           ).pipe(Effect.flip);
-          assert.equal(failure.code, "ownership_mismatch");
-        }
-        assert.isFalse(called);
-        assert.isFalse(yield* fs.exists(path.join(config.skillRuntimeDir, input.sessionId)));
-      }),
-    );
+          assert.equal(failure.code, "unsafe_identity");
+          assert.isFalse(called);
+          assert.isFalse(yield* fs.exists(path.join(config.skillRuntimeDir, input.sessionId)));
+          const clone = SkillMaterializationService.SkillMaterializationService.of({ ...service });
+          const clonedFailure = yield* SkillMaterializationService.withOwnedSkillMaterialization(
+            clone,
+            input,
+            () => Effect.void,
+          ).pipe(Effect.flip);
+          assert.equal(clonedFailure.code, "ownership_mismatch");
+          const ordinary = yield* service.materialize({ ...input, packages: [] });
+          assert.isTrue(yield* fs.exists(ordinary.root));
+          yield* service.dispose(input);
+          assert.isFalse(yield* fs.exists(ordinary.root));
+        }),
+      );
 
     it.effect(
       "fresh adapters discover owned revisions while preserving unrelated runtime files",

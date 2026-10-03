@@ -44,6 +44,7 @@ export class SkillMaterializationError extends Schema.TaggedError<SkillMateriali
   },
 ) {}
 const isSkillMaterializationError = Schema.is(SkillMaterializationError);
+const isManagedSkillKey = Schema.is(ManagedSkillKey);
 
 export interface SkillMaterializationInput {
   readonly sessionId: string;
@@ -669,7 +670,7 @@ export const make = Effect.gen(function* () {
         admittedInput.providerInstanceId.length > 128 ||
         admittedInput.skillKeys.length > 32 ||
         new Set(admittedInput.skillKeys).size !== admittedInput.skillKeys.length ||
-        admittedInput.skillKeys.some((key) => !Schema.is(ManagedSkillKey)(key))
+        admittedInput.skillKeys.some((key) => !isManagedSkillKey(key))
       )
         return yield* failure(
           "unsafe_identity",
@@ -827,9 +828,9 @@ export const make = Effect.gen(function* () {
         }),
         (owned) => {
           const revalidate = native(owned.validate);
-          return use({ root: owned.root, skillPaths: owned.skillPaths, revalidate }).pipe(
-            Effect.tap(() => revalidate),
-          );
+          return Effect.suspend(() =>
+            use({ root: owned.root, skillPaths: owned.skillPaths, revalidate }),
+          ).pipe(Effect.tap(() => revalidate));
         },
         (owned) => native(owned.close).pipe(Effect.orDie),
       );
