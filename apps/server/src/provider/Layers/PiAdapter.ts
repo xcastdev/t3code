@@ -217,7 +217,7 @@ type ActiveOperation = {
 };
 type SessionContext = {
   readonly threadId: ThreadId;
-  readonly skillPlan?: ProviderSkillPlan;
+  skillPlan?: ProviderSkillPlan | undefined;
   session?: ProviderSession;
   active?: ActiveOperation | undefined;
   failure?: ProviderAdapterError;
@@ -659,9 +659,12 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             ...(callerHints.modelSelection !== undefined
               ? { modelSelection: structuredClone(callerHints.modelSelection) }
               : {}),
+            ...(callerHints.skillPlan !== undefined
+              ? { skillPlan: structuredClone(callerHints.skillPlan) }
+              : {}),
           }),
           catch: () =>
-            invalid("startSession", "Pi resume and model hints must be structured data."),
+            invalid("startSession", "Pi resume, model and skill hints must be structured data."),
         });
         if (shuttingDown)
           return yield* new ProviderAdapterSessionClosedError({
@@ -699,11 +702,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           );
         if (existing) {
           const context = yield* owned(hints.threadId);
-          if (
-            hints.skillPlan !== undefined &&
-            !NodeUtil.isDeepStrictEqual(hints.skillPlan, context.skillPlan)
-          )
-            return yield* invalid("startSession", "Changed Pi skills require a new session.");
           if (context.active)
             return yield* invalid(
               "startSession",
@@ -711,7 +709,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             );
           const previousSession = context.session;
           const previousOperationId = context.lastOperationId;
-          const session = yield* runtime.readSession(hints.threadId).pipe(
+          const previousSkillPlan = context.skillPlan;
+          const skillPlan = hints.skillPlan ?? previousSkillPlan;
+          const session = yield* runtime.readSession(hints.threadId, skillPlan).pipe(
             Effect.mapError((error) => requestError("readSession", error)),
             Effect.flatMap((session) => validateSession(session, hints.threadId)),
           );
@@ -736,7 +736,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
               current !== context ||
               context.active ||
               context.session !== previousSession ||
-              context.lastOperationId !== previousOperationId
+              context.lastOperationId !== previousOperationId ||
+              context.skillPlan !== previousSkillPlan
             )
               return Effect.fail(
                 invalid(
@@ -745,21 +746,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
                 ),
               );
             context.session = session;
+            context.skillPlan = skillPlan;
             return Effect.succeed(session);
           });
         }
-        const skillPlan =
-          hints.skillPlan === undefined
-            ? undefined
-            : yield* Effect.try({
-                try: () => structuredClone(hints.skillPlan),
-                catch: () =>
-                  new ProviderAdapterValidationError({
-                    provider,
-                    operation: "startSession",
-                    issue: "Pi skill plan cannot be copied.",
-                  }),
-              });
+        const skillPlan = hints.skillPlan;
         const context: SessionContext = {
           threadId: hints.threadId,
           closing: false,
