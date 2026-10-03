@@ -101,7 +101,15 @@ export default mergeConfig(
       outDir: packExecutable ? "dist-exe" : "dist",
       sourcemap: !packExecutable,
       clean: true,
-      copy: ({ outDir }) => [{ from: piSdkMetadataPath, to: NodePath.join(outDir, "pi-sdk") }],
+      copy: ({ outDir }) => [
+        { from: piSdkMetadataPath, to: NodePath.join(outDir, "pi-sdk") },
+        {
+          from: NodeURL.fileURLToPath(
+            new URL("./src/provider/pi/pi-managed-process-owner.py", import.meta.url),
+          ),
+          to: outDir,
+        },
+      ],
       ...(packExecutable
         ? {
             exe: {
