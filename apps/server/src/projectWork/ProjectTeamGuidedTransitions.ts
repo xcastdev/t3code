@@ -464,6 +464,43 @@ export const decideProjectTeamGuidedTransition = (
       });
       record(run);
       assertProjectTeamRunAuthority(state, run, role!, true);
+      if (t.dispatch !== undefined) {
+        const effect = t.dispatch.effect;
+        if (
+          effect.kind !== "effect" ||
+          effect.effectKind !== "dispatch" ||
+          effect.status !== "pending" ||
+          effect.projectId !== run.projectId ||
+          effect.runId !== run.recordId ||
+          effect.taskId !== run.taskId ||
+          effect.targetId !== run.recordId ||
+          effect.generation !== run.generation ||
+          effect.revision !== 0 ||
+          effect.claimGeneration !== 0 ||
+          effect.availableAt !== at
+        )
+          reject("Dispatch intent must match the atomic claim");
+        record(effect);
+        const reservation = t.dispatch.writableReservation;
+        if (reservation !== undefined) {
+          if (
+            reservation.kind !== "reservation" ||
+            reservation.status !== "held" ||
+            reservation.scope !== "project" ||
+            reservation.projectId !== run.projectId ||
+            reservation.environmentId !== run.environmentId ||
+            reservation.runId !== run.recordId ||
+            reservation.taskId !== run.taskId ||
+            reservation.attemptId !== run.attemptId ||
+            reservation.resourceKey !== "writable" ||
+            reservation.generation !== run.generation ||
+            reservation.revision !== 0 ||
+            reservation.consumedTokens !== 0
+          )
+            reject("Writable reservation must match the atomic claim");
+          record(reservation);
+        }
+      }
       break;
     }
     case "failure": {

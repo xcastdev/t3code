@@ -1,0 +1,641 @@
+import {
+  canonicalProjectWorkPayload,
+  CommandId,
+  ProjectTeamRecord as ProjectTeamRecordSchema,
+  EnvironmentId,
+  ProjectWorkTaskId,
+  ProjectWorkFoundationCommitCommand,
+  type ProjectTeamRecord,
+} from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { assertProjectTeamRunAuthority, projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
+import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
+import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
+import { resolveProjectTeamLimits } from "./ProjectTeamLimits.ts";
+
+const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
+const Text = Schema.String.check(Schema.isMaxLength(4096));
+const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
+const Positive = Safe.check(Schema.isGreaterThan(0));
+const Digest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+const Stage = Schema.Literals([
+  "reserved",
+  "workspace-ready",
+  "setup-complete",
+  "session-bound",
+  "assignment-intent",
+  "assignment-observed",
+  "stopping",
+  "settled",
+  "quarantine",
+]);
+const GitAssignment = Schema.Struct({
+  effectId: Id,
+  runId: Id,
+  generation: Safe,
+  primaryRoot: Text,
+  commonGitDirectory: Text,
+  worktreePath: Text,
+  branchRef: Text,
+  baseRef: Text,
+  baseOid: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/)),
+  ownershipToken: Id,
+  policyHash: Digest,
+});
+const Identity = Schema.Struct({ path: Text, dev: Id, ino: Id });
+export const ProjectTeamWorkspaceReceipt = Schema.Struct({
+  assignment: GitAssignment,
+  primary: Identity,
+  worktree: Identity,
+  common: Identity,
+  gitDirectory: Identity,
+  initialHeadOid: Schema.String,
+  pointerAndConfigurationHash: Digest,
+});
+const Request = Schema.Struct({
+  dispatchId: Id,
+  claim: ProjectWorkFoundationCommitCommand,
+  git: GitAssignment,
+  setupId: Id,
+  initializeOperationId: Id,
+  assignmentOperationId: Id,
+  assignment: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.makeFilter((value) => Buffer.byteLength(value) <= 131072, {
+      message: "Assignment exceeds its byte budget",
+    }),
+  ),
+});
+const Limits = Schema.Struct({
+  rootTaskId: ProjectWorkTaskId,
+  maximumTokens: Positive,
+  attemptMaximumTokens: Positive,
+  rootDeadlineAtMs: Positive,
+  deadlineAtMs: Positive,
+  delegationDepth: Safe,
+  maximumDelegationDepth: Safe,
+  repairAllowance: Safe,
+  environmentModelCalls: Positive,
+  projectWritableWorkers: Safe,
+  modelCalls: Positive,
+  writable: Schema.Boolean,
+  limitsRecordId: Id,
+  limitsRevision: Safe,
+});
+const RootCaps = Schema.Struct({
+  maximumDelegationDepth: Safe.check(Schema.isLessThanOrEqualTo(8)),
+  repairAllowance: Safe.check(Schema.isLessThanOrEqualTo(16)),
+  environmentModelCalls: Positive.check(Schema.isLessThanOrEqualTo(128)),
+  projectWritableWorkers: Safe.check(Schema.isLessThanOrEqualTo(64)),
+  modelCalls: Positive.check(Schema.isLessThanOrEqualTo(128)),
+});
+const Intent = Schema.Struct({
+  request: Request,
+  compiledClaim: ProjectWorkFoundationCommitCommand,
+  limits: Limits,
+  rootCaps: RootCaps,
+  writableReservationId: Schema.optionalKey(Id),
+});
+export type ProjectTeamDispatchRequest = typeof Request.Type;
+export type ProjectTeamDispatchStage = typeof Stage.Type;
+type Binding = Extract<ProjectTeamRecord, { kind: "run-binding" }>;
+type Row = {
+  dispatch_id: string;
+  project_id: string;
+  environment_id: string;
+  binding_id: string;
+  generation: number;
+  revision: number;
+  claim_generation: number;
+  stage: ProjectTeamDispatchStage;
+  intent_json: string;
+};
+const strict = { onExcessProperty: "error" } as const;
+const decodeRequest = Schema.decodeUnknownEffect(Request, strict);
+const decodeEnvironment = Schema.decodeUnknownEffect(EnvironmentId);
+const decodeCalls = Schema.decodeUnknownEffect(Positive.check(Schema.isLessThanOrEqualTo(128)));
+const decodeId = Schema.decodeUnknownEffect(Id);
+const decodeRecord = Schema.decodeUnknownEffect(ProjectTeamRecordSchema);
+const decodeIntent = Schema.decodeUnknownEffect(Schema.fromJsonString(Intent), strict);
+const encodeIntent = Schema.encodeSync(Schema.fromJsonString(Intent));
+
+const fingerprint = (value: unknown) =>
+  NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+
+export class ProjectTeamDispatchJournalError extends Schema.TaggedError<ProjectTeamDispatchJournalError>()(
+  "ProjectTeamDispatchJournalError",
+  { reason: Schema.String },
+) {}
+const deny = (reason: string) => new ProjectTeamDispatchJournalError({ reason });
+const time = (millis: number) => DateTime.formatIso(DateTime.makeUnsafe(millis));
+const deadline = (value: string) => {
+  const parsed = DateTime.make(value);
+  return Option.isSome(parsed) && DateTime.formatIso(parsed.value) === value
+    ? DateTime.toEpochMillis(parsed.value)
+    : undefined;
+};
+const fence = (row: Row) =>
+  Object.freeze({
+    dispatchId: row.dispatch_id,
+    revision: row.revision,
+    claimGeneration: row.claim_generation,
+    stage: row.stage,
+  });
+export type ProjectTeamDispatchFence = ReturnType<typeof fence>;
+
+/** Only Root constructs this journal. Every effect admission and receipt checks committed authority. */
+export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatchJournal")(
+  function* (options: {
+    readonly environmentId: string;
+    readonly maximumEnvironmentModelCalls: number;
+  }) {
+    const sql = yield* SqlClient.SqlClient;
+    const repository = yield* ProjectWorkRepository;
+    const environmentId = yield* decodeEnvironment(options.environmentId);
+    const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
+    const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
+      const rows = yield* sql<Row>`SELECT dispatch_id,project_id,environment_id,binding_id,
+      generation,revision,claim_generation,stage,intent_json FROM project_team_dispatch
+      WHERE dispatch_id=${dispatchId} AND environment_id=${environmentId}`;
+      const row = rows[0];
+      if (!row || rows.length !== 1) return yield* deny("Dispatch ownership is missing");
+      const intent = yield* decodeIntent(row.intent_json).pipe(
+        Effect.mapError(() => deny("Dispatch intent is invalid")),
+      );
+      if (
+        intent.request.dispatchId !== row.dispatch_id ||
+        intent.compiledClaim.projectId !== row.project_id ||
+        intent.compiledClaim.transition?.kind !== "claim" ||
+        intent.compiledClaim.transition.binding.recordId !== row.binding_id ||
+        intent.compiledClaim.transition.binding.generation !== row.generation
+      )
+        return yield* deny("Dispatch identity does not match its retained intent");
+      return { row, intent };
+    });
+    const current = Effect.fn("ProjectTeamDispatchJournal.current")(function* (
+      row: Row,
+      intent: typeof Intent.Type,
+    ) {
+      if (yield* isProjectWorkTombstoned(sql, row.project_id))
+        return yield* deny("Project is deleted");
+      const now = yield* Clock.currentTimeMillis;
+      if (now >= intent.limits.deadlineAtMs) return yield* deny("Frozen attempt deadline expired");
+      const state = yield* readCurrentState(sql, row.project_id);
+      const records = state.foundationRecords ?? [];
+      const bindings = records.filter(
+        (r): r is Binding => r.kind === "run-binding" && r.recordId === row.binding_id,
+      );
+      const binding = bindings[0];
+      if (
+        bindings.length !== 1 ||
+        !binding ||
+        binding.environmentId !== environmentId ||
+        binding.generation !== row.generation ||
+        binding.leaseGeneration !== row.generation
+      )
+        return yield* deny("Dispatch run is replaced or missing");
+      const initial = intent.compiledClaim.transition;
+      if (initial?.kind !== "claim") return yield* deny("Dispatch claim is missing");
+      const frozen = initial.binding;
+      if (
+        binding.taskId !== frozen.taskId ||
+        binding.attemptId !== frozen.attemptId ||
+        binding.threadId !== frozen.threadId ||
+        binding.providerInstanceId !== frozen.providerInstanceId ||
+        binding.worktree !== frozen.worktree ||
+        binding.branch !== frozen.branch ||
+        fingerprint(binding.configuration) !== fingerprint(frozen.configuration)
+      )
+        return yield* deny("Frozen dispatch configuration changed");
+      const role = records.find(
+        (r) => r.kind === "role-revision" && r.recordId === binding.roleRevisionId,
+      );
+      if (role?.kind !== "role-revision") return yield* deny("Frozen role is missing");
+      const rootBudgets = yield* sql<{ maximum_tokens: number; deadline_at_ms: number }>`
+      SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE environment_id=${environmentId}
+        AND project_id=${row.project_id} AND root_task_id=${intent.limits.rootTaskId}`;
+      if (
+        rootBudgets.length !== 1 ||
+        rootBudgets[0]?.maximum_tokens !== intent.limits.maximumTokens ||
+        rootBudgets[0]?.deadline_at_ms !== intent.limits.rootDeadlineAtMs
+      )
+        return yield* deny("Original root budget changed or disappeared");
+      const policy = resolveProjectTeamLimits({
+        state,
+        taskId: binding.taskId,
+        roleRevisionId: binding.roleRevisionId,
+        nowMs: now,
+        environmentModelCalls: environmentCalls,
+        writable: intent.limits.writable,
+        rootBudget: {
+          rootTaskId: intent.limits.rootTaskId,
+          maximumTokens: intent.limits.maximumTokens,
+          deadlineAtMs: intent.limits.rootDeadlineAtMs,
+        },
+        attemptConfiguration: binding.configuration,
+        ...(binding.parentRunId === undefined ? {} : { parentRunId: binding.parentRunId }),
+      });
+      if (
+        policy._tag !== "Eligible" ||
+        policy.frozen.delegationDepth > intent.limits.maximumDelegationDepth
+      )
+        return yield* deny("Current managed limits deny execution");
+      yield* Effect.try({
+        try: () => assertProjectTeamRunAuthority(state, binding, role, true),
+        catch: () => deny("Dispatch grant or assignment is stale"),
+      });
+      const attempt = state.attempts.find(
+        (a) => a.attemptId === binding.attemptId && a.taskId === binding.taskId,
+      );
+      if (
+        state.tasks.find((t) => t.taskId === binding.taskId)?.activeAttemptId !==
+          binding.attemptId ||
+        !attempt ||
+        (attempt.state !== "leased" && attempt.state !== "running") ||
+        !attempt.leasedUntil ||
+        attempt.leaseToken !== initial.claim.leaseToken ||
+        (deadline(attempt.leasedUntil) ?? 0) <= now
+      )
+        return yield* deny("Dispatch lease expired or changed");
+      return { state, binding, role, now };
+    });
+    const reserve = Effect.fn("ProjectTeamDispatchJournal.reserve")(function* (
+      input: ProjectTeamDispatchRequest,
+    ) {
+      const request = yield* decodeRequest(input).pipe(
+        Effect.mapError(() => deny("Invalid dispatch request")),
+      );
+      const transition = request.claim.transition;
+      if (
+        transition?.kind !== "claim" ||
+        transition.dispatch !== undefined ||
+        request.claim.guided !== undefined
+      )
+        return yield* deny("Dispatch requires one uncompiled private claim");
+      const binding = transition.binding;
+      const requestedLease = deadline(transition.claim.leasedUntil);
+      if (requestedLease === undefined) return yield* deny("Dispatch lease timestamp is invalid");
+      if (
+        binding.environmentId !== environmentId ||
+        request.git.effectId !== request.dispatchId ||
+        request.git.runId !== binding.recordId ||
+        request.git.generation !== binding.generation ||
+        request.git.worktreePath !== binding.worktree ||
+        request.git.branchRef !== binding.branch
+      )
+        return yield* deny("Assignment does not match its frozen run");
+      let admitted: { row: Row; intent: typeof Intent.Type } | undefined;
+      yield* repository.executeAtomic(
+        Effect.gen(function* () {
+          const existing = yield* sql<Row>`SELECT dispatch_id,project_id,environment_id,binding_id,
+        generation,revision,claim_generation,stage,intent_json FROM project_team_dispatch
+        WHERE dispatch_id=${request.dispatchId}`;
+          if (existing.length > 0) {
+            admitted = yield* read(request.dispatchId);
+            if (fingerprint(admitted.intent.request) !== fingerprint(request))
+              return yield* deny("Dispatch identity was reused");
+            yield* current(admitted.row, admitted.intent);
+            return [admitted.intent.compiledClaim];
+          }
+          if (yield* isProjectWorkTombstoned(sql, binding.projectId))
+            return yield* deny("Project is deleted");
+          const state = yield* readCurrentState(sql, binding.projectId);
+          const now = yield* Clock.currentTimeMillis;
+          const records = state.foundationRecords ?? [];
+          let rootTaskId = binding.taskId;
+          const tasks = new Set<string>();
+          for (;;) {
+            if (tasks.has(rootTaskId) || tasks.size >= 9)
+              return yield* deny("Invalid task ancestry");
+            tasks.add(rootTaskId);
+            const memberships = records.filter(
+              (r) => r.kind === "task-membership" && r.taskId === rootTaskId,
+            );
+            const membership = memberships[0];
+            if (memberships.length !== 1 || membership?.kind !== "task-membership")
+              return yield* deny("Invalid task ancestry");
+            if (!membership.parentTaskId) break;
+            rootTaskId = membership.parentTaskId;
+          }
+          const budgets = yield* sql<{ maximum_tokens: number; deadline_at_ms: number }>`
+        SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget
+        WHERE environment_id=${environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId}`;
+          const anchors = yield* sql<{
+            intent_json: string;
+          }>`SELECT intent_json FROM project_team_dispatch
+        WHERE environment_id=${environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId}
+        ORDER BY created_at,dispatch_id LIMIT 1`;
+          const anchor = anchors[0] ? yield* decodeIntent(anchors[0].intent_json) : undefined;
+          if (budgets.length > 0 !== (anchor !== undefined))
+            return yield* deny("Root budget requires trusted legacy reconciliation");
+          const role = records.find(
+            (r) => r.kind === "role-revision" && r.recordId === binding.roleRevisionId,
+          );
+          if (role?.kind !== "role-revision") return yield* deny("Configured role is missing");
+          const policies = records.filter(
+            (r) => r.kind === "limits" && r.status === "configured" && r.model === role.model,
+          );
+          const policy = policies[0];
+          if (policies.length !== 1 || policy?.kind !== "limits")
+            return yield* deny("One configured model policy is required");
+          if (
+            anchor &&
+            (budgets[0]?.maximum_tokens !== anchor.limits.maximumTokens ||
+              budgets[0]?.deadline_at_ms !== anchor.limits.rootDeadlineAtMs ||
+              anchor.limits.rootTaskId !== rootTaskId)
+          )
+            return yield* deny("Original root budget changed");
+          // Implementation also reserves its setup writes, even when its local tool subset is read-only.
+          const writable =
+            role.role === "implementer" ||
+            ["pi.write", "pi.edit", "pi.bash"].some((tool) =>
+              binding.configuration.toolIds.includes(tool),
+            );
+          const rootBudget = budgets[0]
+            ? {
+                rootTaskId,
+                maximumTokens: budgets[0].maximum_tokens,
+                deadlineAtMs: budgets[0].deadline_at_ms,
+              }
+            : {
+                rootTaskId,
+                maximumTokens: Math.min(binding.configuration.maxTokens, policy.tokenLimit),
+                deadlineAtMs:
+                  now + Math.min(binding.configuration.maxDurationMs, policy.durationLimitMs),
+              };
+          const resolved = resolveProjectTeamLimits({
+            state,
+            taskId: binding.taskId,
+            roleRevisionId: binding.roleRevisionId,
+            nowMs: now,
+            environmentModelCalls: environmentCalls,
+            writable,
+            rootBudget,
+            attemptConfiguration: binding.configuration,
+            ...(binding.parentRunId === undefined ? {} : { parentRunId: binding.parentRunId }),
+          });
+          if (resolved._tag !== "Eligible")
+            return yield* deny(`Dispatch limits blocked: ${resolved.reason}`);
+          const snapshot = resolved.frozen;
+          const rootCaps = anchor?.rootCaps ?? {
+            maximumDelegationDepth: snapshot.maximumDelegationDepth,
+            repairAllowance: snapshot.repairAllowance,
+            environmentModelCalls: snapshot.environmentModelCalls,
+            projectWritableWorkers: snapshot.projectWritableWorkers,
+            modelCalls: snapshot.modelCalls,
+          };
+          const limits = {
+            ...snapshot,
+            maximumDelegationDepth: Math.min(
+              rootCaps.maximumDelegationDepth,
+              snapshot.maximumDelegationDepth,
+            ),
+            repairAllowance: Math.min(rootCaps.repairAllowance, snapshot.repairAllowance),
+            environmentModelCalls: Math.min(
+              rootCaps.environmentModelCalls,
+              snapshot.environmentModelCalls,
+            ),
+            projectWritableWorkers: Math.min(
+              rootCaps.projectWritableWorkers,
+              snapshot.projectWritableWorkers,
+            ),
+            modelCalls: Math.min(rootCaps.modelCalls, snapshot.modelCalls),
+          };
+          if (limits.delegationDepth > limits.maximumDelegationDepth)
+            return yield* deny("Original root depth exhausted");
+          const held = yield* sql<{ slot: number }>`SELECT slot FROM project_team_reservation
+        WHERE project_id=${binding.projectId} AND status='held' AND scope_key=${canonicalProjectWorkPayload([environmentId, "project", binding.projectId])}`;
+          const slot = Array.from(
+            { length: limits.projectWritableWorkers },
+            (_, index) => index,
+          ).find((index) => !held.some((r) => r.slot === index));
+          if (writable && slot === undefined)
+            return yield* deny("Writable project capacity exhausted");
+          const at = request.claim.committedAt;
+          const effectId = projectTeamDerivedRecordId(request.claim.commandId, "dispatch-effect");
+          const reservationId = projectTeamDerivedRecordId(
+            request.claim.commandId,
+            "writable-reservation",
+          );
+          const compiledClaim: typeof ProjectWorkFoundationCommitCommand.Type = {
+            ...request.claim,
+            transition: {
+              ...transition,
+              binding: {
+                ...binding,
+                configuration: {
+                  ...binding.configuration,
+                  maxTokens: limits.attemptMaximumTokens,
+                  maxDurationMs: limits.deadlineAtMs - now,
+                },
+              },
+              claim: {
+                ...transition.claim,
+                leasedUntil: time(Math.min(requestedLease, limits.deadlineAtMs)),
+              },
+              dispatch: {
+                effect: {
+                  kind: "effect",
+                  projectId: binding.projectId,
+                  recordId: effectId,
+                  revision: 0,
+                  generation: binding.generation,
+                  updatedAt: at,
+                  status: "pending",
+                  effectId: request.dispatchId,
+                  effectKind: "dispatch",
+                  taskId: binding.taskId,
+                  runId: binding.recordId,
+                  targetId: binding.recordId,
+                  payload: {
+                    recordIds: [binding.recordId],
+                    expectedRevision: request.claim.expectedRevision,
+                  },
+                  claimGeneration: 0,
+                  availableAt: at,
+                },
+                ...(writable
+                  ? {
+                      writableReservation: {
+                        kind: "reservation" as const,
+                        projectId: binding.projectId,
+                        recordId: reservationId,
+                        revision: 0,
+                        generation: binding.generation,
+                        updatedAt: at,
+                        status: "held" as const,
+                        environmentId,
+                        scope: "project" as const,
+                        resourceKey: "writable",
+                        slot: slot!,
+                        runId: binding.recordId,
+                        taskId: binding.taskId,
+                        attemptId: binding.attemptId,
+                        maximumTokens: 0,
+                        consumedTokens: 0,
+                      },
+                    }
+                  : {}),
+              },
+            },
+          };
+          const intent: typeof Intent.Type = {
+            request,
+            compiledClaim,
+            limits,
+            rootCaps,
+            ...(writable ? { writableReservationId: reservationId } : {}),
+          };
+          if (Buffer.byteLength(encodeIntent(intent)) > 262144)
+            return yield* deny("Dispatch intent exceeds its storage bound");
+          if (budgets.length === 0)
+            yield* sql`INSERT INTO project_team_model_budget VALUES
+        (${environmentId},${binding.projectId},${rootTaskId},${limits.maximumTokens},${limits.rootDeadlineAtMs})`;
+          admitted = {
+            row: {
+              dispatch_id: request.dispatchId,
+              project_id: binding.projectId,
+              environment_id: environmentId,
+              binding_id: binding.recordId,
+              generation: binding.generation,
+              stage: "reserved",
+              revision: 0,
+              claim_generation: 0,
+              intent_json: encodeIntent(intent),
+            },
+            intent,
+          };
+          return [compiledClaim];
+        }),
+        Effect.gen(function* () {
+          if (!admitted) return yield* deny("Dispatch was not admitted");
+          yield* current(admitted.row, admitted.intent);
+          const { row, intent } = admitted;
+          yield* sql`INSERT INTO project_team_dispatch (dispatch_id,environment_id,project_id,binding_id,
+        generation,task_id,attempt_id,worktree,branch,root_task_id,root_maximum_tokens,root_deadline_at_ms,
+        attempt_maximum_tokens,attempt_deadline_at_ms,delegation_depth,maximum_delegation_depth,
+        repair_allowance,stage,revision,claim_generation,intent_json,created_at,updated_at)
+        VALUES (${row.dispatch_id},${environmentId},${row.project_id},${row.binding_id},${row.generation},
+          ${binding.taskId},${binding.attemptId},${binding.worktree},${binding.branch},${intent.limits.rootTaskId},
+          ${intent.limits.maximumTokens},${intent.limits.rootDeadlineAtMs},${intent.limits.attemptMaximumTokens},
+          ${intent.limits.deadlineAtMs},${intent.limits.delegationDepth},${intent.limits.maximumDelegationDepth},
+          ${intent.limits.repairAllowance},'reserved',0,0,${row.intent_json},${request.claim.committedAt},${request.claim.committedAt})
+        ON CONFLICT(dispatch_id) DO NOTHING`;
+          const committed = yield* read(row.dispatch_id);
+          if (committed.row.intent_json !== row.intent_json)
+            return yield* deny("Dispatch identity conflicts");
+        }),
+      );
+      if (!admitted) return yield* deny("Dispatch commit is missing");
+      return { fence: fence(admitted.row), intent: admitted.intent };
+    });
+    const inspect = Effect.fn("ProjectTeamDispatchJournal.inspect")(function* (dispatchId: string) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const value = yield* read(dispatchId);
+          yield* current(value.row, value.intent);
+          return { fence: fence(value.row), intent: value.intent };
+        }),
+      );
+    });
+    const claimEffect = Effect.fn("ProjectTeamDispatchJournal.claimEffect")(function* (
+      expected: ProjectTeamDispatchFence,
+    ) {
+      let claimed: { row: Row; intent: typeof Intent.Type } | undefined;
+      yield* repository.executeAtomic(
+        Effect.gen(function* () {
+          const value = yield* read(expected.dispatchId);
+          const authority = yield* current(value.row, value.intent);
+          if (
+            fingerprint(fence(value.row)) !== fingerprint(expected) ||
+            value.row.stage !== "reserved"
+          )
+            return yield* deny("Dispatch claim fence is stale");
+          const effect = authority.state.foundationRecords?.find(
+            (record) =>
+              record.kind === "effect" &&
+              record.effectId === expected.dispatchId &&
+              record.runId === value.row.binding_id,
+          );
+          if (
+            effect?.kind !== "effect" ||
+            effect.status !== "pending" ||
+            effect.claimGeneration !== value.row.claim_generation ||
+            effect.generation !== value.row.generation
+          )
+            return yield* deny("Dispatch effect is already claimed or changed");
+          const at = time(authority.now);
+          const updated = yield* decodeRecord({
+            ...effect,
+            status: "claimed",
+            revision: effect.revision + 1,
+            claimGeneration: effect.claimGeneration + 1,
+            updatedAt: at,
+          });
+          claimed = {
+            ...value,
+            row: {
+              ...value.row,
+              revision: value.row.revision + 1,
+              claim_generation: value.row.claim_generation + 1,
+            },
+          };
+          return [
+            {
+              type: "project-work.foundation.commit" as const,
+              projectId: value.intent.compiledClaim.projectId,
+              commandId: CommandId.make(
+                projectTeamDerivedRecordId(value.intent.compiledClaim.commandId, "claim-dispatch"),
+              ),
+              expectedRevision: authority.state.revision,
+              attribution: value.intent.compiledClaim.attribution,
+              records: [updated],
+              committedAt: at,
+            },
+          ];
+        }),
+        Effect.gen(function* () {
+          if (!claimed) return yield* deny("Dispatch effect claim is missing");
+          yield* current(claimed.row, claimed.intent);
+          const changed =
+            yield* sql`UPDATE project_team_dispatch SET revision=${claimed.row.revision},
+        claim_generation=${claimed.row.claim_generation},updated_at=${time(yield* Clock.currentTimeMillis)}
+        WHERE dispatch_id=${expected.dispatchId} AND environment_id=${environmentId}
+          AND revision=${expected.revision} AND claim_generation=${expected.claimGeneration} AND stage='reserved'
+        RETURNING dispatch_id`;
+          if (changed.length !== 1) return yield* deny("Dispatch effect claim was superseded");
+        }),
+      );
+      if (!claimed) return yield* deny("Dispatch effect claim did not commit");
+      return { fence: fence(claimed.row), intent: claimed.intent };
+    });
+    const readRecoveryPage = Effect.fn("ProjectTeamDispatchJournal.readRecoveryPage")(
+      function* (input: { readonly afterDispatchId?: string; readonly limit: number }) {
+        const limit = yield* decodeCalls(input.limit);
+        const after =
+          input.afterDispatchId === undefined ? "" : yield* decodeId(input.afterDispatchId);
+        // Cleanup ownership is readable after revocation/deletion; this cursor grants no execution authority.
+        const rows = yield* sql<{
+          dispatch_id: string;
+        }>`SELECT dispatch_id FROM project_team_dispatch
+      WHERE environment_id=${environmentId} AND stage <> 'settled' AND dispatch_id > ${after}
+      ORDER BY dispatch_id LIMIT ${limit}`;
+        return yield* Effect.forEach(rows, (row) =>
+          read(row.dispatch_id).pipe(
+            Effect.map((value) => ({
+              fence: fence(value.row),
+              intent: value.intent,
+            })),
+          ),
+        );
+      },
+    );
+    return { reserve, inspect, claimEffect, readRecoveryPage };
+  },
+);
