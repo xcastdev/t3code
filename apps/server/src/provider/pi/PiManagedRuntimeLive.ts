@@ -2,6 +2,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   IsoDateTime,
   ManagedSkillKey,
+  ManagedSkillManifest,
   ProviderInstanceId,
   SkillCatalogRevision,
   ThreadId,
@@ -10,6 +11,8 @@ import {
   type ProviderSession,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
+import * as Fiber from "effect/Fiber";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -30,9 +33,14 @@ import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOper
 import { make as makeAccounting } from "../../projectWork/ProjectTeamModelAccounting.ts";
 import { ProjectWorkGateway } from "../../projectWork/ProjectWorkGateway.ts";
 import { ManagedSkillRepository } from "../../skills/ManagedSkillRepository.ts";
+import { ServerConfig } from "../../config.ts";
+import { DEFAULT_SKILL_PACKAGE_LIMITS, SKILL_MANIFEST_FILE } from "../../skills/SkillPackage.ts";
 import { SkillMaterializationService } from "../../skills/SkillMaterializationService.ts";
 import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
-import { resolvePiManagedSkillSelection } from "./PiManagedSkillSelection.ts";
+import {
+  resolvePiManagedSkillSelection,
+  type PiManagedSkillSelection,
+} from "./PiManagedSkillSelection.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { buildServerProvider } from "../providerSnapshot.ts";
 import {
@@ -107,6 +115,222 @@ const directoryFlags =
   NodeFS.constants.O_NONBLOCK;
 const fileFlags =
   NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK;
+const sourceStat = (stat: import("node:fs").BigIntStats) =>
+  encode({
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: String(stat.mode),
+    uid: String(stat.uid),
+    nlink: String(stat.nlink),
+    size: String(stat.size),
+    mtime: String(stat.mtimeNs),
+    ctime: String(stat.ctimeNs),
+  });
+const sourceChanged = () => deny("Pi selected source or catalogue changed", "conflict");
+const verifySource = (fence: () => void) =>
+  Effect.try({ try: fence, catch: () => sourceChanged() });
+const sourceMissing = Schema.is(Schema.Struct({ code: Schema.Literal("ENOENT") }));
+const decodeSourceManifest = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      ...ManagedSkillManifest.fields,
+      projectState: Schema.optionalKey(Schema.Literal("override")),
+    }),
+  ),
+);
+// Trusted repository mutations serialize per owned root and publish by rename. Capturing
+// those root identities before resolution fences winner/override/tombstone changes without
+// scanning unbounded catalogues in SQL callbacks. Unrelated in-place catalogue edits are
+// outside that mutation model; selected files themselves are always descriptor-validated.
+const skillCatalogueReceipt = (
+  directories: ReadonlyArray<string>,
+  catalogues: ReadonlySet<string>,
+) => {
+  const fingerprint = (path: string, stat: import("node:fs").BigIntStats) =>
+    catalogues.has(path)
+      ? sourceStat(stat)
+      : encode({
+          dev: String(stat.dev),
+          ino: String(stat.ino),
+          uid: String(stat.uid),
+          mode: String(stat.mode),
+        });
+  const before = directories.map((path) => {
+    try {
+      const fd = NodeFS.openSync(path, directoryFlags);
+      try {
+        const stat = NodeFS.fstatSync(fd, { bigint: true });
+        if (
+          !stat.isDirectory() ||
+          NodeFS.realpathSync(path) !== path ||
+          NodeFS.realpathSync(`/proc/self/fd/${fd}`) !== path ||
+          sourceStat(stat) !== sourceStat(NodeFS.lstatSync(path, { bigint: true }))
+        )
+          throw sourceChanged();
+        return fingerprint(path, stat);
+      } finally {
+        NodeFS.closeSync(fd);
+      }
+    } catch (error) {
+      if (sourceMissing(error)) return null;
+      throw error;
+    }
+  });
+  return () => {
+    directories.forEach((path, index) => {
+      try {
+        const stat = NodeFS.lstatSync(path, { bigint: true });
+        if (
+          !stat.isDirectory() ||
+          NodeFS.realpathSync(path) !== path ||
+          fingerprint(path, stat) !== before[index]
+        )
+          throw sourceChanged();
+      } catch (error) {
+        if (before[index] !== null || !sourceMissing(error)) throw sourceChanged();
+      }
+    });
+  };
+};
+const captureSkillSources = async (
+  paths: Path.Path,
+  selection: ReadonlyArray<PiManagedSkillSelection>,
+  catalogue: () => void,
+  roots: { readonly global: string; readonly project: string },
+) => {
+  const receipts: Array<{ path: string; directory: boolean; stat: string }> = [];
+  const limits = DEFAULT_SKILL_PACKAGE_LIMITS;
+  // Selection is bounded to 32 packages; each inventory uses the shared package limits.
+  if (selection.length > 32) throw sourceChanged();
+  const validate = (path: string) => {
+    if (
+      !paths.isAbsolute(path) ||
+      paths.normalize(path) !== path ||
+      path.length > 4096 ||
+      path.split("/").length > 96
+    )
+      throw sourceChanged();
+  };
+  for (const selected of selection) {
+    let entries = 0;
+    let files = 0;
+    let bytes = 0n;
+    const inventory: Array<{ relative: string; path: string; bytes: Buffer }> = [];
+    const walk = async (path: string, relative: string, depth: number): Promise<void> => {
+      validate(path);
+      if (depth > limits.maxDepth || (relative !== "" && ++entries > limits.maxEntries))
+        throw sourceChanged();
+      const initial = await NodeFS.promises.lstat(path, { bigint: true });
+      if (
+        initial.isSymbolicLink() ||
+        (!initial.isDirectory() && !initial.isFile()) ||
+        (!initial.isDirectory() && initial.nlink !== 1n)
+      )
+        throw sourceChanged();
+      const fd = await NodeFS.promises.open(
+        path,
+        initial.isDirectory() ? directoryFlags : fileFlags,
+      );
+      try {
+        const fingerprint = sourceStat(initial);
+        if (
+          sourceStat(await fd.stat({ bigint: true })) !== fingerprint ||
+          (await NodeFS.promises.realpath(`/proc/self/fd/${fd.fd}`)) !== path ||
+          (await NodeFS.promises.realpath(path)) !== path
+        )
+          throw sourceChanged();
+        if (initial.isDirectory()) {
+          const directory = await NodeFS.promises.opendir(`/proc/self/fd/${fd.fd}`);
+          try {
+            for (;;) {
+              const entry = await directory.read();
+              if (!entry) break;
+              await walk(
+                path + "/" + entry.name,
+                relative ? relative + "/" + entry.name : entry.name,
+                depth + 1,
+              );
+            }
+          } finally {
+            await directory.close();
+          }
+        } else {
+          bytes += initial.size;
+          if (
+            ++files > limits.maxFiles ||
+            initial.size < 0n ||
+            bytes > BigInt(limits.maxBytes) ||
+            (relative === SKILL_MANIFEST_FILE && initial.size > BigInt(limits.maxManifestBytes))
+          )
+            throw sourceChanged();
+          const content = Buffer.alloc(Number(initial.size));
+          let offset = 0;
+          while (offset < content.length) {
+            const read = await fd.read(content, offset, content.length - offset, offset);
+            if (read.bytesRead === 0) throw sourceChanged();
+            offset += read.bytesRead;
+          }
+          if ((await fd.read(Buffer.alloc(1), 0, 1, content.length)).bytesRead !== 0)
+            throw sourceChanged();
+          inventory.push({ relative, path, bytes: content });
+        }
+        if (
+          sourceStat(await fd.stat({ bigint: true })) !== fingerprint ||
+          sourceStat(await NodeFS.promises.lstat(path, { bigint: true })) !== fingerprint
+        )
+          throw sourceChanged();
+        receipts.push({ path, directory: initial.isDirectory(), stat: fingerprint });
+      } finally {
+        await fd.close();
+      }
+    };
+    await walk(selected.packagePath, "", 0);
+    const manifestFile = inventory.find((file) => file.relative === SKILL_MANIFEST_FILE);
+    if (!manifestFile) throw sourceChanged();
+    const manifest = decodeSourceManifest(manifestFile.bytes.toString("utf8"));
+    if (
+      manifest.id !== selected.skillId ||
+      manifest.key !== selected.key ||
+      manifest.ownership !== "t3" ||
+      manifest.revision.hash !== selected.expectedHash ||
+      paths.basename(selected.packagePath) !== selected.key ||
+      paths.dirname(selected.packagePath) !==
+        (manifest.scope === "global" ? roots.global : roots.project)
+    )
+      throw sourceChanged();
+    const hash = NodeCrypto.createHash("sha256");
+    for (const file of inventory.sort((a, b) => a.relative.localeCompare(b.relative))) {
+      if (file.relative === SKILL_MANIFEST_FILE) continue;
+      hash
+        .update(file.relative)
+        .update("\0")
+        .update(String(file.bytes.length))
+        .update("\0")
+        .update(file.bytes);
+    }
+    if (hash.digest("hex") !== selected.expectedHash) throw sourceChanged();
+  }
+  const check = () => {
+    catalogue();
+    for (const receipt of receipts) {
+      const fd = NodeFS.openSync(receipt.path, receipt.directory ? directoryFlags : fileFlags);
+      try {
+        const stat = NodeFS.fstatSync(fd, { bigint: true });
+        if (
+          sourceStat(stat) !== receipt.stat ||
+          sourceStat(NodeFS.lstatSync(receipt.path, { bigint: true })) !== receipt.stat ||
+          NodeFS.realpathSync(receipt.path) !== receipt.path ||
+          NodeFS.realpathSync(`/proc/self/fd/${fd}`) !== receipt.path
+        )
+          throw sourceChanged();
+      } finally {
+        NodeFS.closeSync(fd);
+      }
+    }
+  };
+  check();
+  return check;
+};
 interface WorkspaceMetadata {
   readonly directories: ReadonlyArray<string>;
   readonly assigned: string;
@@ -368,6 +592,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const authorization = yield* ProjectTeamAuthorization;
   const gateway = yield* ProjectWorkGateway;
   const skillRepository = yield* Effect.serviceOption(ManagedSkillRepository);
+  const serverConfig = yield* Effect.serviceOption(ServerConfig);
   const materialization = yield* Effect.serviceOption(SkillMaterializationService);
   const accounting = yield* makeAccounting({
     environmentId: options.environmentId,
@@ -605,7 +830,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     guard(
       Effect.gen(function* () {
         const agentDirectory = instance.configuration.agentDirectory ?? options.agentDirectory;
-        const instanceScope = yield* Scope.Scope;
+        const stageScopes = new Set<Scope.Closeable>();
+        let closing = false;
         const active = new Map<
           ThreadId,
           {
@@ -613,7 +839,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             readonly stop: Effect.Effect<void, PiManagedRuntimeError>;
           }
         >();
-        const preparing = new Set<ThreadId>();
+        const preparing = new Map<ThreadId, Effect.Effect<void>>();
         const sessionFor = (
           authority: ProjectTeamAuthority,
           native?: PiNativeReference,
@@ -670,6 +896,39 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             Effect.mapError((error) => deny(error.detail, error.code)),
           );
         });
+        const selectedSnapshot = Effect.fn("PiManagedRuntimeLive.selectedSnapshot")(function* (
+          authority: ProjectTeamAuthority,
+          workspace: { readonly fence: WorkspaceFence },
+        ) {
+          if (authority.binding.configuration.skillIds.length === 0)
+            return { selection: Object.freeze([]), fence: () => {} };
+          if (Option.isNone(serverConfig))
+            return yield* deny("Managed skill roots are unavailable", "unavailable");
+          const project = workspace.fence.metadata.primary;
+          const catalogue = yield* Effect.try({
+            try: () =>
+              skillCatalogueReceipt(
+                [
+                  serverConfig.value.stateDir,
+                  serverConfig.value.managedSkillsDir,
+                  project + "/.t3code",
+                  project + "/.t3code/skills",
+                ],
+                new Set([serverConfig.value.managedSkillsDir, project + "/.t3code/skills"]),
+              ),
+            catch: () => sourceChanged(),
+          });
+          const selection = yield* selectedSkills(authority, workspace);
+          const fence = yield* Effect.tryPromise({
+            try: () =>
+              captureSkillSources(paths, selection, catalogue, {
+                global: serverConfig.value.managedSkillsDir,
+                project: project + "/.t3code/skills",
+              }),
+            catch: () => sourceChanged(),
+          }).pipe(Effect.uninterruptible);
+          return { selection, fence };
+        });
         const authorizeSkills: PiManagedRuntimeInstance["authorizeSkills"] = (suppliedRequest) =>
           guard(
             Effect.gen(function* () {
@@ -699,7 +958,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 return yield* deny("Pi skill cwd differs from durable assignment");
               const context = contextFor(authority);
               const workspace = yield* verifyWorkspace(authority, agentDirectory);
-              const selection = yield* selectedSkills(authority, workspace);
+              const { selection, fence: sourceFence } = yield* selectedSnapshot(
+                authority,
+                workspace,
+              );
               if (
                 selection.some(
                   (selected) =>
@@ -726,6 +988,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       "conflict",
                     );
                   workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                  sourceFence();
                   return Object.freeze(selection.map((selected) => selected.key));
                 },
               );
@@ -741,16 +1004,54 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
           } catch {
             return Effect.fail(deny("Pi operation request cannot be copied"));
           }
+          let attempted = false;
           return Effect.suspend(() => {
+            if (attempted || closing)
+              return Effect.fail(deny("Pi preparation already attempted or closing", "conflict"));
+            attempted = true;
             if (active.has(request.threadId) || preparing.has(request.threadId))
               return Effect.fail(deny("Pi operation is already preparing or active", "conflict"));
-            preparing.add(request.threadId);
+            const preparation = { canceled: false, done: Promise.withResolvers<void>() };
+
+            const assertPreparing = () => {
+              if (preparation.canceled || closing)
+                throw deny("Pi preparation canceled", "conflict");
+            };
+            const preparationCurrent = Effect.try({
+              try: assertPreparing,
+              catch: () => deny("Pi preparation canceled", "conflict"),
+            });
             let resourceScope: Scope.Closeable | undefined;
+            const closeResources = Effect.suspend(() => {
+              const scope = resourceScope;
+              return scope
+                ? Scope.close(scope, Exit.void).pipe(
+                    Effect.ensuring(Effect.sync(() => stageScopes.delete(scope))),
+                  )
+                : Effect.void;
+            });
             let skillStage: PiSkillStageLifetime | undefined;
             let stageSealed = false;
             let durableAttempted = false;
-            return guard(
+            let preparationFiber:
+              | Fiber.Fiber<PiManagedPreparedOperation, PiManagedRuntimeError>
+              | undefined;
+            preparing.set(
+              request.threadId,
+              Effect.suspend(() => {
+                preparation.canceled = true;
+                // A durable handoff must complete before we can settle its never-started owner.
+                // Earlier interruptible reads are canceled; owned descriptor IO joins its closes.
+                const cancel =
+                  !durableAttempted && preparationFiber
+                    ? Fiber.interrupt(preparationFiber)
+                    : Effect.void;
+                return cancel.pipe(Effect.andThen(Effect.promise(() => preparation.done.promise)));
+              }),
+            );
+            const prepare = guard(
               Effect.gen(function* () {
+                yield* preparationCurrent;
                 if (!instance.enabled) return yield* deny("Pi instance disabled");
                 if (active.has(request.threadId))
                   return yield* deny("Pi operation is already prepared or active", "conflict");
@@ -789,7 +1090,11 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     authority.role.tools.includes(tool.capabilityId),
                 );
                 const workspace = yield* verifyWorkspace(authority, agentDirectory);
-                const selection = yield* selectedSkills(authority, workspace);
+                const { selection, fence: sourceFence } = yield* selectedSnapshot(
+                  authority,
+                  workspace,
+                );
+                yield* preparationCurrent;
                 const resourceHash = piManagedSkillResourceIdentity(selection);
                 const nativeConfig = yield* configuration(agentDirectory, authority);
                 const previous =
@@ -812,6 +1117,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 const context = contextFor(authority);
                 const authorizeResources = guard(
                   Effect.gen(function* () {
+                    yield* preparationCurrent;
                     const current = yield* operations.current(
                       identity(request.threadId),
                       request.kind === "initialize",
@@ -830,7 +1136,9 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           "Pi selected resource authority changed during admission",
                           "conflict",
                         );
+                      assertPreparing();
                       workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                      sourceFence();
                     });
                   }),
                 );
@@ -848,7 +1156,9 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     Effect.provideService(FileSystem.FileSystem, fs),
                     Effect.provideService(Path.Path, paths),
                   );
-                  resourceScope = yield* Scope.fork(instanceScope, "sequential");
+                  yield* preparationCurrent;
+                  resourceScope = yield* Scope.make();
+                  stageScopes.add(resourceScope);
                   const ownedScope = resourceScope;
                   skillStage = yield* options.allocateSkillStage.pipe(
                     Effect.provideService(Scope.Scope, ownedScope),
@@ -892,7 +1202,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     if (!skillStage || !resourceScope) return Effect.void;
                     return (
                       disposition === "drained" ? skillStage.remove() : skillStage.retain()
-                    ).pipe(Effect.ensuring(Scope.close(resourceScope, Exit.void)));
+                    ).pipe(Effect.ensuring(closeResources));
                   });
                 const persistTerminal = (
                   terminal: import("./PiSessionRuntime.ts").PiSessionTerminal,
@@ -969,9 +1279,13 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     "conflict",
                   );
                 yield* finalWorkspaceFence(paths, workspace.fence);
+                yield* preparationCurrent;
+                yield* verifySource(sourceFence);
                 const allocation = yield* preallocatePiManagedProcess(launch).pipe(
                   Effect.provide(services),
                 );
+                yield* preparationCurrent;
+                yield* verifySource(sourceFence);
                 durableAttempted = true;
                 const durable = yield* operations.prepare(
                   identity(request.threadId),
@@ -1072,6 +1386,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       }
                       yield* operations.authorize(durable);
                       if (signal.aborted) return yield* deny("Pi operation canceled");
+                      yield* verifySource(sourceFence);
                     }),
                   );
                 const runtime = yield* makePiSessionRuntime({
@@ -1256,6 +1571,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 });
                 let controlId = 0;
                 const done = Promise.withResolvers<void>();
+                let stopFailure: PiManagedRuntimeError | undefined;
                 let started = false;
                 const cancellation = new AbortController();
                 let execution:
@@ -1297,6 +1613,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         );
                       yield* verifyWorkspace(beforePublication, agentDirectory, workspace);
                       const current = yield* operations.publication(durable, terminal);
+                      yield* verifySource(sourceFence);
+                      yield* finalWorkspaceFence(paths, workspace.fence);
                       // No asynchronous work separates these owner checks from publication.
                       if (
                         cancellation.signal.aborted ||
@@ -1356,6 +1674,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 const stop = guard(
                   Effect.uninterruptible(
                     Effect.gen(function* () {
+                      preparation.canceled = true;
                       if (!started) {
                         started = true;
                         yield* persistTerminal({
@@ -1366,7 +1685,14 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           native: null,
                           drain: null,
                           accountingReceipts: [],
-                        });
+                        }).pipe(
+                          Effect.tapError((error) =>
+                            Effect.sync(() => {
+                              stopFailure = error;
+                            }),
+                          ),
+                          Effect.ensuring(Effect.sync(() => done.resolve())),
+                        );
                         if (
                           active.get(request.threadId)?.prepared.operation.operationId ===
                           operation.operationId
@@ -1377,10 +1703,21 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       }
                       cancellation.abort();
                       yield* Effect.promise(() => done.promise);
+                      if (stopFailure) return yield* stopFailure;
                     }),
                   ),
                 );
                 active.set(request.threadId, { prepared, stop });
+                if (preparation.canceled || closing) {
+                  yield* stop;
+                  return yield* deny("Pi preparation canceled", "conflict");
+                }
+                try {
+                  sourceFence();
+                } catch {
+                  yield* stop;
+                  return yield* sourceChanged();
+                }
                 return prepared;
               }),
             ).pipe(
@@ -1391,17 +1728,39 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   stageSealed && !durableAttempted && skillStage
                     ? skillStage.remove()
                     : Effect.void;
-                return cleanup.pipe(Effect.ensuring(Scope.close(resourceScope, Exit.void)));
+                return cleanup.pipe(Effect.ensuring(closeResources));
               }),
-              Effect.ensuring(Effect.sync(() => preparing.delete(request.threadId))),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  preparing.delete(request.threadId);
+                  preparation.done.resolve();
+                }),
+              ),
+            );
+            return Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                preparationFiber = yield* prepare.pipe(
+                  Effect.forkChild({ uninterruptible: false }),
+                );
+                const exit = yield* restore(Fiber.await(preparationFiber));
+                if (
+                  (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)) ||
+                  (Exit.isSuccess(exit) && (preparation.canceled || closing))
+                )
+                  return yield* deny("Pi preparation canceled", "conflict");
+                return yield* exit;
+              }),
             );
           });
         };
         const requestStop = (threadId: ThreadId) =>
           guard(
             Effect.gen(function* () {
+              const pending = preparing.get(threadId);
+              if (pending) yield* pending;
               const running = active.get(threadId);
               if (!running) {
+                if (pending) return;
                 yield* operations.current(identity(threadId));
                 return;
               }
@@ -1409,12 +1768,29 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             }),
           );
         const stopAll = Effect.suspend(() =>
-          Effect.forEach([...active.keys()], requestStop, { discard: true }),
+          Effect.forEach([...new Set([...preparing.keys(), ...active.keys()])], requestStop, {
+            discard: true,
+          }),
         ).pipe(Effect.asVoid);
         yield* Effect.addFinalizer(() =>
-          Effect.suspend(() =>
-            Effect.forEach([...active.keys()], requestStop, { discard: true }),
-          ).pipe(Effect.catch(() => Effect.void)),
+          Effect.sync(() => {
+            closing = true;
+          }).pipe(
+            Effect.andThen(
+              Effect.suspend(() =>
+                Effect.forEach(
+                  [...new Set([...preparing.keys(), ...active.keys()])],
+                  (threadId) => requestStop(threadId).pipe(Effect.catch(() => Effect.void)),
+                  { discard: true },
+                ),
+              ),
+            ),
+            Effect.ensuring(
+              Effect.forEach(stageScopes, (scope) => Scope.close(scope, Exit.void), {
+                discard: true,
+              }),
+            ),
+          ),
         );
         const readCommitted = <A>(
           threadId: ThreadId,
@@ -1444,7 +1820,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 );
               const context = contextFor(committed.authority);
               const workspace = yield* verifyWorkspace(committed.authority, agentDirectory);
-              const selection = yield* selectedSkills(committed.authority, workspace);
+              const { selection, fence: sourceFence } = yield* selectedSnapshot(
+                committed.authority,
+                workspace,
+              );
               const resourceHash = piManagedSkillResourceIdentity(selection);
               if ((committed.resourceHash ?? piManagedSkillResourceIdentity([])) !== resourceHash)
                 return yield* deny("Changed Pi skills require a new native session", "conflict");
@@ -1486,6 +1865,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   if (contextFor(latest) !== context)
                     throw deny("Pi native view authority changed", "conflict");
                   workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                  sourceFence();
                   return result;
                 },
                 {
