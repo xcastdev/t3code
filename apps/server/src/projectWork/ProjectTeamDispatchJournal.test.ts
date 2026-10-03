@@ -22,6 +22,7 @@ import { ProjectWorkProjection } from "./ProjectWorkProjection.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import {
   makeProjectTeamDispatchJournal,
+  ProjectTeamDispatchJournalError,
   type ProjectTeamDispatchRequest,
 } from "./ProjectTeamDispatchJournal.ts";
 
@@ -512,4 +513,294 @@ for (const patch of [
           );
         }),
       ),
+  );
+
+it.effect("cannot advance a durable stage without Root's actual receipt verifier", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      const result = yield* f.journal
+        .advanceStage(claimed.fence, {
+          receiptId: "workspace",
+          stage: "workspace-ready",
+          evidence: { claimed: true },
+        })
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+        { stage: "reserved", revision: 1 },
+      ]);
+      expect(yield* f.sql`SELECT receipt_id FROM project_team_dispatch_receipt`).toEqual([]);
+    }),
+  ),
+);
+
+it.effect(
+  "persists verified stages in order and deduplicates only the exact original receipt",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        // SQLite sequencing control only: production verifier must inspect real Git/setup/native receipts.
+        const verified = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: (receipt, snapshot) =>
+            receipt.evidence.bindingId === snapshot.intent.request.git.runId
+              ? Effect.void
+              : Effect.fail(
+                  new ProjectTeamDispatchJournalError({
+                    reason: "Control rejects mismatched binding",
+                  }),
+                ),
+        });
+        const receipt = {
+          receiptId: "workspace",
+          stage: "workspace-ready" as const,
+          evidence: { bindingId: "binding" },
+        };
+        const first = yield* verified.advanceStage(claimed.fence, receipt);
+        expect(first.fence).toEqual({ ...claimed.fence, stage: "workspace-ready", revision: 2 });
+        expect((yield* verified.advanceStage(claimed.fence, receipt)).duplicate).toBe(true);
+        expect(
+          (yield* verified
+            .advanceStage(first.fence, { ...receipt, evidence: { bindingId: "other" } })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* verified
+            .advanceStage(first.fence, {
+              receiptId: "session",
+              stage: "session-bound",
+              evidence: { bindingId: "binding" },
+            })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* verified
+            .advanceStage(claimed.fence, {
+              receiptId: "setup",
+              stage: "setup-complete",
+              evidence: { bindingId: "binding" },
+            })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const setup = yield* verified.advanceStage(first.fence, {
+          receiptId: "setup",
+          stage: "setup-complete",
+          evidence: { bindingId: "binding" },
+        });
+        expect(setup.fence.stage).toBe("setup-complete");
+        expect(
+          (yield* verified.readStageReceipts(f.request.dispatchId)).map((r) => r.receiptId),
+        ).toEqual(["workspace", "setup"]);
+      }),
+    ),
+);
+
+it.effect("rolls back stage progression if verifier or final append fails", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      const receipt = { receiptId: "workspace", stage: "workspace-ready" as const, evidence: {} };
+      const denied = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () =>
+          Effect.fail(new ProjectTeamDispatchJournalError({ reason: "No actual native receipt" })),
+      });
+      expect((yield* denied.advanceStage(claimed.fence, receipt).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      const accepted = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () => Effect.void,
+      });
+      yield* f.sql`CREATE TRIGGER reject_stage BEFORE INSERT ON project_team_dispatch_receipt
+    BEGIN SELECT RAISE(ABORT,'control fails final append'); END`;
+      expect((yield* accepted.advanceStage(claimed.fence, receipt).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+        { stage: "reserved", revision: 1 },
+      ]);
+      expect(yield* f.sql`SELECT receipt_id FROM project_team_dispatch_receipt`).toEqual([]);
+    }),
+  ),
+);
+
+it.effect(
+  "retained recovery reads survive expired execution authority without granting another effect",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const reserved = yield* f.journal.reserve(f.request);
+        yield* TestClock.setTime(reserved.intent.limits.deadlineAtMs);
+        expect((yield* f.journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* f.journal.readRetained(f.request.dispatchId)).toEqual(reserved);
+        const candidates = yield* f.journal.readRecoveryCandidates({ limit: 1 });
+        expect(candidates).toHaveLength(1);
+        expect(candidates[0]?.dispatchId).toBe(f.request.dispatchId);
+        expect(candidates[0]?.snapshot._tag).toBe("Success");
+        expect((yield* f.journal.claimEffect(reserved.fence).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* f.sql`SELECT revision,claim_generation FROM project_team_dispatch`).toEqual([
+          { revision: 0, claim_generation: 0 },
+        ]);
+      }),
+    ),
+);
+
+it.effect("a corrupt retained row remains a bounded recovery candidate with a failed decode", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.journal.reserve(f.request);
+      // Simulate restored state whose mutable scalar no longer matches its immutable intent.
+      yield* f.sql`UPDATE project_team_dispatch SET updated_at='invalid-clock'`;
+      expect((yield* f.journal.readRecoveryPage({ limit: 1 }).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      const candidates = yield* f.journal.readRecoveryCandidates({ limit: 1 });
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0]?.dispatchId).toBe(f.request.dispatchId);
+      expect(candidates[0]?.snapshot._tag).toBe("Failure");
+      expect(
+        yield* f.journal.readRecoveryCandidates({
+          afterDispatchId: f.request.dispatchId,
+          limit: 1,
+        }),
+      ).toEqual([]);
+      expect(
+        (yield* f.journal.readRecoveryCandidates({ limit: 129 }).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.sql`SELECT dispatch_id,stage FROM project_team_dispatch`).toEqual([
+        { dispatch_id: f.request.dispatchId, stage: "reserved" },
+      ]);
+    }),
+  ),
+);
+
+it.effect(
+  "retained cleanup stages remain recordable after expiry and never release the writer",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        yield* TestClock.setTime(claimed.intent.limits.deadlineAtMs);
+        const cleanup = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          // Sequencing control only: actual physical owner/drain verification is a required Root port.
+          verifyStage: (receipt) =>
+            receipt.stage === "stopping"
+              ? Effect.void
+              : Effect.fail(
+                  new ProjectTeamDispatchJournalError({ reason: "No physical forward receipt" }),
+                ),
+        });
+        const stopped = yield* cleanup.advanceStage(claimed.fence, {
+          receiptId: "stop",
+          stage: "stopping",
+          evidence: { owner: "retained" },
+        });
+        expect(stopped.fence.stage).toBe("stopping");
+        expect((yield* cleanup.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(
+          (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+            (r) => r.kind === "reservation",
+          )?.status,
+        ).toBe("held");
+        expect(
+          (yield* cleanup.readStageReceipts(f.request.dispatchId)).map((r) => r.stage),
+        ).toEqual(["stopping"]);
+      }),
+    ),
+);
+
+it.effect(
+  "final stage authorization rejects binding projection loss during receipt verification",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () =>
+            f.sql`DELETE FROM project_team_run_binding WHERE record_id='binding'`.pipe(
+              Effect.asVoid,
+              Effect.mapError(
+                () =>
+                  new ProjectTeamDispatchJournalError({ reason: "Control SQL verifier failed" }),
+              ),
+            ),
+        });
+        expect(
+          (yield* journal
+            .advanceStage(claimed.fence, {
+              receiptId: "workspace",
+              stage: "workspace-ready",
+              evidence: {},
+            })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+          { stage: "reserved", revision: 1 },
+        ]);
+        expect(yield* f.sql`SELECT receipt_id FROM project_team_dispatch_receipt`).toEqual([]);
+        // The verifier's controlled SQL mutation is rolled back with the denied stage.
+        expect(
+          yield* f.sql`SELECT record_id FROM project_team_run_binding WHERE record_id='binding'`,
+        ).toEqual([{ record_id: "binding" }]);
+      }),
+    ),
+);
+
+for (const corruption of ["generation", "revision", "time", "stage"] as const)
+  it.effect(`retained receipt corruption cannot become stage evidence: ${corruption}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+        });
+        const receipt = { receiptId: "workspace", stage: "workspace-ready" as const, evidence: {} };
+        yield* journal.advanceStage(claimed.fence, receipt);
+        // Restore corruption is injected only after removing the actual append-only update guard.
+        yield* f.sql`DROP TRIGGER project_team_dispatch_receipt_no_update`;
+        if (corruption === "generation")
+          yield* f.sql`UPDATE project_team_dispatch_receipt SET claim_generation=0`;
+        if (corruption === "revision")
+          yield* f.sql`UPDATE project_team_dispatch_receipt SET revision=50`;
+        if (corruption === "time")
+          yield* f.sql`UPDATE project_team_dispatch_receipt SET recorded_at='invalid-clock'`;
+        if (corruption === "stage")
+          yield* f.sql`UPDATE project_team_dispatch_receipt SET stage='setup-complete'`;
+        expect(
+          (yield* journal.readStageReceipts(f.request.dispatchId).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* journal.advanceStage(claimed.fence, receipt).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* f.sql`SELECT stage,revision FROM project_team_dispatch`).toEqual([
+          { stage: "workspace-ready", revision: 2 },
+        ]);
+      }),
+    ),
   );
