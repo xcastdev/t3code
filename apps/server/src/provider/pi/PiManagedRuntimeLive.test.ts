@@ -1,7 +1,7 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
-import { CommandId, SkillCatalogRevision } from "@t3tools/contracts";
+import { CommandId, ManagedSkillKey, SkillCatalogRevision } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
@@ -23,6 +23,9 @@ import {
   threadId,
   at,
 } from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import * as ManagedSkills from "../../skills/ManagedSkillRepository.ts";
+import * as ServerConfig from "../../config.ts";
+import { hashSkillPackage } from "../../skills/SkillPackage.ts";
 import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentAuth } from "../../auth/EnvironmentAuth.ts";
@@ -2412,4 +2415,159 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
       );
     }
   },
+);
+
+const skillAuthorityLayer = ManagedSkills.layer.pipe(
+  Layer.provideMerge(
+    ServerConfig.layerTest(process.cwd(), { prefix: "pi-current-skill-authority-" }),
+  ),
+  Layer.provideMerge(NodeServices.layer),
+);
+const catalogueRequest = (cwd: string) => ({
+  runtime: {
+    providerInstanceId,
+    threadId,
+    cwd,
+    sessionId: `thread-${NodeCrypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24)}`,
+  },
+  desiredRevision: SkillCatalogRevision.make(1),
+  skills: [],
+});
+
+it.effect("authorizes only selected current owned skill keys from the complete catalogue", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const repository = yield* ManagedSkills.ManagedSkillRepository;
+      const global = yield* repository.createGlobal({
+        expectedRevision: 0,
+        content: { key: ManagedSkillKey.make("review"), name: "Review", body: "Global review." },
+      });
+      const unrelated = yield* repository.createGlobal({
+        expectedRevision: 0,
+        content: { key: ManagedSkillKey.make("deploy"), name: "Deploy", body: "Unselected." },
+      });
+      const selected = yield* repository.setProjectOverride({
+        projectRoot: f.main,
+        key: global.manifest.key,
+        content: { name: "Project review", body: "Only the primary project override." },
+      });
+      yield* restoreHistoricalBinding({
+        ...f.role,
+        revision: f.role.revision + 1,
+        skills: [selected.manifest.id],
+      });
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        configuration: { ...f.binding.configuration, skillIds: [selected.manifest.id] },
+      });
+      const request = {
+        ...catalogueRequest(f.worktree),
+        skills: [
+          { key: selected.manifest.key, packagePath: selected.packagePath },
+          { key: unrelated.manifest.key, packagePath: unrelated.packagePath },
+        ],
+      };
+      const before = yield* hashSkillPackage(selected.packagePath);
+      expect(yield* f.instance.authorizeSkills(request)).toEqual([selected.manifest.key]);
+      for (const skills of [
+        [],
+        [{ key: selected.manifest.key, packagePath: global.packagePath }],
+        [...request.skills, request.skills[0]!],
+      ])
+        yield* rejected(f.instance.authorizeSkills({ ...request, skills }));
+      expect(yield* hashSkillPackage(selected.packagePath)).toBe(before);
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toHaveLength(0);
+    }),
+  ).pipe(Effect.provide(skillAuthorityLayer)),
+);
+
+it.effect(
+  "authorizes empty frozen selection without repository access or role skill activation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* restoreHistoricalBinding({
+          ...f.role,
+          revision: f.role.revision + 1,
+          skills: ["uninstalled-role-skill"],
+        });
+        const keys = yield* f.instance.authorizeSkills(catalogueRequest(f.worktree));
+        expect(keys).toEqual([]);
+        expect(Object.isFrozen(keys)).toBe(true);
+        for (const runtime of [
+          { ...catalogueRequest(f.worktree).runtime, cwd: f.main },
+          { ...catalogueRequest(f.worktree).runtime, sessionId: "forged-session" },
+        ])
+          yield* rejected(f.instance.authorizeSkills({ ...catalogueRequest(f.worktree), runtime }));
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+);
+
+it.effect("rechecks durable skill authority after an owned repository read receipt", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const repository = yield* ManagedSkills.ManagedSkillRepository;
+      const selected = yield* repository.createGlobal({
+        expectedRevision: 0,
+        content: { key: ManagedSkillKey.make("review"), name: "Review", body: "Review." },
+      });
+      yield* restoreHistoricalBinding({
+        ...f.role,
+        revision: f.role.revision + 1,
+        skills: [selected.manifest.id],
+      });
+      const binding = {
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        configuration: { ...f.binding.configuration, skillIds: [selected.manifest.id] },
+      };
+      yield* restoreHistoricalBinding(binding);
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(
+        Effect.provideService(ManagedSkills.ManagedSkillRepository, {
+          ...repository,
+          readGlobal: (id) =>
+            repository.readGlobal(id).pipe(
+              Effect.tap(() => Deferred.succeed(entered, undefined)),
+              Effect.tap(() => Deferred.await(release)),
+            ),
+        }),
+      );
+      const instance = yield* runtime.forInstance({
+        instanceId: providerInstanceId,
+        enabled: true,
+        configuration: {},
+      });
+      const pending = yield* instance
+        .authorizeSkills({
+          ...catalogueRequest(f.worktree),
+          skills: [{ key: selected.manifest.key, packagePath: selected.packagePath }],
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(pending).pipe(
+          Effect.flatMap(() => Effect.die("Authorization finished before its owned read receipt.")),
+        ),
+      );
+      yield* restoreHistoricalBinding({
+        ...binding,
+        revision: binding.revision + 1,
+        status: "stopping",
+      });
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+    }),
+  ).pipe(Effect.provide(skillAuthorityLayer)),
 );
