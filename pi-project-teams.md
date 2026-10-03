@@ -7,10 +7,10 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-03 10:33 UTC. **P1–P4 are complete; P5–P14 remain open. Latest main product commit: `99f588ce0`**. No product branch has been pushed and no product PR exists.
+Last updated: 2026-10-03 11:25 UTC. **P1–P4 are complete; P5–P14 remain open. Latest main product commit: `99f588ce0`**. No product branch has been pushed and no product PR exists.
 
 - **Done:** P1–P4; approved intake, authority and human workflow work is on main.
-- **Working now:** P7 current archive/desktop packaging, joined Claude probe cleanup, and the verified rollback-error repair. Mobile draft recovery is committed and awaiting the exact integrated backend review.
+- **Working now:** P7 packaged runtime proof and the Claude retained-pipe cleanup repair. The rollback repair is approved and staged; mobile draft recovery is under the same reviewer against the exact integrated backend.
 - **Next:** land the combined reviewed P7 wave, then dispatch/recovery, messaging, memory, GitHub delivery and full supervision clients (P8–P14).
 - **Completion gates:** all 19 final acceptance criteria and both independent audits remain open. No local model runs; product branches remain unpushed.
 
@@ -48,7 +48,15 @@ Last updated: 2026-10-03 10:33 UTC. **P1–P4 are complete; P5–P14 remain open
 
 - **Production repairs pass focused controls:** physical desktop paths/unpack patterns pass 80 cases. Unsupported-host construction passes three controls. Actual registry publication and direct latest-snapshot refresh pass the catalogue race control, including a held old registry snapshot. The normal five-root production compiler passes; its independent closure audit identified one omitted dependency input. Fresh normal08 passes with all 3,467 physical inputs and 87 bundled libraries identified. Actual desktop composite normal04 also passes (442 physical, 88 bundled); no diagnostic waiver. One preparation attempt omitted runner metadata and failed before invoking the compiler; its three processes drained. Root repair source is committed clean at `76fd755ae`; current server/SEA/archive builds are underway and final source review remains open.
 
-- **Mobile repair committed; backend rollback finding active:** mobile `1f06ad5bd` passes 39 draft/action cases, the actual scoped Expo compiler and style. Root read the full repair and verified all 68 sealed artifacts. Same-reviewer integrated recovery is pending. Backend `22bfe52aa` passes 36 cases, but its sole reviewer proves actual failed SQL rollback loses its defect and becomes a definite rejection while a callback mutation remains pending. Root read the complete report and verified all 63 sealed entries. The same exclusive worker is repairing the Repository/Gateway boundary; no merge or approval is claimed.
+- **Rollback repair approved and staged:** `2b72711c0` preserves complete failed-rollback causes and public uncertainty. Root verified all 172 producer entries and 56 same-reviewer entries. Fresh review passes 81 cases, including actual SQL rollback defects and mixed failure causes. Approved local wave merge is `57bb92a49`; main product remains unchanged.
+
+- **Claude repair needs one verified follow-up:** `1ed8bea7f` passes 14 affected cases and normal compilation. Its fresh reviewer proves an inherited stderr pipe can keep uninterruptible cleanup pending after the actual child exits. Root verified the complete review and all 132 sealed entries. The same worker is repairing the bounded owned-pipe cleanup; the same reviewer will recheck it.
+
+- **Current archive and runtime proof:** exact dependency pin `72ba53c4` builds the real npm package, SEA intermediate, full Linux release archive and faithful ASAR layout. The release archive uses FFI 1.3.2 and passes actual parent startup, immutable runtime publication, shutdown, stage deletion and captured-process/port drain. The actual ASAR parent also publishes its runtime; final cleanup receipt is being checked. Bare SEA without its release sidecars fails activation and is explicitly excluded from a standalone-runtime claim. Historical mismatched archive and failed bare-SEA checks remain preserved. Current normal09 passes with 3,467 physical inputs plus 87 bundled libraries; the offline frozen-lock failure remains recorded without a policy bypass.
+
+- **Mobile same-reviewer gate running:** Root prepared private review composition `0ca1ba9d8` from approved backend wave `57bb92a49` and all nine exact mobile files at `1f06ad5bd`. This includes the approved public error encoder and rollback repair. The original reviewer is checking definite stale rejection versus uncertain rollback/transport behavior. No unreviewed mobile code has entered the wave or main.
+
+- **Next-wave preparation complete in parallel:** three read-only current-base proposals cover scheduler/limits, Git/setup and recovery. They reuse existing model accounting, guided authorization and native preallocation/reconciliation; they do not complete P8 or authorize dispatch before P7's required gates.
 
 | Tally                       | Done | In progress | Left | Total |
 | --------------------------- | ---- | ----------- | ---- | ----- |
@@ -79,20 +87,20 @@ Prioritize **Pi, OpenCode, Claude and Codex**. Shared contracts, migrations, wir
 
 Each row is one subagent seat. Finished agents release their seat. Implementation has resumed. Status questions receive a brief update and do not halt implementation unless the user explicitly asks to pause or stop. The rows below record current assignments and next actions. Phase tallies describe unfinished implementation, not running processes. Worktrees and evidence live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                         | State                            | Assignment / exact base                                 | Next gate                                                     |
-| ---- | --------------------------------------------- | -------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------- |
-| 1    | `review_p7_production_wiring_packaging_xhigh` | Active sole reviewer             | Initial `71a30467d`; Root repair candidate pending      | Same-reviewer production/packaging recheck                    |
-| 2    | `p7_current_shipping_runtime_proof_high`      | Waiting for exact Root candidate | Archive WT at `c25e8dbd7`; web outputs frozen           | Current server/SEA/archive/ASAR assembly                      |
-| 3    | `gateway_team_error_preservation_high`        | Active rollback repair           | `22bfe52aa`; exclusive Repository/Gateway files         | Actual rollback failure/cancellation checks                   |
-| 4    | `claude_readiness_joined_cleanup_high`        | Active isolated worker           | Exact base `76fd755ae`; ClaudeProvider source/test only | Real no-inference persistent-child cleanup controls           |
-| 5    | —                                             | Available                        | Mobile repair `1f06ad5bd` committed and inspected       | Same mobile reviewer awaits integrated backend/public encoder |
-| 6    | —                                             | Available                        | Sole Gateway reviewer returned verified R1              | Same reviewer rechecks repaired exact source                  |
-| 7    | —                                             | Available                        | Selected reader and Entry approved                      | Combined gate open                                            |
-| 8    | —                                             | Available                        | Native-read policy approved                             | Combined gate open                                            |
-| 9    | —                                             | Available                        | Bash isolation approved                                 | Combined actual lifetime gate open                            |
-| 10   | —                                             | Available                        | Stage lifetime approved                                 | Combined actual lifetime gate open                            |
+| Slot | Agent                                         | State                | Assignment / exact base                                               | Next gate                                                   |
+| ---- | --------------------------------------------- | -------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------- |
+| 1    | `review_p7_production_wiring_packaging_xhigh` | Active sole reviewer | Exact Root production `72ba53c4`                                      | Current parent receipts and Root final evidence seal        |
+| 2    | —                                             | Available            | Shipping worker finished exact `72ba53c4`; archive/ASAR seal complete | Root current parent verification                            |
+| 3    | —                                             | Available            | Gateway `2b72711c0` approved and staged at `57bb92a49`                | Combined wave gate                                          |
+| 4    | `claude_readiness_joined_cleanup_high`        | Active repair        | Same three exclusive files from `1ed8bea7f`                           | Held-pipe regression, focused checks, same-reviewer recheck |
+| 5    | `review_p12_mobile_human_foundation_xhigh`    | Active same reviewer | Private composition `0ca1ba9d8`                                       | Actual public-codec/backend mobile recovery                 |
+| 6    | —                                             | Available            | Gateway sole review complete; 81 cases pass                           | Combined wave gate                                          |
+| 7    | —                                             | Available            | Current Git/setup preparation complete                                | Root shared interfaces after P7                             |
+| 8    | —                                             | Available            | Current scheduler/limits preparation complete                         | Root budget/drain interfaces                                |
+| 9    | —                                             | Available            | Current recovery preparation complete                                 | Root effect-stage/stop interfaces                           |
+| 10   | —                                             | Available            | Approved P7 leaves staged                                             | Combined wave review                                        |
 
-Compiler/build seat: archive worker; Gateway normal compiler follows. Root production and desktop scoped normal checks pass. Ready independent work proceeds in parallel; shared interfaces and prerequisite gates retain their single owner.
+Compiler/build seat: available; current Root production normal09 is complete. Root checks packaged parents sequentially. Independent focused repair/review checks proceed in isolated units; no local model is hosted.
 
 Bash checkpoint: the original two-file uncommitted draft and 22/22 benign checks remain recorded. Automatic safety review rejected a proposed boundary probe; it was not executed and will not be retried or rephrased. The descriptor-source helper failed its ordinary native compatibility proof. The corrected helper now passes that proof using admitted inherited readonly direct-child mountpoints and source-free remounts, preserving original descriptors and an owned asynchronous operations/close API; sole fresh review is approved and staged. Root must demonstrate the authorized outer workspace/readonly-protected-mount topology and actual owner drain before claiming the boundary. Benign compatibility checks do not close that obligation. Root retains entry consumption, Runtime, contracts and wiring.
 
