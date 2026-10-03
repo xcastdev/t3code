@@ -56,6 +56,22 @@ const requestError = (method: string, error: PiManagedRuntimeError) =>
     }[error.code],
   });
 
+const safeStopCause = (
+  method: "stopSession" | "stopAll",
+  cause: Cause.Cause<PiManagedRuntimeError>,
+) =>
+  Cause.fromReasons(
+    cause.reasons.map((reason) => {
+      if (Cause.isInterruptReason(reason)) return reason;
+      const error = Cause.isFailReason(reason)
+        ? reason.error
+        : new PiManagedRuntimeError({ code: "uncertain", detail: "Pi owned stop failed." });
+      return Cause.makeFailReason(requestError(method, error)).annotate(
+        Context.makeUnsafe(reason.annotations),
+      );
+    }),
+  );
+
 const decodeOperationId = Schema.decodeEffect(PiWorkerOperation.fields.operationId);
 
 function freezeRequest<A>(value: A, seen = new WeakSet<object>()): A {
@@ -383,9 +399,9 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           context.closing = true;
           if (context.active) context.active.acceptingEvents = false;
           const stop = Effect.gen(function* () {
-            yield* runtime
-              .requestStop(context.threadId)
-              .pipe(Effect.mapError((error) => requestError("stopSession", error)));
+            yield* Effect.suspend(() => runtime.requestStop(context.threadId)).pipe(
+              Effect.catchCause((cause) => Effect.failCause(safeStopCause("stopSession", cause))),
+            );
             if (context.active) yield* Deferred.await(context.active.done);
             if (sessions.get(context.threadId) !== context) return;
             // Retain the ownership fence until the exit has been published.
@@ -538,18 +554,7 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
               Effect.suspend(() => runtime.requestStop(context.threadId)),
             );
             const cleanupReasons = Exit.isFailure(cleanup)
-              ? cleanup.cause.reasons.map((reason) => {
-                  if (Cause.isInterruptReason(reason)) return reason;
-                  const error = Cause.isFailReason(reason)
-                    ? reason.error
-                    : new PiManagedRuntimeError({
-                        code: "uncertain",
-                        detail: "Pi prepared identity cleanup failed.",
-                      });
-                  return Cause.makeFailReason(requestError("stopSession", error)).annotate(
-                    Context.makeUnsafe(reason.annotations),
-                  );
-                })
+              ? safeStopCause("stopSession", cleanup.cause).reasons
               : [];
             // Equal sanitized reasons still represent separate owned cleanup occurrences.
             return yield* Effect.failCause(
@@ -964,8 +969,8 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     }
     yield* PubSub.shutdown(events);
     const stop = yield* Effect.exit(
-      runtime.stopAll.pipe(
-        Effect.mapError((error) => requestError("stopAll", error)),
+      Effect.suspend(() => runtime.stopAll).pipe(
+        Effect.catchCause((cause) => Effect.failCause(safeStopCause("stopAll", cause))),
         Effect.tapError((error) =>
           Effect.sync(() => {
             for (const context of sessions.values()) {
