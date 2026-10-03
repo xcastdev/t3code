@@ -11,6 +11,7 @@ import { PiManagedRuntime, PiManagedRuntimeError } from "./PiManagedRuntime.ts";
 import { makePiManagedRuntimeLive } from "./PiManagedRuntimeLive.ts";
 import { PiModelCatalogue } from "./PiModelCatalogue.ts";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
+import { makePiSkillStageLifetime } from "./PiSkillStageLifetime.ts";
 
 const NodeFS = process.getBuiltinModule("fs");
 const nativeFS = NodeFS.promises;
@@ -424,8 +425,13 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
           const processes = yield* decodeRows(relevant);
           for (const process of processes) {
             const allocation = process.allocation;
-            if (allocation.launch.runtimeFiles.length !== stage.entries.length) return false;
-            for (const file of allocation.launch.runtimeFiles) {
+            const files = allocation.launch.runtimeFiles.filter(
+              (file) =>
+                ownedIdentities.has(`${file.dev}:${file.ino}`) ||
+                file.source.startsWith(stage.directory + "/"),
+            );
+            if (files.length !== stage.entries.length) return false;
+            for (const file of files) {
               const entry = stage.entries.find(
                 (entry) => stage.directory + "/" + entry.name === file.source,
               );
@@ -484,6 +490,14 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       const liveOptions = {
         ...options,
         runtimeFiles: assets.runtimeFiles,
+        allocateSkillStage: Effect.gen(function* () {
+          if (!accepting) return yield* closed();
+          const root = options.stagingRoot + "/pi-selected-skills";
+          const stat = yield* native(() => privateDirectory(root, uid));
+          if ((stat.mode & 0o7777) !== 0o700) return yield* unavailable();
+          if (!accepting) return yield* closed();
+          return yield* makePiSkillStageLifetime(root);
+        }),
         readCatalogue,
         transport,
         revalidateRuntime,
