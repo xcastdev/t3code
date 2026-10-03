@@ -512,6 +512,33 @@ describe("Managed Git execution", () => {
     );
   }
 
+  it.effect("denies a commondir in assigned common metadata before any managed Git child", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const entry = f.path.join(f.assignment.commonGitDirectory, "commondir");
+      yield* f.fs.writeFileString(entry, "unsupported\n");
+      let spawned = false;
+      const spawner = ChildProcessSpawner.make(() => {
+        spawned = true;
+        return Effect.die("Managed Git must not start for redirected common metadata");
+      });
+      const context = yield* Managed.make({
+        assignment: f.assignment,
+        revalidate: Effect.void,
+        persistWorkspace: () => Effect.die("Unexpected receipt"),
+      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+      expect(
+        (yield* Managed.prepareManagedGitExecution(context, f.input()).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* Managed.createManagedWorktree(context, f.input()).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(spawned).toBe(false);
+      expect(yield* f.fs.readFileString(entry)).toBe("unsupported\n");
+      expect(yield* f.fs.exists(f.assignment.worktreePath)).toBe(false);
+    }).pipe(Effect.provide(trackedServices)),
+  );
+
   for (const layout of [
     "alternates",
     "http-alternates",

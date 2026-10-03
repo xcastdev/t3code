@@ -338,6 +338,8 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
         )
           return fail();
       }
+      // --git-dir still follows commondir. The assigned common root must terminate that chain.
+      if (read(path.join(a.commonGitDirectory, "commondir"), true)) return fail();
       const config = read(path.join(a.commonGitDirectory, "config"));
       if (!config) return fail();
       if (read(path.join(a.commonGitDirectory, "config.worktree"), true)) return fail();
