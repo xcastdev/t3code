@@ -2,6 +2,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
   ProjectTeamRunBinding,
+  ProjectTeamRoleRevision,
   CommandId,
   type ProviderInstanceId,
   type ThreadId,
@@ -43,6 +44,8 @@ import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts"
 
 const encode = canonicalProjectWorkPayload;
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
+const isWorkerIdentity = Schema.is(PiWorkerIdentity);
+const isWorkerOperation = Schema.is(PiWorkerOperation);
 const decodeNativeInput = Schema.decodeUnknownEffect(PiNativeReference, {
   onExcessProperty: "error",
 });
@@ -170,6 +173,20 @@ const decodeReplayIntent = Schema.decodeEffect(
       role: Schema.Json,
       allocation: PiManagedProcessAllocationSchema,
       resourceHash: ResourceIdentity,
+      rootBudget: RootBudget,
+      operationLimits: OperationLimits,
+    }),
+  ),
+  { onExcessProperty: "error" },
+);
+const decodeBudgetIntent = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      request: Schema.JsonObject,
+      binding: ProjectTeamRunBinding,
+      role: ProjectTeamRoleRevision,
+      allocation: PiManagedProcessAllocationSchema,
+      resourceHash: Schema.optional(ResourceIdentity),
       rootBudget: RootBudget,
       operationLimits: OperationLimits,
     }),
@@ -527,6 +544,108 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         authority = resolved;
       }
     });
+    const standaloneBudget = Effect.fn("ProjectTeamPiOperations.standaloneBudget")(function* (
+      authority: ProjectTeamAuthority,
+      rootTaskId: string,
+    ) {
+      const rows =
+        yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND project_id=${authority.binding.projectId} AND root_task_id=${rootTaskId} ORDER BY rowid LIMIT 1`;
+      const row = rows[0];
+      if (!row) return yield* deny("Pi root budget requires trusted legacy reconciliation");
+      const intent = yield* decodeBudgetIntent(row.intent_json);
+      const original = intent.binding;
+      const processes = yield* sql<{
+        unit: string;
+        allocation_json: string;
+      }>`SELECT unit,allocation_json FROM project_team_pi_process WHERE operation_id=${row.operation_id} LIMIT 2`;
+      const process = processes[0];
+      if (
+        processes.length !== 1 ||
+        !process ||
+        process.unit !== intent.allocation.unit ||
+        encode(yield* decodeReplayAllocation(process.allocation_json)) !== encode(intent.allocation)
+      )
+        return yield* deny("Original standalone Pi allocation proof changed");
+      if (row.terminal_json) {
+        const terminal = yield* decodeTerminal(row.terminal_json);
+        if (
+          terminal.identity.workerId !== row.worker_id ||
+          terminal.identity.generation !== row.generation ||
+          terminal.operation.operationId !== row.operation_id ||
+          terminal.operation.operationKind !== row.operation_kind
+        )
+          return yield* deny("Original standalone Pi terminal owner changed");
+      }
+      const bindings = authority.state.foundationRecords?.filter(
+        (r) => r.kind === "run-binding" && r.recordId === original.recordId,
+      );
+      const retained = bindings?.[0];
+      const roles = authority.state.foundationRecords?.filter(
+        (r) => r.kind === "role-revision" && r.recordId === original.roleRevisionId,
+      );
+      const role = roles?.[0];
+      const immutableRole = (value: typeof ProjectTeamRoleRevision.Type) => {
+        const { revision: _, status: _status, updatedAt: _at, ...immutable } = value;
+        return encode(immutable);
+      };
+      const started = Date.parse(original.updatedAt);
+      const durationDeadline = started + original.configuration.maxDurationMs;
+      // The first standalone operation captured the effective lease/duration cap.
+      // Later lease or binding timestamps cannot reconstruct or extend that cap.
+      if (
+        row.environment_id !== options.environmentId ||
+        row.project_id !== authority.binding.projectId ||
+        row.project_id !== original.projectId ||
+        row.binding_id !== original.recordId ||
+        row.root_binding_id !== original.recordId ||
+        row.root_task_id !== rootTaskId ||
+        original.taskId !== rootTaskId ||
+        original.environmentId !== options.environmentId ||
+        original.parentRunId !== undefined ||
+        row.generation !== original.generation ||
+        row.provider_instance_id !== original.providerInstanceId ||
+        row.thread_id !== original.threadId ||
+        row.operation_kind !== "initialize" ||
+        !Number.isSafeInteger(row.operation_ordinal) ||
+        row.operation_ordinal < 0 ||
+        !isWorkerIdentity({ workerId: row.worker_id, generation: row.generation }) ||
+        !isWorkerOperation({
+          operationId: row.operation_id,
+          operationKind: row.operation_kind,
+        }) ||
+        intent.request.kind !== row.operation_kind ||
+        intent.request.threadId !== row.thread_id ||
+        (intent.request.operationId !== undefined &&
+          (intent.request.operationId !== row.operation_id ||
+            NodeCrypto.createHash("sha256").update(encode(intent.request)).digest("hex") !==
+              row.request_hash ||
+            !intent.resourceHash)) ||
+        bindings?.length !== 1 ||
+        retained?.kind !== "run-binding" ||
+        immutableBinding(retained) !== immutableBinding(original) ||
+        roles?.length !== 1 ||
+        role?.kind !== "role-revision" ||
+        intent.role.recordId !== original.roleRevisionId ||
+        intent.role.projectId !== original.projectId ||
+        immutableRole(role) !== immutableRole(intent.role) ||
+        original.configuration.instructionsHash !==
+          NodeCrypto.createHash("sha256").update(intent.role.instructions).digest("hex") ||
+        !validRetainedAllocation(intent.allocation) ||
+        intent.allocation.launch.workspaceRoot !== original.worktree ||
+        intent.rootBudget.rootTaskId !== rootTaskId ||
+        intent.rootBudget.maximumTokens !== intent.operationLimits.maximumTokens ||
+        intent.rootBudget.deadlineAtMs !== intent.operationLimits.deadlineAtMs ||
+        intent.operationLimits.maximumTokens !== row.maximum_tokens ||
+        intent.operationLimits.deadlineAtMs !== row.deadline_at_ms ||
+        row.maximum_tokens > original.configuration.maxTokens ||
+        !Number.isSafeInteger(started) ||
+        !Number.isSafeInteger(durationDeadline) ||
+        row.deadline_at_ms <= started ||
+        row.deadline_at_ms > durationDeadline
+      )
+        return yield* deny("Original standalone Pi budget proof changed");
+      return intent.rootBudget;
+    });
     const rootBudget = Effect.fn("ProjectTeamPiOperations.rootBudget")(function* (
       authority: ProjectTeamAuthority,
       root: Effect.Success<ReturnType<typeof roots>>,
@@ -584,12 +703,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         maximumTokens = Math.min(maximumTokens, limits.attemptMaximumTokens);
         deadlineAtMs = Math.min(deadlineAtMs, limits.deadlineAtMs);
       }
-      if (!anchor && budgets[0]) {
-        const prior = yield* sql<{
-          intent_json: string;
-        }>`SELECT intent_json FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${root.rootTaskId} ORDER BY rowid LIMIT 1`;
-        if (prior[0]) anchor = (yield* decodeIntent(prior[0].intent_json)).rootBudget;
-        if (!anchor) return yield* deny("Pi root budget requires trusted legacy reconciliation");
+      if (!anchors[0] && budgets[0]) {
+        const original = yield* standaloneBudget(authority, root.rootTaskId);
+        if (anchor && encode(anchor) !== encode(original))
+          return yield* deny("Original standalone Pi root budget changed");
+        anchor = original;
       }
       if (!anchor && binding.recordId !== root.root.recordId)
         return yield* deny("Pi child requires an original root budget");

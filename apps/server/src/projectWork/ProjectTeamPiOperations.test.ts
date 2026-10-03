@@ -2129,3 +2129,298 @@ for (const mode of [
     ),
   );
 }
+
+for (const mode of [
+  "unchanged",
+  "missing-caps",
+  "wrong-prior-binding",
+  "over-root-tokens",
+  "over-root-time",
+  "over-all-token-caps",
+  "over-all-time-caps",
+  "wrong-root-binding",
+  "wrong-role",
+  "wrong-request",
+  "wrong-allocation",
+] as const) {
+  it.effect(`standalone root anchor validates the complete original proof: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const first = yield* f.prepare();
+        yield* f.operations.persistTerminal(first, {
+          identity: { workerId: first.workerId, generation: 0 },
+          operation: first.operation,
+          outcome: "canceled",
+          ownerCaptured: false,
+          native: null,
+          drain: null,
+          accountingReceipts: [],
+        });
+        if (mode === "missing-caps")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_remove(intent_json,'$.operationLimits')`;
+        if (mode === "wrong-prior-binding")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.binding.recordId','foreign')`;
+        if (mode === "over-root-tokens" || mode === "over-all-token-caps") {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.rootBudget.maximumTokens',20001)`;
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=20001`;
+          if (mode === "over-all-token-caps")
+            yield* f.sql`UPDATE project_team_pi_operation SET maximum_tokens=20001,intent_json=json_set(intent_json,'$.operationLimits.maximumTokens',20001)`;
+        }
+        if (mode === "over-root-time" || mode === "over-all-time-caps") {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.rootBudget.deadlineAtMs',deadline_at_ms+1000)`;
+          yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=deadline_at_ms+1000`;
+          if (mode === "over-all-time-caps")
+            yield* f.sql`UPDATE project_team_pi_operation SET deadline_at_ms=deadline_at_ms+1000,intent_json=json_set(intent_json,'$.operationLimits.deadlineAtMs',deadline_at_ms+1000)`;
+        }
+        if (mode === "wrong-root-binding")
+          yield* f.sql`UPDATE project_team_pi_operation SET root_binding_id='foreign'`;
+        if (mode === "wrong-role")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.role.instructions','Changed original role')`;
+        if (mode === "wrong-request")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.request.threadId','foreign')`;
+        if (mode === "wrong-allocation")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.allocation.nonce','foreign')`;
+        const before = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        const nextAllocation = {
+          ...f.allocation,
+          unit: `t3-pi-managed-anchor-${mode}.service`,
+          nonce: `anchor-${mode}`,
+        };
+        const next = yield* f.operations
+          .prepare(f.identity, { threadId, kind: "initialize" }, `anchor-${mode}`, {
+            allocation: nextAllocation,
+            workerId: `anchor-${mode}`,
+            operationId: `anchor-${mode}`,
+          })
+          .pipe(Effect.result);
+        expect(next._tag).toBe(mode === "unchanged" ? "Success" : "Failure");
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(before);
+        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(
+          mode === "unchanged" ? 2 : 1,
+        );
+        expect(yield* f.sql`SELECT status FROM project_team_pi_process ORDER BY rowid`).toEqual(
+          mode === "unchanged"
+            ? [{ status: "drained" }, { status: "allocated" }]
+            : [{ status: "drained" }],
+        );
+      }),
+    ),
+  );
+}
+
+for (const tampered of [false, true]) {
+  it.effect(
+    `standalone root anchor retains the original deadline after native update: ${tampered}`,
+    () =>
+      fileTest(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const first = yield* f.prepare();
+          yield* f.operations.persistNative(first, nativeReference);
+          yield* f.operations.persistTerminal(first, {
+            identity: { workerId: first.workerId, generation: 0 },
+            operation: first.operation,
+            outcome: "canceled",
+            ownerCaptured: false,
+            native: null,
+            drain: null,
+            accountingReceipts: [],
+          });
+          if (tampered) {
+            yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.rootBudget.deadlineAtMs',deadline_at_ms+1000)`;
+            yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=deadline_at_ms+1000`;
+          }
+          yield* TestClock.setTime(first.deadlineAtMs + 1);
+          const before = yield* f.sql`SELECT * FROM project_team_model_budget`;
+          yield* rejected(
+            f.operations.prepare(f.identity, { threadId, kind: "initialize" }, "late", {
+              allocation: {
+                ...f.allocation,
+                unit: "t3-pi-managed-anchor-late.service",
+                nonce: "late",
+              },
+              operationId: "late",
+              workerId: "late",
+            }),
+          );
+          expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(before);
+          expect((yield* f.sql`SELECT * FROM project_team_pi_operation`).length).toBe(1);
+          expect(yield* f.sql`SELECT status FROM project_team_pi_process ORDER BY rowid`).toEqual([
+            { status: "drained" },
+          ]);
+        }),
+      ),
+  );
+}
+
+const activateStandalone = (
+  f: Effect.Success<typeof fixture>,
+  op: Parameters<typeof f.operations.persistence>[0],
+) =>
+  Effect.gen(function* () {
+    const owner = {
+      type: "owner" as const,
+      unit: op.allocation.unit,
+      nonce: op.allocation.nonce,
+      invocation: "a".repeat(32),
+      cgroup: `/sys/fs/cgroup/${op.allocation.unit}`,
+      pid: 123,
+      memoryBytes: op.allocation.policy.memoryBytes,
+      swapBytes: 0 as const,
+      oomGroup: 1 as const,
+    };
+    yield* f.operations.persistence(op).claimActivation(op.allocation);
+    yield* f.operations.persistence(op).beforeStart(owner);
+    yield* f.operations.persistNative(op, nativeReference);
+    return owner;
+  });
+for (const tampered of [false, true]) {
+  it.effect(`standalone root anchor keeps exhausted cumulative charges: ${tampered}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const first = yield* f.prepare();
+        const owner = yield* activateStandalone(f, first);
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "command-code-ling-free",
+          model,
+          acceptedReportedModels: [model],
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const request = {
+          workerId: first.workerId,
+          operationId: first.operation.operationId,
+          generation: 0,
+          requestId: 1,
+          routeId: "command-code-ling-free",
+          provider: "command-code" as const,
+          model,
+          maxInputTokens: 19900,
+          maxOutputTokens: 100,
+          callCount: 1 as const,
+          deadlineAtMs: time + 10000,
+        };
+        const receipt = yield* accounting.reserve(first.principal, request);
+        yield* accounting.settle({
+          ...request,
+          reservationId: receipt.reservationId,
+          outcome: "unknown",
+          transportDrained: true,
+          chargedInputTokens: 19900,
+          chargedOutputTokens: 100,
+        });
+        yield* f.operations.persistTerminal(first, {
+          identity: { workerId: first.workerId, generation: 0 },
+          operation: first.operation,
+          outcome: "failed",
+          ownerCaptured: true,
+          native: nativeReference,
+          accountingReceipts: [],
+          drain: {
+            unit: owner.unit,
+            invocation: owner.invocation,
+            cgroup: owner.cgroup,
+            ownerPid: owner.pid,
+            memoryBytes: owner.memoryBytes,
+            swapBytes: 0,
+            oomGroup: 1,
+            launcherPid: 124,
+            childPid: 125,
+            childExitCode: 0,
+            kernel: "removed",
+          },
+        });
+        if (tampered) {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.rootBudget.maximumTokens',20002)`;
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=20002`;
+        }
+        const before = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        const next = yield* f.operations
+          .prepare(f.identity, { threadId, kind: "initialize" }, "more", {
+            allocation: {
+              ...f.allocation,
+              unit: "t3-pi-managed-anchor-more.service",
+              nonce: "more",
+            },
+            operationId: "more",
+            workerId: "more",
+          })
+          .pipe(Effect.result);
+        if (tampered) expect(next._tag).toBe("Failure");
+        else {
+          if (next._tag !== "Success") return yield* Effect.die("Intact Root proof unavailable");
+          yield* activateStandalone(f, next.success);
+          yield* rejected(
+            accounting.reserve(next.success.principal, {
+              ...request,
+              workerId: "more",
+              operationId: "more",
+              maxInputTokens: 1,
+              maxOutputTokens: 1,
+            }),
+          );
+        }
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(before);
+        expect(
+          yield* f.sql`SELECT status,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
+        ).toEqual([{ status: "unknown", charged_input_tokens: 19900, charged_output_tokens: 100 }]);
+        expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(tampered ? 1 : 2);
+      }),
+    ),
+  );
+}
+
+it.effect("standalone root anchor validates existing-operation authorization and reservation", () =>
+  fileTest(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const first = yield* f.prepare();
+      yield* activateStandalone(f, first);
+      const accounting = yield* makeAccounting({
+        environmentId: "environment",
+        routeId: "command-code-ling-free",
+        model,
+        acceptedReportedModels: [model],
+        resolveOperation: f.operations.resolveOperation,
+      });
+      const request = {
+        workerId: first.workerId,
+        operationId: first.operation.operationId,
+        generation: 0,
+        requestId: 1,
+        routeId: "command-code-ling-free",
+        provider: "command-code" as const,
+        model,
+        maxInputTokens: 19900,
+        maxOutputTokens: 100,
+        callCount: 1 as const,
+        deadlineAtMs: time + 10000,
+      };
+      const receipt = yield* accounting.reserve(first.principal, request);
+      yield* accounting.settle({
+        ...request,
+        reservationId: receipt.reservationId,
+        outcome: "unknown",
+        transportDrained: true,
+        chargedInputTokens: 19900,
+        chargedOutputTokens: 100,
+      });
+      yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.rootBudget.maximumTokens',20002)`;
+      yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=20002`;
+      yield* rejected(
+        accounting.reserve(first.principal, {
+          ...request,
+          requestId: 2,
+          maxInputTokens: 1,
+          maxOutputTokens: 1,
+        }),
+      );
+      yield* rejected(f.operations.authorize(first));
+      expect(
+        yield* f.sql`SELECT status,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
+      ).toEqual([{ status: "unknown", charged_input_tokens: 19900, charged_output_tokens: 100 }]);
+    }),
+  ),
+);
