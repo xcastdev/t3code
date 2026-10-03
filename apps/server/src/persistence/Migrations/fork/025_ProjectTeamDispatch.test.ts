@@ -5,7 +5,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../../Migrations.ts";
 
 const fixture = Effect.gen(function* () {
-  yield* runMigrations();
+  yield* runMigrations({ toForkMigrationInclusive: 25 });
   const sql = yield* SqlClient.SqlClient;
   yield* sql`INSERT INTO project_team_run_binding
     (record_id,project_id,status,revision,generation,updated_at,payload_json)
