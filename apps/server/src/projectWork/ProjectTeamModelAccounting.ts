@@ -57,6 +57,7 @@ const OutputDetails = Schema.Struct({
 const Settlement = Schema.Struct({
   ...fields,
   reservationId: Id,
+  transportDrained: Schema.optional(Schema.Boolean),
   outcome: Schema.Literals(["reported", "failed", "unknown"]),
   failureCode: Schema.optional(Schema.String.check(Schema.isPattern(/^[A-Z_]{1,64}$/))),
   chargedInputTokens: Safe,
@@ -135,6 +136,7 @@ type Row = {
   maximum_output_tokens: number;
   deadline_at_ms: number;
   status: string;
+  capacity_state: "held" | "released" | "quarantine" | "legacy";
   charged_input_tokens: number;
   charged_output_tokens: number;
   accounting_receipt_id: string | null;
@@ -259,6 +261,11 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             ),
           );
           yield* clockCheck(deadline);
+          const legacy = yield* sql<{
+            reservation_id: string;
+          }>`SELECT reservation_id FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND capacity_state='legacy' LIMIT 1`;
+          if (legacy.length > 0)
+            return yield* deny("Legacy model transport requires reconciliation");
           const budgets = yield* sql<{
             maximum_tokens: number;
             deadline_at_ms: number;
@@ -303,7 +310,7 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             environment_slot: number;
             model_slot: number;
             model: string;
-          }>`SELECT environment_slot,model_slot,model FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND status='held'`;
+          }>`SELECT environment_slot,model_slot,model FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND capacity_state IN ('held','quarantine')`;
           const environmentSlot = Array.from(
             { length: policy.maximumConcurrentCalls },
             (_, i) => i,
@@ -315,7 +322,7 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           if (environmentSlot === undefined || modelSlot === undefined)
             return yield* deny("Model call capacity exhausted");
           const reservationId = yield* crypto.randomUUIDv4;
-          yield* sql`INSERT INTO project_team_model_request (reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,environment_slot,model_slot,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,charged_input_tokens,charged_output_tokens,reservation_json) VALUES (${reservationId},${policy.environmentId},${binding.projectId},${operation.rootTaskId},${binding.recordId},${binding.attemptId},${reservation.workerId},${reservation.generation},${reservation.operationId},${reservation.requestId},${reservation.routeId},${reservation.provider},${reservation.model},${environmentSlot},${modelSlot},${reservation.maxInputTokens},${reservation.maxOutputTokens},${reservation.deadlineAtMs},'held',0,0,${encodeReservation(reservation)})`;
+          yield* sql`INSERT INTO project_team_model_request (reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,environment_slot,model_slot,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,charged_input_tokens,charged_output_tokens,reservation_json) VALUES (${reservationId},${policy.environmentId},${binding.projectId},${operation.rootTaskId},${binding.recordId},${binding.attemptId},${reservation.workerId},${reservation.generation},${reservation.operationId},${reservation.requestId},${reservation.routeId},${reservation.provider},${reservation.model},${environmentSlot},${modelSlot},${reservation.maxInputTokens},${reservation.maxOutputTokens},${reservation.deadlineAtMs},'held','held',0,0,${encodeReservation(reservation)})`;
           yield* clockCheck(deadline);
           return { reservationId, status: "reserved" as const };
         }),
@@ -389,6 +396,11 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             if (!row.settlement_json || !row.accounting_receipt_id)
               return yield* deny("Settlement journal incomplete");
             const previous = yield* storedSettlement(row.settlement_json);
+            // A repeated settlement cannot establish new transport cleanup or release quarantine.
+            committedSettlement = {
+              ...settlement,
+              transportDrained: previous.transportDrained,
+            };
             if (
               row.status !== previous.outcome ||
               row.charged_input_tokens !== previous.chargedInputTokens ||
@@ -406,7 +418,7 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
               )
                 return yield* deny("Reported evidence changed");
               committedSettlement = {
-                ...settlement,
+                ...committedSettlement,
                 reportedUsage: previous.reportedUsage,
                 reportedModel: previous.reportedModel,
               };
@@ -421,8 +433,16 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             )
               return yield* deny("Settled request cannot be rewritten");
           }
+          if (row.status === "held" && row.capacity_state !== "held")
+            return yield* deny("Reservation capacity journal mismatch");
+          const capacityState =
+            row.status === "held"
+              ? settlement.transportDrained === true
+                ? "released"
+                : "quarantine"
+              : row.capacity_state;
           const receipt = row.accounting_receipt_id ?? (yield* crypto.randomUUIDv4);
-          yield* sql`UPDATE project_team_model_request SET status=${settlement.outcome},charged_input_tokens=${inputCharge},charged_output_tokens=${outputCharge},accounting_receipt_id=${receipt},settlement_json=${encodeSettlement(committedSettlement)} WHERE reservation_id=${row.reservation_id}`;
+          yield* sql`UPDATE project_team_model_request SET status=${settlement.outcome},capacity_state=${capacityState},charged_input_tokens=${inputCharge},charged_output_tokens=${outputCharge},accounting_receipt_id=${receipt},settlement_json=${encodeSettlement(committedSettlement)} WHERE reservation_id=${row.reservation_id}`;
           return { accountingReceiptId: receipt };
         }),
       );
