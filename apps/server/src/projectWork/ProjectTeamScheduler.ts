@@ -85,6 +85,7 @@ type TaskWindow = {
   readonly afterTaskId?: ProjectWorkTaskId;
   readonly limit: number;
   readonly candidates: Array<Candidate>;
+  readonly visited: Set<ProjectWorkTaskId>;
 };
 
 /** A wake-driven bounded sweep. These cursors and pending IDs are disposable selection state;
@@ -181,16 +182,18 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
         });
         continue;
       }
-      // A retained window only selects IDs still present in this current page, using
-      // current priorities. Its keyset cursor follows the refreshed page as well.
-      const remaining =
-        window === undefined ? undefined : new Set(window.candidates.map((c) => c.taskId));
+      // Refresh from all current eligible IDs and priorities, including replacements.
+      // Remember visits only within this bounded page so repeated high-priority IDs
+      // cannot starve its remaining tasks; cursor progress follows the actual keyset.
+      const currentIds = new Set(candidates.map((c) => c.taskId));
+      const visited = new Set([...(window?.visited ?? [])].filter((id) => currentIds.has(id)));
       const pending: TaskWindow = {
         ...(afterTaskId === undefined ? {} : { afterTaskId }),
         limit: pageLimit,
         candidates: candidates
-          .filter((c) => remaining === undefined || remaining.has(c.taskId))
+          .filter((c) => !visited.has(c.taskId))
           .sort(byPriority((c: Candidate) => c.taskId)),
+        visited,
       };
       // Publish before any interruptible preparation, transaction or notification.
       // Keep the selected ID until a definitive result; the journal remains durable
@@ -201,7 +204,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
         taskCursors.set(project.projectId, candidates[candidates.length - 1]!.taskId);
       else taskCursors.delete(project.projectId);
       const consumeCandidate = () => {
-        pending.candidates.shift();
+        pending.visited.add(pending.candidates.shift()!.taskId);
         if (pending.candidates.length === 0) windows.delete(project.projectId);
       };
       let scanned = 0;

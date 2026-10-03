@@ -1474,7 +1474,9 @@ it.effect(
                     claim: { ...f.thirdRequest.claim, expectedRevision: state.revision },
                   },
                 })
-              : f.prepare({ state, taskId: id }),
+              : id === f.otherId
+                ? Effect.succeed({ _tag: "Blocked" as const, reason: "temporarily-unavailable" })
+                : f.prepare({ state, taskId: id }),
         });
         expect(
           (yield* scheduler.sweep({ tasksPerProject: 2, maximumReservations: 1 })).committed.map(
@@ -1490,6 +1492,145 @@ it.effect(
             (result) => result.fence.dispatchId,
           ),
         ).toEqual([f.thirdRequest.dispatchId]);
+        expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
+      }),
+    ),
+);
+
+for (const replacement of [false, true]) {
+  it.effect(
+    replacement
+      ? "a fresh eligible replacement on a short page reaches actual reserve"
+      : "the same task reserves from a retained short page",
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* threeTasks;
+          let changed = false;
+          const prepared: Array<ProjectWorkTaskId> = [];
+          const scheduler = yield* schedulerWith(f, {
+            ...continuationPorts(f),
+            readProjectState: ({ afterTaskId, limit }) =>
+              readCurrentState(f.sql, projectId).pipe(
+                Effect.map((state) => ({
+                  state,
+                  candidates: (changed
+                    ? [{ taskId: f.thirdId, priority: 50 }]
+                    : [
+                        { taskId, priority: 100 },
+                        { taskId: replacement ? f.otherId : f.thirdId, priority: 0 },
+                      ]
+                  )
+                    .filter(
+                      (candidate) => afterTaskId === undefined || candidate.taskId > afterTaskId,
+                    )
+                    .slice(0, limit),
+                })),
+              ),
+            prepareRequest: ({ state, taskId: id }) =>
+              Effect.sync(() => {
+                prepared.push(id);
+                const request =
+                  id === f.thirdId ? f.thirdRequest : id === f.otherId ? f.otherRequest : f.request;
+                return {
+                  _tag: "Prepared" as const,
+                  request: {
+                    ...request,
+                    claim: { ...request.claim, expectedRevision: state.revision },
+                  },
+                };
+              }),
+          });
+          const first = yield* scheduler.sweep({ tasksPerProject: 3, maximumReservations: 1 });
+          expect(first.blocked).toEqual([]);
+          expect(first.committed.map((result) => result.fence.dispatchId)).toEqual([
+            f.request.dispatchId,
+          ]);
+          expect(first.hasMore).toBe(true);
+          changed = true;
+          const next = yield* scheduler.sweep({ tasksPerProject: 3, maximumReservations: 1 });
+          expect(next.blocked).toEqual([]);
+          expect(next.committed.map((result) => result.fence.dispatchId)).toEqual([
+            f.thirdRequest.dispatchId,
+          ]);
+          expect(next.tasksScanned).toBe(1);
+          expect(next.hasMore).toBe(false);
+          expect(prepared).toEqual([taskId, f.thirdId]);
+          const state = yield* readCurrentState(f.sql, projectId);
+          expect(state.attempts).toHaveLength(2);
+          expect(state.tasks.find((task) => task.taskId === f.thirdId)).toMatchObject({
+            state: "in-progress",
+            activeAttemptId: "continuation-third-attempt",
+          });
+          expect(state.tasks.find((task) => task.taskId === f.otherId)?.state).toBe("ready");
+          expect(
+            (yield* f.journal.readRecoveryPage({ limit: 32 }))
+              .map((result) => result.intent.request.dispatchId)
+              .sort(),
+          ).toEqual([f.request.dispatchId, f.thirdRequest.dispatchId].sort());
+        }),
+      ),
+  );
+}
+
+it.effect(
+  "visited high-priority candidates do not starve a lower task when the scan budget shrinks",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* threeTasks;
+        const prepared: Array<ProjectWorkTaskId> = [];
+        const scheduler = yield* schedulerWith(f, {
+          ...continuationPorts(f),
+          readProjectState: ({ afterTaskId, limit }) =>
+            readCurrentState(f.sql, projectId).pipe(
+              Effect.map((state) => ({
+                state,
+                candidates: [
+                  { taskId, priority: 100 },
+                  { taskId: f.otherId, priority: 10 },
+                  { taskId: f.thirdId, priority: 0 },
+                ]
+                  .filter(
+                    (candidate) => afterTaskId === undefined || candidate.taskId > afterTaskId,
+                  )
+                  .slice(0, limit),
+              })),
+            ),
+          prepareRequest: ({ state, taskId: id }) => {
+            prepared.push(id);
+            return id === f.otherId
+              ? Effect.succeed({ _tag: "Blocked" as const, reason: "temporarily-unavailable" })
+              : Effect.succeed({
+                  _tag: "Prepared" as const,
+                  request: {
+                    ...(id === f.thirdId ? f.thirdRequest : f.request),
+                    claim: {
+                      ...(id === f.thirdId ? f.thirdRequest.claim : f.request.claim),
+                      expectedRevision: state.revision,
+                    },
+                  },
+                });
+          },
+        });
+        expect(
+          (yield* scheduler.sweep({ tasksPerProject: 3, maximumReservations: 1 })).committed.map(
+            (result) => result.fence.dispatchId,
+          ),
+        ).toEqual([f.request.dispatchId]);
+        const blocked = yield* scheduler.sweep({ tasksPerProject: 1, maximumReservations: 1 });
+        expect(blocked.tasksScanned).toBe(1);
+        expect(blocked.committed).toEqual([]);
+        expect(blocked.blocked).toMatchObject([
+          { taskId: f.otherId, phase: "prepare", reason: "temporarily-unavailable" },
+        ]);
+        expect(blocked.hasMore).toBe(true);
+        const next = yield* scheduler.sweep({ tasksPerProject: 1, maximumReservations: 1 });
+        expect(next.tasksScanned).toBe(1);
+        expect(next.committed.map((result) => result.fence.dispatchId)).toEqual([
+          f.thirdRequest.dispatchId,
+        ]);
+        expect(prepared).toEqual([taskId, f.otherId, f.thirdId]);
         expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
       }),
     ),
