@@ -13,6 +13,7 @@ import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
@@ -34,11 +35,15 @@ import * as ServerSettings from "../../serverSettings.ts";
 import { makeSqlitePersistenceLive } from "../../persistence/Layers/Sqlite.ts";
 import * as Authorization from "../../projectWork/ProjectTeamAuthorization.ts";
 import { ProjectWorkRepositoryLive } from "../../projectWork/ProjectWorkRepository.ts";
+import { readCurrentState } from "../../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkQueryLive } from "../../projectWork/ProjectWorkQuery.ts";
 import { ProjectWorkSearchLive } from "../../projectWork/ProjectWorkSearch.ts";
 import { ProjectWorkNarrativeLive } from "../../projectWork/ProjectWorkNarrative.ts";
 import { ProjectWorkBriefingLive } from "../../projectWork/ProjectWorkBriefing.ts";
-import { ProjectWorkGatewayLive } from "../../projectWork/ProjectWorkGateway.ts";
+import {
+  ProjectWorkGateway,
+  ProjectWorkGatewayLive,
+} from "../../projectWork/ProjectWorkGateway.ts";
 import {
   ProjectWorkProjection,
   ProjectWorkProjectionLive,
@@ -277,6 +282,359 @@ const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.result,
     Effect.map((result) => expect(result._tag).toBe("Failure")),
   );
+describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
+  "actual SDK guided Runtime bridge",
+  () => {
+    for (const [mode, disposition] of [
+      ["report", "ordinary"],
+      ["plan", "ordinary"],
+      ["report", "held-control"],
+      ["report", "held-cancel"],
+    ] as const) {
+      const caseId = disposition === "ordinary" ? mode : disposition;
+      it.effect(`routes ${caseId} through current durable authority`, () =>
+        scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture;
+            const manifest = process.env.PI_MANAGED_RUNTIME_TEST_CLOSURE;
+            const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+            if (!manifest || !evidence) return yield* Effect.die("SDK closure/evidence required");
+            const closure = yield* decodeClosure(yield* f.fs.readFileString(manifest));
+            for (const file of closure.files) {
+              const bytes = yield* f.fs.readFile(file.source);
+              expect(bytes.length).toBe(file.bytes);
+              expect(NodeCrypto.createHash("sha256").update(bytes).digest("hex")).toBe(file.sha256);
+            }
+            const actualAt = DateTime.formatIso(DateTime.nowUnsafe());
+            yield* TestClock.setTime(Date.parse(actualAt));
+            const capability = `project-work.${mode}`;
+            yield* restoreHistoricalBinding({
+              ...f.role,
+              revision: f.role.revision + 1,
+              role: mode === "plan" ? "coordinator" : "investigator",
+              tools: [capability],
+            });
+            yield* restoreHistoricalBinding({
+              ...f.binding,
+              revision: f.binding.revision + 1,
+              updatedAt: actualAt,
+              configuration: { ...f.binding.configuration, toolIds: [capability] },
+            });
+            yield* f.fs.writeFileString(
+              f.options.agentDirectory + "/auth.json",
+              json({ "command-code": { type: "api_key", key: "synthetic-guided-key" } }),
+            );
+            let calls = 0;
+            let toolResult = false;
+            let intentJSON = "";
+            const sequence: string[] = [];
+            const entered = yield* Deferred.make<void>();
+            const permitHeld = yield* Deferred.make<void>();
+            const permitRelease = yield* Deferred.make<void>();
+            const testScope = yield* Effect.scope;
+            const realGateway = yield* ProjectWorkGateway;
+            let permitOwner: Fiber.Fiber<void, SqlError> | undefined;
+            const gateway = ProjectWorkGateway.of({
+              ...realGateway,
+              write: (...args) =>
+                Effect.gen(function* () {
+                  if (disposition !== "ordinary") {
+                    sequence.push("bridge-entered");
+                    permitOwner = yield* f.sql
+                      .withTransaction(
+                        Effect.gen(function* () {
+                          sequence.push("actual-sql-permit-held");
+                          yield* Deferred.succeed(permitHeld, undefined);
+                          yield* Deferred.await(permitRelease);
+                          sequence.push("actual-sql-permit-released");
+                        }),
+                      )
+                      .pipe(Effect.forkIn(testScope));
+                    yield* Deferred.await(permitHeld);
+                    yield* Deferred.succeed(entered, undefined);
+                  }
+                  const result = yield* realGateway.write(...args);
+                  sequence.push("actual-gateway-write-committed");
+                  return result;
+                }),
+            });
+            yield* Effect.addFinalizer(() => Deferred.succeed(permitRelease, undefined));
+            const runtime = yield* makePiManagedRuntimeLive({
+              ...f.options,
+              memoryBytes: 536870912,
+              maxInputTokens: 18000,
+              cleanupDeadlineMs: 5000,
+              runtimeFiles: closure.files.map(({ source, target }) => ({ source, target })),
+              workerArgv: (identity, operation) => [
+                "/runtime/node",
+                "--max-old-space-size=512",
+                "/runtime/dist/worker.mjs",
+                identity.workerId,
+                String(identity.generation),
+                operation.operationId,
+                operation.operationKind,
+                "plain",
+              ],
+              readCatalogue: Effect.succeed({
+                source: "https://api.commandcode.ai/provider/v1/models",
+                fetchedAt: actualAt,
+                selectedEntry: {
+                  id: model,
+                  owned_by: "command-code",
+                  context_length: 20000,
+                  supported_endpoints: ["/chat/completions"],
+                },
+              }),
+              transport: async (_url, init) => {
+                calls++;
+                expect(calls).toBeLessThanOrEqual(2);
+                const body = parseTransportBody(init.body);
+                expect(body.tools?.map((entry) => entry.function.name)).toEqual([
+                  `project_work_${mode}`,
+                ]);
+                if (calls === 2) {
+                  expect(mode).toBe("report");
+                  toolResult = body.messages.some(
+                    (message) =>
+                      message.role === "tool" &&
+                      typeof message.content === "string" &&
+                      message.content.includes(`native-guided-${caseId}`),
+                  );
+                  expect(toolResult).toBe(true);
+                }
+                const delta =
+                  calls === 1
+                    ? {
+                        role: "assistant",
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: "guided-call",
+                            type: "function",
+                            function: {
+                              name: `project_work_${mode}`,
+                              arguments: json({ intentJSON }),
+                            },
+                          },
+                        ],
+                      }
+                    : { role: "assistant", content: "Finding retained" };
+                const data = [
+                  { model, choices: [{ index: 0, delta, finish_reason: null }] },
+                  {
+                    model,
+                    choices: [
+                      { index: 0, delta: {}, finish_reason: calls === 1 ? "tool_calls" : "stop" },
+                    ],
+                  },
+                  {
+                    model,
+                    choices: [],
+                    usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+                  },
+                ];
+                return new Response(
+                  data.map((entry) => `data: ${json(entry)}\n\n`).join("") + "data: [DONE]\n\n",
+                  { headers: { "content-type": "text/event-stream" } },
+                );
+              },
+            }).pipe(Effect.provideService(ProjectWorkGateway, gateway));
+            const instance = yield* runtime.forInstance({
+              instanceId: providerInstanceId,
+              enabled: true,
+              configuration: {},
+            });
+            const initialize = yield* instance.prepareOperation(
+              { threadId, kind: "initialize" },
+              () => Effect.void,
+            );
+            yield* initialize.run;
+            const before = yield* readCurrentState(f.sql, f.binding.projectId);
+            const task = before.tasks.find((entry) => entry.taskId === f.binding.taskId)!;
+            const assignment = before.foundationRecords!.find(
+              (record) => record.kind === "task-membership" && record.taskId === task.taskId,
+            )!;
+            const plan = before.foundationRecords!.find(
+              (record) => record.kind === "plan-revision" && record.taskId === task.taskId,
+            )!;
+            const envelope = {
+              projectId: f.binding.projectId,
+              taskId: task.taskId,
+              commandId: `native-guided-${caseId}`,
+              expectedRevision: before.revision,
+              expectedTaskRevision: task.revision,
+              specRevision: 1,
+            };
+            intentJSON = json(
+              mode === "report"
+                ? {
+                    ...envelope,
+                    type: "project-team.assignment.report",
+                    planRevision: 1,
+                    assignmentId: assignment.recordId,
+                    expectedAssignmentRevision: assignment.revision,
+                    summary: "The native SDK retained a sourced finding",
+                    evidenceIds: [],
+                    outputArtifactIds: [],
+                    outcome: "findings",
+                  }
+                : {
+                    ...envelope,
+                    type: "project-team.plan.propose",
+                    previousPlanId: plan.recordId,
+                    expectedPreviousPlanRevision: plan.revision,
+                    content: "New plan awaits human approval",
+                    dependencyTaskIds: [],
+                  },
+            );
+            const prompt = yield* instance.prepareOperation(
+              { threadId, kind: "prompt", prompt: "Use guided tool" },
+              () => Effect.void,
+            );
+            let stopInvoked = false;
+            let stopJoined = false;
+            let abortObserved = false;
+            const aborted = Promise.withResolvers<void>();
+            const originalAbort = AbortController.prototype.abort;
+            if (disposition === "held-cancel")
+              AbortController.prototype.abort = function (...args) {
+                originalAbort.apply(this, args);
+                if (stopInvoked && this.signal.aborted) {
+                  abortObserved = true;
+                  sequence.push("actual-cancellation-aborted");
+                  aborted.resolve();
+                }
+              };
+            let outcome;
+            try {
+              if (disposition === "ordinary") outcome = yield* prompt.run.pipe(Effect.result);
+              else {
+                const running = yield* Effect.forkChild(prompt.run.pipe(Effect.result));
+                yield* Effect.raceFirst(
+                  Deferred.await(entered),
+                  Fiber.join(running).pipe(
+                    Effect.flatMap((early) =>
+                      Effect.die("Operation returned before held SQL permit: " + json(early)),
+                    ),
+                  ),
+                );
+                let stopping: Fiber.Fiber<void, PiManagedRuntimeError> | undefined;
+                if (disposition === "held-cancel") {
+                  sequence.push("request-stop-invoked");
+                  stopInvoked = true;
+                  stopping = yield* Effect.forkChild(instance.requestStop(threadId));
+                  yield* Effect.promise(() => aborted.promise);
+                }
+                sequence.push("permit-release-requested");
+                yield* Deferred.succeed(permitRelease, undefined);
+                if (permitOwner) yield* Fiber.join(permitOwner);
+                outcome = yield* Fiber.join(running);
+                if (stopping) {
+                  yield* Fiber.join(stopping);
+                  stopJoined = true;
+                  sequence.push("stop-joined");
+                }
+                sequence.push("run-returned-" + outcome._tag);
+              }
+            } finally {
+              AbortController.prototype.abort = originalAbort;
+            }
+            const after = yield* readCurrentState(f.sql, f.binding.projectId);
+            const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts
+              WHERE project_id=${f.binding.projectId} AND command_id=${envelope.commandId}`;
+            yield* f.fs.writeFileString(
+              evidence + `/guided-${caseId}-attempt.json`,
+              json({
+                disposition,
+                sequence,
+                stopInvoked,
+                stopJoined,
+                abortObserved,
+                calls,
+                outcome,
+                beforeRevision: before.revision,
+                after,
+                receipts,
+                operations: yield* f.sql`SELECT * FROM project_team_pi_operation`,
+                processes: yield* f.sql`SELECT * FROM project_team_pi_process`,
+                modelRequests: yield* f.sql`SELECT * FROM project_team_model_request`,
+              }),
+            );
+            const owners = yield* f.sql<{
+              owner_json: string;
+              drain_json: string;
+            }>`SELECT owner_json,drain_json FROM project_team_pi_process`;
+            expect(owners).toHaveLength(2);
+            for (const row of owners) {
+              const owner = parseOwner(row.owner_json);
+              const drain = parseFullDrain(row.drain_json);
+              expect(drain.invocation).toBe(owner.invocation);
+              expect(drain.unit).toBe(owner.unit);
+              expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(true);
+              for (const pid of [drain.ownerPid, drain.launcherPid, drain.childPid])
+                expect(yield* f.fs.exists(`/proc/${pid}`)).toBe(false);
+            }
+            const canceled = disposition === "held-cancel";
+            expect(outcome._tag).toBe(mode === "report" && !canceled ? "Success" : "Failure");
+            expect(calls).toBe(mode === "report" && !canceled ? 2 : 1);
+            expect(receipts).toHaveLength(canceled ? 0 : 1);
+            if (!canceled) expect(after.revision).toBeGreaterThan(before.revision);
+            if (canceled) {
+              const terminals = yield* f.sql<{ terminal_json: string }>`
+                SELECT terminal_json FROM project_team_pi_operation WHERE operation_kind='prompt'`;
+              expect(terminals).toHaveLength(1);
+              expect((yield* decodeLocalTerminal(terminals[0]!.terminal_json)).outcome).not.toBe(
+                "success",
+              );
+              expect(stopJoined).toBe(true);
+              expect(abortObserved).toBe(true);
+              expect(after.revision).toBe(before.revision);
+              expect(sequence).not.toContain("actual-gateway-write-committed");
+              expect(
+                after.evidence.some(
+                  (entry) => entry.detail === "The native SDK retained a sourced finding",
+                ),
+              ).toBe(false);
+            } else if (mode === "report") {
+              expect(
+                after.evidence.some(
+                  (entry) => entry.detail === "The native SDK retained a sourced finding",
+                ),
+              ).toBe(true);
+            } else {
+              expect(
+                after.foundationRecords!.some(
+                  (record) =>
+                    record.kind === "plan-revision" &&
+                    record.content === "New plan awaits human approval" &&
+                    record.status === "proposed",
+                ),
+              ).toBe(true);
+              yield* rejected(instance.readSession(threadId));
+            }
+            yield* f.fs.writeFileString(
+              evidence + `/guided-${caseId}.json`,
+              json({
+                mode,
+                disposition,
+                sequence,
+                stopJoined,
+                abortObserved,
+                calls,
+                toolResult,
+                beforeRevision: before.revision,
+                afterRevision: after.revision,
+                receipts,
+                owners,
+                outcome: outcome._tag,
+              }),
+            );
+          }),
+        ),
+      );
+    }
+  },
+);
 it.effect(
   "inspection reads explicit catalogue and models without credentials, transport or process launch",
   () =>
