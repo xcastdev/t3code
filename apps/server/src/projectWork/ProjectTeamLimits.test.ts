@@ -421,7 +421,6 @@ describe("resolveProjectTeamLimits", () => {
     "cross-project",
     "unrelated-root",
     "duplicate",
-    "too-long",
     "membership-disagreement",
   ] as const)("denies invalid persisted run chain: %s", (kind) => {
     const input = childFixture(1);
@@ -432,13 +431,6 @@ describe("resolveProjectTeamLimits", () => {
     if (kind === "cross-project") Reflect.set(parent, "projectId", "other");
     if (kind === "unrelated-root") Reflect.set(parent, "taskId", "other");
     if (kind === "duplicate") input.state.foundationRecords.push(binding("parent"));
-    if (kind === "too-long") {
-      Reflect.set(parent, "parentRunId", "run-1");
-      for (let n = 1; n <= 9; n++)
-        input.state.foundationRecords.push(
-          binding(`run-${n}`, taskId, n === 9 ? undefined : `run-${n + 1}`),
-        );
-    }
     if (kind === "membership-disagreement")
       input.state.foundationRecords = input.state.foundationRecords.map((entry) =>
         entry.kind === "task-membership" && entry.taskId === input.taskId
@@ -575,5 +567,101 @@ describe("resolveProjectTeamLimits", () => {
       _tag: "Blocked",
       reason: "invalid-task-lineage",
     });
+  });
+  const replacements = (count: number, idTask = taskId) =>
+    Array.from({ length: count }, (_, index) =>
+      binding(`replacement-${index}`, idTask, index === 0 ? undefined : `replacement-${index - 1}`),
+    );
+  it.each([12, 64])("preserves root budget through %s same-task replacement sessions", (count) => {
+    const history = replacements(count);
+    const input = fixture([
+      role(),
+      limits(),
+      membership(),
+      ...(count === 64 ? history.reverse() : history),
+    ]);
+    expect(
+      eligible({ ...input, parentRunId: `replacement-${count - 1}`, rootBudget: budget }),
+    ).toMatchObject({
+      rootTaskId: taskId,
+      maximumTokens: 1000,
+      rootDeadlineAtMs: 1100,
+      delegationDepth: 0,
+    });
+    expect(resolveProjectTeamLimits(input)).toEqual({
+      _tag: "Blocked",
+      reason: "root-budget-required",
+    });
+  });
+  it("permits a leaf replacement at maximum task delegation depth", () => {
+    const input = childFixture(8);
+    input.state.foundationRecords = input.state.foundationRecords.map((record) =>
+      record.kind === "limits" || record.kind === "role-revision"
+        ? { ...record, delegationDepth: 8 }
+        : record,
+    );
+    for (let depth = 0; depth <= 8; depth++)
+      input.state.foundationRecords.push(
+        binding(
+          `depth-run-${depth}`,
+          depth === 0 ? taskId : ProjectWorkTaskId.make(`child-${depth}`),
+          depth === 0 ? undefined : `depth-run-${depth - 1}`,
+        ),
+      );
+    input.state.foundationRecords.push(binding("leaf-replacement", input.taskId, "depth-run-8"));
+    expect(
+      eligible({ ...input, parentRunId: "leaf-replacement", rootBudget: budget }),
+    ).toMatchObject({
+      rootTaskId: taskId,
+      maximumTokens: 1000,
+      rootDeadlineAtMs: 1100,
+      delegationDepth: 8,
+    });
+  });
+  it.each(["cycle", "missing", "duplicate", "cross-project"] as const)(
+    "denies %s deep in replacement history",
+    (kind) => {
+      const history = replacements(16);
+      const first = history[0]!;
+      if (kind === "cycle") Reflect.set(first, "parentRunId", "replacement-15");
+      if (kind === "missing") Reflect.set(first, "parentRunId", "missing-ancestor");
+      if (kind === "cross-project") Reflect.set(first, "projectId", "other");
+      const input = fixture([
+        role(),
+        limits(),
+        membership(),
+        ...history.reverse(),
+        ...(kind === "duplicate" ? [binding("replacement-0")] : []),
+      ]);
+      expect(resolveProjectTeamLimits({ ...input, rootBudget: budget })).toEqual({
+        _tag: "Blocked",
+        reason: "invalid-run-lineage",
+      });
+    },
+  );
+  it("denies a later run that skips its task parent despite earlier valid ancestry", () => {
+    const input = childFixture(2);
+    input.state.foundationRecords.push(
+      binding("root-run"),
+      binding("parent-run", ProjectWorkTaskId.make("child-1"), "root-run"),
+      binding("valid-prior", input.taskId, "parent-run"),
+      binding("invalid-prior", input.taskId, "root-run"),
+    );
+    expect(resolveProjectTeamLimits({ ...input, rootBudget: budget })).toEqual({
+      _tag: "Blocked",
+      reason: "invalid-run-lineage",
+    });
+  });
+  it("denies a sibling run within the same canonical project root", () => {
+    const input = childFixture(1);
+    const sibling = ProjectWorkTaskId.make("sibling");
+    input.state.tasks.push(task(sibling));
+    input.state.foundationRecords.push(
+      membership(sibling, { parentTaskId: taskId }),
+      binding("sibling-run", sibling),
+    );
+    expect(
+      resolveProjectTeamLimits({ ...input, parentRunId: "sibling-run", rootBudget: budget }),
+    ).toEqual({ _tag: "Blocked", reason: "invalid-run-lineage" });
   });
 });

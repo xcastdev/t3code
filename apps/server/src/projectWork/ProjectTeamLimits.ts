@@ -186,9 +186,15 @@ export const resolveProjectTeamLimits = (input: {
   if (input.writable && policy.projectWritableWorkers === 0)
     return blocked("writable-capacity-exhausted");
 
-  const priorRuns = records.filter(
-    (r): r is Run => r.kind === "run-binding" && r.taskId === input.taskId,
-  );
+  const runs = records.filter((record): record is Run => record.kind === "run-binding");
+  const priorRuns = runs.filter((run) => run.taskId === input.taskId);
+  const runsById = new Map<string, Run>();
+  const duplicateRunIds = new Set<string>();
+  for (const run of runs) {
+    if (runsById.has(run.recordId)) duplicateRunIds.add(run.recordId);
+    else runsById.set(run.recordId, run);
+  }
+  const membershipsByTask = new Map(lineage.map((entry) => [entry.taskId, entry]));
   const recordedParent = membership.assignment?.parentRunId;
   if (
     input.parentRunId !== undefined &&
@@ -202,32 +208,33 @@ export const resolveProjectTeamLimits = (input: {
     ...priorRuns.map((run) => run.recordId),
     ...(parentRunId === undefined ? [] : [parentRunId]),
   ];
+  const validatedRuns = new Set<string>();
   for (const start of starts) {
     const seenRuns = new Set<string>();
     let runId: string | undefined = start;
     let previousTaskId = input.taskId;
     while (runId !== undefined) {
-      if (seenRuns.size >= maximumLineageNodes || seenRuns.has(runId))
+      const run = runsById.get(runId);
+      if (run === undefined || duplicateRunIds.has(runId)) return blocked("invalid-run-lineage");
+      const previousMembership = membershipsByTask.get(previousTaskId);
+      // Every incoming edge must match task ancestry, even when its suffix was validated earlier.
+      if (run.taskId !== previousTaskId && run.taskId !== previousMembership?.parentTaskId)
         return blocked("invalid-run-lineage");
-      seenRuns.add(runId);
-      const runs = records.filter(
-        (r): r is Run => r.kind === "run-binding" && r.recordId === runId,
-      );
-      if (runs.length !== 1) return blocked("invalid-run-lineage");
-      const run = runs[0]!;
-      const previousMembership = lineage.find((entry) => entry.taskId === previousTaskId);
+      if (validatedRuns.has(runId)) break;
       if (
+        seenRuns.has(runId) ||
         !validRun(run) ||
         !validId(run.recordId) ||
         !validInteger(run.revision) ||
         run.projectId !== state.projectId ||
-        !seenTasks.has(run.taskId) ||
-        (run.taskId !== previousTaskId && run.taskId !== previousMembership?.parentTaskId)
+        !seenTasks.has(run.taskId)
       )
         return blocked("invalid-run-lineage");
+      seenRuns.add(runId);
       previousTaskId = run.taskId;
       runId = run.parentRunId;
     }
+    for (const id of seenRuns) validatedRuns.add(id);
   }
   if (
     input.rootBudget === undefined &&
