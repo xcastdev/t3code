@@ -40,19 +40,7 @@ const boundedText = (maximum: number) =>
   );
 const canonicalPath = boundedText(4096).check(
   Schema.isPattern(/^\/(?:[^/\\\0\r\n]+(?:\/[^/\\\0\r\n]+)*)$/),
-  Schema.makeFilter(
-    (value) =>
-      !value
-        .split("/")
-        .some(
-          (part) =>
-            part === "." ||
-            part === ".." ||
-            part.startsWith("@") ||
-            part.startsWith("~") ||
-            part.startsWith("file:"),
-        ),
-  ),
+  Schema.makeFilter((value) => !value.split("/").some((part) => part === "." || part === "..")),
 );
 const Selection = Schema.Array(
   Schema.Struct({
@@ -400,7 +388,14 @@ export async function makePiSelectedSkillRead(
                 assertPath(path);
                 await verify();
                 // The public pinned SDK sniffs at most 4,100 bytes from this held FD.
-                const mime = await loaded.detectSupportedImageMimeTypeFromFile(descriptor);
+                const mime = await loaded
+                  .detectSupportedImageMimeTypeFromFile(descriptor)
+                  .catch(() => {
+                    // The public detector owns a second FD. Its rejected promise
+                    // cannot confirm that FD closed; Root must retain outer ownership.
+                    uncertain = true;
+                    throw failure();
+                  });
                 await verify();
                 if (mime) throw failure();
                 return null;
