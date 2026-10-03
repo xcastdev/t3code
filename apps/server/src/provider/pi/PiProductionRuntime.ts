@@ -513,11 +513,12 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       );
       return {
         ...managed,
-        prepareOperation: (...args: Parameters<typeof managed.prepareOperation>) =>
-          Effect.suspend(() => {
+        prepareOperation: (...args: Parameters<typeof managed.prepareOperation>) => {
+          const preparation = managed.prepareOperation(...args);
+          return Effect.suspend(() => {
             if (!accepting) return Effect.fail(closed());
             preparing++;
-            return managed.prepareOperation(...args).pipe(
+            return preparation.pipe(
               Effect.map((prepared) => ({
                 ...prepared,
                 run: Effect.suspend(() => (accepting ? prepared.run : Effect.fail(closed()))),
@@ -528,7 +529,8 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
                 }),
               ),
             );
-          }),
+          });
+        },
       };
     }).pipe(
       Effect.provide(services),

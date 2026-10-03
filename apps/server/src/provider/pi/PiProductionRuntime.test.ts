@@ -932,10 +932,17 @@ product("the approved Runtime consumes factory asset revalidation before durable
         Effect.gen(function* () {
           const managed = yield* service.forInstance(instance);
           expect(f.revalidationCalls).toBe(0);
-          const prepared = yield* managed.prepareOperation(
-            { kind: "initialize", threadId },
-            () => Effect.void,
-          );
+          const request = {
+            kind: "initialize" as const,
+            threadId,
+            cwd: assigned,
+            modelSelection: { instanceId: providerInstanceId, model },
+          };
+          const preparation = managed.prepareOperation(request, () => Effect.void);
+          // The factory must preserve caller values before any asynchronous preparation.
+          request.cwd = primary;
+          request.modelSelection.model = "mutated-after-call";
+          const prepared = yield* preparation;
           expect(f.revalidationCalls).toBe(1);
           const before =
             yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
