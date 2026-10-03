@@ -1,4 +1,4 @@
-import { ProjectTeamEffect } from "@t3tools/contracts";
+import { canonicalProjectWorkPayload, ProjectTeamEffect } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as NodeCrypto from "node:crypto";
@@ -400,50 +400,72 @@ for (const mode of ["unchanged", "stop-first", "expired", "expires-in-callback"]
   );
 }
 
-const terminalFixture = Effect.gen(function* () {
-  const f = yield* fixture;
-  const op = yield* f.prepare();
-  // Captured owner and drain metadata are synthetic SQL fixtures, not native process proof.
-  const owner = {
-    type: "owner" as const,
-    unit: f.allocation.unit,
-    nonce: f.allocation.nonce,
-    invocation: "a".repeat(32),
-    cgroup: `/sys/fs/cgroup/${f.allocation.unit}`,
-    pid: 123,
-    memoryBytes: f.allocation.policy.memoryBytes,
-    swapBytes: 0,
-    oomGroup: 1,
-  };
-  const drain = {
-    unit: owner.unit,
-    invocation: owner.invocation,
-    cgroup: owner.cgroup,
-    ownerPid: owner.pid,
-    memoryBytes: owner.memoryBytes,
-    swapBytes: 0,
-    oomGroup: 1,
-    launcherPid: 124,
-    childPid: 125,
-    childExitCode: 0,
-    kernel: "populated 0\nfrozen 0",
-  };
-  const activate = Effect.gen(function* () {
-    yield* f.operations.persistence(op).claimActivation(f.allocation);
-    yield* f.operations.persistence(op).beforeStart(owner);
-    yield* f.operations.persistNative(op, nativeReference);
+const terminalFixtureFor = (stable = false) =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const request = {
+      threadId,
+      kind: "initialize" as const,
+      ...(stable ? { operationId: "stable-initialize" } : {}),
+    };
+    const requestHash = stable
+      ? NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(request)).digest("hex")
+      : "request";
+    const resourceHash = "a".repeat(64);
+    const op = stable
+      ? yield* f.operations.prepare(f.identity, request, requestHash, {
+          allocation: f.allocation,
+          workerId: "worker",
+          operationId: request.operationId!,
+          resourceHash,
+        })
+      : yield* f.prepare();
+    // Captured owner and drain metadata are synthetic SQL fixtures, not native process proof.
+    const owner = {
+      type: "owner" as const,
+      unit: f.allocation.unit,
+      nonce: f.allocation.nonce,
+      invocation: "a".repeat(32),
+      cgroup: `/sys/fs/cgroup/${f.allocation.unit}`,
+      pid: 123,
+      memoryBytes: f.allocation.policy.memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+    };
+    const drain = {
+      unit: owner.unit,
+      invocation: owner.invocation,
+      cgroup: owner.cgroup,
+      ownerPid: owner.pid,
+      memoryBytes: owner.memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+      launcherPid: 124,
+      childPid: 125,
+      childExitCode: 0,
+      kernel: "populated 0\nfrozen 0",
+    };
+    const activate = Effect.gen(function* () {
+      yield* f.operations.persistence(op).claimActivation(f.allocation);
+      yield* f.operations.persistence(op).beforeStart(owner);
+      yield* f.operations.persistNative(op, nativeReference);
+    });
+    const terminal = (
+      outcome: PiSessionTerminal["outcome"],
+      drained = false,
+    ): PiSessionTerminal => ({
+      identity: { workerId: op.workerId, generation: 0 },
+      operation: op.operation,
+      outcome,
+      ownerCaptured: drained,
+      native: drained ? nativeReference : null,
+      drain: drained ? drain : null,
+      accountingReceipts: [],
+    });
+    return { ...f, op, owner, drain, activate, terminal, request, requestHash, resourceHash };
   });
-  const terminal = (outcome: PiSessionTerminal["outcome"], drained = false): PiSessionTerminal => ({
-    identity: { workerId: op.workerId, generation: 0 },
-    operation: op.operation,
-    outcome,
-    ownerCaptured: drained,
-    native: drained ? nativeReference : null,
-    drain: drained ? drain : null,
-    accountingReceipts: [],
-  });
-  return { ...f, op, owner, drain, activate, terminal };
-});
+
+const terminalFixture = terminalFixtureFor();
 
 for (const mode of [
   "allocated-canceled",
@@ -1028,3 +1050,209 @@ for (const mode of ["control", "before-prepare", "before-final-commit", "after-c
     ),
   );
 }
+
+for (const mode of [
+  "completed",
+  "prepared",
+  "starting",
+  "running",
+  "quarantine",
+  "failed",
+  "request",
+  "hash",
+  "kind",
+  "resource",
+  "binding",
+  "generation",
+  "scalar",
+  "allocation",
+  "owner",
+  "drain",
+  "native",
+  "terminal",
+  "deadline",
+  "retired",
+] as const) {
+  it.effect(`stable Pi identity never repeats external work: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixtureFor(true);
+        if (mode !== "prepared") yield* f.activate;
+        if (!["prepared", "starting", "running", "quarantine"].includes(mode))
+          yield* f.operations.persistTerminal(
+            f.op,
+            f.terminal(mode === "failed" ? "failed" : "success", true),
+          );
+        if (["starting", "quarantine"].includes(mode))
+          yield* f.sql`UPDATE project_team_pi_operation SET status=${mode}`;
+        let request: typeof f.request & { readonly cwd?: string } = f.request;
+        let hash = f.requestHash;
+        let resource = f.resourceHash;
+        if (mode === "request") request = { ...request, cwd: "changed" };
+        if (mode === "hash") hash = "b".repeat(64);
+        if (mode === "kind")
+          yield* f.sql`UPDATE project_team_pi_operation SET operation_kind='compact'`;
+        if (mode === "resource") resource = "b".repeat(64);
+        if (mode === "scalar")
+          yield* f.sql`UPDATE project_team_pi_operation SET project_id='other'`;
+        if (mode === "allocation")
+          yield* f.sql`UPDATE project_team_pi_process SET allocation_json=json_set(allocation_json,'$.nonce','other')`;
+        if (mode === "owner")
+          yield* f.sql`UPDATE project_team_pi_process SET owner_json=json_set(owner_json,'$.nonce','other')`;
+        if (mode === "drain")
+          yield* f.sql`UPDATE project_team_pi_process SET drain_json=json_set(drain_json,'$.childExitCode',1)`;
+        if (mode === "native")
+          yield* f.sql`UPDATE project_team_pi_operation SET native_json=json_set(native_json,'$.leafId','other')`;
+        if (mode === "terminal")
+          yield* f.sql`UPDATE project_team_pi_operation SET terminal_json='{'`;
+        if (["binding", "generation", "retired"].includes(mode)) {
+          const binding = (yield* f.operations.current(f.identity)).binding;
+          yield* restoreHistoricalBinding({
+            ...binding,
+            revision: binding.revision + 1,
+            ...(mode === "binding"
+              ? { branch: "other" }
+              : mode === "generation"
+                ? { generation: 1 }
+                : { status: "settled" as const }),
+          });
+        }
+        if (mode === "deadline") yield* TestClock.setTime(f.op.deadlineAtMs);
+        const effect = f.operations.lookup(f.identity, request, hash, resource);
+        if (mode === "completed") {
+          const receipt = yield* effect;
+          expect(receipt?.terminal).toEqual(f.terminal("success", true));
+          expect(receipt?.operation).toEqual(f.op.operation);
+          // Reconstructing the private service models response loss and a server restart.
+          const restarted = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+          expect((yield* restarted.lookup(f.identity, request, hash, resource))?.terminal).toEqual(
+            receipt?.terminal,
+          );
+        } else yield* typedDenial(effect);
+        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(1);
+        expect((yield* f.sql`SELECT unit FROM project_team_pi_process`).length).toBe(1);
+        expect((yield* f.sql`SELECT reservation_id FROM project_team_model_request`).length).toBe(
+          0,
+        );
+      }),
+    ),
+  );
+}
+
+for (const mode of [
+  "reported",
+  "lost-receipt",
+  "changed-settlement",
+  "changed-reservation",
+  "changed-charge",
+  "changed-root",
+  "pending",
+  "budget",
+] as const) {
+  it.effect(`stable Pi replay preserves original accounting: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixtureFor(true);
+        yield* f.activate;
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "command-code-ling-free",
+          model,
+          acceptedReportedModels: [model],
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const reservation = {
+          workerId: f.op.workerId,
+          operationId: f.op.operation.operationId,
+          generation: 0,
+          requestId: 1,
+          routeId: "command-code-ling-free",
+          provider: "command-code" as const,
+          model,
+          maxInputTokens: 100,
+          maxOutputTokens: 100,
+          callCount: 1 as const,
+          deadlineAtMs: time + 10000,
+        };
+        const reserved = yield* accounting.reserve(f.op.principal, reservation);
+        const usage = { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 };
+        const settled = yield* accounting.settle({
+          ...reservation,
+          reservationId: reserved.reservationId,
+          outcome: "reported",
+          chargedInputTokens: 10,
+          chargedOutputTokens: 20,
+          reportedModel: model,
+          reportedUsage: usage,
+        });
+        const terminal = {
+          ...f.terminal("success", true),
+          accountingReceipts: [
+            {
+              requestId: 1,
+              routeId: reservation.routeId,
+              provider: reservation.provider,
+              model,
+              reportedModel: model,
+              usage,
+              reservationId: reserved.reservationId,
+              accountingReceiptId: settled.accountingReceiptId,
+            },
+          ],
+        };
+        yield* f.operations.persistTerminal(f.op, terminal);
+        if (mode === "lost-receipt")
+          yield* f.sql`UPDATE project_team_model_request SET accounting_receipt_id=NULL`;
+        if (mode === "changed-settlement")
+          yield* f.sql`UPDATE project_team_model_request SET settlement_json=json_set(settlement_json,'$.reportedUsage.total_tokens',99)`;
+        if (mode === "changed-reservation")
+          yield* f.sql`UPDATE project_team_model_request SET reservation_json=json_set(reservation_json,'$.requestId',2)`;
+        if (mode === "changed-charge")
+          yield* f.sql`UPDATE project_team_model_request SET charged_input_tokens=99`;
+        if (mode === "changed-root")
+          yield* f.sql`UPDATE project_team_model_request SET run_id='other'`;
+        if (mode === "pending") yield* f.sql`UPDATE project_team_model_request SET status='held'`;
+        if (mode === "budget")
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=maximum_tokens+1`;
+        const replay = f.operations.lookup(f.identity, f.request, f.requestHash, f.resourceHash);
+        if (mode === "reported") {
+          expect((yield* replay)?.terminal).toEqual(terminal);
+          expect((yield* replay)?.terminal).toEqual(terminal);
+        } else yield* typedDenial(replay, "uncertain");
+        expect((yield* f.sql`SELECT reservation_id FROM project_team_model_request`).length).toBe(
+          1,
+        );
+      }),
+    ),
+  );
+}
+it.effect("a stable lookup miss cannot admit two competing preparations", () =>
+  fileTest(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const request = { threadId, kind: "initialize" as const, operationId: "competing-root-id" };
+      const hash = NodeCrypto.createHash("sha256")
+        .update(canonicalProjectWorkPayload(request))
+        .digest("hex");
+      const resourceHash = "a".repeat(64);
+      expect(yield* f.operations.lookup(f.identity, request, hash, resourceHash)).toBeUndefined();
+      const prepare = (workerId: string) =>
+        f.operations
+          .prepare(f.identity, request, hash, {
+            allocation: f.allocation,
+            operationId: request.operationId,
+            workerId,
+            resourceHash,
+          })
+          .pipe(Effect.result);
+      const results = yield* Effect.all([prepare("first"), prepare("second")], {
+        concurrency: "unbounded",
+      });
+      expect(results.filter((entry) => entry._tag === "Success")).toHaveLength(1);
+      expect(results.filter((entry) => entry._tag === "Failure")).toHaveLength(1);
+      yield* typedDenial(f.operations.lookup(f.identity, request, hash, resourceHash), "conflict");
+      expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(1);
+      expect((yield* f.sql`SELECT unit FROM project_team_pi_process`).length).toBe(1);
+    }),
+  ),
+);

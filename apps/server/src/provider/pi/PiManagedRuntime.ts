@@ -36,6 +36,8 @@ export class PiManagedRuntimeError extends Schema.TaggedError<PiManagedRuntimeEr
 ) {}
 
 type Assertions = {
+  /** Stable identity supplied only by Root's private durable dispatch producer. */
+  readonly operationId?: PiWorkerOperation["operationId"];
   readonly runtimeMode?: ProviderSession["runtimeMode"];
   readonly cwd?: string;
   readonly modelSelection?: ModelSelection;

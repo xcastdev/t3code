@@ -1,7 +1,12 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
-import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
-import { CommandId, ManagedSkillKey, SkillCatalogRevision } from "@t3tools/contracts";
+import { PiManagedRuntimeError, type PiManagedOperationRequest } from "./PiManagedRuntime.ts";
+import {
+  canonicalProjectWorkPayload,
+  CommandId,
+  ManagedSkillKey,
+  SkillCatalogRevision,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
@@ -4039,3 +4044,271 @@ it.effect("joins a held durable preparation receipt before canceling its never-s
     }),
   ).pipe(Effect.provide(selectedRuntimeLayer)),
 );
+
+// Durable metadata below is synthetic; these cases exercise real SQL and the real
+// nonmutating file reader without starting a Pi process or model transport.
+const stableReplayFixtureFor = (prompt = false) =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const request: PiManagedOperationRequest = prompt
+      ? {
+          threadId,
+          kind: "prompt",
+          prompt: "Original approved assignment",
+          operationId: "root-stable-assignment",
+        }
+      : { threadId, kind: "initialize", operationId: "root-stable-initialize" };
+    if (prompt)
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        status: "running",
+        sessionId: "original-native",
+      });
+    const operationDirectory =
+      f.options.nativeStateRoot +
+      "/" +
+      NodeCrypto.createHash("sha256")
+        .update(
+          json([
+            "environment",
+            providerInstanceId,
+            threadId,
+            f.binding.recordId,
+            f.binding.generation,
+          ]),
+        )
+        .digest("hex");
+    yield* f.fs.makeDirectory(operationDirectory + "/sessions", { recursive: true });
+    const allocation = yield* preallocatePiManagedProcess({
+      workspaceRoot: f.worktree,
+      workspaceAccess: "readonly",
+      nativeStateRoot: operationDirectory,
+      protectedRoots: f.options.protectedRoots,
+      runtimeFiles: f.options.runtimeFiles,
+      argv: ["/bin/true"],
+      memoryBytes: f.options.memoryBytes,
+      runtimeSeconds: 10,
+    });
+    const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+    const requestHash = NodeCrypto.createHash("sha256")
+      .update(canonicalProjectWorkPayload(request))
+      .digest("hex");
+    const op = yield* operations.prepare({ providerInstanceId, threadId }, request, requestHash, {
+      allocation,
+      operationId: request.operationId!,
+      workerId: "original-worker",
+      resourceHash: piManagedSkillResourceIdentity([]),
+    });
+    const owner = {
+      type: "owner" as const,
+      unit: allocation.unit,
+      nonce: allocation.nonce,
+      invocation: "a".repeat(32),
+      cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+      pid: 123,
+      memoryBytes: allocation.policy.memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+    };
+    yield* operations.persistence(op).claimActivation(allocation);
+    yield* operations.persistence(op).beforeStart(owner);
+    const native = {
+      sessionId: "original-native",
+      sessionReference: "sessions/original.jsonl",
+      leafId: "original-leaf",
+      persisted: true,
+    };
+    yield* operations.persistNative(op, native);
+    const terminal = {
+      identity: { workerId: op.workerId, generation: 0 },
+      operation: op.operation,
+      outcome: "success" as const,
+      ownerCaptured: true,
+      native,
+      accountingReceipts: [],
+      drain: {
+        unit: owner.unit,
+        invocation: owner.invocation,
+        cgroup: owner.cgroup,
+        ownerPid: owner.pid,
+        memoryBytes: owner.memoryBytes,
+        swapBytes: 0,
+        oomGroup: 1,
+        launcherPid: 124,
+        childPid: 125,
+        childExitCode: 0,
+        kernel: "removed",
+      },
+    };
+    yield* operations.persistTerminal(op, terminal);
+    const nativeFile = operationDirectory + "/sessions/original.jsonl";
+    const bytes =
+      [
+        json({
+          type: "session",
+          version: 3,
+          id: native.sessionId,
+          timestamp: at,
+          cwd: "/workspace",
+        }),
+        json({
+          type: "custom",
+          id: native.leafId,
+          parentId: null,
+          timestamp: at,
+          customType: "stable-fixture",
+          data: { retained: true },
+        }),
+      ].join("\n") + "\n";
+    yield* f.fs.writeFileString(nativeFile, bytes);
+    // Configuration inspection is cached and read-only; no credential is resolved.
+    yield* f.fs.writeFileString(
+      f.options.agentDirectory + "/settings.json",
+      json({
+        defaultProvider: "command-code",
+        defaultModel: model,
+        packages: [],
+        extensions: [],
+        skills: [],
+        promptTemplates: [],
+      }),
+    );
+    return { ...f, request, op, terminal, nativeFile, bytes };
+  });
+for (const mode of [
+  "restart",
+  "prompt-restart",
+  "changed-request",
+  "bad-id",
+  "active",
+  "uncertain",
+  "missing-native",
+  "changed-native",
+  "expired",
+  "retired",
+  "held-stop",
+  "run-expired",
+] as const) {
+  it.effect(`replays stable Pi receipts without allocation or event effects: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor(mode === "prompt-restart");
+        let request: PiManagedOperationRequest = f.request;
+        if (mode === "changed-request")
+          request = { ...request, kind: "prompt", prompt: "different" };
+        if (mode === "bad-id") request = { ...request, operationId: "../outside" };
+        if (mode === "active" || mode === "uncertain")
+          yield* f.sql`UPDATE project_team_pi_operation SET status=${mode === "active" ? "running" : "quarantine"}`;
+        if (mode === "missing-native") yield* f.fs.remove(f.nativeFile);
+        if (mode === "changed-native")
+          yield* f.fs.writeFileString(f.nativeFile, f.bytes.replace("original-leaf", "other-leaf"));
+        if (mode === "expired") yield* TestClock.setTime(f.op.deadlineAtMs);
+        if (mode === "retired") {
+          const binding = (yield* readCurrentState(
+            f.sql,
+            f.binding.projectId,
+          )).foundationRecords?.find(
+            (record) => record.kind === "run-binding" && record.recordId === f.binding.recordId,
+          );
+          if (binding?.kind !== "run-binding") return yield* Effect.die("binding missing");
+          yield* restoreHistoricalBinding({
+            ...binding,
+            revision: binding.revision + 1,
+            status: "settled",
+          });
+        }
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let held = false;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (
+              mode !== "held-stop" ||
+              held ||
+              !statement
+                .compile()[0]
+                .includes("SELECT * FROM project_team_pi_operation WHERE operation_id=")
+            )
+              return statement;
+            return statement.pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  held = true;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }),
+              ),
+            );
+          },
+        });
+        let events = 0;
+        let allocations = 0;
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          allocateSkillStage: Effect.sync(() => {
+            allocations++;
+            throw Error("unexpected allocation");
+          }),
+        }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const instance = yield* runtime
+          .forInstance({ instanceId: providerInstanceId, enabled: true, configuration: {} })
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const pending = yield* instance
+          .prepareOperation(request, () =>
+            Effect.sync(() => {
+              events++;
+            }),
+          )
+          .pipe(
+            Effect.result,
+            Effect.provideService(SqlClient.SqlClient, observedSql),
+            Effect.forkChild,
+          );
+        if (mode === "held-stop") {
+          yield* Deferred.await(entered);
+          const stop = yield* instance.requestStop(threadId).pipe(Effect.forkChild);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(stop);
+        }
+        const result = yield* Fiber.join(pending);
+        if (mode === "restart" || mode === "prompt-restart" || mode === "run-expired") {
+          expect(result._tag).toBe("Success");
+          if (result._tag !== "Success") return yield* Effect.die("replay denied");
+          expect(result.success.operation).toEqual(f.op.operation);
+          if (result.success.kind === "prompt")
+            expect(result.success.turnId).toBe(f.op.operation.operationId);
+          if (mode === "run-expired") {
+            yield* TestClock.setTime(f.op.deadlineAtMs);
+            yield* rejected(
+              result.success.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql)),
+            );
+          } else {
+            const receipt = yield* result.success.run.pipe(
+              Effect.provideService(SqlClient.SqlClient, observedSql),
+            );
+            expect(receipt.terminal).toEqual(f.terminal);
+            expect(receipt.session.resumeCursor).toEqual(f.terminal.native);
+            expect(
+              (yield* result.success.run.pipe(
+                Effect.provideService(SqlClient.SqlClient, observedSql),
+              )).terminal,
+            ).toEqual(f.terminal);
+            yield* rejected(result.success.steer("steer", "later"));
+            yield* rejected(result.success.interrupt);
+            expect(yield* f.fs.readFileString(f.nativeFile)).toBe(f.bytes);
+          }
+        } else expect(result._tag).toBe("Failure");
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+        expect(allocations).toBe(0);
+        expect(events).toBe(0);
+        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(1);
+        expect((yield* f.sql`SELECT reservation_id FROM project_team_model_request`).length).toBe(
+          0,
+        );
+      }),
+    ),
+  );
+}

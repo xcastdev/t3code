@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 import {
   IsoDateTime,
+  canonicalProjectWorkPayload,
   ManagedSkillKey,
   ManagedSkillManifest,
   ProviderInstanceId,
@@ -65,7 +66,11 @@ import {
   piProjectWorkToolCapabilities,
 } from "./PiProjectWorkTools.ts";
 import type { PiModelBrokerConfig, PiModelTool } from "./PiModelBroker.ts";
-import type { PiNativeReference, PiWorkerIdentity, PiWorkerOperation } from "./PiWorkerProtocol.ts";
+import {
+  PiWorkerOperation,
+  type PiNativeReference,
+  type PiWorkerIdentity,
+} from "./PiWorkerProtocol.ts";
 import type { PiSkillStageLifetime } from "./PiSkillStageLifetime.ts";
 import {
   piManagedSkillResourceIdentity,
@@ -98,6 +103,7 @@ const decodeSkillCandidates = Schema.decodeUnknownEffect(
   }),
   { onExcessProperty: "error" },
 );
+const decodeOperation = Schema.decodeEffect(PiWorkerOperation);
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 const deny = (detail: string, code: PiManagedRuntimeError["code"] = "denied") =>
   new PiManagedRuntimeError({ code, detail });
@@ -599,6 +605,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     resolveOperation: operations.resolveOperation,
   });
   const crypto = yield* Crypto.Crypto;
+  const clock = yield* Clock.Clock;
   const fs = yield* FileSystem.FileSystem;
   const paths = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -1093,6 +1100,132 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 );
                 yield* preparationCurrent;
                 const resourceHash = piManagedSkillResourceIdentity(selection);
+                const requestHash = digest(canonicalProjectWorkPayload(request));
+                const replay = yield* operations.lookup(
+                  identity(request.threadId),
+                  request,
+                  requestHash,
+                  resourceHash,
+                );
+                if (replay) {
+                  const context = contextFor(replay.authority);
+                  const validateReplay = guard(
+                    Effect.gen(function* () {
+                      yield* preparationCurrent;
+                      const current = yield* operations.lookup(
+                        identity(request.threadId),
+                        request,
+                        requestHash,
+                        resourceHash,
+                      );
+                      if (
+                        !current ||
+                        canonicalProjectWorkPayload(current.terminal) !==
+                          canonicalProjectWorkPayload(replay.terminal) ||
+                        contextFor(current.authority) !== context
+                      )
+                        return yield* deny("Pi replay receipt or authority changed", "conflict");
+                      const physical = workspace.fence.directories.find(
+                        (entry) => entry.path === binding.worktree,
+                      );
+                      if (
+                        !physical ||
+                        physical.dev !== String(current.workspace.dev) ||
+                        physical.ino !== String(current.workspace.ino)
+                      )
+                        return yield* deny(
+                          "Pi replay workspace physical identity changed",
+                          "conflict",
+                        );
+                      if (
+                        piManagedSkillResourceIdentity(
+                          yield* selectedSkills(current.authority, workspace),
+                        ) !== resourceHash
+                      )
+                        return yield* deny("Pi replay selected content changed", "conflict");
+                      yield* verifyWorkspace(current.authority, agentDirectory, workspace);
+                      yield* configuration(agentDirectory, current.authority);
+                      if (request.skillPlan !== undefined) {
+                        if (Option.isNone(materialization))
+                          return yield* deny(
+                            "Pi replay skill materialization unavailable",
+                            "unavailable",
+                          );
+                        yield* validatePiManagedSkillPlan({
+                          selection,
+                          skillPlan: request.skillPlan,
+                          materialization: materialization.value,
+                          threadId: request.threadId,
+                          providerInstanceId: instance.instanceId,
+                          authorizeCurrent: preparationCurrent,
+                        }).pipe(
+                          Effect.provideService(FileSystem.FileSystem, fs),
+                          Effect.provideService(Path.Path, paths),
+                        );
+                      }
+                      yield* Effect.tryPromise({
+                        try: () =>
+                          readPiNativeSession({
+                            sessionDirectoryRoot:
+                              options.nativeStateRoot +
+                              "/" +
+                              digest(
+                                encode([
+                                  options.environmentId,
+                                  instance.instanceId,
+                                  request.threadId,
+                                  binding.recordId,
+                                  binding.generation,
+                                ]),
+                              ) +
+                              "/sessions",
+                            expectedCwd: "/workspace",
+                            native: current.native,
+                          }),
+                        catch: () => deny("Pi replay native checkpoint unavailable", "uncertain"),
+                      }).pipe(Effect.uninterruptible);
+                      return yield* operations.admitCurrent(
+                        identity(request.threadId),
+                        (latest) => {
+                          assertPreparing();
+                          if (
+                            contextFor(latest) !== context ||
+                            clock.currentTimeMillisUnsafe() >= current.deadlineAtMs
+                          )
+                            throw deny("Pi replay authority or deadline changed", "conflict");
+                          workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                          sourceFence();
+                          return {
+                            terminal: current.terminal,
+                            session: sessionFor(latest, current.native),
+                          };
+                        },
+                        {
+                          operationId: current.operation.operationId,
+                          native: current.native,
+                          resourceHash,
+                        },
+                      );
+                    }),
+                  );
+                  yield* validateReplay;
+                  const run = validateReplay;
+                  const steer: PiManagedPreparedOperation["steer"] = () =>
+                    Effect.fail(deny("Completed Pi operation cannot receive controls", "conflict"));
+                  const interrupt = Effect.fail(
+                    deny("Completed Pi operation cannot receive controls", "conflict"),
+                  );
+                  return request.kind === "prompt"
+                    ? {
+                        kind: "prompt" as const,
+                        turnId: TurnId.make(replay.operation.operationId),
+                        operation: replay.operation,
+                        run,
+                        steer,
+                        interrupt,
+                      }
+                    : { kind: request.kind, operation: replay.operation, run, steer, interrupt };
+                }
                 const nativeConfig = yield* configuration(agentDirectory, authority);
                 const previous =
                   request.kind === "initialize" && binding.status === "reserved"
@@ -1214,7 +1347,15 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     "unavailable",
                   );
                 const operation: PiWorkerOperation = {
-                  operationId: yield* crypto.randomUUIDv4,
+                  operationId:
+                    request.operationId === undefined
+                      ? yield* crypto.randomUUIDv4
+                      : (yield* decodeOperation({
+                          operationId: request.operationId,
+                          operationKind: request.kind,
+                        }).pipe(
+                          Effect.mapError(() => deny("Invalid stable Pi operation identity")),
+                        )).operationId,
                   operationKind: request.kind,
                 };
                 const workerId = yield* crypto.randomUUIDv4;
@@ -1288,7 +1429,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 const durable = yield* operations.prepare(
                   identity(request.threadId),
                   request,
-                  digest(encode(request)),
+                  request.operationId === undefined ? digest(encode(request)) : requestHash,
                   { allocation, workerId, operationId: operation.operationId, resourceHash },
                 );
                 if (contextFor(durable.authority) !== context)
