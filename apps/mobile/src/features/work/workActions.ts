@@ -1,4 +1,5 @@
 import {
+  EnvironmentAuthorizationError,
   ProjectTeamRecord,
   ProjectWorkTask,
   ProjectWorkCriterion,
@@ -151,6 +152,7 @@ export interface MobileWorkActionState {
 // Only validated public domain fields establish an authoritative write rejection.
 const knownPublicRejection = Schema.is(
   Schema.Union([
+    Schema.Struct(EnvironmentAuthorizationError.fields),
     Schema.Struct({ _tag: Schema.Literal("ProjectTeamAuthorizationError"), reason: Schema.String }),
     Schema.Struct({
       _tag: Schema.Literal("ProjectWorkAuthorizationError"),
@@ -215,7 +217,7 @@ function publicWorkRejection(error: unknown) {
   const reason =
     error._tag === "ProjectWorkContentRejectedError"
       ? "Content contains a secret; edit your draft before resending"
-      : error._tag === "ProjectWorkPolicyError"
+      : error._tag === "ProjectWorkPolicyError" || error._tag === "EnvironmentAuthorizationError"
         ? error.message
         : error.reason;
   return {

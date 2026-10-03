@@ -354,6 +354,11 @@ describe("mobile human work", () => {
 
   it.each([
     {
+      _tag: "EnvironmentAuthorizationError",
+      message: "The authenticated token is missing required scope: orchestration:operate.",
+      requiredScope: "orchestration:operate",
+    },
+    {
       _tag: "ProjectTeamAuthorizationError",
       reason: "Only a human can respond to gates, answer or promote memory",
     },
@@ -380,8 +385,14 @@ describe("mobile human work", () => {
     );
     session.edit("Inspect original", "Original findings");
     await session.submit({ kind: "investigate" });
-    expect(session.state.status).toBe("denied");
+    expect(session.state).toMatchObject({
+      status: "denied",
+      objective: "Inspect original",
+      outputs: "Original findings",
+    });
     expect(session.state.notice).not.toBeNull();
+    if (rejection._tag === "EnvironmentAuthorizationError")
+      expect(session.state.notice).toContain(rejection.message);
     expect(session.state.pending).toBe(sent[0]);
     session.edit("Inspect corrected", "Corrected findings");
     await session.submit({ kind: "investigate" });
@@ -399,6 +410,32 @@ describe("mobile human work", () => {
   });
 
   it.each([
+    {
+      _tag: "EnvironmentAuthorizationError",
+      message: "Unknown required scope",
+      requiredScope: "future:scope",
+    },
+    { _tag: "EnvironmentAuthorizationError", requiredScope: "orchestration:operate" },
+    {
+      _tag: "EnvironmentAuthorizationError",
+      message: false,
+      requiredScope: "orchestration:operate",
+    },
+    {
+      _tag: "FutureEnvironmentAuthorizationError",
+      message: "Unknown authorization error",
+      requiredScope: "orchestration:operate",
+    },
+    {
+      _tag: "PersistenceSqlError",
+      operation: "ProjectWorkGateway.write",
+      detail: "SQL failed",
+      cause: {
+        _tag: "EnvironmentAuthorizationError",
+        message: "The authenticated token is missing required scope: orchestration:operate.",
+        requiredScope: "orchestration:operate",
+      },
+    },
     {
       _tag: "PersistenceSqlError",
       operation: "ProjectWorkRepository.executeAuthorized",
