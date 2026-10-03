@@ -1,3 +1,5 @@
+import { vi } from "vite-plus/test";
+import * as SessionRuntime from "./PiSessionRuntime.ts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import {
@@ -9,6 +11,10 @@ import {
 import {
   canonicalProjectWorkPayload,
   CommandId,
+  ProjectWorkTaskRead,
+  ProjectWorkWriteResult,
+  ProjectWorkEvidenceRead,
+  ProjectWorkComment,
   ManagedSkillKey,
   SkillCatalogRevision,
 } from "@t3tools/contracts";
@@ -126,6 +132,15 @@ const decodeLocalTerminal = Schema.decodeEffect(
     }),
   ),
 );
+const decodeReportReceipt = Schema.decodeEffect(Schema.fromJsonString(ProjectWorkWriteResult));
+const decodeReportTask = Schema.decodeUnknownEffect(ProjectWorkTaskRead);
+const decodeReportEvidence = Schema.decodeUnknownEffect(Schema.Array(ProjectWorkEvidenceRead));
+const decodeReportComments = Schema.decodeUnknownEffect(Schema.Array(ProjectWorkComment));
+const isManagedRuntimeError = Schema.is(PiManagedRuntimeError);
+const controlledCallbackError = (cause: unknown) =>
+  isManagedRuntimeError(cause)
+    ? cause
+    : new PiManagedRuntimeError({ code: "uncertain", detail: "Controlled callback failed" });
 const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const parseOwner = Schema.decodeSync(
   Schema.fromJsonString(
@@ -3425,6 +3440,245 @@ const settledNativeForRead = Effect.fn("PiManagedRuntimeLive.settledNativeForRea
   yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${operation.operation.operationId}`;
   return native;
 });
+for (const outcome of ["findings", "complete"] as const)
+  it.effect(`retains committed ${outcome} reports across the return fence`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* restoreHistoricalBinding({
+          ...f.role,
+          revision: f.role.revision + 1,
+          tools: ["project-work.report"],
+        });
+        yield* restoreHistoricalBinding({
+          ...f.binding,
+          revision: f.binding.revision + 1,
+          configuration: { ...f.binding.configuration, toolIds: ["project-work.report"] },
+        });
+        const initial = yield* readCurrentState(f.sql, f.binding.projectId);
+        const membership = initial.foundationRecords!.find(
+          (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
+        );
+        if (membership?.kind !== "task-membership") return yield* Effect.die("No membership");
+        yield* restoreHistoricalBinding({
+          ...membership,
+          revision: membership.revision + 1,
+          deliverableKind: "non-code",
+        });
+        yield* settledNativeForRead(f, piManagedSkillResourceIdentity([]));
+        // Capture the real Runtime callbacks without acquiring a process or importing the SDK.
+        let session: SessionRuntime.PiSessionRuntimeOptions | undefined;
+        const original = SessionRuntime.makePiSessionRuntime;
+        const capture = vi
+          .spyOn(SessionRuntime, "makePiSessionRuntime")
+          .mockImplementation((input) => {
+            session = input;
+            return original(input);
+          });
+        yield* Effect.addFinalizer(() => Effect.sync(() => capture.mockRestore()));
+        yield* f.instance.prepareOperation(
+          { threadId, kind: "prompt", prompt: "Retain the assignment report" },
+          () => Effect.void,
+        );
+        if (!session) return yield* Effect.die("No controlled session captured");
+        const captured = session;
+        const before = yield* readCurrentState(f.sql, f.binding.projectId);
+        const task = before.tasks.find((entry) => entry.taskId === f.binding.taskId)!;
+        const assignment = before.foundationRecords!.find(
+          (record) => record.kind === "task-membership" && record.taskId === task.taskId,
+        )!;
+        const intent = {
+          type: "project-team.assignment.report",
+          projectId: task.projectId,
+          taskId: task.taskId,
+          commandId: CommandId.make(`controlled-report-${outcome}`),
+          expectedRevision: before.revision,
+          expectedTaskRevision: task.revision,
+          assignmentId: assignment.recordId,
+          expectedAssignmentRevision: assignment.revision,
+          specRevision: 1,
+          planRevision: 1,
+          summary: "The retained source supports the non-code deliverable",
+          evidenceIds: [],
+          outputArtifactIds: [],
+          outputs: before.criteria
+            .filter((entry) => entry.taskId === task.taskId)
+            .map((entry) => ({
+              criterionId: entry.criterionId,
+              kind: "observation",
+              detail: "Retained fixture source evidence for the required output",
+            })),
+          outcome,
+        };
+        const input = { arguments: { intentJSON: json(intent) } };
+        const text = json(input);
+        const call = {
+          type: "tool-call" as const,
+          callId: 1,
+          nativeCallId: "controlled-report-call",
+          lifecycleId: 1,
+          toolName: "project_work_report",
+          execution: "bridge" as const,
+          input: { transferId: "controlled-input", totalBytes: Buffer.byteLength(text) },
+        };
+        const signal = new AbortController().signal;
+        const returned = yield* Effect.tryPromise({
+          try: () => captured.executeBridgeTool(call, input, signal),
+          catch: controlledCallbackError,
+        }).pipe(Effect.result);
+        const after = yield* readCurrentState(f.sql, task.projectId);
+        const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts
+          WHERE project_id=${task.projectId} AND command_id=${intent.commandId}`;
+        expect(receipts).toHaveLength(1);
+        expect(
+          (yield* decodeReportReceipt(String(receipts[0]!.result_json))).receipt,
+        ).toMatchObject({
+          commandId: intent.commandId,
+          status: "accepted",
+          projectId: task.projectId,
+        });
+        expect(after.evidence.some((entry) => entry.detail === intent.summary)).toBe(true);
+        expect((after.comments ?? []).some((entry) => entry.body === intent.summary)).toBe(true);
+        expect(after.tasks.find((entry) => entry.taskId === task.taskId)?.state).toBe(
+          outcome === "complete" ? "completed" : task.state,
+        );
+        expect(
+          after.foundationRecords!.find((entry) => entry.recordId === f.binding.recordId)?.status,
+        ).toBe(outcome === "complete" ? "stopping" : "running");
+        const gateway = yield* ProjectWorkGateway;
+        const publicViews = {
+          task: yield* gateway.read({
+            projectId: task.projectId,
+            taskId: task.taskId,
+            operation: "task",
+          }),
+          evidence: yield* gateway.read({
+            projectId: task.projectId,
+            taskId: task.taskId,
+            operation: "evidence",
+          }),
+          comments: yield* gateway.read({
+            projectId: task.projectId,
+            taskId: task.taskId,
+            operation: "comments",
+          }),
+        };
+        expect((yield* decodeReportTask(publicViews.task)).state).toBe(
+          outcome === "complete" ? "completed" : task.state,
+        );
+        expect(
+          (yield* decodeReportEvidence(publicViews.evidence)).some(
+            (entry) => entry.detail === intent.summary,
+          ),
+        ).toBe(true);
+        expect(
+          (yield* decodeReportComments(publicViews.comments)).some(
+            (entry) => entry.body === intent.summary,
+          ),
+        ).toBe(true);
+        const probes: Array<{ phase: string; result: unknown }> = [];
+        if (outcome === "complete") {
+          for (const phase of [
+            "beforeToolReturn",
+            "beforeToolInvoke",
+            "beforeStart",
+            "beforeControl",
+          ] as const) {
+            const result = yield* Effect.tryPromise({
+              try: () =>
+                captured.authorizeCurrent(
+                  { identity: captured.identity, operation: captured.operation, phase },
+                  signal,
+                ),
+              catch: controlledCallbackError,
+            }).pipe(Effect.result);
+            probes.push({ phase, result });
+            expect(result._tag).toBe("Failure");
+          }
+          const modelAdmission = yield* Effect.tryPromise({
+            try: () => captured.broker.authorizeCurrent("beforeReserve", signal),
+            catch: controlledCallbackError,
+          }).pipe(Effect.result);
+          probes.push({ phase: "beforeModelReserve", result: modelAdmission });
+          expect(modelAdmission._tag).toBe("Failure");
+          yield* Effect.tryPromise({
+            try: () =>
+              captured.persistTerminal(
+                {
+                  identity: captured.identity,
+                  operation: captured.operation,
+                  outcome: "failed",
+                  ownerCaptured: false,
+                  native: null,
+                  drain: null,
+                  accountingReceipts: [],
+                  failureCode: "CONTROLLED_RETURN_FENCE",
+                },
+                signal,
+              ),
+            catch: controlledCallbackError,
+          });
+          const retained = yield* readCurrentState(f.sql, task.projectId);
+          expect(retained.tasks.find((entry) => entry.taskId === task.taskId)?.state).toBe(
+            "completed",
+          );
+          expect(retained.evidence.some((entry) => entry.detail === intent.summary)).toBe(true);
+          expect(
+            (yield* decodeReportTask(
+              yield* gateway.read({
+                projectId: task.projectId,
+                taskId: task.taskId,
+                operation: "task",
+              }),
+            )).state,
+          ).toBe("completed");
+          const replay = yield* Effect.tryPromise({
+            try: () => captured.executeBridgeTool(call, input, signal),
+            catch: controlledCallbackError,
+          }).pipe(Effect.result);
+          expect(replay._tag).toBe("Failure");
+          expect(
+            yield* f.sql`SELECT * FROM project_work_command_receipts
+            WHERE project_id=${task.projectId} AND command_id=${intent.commandId}`,
+          ).toEqual(receipts);
+        }
+        const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+        if (evidence)
+          yield* f.fs.writeFileString(
+            evidence + `/controlled-observation-${outcome}.json`,
+            json({
+              outcome,
+              beforeRevision: before.revision,
+              after,
+              receipts,
+              returned,
+              publicViews,
+              probes,
+              operations:
+                yield* f.sql`SELECT operation_kind,status,terminal_json FROM project_team_pi_operation`,
+              transports: f.transports,
+              launches: f.launches,
+              models: yield* f.sql`SELECT * FROM project_team_model_request`,
+              processes:
+                yield* f.sql`SELECT status,owner_json,drain_json FROM project_team_pi_process`,
+            }),
+          );
+        expect(f.transports).toBe(0);
+        expect((yield* f.sql`SELECT * FROM project_team_model_request`).length).toBe(0);
+        const processes = yield* f.sql<{
+          owner_json: string | null;
+        }>`SELECT owner_json FROM project_team_pi_process`;
+        expect(processes).toHaveLength(2);
+        expect(processes.every((entry) => entry.owner_json === null)).toBe(true);
+        expect(returned._tag).toBe(outcome === "complete" ? "Failure" : "Success");
+        if (returned._tag === "Success")
+          expect(returned.success).toEqual({
+            kind: "text",
+            text: String(receipts[0]!.result_json),
+          });
+      }),
+    ),
+  );
 it.effect(
   "admits the exact committed native view and rejects a changed durable resource hash without launch",
   () =>
