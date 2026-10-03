@@ -148,8 +148,81 @@ export interface MobileWorkActionState {
   readonly notice: string | null;
   readonly pending: ProjectWorkWriteIntent | null;
 }
-const errorRecord = (error: unknown): Record<string, unknown> | null =>
-  typeof error === "object" && error !== null ? (error as Record<string, unknown>) : null;
+// Only validated public domain fields establish an authoritative write rejection.
+const knownPublicRejection = Schema.is(
+  Schema.Union([
+    Schema.Struct({ _tag: Schema.Literal("ProjectTeamAuthorizationError"), reason: Schema.String }),
+    Schema.Struct({
+      _tag: Schema.Literal("ProjectWorkAuthorizationError"),
+      reason: Schema.Literals([
+        "spoofed-attribution",
+        "agent-approval-required",
+        "invalid-approval",
+        "project-work-disabled",
+        "unknown-project",
+        "project-archived",
+        "project-tombstoned",
+      ]),
+    }),
+    Schema.Struct({
+      _tag: Schema.Literal("ProjectWorkContentRejectedError"),
+      matches: Schema.Array(Schema.Struct({ path: Schema.String, kind: Schema.String })),
+    }),
+    Schema.Struct({
+      _tag: Schema.Literal("ProjectWorkPolicyError"),
+      code: Schema.Literals([
+        "unknown-task",
+        "unknown-criterion",
+        "unknown-evidence",
+        "unknown-relationship",
+        "unknown-blocker",
+        "stale-revision",
+        "invalid-state",
+        "invalid-specification",
+        "invalid-relationship",
+        "active-attempt",
+        "unresolved-dependency",
+        "unsatisfied-criterion",
+        "protected-specification",
+        "approval-required",
+        "authority-required",
+        "duplicate-record",
+        "deferred-command",
+      ]),
+      message: Schema.String,
+    }),
+  ]),
+);
+const changedTeamTarget = new Set([
+  "Project revision changed",
+  "Task or specification revision changed",
+  "Plan revision changed",
+  "Gate target changed",
+  "Specification approval target changed",
+  "Plan approval target changed",
+  "Gate response is no longer eligible",
+  "Gate response changed since receipt",
+  "Guided project or task revision changed",
+  "Guided receipt target changed",
+]);
+function publicWorkRejection(error: unknown) {
+  if (!knownPublicRejection(error)) return null;
+  if (
+    (error._tag === "ProjectTeamAuthorizationError" && changedTeamTarget.has(error.reason)) ||
+    (error._tag === "ProjectWorkPolicyError" && error.code === "stale-revision")
+  )
+    return { status: "stale" as const, notice: null };
+  const reason =
+    error._tag === "ProjectWorkContentRejectedError"
+      ? "Content contains a secret; edit your draft before resending"
+      : error._tag === "ProjectWorkPolicyError"
+        ? error.message
+        : error.reason;
+  return {
+    status: "denied" as const,
+    notice: `The server denied this action: ${reason}. Your draft is kept.`,
+  };
+}
 
 /** Owns one scoped draft and exact command across conflict, disconnect and retry. */
 export function createWorkActionSession(
@@ -196,10 +269,8 @@ export function createWorkActionSession(
         notice: "Recorded. Refresh work to see the current state.",
       });
     } catch (error) {
-      const record = errorRecord(error);
-      const code = record?.code;
-      const status =
-        code === "stale-revision" ? "stale" : typeof code === "string" ? "denied" : "uncertain";
+      const rejection = publicWorkRejection(error);
+      const status = rejection?.status ?? "uncertain";
       if (status === "stale") blockedRevision = intent.expectedRevision ?? null;
       update({
         status,
@@ -207,9 +278,7 @@ export function createWorkActionSession(
           status === "stale"
             ? "Work changed on another client. Your draft is kept. Refresh and review it before sending a new command."
             : status === "denied"
-              ? typeof record?.message === "string"
-                ? record.message
-                : "The server denied this action. Your draft is kept."
+              ? (rejection?.notice ?? "The server denied this action. Your draft is kept.")
               : "The response was lost. The action may have been recorded. Retry the exact command or refresh to inspect its result.",
       });
     }

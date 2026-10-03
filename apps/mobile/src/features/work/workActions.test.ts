@@ -229,7 +229,11 @@ describe("mobile human work", () => {
       () => latest,
       async (input) => {
         sent.push(input);
-        throw { code: "stale-revision", message: "Changed elsewhere" };
+        throw {
+          _tag: "ProjectWorkPolicyError",
+          code: "stale-revision",
+          message: "Changed elsewhere",
+        };
       },
       () => CommandId.make("command"),
     );
@@ -287,6 +291,156 @@ describe("mobile human work", () => {
     expect(session.state.objective).toBe("Inspect safely");
     session.reset();
     expect(session.state.status).toBe("uncertain");
+    expect(session.state.pending).toBe(sent[0]);
+    await session.retry();
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toBe(sent[0]);
+    expect(session.state.status).toBe("accepted");
+  });
+
+  it.each([
+    "Project revision changed",
+    "Task or specification revision changed",
+    "Plan revision changed",
+    "Gate target changed",
+    "Specification approval target changed",
+    "Plan approval target changed",
+    "Gate response is no longer eligible",
+    "Gate response changed since receipt",
+    "Guided project or task revision changed",
+    "Guided receipt target changed",
+  ])("recovers from public authoritative rejection: %s", async (reason) => {
+    let latest = current();
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      () => latest,
+      async (input) => {
+        sent.push(decodeWrite(input));
+        if (sent.length === 1) throw { _tag: "ProjectTeamAuthorizationError", reason };
+      },
+      () => CommandId.make(`command-${sent.length + 1}`),
+    );
+    session.edit("Read reconnect history", "Findings\nOpen questions");
+    await session.submit({ kind: "gate", gateId: "spec", response: "rejected" });
+    expect(session.state).toMatchObject({
+      status: "stale",
+      objective: "Read reconnect history",
+      outputs: "Findings\nOpen questions",
+      pending: sent[0],
+    });
+    await session.retry();
+    expect(sent).toHaveLength(1);
+    session.reset();
+    expect(session.canSubmit(10)).toBe(false);
+    await session.submit({ kind: "investigate" });
+    expect(sent).toHaveLength(1);
+    latest = {
+      ...latest,
+      context: { ...context, revision: 11 },
+      foundation: { ...foundation, revision: 11 },
+    };
+    session.reset();
+    await session.submit({ kind: "investigate" });
+    expect(session.state.status).toBe("accepted");
+    expect(sent[1]).toMatchObject({
+      commandId: "command-2",
+      expectedRevision: 11,
+      objective: "Read reconnect history",
+      outputDescriptions: ["Findings", "Open questions"],
+    });
+    expect(sent[1]).not.toBe(sent[0]);
+  });
+
+  it.each([
+    {
+      _tag: "ProjectTeamAuthorizationError",
+      reason: "Only a human can respond to gates, answer or promote memory",
+    },
+    { _tag: "ProjectWorkAuthorizationError", reason: "project-work-disabled" },
+    {
+      _tag: "ProjectWorkContentRejectedError",
+      matches: [{ path: "$.objective", kind: "known-secret" }],
+    },
+    {
+      _tag: "ProjectWorkPolicyError",
+      code: "invalid-state",
+      message: "Investigation is unavailable in this state.",
+    },
+  ])("allows draft correction after public $_tag rejection", async (rejection) => {
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      current,
+      async (input) => {
+        sent.push(input);
+        if (sent.length === 1) throw rejection;
+      },
+      () => CommandId.make(`command-${sent.length + 1}`),
+    );
+    session.edit("Inspect original", "Original findings");
+    await session.submit({ kind: "investigate" });
+    expect(session.state.status).toBe("denied");
+    expect(session.state.notice).not.toBeNull();
+    expect(session.state.pending).toBe(sent[0]);
+    session.edit("Inspect corrected", "Corrected findings");
+    await session.submit({ kind: "investigate" });
+    await session.retry();
+    expect(sent).toHaveLength(1);
+    session.reset();
+    await session.submit({ kind: "investigate" });
+    expect(sent[1]).toMatchObject({
+      commandId: "command-2",
+      expectedRevision: 10,
+      objective: "Inspect corrected",
+      outputDescriptions: ["Corrected findings"],
+    });
+    expect(session.state.status).toBe("accepted");
+  });
+
+  it.each([
+    {
+      _tag: "PersistenceSqlError",
+      operation: "ProjectWorkRepository.executeAuthorized",
+      detail: "Request failed",
+      cause: { _tag: "ProjectTeamAuthorizationError", reason: "Project revision changed" },
+    },
+    {
+      _tag: "PersistenceSqlError",
+      operation: "ProjectWorkGateway.write",
+      detail: "SQL failed",
+      code: "stale-revision",
+    },
+    { code: "ECONNRESET", message: "Connection lost" },
+    { code: "stale-revision", message: "Unrecognized rejection shape" },
+    { _tag: "UnknownNetworkError", code: "invalid-state", reason: "Project revision changed" },
+    { _tag: "ProjectWorkPolicyError", code: "future-code", message: "Unknown policy" },
+    { _tag: "ProjectTeamAuthorizationError", reason: null },
+    { _tag: "ProjectWorkContentRejectedError", matches: "invalid" },
+    { reason: "Project revision changed" },
+    'Expected JSON value\n  at ["cause"][0]["error"]: Project revision changed',
+  ])("keeps unknown/SQL/network failure %j uncertain with exact replay", async (failure) => {
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      current,
+      async (input) => {
+        sent.push(input);
+        if (sent.length === 1) throw failure;
+      },
+      () => CommandId.make("command"),
+    );
+    session.edit("Inspect original", "Original findings");
+    await session.submit({ kind: "investigate" });
+    session.edit("Competing correction", "Competing findings");
+    session.reset();
+    await session.submit({ kind: "gate", gateId: "spec", response: "approved" });
+    expect(sent).toHaveLength(1);
+    expect(session.state).toMatchObject({
+      status: "uncertain",
+      objective: "Inspect original",
+      outputs: "Original findings",
+    });
     expect(session.state.pending).toBe(sent[0]);
     await session.retry();
     expect(sent).toHaveLength(2);
