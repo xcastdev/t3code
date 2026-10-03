@@ -8,6 +8,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as NodeUtil from "node:util";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -34,6 +35,7 @@ import type {
   ProviderAdapterShape,
   ProviderAdapterSessionStartInput,
 } from "../Services/ProviderAdapter.ts";
+import { PiWorkerOperation } from "../pi/PiWorkerProtocol.ts";
 import type { PiSessionTerminal } from "../pi/PiSessionRuntime.ts";
 import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
 
@@ -52,6 +54,17 @@ const requestError = (method: string, error: PiManagedRuntimeError) =>
         "Pi operation could not be confirmed. Reconcile the owned session before retrying.",
     }[error.code],
   });
+
+const decodeOperationId = Schema.decodeEffect(PiWorkerOperation.fields.operationId);
+
+function freezeRequest<A>(value: A, seen = new WeakSet<object>()): A {
+  if (value !== null && typeof value === "object" && !seen.has(value)) {
+    seen.add(value);
+    for (const entry of Object.values(value)) freezeRequest(entry, seen);
+    Object.freeze(value);
+  }
+  return value;
+}
 
 const unavailableUsage: TurnTokenUsage = {
   usageScope: "main_agent",
@@ -227,11 +240,15 @@ type SessionContext = {
 };
 
 /** This adapter owns logical sessions and fibers; the private runtime owns durable intent and execution. */
-export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
+const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
   readonly instanceId: ProviderInstanceId;
   readonly runtime: PiManagedRuntimeInstance;
+  /** Root's private dispatch identity lookup; its result grants no execution authority. */
+  readonly resolveOperationId?: (
+    request: PiManagedOperationRequest,
+  ) => Effect.Effect<PiWorkerOperation["operationId"] | undefined, PiManagedRuntimeError>;
 }): Effect.fn.Return<ProviderAdapterShape<ProviderAdapterError>, never, Scope.Scope> {
-  const { instanceId, runtime } = input;
+  const { instanceId, runtime, resolveOperationId } = input;
   const operationScope = yield* Scope.make();
   const events = yield* PubSub.dropping<ProviderRuntimeEvent>(256);
   const sessions = new Map<ThreadId, SessionContext>();
@@ -423,14 +440,18 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
 
   const launch = Effect.fn("PiAdapter.launch")(function* (
     context: SessionContext,
-    request: PiManagedOperationRequest,
+    suppliedRequest: PiManagedOperationRequest,
     hints?: ProviderAdapterSessionStartInput,
   ) {
     if (context.active)
       return yield* invalid(
-        request.kind,
+        suppliedRequest.kind,
         "Pi already has an initialization or turn in progress for this thread.",
       );
+    const request = yield* Effect.try({
+      try: () => freezeRequest(structuredClone(suppliedRequest)),
+      catch: () => invalid(suppliedRequest.kind, "Pi operation request must be structured data."),
+    });
     const active: ActiveOperation = {
       prepared: yield* Deferred.make<PiManagedPreparedOperation, ProviderAdapterError>(),
       result: yield* Deferred.make<ProviderSession, ProviderAdapterError>(),
@@ -440,9 +461,59 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     };
     context.active = active;
     const work = Effect.gen(function* () {
-      const prepared = yield* runtime
-        .prepareOperation(request, observe(context, active))
-        .pipe(Effect.mapError((error) => requestError(request.kind, error)));
+      const resolvedId = resolveOperationId
+        ? yield* Effect.suspend(() => resolveOperationId(request)).pipe(
+            Effect.mapError((error) => requestError(request.kind, error)),
+            Effect.catchDefect(() =>
+              Effect.fail(
+                requestError(
+                  request.kind,
+                  new PiManagedRuntimeError({
+                    code: "uncertain",
+                    detail: "Pi dispatch identity lookup failed.",
+                  }),
+                ),
+              ),
+            ),
+          )
+        : undefined;
+      const operationId =
+        resolvedId === undefined
+          ? undefined
+          : yield* decodeOperationId(resolvedId).pipe(
+              Effect.mapError(() =>
+                requestError(
+                  request.kind,
+                  new PiManagedRuntimeError({
+                    code: "denied",
+                    detail: "Pi dispatch operation identity is invalid.",
+                  }),
+                ),
+              ),
+            );
+      const resolvedRequest =
+        operationId === undefined ? request : Object.freeze({ ...request, operationId });
+      // Lookup may await or auto-yield; ownership and preparation must share one evaluation.
+      const prepared = yield* Effect.suspend(() => {
+        if (shuttingDown || context.closing)
+          return Effect.fail(
+            new ProviderAdapterSessionClosedError({ provider, threadId: context.threadId }),
+          );
+        if (context.failure) return Effect.fail(context.failure);
+        if (sessions.get(context.threadId) !== context || context.active !== active)
+          return Effect.fail(
+            requestError(
+              request.kind,
+              new PiManagedRuntimeError({
+                code: "conflict",
+                detail: "Pi preparation no longer owns its session.",
+              }),
+            ),
+          );
+        return runtime
+          .prepareOperation(resolvedRequest, observe(context, active))
+          .pipe(Effect.mapError((error) => requestError(request.kind, error)));
+      });
       // Capture the returned operation once; controls and completion never consult mutable adapter selection.
       active.operation = {
         ...prepared,
@@ -450,6 +521,35 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
         interrupt: yield* Effect.cached(prepared.interrupt),
       };
       context.lastOperationId = active.operation.operation.operationId;
+      if (operationId !== undefined && active.operation.operation.operationId !== operationId)
+        return yield* Effect.fail(
+          requestError(
+            request.kind,
+            new PiManagedRuntimeError({
+              code: "uncertain",
+              detail: "Prepared Pi identity did not match Root's dispatch operation.",
+            }),
+          ),
+        ).pipe(
+          Effect.onExit(() =>
+            Effect.uninterruptible(
+              Effect.suspend(() => runtime.requestStop(context.threadId)).pipe(
+                Effect.mapError((error) => requestError("stopSession", error)),
+                Effect.catchDefect(() =>
+                  Effect.fail(
+                    requestError(
+                      "stopSession",
+                      new PiManagedRuntimeError({
+                        code: "uncertain",
+                        detail: "Pi prepared identity cleanup failed.",
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
       if (prepared.kind !== request.kind || prepared.operation.operationKind !== request.kind)
         return yield* requestError(
           request.kind,
@@ -598,8 +698,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
         }),
       );
     }).pipe(
-      Effect.catch((error) =>
-        Effect.gen(function* () {
+      Effect.catchCause((cause) => {
+        const failure = Cause.findError(cause);
+        if (failure._tag !== "Success") return Effect.failCause(cause);
+        const error = failure.success;
+        return Effect.gen(function* () {
           if (
             !(context.closing || shuttingDown || (active.canceled && context.session)) &&
             error._tag !== "ProviderAdapterValidationError"
@@ -622,10 +725,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
                 tokenUsage: active.tokenUsage,
               },
             }).pipe(Effect.ignore);
-          yield* Deferred.fail(active.prepared, error);
-          return yield* error;
-        }),
-      ),
+          return yield* Effect.failCause(cause);
+        });
+      }),
       Effect.onExit((exit) =>
         Effect.gen(function* () {
           active.acceptingEvents = false;
@@ -923,3 +1025,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     streamEvents: Stream.fromPubSub(events),
   };
 });
+
+/** Capture factory ports synchronously; deferred construction cannot replace Root's resolver. */
+export const makePiAdapter = (input: Parameters<typeof makeCapturedPiAdapter>[0]) =>
+  makeCapturedPiAdapter({ ...input });
