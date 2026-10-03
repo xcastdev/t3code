@@ -615,12 +615,31 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         false,
       );
 
-      // Windows unpacks native files explicitly so their JavaScript and metadata
-      // stay archived. Other platforms retain electron-builder's defaults.
+      // Windows retains its sidecar layout. Unix backend and native wrapper files
+      // must be readable by the child process outside Electron's virtual archive.
       assert.notProperty(mac, "asar");
       assert.notProperty(linux, "asar");
-      assert.notProperty(mac, "asarUnpack");
-      assert.notProperty(linux, "asarUnpack");
+      for (const config of [mac, linux]) {
+        const unpack = config.asarUnpack as ReadonlyArray<string>;
+        for (const file of [
+          "apps/server/dist/bin.mjs",
+          "apps/server/dist/pi-worker.mjs",
+          "apps/server/dist/pi-managed-process-owner.py",
+          "apps/server/dist/pi-sdk/package.json",
+          "node_modules/@ff-labs/fff-node/index.js",
+          "node_modules/@ff-labs/fff-linux-x64-gnu/fff.node",
+          "node_modules/node-gyp-build-optional-packages/index.js",
+          "node_modules/detect-libc/lib/detect-libc.js",
+          "node_modules/node-pty/lib/index.js",
+          "node_modules/msgpackr-extract/index.js",
+        ]) {
+          assert.ok(
+            unpack.some((glob) => NodePath.matchesGlob(file, glob)),
+            file,
+          );
+        }
+        assert.ok(!unpack.some((glob) => NodePath.matchesGlob("apps/desktop/dist/index.js", glob)));
+      }
       assert.deepStrictEqual(win.asar, { smartUnpack: false });
       assert.deepStrictEqual(win.asarUnpack, [WINDOWS_NATIVE_ASAR_UNPACK_GLOB]);
       assert.deepStrictEqual(winWithoutWslRuntime.asar, win.asar);

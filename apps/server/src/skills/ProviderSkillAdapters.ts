@@ -242,7 +242,9 @@ const PiOwnershipMarker = Schema.Struct({
 const decodePiOwnershipMarker = Schema.decodeUnknownEffect(
   Schema.fromJsonString(PiOwnershipMarker),
 );
-const decodePiAllowedKeys = Schema.decodeUnknownEffect(Schema.ReadonlySet(ManagedSkillKey));
+const decodePiAllowedKeys = Schema.decodeUnknownEffect(
+  Schema.ReadonlySet(ManagedSkillKey).check(Schema.isMaxSize(32)),
+);
 
 // Custom output has no service collector. Detach it before removal so an async ownership
 // receipt cannot authorize deleting a replacement at the public path. The short final
@@ -387,12 +389,15 @@ export function makePiSkillAdapter(input: {
         ),
       ),
     );
-    if (request.skills.some((skill) => !keys.has(skill.key))) {
+    const candidates = new Set(request.skills.map((skill) => skill.key));
+    if ([...keys].some((key) => !candidates.has(key))) {
       return yield* adapterError(
         "managed_skill_not_allowed",
-        "A requested skill is outside the managed run's frozen selection.",
+        "An authorized skill is missing from the managed catalogue candidates.",
       );
     }
+    // A callback may retain and mutate its Set while materialization is in flight.
+    return new Set(keys);
   });
 
   return {
@@ -435,12 +440,16 @@ export function makePiSkillAdapter(input: {
       for (const skill of prepared.skills) Object.freeze(skill);
       Object.freeze(prepared.skills);
       Object.freeze(prepared);
-      yield* authorize(prepared);
+      const allowed = yield* authorize(prepared);
+      const selected = Object.freeze({
+        ...prepared,
+        skills: Object.freeze(prepared.skills.filter((skill) => allowed.has(skill.key))),
+      });
       const materializationInput = {
         sessionId: prepared.runtime.sessionId,
         providerInstanceId: input.providerInstanceId,
         desiredRevision: prepared.desiredRevision,
-        packages: prepared.skills.map((skill) => ({
+        packages: selected.skills.map((skill) => ({
           key: skill.key,
           sourcePath: skill.packagePath,
         })),
@@ -520,8 +529,8 @@ export function makePiSkillAdapter(input: {
           );
           // Pin custom owned output before rejecting its map so failed preparation cleans it.
           if (
-            materialized.skillPaths.size !== prepared.skills.length ||
-            prepared.skills.some(
+            materialized.skillPaths.size !== selected.skills.length ||
+            selected.skills.some(
               (skill) =>
                 materialized.skillPaths.get(skill.key) !==
                 NodePath.join(materialized.root, skill.key),
@@ -533,11 +542,20 @@ export function makePiSkillAdapter(input: {
             );
           }
           // Copying can outlast a lease or role revocation; do not return a stale plan.
-          yield* authorize(prepared);
+          const currentAllowed = yield* authorize(prepared);
+          if (
+            currentAllowed.size !== allowed.size ||
+            [...allowed].some((key) => !currentAllowed.has(key))
+          ) {
+            return yield* adapterError(
+              "managed_skill_not_allowed",
+              "The managed run's frozen skill selection changed during copying.",
+            );
+          }
           const payload: PiManagedSkillsPayload = {
             kind: "pi-managed-skills",
             root: materialized.root,
-            skills: prepared.skills.map((skill) => ({
+            skills: selected.skills.map((skill) => ({
               key: skill.key,
               path: NodePath.join(materialized.root, skill.key, SKILL_BODY_FILE),
             })),
@@ -546,7 +564,7 @@ export function makePiSkillAdapter(input: {
             providerInstanceId: input.providerInstanceId,
             desiredRevision: prepared.desiredRevision,
             applicationMode: "new_session_required",
-            skillKeys: prepared.skills.map((skill) => skill.key),
+            skillKeys: selected.skills.map((skill) => skill.key),
             payload,
           } satisfies ProviderSkillPlan;
         }),

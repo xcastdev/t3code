@@ -21,6 +21,7 @@
       "entry": [
         "src/bin.ts!",
         "src/claude-history-worker.ts!",
+        "src/pi-worker.ts!",
         "scripts/cli.ts",
         "scripts/evaluate-thread-titles.ts",
         "src/provider/testFixtures/*.mjs",
@@ -28,8 +29,11 @@
         "src/provider/pi/fixtures/p1-runtime-descendants.mjs",
         "src/provider/pi/fixtures/p1-runtime-linux-proof.mjs",
         "src/provider/pi/fixtures/p1-runtime-mcp.mjs",
+        "src/provider/pi/fixtures/p7-worker-entry-local-tools.mjs",
         "src/provider/pi/fixtures/p7-sdk-worker-child.mjs",
         "src/provider/pi/fixtures/p7-sdk-worker-native.mjs",
+        "src/provider/pi/fixtures/p7-sdk-session-runtime-child.mjs",
+        "src/provider/pi/fixtures/p7-sdk-session-runtime-linux-proof.mjs",
       ],
       // Keep the transitive Effect runtime pinned for standalone npm installs.
       // Native msgpack acceleration and the Vite+ web build prerequisite.

@@ -27,6 +27,12 @@ import { GrokDriver, type GrokDriverEnv } from "./Drivers/GrokDriver.ts";
 import { OpenCodeDriver, type OpenCodeDriverEnv } from "./Drivers/OpenCodeDriver.ts";
 import { AntigravityDriver, type AntigravityDriverEnv } from "./Drivers/AntigravityDriver.ts";
 import type { AnyProviderDriver } from "./ProviderDriver.ts";
+import { makePiDriver } from "./Drivers/PiDriver.ts";
+import { makePiAdapter } from "./Layers/PiAdapter.ts";
+import type { PiManagedRuntime } from "./pi/PiManagedRuntime.ts";
+import type { SkillMaterializationService } from "../skills/SkillMaterializationService.ts";
+
+const PiDriver = makePiDriver({ makeAdapter: makePiAdapter });
 
 /**
  * Union of infrastructure services required to construct any built-in
@@ -39,7 +45,9 @@ export type BuiltInDriversEnv =
   | CursorDriverEnv
   | GrokDriverEnv
   | OpenCodeDriverEnv
-  | AntigravityDriverEnv;
+  | AntigravityDriverEnv
+  | PiManagedRuntime
+  | SkillMaterializationService;
 
 /**
  * Ordered list of built-in drivers. Order matters only for tie-breaking in
@@ -53,4 +61,5 @@ export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv
   GrokDriver,
   OpenCodeDriver,
   AntigravityDriver,
+  PiDriver,
 ];

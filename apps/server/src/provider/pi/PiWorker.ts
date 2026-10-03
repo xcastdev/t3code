@@ -37,6 +37,7 @@ import {
   type PiWorkerIdentity,
   type PiWorkerOperation,
   type PiNativeReference,
+  type PiWorkerBootstrap,
 } from "./PiWorkerProtocol.ts";
 
 const encodeToolInput = Schema.encodeSync(Schema.fromJsonString(PiWorkerToolInput), {
@@ -53,6 +54,10 @@ export interface PiSdkWorkerOptions {
   readonly sessionDirectory: string;
   /** Parent freezes this native retention setting with the run configuration. */
   readonly compactionKeepRecentTokens?: number;
+  /** Fixed child resources are admitted before any native session is opened. */
+  readonly initializeLocalResources?: (
+    resources: NonNullable<PiWorkerBootstrap["resources"]>,
+  ) => Promise<void>;
   readonly emit: (bytes: Buffer) => Promise<void>;
   readonly localTools: Readonly<
     Record<
@@ -287,6 +292,9 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
         if (actualCwd !== bootstrap.expectedCwd) throw Error("INVALID_INPUT");
         const context = protocol.takeTransfer(bootstrap.context.transferId);
         if (context.purpose !== "context") throw Error("INVALID_INPUT");
+        if (canceled) throw Error("CANCELED");
+        await options.initializeLocalResources?.(bootstrap.resources ?? { skills: [] });
+        if (canceled) throw Error("CANCELED");
         if (bootstrap.native) {
           const reference = bootstrap.native.sessionReference;
           if (!reference.startsWith("sessions/") || reference.slice(9).includes("/"))

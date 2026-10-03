@@ -146,7 +146,7 @@ const makeOpenCodeConfig = (overrides: Partial<OpenCodeSettings>): OpenCodeSetti
 
 const makeTildeProviderFixtures = Effect.fn(
   "ProviderInstanceRegistryLive.test.makeTildeProviderFixtures",
-)(function* () {
+)(function* (skillCatalog: "valid" | "missing" | "wrong-cwd" | "errors" = "valid") {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const homePath = expandHomePath("~");
@@ -161,9 +161,27 @@ const makeTildeProviderFixtures = Effect.fn(
   const codexFixtureDir = path.join(import.meta.dirname, "../testFixtures");
 
   yield* fileSystem.copyFile(path.join(codexFixtureDir, "codexCollabMockPeer.sh"), codexPath);
-  yield* fileSystem.copyFile(
+  const codexPeer = yield* fileSystem.readFileString(
     path.join(codexFixtureDir, "codexCollabMockPeer.mjs"),
+  );
+  // Readiness needs one catalog for the requested cwd, including when it has no skills.
+  yield* fileSystem.writeFileString(
     path.join(fixtureDir, "codexCollabMockPeer.mjs"),
+    codexPeer.replace(
+      'if (method === "skills/list" || method === "model/list") {',
+      [
+        'if (method === "skills/list") {',
+        '  const data = script.skillCatalog === "missing" ? [] : message.params.cwds.map((cwd) => ({',
+        '    cwd: script.skillCatalog === "wrong-cwd" ? `${cwd}/other` : cwd,',
+        "    skills: [],",
+        '    errors: script.skillCatalog === "errors" ? [{ path: `${cwd}/SKILL.md`, message: "fixture catalog error" }] : [],',
+        "  }));",
+        "  write({ id, result: { data } });",
+        "  return;",
+        "}",
+        'if (method === "model/list") {',
+      ].join("\n"),
+    ),
   );
   yield* fileSystem.copyFile(
     path.join(codexFixtureDir, "codexMultiAgentWire.json"),
@@ -172,7 +190,7 @@ const makeTildeProviderFixtures = Effect.fn(
   yield* fileSystem.writeFileString(
     codexScriptPath,
     // @effect-diagnostics-next-line preferSchemaOverJson:off - fixed script document read by the external Codex mock peer.
-    JSON.stringify({ rootThreadId: "probe-thread", notifications: [] }),
+    JSON.stringify({ rootThreadId: "probe-thread", notifications: [], skillCatalog }),
   );
   yield* fileSystem.chmod(codexPath, 0o755);
 
@@ -393,6 +411,46 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
       });
     }).pipe(Effect.provide(testLayer)),
   );
+
+  for (const skillCatalog of ["missing", "wrong-cwd", "errors"] as const)
+    it.live(
+      `rejects Codex readiness from a configured tilde path with ${skillCatalog} catalog`,
+      () =>
+        Effect.gen(function* () {
+          if (yield* isHostWindows) return;
+          const fixtures = yield* makeTildeProviderFixtures(skillCatalog);
+          const codexId = ProviderInstanceId.make("codex_tilde_invalid_catalog");
+          const { registry } = yield* makeProviderInstanceRegistry({
+            drivers: [CodexDriver],
+            configMap: {
+              [codexId]: {
+                driver: ProviderDriverKind.make("codex"),
+                enabled: true,
+                environment: [
+                  {
+                    name: "T3_CODEX_COLLAB_SCRIPT",
+                    value: fixtures.codexScriptPath,
+                    sensitive: false,
+                  },
+                ],
+                config: makeCodexConfig({ enabled: true, binaryPath: fixtures.codexBinaryPath }),
+              },
+            },
+          });
+          const codex = yield* registry.getInstance(codexId);
+          expect(codex).toBeDefined();
+          const snapshot = yield* codex!.snapshot.refresh;
+          expect(snapshot).toMatchObject({
+            installed: true,
+            status: "error",
+            version: null,
+            auth: { status: "unknown" },
+          });
+          expect(snapshot.message).toContain(
+            "Codex did not return one error-free skill catalog for the requested cwd.",
+          );
+        }).pipe(Effect.provide(testLayer)),
+    );
 
   it.live(
     "shadows instances whose driver is not registered in this build without failing boot",

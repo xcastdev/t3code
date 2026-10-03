@@ -33,6 +33,10 @@ const CUSTOM_MODEL_PLACEHOLDER_BY_KIND: Partial<Record<ProviderDriverKind, strin
 /** Above this many models the list gets a filter input. */
 const FILTER_THRESHOLD = 8;
 
+export function supportsCustomModels(driverKind: ProviderDriverKind | null): boolean {
+  return driverKind !== "antigravity" && driverKind !== "piAgent";
+}
+
 /**
  * Short capability words shown after a model's slug. Claude and Cursor report
  * fast mode as a boolean `fastMode` option; Codex reports it as a
@@ -171,6 +175,7 @@ export function ProviderModelsSection({
   onFavoriteModelsChange,
   onModelOrderChange,
 }: ProviderModelsSectionProps) {
+  const canEditCustomModels = supportsCustomModels(driverKind);
   const [input, setInput] = useState("");
   const [isAdding, setIsAdding] = useState(false);
   const [filter, setFilter] = useState("");
@@ -223,7 +228,7 @@ export function ProviderModelsSection({
   }, [displayModels]);
 
   const handleAdd = () => {
-    if (driverKind === "antigravity") return;
+    if (!canEditCustomModels) return;
     const normalized = normalizeCustomModelSlug(input);
     if (!normalized) {
       setError("Enter a model slug.");
@@ -259,6 +264,7 @@ export function ProviderModelsSection({
   };
 
   const handleRemove = (slug: string) => {
+    if (!canEditCustomModels) return;
     if (editingSlug === slug) setEditingSlug(null);
     onChange(customModels.filter((entry) => entry.slug !== slug));
     onModelOrderChange(modelOrder.filter((model) => model !== slug));
@@ -267,6 +273,7 @@ export function ProviderModelsSection({
   };
 
   const handleSaveEdit = (next: CustomModelDefinition) => {
+    if (!canEditCustomModels) return;
     onChange(customModels.map((entry) => (entry.slug === next.slug ? next : entry)));
     setEditingSlug(null);
   };
@@ -381,7 +388,7 @@ export function ProviderModelsSection({
           </Tooltip>
         </>
       ) : null}
-      {model.isCustom ? (
+      {canEditCustomModels && model.isCustom ? (
         <>
           <Tooltip>
             <TooltipTrigger
@@ -540,7 +547,7 @@ export function ProviderModelsSection({
             {hiddenCount > 0 ? ` · ${hiddenCount} hidden` : ""}
           </span>
         </div>
-        {driverKind !== "antigravity" && !isAdding ? (
+        {canEditCustomModels && !isAdding ? (
           <Button
             type="button"
             size="xs"
@@ -567,7 +574,7 @@ export function ProviderModelsSection({
           const previous = visibleModels[index - 1];
           const startsGroup = previous === undefined || groupOf(previous) !== group;
           const editingEntry =
-            model.isCustom && editingSlug === model.slug
+            canEditCustomModels && model.isCustom && editingSlug === model.slug
               ? customModels.find((entry) => entry.slug === model.slug)
               : undefined;
           return (
@@ -598,7 +605,7 @@ export function ProviderModelsSection({
         })}
       </div>
 
-      {driverKind === "antigravity" ? null : isAdding ? (
+      {canEditCustomModels && isAdding ? (
         <div className="mt-3 flex flex-col gap-2 sm:flex-row">
           <Input
             id={`provider-instance-${instanceId}-custom-model`}
@@ -633,7 +640,7 @@ export function ProviderModelsSection({
         </div>
       ) : null}
 
-      {driverKind !== "antigravity" && error ? (
+      {canEditCustomModels && error ? (
         <p className="mt-2 text-xs text-destructive">{error}</p>
       ) : null}
     </div>

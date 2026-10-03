@@ -43,7 +43,7 @@ import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { DriverOption } from "./providerDriverMeta";
 import { ProviderSettingsForm } from "./ProviderSettingsForm";
-import { ProviderModelsSection } from "./ProviderModelsSection";
+import { ProviderModelsSection, supportsCustomModels } from "./ProviderModelsSection";
 import { ProviderInstanceIcon, providerInstanceInitials } from "../chat/ProviderInstanceIcon";
 import { ProviderAccentColorPicker } from "./ProviderAccentColorPicker";
 import { RedactedSensitiveText } from "./RedactedSensitiveText";
@@ -473,15 +473,18 @@ export function ProviderInstanceCard({
   const driverKind: ProviderDriverKind | null = isProviderDriverKind(instance.driver)
     ? instance.driver
     : null;
-  const customModels =
-    instance.driver === "antigravity" ? [] : readConfigCustomModels(instance.config);
-  // Server-returned models may lag behind settings writes. Treat probe
-  // models as the source for built-ins only; custom rows come directly
-  // from the current instance config so add/remove reflects immediately.
-  const modelsForDisplay = deriveProviderModelsForDisplay({
-    liveModels: liveProvider?.models,
-    customModels,
-  });
+  const canEditCustomModels = supportsCustomModels(instance.driver);
+  const customModels = canEditCustomModels ? readConfigCustomModels(instance.config) : [];
+  // Pi's native catalog is read-only here. For editable catalogs, probe
+  // models may lag behind settings writes, so custom rows come directly
+  // from the current instance config to reflect add/remove immediately.
+  const modelsForDisplay =
+    instance.driver === "piAgent"
+      ? (liveProvider?.models ?? [])
+      : deriveProviderModelsForDisplay({
+          liveModels: liveProvider?.models,
+          customModels,
+        });
   const updateDisplayName = (value: string) => {
     const trimmed = value.trim();
     const { displayName: _omit, ...rest } = instance;
@@ -516,6 +519,7 @@ export function ProviderInstanceCard({
   };
 
   const updateCustomModels = (next: ReadonlyArray<CustomModelDefinition>) => {
+    if (!canEditCustomModels) return;
     const nextConfig = nextConfigBlobWithValue(
       instance.config,
       "customModels",
@@ -893,8 +897,8 @@ export function ProviderInstanceCard({
         >
           <div className="px-3 py-3 sm:px-4">
             <p className="mb-3 text-xs text-muted-foreground">
-              Favorites, visibility, and ordering are saved on this device. Custom models are saved
-              on the selected environment.
+              Favorites, visibility, and ordering are saved on this device.
+              {canEditCustomModels ? " Custom models are saved on the selected environment." : null}
             </p>
             <ProviderModelsSection
               instanceId={instanceId}

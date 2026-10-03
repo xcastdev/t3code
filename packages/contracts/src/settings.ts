@@ -571,6 +571,27 @@ function makeProviderSettingsSchema<const Fields extends Schema.Struct.Fields>(
   );
 }
 
+/** Pi instance configuration selects native settings; it never carries credentials or authority. */
+export const PiSettings = makeProviderSettingsSchema(
+  {
+    agentDirectory: Schema.optional(
+      Schema.String.check(
+        Schema.isMinLength(1),
+        Schema.isMaxLength(4096),
+        Schema.makeFilter((value) => value.trim() === value && !value.includes("\0")),
+      ),
+    ).pipe(
+      Schema.annotateKey({
+        title: "Pi configuration directory",
+        description: "Directory containing this instance's native Pi settings.",
+        providerSettingsForm: { placeholder: "~/.pi/agent", clearWhenEmpty: "omit" },
+      }),
+    ),
+  },
+  { order: ["agentDirectory"] },
+).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type PiSettings = typeof PiSettings.Type;
+
 export const CodexSettings = makeProviderSettingsSchema(
   {
     enabled: Schema.Boolean.pipe(

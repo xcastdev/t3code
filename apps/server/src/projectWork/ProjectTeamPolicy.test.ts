@@ -1,10 +1,21 @@
 import {
+  CommandId,
+  EnvironmentId,
   ProjectId,
+  ProjectWorkAttemptId,
   ProjectWorkTaskId,
+  ProviderInstanceId,
+  ThreadId,
+  type ProjectTeamGuidedIntent,
   type ProjectTeamRecord,
+  type ProjectWorkCommand,
   type ProjectWorkTask,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import {
   evaluateProjectTeamDependency,
@@ -15,8 +26,17 @@ import {
   projectTeamScopeHash,
   projectTeamPlanHash,
   assertProjectTeamOrdinarySuccessor,
+  assertProjectTeamRunAuthority,
 } from "./ProjectTeamPolicy.ts";
-import { emptyProjectWorkReducerState } from "./ProjectWorkDecider.ts";
+import {
+  applyProjectWorkEvents,
+  decideProjectWorkCommand,
+  emptyProjectWorkReducerState,
+} from "./ProjectWorkDecider.ts";
+import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
+import { scoped } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
+import { runMigrations } from "../persistence/Migrations.ts";
 
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
 type Membership = Extract<ProjectTeamRecord, { kind: "task-membership" }>;
@@ -24,6 +44,482 @@ type RepairEpisode = Extract<ProjectTeamRecord, { kind: "repair-episode" }>;
 const projectId = ProjectId.make("project-a");
 const taskId = ProjectWorkTaskId.make("task-a");
 const now = "2026-09-30T00:00:00.000Z";
+
+type Binding = Extract<ProjectTeamRecord, { kind: "run-binding" }>;
+type Role = Extract<ProjectTeamRecord, { kind: "role-revision" }>;
+type RunKind = "investigation" | "planning" | "review" | "execution";
+const piReadonlyTools = ["pi.read", "project-work.read-project", "project-work.read-task"];
+const legacyReadonlyTools = ["read", "search", "project-work", "project-work.report"];
+const writableTools = [
+  "pi.write",
+  "pi.edit",
+  "pi.bash",
+  "write",
+  "edit",
+  "bash",
+  "project-work.write",
+  "project-work.delegate",
+];
+
+/** Real guided grants and atomic claims; no worker process is launched by this fixture. */
+const currentRun = (kind: RunKind, toolIds = piReadonlyTools) => {
+  let state = emptyProjectWorkReducerState(projectId);
+  const commands: ProjectWorkCommand[] = [];
+  const attribution = gate().attribution;
+  const advance = (command: ProjectWorkCommand) => {
+    state = applyProjectWorkEvents(state, decideProjectWorkCommand(state, command));
+    commands.push(command);
+  };
+  const commit = (records: ProjectTeamRecord[]) =>
+    advance({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: CommandId.make(`records-${state.revision}`),
+      expectedRevision: state.revision,
+      records,
+      attribution,
+      committedAt: now,
+    });
+  const envelope = () => ({
+    projectId,
+    taskId,
+    commandId: CommandId.make(`guided-${state.revision}`),
+    expectedRevision: state.revision,
+    expectedTaskRevision: state.tasks.find((entry) => entry.taskId === taskId)!.revision,
+  });
+  const guided = (intent: ProjectTeamGuidedIntent) =>
+    advance({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: intent.commandId,
+      expectedRevision: intent.expectedRevision,
+      attribution,
+      records: [],
+      committedAt: now,
+      guided: { intent },
+    });
+  const approval = (kind: "specification" | "plan") =>
+    state.foundationRecords!.find(
+      (record): record is Gate =>
+        record.kind === "gate" && record.taskId === taskId && record.gate === kind,
+    )!;
+  const approve = (kind: "specification" | "plan") => {
+    const record = approval(kind);
+    commit([{ ...record, status: "approved", revision: record.revision + 1 }]);
+  };
+  advance({
+    type: "project-work.task.create",
+    projectId,
+    taskId,
+    commandId: CommandId.make("capture-readonly"),
+    title: "Investigate a bounded issue",
+    createdAt: now,
+  });
+  if (kind !== "investigation") {
+    guided({
+      ...envelope(),
+      type: "project-team.specification.propose",
+      expectedSpecRevision: 0,
+      specification: {
+        objective: "Deliver one behavior",
+        scopeIn: "The approved behavior",
+        scopeOut: "Other implementation",
+        criterionIds: [],
+        revision: 1,
+        protected: false,
+      },
+      criterionSnapshots: [],
+    });
+    approve("specification");
+    if (kind !== "planning") {
+      guided({
+        ...envelope(),
+        type: "project-team.plan.propose",
+        specRevision: 1,
+        content: "Implement and verify the approved behavior",
+        dependencyTaskIds: [],
+      });
+      approve("plan");
+    }
+  }
+  const plan = state.foundationRecords!.find(
+    (record): record is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+      record.kind === "plan-revision",
+  );
+  if (kind === "investigation") {
+    guided({
+      ...envelope(),
+      type: "project-team.investigation.start",
+      objective: "Read source and report the cause",
+      outputDescriptions: ["Sourced findings"],
+    });
+  } else if (kind === "execution") {
+    guided({
+      ...envelope(),
+      type: "project-team.execution.start",
+      specRevision: 1,
+      planRevision: 1,
+      specGateId: approval("specification").recordId,
+      expectedSpecGateRevision: approval("specification").revision,
+      planId: plan!.recordId,
+      expectedPlanRecordRevision: plan!.revision,
+      planGateId: approval("plan").recordId,
+      expectedPlanGateRevision: approval("plan").revision,
+    });
+  } else {
+    guided({
+      ...envelope(),
+      type: "project-team.assignment.start",
+      assignmentKind: kind,
+      objective: kind === "planning" ? "Draft the first plan" : "Review approved scope",
+      outputDescriptions: [kind === "planning" ? "Proposed plan" : "Review findings"],
+      specRevision: 1,
+      specificationGateId: approval("specification").recordId,
+      expectedSpecificationGateRevision: approval("specification").revision,
+      ...(plan === undefined
+        ? {}
+        : {
+            parentPlan: {
+              recordId: plan.recordId,
+              expectedRecordRevision: plan.revision,
+              planRevision: plan.planRevision,
+              gateId: approval("plan").recordId,
+              expectedGateRevision: approval("plan").revision,
+            },
+          }),
+    });
+  }
+  const assignedTask = state.tasks.find((entry) =>
+    kind === "execution" ? entry.taskId === taskId : entry.taskId !== taskId,
+  )!;
+  const template = state.foundationRecords!.find(
+    (record): record is Role => record.kind === "role-revision",
+  );
+  const role: Role = {
+    kind: "role-revision",
+    recordId: "frozen-pi-role",
+    projectId,
+    revision: 0,
+    generation: 0,
+    updatedAt: now,
+    status: "available",
+    roleId: kind,
+    roleRevision: 1,
+    role: template?.role ?? "implementer",
+    instructions: "Stay in the granted scope",
+    skills: [],
+    tools: [
+      ...legacyReadonlyTools,
+      ...piReadonlyTools,
+      ...(kind === "planning" ? ["project-work.plan"] : []),
+      ...(kind === "execution" ? writableTools : []),
+    ],
+    model: "fixture-model",
+    memoryAccess: "project",
+    delegationDepth: 0,
+  };
+  commit([
+    role,
+    {
+      kind: "member",
+      recordId: "pi-member",
+      projectId,
+      revision: 0,
+      generation: 0,
+      updatedAt: now,
+      status: "active",
+      name: "Assigned worker",
+      coordinator: false,
+      roleRevisionId: role.recordId,
+    },
+  ]);
+  const grant = state.foundationRecords!.find(
+    (record): record is Gate =>
+      record.kind === "gate" &&
+      record.taskId === assignedTask.taskId &&
+      (record.gate === "investigation" ||
+        record.gate === "assignment" ||
+        record.gate === "execution"),
+  )!;
+  const binding: Binding = {
+    kind: "run-binding",
+    recordId: "pi-run",
+    projectId,
+    revision: 0,
+    generation: 0,
+    updatedAt: now,
+    status: "reserved",
+    taskId: assignedTask.taskId,
+    attemptId: ProjectWorkAttemptId.make("pi-attempt"),
+    memberId: "pi-member",
+    roleRevisionId: role.recordId,
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    threadId: ThreadId.make("pi-readonly-thread"),
+    environmentId: EnvironmentId.make("policy-test"),
+    model: role.model,
+    configuration: {
+      instructionsHash: "fixture-instructions",
+      toolIds,
+      skillIds: [],
+      runtimeVersion: "fixture",
+      maxTokens: 1000,
+      maxDurationMs: 1000,
+      paidFallback: false,
+    },
+    worktree: "/fixture/pi-worktree",
+    branch: "fixture-branch",
+    leaseGeneration: 0,
+    specRevision: assignedTask.specRevision,
+    planRevision: kind === "execution" ? plan!.planRevision : 0,
+    authorizationGateId: grant.recordId,
+    ...(kind === "execution"
+      ? {
+          specificationGateId: approval("specification").recordId,
+          planGateId: approval("plan").recordId,
+        }
+      : {}),
+    scopeHash: projectTeamScopeHash(
+      state,
+      assignedTask.taskId,
+      kind === "execution" ? plan : undefined,
+    ),
+  };
+  const commandId = CommandId.make("claim-pi-run");
+  advance({
+    type: "project-work.foundation.commit",
+    projectId,
+    commandId,
+    expectedRevision: state.revision,
+    records: [],
+    attribution: {
+      actor: { kind: "system", id: "scheduler" },
+      source: { kind: "system", id: "scheduler" },
+      recordedAt: now,
+    },
+    committedAt: now,
+    transition: {
+      kind: "claim",
+      taskId: binding.taskId,
+      expectedTaskRevision: assignedTask.revision,
+      authorizationGateId: grant.recordId,
+      expectedGateRevision: grant.revision,
+      binding,
+      claim: {
+        type: "project-work.task.claim",
+        projectId,
+        taskId: binding.taskId,
+        commandId,
+        attemptId: binding.attemptId,
+        leaseToken: "pi-lease",
+        leasedUntil: "2026-10-01T00:00:00.000Z",
+        claimedAt: now,
+      },
+    },
+  });
+  const running = { ...binding, status: "running" as const, revision: 1, sessionId: "pi-native" };
+  commit([running]);
+  return { state, commands, role, binding: running };
+};
+
+describe("Pi readonly run capabilities", () => {
+  it.each(["investigation", "planning", "review"] as const)(
+    "permits exact readonly Pi capabilities under the real %s grant",
+    (kind) => {
+      const { state, binding, role } = currentRun(kind);
+      expect(() => assertProjectTeamRunAuthority(state, binding, role, false)).not.toThrow();
+      expect(
+        state.foundationRecords!.filter(
+          (record) => record.kind === "gate" && record.gate === "execution",
+        ),
+      ).toEqual([]);
+      expect(
+        state.foundationRecords!.find((record) => record.recordId === binding.authorizationGateId),
+      ).toMatchObject({
+        gate: kind === "investigation" ? "investigation" : "assignment",
+        status: "consumed",
+        consumedByRunId: binding.recordId,
+      });
+      expect(binding.configuration.toolIds.every((tool) => role.tools.includes(tool))).toBe(true);
+    },
+  );
+
+  it.each(["investigation", "planning", "review"] as const)(
+    "preserves legacy readonly capabilities for %s",
+    (kind) => {
+      const { state, binding, role } = currentRun(kind, legacyReadonlyTools);
+      expect(() => assertProjectTeamRunAuthority(state, binding, role, false)).not.toThrow();
+    },
+  );
+
+  it.each(["investigation", "planning", "review"] as const)(
+    "denies writable and delegated tools even when the frozen %s role advertises them",
+    (kind) => {
+      const { state, binding, role } = currentRun(kind, legacyReadonlyTools);
+      for (const tool of [
+        ...writableTools,
+        "pi.read-extra",
+        "project-work.read-task-extra",
+        ...(kind === "planning" ? [] : ["project-work.plan"]),
+      ]) {
+        const grantedRole = { ...role, tools: [...role.tools, tool] };
+        const selected = {
+          ...binding,
+          configuration: { ...binding.configuration, toolIds: [tool] },
+        };
+        expect(() => assertProjectTeamRunAuthority(state, selected, grantedRole, false)).toThrow(
+          "writable implementation authority",
+        );
+      }
+    },
+  );
+
+  it("permits planning output only for the inherited planner", () => {
+    const { state, binding, role } = currentRun("planning", [
+      "project-work.plan",
+      ...piReadonlyTools,
+    ]);
+    expect(() => assertProjectTeamRunAuthority(state, binding, role, false)).not.toThrow();
+  });
+
+  it.each(["investigation", "planning", "review"] as const)(
+    "requires selected Pi tools to remain a subset of the frozen %s role",
+    (kind) => {
+      const { state, binding, role } = currentRun(kind);
+      for (const tool of piReadonlyTools) {
+        const narrowed = { ...role, tools: role.tools.filter((entry) => entry !== tool) };
+        expect(() => assertProjectTeamRunAuthority(state, binding, narrowed, false)).toThrow(
+          "frozen capabilities changed",
+        );
+      }
+    },
+  );
+
+  it.each(["investigation", "planning", "review"] as const)(
+    "does not renew stale or revoked %s authority for readonly tools",
+    (kind) => {
+      const { state, binding, role } = currentRun(kind);
+      const staleSpecification = {
+        ...state,
+        tasks: state.tasks.map((entry) =>
+          entry.taskId === binding.taskId
+            ? { ...entry, specRevision: entry.specRevision + 1 }
+            : entry,
+        ),
+      };
+      expect(() => assertProjectTeamRunAuthority(staleSpecification, binding, role, false)).toThrow(
+        "scope changed",
+      );
+      for (const status of ["invalidated", "rejected", "approved"] as const) {
+        const revoked = {
+          ...state,
+          foundationRecords: state.foundationRecords!.map((record) =>
+            record.recordId === binding.authorizationGateId && record.kind === "gate"
+              ? { ...record, status }
+              : record,
+          ),
+        };
+        expect(() => assertProjectTeamRunAuthority(revoked, binding, role, false)).toThrow(
+          "consumed human grant",
+        );
+      }
+      expect(() =>
+        assertProjectTeamRunAuthority(state, { ...binding, status: "revoked" }, role, false),
+      ).toThrow("no longer active");
+      expect(() =>
+        assertProjectTeamRunAuthority(state, binding, { ...role, status: "retired" }, false),
+      ).toThrow("no longer available");
+      if (kind !== "investigation") {
+        const staleParent = {
+          ...state,
+          tasks: state.tasks.map((entry) =>
+            entry.taskId === taskId ? { ...entry, specRevision: entry.specRevision + 1 } : entry,
+          ),
+        };
+        expect(() => assertProjectTeamRunAuthority(staleParent, binding, role, false)).toThrow(
+          "parent specification",
+        );
+        const revokedParent = {
+          ...state,
+          foundationRecords: state.foundationRecords!.map((record) =>
+            record.kind === "gate" && record.taskId === taskId
+              ? { ...record, status: "invalidated" as const }
+              : record,
+          ),
+        };
+        expect(() => assertProjectTeamRunAuthority(revokedParent, binding, role, false)).toThrow(
+          "specification approval is stale",
+        );
+      }
+    },
+  );
+
+  it("preserves ordinary execution's explicitly approved writable capabilities", () => {
+    const { state, binding, role } = currentRun("execution", [
+      ...piReadonlyTools,
+      ...writableTools,
+    ]);
+    expect(() => assertProjectTeamRunAuthority(state, binding, role, false)).not.toThrow();
+  });
+});
+
+for (const kind of ["investigation", "planning", "review", "execution"] as const) {
+  effectIt.effect(`resolves genuine ${kind} authority from current SQLite history`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const fixture = currentRun(kind);
+        yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
+        const repository = yield* ProjectWorkRepository;
+        yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${projectId},'Project','/fixture','[]',${now},${now})`;
+        for (const command of fixture.commands) yield* repository.execute(command);
+        yield* TestClock.setTime(Date.parse(now));
+        const auth = yield* ProjectTeamAuthorization;
+        const authority = yield* auth.issueCredential({
+          providerInstanceId: fixture.binding.providerInstanceId,
+          threadId: fixture.binding.threadId,
+        });
+        expect(authority).toBeDefined();
+        const credential = authority!.credential;
+        const principal = {
+          actor: { kind: "agent" as const, id: managedActorId(credential) },
+          managed: credential,
+        };
+        expect(yield* auth.resolve(principal)).toMatchObject({
+          binding: { recordId: "pi-run", configuration: { toolIds: piReadonlyTools } },
+        });
+        yield* auth.read(principal, {
+          projectId,
+          taskId: fixture.binding.taskId,
+          operation: "task",
+        });
+        expect(
+          (yield* auth
+            .resolve({
+              ...principal,
+              managed: { ...credential, generation: credential.generation + 1 },
+            })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        yield* TestClock.setTime(Date.parse("2026-10-01T00:00:00.000Z"));
+        expect((yield* auth.resolve(principal).pipe(Effect.result))._tag).toBe("Failure");
+        yield* TestClock.setTime(Date.parse(now));
+        expect(yield* auth.resolve(principal)).toBeDefined();
+        yield* repository.execute({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: CommandId.make("revoke-pi-run"),
+          expectedRevision: fixture.state.revision,
+          attribution: gate().attribution,
+          records: [
+            { ...fixture.binding, status: "revoked", revision: fixture.binding.revision + 1 },
+          ],
+          committedAt: now,
+        });
+        expect((yield* auth.resolve(principal).pipe(Effect.result))._tag).toBe("Failure");
+      }),
+    ),
+  );
+}
 
 describe("ordinary successor repair fence", () => {
   const episode: RepairEpisode = {

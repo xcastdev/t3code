@@ -17,8 +17,18 @@ import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import * as Logger from "effect/Logger";
+import * as PubSub from "effect/PubSub";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import type { ProviderInstance } from "../provider/ProviderDriver.ts";
+import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
+import * as Repository from "./ManagedSkillRepository.ts";
+import * as CatalogIndex from "./SkillCatalogIndex.ts";
+import * as Native from "./NativeSkillObservationService.ts";
+import * as Catalog from "./SkillCatalogService.ts";
+import { SkillWatchService } from "./SkillWatchService.ts";
 import * as Materialization from "./SkillMaterializationService.ts";
 import { hashSkillPackage } from "./SkillPackage.ts";
 import {
@@ -323,7 +333,147 @@ const piFixture = Effect.fn("ProviderSkillAdapters.test.piFixture")(function* ()
   };
 });
 
+const PiCatalogTestLayer = CatalogIndex.layer.pipe(
+  Layer.provideMerge(Repository.layer),
+  Layer.provideMerge(Native.layer),
+  Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provideMerge(PiTestLayer),
+);
+
 describe("Pi managed skill delivery", () => {
+  it.layer(PiCatalogTestLayer)("catalogue selection", (it) => {
+    it.effect(
+      "copies only the authorized subset or no packages from a nonempty real catalogue",
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* piFixture();
+          const repository = yield* Repository.ManagedSkillRepository;
+          const review = yield* repository.createGlobal({
+            expectedRevision: 0,
+            content: { key: piKey, name: "Review", body: "Review the assigned change." },
+          });
+          const deploy = yield* repository.createGlobal({
+            expectedRevision: 0,
+            content: {
+              key: ManagedSkillKey.make("deploy"),
+              name: "Deploy",
+              body: "Do not activate this unrelated package.",
+            },
+          });
+          const sources = [review, deploy];
+          const before = yield* Effect.forEach(sources, (source) =>
+            Effect.all([
+              hashSkillPackage(source.packagePath),
+              fixture.fs.readFileString(fixture.path.join(source.packagePath, "t3-skill.json")),
+            ]),
+          );
+          for (const empty of [false, true]) {
+            const adapter = makePiSkillAdapter({
+              providerInstanceId: piInstanceId,
+              materialization: fixture.materialization,
+              discoverCandidates: () => Effect.fail({ _tag: "NativeMustNotLoad" }),
+              authorizeManagedRequest: (request) =>
+                Effect.sync(() => {
+                  assert.deepEqual(request.skills.map((skill) => skill.key).sort(), [
+                    "deploy",
+                    "review",
+                  ]);
+                  assert.isTrue(Object.isFrozen(request));
+                  return new Set(empty ? [] : [piKey]);
+                }),
+            });
+            const changes = yield* PubSub.unbounded<void>();
+            const instance: ProviderInstance = {
+              instanceId: piInstanceId,
+              driverKind: ProviderDriverKind.make("piAgent"),
+              continuationIdentity: {
+                driverKind: ProviderDriverKind.make("piAgent"),
+                continuationKey: "catalogue-test",
+              },
+              displayName: undefined,
+              enabled: true,
+              skillAdapter: adapter,
+              get snapshot(): never {
+                throw new Error("Catalogue preparation does not inspect provider metadata.");
+              },
+              get adapter(): never {
+                throw new Error("Catalogue preparation does not start a provider session.");
+              },
+              get textGeneration(): never {
+                throw new Error("Catalogue preparation does not generate text.");
+              },
+            };
+            const index = yield* CatalogIndex.SkillCatalogIndex;
+            const catalog = yield* Catalog.make.pipe(
+              Effect.provideService(ProviderInstanceRegistry, {
+                getInstance: () => Effect.succeed(instance),
+                listInstances: Effect.succeed([instance]),
+                listUnavailable: Effect.succeed([]),
+                streamChanges: Stream.fromPubSub(changes),
+                subscribeChanges: PubSub.subscribe(changes),
+              }),
+              Effect.provideService(SkillWatchService, {
+                acquireProject: index.acquireProject,
+                releaseProject: index.releaseProject,
+                invalidateGlobal: Effect.void,
+                invalidateProject: () => Effect.void,
+              }),
+            );
+            const result = yield* catalog.prepareSession({
+              threadId: fixture.request.runtime.threadId!,
+              providerInstanceId: piInstanceId,
+              cwd: fixture.source,
+              desiredRevision: fixture.request.desiredRevision,
+              appliedRevision: SkillCatalogRevision.make(0),
+            });
+            const plan = result.plan;
+            if (plan === undefined)
+              return yield* Effect.die("Nonempty catalogue must reach the Pi adapter.");
+            assert.deepEqual(plan.skillKeys, empty ? [] : [piKey]);
+            // The opaque plan carries the exact root; locate this session's generated ownership marker.
+            const sessions = yield* fixture.fs.readDirectory(fixture.config.skillRuntimeDir);
+            assert.equal(sessions.length, 1);
+            const output = fixture.path.join(
+              fixture.config.skillRuntimeDir,
+              sessions[0]!,
+              "2",
+              "pi-team",
+            );
+            assert.deepEqual(plan.payload, {
+              kind: "pi-managed-skills",
+              root: output,
+              skills: empty
+                ? []
+                : [{ key: piKey, path: fixture.path.join(output, piKey, "SKILL.md") }],
+            });
+            assert.deepEqual(
+              (yield* fixture.fs.readDirectory(output)).sort(),
+              empty ? [".t3-owned.json"] : [".t3-owned.json", "review"],
+            );
+            if (!empty)
+              assert.equal(
+                yield* fixture.fs.readFileString(fixture.path.join(output, piKey, "SKILL.md")),
+                yield* fixture.fs.readFileString(fixture.path.join(review.packagePath, "SKILL.md")),
+              );
+            assert.deepEqual(
+              yield* Effect.forEach(sources, (source) =>
+                Effect.all([
+                  hashSkillPackage(source.packagePath),
+                  fixture.fs.readFileString(fixture.path.join(source.packagePath, "t3-skill.json")),
+                ]),
+              ),
+              before,
+            );
+            yield* catalog.disposeSession({
+              threadId: fixture.request.runtime.threadId!,
+              providerInstanceId: piInstanceId,
+              cwd: fixture.source,
+            });
+            assert.isFalse(yield* fixture.fs.exists(output));
+          }
+        }),
+    );
+  });
   it.layer(PiTestLayer)("enforces managed authorization", (it) => {
     for (const scenario of [
       { phase: "public", receipt: "root-stat", change: "replacement" },
@@ -1154,7 +1304,7 @@ describe("Pi managed skill delivery", () => {
             providerInstanceId: piInstanceId,
             materialization: fixture.materialization,
             discoverCandidates: () => Effect.fail({ _tag: "NativeMustNotLoad" }),
-            authorizeManagedRequest: () => Effect.succeed(new Set([piKey])),
+            authorizeManagedRequest: () => Effect.succeed(new Set<ManagedSkillKey>()),
           });
           const plan = yield* adapter.prepareSession({ ...fixture.request, skills: [] });
           const root = fixture.path.join(
@@ -1279,38 +1429,42 @@ describe("Pi managed skill delivery", () => {
         }),
     );
 
-    it.effect("fails closed without a callback or when a frozen selection excludes the key", () =>
-      Effect.gen(function* () {
-        const fixture = yield* piFixture();
-        const options = {
-          providerInstanceId: piInstanceId,
-          materialization: fixture.materialization,
-          discoverCandidates: () => Effect.succeed([]),
-        };
-        // @ts-expect-error The callback is deliberately absent to prove the runtime boundary too.
-        const missing = makePiSkillAdapter(options);
-        const missingResult = yield* missing.prepareSession(fixture.request).pipe(Effect.result);
-        assert.equal(missingResult._tag, "Failure");
-        if (missingResult._tag === "Failure")
-          assert.equal(missingResult.failure.code, "managed_authorization_required");
-        for (const allowed of [
-          new Set<ManagedSkillKey>(),
-          new Set([ManagedSkillKey.make("deploy")]),
-          new Set(["../escape" as ManagedSkillKey]),
-        ]) {
-          const adapter = makePiSkillAdapter({
-            ...options,
-            authorizeManagedRequest: () => Effect.succeed(allowed),
-          });
-          const result = yield* adapter.prepareSession(fixture.request).pipe(Effect.result);
-          assert.equal(result._tag, "Failure");
-        }
-        assert.isFalse(
-          yield* fixture.fs.exists(
-            fixture.path.join(fixture.config.skillRuntimeDir, fixture.request.runtime.sessionId),
-          ),
-        );
-      }),
+    it.effect(
+      "rejects absent authorization, missing authorized keys and invalid authorization before copying",
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* piFixture();
+          const options = {
+            providerInstanceId: piInstanceId,
+            materialization: fixture.materialization,
+            discoverCandidates: () => Effect.succeed([]),
+          };
+          // @ts-expect-error The callback is deliberately absent to prove the runtime boundary too.
+          const missing = makePiSkillAdapter(options);
+          const missingResult = yield* missing.prepareSession(fixture.request).pipe(Effect.result);
+          assert.equal(missingResult._tag, "Failure");
+          if (missingResult._tag === "Failure")
+            assert.equal(missingResult.failure.code, "managed_authorization_required");
+          for (const allowed of [
+            new Set([ManagedSkillKey.make("deploy")]),
+            new Set(["../escape" as ManagedSkillKey]),
+            new Set(
+              Array.from({ length: 33 }, (_, index) => ManagedSkillKey.make(`skill-${index}`)),
+            ),
+          ]) {
+            const adapter = makePiSkillAdapter({
+              ...options,
+              authorizeManagedRequest: () => Effect.succeed(allowed),
+            });
+            const result = yield* adapter.prepareSession(fixture.request).pipe(Effect.result);
+            assert.equal(result._tag, "Failure");
+          }
+          assert.isFalse(
+            yield* fixture.fs.exists(
+              fixture.path.join(fixture.config.skillRuntimeDir, fixture.request.runtime.sessionId),
+            ),
+          );
+        }),
     );
 
     it.effect("keeps native discovery failures advisory for an authorized explicit selection", () =>
@@ -1328,6 +1482,55 @@ describe("Pi managed skill delivery", () => {
         );
         const plan = yield* adapter.prepareSession(fixture.request);
         assert.deepEqual(plan.skillKeys, [piKey]);
+        yield* adapter.disposeSession(fixture.request.runtime);
+      }),
+    );
+
+    it.effect("snapshots a retained authorization Set across materialization", () =>
+      Effect.gen(function* () {
+        const fixture = yield* piFixture();
+        const retained = new Set([piKey]);
+        let copied = false;
+        const materialization: SkillMaterializationServiceShape = {
+          ...fixture.materialization,
+          materialize: (input) =>
+            fixture.materialization.materialize(input).pipe(
+              Effect.map((result) => {
+                retained.clear();
+                retained.add(ManagedSkillKey.make("deploy"));
+                copied = true;
+                return result;
+              }),
+            ),
+        };
+        const adapter = makePiSkillAdapter({
+          providerInstanceId: piInstanceId,
+          materialization,
+          discoverCandidates: () => Effect.fail({ _tag: "NativeMustNotLoad" }),
+          authorizeManagedRequest: () => Effect.succeed(copied ? new Set([piKey]) : retained),
+        });
+        const plan = yield* adapter.prepareSession({
+          ...fixture.request,
+          skills: [
+            ...fixture.request.skills,
+            { key: ManagedSkillKey.make("deploy"), packagePath: "/unselected-must-not-copy" },
+          ],
+        });
+        assert.deepEqual(plan.skillKeys, [piKey]);
+        const root = fixture.path.join(
+          fixture.config.skillRuntimeDir,
+          fixture.request.runtime.sessionId,
+          "2",
+          "pi-team",
+        );
+        assert.deepEqual((yield* fixture.fs.readDirectory(root)).sort(), [
+          ".t3-owned.json",
+          "review",
+        ]);
+        assert.include(
+          yield* fixture.fs.readFileString(fixture.path.join(root, "review", "SKILL.md")),
+          "Review the assigned change.",
+        );
         yield* adapter.disposeSession(fixture.request.runtime);
       }),
     );
@@ -1372,7 +1575,7 @@ describe("Pi managed skill delivery", () => {
     );
 
     it.effect(
-      "cleans only the copied generation when authority or selection is revoked during copying",
+      "cleans only the copied generation when authority or the exact selection changes during copying",
       () =>
         Effect.gen(function* () {
           const fixture = yield* piFixture();
@@ -1397,7 +1600,7 @@ describe("Pi managed skill delivery", () => {
             desiredRevision: 2,
             packages: [],
           });
-          for (const revokedSelection of [false, true]) {
+          for (const change of ["authority", "revocation", "expansion", "replacement"] as const) {
             let copied = false;
             const materialization: SkillMaterializationServiceShape = {
               ...fixture.materialization,
@@ -1411,8 +1614,16 @@ describe("Pi managed skill delivery", () => {
             };
             const authorizeManagedRequest: PiManagedSkillAuthorization = () =>
               copied
-                ? revokedSelection
-                  ? Effect.succeed(new Set())
+                ? change !== "authority"
+                  ? Effect.succeed(
+                      new Set(
+                        change === "revocation"
+                          ? []
+                          : change === "expansion"
+                            ? [piKey, ManagedSkillKey.make("deploy")]
+                            : [ManagedSkillKey.make("deploy")],
+                      ),
+                    )
                   : Effect.fail(
                       new ProviderSkillAdapterError({
                         code: "managed_run_revoked",
@@ -1426,12 +1637,20 @@ describe("Pi managed skill delivery", () => {
               discoverCandidates: () => Effect.succeed([]),
               authorizeManagedRequest,
             });
-            const result = yield* adapter.prepareSession(fixture.request).pipe(Effect.result);
+            const result = yield* adapter
+              .prepareSession({
+                ...fixture.request,
+                skills: [
+                  ...fixture.request.skills,
+                  { key: ManagedSkillKey.make("deploy"), packagePath: "/unselected-must-not-copy" },
+                ],
+              })
+              .pipe(Effect.result);
             assert.equal(result._tag, "Failure");
             if (result._tag === "Failure")
               assert.equal(
                 result.failure.code,
-                revokedSelection ? "managed_skill_not_allowed" : "managed_run_revoked",
+                change === "authority" ? "managed_run_revoked" : "managed_skill_not_allowed",
               );
             assert.isFalse(
               yield* fixture.fs.exists(

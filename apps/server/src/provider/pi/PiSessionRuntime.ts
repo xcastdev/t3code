@@ -97,6 +97,8 @@ export interface PiSessionRuntimeOptions {
   ) => Promise<typeof PiWorkerToolOutput.Type>;
   readonly persistNative: (frame: PiWorkerFrame, signal: AbortSignal) => Promise<void>;
   readonly onSdkEvent: (frame: PiWorkerFrame, signal: AbortSignal) => Promise<void>;
+  // Observations are sequential. Never await later frames or model completion here.
+  readonly onWorkerFrame?: (frame: PiWorkerFrame, signal: AbortSignal) => Promise<void>;
   readonly persistControl: (
     receipt: {
       readonly identity: PiWorkerIdentity;
@@ -204,6 +206,7 @@ function captureOptions(input: PiSessionRuntimeOptions) {
     input.cleanupDeadlineMs < 1 ||
     input.cleanupDeadlineMs > 30_000 ||
     !input.persistence ||
+    (input.onWorkerFrame !== undefined && typeof input.onWorkerFrame !== "function") ||
     [
       input.authorizeCurrent,
       input.executeBridgeTool,
@@ -380,6 +383,9 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           let brokerTask: Promise<void> | undefined;
           let toolTask: Promise<void> | undefined;
           let toolCall: PiWorkerToolCall | undefined;
+          let localOutput:
+            | { readonly transferId: string; readonly capability: PiSessionToolCapability }
+            | undefined;
           let toolStarted = Promise.withResolvers<void>();
           let ack:
             | {
@@ -485,6 +491,15 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           const dispatch = async (raw: string) => {
             const frame = freezeJson(decodePiWorkerFrame(raw));
             protocol.acceptWorker(frame);
+            if (
+              frame.message.type === "transfer-end" &&
+              localOutput?.transferId === frame.message.transferId
+            ) {
+              await authorize("beforeToolReturn", localOutput.capability);
+              localOutput = undefined;
+            }
+            const observer = callbacks.onWorkerFrame;
+            if (observer) await callback(() => observer(frame, controller.signal));
             const message = frame.message;
             switch (message.type) {
               case "request": {
@@ -542,6 +557,19 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
                 toolCall = message;
                 toolStarted = Promise.withResolvers<void>();
                 break;
+              case "tool-result": {
+                const capability = toolCall && capabilities.get(toolCall.toolName);
+                if (
+                  !toolCall ||
+                  toolCall.callId !== message.callId ||
+                  !capability ||
+                  capability.execution !== "local" ||
+                  localOutput
+                )
+                  throw failure("TOOL_CAPABILITY_INVALID");
+                localOutput = { transferId: message.output.transferId, capability };
+                break;
+              }
               case "transfer-end": {
                 if (!toolCall || message.transferId !== toolCall.input.transferId) break;
                 if (toolTask) throw failure("TOOL_TASK_CONCURRENT");
@@ -554,6 +582,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
                 toolTask = tracked(
                   (async () => {
                     await authorize("beforeTool", capability);
+                    if (call.execution === "local") await authorize("beforeToolInvoke", capability);
                     send({ type: "tool-authorized", callId: call.callId, allowed: true });
                     if (call.execution === "local") return;
                     await waitSignal(toolStarted.promise, controller.signal);
@@ -684,7 +713,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           let processFailure: unknown;
           const work = Effect.gen(function* () {
             yield* promiseEffect(() => authorize("beforeStart"));
-            yield* child.start;
+            const childPid = yield* child.start;
             exitTask = tracked(
               perform(child.awaitExit).then(
                 (receipt) => {
@@ -712,7 +741,35 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
             closing = true;
             wake.resolve();
             yield* promiseEffect(() => waitSignal(writer, controller.signal));
-            yield* child.endInput;
+            yield* child.endInput.pipe(
+              Effect.catch((error) =>
+                Effect.gen(function* () {
+                  if (
+                    error.phase !== "transport" ||
+                    error.message !== "Managed input cannot close before start or after exit."
+                  )
+                    return yield* Effect.fail(error);
+                  // A native worker may close first. Accept that race only after its owned drain.
+                  const receipt = yield* promiseEffect(() =>
+                    waitSignal(exitTask!, controller.signal),
+                  );
+                  if (
+                    receipt.childExitCode !== 0 ||
+                    receipt.childPid !== childPid ||
+                    receipt.unit !== child.owner.unit ||
+                    receipt.invocation !== child.owner.invocation ||
+                    receipt.cgroup !== child.owner.cgroup ||
+                    receipt.ownerPid !== child.owner.pid ||
+                    receipt.memoryBytes !== child.owner.memoryBytes ||
+                    receipt.swapBytes !== child.owner.swapBytes ||
+                    receipt.oomGroup !== child.owner.oomGroup ||
+                    (receipt.kernel !== "removed" &&
+                      !receipt.kernel.split("\n").includes("populated 0"))
+                  )
+                    return yield* Effect.fail(error);
+                }),
+              ),
+            );
             drain = yield* promiseEffect(() => waitSignal(exitTask!, controller.signal));
             yield* promiseEffect(() =>
               waitSignal(
@@ -720,7 +777,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
                 controller.signal,
               ),
             );
-            if (fatal || !readerEnded || drain.childExitCode !== 0)
+            if (fatal || controller.signal.aborted || !readerEnded || drain.childExitCode !== 0)
               return yield* failure("DRAIN_BARRIER");
           });
           const cleanup = Effect.gen(function* () {

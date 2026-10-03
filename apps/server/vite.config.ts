@@ -1,9 +1,15 @@
 import "vite-plus/test/config";
 import { defineConfig, mergeConfig } from "vite-plus";
+import * as Schema from "effect/Schema";
 
 import baseConfig from "../../vite.config.ts";
 import { loadRepoEnv } from "../../scripts/lib/public-config.ts";
+
 import packageJson from "./package.json" with { type: "json" };
+
+const NodeFS = process.getBuiltinModule("fs");
+const NodePath = process.getBuiltinModule("path");
+const NodeURL = process.getBuiltinModule("url");
 
 // The bundle used to inline only workspace packages, leaving every third-party
 // runtime dep external. External deps must exist on the real filesystem (the WSL
@@ -30,6 +36,18 @@ const cliBuildChannel = /^[^-+]+-(?:nightly|preview)\./.test(packageJson.version
 // executable needs a host Node that supports `--build-sea` (25.7+), so this is
 // a separate mode rather than a second entry in the default build.
 const packExecutable = process.env.T3CODE_PACK_EXE === "1";
+const piSdkMetadataPath = NodeURL.fileURLToPath(
+  new URL("./node_modules/@earendil-works/pi-coding-agent/package.json", import.meta.url),
+);
+const decodePiSdkMetadata = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      name: Schema.Literal("@earendil-works/pi-coding-agent"),
+      version: Schema.Literal("0.99.1"),
+    }),
+  ),
+);
+decodePiSdkMetadata(NodeFS.readFileSync(piSdkMetadataPath, "utf8"));
 // `<platform>-<arch>` in nodejs.org naming (darwin-x64, linux-arm64, win-x64).
 // When set, tsdown injects the bundle into a downloaded Node of that target
 // instead of the host Node, which is how the arm64 macOS runner produces the
@@ -77,10 +95,21 @@ export default mergeConfig(
     pack: {
       // The executable embeds one entry; the history worker becomes a hidden
       // subcommand there instead of a sibling script.
-      entry: packExecutable ? ["src/bin.ts"] : ["src/bin.ts", "src/claude-history-worker.ts"],
+      entry: packExecutable
+        ? ["src/bin.ts"]
+        : ["src/bin.ts", "src/claude-history-worker.ts", "src/pi-worker.ts"],
       outDir: packExecutable ? "dist-exe" : "dist",
       sourcemap: !packExecutable,
       clean: true,
+      copy: ({ outDir }) => [
+        { from: piSdkMetadataPath, to: NodePath.join(outDir, "pi-sdk") },
+        {
+          from: NodeURL.fileURLToPath(
+            new URL("./src/provider/pi/pi-managed-process-owner.py", import.meta.url),
+          ),
+          to: outDir,
+        },
+      ],
       ...(packExecutable
         ? {
             exe: {
