@@ -12,6 +12,7 @@ import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
@@ -35,7 +36,10 @@ import { ProjectWorkQueryLive } from "../../projectWork/ProjectWorkQuery.ts";
 import { ProjectWorkSearchLive } from "../../projectWork/ProjectWorkSearch.ts";
 import { ProjectWorkNarrativeLive } from "../../projectWork/ProjectWorkNarrative.ts";
 import { ProjectWorkBriefingLive } from "../../projectWork/ProjectWorkBriefing.ts";
-import { ProjectWorkGatewayLive } from "../../projectWork/ProjectWorkGateway.ts";
+import {
+  ProjectWorkGateway,
+  ProjectWorkGatewayLive,
+} from "../../projectWork/ProjectWorkGateway.ts";
 import {
   ProjectWorkProjection,
   ProjectWorkProjectionLive,
@@ -277,8 +281,14 @@ const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
   "actual SDK guided Runtime bridge",
   () => {
-    for (const mode of ["report", "plan"] as const) {
-      it.effect(`routes ${mode} through current durable authority`, () =>
+    for (const [mode, disposition] of [
+      ["report", "ordinary"],
+      ["plan", "ordinary"],
+      ["report", "held-control"],
+      ["report", "held-cancel"],
+    ] as const) {
+      const caseId = disposition === "ordinary" ? mode : disposition;
+      it.effect(`routes ${caseId} through current durable authority`, () =>
         scoped(
           Effect.gen(function* () {
             const f = yield* fixture;
@@ -313,6 +323,38 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
             let calls = 0;
             let toolResult = false;
             let intentJSON = "";
+            const sequence: string[] = [];
+            const entered = yield* Deferred.make<void>();
+            const permitHeld = yield* Deferred.make<void>();
+            const permitRelease = yield* Deferred.make<void>();
+            const testScope = yield* Effect.scope;
+            const realGateway = yield* ProjectWorkGateway;
+            let permitOwner: Fiber.Fiber<void, SqlError> | undefined;
+            const gateway = ProjectWorkGateway.of({
+              ...realGateway,
+              write: (...args) =>
+                Effect.gen(function* () {
+                  if (disposition !== "ordinary") {
+                    sequence.push("bridge-entered");
+                    permitOwner = yield* f.sql
+                      .withTransaction(
+                        Effect.gen(function* () {
+                          sequence.push("actual-sql-permit-held");
+                          yield* Deferred.succeed(permitHeld, undefined);
+                          yield* Deferred.await(permitRelease);
+                          sequence.push("actual-sql-permit-released");
+                        }),
+                      )
+                      .pipe(Effect.forkIn(testScope));
+                    yield* Deferred.await(permitHeld);
+                    yield* Deferred.succeed(entered, undefined);
+                  }
+                  const result = yield* realGateway.write(...args);
+                  sequence.push("actual-gateway-write-committed");
+                  return result;
+                }),
+            });
+            yield* Effect.addFinalizer(() => Deferred.succeed(permitRelease, undefined));
             const runtime = yield* makePiManagedRuntimeLive({
               ...f.options,
               memoryBytes: 536870912,
@@ -352,7 +394,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
                     (message) =>
                       message.role === "tool" &&
                       typeof message.content === "string" &&
-                      message.content.includes("native-guided-report"),
+                      message.content.includes(`native-guided-${caseId}`),
                   );
                   expect(toolResult).toBe(true);
                 }
@@ -392,7 +434,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
                   { headers: { "content-type": "text/event-stream" } },
                 );
               },
-            });
+            }).pipe(Effect.provideService(ProjectWorkGateway, gateway));
             const instance = yield* runtime.forInstance({
               instanceId: providerInstanceId,
               enabled: true,
@@ -414,7 +456,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
             const envelope = {
               projectId: f.binding.projectId,
               taskId: task.taskId,
-              commandId: `native-guided-${mode}`,
+              commandId: `native-guided-${caseId}`,
               expectedRevision: before.revision,
               expectedTaskRevision: task.revision,
               specRevision: 1,
@@ -445,25 +487,111 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
               { threadId, kind: "prompt", prompt: "Use guided tool" },
               () => Effect.void,
             );
-            const outcome = yield* prompt.run.pipe(Effect.result);
+            let stopInvoked = false;
+            let stopJoined = false;
+            let abortObserved = false;
+            const aborted = Promise.withResolvers<void>();
+            const originalAbort = AbortController.prototype.abort;
+            if (disposition === "held-cancel")
+              AbortController.prototype.abort = function (...args) {
+                originalAbort.apply(this, args);
+                if (stopInvoked && this.signal.aborted) {
+                  abortObserved = true;
+                  sequence.push("actual-cancellation-aborted");
+                  aborted.resolve();
+                }
+              };
+            let outcome;
+            try {
+              if (disposition === "ordinary") outcome = yield* prompt.run.pipe(Effect.result);
+              else {
+                const running = yield* Effect.forkChild(prompt.run.pipe(Effect.result));
+                yield* Effect.raceFirst(
+                  Deferred.await(entered),
+                  Fiber.join(running).pipe(
+                    Effect.flatMap((early) =>
+                      Effect.die("Operation returned before held SQL permit: " + json(early)),
+                    ),
+                  ),
+                );
+                let stopping: Fiber.Fiber<void, PiManagedRuntimeError> | undefined;
+                if (disposition === "held-cancel") {
+                  sequence.push("request-stop-invoked");
+                  stopInvoked = true;
+                  stopping = yield* Effect.forkChild(instance.requestStop(threadId));
+                  yield* Effect.promise(() => aborted.promise);
+                }
+                sequence.push("permit-release-requested");
+                yield* Deferred.succeed(permitRelease, undefined);
+                if (permitOwner) yield* Fiber.join(permitOwner);
+                outcome = yield* Fiber.join(running);
+                if (stopping) {
+                  yield* Fiber.join(stopping);
+                  stopJoined = true;
+                  sequence.push("stop-joined");
+                }
+                sequence.push("run-returned-" + outcome._tag);
+              }
+            } finally {
+              AbortController.prototype.abort = originalAbort;
+            }
+            const after = yield* readCurrentState(f.sql, f.binding.projectId);
+            const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts
+              WHERE project_id=${f.binding.projectId} AND command_id=${envelope.commandId}`;
             yield* f.fs.writeFileString(
-              evidence + `/guided-${mode}-attempt.json`,
+              evidence + `/guided-${caseId}-attempt.json`,
               json({
+                disposition,
+                sequence,
+                stopInvoked,
+                stopJoined,
+                abortObserved,
                 calls,
                 outcome,
+                beforeRevision: before.revision,
+                after,
+                receipts,
                 operations: yield* f.sql`SELECT * FROM project_team_pi_operation`,
                 processes: yield* f.sql`SELECT * FROM project_team_pi_process`,
                 modelRequests: yield* f.sql`SELECT * FROM project_team_model_request`,
               }),
             );
-            expect(outcome._tag).toBe(mode === "report" ? "Success" : "Failure");
-            expect(calls).toBe(mode === "report" ? 2 : 1);
-            const after = yield* readCurrentState(f.sql, f.binding.projectId);
-            expect(after.revision).toBeGreaterThan(before.revision);
-            const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts
-              WHERE project_id=${f.binding.projectId} AND command_id=${envelope.commandId}`;
-            expect(receipts).toHaveLength(1);
-            if (mode === "report") {
+            const owners = yield* f.sql<{
+              owner_json: string;
+              drain_json: string;
+            }>`SELECT owner_json,drain_json FROM project_team_pi_process`;
+            expect(owners).toHaveLength(2);
+            for (const row of owners) {
+              const owner = parseOwner(row.owner_json);
+              const drain = parseFullDrain(row.drain_json);
+              expect(drain.invocation).toBe(owner.invocation);
+              expect(drain.unit).toBe(owner.unit);
+              expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(true);
+              for (const pid of [drain.ownerPid, drain.launcherPid, drain.childPid])
+                expect(yield* f.fs.exists(`/proc/${pid}`)).toBe(false);
+            }
+            const canceled = disposition === "held-cancel";
+            expect(outcome._tag).toBe(mode === "report" && !canceled ? "Success" : "Failure");
+            expect(calls).toBe(mode === "report" && !canceled ? 2 : 1);
+            expect(receipts).toHaveLength(canceled ? 0 : 1);
+            if (!canceled) expect(after.revision).toBeGreaterThan(before.revision);
+            if (canceled) {
+              const terminals = yield* f.sql<{ terminal_json: string }>`
+                SELECT terminal_json FROM project_team_pi_operation WHERE operation_kind='prompt'`;
+              expect(terminals).toHaveLength(1);
+              expect((yield* decodeLocalTerminal(terminals[0]!.terminal_json)).outcome).not.toBe(
+                "success",
+              );
+              expect(stopJoined).toBe(true);
+              expect(abortObserved).toBe(true);
+              expect(after.revision).toBe(before.revision);
+              expect(sequence).not.toContain("actual-gateway-write-committed");
+              expect(
+                after.evidence.some(
+                  (entry) => entry.detail === "The native SDK retained a sourced finding",
+                ),
+              ).toBe(false);
+            } else if (mode === "report") {
               expect(
                 after.evidence.some(
                   (entry) => entry.detail === "The native SDK retained a sourced finding",
@@ -480,24 +608,14 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_GUIDED_GATE === "1")(
               ).toBe(true);
               yield* rejected(instance.readSession(threadId));
             }
-            const owners = yield* f.sql<{
-              owner_json: string;
-              drain_json: string;
-            }>`SELECT owner_json,drain_json FROM project_team_pi_process`;
-            expect(owners).toHaveLength(2);
-            for (const row of owners) {
-              const owner = parseOwner(row.owner_json);
-              const drain = parseFullDrain(row.drain_json);
-              expect(drain.invocation).toBe(owner.invocation);
-              expect(drain.unit).toBe(owner.unit);
-              expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(true);
-              for (const pid of [drain.ownerPid, drain.launcherPid, drain.childPid])
-                expect(yield* f.fs.exists(`/proc/${pid}`)).toBe(false);
-            }
             yield* f.fs.writeFileString(
-              evidence + `/guided-${mode}.json`,
+              evidence + `/guided-${caseId}.json`,
               json({
                 mode,
+                disposition,
+                sequence,
+                stopJoined,
+                abortObserved,
                 calls,
                 toolResult,
                 beforeRevision: before.revision,

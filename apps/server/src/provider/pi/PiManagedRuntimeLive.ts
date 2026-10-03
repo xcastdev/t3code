@@ -916,6 +916,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         return { kind: "text" as const, text: encode(result) };
                       }),
                     ),
+                    { signal },
                   ),
                 persistNative: (frame, signal) =>
                   perform(
