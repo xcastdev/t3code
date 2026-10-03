@@ -114,6 +114,8 @@ const fixture = Effect.gen(function* () {
           rootTaskId: row.root_task_id,
           maximumTokens: row.maximum_tokens,
           deadlineAtMs: row.deadline_at_ms,
+          operationMaximumTokens: row.maximum_tokens,
+          operationDeadlineAtMs: row.deadline_at_ms,
         };
       }).pipe(Effect.mapError(() => new ModelAccountingError({ reason: "Operation unavailable" }))),
   };
@@ -142,6 +144,46 @@ it.effect("denies ordinary, stale and revoked authority without reserving", () =
       expect(yield* f.counts()).toEqual([{ budgets: 0, requests: 0 }]);
     }).pipe(Effect.provide(runtime(path))),
   ),
+);
+
+it.effect(
+  "intersects effective operation caps with the immutable root budget and current binding",
+  () =>
+    fileTest((path) =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const accounting = yield* make({
+          ...f.options,
+          resolveOperation: (authority, reservation) =>
+            f.options.resolveOperation(authority, reservation).pipe(
+              Effect.map((operation) => ({
+                ...operation,
+                operationMaximumTokens: 250,
+                operationDeadlineAtMs: 5000,
+              })),
+            ),
+        });
+        const bounded = { ...request(), deadlineAtMs: 5000 };
+        const first = yield* accounting.reserve(f.principal, bounded);
+        yield* denied(
+          accounting.reserve(f.principal, { ...bounded, requestId: 2, maxInputTokens: 151 }),
+        );
+        yield* denied(
+          accounting.reserve(f.principal, { ...bounded, requestId: 2, deadlineAtMs: 5001 }),
+        );
+        yield* accounting.settle(unknown(first.reservationId, bounded));
+        expect((yield* accounting.reserve(f.principal, { ...bounded, requestId: 2 })).status).toBe(
+          "reserved",
+        );
+        yield* denied(accounting.reserve(f.principal, { ...bounded, requestId: 3 }));
+        expect(
+          yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget`,
+        ).toEqual([{ maximum_tokens: 500, deadline_at_ms: 10000 }]);
+        yield* TestClock.setTime(5000);
+        yield* denied(accounting.reserve(f.principal, bounded));
+        expect(yield* f.counts()).toEqual([{ budgets: 1, requests: 2 }]);
+      }).pipe(Effect.provide(runtime(path))),
+    ),
 );
 
 it.effect(

@@ -84,12 +84,15 @@ const Policy = Schema.Struct({
   maximumConcurrentModelCalls: Positive.check(Schema.isLessThanOrEqualTo(128)),
   acceptedReportedModels: Schema.Array(Id).check(Schema.isMinLength(1), Schema.isMaxLength(32)),
 });
+// Root ceilings identify the cumulative journal; operation ceilings bound this request's owner.
 const Operation = Schema.Struct({
   workerId: Id,
   operationId: Id,
   rootTaskId: Id,
   maximumTokens: Positive,
   deadlineAtMs: Positive,
+  operationMaximumTokens: Positive,
+  operationDeadlineAtMs: Positive,
 });
 const strict = { onExcessProperty: "error" } as const;
 const encodeReservation = Schema.encodeSync(Schema.fromJsonString(Reservation));
@@ -245,13 +248,16 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           if (
             operation.workerId !== reservation.workerId ||
             operation.operationId !== reservation.operationId ||
+            reservation.deadlineAtMs > operation.operationDeadlineAtMs ||
             reservation.deadlineAtMs > operation.deadlineAtMs ||
+            maximum > operation.operationMaximumTokens ||
             maximum > binding.configuration.maxTokens
           )
             return yield* deny("Model operation policy mismatch");
           const deadline = Math.min(
             reservation.deadlineAtMs,
             operation.deadlineAtMs,
+            operation.operationDeadlineAtMs,
             Option.getOrElse(
               DateTime.make(
                 authority.state.attempts.find((a) => a.attemptId === binding.attemptId)
