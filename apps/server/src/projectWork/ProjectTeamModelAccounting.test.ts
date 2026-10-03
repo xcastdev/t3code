@@ -67,6 +67,7 @@ const request = (requestId = 1): PiModelRequestReservation => ({
 const unknown = (reservationId: string, reservation = request()): PiModelRequestSettlement => ({
   ...reservation,
   reservationId,
+  transportDrained: true,
   outcome: "unknown",
   chargedInputTokens: reservation.maxInputTokens,
   chargedOutputTokens: reservation.maxOutputTokens,
@@ -74,6 +75,7 @@ const unknown = (reservationId: string, reservation = request()): PiModelRequest
 const reported = (reservationId: string, reservation = request()): PiModelRequestSettlement => ({
   ...reservation,
   reservationId,
+  transportDrained: true,
   outcome: "reported",
   chargedInputTokens: 10,
   chargedOutputTokens: 20,
@@ -306,6 +308,141 @@ it.effect("rolls back root budget, request and slots when SQL fails", () =>
   ),
 );
 
+for (const capacity of ["environment", "model"] as const)
+  for (const transportDrained of [undefined, false, true])
+    it.effect(
+      `retains ${capacity} transport capacity independently of unknown usage: ${transportDrained}`,
+      () =>
+        fileTest((path) =>
+          Effect.gen(function* () {
+            const f = yield* fixture;
+            const accounting = yield* make({
+              ...f.options,
+              maximumConcurrentCalls: capacity === "environment" ? 1 : 2,
+              maximumConcurrentModelCalls: capacity === "model" ? 1 : 2,
+            });
+            const reservation = yield* accounting.reserve(f.principal, request());
+            const settlement = unknown(reservation.reservationId);
+            if (transportDrained === undefined)
+              Reflect.deleteProperty(settlement, "transportDrained");
+            else Reflect.set(settlement, "transportDrained", transportDrained);
+            const receipt = yield* accounting.settle(settlement);
+            expect(yield* accounting.settle(settlement)).toEqual(receipt);
+            if (transportDrained === true) {
+              const next = yield* accounting.reserve(f.principal, request(2));
+              yield* accounting.settle(unknown(next.reservationId, request(2)));
+              yield* denied(accounting.reserve(f.principal, request(3)));
+            } else {
+              yield* denied(accounting.reserve(f.principal, request(2)));
+            }
+            // A duplicate reporting a later drain cannot release the original quarantine.
+            expect(yield* accounting.settle({ ...settlement, transportDrained: true })).toEqual(
+              receipt,
+            );
+            if (transportDrained !== true)
+              yield* denied(accounting.reserve(f.principal, request(2)));
+            expect(
+              yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens,accounting_receipt_id FROM project_team_model_request WHERE reservation_id=${reservation.reservationId}`,
+            ).toEqual([
+              {
+                status: "unknown",
+                capacity_state: transportDrained === true ? "released" : "quarantine",
+                charged_input_tokens: 100,
+                charged_output_tokens: 100,
+                accounting_receipt_id: receipt.accountingReceiptId,
+              },
+            ]);
+            expect(yield* accounting.reserve(f.principal, request())).toEqual({
+              reservationId: reservation.reservationId,
+              status: "existing",
+            });
+          }).pipe(Effect.provide(runtime(path))),
+        ),
+    );
+
+it.effect("blocks a legacy environment despite historical reuse of a settled slot", () =>
+  fileTest((path) =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const reservation = yield* f.accounting.reserve(f.principal, request());
+      const settlement = reported(reservation.reservationId);
+      const receipt = yield* f.accounting.settle(settlement);
+      // Represent pre-upgrade settlements: no trusted drain evidence, and their slots were reused.
+      const rows =
+        yield* f.sql`SELECT * FROM project_team_model_request WHERE reservation_id=${reservation.reservationId}`;
+      const historical = { ...rows[0], capacity_state: "legacy" };
+      yield* f.sql`UPDATE project_team_model_request SET capacity_state='legacy' WHERE reservation_id=${reservation.reservationId}`;
+      yield* f.sql`INSERT INTO project_team_model_request ${f.sql.insert({
+        ...historical,
+        reservation_id: "legacy-second",
+        worker_id: "legacy-worker",
+      })}`;
+      yield* denied(f.accounting.reserve(f.principal, request(2)));
+      yield* denied(f.accounting.reserve(f.principal, request()));
+      expect(yield* f.accounting.settle(settlement)).toEqual(receipt);
+      yield* denied(f.accounting.reserve(f.principal, request(2)));
+      expect(
+        yield* f.sql`SELECT capacity_state FROM project_team_model_request ORDER BY reservation_id`,
+      ).toEqual([{ capacity_state: "legacy" }, { capacity_state: "legacy" }]);
+      expect(yield* f.counts()).toEqual([{ budgets: 1, requests: 2 }]);
+    }).pipe(Effect.provide(runtime(path))),
+  ),
+);
+
+for (const outcome of ["reported", "failed"] as const)
+  for (const transportDrained of [false, true])
+    it.effect(`preserves ${outcome} charges and transport capacity: ${transportDrained}`, () =>
+      fileTest((path) =>
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const accounting = yield* make({
+            ...f.options,
+            maximumConcurrentCalls: 1,
+            maximumConcurrentModelCalls: 1,
+          });
+          const reservation = yield* accounting.reserve(f.principal, request());
+          const report = {
+            ...reported(reservation.reservationId),
+            transportDrained,
+            ...(outcome === "failed"
+              ? {
+                  outcome,
+                  failureCode: "AUTHORIZATION_REJECTED" as const,
+                  chargedInputTokens: 100,
+                  chargedOutputTokens: 100,
+                }
+              : {}),
+          };
+          const receipt = yield* accounting.settle(report);
+          const failed: PiModelRequestSettlement = {
+            ...report,
+            transportDrained: true,
+            outcome: "failed",
+            failureCode: "AUTHORIZATION_REJECTED",
+            chargedInputTokens: 100,
+            chargedOutputTokens: 100,
+          };
+          expect(yield* accounting.settle(failed)).toEqual(receipt);
+          expect(yield* accounting.settle(failed)).toEqual(receipt);
+          if (transportDrained) {
+            expect((yield* accounting.reserve(f.principal, request(2))).status).toBe("reserved");
+          } else {
+            yield* denied(accounting.reserve(f.principal, request(2)));
+          }
+          expect(
+            yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens FROM project_team_model_request WHERE reservation_id=${reservation.reservationId}`,
+          ).toEqual([
+            {
+              status: "failed",
+              capacity_state: transportDrained ? "released" : "quarantine",
+              charged_input_tokens: 100,
+              charged_output_tokens: 100,
+            },
+          ]);
+        }).pipe(Effect.provide(runtime(path))),
+      ),
+    );
+
 it.effect(
   "checks Clock after operation authority and after the actual request insert receipt",
   () =>
@@ -458,6 +595,9 @@ it.effect("rejects invalid usage and missing or unsafe policy without losing the
       );
       const reservation = yield* f.accounting.reserve(f.principal, request());
       const report = reported(reservation.reservationId);
+      const invalidDrain = { ...report };
+      Reflect.set(invalidDrain, "transportDrained", "true");
+      yield* denied(f.accounting.settle(invalidDrain));
       for (const invalid of [
         { ...report, reportedModel: "other" },
         {

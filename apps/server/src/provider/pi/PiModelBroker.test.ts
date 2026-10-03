@@ -184,6 +184,7 @@ it("captures parent route and identity, reserves once before transport, and retu
   expect(f.phases.at(-1)).toBe("beforeReturn");
   expect(f.settlements[0]).toMatchObject({
     outcome: "reported",
+    transportDrained: true,
     chargedInputTokens: 50,
     chargedOutputTokens: 10,
   });
@@ -668,6 +669,105 @@ it("canceling a pending response read awaits its actual cancel drain", async () 
   drained.resolve();
   await expect(pending).rejects.toThrow("REQUEST_ABORTED");
   expect(f.settlements).toHaveLength(1);
+  expect(f.settlements[0]).toMatchObject({ transportDrained: true });
+});
+
+it("retains failed drain evidence independently of an earlier parsing failure", async () => {
+  const cancelEntered = deferred<void>();
+  const releaseCancel = deferred<void>();
+  const f = fixture({
+    transport: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("data: invalid-json\n\n"));
+          },
+          async cancel() {
+            cancelEntered.resolve();
+            await releaseCancel.promise;
+            throw Error("synthetic failed cancel");
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+  });
+  const result = f.invoke().catch((error: unknown) => error);
+  await cancelEntered.promise;
+  expect(f.settlements).toHaveLength(0);
+  releaseCancel.resolve();
+  expect(await result).toMatchObject({ code: "SSE_FRAME_INVALID" });
+  expect(f.settlements).toHaveLength(1);
+  expect(f.settlements[0]).toMatchObject({
+    outcome: "unknown",
+    failureCode: "SSE_FRAME_INVALID",
+    transportDrained: false,
+    chargedInputTokens: 20_000,
+    chargedOutputTokens: 512,
+  });
+  await expect(f.invoke()).rejects.toThrow("REQUEST_REPLAY");
+  expect(f.settlements).toHaveLength(1);
+});
+
+it.each([true, false])(
+  "joins a response arriving after abort and records cancellation success %s",
+  async (cancelSucceeds) => {
+    const external = new AbortController();
+    const entered = deferred<void>();
+    const responseReady = deferred<void>();
+    const cancelEntered = deferred<void>();
+    const drain = deferred<void>();
+    const f = fixture({
+      transport: async () => {
+        entered.resolve();
+        await responseReady.promise;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            async cancel() {
+              cancelEntered.resolve();
+              await drain.promise;
+              if (!cancelSucceeds) throw Error("synthetic failed cancel");
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const result = f.invoke(requestBody(), 1, external.signal).catch((error: unknown) => error);
+    await entered.promise;
+    external.abort();
+    responseReady.resolve();
+    // Settlement, if reached before cancellation, gives the old implementation a deterministic exit.
+    const first = await Promise.race([
+      cancelEntered.promise.then(() => "cancel"),
+      result.then(() => "settled"),
+    ]);
+    expect(first).toBe("cancel");
+    expect(f.settlements).toHaveLength(0);
+    drain.resolve();
+    expect(await result).toMatchObject({ code: "REQUEST_ABORTED" });
+    expect(f.settlements[0]).toMatchObject({
+      outcome: "unknown",
+      transportDrained: cancelSucceeds,
+      chargedInputTokens: 20_000,
+      chargedOutputTokens: 512,
+    });
+  },
+);
+
+it("records failed rejected-response drain without releasing capacity", async () => {
+  const f = fixture({
+    transport: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          cancel() {
+            throw Error("synthetic failed cancel");
+          },
+        }),
+        { status: 429 },
+      ),
+  });
+  await expect(f.invoke()).rejects.toThrow("TRANSPORT_RESPONSE_REJECTED");
+  expect(f.settlements[0]).toMatchObject({ transportDrained: false, outcome: "unknown" });
 });
 
 it("settlement upgrade failure preserves denial without a success receipt", async () => {

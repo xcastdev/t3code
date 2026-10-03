@@ -207,6 +207,8 @@ export interface PiModelRequestReservation {
 }
 export interface PiModelRequestSettlement extends PiModelRequestReservation {
   readonly reservationId: string;
+  /** Parent-owned transport cleanup evidence; absence cannot release managed capacity. */
+  readonly transportDrained?: boolean;
   readonly outcome: "reported" | "failed" | "unknown";
   readonly failureCode?: PiModelBrokerErrorCode;
   readonly chargedInputTokens: number;
@@ -463,22 +465,25 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       } catch {
         fail(controller.signal.aborted ? "REQUEST_ABORTED" : "TRANSPORT_FAILED");
       }
+      // Own a returned body before checking abort or response policy so both paths join its drain.
+      if (response.body) {
+        try {
+          reader = response.body.getReader();
+        } catch {
+          cancelFailed = true;
+          fail("TRANSPORT_DRAIN_FAILED");
+        }
+      }
       check();
       if (
         response.redirected ||
         response.status !== 200 ||
-        !response.body ||
+        !reader ||
         response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !==
           "text/event-stream"
       ) {
-        try {
-          await response.body?.cancel();
-        } catch {
-          fail("TRANSPORT_DRAIN_FAILED");
-        }
         fail("TRANSPORT_RESPONSE_REJECTED");
       }
-      reader = response.body.getReader();
       controller.signal.addEventListener("abort", cancelReader, { once: true });
       if (controller.signal.aborted) cancelReader();
       const secret = Buffer.from(credential);
@@ -687,13 +692,19 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         if (cancelPending) await cancelPending;
         if (cancelFailed) failure ??= new PiModelBrokerError("TRANSPORT_DRAIN_FAILED");
         controller.signal.removeEventListener("abort", cancelReader);
-        reader.releaseLock();
+        try {
+          reader.releaseLock();
+        } catch {
+          cancelFailed = true;
+          failure ??= new PiModelBrokerError("TRANSPORT_DRAIN_FAILED");
+        }
       }
       if (reservationId) {
         try {
           const settlement: PiModelRequestSettlement = {
             ...reservation,
             reservationId,
+            transportDrained: !cancelFailed,
             outcome: usage ? (failure ? "failed" : "reported") : "unknown",
             chargedInputTokens: failure
               ? Math.max(usage?.prompt_tokens ?? 0, reservation.maxInputTokens)
@@ -734,6 +745,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         const upgraded = await cfg.settleRequest({
           ...reservation,
           reservationId,
+          transportDrained: !cancelFailed,
           outcome: "failed",
           failureCode: denied.code,
           chargedInputTokens: Math.max(usage.prompt_tokens, reservation.maxInputTokens),
