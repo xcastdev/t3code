@@ -1,9 +1,11 @@
 import { runGitHubStackAction, type GitHubStackActionError } from "./githubStackActions.ts";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -1019,6 +1021,19 @@ const ExactHeadMergeInput = Schema.Struct({
 });
 const isExactHeadMergeInput = Schema.is(ExactHeadMergeInput);
 
+// Match GitHub's UTC spelling and round-trip it so normalized impossible dates are refused.
+const ExactHeadMergeTimestamp = Schema.String.check(
+  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u),
+  Schema.makeFilter((value) => {
+    const parsed = DateTime.make(value);
+    return (
+      Option.isSome(parsed) &&
+      DateTime.formatIso(parsed.value) ===
+        (value.includes(".") ? value : value.replace("Z", ".000Z"))
+    );
+  }),
+);
+
 // Keep the raw state and null/missing distinction: ordinary display normalization supplies
 // defaults that cannot establish an immediate merge's preconditions or its completion.
 const decodeExactHeadMergeDetail = Schema.decodeUnknownEffect(
@@ -1028,7 +1043,7 @@ const decodeExactHeadMergeDetail = Schema.decodeUnknownEffect(
       state: Schema.optional(Schema.String),
       headRefOid: Schema.optional(Schema.NullOr(Schema.String)),
       autoMergeRequest: Schema.optional(Schema.NullOr(Schema.Unknown)),
-      mergedAt: Schema.optional(Schema.NullOr(Schema.String)),
+      mergedAt: Schema.optional(Schema.NullOr(ExactHeadMergeTimestamp)),
     }),
   ),
 );

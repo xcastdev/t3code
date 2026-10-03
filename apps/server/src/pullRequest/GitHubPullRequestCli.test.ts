@@ -1917,6 +1917,62 @@ layer("GitHubPullRequestCli.layer", (it) => {
     );
   }
 
+  for (const phase of ["preflight", "confirmation"] as const) {
+    for (const mergedAt of [
+      "not-a-timestamp",
+      " ",
+      "2026-99-99T99:99:99Z",
+      "2026-02-30T12:00:00Z",
+    ]) {
+      it.effect(`exact-head timestamp refuses ${phase} value ${mergedAt}`, () =>
+        Effect.gen(function* () {
+          mockedExecute.mockReturnValueOnce(
+            Effect.succeed(output(exactDetail(phase === "preflight" ? { mergedAt } : {}))),
+          );
+          mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+          mockedExecute.mockReturnValueOnce(
+            Effect.succeed(
+              output(
+                exactDetail({
+                  state: "MERGED",
+                  mergedAt: phase === "confirmation" ? mergedAt : "2026-07-03T00:00:00Z",
+                }),
+              ),
+            ),
+          );
+          const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+          const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+          expect(error).toMatchObject(
+            phase === "preflight"
+              ? { _tag: "GitHubPullRequestReadError" }
+              : { _tag: "GitHubExactHeadMergeUncertainError", phase: "confirmation" },
+          );
+          expect(mockedExecute).toHaveBeenCalledTimes(phase === "preflight" ? 1 : 3);
+        }),
+      );
+    }
+  }
+
+  it.effect("exact-head timestamp accepts a canonical leap-day time with milliseconds", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail({ mergedAt: null }))));
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            exactDetail({
+              state: "MERGED",
+              mergedAt: "2024-02-29T12:00:00.123Z",
+            }),
+          ),
+        ),
+      );
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+      yield* cli.runPullRequestAction(exactMergeInput);
+      expect(mockedExecute).toHaveBeenCalledTimes(3);
+    }),
+  );
+
   it.effect("merges with the strategy it was asked for", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValue(Effect.succeed(output("")));
