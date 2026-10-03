@@ -11,6 +11,8 @@ import {
   SkillCatalogRevision,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -394,7 +396,7 @@ const makeFake = Effect.fn("PiAdapter.test.makeFake")(function* (instance = inst
       const result = yield* Deferred.make<Output, PiManagedRuntimeError>();
       const started = yield* Deferred.make<void>();
       const operation = {
-        operationId: `root-operation-${operations.length}`,
+        operationId: request.operationId ?? `root-operation-${operations.length}`,
         operationKind: request.kind,
       };
       const run = Effect.gen(function* () {
@@ -1637,3 +1639,482 @@ for (const source of ["prepare", "read", "stop", "failure-code", "session"] as c
       expect(json(yield* adapter.listSessions())).not.toContain(marker);
     }),
   );
+
+// Stable IDs come from a private Root callback; these tests prove transport and adapter lifetime only.
+it.effect("forwards exact Root operation IDs for initialization and assignment prompts", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const resolved: PiManagedOperationRequest[] = [];
+    const adapter = yield* makePiAdapter({
+      instanceId,
+      runtime: fake.runtime,
+      resolveOperationId: (request) => {
+        resolved.push(request);
+        return Effect.succeed(
+          request.kind === "initialize" ? "dispatch_initialize" : "dispatch_assignment",
+        );
+      },
+    });
+    const queue = yield* subscribe(adapter.streamEvents);
+    yield* adapter.startSession(startInput);
+    yield* nextType(queue, "session.started");
+    const turn = yield* adapter.sendTurn({ threadId, input: "approved assignment" });
+    expect(fake.requests.map((request) => request.operationId)).toEqual([
+      "dispatch_initialize",
+      "dispatch_assignment",
+    ]);
+    expect(resolved.map((request) => request.kind)).toEqual(["initialize", "prompt"]);
+    expect(turn.turnId).toBe(fake.operations[1]!.prepared.turnId);
+    expect((yield* nextType(queue, "turn.started")).eventId).toContain("dispatch_assignment");
+    // Preparation acknowledgment alone cannot prove native assignment consumption or completion.
+    expect(yield* Deferred.isDone(fake.operations[1]!.result)).toBe(false);
+    expect(yield* Queue.size(queue)).toBe(0);
+    yield* fake.settle(fake.operations[1]!, "success");
+    expect((yield* nextType(queue, "turn.completed")).eventId).toContain("dispatch_assignment");
+  }),
+);
+
+it.effect("captures the Root resolver when the factory is called", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    let originalCalls = 0;
+    let replacementCalls = 0;
+    const options = {
+      instanceId,
+      runtime: fake.runtime,
+      resolveOperationId: (_request: PiManagedOperationRequest) => {
+        originalCalls++;
+        return Effect.succeed("captured_root_id");
+      },
+    };
+    const creation = makePiAdapter(options);
+    options.resolveOperationId = () => {
+      replacementCalls++;
+      return Effect.succeed("replacement_root_id");
+    };
+    const adapter = yield* creation;
+    yield* adapter.startSession(startInput);
+    expect(fake.requests[0]?.operationId).toBe("captured_root_id");
+    expect(originalCalls).toBe(1);
+    expect(replacementCalls).toBe(0);
+  }),
+);
+
+it.effect("undefined Root identity preserves ordinary Runtime allocation", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({
+      instanceId,
+      runtime: fake.runtime,
+      resolveOperationId: () => Effect.succeed(undefined),
+    });
+    yield* adapter.startSession(startInput);
+    yield* adapter.sendTurn({ threadId, input: "ordinary prompt" });
+    expect(fake.requests.every((request) => request.operationId === undefined)).toBe(true);
+    expect(fake.operations[1]!.prepared.operation.operationId).toBe("root-operation-1");
+    yield* fake.settle(fake.operations[1]!, "success");
+  }),
+);
+
+it.effect("keeps the held resolver request immutable and isolated from caller hints", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const entered = yield* Deferred.make<PiManagedOperationRequest>();
+    const release = yield* Deferred.make<void>();
+    const callerPlan = readyPlan();
+    const expected = structuredClone(callerPlan);
+    const cursor = { sessionId: "native-one", leafId: "leaf-0" };
+    const adapter = yield* makePiAdapter({
+      instanceId,
+      runtime: fake.runtime,
+      resolveOperationId: Effect.fn("PiAdapter.test.heldImmutableResolver")(function* (request) {
+        yield* Deferred.succeed(entered, request);
+        yield* Deferred.await(release);
+        return "immutable_root_id";
+      }),
+    });
+    const starting = yield* Effect.forkScoped(
+      Effect.exit(
+        adapter.startSession({
+          ...startInput,
+          skillPlan: callerPlan,
+          resumeCursor: cursor,
+        }),
+      ),
+    );
+    const snapshot = yield* Deferred.await(entered);
+    callerPlan.payload.skills[0]!.path = "/caller/replaced";
+    cursor.leafId = "caller-replaced";
+    expect(() =>
+      Object.assign(snapshot, { threadId: ThreadId.make("resolver-replaced") }),
+    ).toThrow();
+    expect(() => {
+      const payload = snapshot.skillPlan!.payload;
+      if (payload !== null && typeof payload === "object")
+        Object.assign(payload, { root: "/resolver/replaced" });
+    }).toThrow();
+    yield* Deferred.succeed(release, undefined);
+    expect(Exit.isSuccess(yield* Fiber.join(starting))).toBe(true);
+    expect(fake.requests[0]?.skillPlan).toEqual(expected);
+    expect(fake.requests[0]?.resumeCursor).toEqual({ sessionId: "native-one", leafId: "leaf-0" });
+    expect(fake.requests[0]?.operationId).toBe("immutable_root_id");
+  }),
+);
+
+for (const operationId of ["", "bad/id", "bad id", "bad.id", "x".repeat(129)])
+  it.effect(
+    `rejects malformed Root identity ${operationId.length}:${operationId.slice(0, 8)}`,
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFake();
+        const adapter = yield* makePiAdapter({
+          instanceId,
+          runtime: fake.runtime,
+          resolveOperationId: () => Effect.succeed(operationId),
+        });
+        const result = yield* Effect.exit(adapter.startSession(startInput));
+        expect(json(result)).toContain("ProviderAdapterRequestError");
+        expect(fake.requests).toHaveLength(0);
+        expect(fake.state.stopCalls).toBe(0);
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+      }),
+  );
+
+for (const code of ["denied", "conflict", "unavailable", "uncertain"] as const)
+  it.effect(`denies Root resolver ${code} without allocating or stopping Runtime work`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const marker = "private resolver diagnostic";
+      const adapter = yield* makePiAdapter({
+        instanceId,
+        runtime: fake.runtime,
+        resolveOperationId: () => Effect.fail(new PiManagedRuntimeError({ code, detail: marker })),
+      });
+      const result = yield* Effect.exit(adapter.startSession(startInput));
+      expect(json(result)).toContain("ProviderAdapterRequestError");
+      expect(json(result)).not.toContain(marker);
+      expect(fake.requests).toHaveLength(0);
+      expect(fake.state.stopCalls).toBe(0);
+    }),
+  );
+
+for (const failure of ["throw", "defect"] as const)
+  it.effect(`denies a Root resolver ${failure} with a safe typed failure`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const marker = "private resolver exception";
+      const adapter = yield* makePiAdapter({
+        instanceId,
+        runtime: fake.runtime,
+        resolveOperationId: () => {
+          if (failure === "throw") throw new Error(marker);
+          return Effect.die(new Error(marker));
+        },
+      });
+      const result = yield* Effect.exit(adapter.startSession(startInput));
+      expect(json(result)).toContain("ProviderAdapterRequestError");
+      expect(json(result)).not.toContain(marker);
+      expect(fake.requests).toHaveLength(0);
+      expect(fake.state.stopCalls).toBe(0);
+    }),
+  );
+
+for (const kind of ["initialize", "prompt"] as const)
+  for (const stop of ["stopSession", "stopAll", "interruption"] as const)
+    it.effect(`a held ${kind} resolver racing ${stop} cannot prepare Runtime work`, () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFake();
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const shutdownEntered = yield* Deferred.make<void>();
+        const runtime: PiManagedRuntimeInstance = {
+          ...fake.runtime,
+          stopAll: Deferred.succeed(shutdownEntered, undefined).pipe(
+            Effect.andThen(fake.runtime.stopAll),
+          ),
+        };
+        let held = true;
+        const adapter = yield* makePiAdapter({
+          instanceId,
+          runtime,
+          resolveOperationId: Effect.fn("PiAdapter.test.heldStoppedResolver")(function* (request) {
+            if (request.kind === kind && held) {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Effect.uninterruptible(Deferred.await(release));
+              return "obsolete_root_id";
+            }
+            return undefined;
+          }),
+        });
+        if (kind === "prompt") yield* adapter.startSession(startInput);
+        const before = fake.requests.length;
+        const caller = yield* Effect.forkScoped(
+          Effect.exit(
+            kind === "initialize"
+              ? adapter.startSession(startInput).pipe(Effect.asVoid)
+              : adapter.sendTurn({ threadId, input: "held assignment" }).pipe(Effect.asVoid),
+          ),
+        );
+        yield* Deferred.await(entered);
+        const stopping = yield* Effect.forkScoped(
+          stop === "interruption"
+            ? Fiber.interrupt(caller)
+            : Effect.exit(stop === "stopAll" ? adapter.stopAll() : adapter.stopSession(threadId)),
+        );
+        if (stop === "stopAll") yield* Deferred.await(shutdownEntered);
+        else yield* Queue.take(fake.stopped);
+        expect(fake.requests).toHaveLength(before);
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        expect(stopping.pollUnsafe()).toBeUndefined();
+        expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(stopping);
+        const completed = yield* Effect.exit(Fiber.join(caller));
+        if (stop === "interruption") expect(Exit.isFailure(completed)).toBe(true);
+        else {
+          expect(Exit.isSuccess(completed)).toBe(true);
+          if (Exit.isSuccess(completed)) expect(Exit.isFailure(completed.value)).toBe(true);
+        }
+        expect(fake.requests).toHaveLength(before);
+        if (stop !== "stopAll") {
+          held = false;
+          yield* adapter.startSession(startInput);
+          expect(fake.requests).toHaveLength(before + 1);
+          expect(fake.requests.at(-1)?.operationId).toBeUndefined();
+        }
+      }),
+    );
+
+for (const kind of ["initialize", "prompt"] as const)
+  for (const cleanup of ["success", "failure"] as const)
+    it.effect(
+      `joins a contradictory ${kind} prepared identity and retains cleanup ${cleanup}`,
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFake();
+          fake.state.autoInitialize = kind !== "initialize";
+          const drain = yield* Deferred.make<void>();
+          fake.state.stopGates = [drain];
+          if (cleanup === "failure")
+            fake.state.stopError = new PiManagedRuntimeError({
+              code: "uncertain",
+              detail: "private contradictory cleanup diagnostic",
+            });
+          const runtime: PiManagedRuntimeInstance = {
+            ...fake.runtime,
+            prepareOperation: Effect.fn("PiAdapter.test.contradictoryIdentity")(
+              function* (request, observe) {
+                const prepared = yield* fake.runtime.prepareOperation(request, observe);
+                if (request.kind !== kind) return prepared;
+                return {
+                  ...prepared,
+                  operation: { ...prepared.operation, operationId: "contradictory_identity" },
+                };
+              },
+            ),
+          };
+          const adapter = yield* makePiAdapter({
+            instanceId,
+            runtime,
+            resolveOperationId: () => Effect.succeed("requested_identity"),
+          });
+          if (kind === "prompt") yield* adapter.startSession(startInput);
+          const caller = yield* Effect.forkScoped(
+            Effect.exit(
+              kind === "initialize"
+                ? adapter.startSession(startInput).pipe(Effect.asVoid)
+                : adapter
+                    .sendTurn({ threadId, input: "contradictory assignment" })
+                    .pipe(Effect.asVoid),
+            ),
+          );
+          const operationIndex = kind === "initialize" ? 0 : 1;
+          yield* Queue.take(fake.stopped);
+          yield* Effect.addFinalizer(() => Deferred.succeed(drain, undefined));
+          expect(caller.pollUnsafe()).toBeUndefined();
+          expect(yield* Deferred.isDone(fake.operations[operationIndex]!.started)).toBe(false);
+          yield* Deferred.succeed(drain, undefined);
+          const result = yield* Fiber.join(caller);
+          expect(Exit.isFailure(result)).toBe(true);
+          expect(json(result)).toContain(`"method":"${kind}"`);
+          if (cleanup === "failure") expect(json(result)).toContain('"method":"stopSession"');
+          expect(json(result)).not.toContain("private contradictory cleanup diagnostic");
+          expect(fake.state.stopCalls).toBe(1);
+          expect(yield* adapter.hasSession(threadId)).toBe(kind === "prompt");
+          if (kind === "prompt") expect((yield* adapter.listSessions())[0]?.status).toBe("error");
+          expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
+          expect(fake.requests).toHaveLength(operationIndex + 1);
+        }),
+    );
+
+for (const kind of ["initialize", "prompt"] as const)
+  for (const mode of [
+    "typed-pair",
+    "two-defects",
+    "mixed",
+    "interrupt-pair",
+    "mixed-interrupts",
+    "unannotated-two-defects",
+    "unannotated-mixed",
+    "unannotated-same-typed",
+    "same-annotations-two-defects",
+    "same-annotations-same-typed",
+  ] as const)
+    it.effect(`repair R1 ${kind} cleanup preserves every ${mode} reason after join`, () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFake();
+        fake.state.autoInitialize = kind !== "initialize";
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const typed = [
+          Cause.makeFailReason(
+            new PiManagedRuntimeError({ code: "denied", detail: "private-cleanup-first" }),
+          ),
+          Cause.makeFailReason(
+            new PiManagedRuntimeError({ code: "unavailable", detail: "private-cleanup-second" }),
+          ),
+        ];
+        const defects = [
+          Cause.makeDieReason("private-cleanup-defect-one"),
+          Cause.makeDieReason(new Error("private-cleanup-defect-two")),
+        ];
+        const interrupts = [Cause.makeInterruptReason(101), Cause.makeInterruptReason(202)];
+        const selected = mode.endsWith("same-typed")
+          ? [
+              typed[0]!,
+              Cause.makeFailReason(
+                new PiManagedRuntimeError({ code: "denied", detail: "private-cleanup-duplicate" }),
+              ),
+            ]
+          : mode === "typed-pair"
+            ? typed
+            : mode.endsWith("two-defects")
+              ? defects
+              : mode === "mixed" || mode === "unannotated-mixed"
+                ? [...typed, ...defects]
+                : mode === "interrupt-pair"
+                  ? interrupts
+                  : [
+                      typed[0]!,
+                      interrupts[0]!,
+                      defects[0]!,
+                      typed[1]!,
+                      interrupts[1]!,
+                      defects[1]!,
+                    ];
+        const cleanupReasons = selected.map((reason, index) =>
+          mode.startsWith("unannotated-")
+            ? reason
+            : reason.annotate(
+                Context.makeUnsafe(
+                  new Map<string, unknown>([
+                    ...(mode.startsWith("same-annotations-")
+                      ? []
+                      : [["cleanupStep", index] as const]),
+                    ["correlation", "owned-identity-cleanup"],
+                  ]),
+                ),
+              ),
+        );
+        const originalAnnotations = cleanupReasons.map((reason) => [...reason.annotations]);
+        const runtime: PiManagedRuntimeInstance = {
+          ...fake.runtime,
+          prepareOperation: Effect.fn("PiAdapter.test.multipleCleanupIdentity")(
+            function* (request, observe) {
+              const prepared = yield* fake.runtime.prepareOperation(request, observe);
+              if (request.kind !== kind) return prepared;
+              return {
+                ...prepared,
+                operation: { ...prepared.operation, operationId: "contradictory_cleanup_identity" },
+              };
+            },
+          ),
+          requestStop: () =>
+            Effect.gen(function* () {
+              // A caller seeing Interrupt also joins stopContext; its second controlled receipt is settled.
+              if (fake.state.stopCalls++ > 0) return;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              return yield* Effect.failCause(Cause.fromReasons(cleanupReasons));
+            }),
+        };
+        const adapter = yield* makePiAdapter({
+          instanceId,
+          runtime,
+          resolveOperationId: () => Effect.succeed("requested_cleanup_identity"),
+        });
+        if (kind === "prompt") yield* adapter.startSession(startInput);
+        const caller = yield* Effect.forkScoped(
+          Effect.exit(
+            kind === "initialize"
+              ? adapter.startSession(startInput).pipe(Effect.asVoid)
+              : adapter
+                  .sendTurn({ threadId, input: "cleanup cardinality assignment" })
+                  .pipe(Effect.asVoid),
+          ),
+        );
+        yield* Deferred.await(entered);
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        expect(caller.pollUnsafe()).toBeUndefined();
+        expect(yield* Deferred.isDone(fake.operations.at(-1)!.started)).toBe(false);
+        yield* Deferred.succeed(release, undefined);
+        const completed = yield* Fiber.join(caller);
+        expect(Exit.isFailure(completed)).toBe(true);
+        if (Exit.isFailure(completed)) {
+          const [original, ...retained] = completed.cause.reasons;
+          expect(original).toMatchObject({
+            _tag: "Fail",
+            error: { _tag: "ProviderAdapterRequestError", method: kind },
+          });
+          expect(retained).toHaveLength(cleanupReasons.length);
+          for (const [index, reason] of retained.entries()) {
+            const prior = cleanupReasons[index]!;
+            if (Cause.isInterruptReason(prior))
+              expect(reason).toMatchObject({ _tag: "Interrupt", fiberId: prior.fiberId });
+            else {
+              expect(reason).toMatchObject({
+                _tag: "Fail",
+                error: { _tag: "ProviderAdapterRequestError", method: "stopSession" },
+              });
+              if (
+                reason &&
+                Cause.isFailReason(reason) &&
+                reason.error._tag === "ProviderAdapterRequestError"
+              ) {
+                const expectedCode = Cause.isFailReason(prior) ? prior.error.code : "uncertain";
+                expect(reason.error.detail).toBe(
+                  {
+                    denied:
+                      "Pi authorization was denied. Review the current assignment and permissions.",
+                    conflict:
+                      "Pi operation conflicts with current state. Refresh the session before retrying.",
+                    unavailable:
+                      "Pi operation is unavailable. Review its setup and runtime availability.",
+                    uncertain:
+                      "Pi operation could not be confirmed. Reconcile the owned session before retrying.",
+                  }[expectedCode],
+                );
+              }
+            }
+            for (const [key, value] of originalAnnotations[index]!)
+              expect(reason!.annotations.get(key)).toBe(value);
+            expect(reason!.annotations.has("cleanupStep")).toBe(
+              prior.annotations.has("cleanupStep"),
+            );
+            expect(reason!.annotations.has("correlation")).toBe(
+              prior.annotations.has("correlation"),
+            );
+          }
+        }
+        expect(json(completed)).not.toContain("private-cleanup");
+        expect(cleanupReasons.map((reason) => [...reason.annotations])).toEqual(
+          originalAnnotations,
+        );
+        const interrupted = mode === "interrupt-pair" || mode === "mixed-interrupts";
+        expect(fake.state.stopCalls).toBe(interrupted ? 2 : 1);
+        if (interrupted) expect(yield* adapter.hasSession(threadId)).toBe(false);
+        else
+          expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
+        expect(fake.requests).toHaveLength(kind === "initialize" ? 1 : 2);
+      }),
+    );
