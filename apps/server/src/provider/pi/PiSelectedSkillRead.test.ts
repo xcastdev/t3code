@@ -1,16 +1,30 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { it as effectIt } from "@effect/vitest";
+import { ManagedSkillManifest } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import {
+  hashSkillPackage,
+  inspectSkillPackage,
+  writeSkillPackageContents,
+} from "../../skills/SkillPackage.ts";
 import { makePiSelectedSkillRead } from "./PiSelectedSkillRead.ts";
 
 const fs = process.getBuiltinModule("fs").promises;
 const os = process.getBuiltinModule("os");
+const modules = process.getBuiltinModule("module");
 const sdkDirectory = new URL("../", import.meta.resolve("@earendil-works/pi-coding-agent"))
   .pathname;
 const previousSdk = process.env.PI_PACKAGE_DIR;
+const decodeManifest = Schema.decodeSync(ManagedSkillManifest);
+const encodeEvidence = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const roots: string[] = [];
 const readers: Awaited<ReturnType<typeof makePiSelectedSkillRead>>[] = [];
 afterEach(async () => {
   await Promise.allSettled(readers.splice(0).map((reader) => reader.close()));
   vi.restoreAllMocks();
+  modules.syncBuiltinESMExports();
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
   if (previousSdk === undefined) delete process.env.PI_PACKAGE_DIR;
   else process.env.PI_PACKAGE_DIR = previousSdk;
@@ -87,6 +101,7 @@ async function fixture(
     handles.push(handle);
     return handle;
   });
+  modules.syncBuiltinESMExports();
   process.env.PI_PACKAGE_DIR = sdkDirectory;
   const make = async () => {
     const reader = await makePiSelectedSkillRead(selected());
@@ -105,6 +120,194 @@ async function fixture(
 }
 
 describe("selected skill native Read consumer", () => {
+  it("keeps detector cleanup uncertainty visible and restores only its captured native handle", async () => {
+    const { make, handles } = await fixture();
+    const reader = await make();
+    const fixtureOpen = vi.mocked(fs.open).getMockImplementation()!;
+    let captured:
+      | { handle: Awaited<ReturnType<typeof fs.open>>; close: () => Promise<void> }
+      | undefined;
+    let faultCalls = 0;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await fixtureOpen(...args);
+      if (!captured && /^\/proc\/self\/fd\/\d+$/.test(String(args[0])) && args[1] === "r") {
+        captured = { handle, close: handle.close.bind(handle) };
+        vi.spyOn(handle, "close").mockImplementation(async () => {
+          faultCalls++;
+          throw Error("synthetic detector close failure before native close");
+        });
+      }
+      return handle;
+    });
+    modules.syncBuiltinESMExports();
+    const outcome = (promise: Promise<unknown>) =>
+      promise.then(
+        () => "success",
+        (error: unknown) => String(error),
+      );
+    let observations: unknown;
+    try {
+      const read = await outcome(reader.read({ path: selected()[0]!.path }, signal()));
+      const subsequent = await outcome(reader.read({ path: selected()[0]!.path }, signal()));
+      const close = await outcome(reader.close());
+      if (!captured) throw Error("DETECTOR_HANDLE_NOT_CAPTURED");
+      const identity = await captured.handle.stat({ bigint: true });
+      observations = {
+        read,
+        subsequent,
+        close,
+        fd: captured.handle.fd,
+        dev: String(identity.dev),
+        ino: String(identity.ino),
+        faultCalls,
+      };
+      expect(captured.handle.fd).not.toBe(-1);
+      expect(faultCalls).toBe(1);
+      expect(read).toBe("Error: TOOL_FAILURE");
+      expect(subsequent).toBe("Error: TOOL_FAILURE");
+      expect(close).toBe("Error: TOOL_FAILURE");
+    } finally {
+      if (captured && captured.handle.fd !== -1) await captured.close();
+      expect(handles.every((handle) => handle.fd === -1)).toBe(true);
+      const evidence = process.env.PI_SELECTED_SKILL_READ_REPAIR_EVIDENCE_DIRECTORY;
+      if (evidence)
+        await fs.writeFile(
+          evidence + "/detector-fault.json",
+          JSON.stringify(
+            {
+              observations,
+              restored: captured?.handle.fd === -1,
+              allFixtureHandlesClosed: handles.every((handle) => handle.fd === -1),
+            },
+            null,
+            2,
+          ),
+        );
+    }
+  });
+
+  it("joins the public detector after cancellation without treating successful cleanup as uncertainty", async () => {
+    const { make, handles } = await fixture();
+    const reader = await make();
+    const fixtureOpen = vi.mocked(fs.open).getMockImplementation()!;
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let detector: Awaited<ReturnType<typeof fs.open>> | undefined;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await fixtureOpen(...args);
+      if (/^\/proc\/self\/fd\/\d+$/.test(String(args[0])) && args[1] === "r") {
+        detector = handle;
+        const read = handle.read.bind(handle);
+        vi.spyOn(handle, "read").mockImplementation(async (...readArgs) => {
+          const result = await read(...readArgs);
+          entered.resolve();
+          await release.promise;
+          return result;
+        });
+      }
+      return handle;
+    });
+    modules.syncBuiltinESMExports();
+    const controller = new AbortController();
+    const pending = reader.read({ path: selected()[0]!.path }, controller.signal).then(
+      () => "unexpected",
+      (error: unknown) => String(error),
+    );
+    try {
+      await entered.promise;
+      controller.abort();
+      expect(await pending).toBe("Error: Operation aborted");
+      const closing = reader.close();
+      let closed = false;
+      void closing.then(() => {
+        closed = true;
+      });
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      expect(detector?.fd).not.toBe(-1);
+      release.resolve();
+      await closing;
+      expect(handles.every((handle) => handle.fd === -1)).toBe(true);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+  });
+
+  effectIt.effect(
+    "reads literal asset names accepted by the actual managed package writer, hash and inspector",
+    () =>
+      Effect.gen(function* () {
+        const packagePath = yield* Effect.promise(() =>
+          fs.mkdtemp(os.tmpdir() + "/pi-selected-package-"),
+        );
+        roots.push(packagePath);
+        const assets = ["assets/@notes.txt", "assets/~scratch.txt", "assets/file:report.txt"];
+        const manifest = decodeManifest({
+          schemaVersion: 1,
+          kind: "managed-skill",
+          id: "reader-example",
+          key: "example",
+          scope: "global",
+          revision: { revision: 1, hash: "a".repeat(64) },
+          origin: "created",
+          ownership: "t3",
+        });
+        const inspection = yield* Effect.gen(function* () {
+          yield* writeSkillPackageContents({
+            packagePath,
+            manifest,
+            content: {
+              key: manifest.key,
+              name: "Reader package",
+              body: "Literal packaged assets",
+              assetPaths: assets,
+            },
+          });
+          yield* Effect.promise(async () => {
+            await fs.mkdir(packagePath + "/assets");
+            for (const relative of assets)
+              await fs.writeFile(packagePath + "/" + relative, "benign " + relative);
+          });
+          const hash = yield* hashSkillPackage(packagePath);
+          yield* writeSkillPackageContents({
+            packagePath,
+            manifest: { ...manifest, revision: { revision: 1, hash } },
+          });
+          return yield* inspectSkillPackage({
+            packagePath,
+            expectedKey: manifest.key,
+            expectedScope: "global",
+          });
+        }).pipe(Effect.provide(NodeServices.layer));
+        expect(inspection.validity).toBe("valid");
+        expect(inspection.diagnostics).toEqual([]);
+        expect(inspection.content?.assetPaths).toEqual(assets);
+        expect(inspection.manifest?.revision.hash).toBe(inspection.hash);
+        const entries: Record<string, Buffer> = {};
+        for (const relative of ["SKILL.md", "t3-skill.json", ...assets])
+          entries[relative] = yield* Effect.promise(() =>
+            fs.readFile(packagePath + "/" + relative),
+          );
+        const { make, handles } = yield* Effect.promise(() => fixture(entries));
+        const reader = yield* Effect.promise(make);
+        for (const relative of assets)
+          expect(
+            text(
+              yield* Effect.promise(() =>
+                reader.read({ path: "/runtime/skills/example/" + relative }, signal()),
+              ),
+            ),
+          ).toBe("benign " + relative);
+        yield* Effect.promise(reader.close);
+        expect(handles.every((handle) => handle.fd === -1)).toBe(true);
+        const evidence = process.env.PI_SELECTED_SKILL_READ_REPAIR_EVIDENCE_DIRECTORY;
+        if (evidence)
+          yield* Effect.promise(() =>
+            fs.writeFile(evidence + "/package-compatibility.json", encodeEvidence(inspection)),
+          );
+      }),
+  );
   it("keeps empty selection inert without filesystem or SDK setup", async () => {
     delete process.env.PI_PACKAGE_DIR;
     const open = vi.spyOn(fs, "open");
@@ -181,6 +384,7 @@ describe("selected skill native Read consumer", () => {
     await expect(
       reader.read({ path: "/runtime/skills/example/assets/picture.png" }, signal()),
     ).rejects.toThrow("TOOL_FAILURE");
+    await reader.close();
   });
 
   it("requires an exact readonly file mount and a matching held FD mount ID", async () => {
