@@ -7,10 +7,10 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-03 12:28 UTC. **P1–P4 are complete; P5–P14 remain open. Latest main product commit: `99f588ce0`**. No product branch has been pushed and no product PR exists.
+Last updated: 2026-10-03 12:54 UTC. **P1–P4 are complete; P5–P14 remain open. Latest main product commit: `99f588ce0`**. No product branch has been pushed and no product PR exists.
 
 - **Done:** P1–P4; approved intake, authority and human workflow work is on main.
-- **Working now:** all four current P7 pieces are approved and merged into the integration branch `0e47ba287`: production wiring/packaging, rollback uncertainty, Claude cleanup and the bounded mobile foundation. Combined required tests and the current production compiler are running; shipping rebuild preparation proceeds in parallel.
+- **Working now:** all four current P7 pieces are approved and merged into the integration branch `0e47ba287`: production wiring/packaging, rollback uncertainty, Claude cleanup and the bounded mobile foundation. Combined required/affected tests pass 268/268 after the reviewed two-line migration expectation repair. Current normal compilation, real shipping builds and all three packaged-parent startup/shutdown checks pass. The combined wave is `73f319465`; fresh wave review is next.
 - **Next:** validate the combined shipping artifacts and obtain one fresh wave review, then land locally and implement dispatch/recovery, messaging, memory, GitHub delivery and full supervision clients (P8–P14).
 - **Completion gates:** all 19 final acceptance criteria and both independent audits remain open. No local model runs; product branches remain unpushed.
 
@@ -87,20 +87,20 @@ Prioritize **Pi, OpenCode, Claude and Codex**. Shared contracts, migrations, wir
 
 Each row is one subagent seat. Finished agents release their seat. Status questions do not pause implementation. Phase tallies count unfinished work, not running processes. Worktrees and evidence live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                    | State                          | Assignment / exact base                      | Next gate                                     |
-| ---- | ---------------------------------------- | ------------------------------ | -------------------------------------------- | --------------------------------------------- |
-| 1    | `p7_combined_normal_check_high`          | Active verification worker     | Normal production compiler at `0e47ba287`    | Physical input audit and process drain        |
-| 2    | `p7_current_shipping_runtime_proof_high` | Active preparation; build held | New isolated shipping outputs at `0e47ba287` | Build seat after compiler; Root parent checks |
-| 3    | —                                        | Available                      | Gateway `2b72711c0` approved and merged      | Combined wave gate                            |
-| 4    | —                                        | Available                      | Claude `8d4cb6585` approved and merged       | Combined wave gate                            |
-| 5    | —                                        | Available                      | Mobile `88ca6dbe2` approved and merged       | Later full client gates                       |
-| 6    | —                                        | Available                      | Production `72ba53c4` approved and merged    | Fresh combined wave review                    |
-| 7    | —                                        | Available                      | Git/setup preparation complete               | Root shared interfaces after P7               |
-| 8    | —                                        | Available                      | Scheduler/limits preparation complete        | Root budget/drain interfaces                  |
-| 9    | —                                        | Available                      | Recovery preparation complete                | Root effect-stage/stop interfaces             |
-| 10   | —                                        | Available                      | Reserved for fresh combined wave reviewer    | Exact frozen candidate after checks           |
+| Slot | Agent                           | State                      | Assignment / exact base                   | Next gate                                    |
+| ---- | ------------------------------- | -------------------------- | ----------------------------------------- | -------------------------------------------- |
+| 1    | —                               | Available                  | Passed and sealed current checks          | Combined wave review                         |
+| 2    | —                               | Available                  | Passed and sealed current checks          | Combined wave review                         |
+| 3    | —                               | Available                  | Passed and sealed current checks          | Combined wave review                         |
+| 4    | —                               | Available                  | Claude `8d4cb6585` approved and merged    | Combined wave gate                           |
+| 5    | —                               | Available                  | Mobile `88ca6dbe2` approved and merged    | Later full client gates                      |
+| 6    | —                               | Available                  | Production `72ba53c4` approved and merged | Fresh combined wave review                   |
+| 7    | —                               | Available                  | Git/setup preparation complete            | Root shared interfaces after P7              |
+| 8    | —                               | Available                  | Scheduler/limits preparation complete     | Root budget/drain interfaces                 |
+| 9    | —                               | Available                  | Recovery preparation complete             | Root effect-stage/stop interfaces            |
+| 10   | `review_p7_combined_wave_xhigh` | Starting fresh wave review | Frozen combined P7 after required checks  | Independent combined source/behavior verdict |
 
-Compiler/build seat: the combined normal compiler worker, capped at 6 GiB with zero swap, Node 512 MiB and Go 5 GiB. Root runs scoped 2 GiB combined tests; shipping heavy builds wait for the compiler seat. No local model is hosted.
+Compiler/build seat: free. Combined production compiler, Repository repair compiler, all 12 real shipping operations and three actual bundled-parent checks pass and are drained. Root verified the complete 36-artifact normal packet, 152 producer/35 reviewer repair artifacts, 13,255 shipping proof files and 8,972 outputs, plus sealed its 80-file actual parent packet. Required/affected tests now pass 268/268; all 26 captured spawns are absent before outer cleanup. The first 267/268 failure and observer overwrite limitation are retained. No local model is hosted.
 
 Production review is approved for `72ba53c4`; Root read the full verdict and verified all 186 files, four private links and directory entries before merging into the wave. The actual published npm supplement is distinct from the Node CLI bundle: its five supported targets include four explicitly missing platform artifacts. Linux archive, faithful ASAR and launcher selection pass at that piece commit; current combined artifacts require fresh affected checks. The correcting supplement preserves the original immutable production seal.
 
@@ -1184,18 +1184,18 @@ Prioritize Pi, OpenCode, Claude and Codex. Shared contracts, migrations, wiring 
 
 Each row is one subagent seat. Finished agents release their seat. Worktrees and evidence live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                             | State                              | Assignment / exact base                      | Next gate                                                     |
-| ---- | --------------------------------- | ---------------------------------- | -------------------------------------------- | ------------------------------------------------------------- |
-| 1    | `p7_bash_entry_consumer_high`     | Active; selected Entry activation  | `b17d1d768`                                  | Eight exclusive child files; constructive native proof active |
-| 2    | — (same authority reviewer)       | Available; APPROVE                 | `322e8589f` / `377707f99`                    | Staged at `87087d709`; combined gate open                     |
-| 3    | — (guided runtime worker)         | Available; approved repair         | `8b75b3256` / `069e66a17`                    | Reconciled at `b2d9fe085`; full wave open                     |
-| 4    | `p10_hit_hydration_high`          | Active isolated escaped-key repair | Base `f3f483b80`; unique-key-repair worktree | Root verified2 actual failures/plaincontrol; same reviewer    |
-| 5    | — (same guided runtime reviewer)  | Available; APPROVE                 | `8b75b3256` / `069e66a17`                    | Root verified all 62 recheck artifacts                        |
-| 6    | `p7_selected_skill_read_high`     | Available; repair committed        | `ce56e6a2c` / `12f67e927`                    | Focused RED/GREEN, final compiler, same-reviewer recheck      |
-| 7    | — (same selected reader reviewer) | Available; APPROVE                 | `ce56e6a2c` / `12f67e927`                    | APPROVE `4598c5112`; staged `0870b05db`                       |
-| 8    | — (last: skill-resource worker)   | Available; repair committed        | `e80496269` / `0722c57e9`                    | Root diff/evidence verification and same-reviewer recheck     |
-| 9    | — (last: Bash isolation reviewer) | Available; APPROVE                 | `a879e051e` / `2a18c0735`                    | Staged at `7d660e413`; Entry integration active               |
-| 10   | — (stage lifetime reviewer)       | Available; APPROVE                 | `6b5ef1faf` / `8552e30de`                    | Staged at `12f67e927`; parent lifetime open                   |
+| Slot | Agent                             | State                              | Assignment / exact base                      | Next gate                                                  |
+| ---- | --------------------------------- | ---------------------------------- | -------------------------------------------- | ---------------------------------------------------------- |
+| 1    | —                                 | Available                          | Passed and sealed current checks             | Combined wave review                                       |
+| 2    | —                                 | Available                          | Passed and sealed current checks             | Combined wave review                                       |
+| 3    | —                                 | Available                          | Passed and sealed current checks             | Combined wave review                                       |
+| 4    | `p10_hit_hydration_high`          | Active isolated escaped-key repair | Base `f3f483b80`; unique-key-repair worktree | Root verified2 actual failures/plaincontrol; same reviewer |
+| 5    | — (same guided runtime reviewer)  | Available; APPROVE                 | `8b75b3256` / `069e66a17`                    | Root verified all 62 recheck artifacts                     |
+| 6    | `p7_selected_skill_read_high`     | Available; repair committed        | `ce56e6a2c` / `12f67e927`                    | Focused RED/GREEN, final compiler, same-reviewer recheck   |
+| 7    | — (same selected reader reviewer) | Available; APPROVE                 | `ce56e6a2c` / `12f67e927`                    | APPROVE `4598c5112`; staged `0870b05db`                    |
+| 8    | — (last: skill-resource worker)   | Available; repair committed        | `e80496269` / `0722c57e9`                    | Root diff/evidence verification and same-reviewer recheck  |
+| 9    | — (last: Bash isolation reviewer) | Available; APPROVE                 | `a879e051e` / `2a18c0735`                    | Staged at `7d660e413`; Entry integration active            |
+| 10   | `review_p7_combined_wave_xhigh`   | Starting fresh wave review         | Frozen combined P7 after required checks     | Independent combined source/behavior verdict               |
 
 Coordinator: owns P5 authority interfaces and P7 production wiring. Final lease repair `fd08bc3bd` is APPROVED; root verifies all47 repair-review artifacts. Its exact source is copied into authority wave `73f8cbd43` (89/89 cases andstrict/Effect pass), now in fresh wave review, and intake base `30728a7f0` (59/59 intake cases pass). The intake worker retains its two files unchanged and runs the full affected gate. Memory owner repair `f3f483b80` resolvesR1; its same reviewer verifies inherited escaped-key limitR2. Root independently reproduces both failures and assigns a separate same-worker repair on exactbase `f3f483b80` (two hydration paths only). It inspects at most4,096 indexed foundation events for the involved owners (4,097 sentinel), with1MiB per event and16MiB total before decoding; excess or corrupt history denies completeness. The256-source/256-observation/128-hit limits remain. Both changes pass their focused tests and actual strict/Effect compiler gates; all captured processes drain. Reviewed candidates remain frozen. Shared interfaces and required prerequisites limit useful parallel work; available seats can take settled, exclusive scopes. Held slices still require combined validation and one fresh wave review before main integration. Only the coordinator performs integrated client verification after permission.
 
