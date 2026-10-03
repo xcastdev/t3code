@@ -39,6 +39,7 @@ import {
   type ProjectTeamPrincipal,
 } from "./ProjectTeamAuthorization.ts";
 import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
+import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
 
 const encode = canonicalProjectWorkPayload;
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
@@ -56,6 +57,10 @@ const decodeOwner = Schema.decodeSync(
 );
 const ResourceIdentity = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
 const decodeResourceIdentity = Schema.decodeUnknownEffect(ResourceIdentity);
+const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
+const Positive = Safe.check(Schema.isGreaterThan(0));
+const OperationLimits = Schema.Struct({ maximumTokens: Positive, deadlineAtMs: Positive });
+const RootBudget = Schema.Struct({ rootTaskId: Schema.String, ...OperationLimits.fields });
 const decodeIntent = Schema.decodeEffect(
   Schema.fromJsonString(
     Schema.Struct({
@@ -69,6 +74,8 @@ const decodeIntent = Schema.decodeEffect(
       }),
       role: Schema.Unknown,
       resourceHash: Schema.optional(ResourceIdentity),
+      rootBudget: Schema.optional(RootBudget),
+      operationLimits: Schema.optional(OperationLimits),
     }),
   ),
 );
@@ -83,8 +90,6 @@ const decodeReadIdentity = Schema.decodeUnknownEffect(
   }),
   { onExcessProperty: "error" },
 );
-const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
-const Positive = Safe.check(Schema.isGreaterThan(0));
 const Usage = Schema.Struct({
   prompt_tokens: Safe,
   completion_tokens: Safe,
@@ -165,6 +170,8 @@ const decodeReplayIntent = Schema.decodeEffect(
       role: Schema.Json,
       allocation: PiManagedProcessAllocationSchema,
       resourceHash: ResourceIdentity,
+      rootBudget: RootBudget,
+      operationLimits: OperationLimits,
     }),
   ),
   { onExcessProperty: "error" },
@@ -350,6 +357,12 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     const clock = yield* Clock.Clock;
     const authorization = yield* ProjectTeamAuthorization;
     const repository = yield* ProjectWorkRepository;
+    // These retained reads validate intent, claim receipts and stage history only.
+    // The schema maximum is unused by them and grants no model-call capacity.
+    const { readRetained, readStageReceipts } = yield* makeProjectTeamDispatchJournal({
+      environmentId: options.environmentId,
+      maximumEnvironmentModelCalls: 128,
+    });
     const ownTransaction = Effect.fn("ProjectTeamPiOperations.ownTransaction")(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(supplied) && supplied.value !== sql)
@@ -387,11 +400,73 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       let authority = initial;
       let maximumTokens = initial.binding.configuration.maxTokens;
       let deadline = Number.MAX_SAFE_INTEGER;
+      const records = initial.state.foundationRecords ?? [];
+      const tasks = new Set<string>();
+      let rootTaskId = initial.binding.taskId;
+      for (;;) {
+        if (tasks.has(rootTaskId) || tasks.size >= 9)
+          return yield* deny("Invalid Pi task ancestry");
+        tasks.add(rootTaskId);
+        const memberships = records.filter(
+          (r) => r.kind === "task-membership" && r.taskId === rootTaskId,
+        );
+        const membership = memberships[0];
+        if (
+          memberships.length !== 1 ||
+          membership?.kind !== "task-membership" ||
+          membership.projectId !== initial.binding.projectId ||
+          membership.status !== "active" ||
+          membership.executionKind === "legacy" ||
+          initial.state.tasks.filter(
+            (t) => t.taskId === rootTaskId && t.projectId === initial.binding.projectId,
+          ).length !== 1
+        )
+          return yield* deny("Pi task ancestor unavailable");
+        if (!membership.parentTaskId) break;
+        rootTaskId = membership.parentTaskId;
+      }
       const seen = new Set<string>();
       while (true) {
         const binding = authority.binding;
         if (seen.has(binding.recordId) || seen.size >= 9) return yield* deny("Invalid Pi ancestry");
         seen.add(binding.recordId);
+        if (binding.recordId !== initial.binding.recordId) {
+          const dispatches = yield* sql<{
+            dispatch_id: string;
+          }>`SELECT dispatch_id FROM project_team_dispatch WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 2`;
+          if (dispatches.length > 1) return yield* deny("Pi ancestor dispatch is ambiguous");
+          if (dispatches[0]) {
+            const snapshot = yield* readRetained(dispatches[0].dispatch_id);
+            yield* readStageReceipts(dispatches[0].dispatch_id);
+            const transition = snapshot.intent.compiledClaim.transition;
+            if (
+              transition?.kind !== "claim" ||
+              immutableBinding(transition.binding) !== immutableBinding(binding) ||
+              snapshot.fence.stage === "stopping" ||
+              snapshot.fence.stage === "quarantine" ||
+              snapshot.fence.stage === "settled"
+            )
+              return yield* deny("Frozen Pi ancestor changed");
+          }
+          const operations = yield* sql<{
+            intent_json: string;
+          }>`SELECT intent_json FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation} ORDER BY operation_ordinal LIMIT 1`;
+          if (operations[0]) {
+            const intent = yield* decodeIntent(operations[0].intent_json);
+            if (
+              !intent.rootBudget ||
+              !intent.operationLimits ||
+              intent.binding.recordId !== binding.recordId ||
+              intent.binding.generation !== binding.generation ||
+              intent.binding.worktree !== binding.worktree ||
+              intent.binding.branch !== binding.branch ||
+              intent.binding.model !== binding.model ||
+              encode(intent.binding.configuration) !== encode(binding.configuration) ||
+              encode(intent.role) !== encode(authority.role)
+            )
+              return yield* deny("Pi ancestor intent changed");
+          }
+        }
         if (
           authority.state.foundationRecords?.some(
             (entry) =>
@@ -416,14 +491,25 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           return yield* deny("Missing durable Pi limits");
         maximumTokens = Math.min(maximumTokens, binding.configuration.maxTokens);
         deadline = Math.min(deadline, lease, started + duration);
-        if (!binding.parentRunId) return { root: binding, maximumTokens, deadlineAtMs: deadline };
-        const parent = authority.state.foundationRecords?.find(
+        if (!tasks.has(binding.taskId)) return yield* deny("Pi run and task ancestry differ");
+        if (!binding.parentRunId) {
+          if (binding.taskId !== rootTaskId) return yield* deny("Pi root run is orphaned");
+          return { root: binding, rootTaskId, maximumTokens, deadlineAtMs: deadline };
+        }
+        const parents = authority.state.foundationRecords?.filter(
           (entry) => entry.kind === "run-binding" && entry.recordId === binding.parentRunId,
         );
+        const parent = parents?.[0];
+        const membership = records.find(
+          (r) => r.kind === "task-membership" && r.taskId === binding.taskId,
+        );
         if (
+          parents?.length !== 1 ||
           parent?.kind !== "run-binding" ||
           parent.projectId !== initial.binding.projectId ||
-          parent.environmentId !== options.environmentId
+          parent.environmentId !== options.environmentId ||
+          (parent.taskId !== binding.taskId &&
+            (membership?.kind !== "task-membership" || parent.taskId !== membership.parentTaskId))
         )
           return yield* deny("Pi ancestor unavailable");
         const credential = {
@@ -440,6 +526,126 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         if (!resolved) return yield* deny("Pi ancestor authority unavailable");
         authority = resolved;
       }
+    });
+    const rootBudget = Effect.fn("ProjectTeamPiOperations.rootBudget")(function* (
+      authority: ProjectTeamAuthority,
+      root: Effect.Success<ReturnType<typeof roots>>,
+      operation: PiWorkerOperation,
+      frozen?: typeof RootBudget.Type,
+    ) {
+      const binding = authority.binding;
+      const budgets = yield* sql<{
+        maximum_tokens: number;
+        deadline_at_ms: number;
+      }>`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${root.rootTaskId}`;
+      const dispatches = yield* sql<{
+        dispatch_id: string;
+      }>`SELECT dispatch_id FROM project_team_dispatch WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 2`;
+      const anchors = yield* sql<{
+        dispatch_id: string;
+      }>`SELECT dispatch_id FROM project_team_dispatch WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${root.rootTaskId} ORDER BY created_at,dispatch_id LIMIT 1`;
+      let anchor = frozen;
+      let maximumTokens = root.maximumTokens;
+      let deadlineAtMs = root.deadlineAtMs;
+      if (dispatches.length > 1) return yield* deny("Pi dispatch identity is ambiguous");
+      if (anchors[0]) {
+        const original = yield* readRetained(anchors[0].dispatch_id);
+        yield* readStageReceipts(anchors[0].dispatch_id);
+        const originalBudget = {
+          rootTaskId: original.intent.limits.rootTaskId,
+          maximumTokens: original.intent.limits.maximumTokens,
+          deadlineAtMs: original.intent.limits.rootDeadlineAtMs,
+        };
+        if (anchor && encode(anchor) !== encode(originalBudget))
+          return yield* deny("Original Pi root budget changed");
+        anchor = originalBudget;
+        if (!dispatches[0]) return yield* deny("Journal root requires its admitted Pi dispatch");
+      }
+      if (dispatches[0]) {
+        const snapshot = yield* readRetained(dispatches[0].dispatch_id);
+        yield* readStageReceipts(dispatches[0].dispatch_id);
+        const transition = snapshot.intent.compiledClaim.transition;
+        const limits = snapshot.intent.limits;
+        if (
+          transition?.kind !== "claim" ||
+          immutableBinding(transition.binding) !== immutableBinding(binding) ||
+          limits.rootTaskId !== root.rootTaskId ||
+          !anchor ||
+          anchor.maximumTokens !== limits.maximumTokens ||
+          anchor.deadlineAtMs !== limits.rootDeadlineAtMs ||
+          (operation.operationKind === "initialize"
+            ? snapshot.intent.request.initializeOperationId
+            : snapshot.intent.request.assignmentOperationId) !== operation.operationId ||
+          snapshot.fence.stage === "stopping" ||
+          snapshot.fence.stage === "quarantine" ||
+          snapshot.fence.stage === "settled"
+        )
+          return yield* deny("Pi operation differs from its admitted dispatch");
+        maximumTokens = Math.min(maximumTokens, limits.attemptMaximumTokens);
+        deadlineAtMs = Math.min(deadlineAtMs, limits.deadlineAtMs);
+      }
+      if (!anchor && budgets[0]) {
+        const prior = yield* sql<{
+          intent_json: string;
+        }>`SELECT intent_json FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${root.rootTaskId} ORDER BY rowid LIMIT 1`;
+        if (prior[0]) anchor = (yield* decodeIntent(prior[0].intent_json)).rootBudget;
+        if (!anchor) return yield* deny("Pi root budget requires trusted legacy reconciliation");
+      }
+      if (!anchor && binding.recordId !== root.root.recordId)
+        return yield* deny("Pi child requires an original root budget");
+      if (!anchor) anchor = { rootTaskId: root.rootTaskId, maximumTokens, deadlineAtMs };
+      if (
+        anchor.rootTaskId !== root.rootTaskId ||
+        (budgets[0] &&
+          (budgets[0].maximum_tokens !== anchor.maximumTokens ||
+            budgets[0].deadline_at_ms !== anchor.deadlineAtMs)) ||
+        (frozen && budgets.length !== 1)
+      )
+        return yield* deny("Frozen Pi root budget changed");
+      return {
+        rootBudget: anchor,
+        maximumTokens: Math.min(maximumTokens, anchor.maximumTokens),
+        deadlineAtMs: Math.min(deadlineAtMs, anchor.deadlineAtMs),
+        exists: budgets.length === 1,
+      };
+    });
+    const operationBudget = Effect.fn("ProjectTeamPiOperations.operationBudget")(function* (
+      authority: ProjectTeamAuthority,
+      root: Effect.Success<ReturnType<typeof roots>>,
+      row: Row,
+    ) {
+      const intent = yield* decodeIntent(row.intent_json);
+      if (
+        !intent.rootBudget ||
+        !intent.operationLimits ||
+        row.environment_id !== options.environmentId ||
+        row.project_id !== authority.binding.projectId ||
+        row.binding_id !== authority.binding.recordId ||
+        row.generation !== authority.binding.generation ||
+        row.provider_instance_id !== authority.binding.providerInstanceId ||
+        row.thread_id !== authority.binding.threadId ||
+        row.root_task_id !== root.rootTaskId ||
+        row.root_binding_id !== root.root.recordId ||
+        intent.binding.recordId !== authority.binding.recordId ||
+        intent.binding.generation !== authority.binding.generation ||
+        intent.binding.worktree !== authority.binding.worktree ||
+        intent.binding.branch !== authority.binding.branch ||
+        intent.binding.model !== authority.binding.model ||
+        encode(intent.binding.configuration) !== encode(authority.binding.configuration) ||
+        encode(intent.role) !== encode(authority.role) ||
+        intent.operationLimits.maximumTokens !== row.maximum_tokens ||
+        intent.operationLimits.deadlineAtMs !== row.deadline_at_ms
+      )
+        return yield* deny("Pi forward operation has no frozen budget proof");
+      const limits = yield* rootBudget(
+        authority,
+        root,
+        { operationId: row.operation_id, operationKind: row.operation_kind },
+        intent.rootBudget,
+      );
+      if (row.maximum_tokens > limits.maximumTokens || row.deadline_at_ms > limits.deadlineAtMs)
+        return yield* deny("Frozen Pi operation policy changed");
+      return limits.rootBudget;
     });
     const clockCheck = Effect.fn("ProjectTeamPiOperations.clockCheck")(function* (
       deadline: number,
@@ -506,6 +712,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
                     (intent.resourceHash ?? null) !== expected.resourceHash
                   )
                     return yield* deny("Pi native read identity changed", "conflict");
+                  yield* operationBudget(authority, root, row);
                 }
                 return yield* Effect.try({
                   try: () => {
@@ -569,6 +776,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         root.deadlineAtMs < row.deadline_at_ms
       )
         return yield* deny("Pi operation owner changed");
+      yield* operationBudget(authority, root, row);
       yield* clockCheck(row.deadline_at_ms);
       return authority;
     });
@@ -713,16 +921,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             encode(drain) !== encode(terminal.drain)
           )
             return yield* deny("Stable Pi process receipts differ", "uncertain");
-          const budgets = yield* sql<{
-            maximum_tokens: number;
-            deadline_at_ms: number;
-          }>`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${root.root.taskId}`;
-          if (
-            budgets.length !== 1 ||
-            budgets[0]?.maximum_tokens !== row.maximum_tokens ||
-            budgets[0]?.deadline_at_ms !== row.deadline_at_ms
-          )
-            return yield* deny("Stable Pi original budget changed", "uncertain");
+          yield* operationBudget(authority, root, row).pipe(
+            Effect.mapError(() => deny("Stable Pi original budget changed", "uncertain")),
+          );
           const requests = yield* sql<{
             reservation_id: string;
             environment_id: string;
@@ -915,23 +1116,12 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           const ordinal = previous[0]?.ordinal;
           if (ordinal === undefined || !Number.isSafeInteger(ordinal))
             return yield* deny("Pi operation ordinal exhausted");
-          const budgets = yield* sql<{
-            maximum_tokens: number;
-            deadline_at_ms: number;
-          }>`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE environment_id=${options.environmentId} AND project_id=${authority.binding.projectId} AND root_task_id=${root.root.taskId}`;
-          const frozen = budgets[0];
-          if (
-            frozen &&
-            (frozen.maximum_tokens > root.maximumTokens ||
-              frozen.deadline_at_ms > root.deadlineAtMs)
-          )
-            return yield* deny("Frozen Pi root policy changed");
-          const maximumTokens = frozen?.maximum_tokens ?? root.maximumTokens;
-          const deadlineAtMs = frozen?.deadline_at_ms ?? root.deadlineAtMs;
-          yield* clockCheck(deadlineAtMs);
-          if (!frozen)
-            yield* sql`INSERT INTO project_team_model_budget VALUES(${options.environmentId},${authority.binding.projectId},${root.root.taskId},${maximumTokens},${deadlineAtMs})`;
           const operation = { operationId, operationKind: request.kind };
+          const limits = yield* rootBudget(authority, root, operation);
+          const { maximumTokens, deadlineAtMs } = limits;
+          yield* clockCheck(deadlineAtMs);
+          if (!limits.exists)
+            yield* sql`INSERT INTO project_team_model_budget VALUES(${options.environmentId},${authority.binding.projectId},${root.rootTaskId},${limits.rootBudget.maximumTokens},${limits.rootBudget.deadlineAtMs})`;
           const principal = {
             actor: { kind: "agent" as const, id: managedActorId(authority.credential) },
             managed: authority.credential,
@@ -941,6 +1131,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             binding: authority.binding,
             role: authority.role,
             allocation,
+            rootBudget: limits.rootBudget,
+            operationLimits: { maximumTokens, deadlineAtMs },
             ...(resourceHash === undefined ? {} : { resourceHash }),
           });
           yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json) VALUES (${operationId},${options.environmentId},${authority.binding.projectId},${authority.binding.recordId},${authority.binding.generation},${identity.providerInstanceId},${identity.threadId},${workerId},${ordinal},${request.kind},${requestHash},${root.root.recordId},${root.root.taskId},${maximumTokens},${deadlineAtMs},'prepared',${intent})`;
@@ -1294,6 +1486,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           );
           if (native.sessionId !== authority.binding.sessionId)
             return yield* deny("Pi native binding mismatch");
+          yield* operationBudget(authority, yield* roots(authority), row).pipe(
+            Effect.mapError(() => deny("Pi native budget proof unavailable", "uncertain")),
+          );
           yield* current(identity);
           return {
             authority,
@@ -1357,12 +1552,19 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         row.deadline_at_ms > root.deadlineAtMs
       )
         return yield* new ModelAccountingError({ reason: "Pi accounting operation mismatch" });
+      const budget = yield* operationBudget(authority, root, row).pipe(
+        Effect.mapError(
+          () => new ModelAccountingError({ reason: "Pi accounting budget unavailable" }),
+        ),
+      );
       return {
         workerId: row.worker_id,
         operationId: row.operation_id,
-        rootTaskId: row.root_task_id,
-        maximumTokens: row.maximum_tokens,
-        deadlineAtMs: row.deadline_at_ms,
+        rootTaskId: budget.rootTaskId,
+        maximumTokens: budget.maximumTokens,
+        deadlineAtMs: budget.deadlineAtMs,
+        operationMaximumTokens: row.maximum_tokens,
+        operationDeadlineAtMs: row.deadline_at_ms,
       };
     });
     return {

@@ -1,4 +1,12 @@
-import { canonicalProjectWorkPayload, ProjectTeamEffect } from "@t3tools/contracts";
+import {
+  canonicalProjectWorkPayload,
+  ProjectTeamEffect,
+  ProjectWorkFoundationCommitCommand,
+  ProjectWorkTaskId,
+  ThreadId,
+  CommandId,
+  ProjectWorkAttemptId,
+} from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as NodeCrypto from "node:crypto";
@@ -12,8 +20,13 @@ import * as TestClock from "effect/testing/TestClock";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
-import { ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+  readCurrentState,
+} from "./ProjectWorkRepository.ts";
 import { ProjectWorkProjection, ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
 import { ProjectWorkQueryLive } from "./ProjectWorkQuery.ts";
 import * as Authorization from "./ProjectTeamAuthorization.ts";
@@ -23,7 +36,12 @@ import {
   providerInstanceId,
   threadId,
   at,
+  projectId,
+  attribution,
+  createManagedAssignment,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
 import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts";
 import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import { make as makeAccounting } from "./ProjectTeamModelAccounting.ts";
@@ -35,6 +53,8 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const parseJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 const model = "inclusionai/ling-3.1-flash:free";
 const time = Date.parse(at) + 100;
+const isoTime = (millis: number) => DateTime.formatIso(DateTime.makeUnsafe(millis));
+const decodeFixtureObject = Schema.decodeUnknownEffect(Schema.JsonObject);
 const fileTest = <A, E, R>(body: Effect.Effect<A, E, R>) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -100,6 +120,763 @@ const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.result,
     Effect.map((result) => expect(result._tag).toBe("Failure")),
   );
+
+const journalFixture = Effect.gen(function* () {
+  const repository = yield* ProjectWorkRepository;
+  const sql = yield* SqlClient.SqlClient;
+  let claim: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+  yield* seed("investigator", "reserved", {
+    nativeSessionId: null,
+    roleTools: [],
+    toolIds: [],
+    issueCredential: false,
+  }).pipe(
+    Effect.provideService(ProjectWorkRepository, {
+      ...repository,
+      execute: (command) => {
+        if (
+          command.type === "project-work.foundation.commit" &&
+          command.transition?.kind === "claim"
+        ) {
+          claim = command;
+          return Effect.fail(
+            new ProjectWorkPolicyError("invalid-state", "Retain journal fixture claim"),
+          );
+        }
+        return repository.execute(command);
+      },
+    }),
+    Effect.result,
+  );
+  if (!claim || claim.transition?.kind !== "claim")
+    return yield* Effect.die("Missing journal fixture claim");
+  const state = yield* readCurrentState(sql, projectId);
+  const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
+  if (role?.kind !== "role-revision") return yield* Effect.die("Missing journal role");
+  yield* restoreHistoricalBinding({ ...role, model });
+  const fs = yield* FileSystem.FileSystem;
+  const worktree = yield* fs.makeTempDirectoryScoped();
+  const nativeRoot = yield* fs.makeTempDirectoryScoped();
+  const protectedRoot = yield* fs.makeTempDirectoryScoped();
+  const binding = {
+    ...claim.transition.binding,
+    worktree,
+    branch: "refs/heads/assigned",
+    model,
+    configuration: {
+      ...claim.transition.binding.configuration,
+      maxTokens: 20000,
+      maxDurationMs: 300000,
+      runtimeVersion: "0.99.1",
+    },
+  };
+  const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+  yield* repository.execute(
+    yield* decodeCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "journal-limits",
+      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+      attribution,
+      committedAt: at,
+      records: [
+        {
+          kind: "limits",
+          projectId,
+          recordId: "limits",
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          status: "configured",
+          model,
+          tokenLimit: 20000,
+          durationLimitMs: 300000,
+          environmentModelCalls: 2,
+          modelCalls: 2,
+          projectWritableWorkers: 1,
+          delegationDepth: 2,
+          repairAllowance: 2,
+        },
+      ],
+    }),
+  );
+  const request = {
+    dispatchId: "journal-dispatch",
+    claim: {
+      ...claim,
+      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+      transition: {
+        ...claim.transition,
+        binding,
+        claim: { ...claim.transition.claim, leasedUntil: isoTime(time + 10000) },
+      },
+    },
+    git: {
+      effectId: "journal-dispatch",
+      runId: binding.recordId,
+      generation: binding.generation,
+      primaryRoot: "/workspace",
+      commonGitDirectory: "/workspace/.git",
+      worktreePath: worktree,
+      branchRef: binding.branch,
+      baseRef: "refs/heads/main",
+      baseOid: "a".repeat(40),
+      ownershipToken: "owner",
+      policyHash: "b".repeat(64),
+    },
+    setupId: "journal-setup",
+    initializeOperationId: "journal-initialize",
+    assignmentOperationId: "journal-assignment",
+    assignment: "Investigate the approved task",
+  };
+  yield* TestClock.setTime(time);
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 2,
+  });
+  const admitted = yield* journal.reserve(request);
+  const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+  const allocation = yield* preallocatePiManagedProcess({
+    workspaceRoot: worktree,
+    workspaceAccess: "readonly",
+    nativeStateRoot: nativeRoot,
+    protectedRoots: [protectedRoot],
+    runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+    argv: ["/bin/true"],
+    memoryBytes: 33554432,
+    runtimeSeconds: 10,
+  });
+  const identity = { providerInstanceId, threadId };
+  return {
+    sql,
+    journal,
+    admitted,
+    operations,
+    allocation,
+    identity,
+    repository,
+    request,
+    binding,
+    role: { ...role, model },
+  };
+});
+
+it.effect("uses the actual journal root budget while the operation keeps its shorter lease", () =>
+  fileTest(
+    Effect.gen(function* () {
+      const f = yield* journalFixture;
+      const op = yield* f.operations.prepare(
+        f.identity,
+        { threadId, kind: "initialize" },
+        "journal-request",
+        {
+          allocation: f.allocation,
+          workerId: "journal-worker",
+          operationId: "journal-initialize",
+        },
+      );
+      expect(op.maximumTokens).toBe(20000);
+      expect(op.deadlineAtMs).toBe(time + 10000);
+      expect(
+        yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget`,
+      ).toEqual([
+        { maximum_tokens: 20000, deadline_at_ms: f.admitted.intent.limits.rootDeadlineAtMs },
+      ]);
+    }),
+  ),
+);
+
+const journalChild = Effect.gen(function* () {
+  const f = yield* journalFixture;
+  const rootOperation = yield* f.operations.prepare(
+    f.identity,
+    { threadId, kind: "initialize" },
+    "root",
+    {
+      allocation: f.allocation,
+      workerId: "root-worker",
+      operationId: "journal-initialize",
+    },
+  );
+  yield* f.operations.persistNative(rootOperation, nativeReference);
+  let claim: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+  const childThreadId = ThreadId.make("journal-child-thread");
+  const childTaskId = ProjectWorkTaskId.make("journal-child-task");
+  yield* createManagedAssignment({
+    taskId: childTaskId,
+    recordId: "journal-child",
+    attemptId: "journal-child-attempt",
+    commandId: "journal-child-dispatch",
+    providerInstanceId,
+    threadId: childThreadId,
+    role: f.role,
+    status: "reserved",
+    parentRunId: f.binding.recordId,
+    configuration: { ...f.binding.configuration, maxTokens: 1000, maxDurationMs: 1000 },
+    leasedUntil: isoTime(time + 5000),
+  }).pipe(
+    Effect.provideService(ProjectWorkRepository, {
+      ...f.repository,
+      execute: (command) => {
+        if (
+          command.type === "project-work.foundation.commit" &&
+          command.transition?.kind === "claim"
+        ) {
+          claim = command;
+          return Effect.fail(new ProjectWorkPolicyError("invalid-state", "Retain child claim"));
+        }
+        return f.repository.execute(command);
+      },
+    }),
+    Effect.result,
+  );
+  if (!claim || claim.transition?.kind !== "claim") return yield* Effect.die("Missing child claim");
+  const state = yield* readCurrentState(f.sql, projectId);
+  const membership = state.foundationRecords?.find(
+    (r) => r.kind === "task-membership" && r.taskId === childTaskId,
+  );
+  if (membership?.kind !== "task-membership") return yield* Effect.die("Missing child membership");
+  yield* restoreHistoricalBinding({
+    ...membership,
+    revision: membership.revision + 1,
+    parentTaskId: f.binding.taskId,
+  });
+  const fs = yield* FileSystem.FileSystem;
+  const worktree = yield* fs.makeTempDirectoryScoped();
+  const binding = { ...claim.transition.binding, worktree, branch: "refs/heads/child" };
+  const request = {
+    ...f.request,
+    dispatchId: "journal-child-dispatch",
+    claim: {
+      ...claim,
+      expectedRevision: (yield* readCurrentState(f.sql, projectId)).revision,
+      transition: { ...claim.transition, binding },
+    },
+    git: {
+      ...f.request.git,
+      effectId: "journal-child-dispatch",
+      runId: binding.recordId,
+      worktreePath: worktree,
+      branchRef: binding.branch,
+    },
+    setupId: "child-setup",
+    initializeOperationId: "child-initialize",
+    assignmentOperationId: "child-assignment",
+  };
+  const admitted = yield* f.journal.reserve(request);
+  const launch = f.allocation.launch;
+  const allocation = yield* preallocatePiManagedProcess({
+    workspaceRoot: worktree,
+    workspaceAccess: "readonly",
+    nativeStateRoot: yield* fs.makeTempDirectoryScoped(),
+    protectedRoots: launch.protectedRoots,
+    runtimeFiles: launch.runtimeFiles.map((file) => ({ source: file.source, target: file.target })),
+    argv: launch.argv,
+    memoryBytes: launch.memoryBytes,
+    runtimeSeconds: launch.runtimeSeconds,
+  });
+  const identity = { providerInstanceId, threadId: childThreadId };
+  const op = yield* f.operations.prepare(
+    identity,
+    { threadId: childThreadId, kind: "initialize" },
+    "child-request",
+    {
+      allocation,
+      workerId: "child-worker",
+      operationId: request.initializeOperationId,
+    },
+  );
+  return { ...f, child: { admitted, allocation, identity, op } };
+});
+
+it.effect(
+  "charges a smaller actual journal child to the immutable root and enforces its operation caps",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* journalChild;
+        const op = f.child.op;
+        expect(op.maximumTokens).toBe(1000);
+        expect(op.deadlineAtMs).toBe(Date.parse(at) + 1000);
+        yield* f.operations.persistence(op).claimActivation(f.child.allocation);
+        yield* f.operations.persistence(op).beforeStart({
+          type: "owner",
+          unit: f.child.allocation.unit,
+          nonce: f.child.allocation.nonce,
+          invocation: "a".repeat(32),
+          cgroup: `/sys/fs/cgroup/${f.child.allocation.unit}`,
+          pid: 123,
+          memoryBytes: 33554432,
+          swapBytes: 0,
+          oomGroup: 1,
+        });
+        yield* f.operations.persistNative(op, { ...nativeReference, sessionId: "child-native" });
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "command-code-ling-free",
+          model,
+          acceptedReportedModels: [model],
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const request = {
+          workerId: op.workerId,
+          operationId: op.operation.operationId,
+          generation: 0,
+          requestId: 1,
+          routeId: "command-code-ling-free",
+          provider: "command-code" as const,
+          model,
+          maxInputTokens: 100,
+          maxOutputTokens: 100,
+          callCount: 1 as const,
+          deadlineAtMs: time + 800,
+        };
+        const first = yield* accounting.reserve(op.principal, request);
+        expect((yield* accounting.reserve(op.principal, request)).status).toBe("existing");
+        yield* rejected(
+          accounting.reserve(op.principal, { ...request, requestId: 2, maxInputTokens: 901 }),
+        );
+        yield* rejected(
+          accounting.reserve(op.principal, { ...request, requestId: 2, deadlineAtMs: time + 901 }),
+        );
+        yield* accounting.settle({
+          ...request,
+          reservationId: first.reservationId,
+          outcome: "unknown",
+          transportDrained: true,
+          chargedInputTokens: 100,
+          chargedOutputTokens: 100,
+        });
+        expect(
+          yield* f.sql`SELECT root_task_id,maximum_tokens,deadline_at_ms FROM project_team_model_budget`,
+        ).toEqual([
+          {
+            root_task_id: f.binding.taskId,
+            maximum_tokens: 20000,
+            deadline_at_ms: f.admitted.intent.limits.rootDeadlineAtMs,
+          },
+        ]);
+        expect(
+          yield* f.sql`SELECT root_task_id,run_id,status,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
+        ).toEqual([
+          {
+            root_task_id: f.binding.taskId,
+            run_id: "journal-child",
+            status: "unknown",
+            charged_input_tokens: 100,
+            charged_output_tokens: 100,
+          },
+        ]);
+      }),
+    ),
+);
+
+for (const mode of [
+  "root-tokens",
+  "root-deadline",
+  "operation-tokens",
+  "operation-deadline",
+  "legacy-intent",
+  "task-cycle",
+  "task-orphan",
+  "run-cycle",
+  "run-orphan",
+  "role-changed",
+  "journal-intent",
+  "journal-history",
+] as const)
+  it.effect(`denies changed actual journal budget or ancestry without resetting it: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* journalChild;
+        const op = f.child.op;
+        const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        switch (mode) {
+          case "root-tokens":
+            yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=maximum_tokens+1`;
+            break;
+          case "root-deadline":
+            yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=deadline_at_ms+1`;
+            break;
+          case "operation-tokens":
+            yield* f.sql`UPDATE project_team_pi_operation SET maximum_tokens=maximum_tokens+1 WHERE operation_id=${op.operation.operationId}`;
+            break;
+          case "operation-deadline":
+            yield* f.sql`UPDATE project_team_pi_operation SET deadline_at_ms=deadline_at_ms+1 WHERE operation_id=${op.operation.operationId}`;
+            break;
+          case "legacy-intent":
+            yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_remove(intent_json,'$.rootBudget','$.operationLimits') WHERE operation_id=${op.operation.operationId}`;
+            break;
+          case "task-cycle":
+          case "task-orphan": {
+            const state = yield* readCurrentState(f.sql, projectId);
+            const membership = state.foundationRecords?.find(
+              (r) => r.kind === "task-membership" && r.taskId === op.authority.binding.taskId,
+            );
+            if (membership?.kind !== "task-membership")
+              return yield* Effect.die("Missing membership");
+            yield* restoreHistoricalBinding({
+              ...membership,
+              revision: membership.revision + 1,
+              parentTaskId:
+                mode === "task-cycle" ? membership.taskId : ProjectWorkTaskId.make("missing-task"),
+            });
+            break;
+          }
+          case "run-cycle":
+          case "run-orphan":
+            yield* restoreHistoricalBinding({
+              ...op.authority.binding,
+              revision: op.authority.binding.revision + 1,
+              parentRunId: mode === "run-cycle" ? op.authority.binding.recordId : "missing-run",
+            });
+            break;
+          case "role-changed":
+            yield* restoreHistoricalBinding({
+              ...f.role,
+              revision: f.role.revision + 1,
+              instructions: "Changed instructions",
+            });
+            break;
+          case "journal-intent": {
+            const rows = yield* f.sql<
+              Record<string, unknown>
+            >`SELECT * FROM project_team_dispatch WHERE binding_id=${op.authority.binding.recordId}`;
+            const intent = parseJson(String(rows[0]!.intent_json));
+            const changed = yield* decodeFixtureObject(intent);
+            const request = yield* decodeFixtureObject(changed.request);
+            yield* f.sql`DELETE FROM project_team_dispatch WHERE binding_id=${op.authority.binding.recordId}`;
+            yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({ ...rows[0], intent_json: encodeJson({ ...changed, request: { ...request, initializeOperationId: "different" } }) })}`;
+            break;
+          }
+          case "journal-history":
+            yield* f.sql`INSERT INTO project_team_dispatch_receipt VALUES ('fabricated','journal-child-dispatch',1,0,'workspace-ready','{}',${at})`;
+            break;
+        }
+        yield* rejected(f.operations.authorize(op));
+        yield* rejected(f.operations.persistence(op).claimActivation(f.child.allocation));
+        const after = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        if (mode === "root-tokens" || mode === "root-deadline") expect(after).not.toEqual(budget);
+        else expect(after).toEqual(budget);
+        expect(yield* f.sql`SELECT reservation_id FROM project_team_model_request`).toEqual([]);
+        expect(
+          yield* f.sql`SELECT status FROM project_team_pi_process WHERE operation_id=${op.operation.operationId}`,
+        ).toEqual([{ status: "allocated" }]);
+      }),
+    ),
+  );
+
+it.effect(
+  "retains cleanup of legacy operation intent while denying forward use and unanchored budgets",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const op = yield* f.prepare();
+        yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_remove(intent_json,'$.rootBudget','$.operationLimits')`;
+        yield* rejected(f.operations.authorize(op));
+        expect(
+          yield* f.operations.persistTerminal(op, {
+            identity: { workerId: op.workerId, generation: 0 },
+            operation: op.operation,
+            outcome: "canceled",
+            ownerCaptured: false,
+            native: null,
+            drain: null,
+            accountingReceipts: [],
+          }),
+        ).toBe("drained");
+        const restarted = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+        yield* rejected(
+          restarted.prepare(f.identity, { threadId, kind: "initialize" }, "replacement", {
+            allocation: f.allocation,
+            workerId: "next-worker",
+            operationId: "replacement",
+          }),
+        );
+        expect(yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation`).toEqual([
+          { operation_id: op.operation.operationId, status: "settled" },
+        ]);
+        expect((yield* f.sql`SELECT * FROM project_team_model_budget`).length).toBe(1);
+      }),
+    ),
+);
+
+it.effect(
+  "a narrower actual journal replacement consumes the original root remainder after unknown usage",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* journalFixture;
+        yield* f.journal.claimEffect(f.admitted.fence);
+        const op = yield* f.operations.prepare(
+          f.identity,
+          { threadId, kind: "initialize" },
+          "root",
+          {
+            allocation: f.allocation,
+            workerId: "root-worker",
+            operationId: "journal-initialize",
+          },
+        );
+        const owner = {
+          type: "owner" as const,
+          unit: f.allocation.unit,
+          nonce: f.allocation.nonce,
+          invocation: "a".repeat(32),
+          cgroup: `/sys/fs/cgroup/${f.allocation.unit}`,
+          pid: 123,
+          memoryBytes: 33554432,
+          swapBytes: 0 as const,
+          oomGroup: 1 as const,
+        };
+        yield* f.operations.persistence(op).claimActivation(f.allocation);
+        yield* f.operations.persistence(op).beforeStart(owner);
+        yield* f.operations.persistNative(op, nativeReference);
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "command-code-ling-free",
+          model,
+          acceptedReportedModels: [model],
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const request = {
+          workerId: op.workerId,
+          operationId: op.operation.operationId,
+          generation: 0,
+          requestId: 1,
+          routeId: "command-code-ling-free",
+          provider: "command-code" as const,
+          model,
+          maxInputTokens: 19700,
+          maxOutputTokens: 100,
+          callCount: 1 as const,
+          deadlineAtMs: time + 9000,
+        };
+        const first = yield* accounting.reserve(op.principal, request);
+        yield* accounting.settle({
+          ...request,
+          reservationId: first.reservationId,
+          outcome: "unknown",
+          transportDrained: true,
+          chargedInputTokens: request.maxInputTokens,
+          chargedOutputTokens: request.maxOutputTokens,
+        });
+        // Synthetic owner/drain receipts isolate SQL budget semantics; no native worker is launched.
+        yield* f.operations.persistTerminal(op, {
+          identity: { workerId: op.workerId, generation: 0 },
+          operation: op.operation,
+          outcome: "failed",
+          ownerCaptured: true,
+          native: nativeReference,
+          accountingReceipts: [],
+          drain: {
+            unit: owner.unit,
+            invocation: owner.invocation,
+            cgroup: owner.cgroup,
+            ownerPid: owner.pid,
+            memoryBytes: owner.memoryBytes,
+            swapBytes: 0,
+            oomGroup: 1,
+            launcherPid: 124,
+            childPid: 125,
+            childExitCode: 0,
+            kernel: "populated 0\nfrozen 0",
+          },
+        });
+        const nextTime = time + 10001;
+        yield* TestClock.setTime(nextTime);
+        yield* f.repository.execute({
+          type: "project-work.attempt.expire",
+          projectId,
+          taskId: f.binding.taskId,
+          commandId: CommandId.make("expire-original"),
+          attemptId: f.binding.attemptId,
+          reason: "Fixture lease expired",
+          expiredAt: isoTime(nextTime),
+        });
+        let state = yield* readCurrentState(f.sql, projectId);
+        const previous = state.foundationRecords?.find(
+          (r) => r.kind === "run-binding" && r.recordId === f.binding.recordId,
+        );
+        if (previous?.kind !== "run-binding") return yield* Effect.die("Missing previous binding");
+        yield* restoreHistoricalBinding({
+          ...previous,
+          revision: previous.revision + 1,
+          status: "settled",
+        });
+        state = yield* readCurrentState(f.sql, projectId);
+        const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+        for (const action of ["resolve-failure", "resume"] as const) {
+          state = yield* readCurrentState(f.sql, projectId);
+          const commandId = `replacement-${action}`;
+          yield* f.repository.execute(
+            yield* decodeCommit({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId,
+              expectedRevision: state.revision,
+              attribution: {
+                actor: { kind: "human", id: "fixture-human" },
+                source: { kind: "web", id: "fixture-browser" },
+                recordedAt: isoTime(nextTime),
+              },
+              records: [],
+              committedAt: isoTime(nextTime),
+              guided: {
+                intent: {
+                  type: "project-team.task.control",
+                  projectId,
+                  taskId: f.binding.taskId,
+                  commandId,
+                  expectedRevision: state.revision,
+                  expectedTaskRevision: state.tasks.find((t) => t.taskId === f.binding.taskId)!
+                    .revision,
+                  control: { action, reason: "Resume after synthetic SQL drain" },
+                },
+              },
+            }),
+          );
+        }
+        state = yield* readCurrentState(f.sql, projectId);
+        const membership = state.foundationRecords?.find(
+          (r) => r.kind === "task-membership" && r.taskId === f.binding.taskId,
+        );
+        const grant = state.foundationRecords?.find(
+          (r) =>
+            r.kind === "gate" &&
+            r.recordId ===
+              (membership?.kind === "task-membership"
+                ? membership.assignment?.authorizationGateId
+                : ""),
+        );
+        if (grant?.kind !== "gate") return yield* Effect.die("Missing resumed grant");
+        const transition = f.request.claim.transition;
+        if (transition?.kind !== "claim") return yield* Effect.die("Missing original transition");
+        const newThread = ThreadId.make("replacement-thread");
+        const fs = yield* FileSystem.FileSystem;
+        const worktree = yield* fs.makeTempDirectoryScoped();
+        const replacement = {
+          ...transition.binding,
+          recordId: "replacement-binding",
+          attemptId: ProjectWorkAttemptId.make("replacement-attempt"),
+          threadId: newThread,
+          generation: 1,
+          leaseGeneration: 1,
+          authorizationGateId: grant.recordId,
+          updatedAt: isoTime(nextTime),
+          worktree,
+          branch: "refs/heads/replacement",
+          configuration: {
+            ...transition.binding.configuration,
+            maxTokens: 1000,
+            maxDurationMs: 1000,
+          },
+        };
+        const dispatch = {
+          ...f.request,
+          dispatchId: "replacement-dispatch",
+          setupId: "replacement-setup",
+          initializeOperationId: "replacement-initialize",
+          assignmentOperationId: "replacement-assignment",
+          claim: {
+            ...f.request.claim,
+            commandId: CommandId.make("replacement-dispatch"),
+            committedAt: isoTime(nextTime),
+            expectedRevision: state.revision,
+            transition: {
+              ...transition,
+              binding: replacement,
+              expectedTaskRevision: state.tasks.find((t) => t.taskId === replacement.taskId)!
+                .revision,
+              authorizationGateId: grant.recordId,
+              expectedGateRevision: grant.revision,
+              claim: {
+                ...transition.claim,
+                commandId: CommandId.make("replacement-dispatch"),
+                attemptId: replacement.attemptId,
+                leaseToken: "replacement-lease",
+                leasedUntil: isoTime(nextTime + 1000),
+                claimedAt: isoTime(nextTime),
+              },
+            },
+          },
+          git: {
+            ...f.request.git,
+            effectId: "replacement-dispatch",
+            runId: replacement.recordId,
+            generation: 1,
+            worktreePath: worktree,
+            branchRef: replacement.branch,
+          },
+        };
+        const admitted = yield* f.journal.reserve(dispatch);
+        expect(admitted.intent.limits.maximumTokens).toBe(20000);
+        expect(admitted.intent.limits.attemptMaximumTokens).toBe(1000);
+        const launch = f.allocation.launch;
+        const allocation = yield* preallocatePiManagedProcess({
+          workspaceRoot: worktree,
+          workspaceAccess: "readonly",
+          nativeStateRoot: yield* fs.makeTempDirectoryScoped(),
+          protectedRoots: launch.protectedRoots,
+          runtimeFiles: launch.runtimeFiles.map((file) => ({
+            source: file.source,
+            target: file.target,
+          })),
+          argv: launch.argv,
+          memoryBytes: launch.memoryBytes,
+          runtimeSeconds: launch.runtimeSeconds,
+        });
+        const next = yield* f.operations.prepare(
+          { providerInstanceId, threadId: newThread },
+          { threadId: newThread, kind: "initialize" },
+          "replacement",
+          {
+            allocation,
+            workerId: "replacement-worker",
+            operationId: "replacement-initialize",
+          },
+        );
+        yield* f.operations.persistence(next).claimActivation(allocation);
+        yield* f.operations.persistence(next).beforeStart({
+          ...owner,
+          unit: allocation.unit,
+          nonce: allocation.nonce,
+          cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+        });
+        yield* f.operations.persistNative(next, {
+          ...nativeReference,
+          sessionId: "replacement-native",
+        });
+        const bounded = {
+          ...request,
+          workerId: next.workerId,
+          operationId: next.operation.operationId,
+          generation: 1,
+          maxInputTokens: 100,
+          deadlineAtMs: nextTime + 900,
+        };
+        const last = yield* accounting.reserve(next.principal, bounded);
+        yield* accounting.settle({
+          ...bounded,
+          reservationId: last.reservationId,
+          outcome: "unknown",
+          transportDrained: true,
+          chargedInputTokens: 100,
+          chargedOutputTokens: 100,
+        });
+        yield* rejected(accounting.reserve(next.principal, { ...bounded, requestId: 2 }));
+        expect(
+          yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget`,
+        ).toEqual([
+          { maximum_tokens: 20000, deadline_at_ms: f.admitted.intent.limits.rootDeadlineAtMs },
+        ]);
+        expect(
+          yield* f.sql`SELECT SUM(charged_input_tokens+charged_output_tokens) AS charged,COUNT(*) AS requests FROM project_team_model_request`,
+        ).toEqual([{ charged: 20000, requests: 2 }]);
+      }),
+    ),
+);
 
 const nativeReference = {
   sessionId: "native",
