@@ -36,6 +36,8 @@ export class PiManagedRuntimeError extends Schema.TaggedError<PiManagedRuntimeEr
 ) {}
 
 type Assertions = {
+  /** Stable identity supplied only by Root's private durable dispatch producer. */
+  readonly operationId?: PiWorkerOperation["operationId"];
   readonly runtimeMode?: ProviderSession["runtimeMode"];
   readonly cwd?: string;
   readonly modelSelection?: ModelSelection;
@@ -64,7 +66,7 @@ export type PiManagedEventObserver = (
 
 export type PiManagedPreparedOperation = {
   readonly operation: PiWorkerOperation;
-  /** Single activation: duplicates return a receipt or conflict without replaying effects. */
+  /** Single activation; receipt reads release their slot until stop or a newer preparation. */
   readonly run: Effect.Effect<
     { readonly terminal: PiSessionTerminal; readonly session: ProviderSession },
     PiManagedRuntimeError

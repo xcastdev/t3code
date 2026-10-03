@@ -1,7 +1,17 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
-import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
-import { CommandId, ManagedSkillKey, SkillCatalogRevision } from "@t3tools/contracts";
+import {
+  PiManagedRuntimeError,
+  type PiManagedOperationRequest,
+  type PiManagedPreparedOperation,
+  type PiManagedRuntimeInstance,
+} from "./PiManagedRuntime.ts";
+import {
+  canonicalProjectWorkPayload,
+  CommandId,
+  ManagedSkillKey,
+  SkillCatalogRevision,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
@@ -4039,3 +4049,581 @@ it.effect("joins a held durable preparation receipt before canceling its never-s
     }),
   ).pipe(Effect.provide(selectedRuntimeLayer)),
 );
+
+// Durable metadata below is synthetic; these cases exercise real SQL and the real
+// nonmutating file reader without starting a Pi process or model transport.
+const stableReplayFixtureFor = (prompt = false) =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const request: PiManagedOperationRequest = prompt
+      ? {
+          threadId,
+          kind: "prompt",
+          prompt: "Original approved assignment",
+          operationId: "root-stable-assignment",
+        }
+      : { threadId, kind: "initialize", operationId: "root-stable-initialize" };
+    if (prompt)
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        status: "running",
+        sessionId: "original-native",
+      });
+    const operationDirectory =
+      f.options.nativeStateRoot +
+      "/" +
+      NodeCrypto.createHash("sha256")
+        .update(
+          json([
+            "environment",
+            providerInstanceId,
+            threadId,
+            f.binding.recordId,
+            f.binding.generation,
+          ]),
+        )
+        .digest("hex");
+    yield* f.fs.makeDirectory(operationDirectory + "/sessions", { recursive: true });
+    const allocation = yield* preallocatePiManagedProcess({
+      workspaceRoot: f.worktree,
+      workspaceAccess: "readonly",
+      nativeStateRoot: operationDirectory,
+      protectedRoots: f.options.protectedRoots,
+      runtimeFiles: f.options.runtimeFiles,
+      argv: ["/bin/true"],
+      memoryBytes: f.options.memoryBytes,
+      runtimeSeconds: 10,
+    });
+    const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+    const requestHash = NodeCrypto.createHash("sha256")
+      .update(canonicalProjectWorkPayload(request))
+      .digest("hex");
+    const op = yield* operations.prepare({ providerInstanceId, threadId }, request, requestHash, {
+      allocation,
+      operationId: request.operationId!,
+      workerId: "original-worker",
+      resourceHash: piManagedSkillResourceIdentity([]),
+    });
+    const owner = {
+      type: "owner" as const,
+      unit: allocation.unit,
+      nonce: allocation.nonce,
+      invocation: "a".repeat(32),
+      cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+      pid: 123,
+      memoryBytes: allocation.policy.memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+    };
+    yield* operations.persistence(op).claimActivation(allocation);
+    yield* operations.persistence(op).beforeStart(owner);
+    const native = {
+      sessionId: "original-native",
+      sessionReference: "sessions/original.jsonl",
+      leafId: "original-leaf",
+      persisted: true,
+    };
+    yield* operations.persistNative(op, native);
+    const terminal = {
+      identity: { workerId: op.workerId, generation: 0 },
+      operation: op.operation,
+      outcome: "success" as const,
+      ownerCaptured: true,
+      native,
+      accountingReceipts: [],
+      drain: {
+        unit: owner.unit,
+        invocation: owner.invocation,
+        cgroup: owner.cgroup,
+        ownerPid: owner.pid,
+        memoryBytes: owner.memoryBytes,
+        swapBytes: 0,
+        oomGroup: 1,
+        launcherPid: 124,
+        childPid: 125,
+        childExitCode: 0,
+        kernel: "removed",
+      },
+    };
+    yield* operations.persistTerminal(op, terminal);
+    const nativeFile = operationDirectory + "/sessions/original.jsonl";
+    const bytes =
+      [
+        json({
+          type: "session",
+          version: 3,
+          id: native.sessionId,
+          timestamp: at,
+          cwd: "/workspace",
+        }),
+        json({
+          type: "custom",
+          id: native.leafId,
+          parentId: null,
+          timestamp: at,
+          customType: "stable-fixture",
+          data: { retained: true },
+        }),
+      ].join("\n") + "\n";
+    yield* f.fs.writeFileString(nativeFile, bytes);
+    // Configuration inspection is cached and read-only; no credential is resolved.
+    yield* f.fs.writeFileString(
+      f.options.agentDirectory + "/settings.json",
+      json({
+        defaultProvider: "command-code",
+        defaultModel: model,
+        packages: [],
+        extensions: [],
+        skills: [],
+        promptTemplates: [],
+      }),
+    );
+    return {
+      ...f,
+      request,
+      op,
+      terminal,
+      nativeFile,
+      bytes,
+      get launches() {
+        return f.launches;
+      },
+      get transports() {
+        return f.transports;
+      },
+    };
+  });
+for (const mode of [
+  "restart",
+  "prompt-restart",
+  "changed-request",
+  "bad-id",
+  "active",
+  "uncertain",
+  "missing-native",
+  "changed-native",
+  "expired",
+  "retired",
+  "held-stop",
+  "run-expired",
+] as const) {
+  it.effect(`replays stable Pi receipts without allocation or event effects: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor(mode === "prompt-restart");
+        let request: PiManagedOperationRequest = f.request;
+        if (mode === "changed-request")
+          request = { ...request, kind: "prompt", prompt: "different" };
+        if (mode === "bad-id") request = { ...request, operationId: "../outside" };
+        if (mode === "active" || mode === "uncertain")
+          yield* f.sql`UPDATE project_team_pi_operation SET status=${mode === "active" ? "running" : "quarantine"}`;
+        if (mode === "missing-native") yield* f.fs.remove(f.nativeFile);
+        if (mode === "changed-native")
+          yield* f.fs.writeFileString(f.nativeFile, f.bytes.replace("original-leaf", "other-leaf"));
+        if (mode === "expired") yield* TestClock.setTime(f.op.deadlineAtMs);
+        if (mode === "retired") {
+          const binding = (yield* readCurrentState(
+            f.sql,
+            f.binding.projectId,
+          )).foundationRecords?.find(
+            (record) => record.kind === "run-binding" && record.recordId === f.binding.recordId,
+          );
+          if (binding?.kind !== "run-binding") return yield* Effect.die("binding missing");
+          yield* restoreHistoricalBinding({
+            ...binding,
+            revision: binding.revision + 1,
+            status: "settled",
+          });
+        }
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let held = false;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (
+              mode !== "held-stop" ||
+              held ||
+              !statement
+                .compile()[0]
+                .includes("SELECT * FROM project_team_pi_operation WHERE operation_id=")
+            )
+              return statement;
+            return statement.pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  held = true;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }),
+              ),
+            );
+          },
+        });
+        let events = 0;
+        let allocations = 0;
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          allocateSkillStage: Effect.sync(() => {
+            allocations++;
+            throw Error("unexpected allocation");
+          }),
+        }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const instance = yield* runtime
+          .forInstance({ instanceId: providerInstanceId, enabled: true, configuration: {} })
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const pending = yield* instance
+          .prepareOperation(request, () =>
+            Effect.sync(() => {
+              events++;
+            }),
+          )
+          .pipe(
+            Effect.result,
+            Effect.provideService(SqlClient.SqlClient, observedSql),
+            Effect.forkChild,
+          );
+        if (mode === "held-stop") {
+          yield* Deferred.await(entered);
+          const stop = yield* instance.requestStop(threadId).pipe(Effect.forkChild);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(stop);
+        }
+        const result = yield* Fiber.join(pending);
+        if (mode === "restart" || mode === "prompt-restart" || mode === "run-expired") {
+          expect(result._tag).toBe("Success");
+          if (result._tag !== "Success") return yield* Effect.die("replay denied");
+          expect(result.success.operation).toEqual(f.op.operation);
+          if (result.success.kind === "prompt")
+            expect(result.success.turnId).toBe(f.op.operation.operationId);
+          if (mode === "run-expired") {
+            yield* TestClock.setTime(f.op.deadlineAtMs);
+            yield* rejected(
+              result.success.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql)),
+            );
+          } else {
+            const receipt = yield* result.success.run.pipe(
+              Effect.provideService(SqlClient.SqlClient, observedSql),
+            );
+            expect(receipt.terminal).toEqual(f.terminal);
+            expect(receipt.session.resumeCursor).toEqual(f.terminal.native);
+            expect(
+              (yield* result.success.run.pipe(
+                Effect.provideService(SqlClient.SqlClient, observedSql),
+              )).terminal,
+            ).toEqual(f.terminal);
+            yield* rejected(result.success.steer("steer", "later"));
+            yield* rejected(result.success.interrupt);
+            expect(yield* f.fs.readFileString(f.nativeFile)).toBe(f.bytes);
+          }
+        } else expect(result._tag).toBe("Failure");
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+        expect(allocations).toBe(0);
+        expect(events).toBe(0);
+        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(1);
+        expect((yield* f.sql`SELECT reservation_id FROM project_team_model_request`).length).toBe(
+          0,
+        );
+      }),
+    ),
+  );
+}
+
+for (const mode of [
+  "unchanged",
+  "stop-after-prepare",
+  "stopAll-after-prepare",
+  "held-run-stop",
+  "held-run-stopAll",
+  "native-root-replacement",
+  "native-final-boundary",
+  "changed-native-root",
+] as const) {
+  it.effect(`replay review repair fences receipt lifetime and native ownership: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor();
+        const original = yield* f.sql`SELECT * FROM project_team_pi_operation`;
+        const originalProcesses = yield* f.sql`SELECT * FROM project_team_pi_process`;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let hold = false;
+        let replaceAtFence = false;
+        const replaceNative = Effect.gen(function* () {
+          const state = f.nativeFile.slice(0, -"/sessions/original.jsonl".length);
+          yield* f.fs.rename(state, state + "-original");
+          yield* f.fs.makeDirectory(state + "/sessions", { recursive: true });
+          yield* f.fs.writeFileString(
+            f.nativeFile,
+            f.bytes.replace('"retained":true', '"retained":false'),
+          );
+        });
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            return mode === "native-final-boundary" &&
+              statement.compile()[0].includes("ORDER BY operation_ordinal DESC LIMIT 1")
+              ? statement.pipe(Effect.tap(() => (replaceAtFence ? replaceNative : Effect.void)))
+              : statement;
+          },
+        });
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          readCatalogue: f.options.readCatalogue.pipe(
+            Effect.tap(() =>
+              hold
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void,
+            ),
+          ),
+        }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const prepared = yield* instance
+          .prepareOperation(f.request, () => Effect.die("unexpected replay event"))
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const run = prepared.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        if (mode === "native-root-replacement") {
+          yield* replaceNative;
+        }
+        if (mode === "native-final-boundary") replaceAtFence = true;
+        if (mode === "changed-native-root") {
+          // Recreate the runtime with a different configured root; it must not discover/replay a same-ID copy.
+          const other = f.options.nativeStateRoot + "-other";
+          yield* f.fs.makeDirectory(other, { recursive: true });
+          const otherRuntime = yield* makePiManagedRuntimeLive({
+            ...f.options,
+            nativeStateRoot: other,
+          });
+          const otherInstance = yield* otherRuntime.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          yield* rejected(otherInstance.prepareOperation(f.request, () => Effect.void));
+        } else if (mode === "stop-after-prepare" || mode === "stopAll-after-prepare") {
+          yield* mode === "stop-after-prepare" ? instance.requestStop(threadId) : instance.stopAll;
+          yield* rejected(run);
+          yield* rejected(run);
+        } else if (mode === "held-run-stop" || mode === "held-run-stopAll") {
+          hold = true;
+          const running = yield* run.pipe(Effect.result, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* mode === "held-run-stop" ? instance.requestStop(threadId) : instance.stopAll;
+          yield* Deferred.succeed(release, undefined);
+          expect((yield* Fiber.join(running))._tag).toBe("Failure");
+          yield* rejected(run);
+        } else if (mode === "native-root-replacement" || mode === "native-final-boundary")
+          yield* rejected(run);
+        else expect((yield* run).terminal).toEqual(f.terminal);
+        expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual(original);
+        expect(yield* f.sql`SELECT * FROM project_team_pi_process`).toEqual(originalProcesses);
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+}
+
+for (const mode of [
+  "no-stop",
+  "explicit-stop",
+  "completed-old",
+  "canceled-old",
+  "completed-stop",
+  "completed-stopAll",
+  "repeat",
+  "held-old-new-writer",
+  "old-new-preparing",
+] as const) {
+  it.effect(`replay completion releases only its own lifetime: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor();
+        const original =
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`;
+        const originalProcess =
+          yield* f.sql`SELECT * FROM project_team_pi_process WHERE operation_id=${f.op.operation.operationId}`;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let hold = false;
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          readCatalogue: f.options.readCatalogue.pipe(
+            Effect.tap(() =>
+              hold
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void,
+            ),
+          ),
+        });
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const old = yield* instance.prepareOperation(f.request, () =>
+          Effect.die("unexpected replay event"),
+        );
+        if (mode === "canceled-old") yield* instance.requestStop(threadId);
+        else expect((yield* old.run).terminal).toEqual(f.terminal);
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+        const nextRequest: PiManagedOperationRequest = {
+          threadId,
+          kind: "prompt",
+          prompt: "Next approved assignment",
+          operationId: "root-stable-next-prompt",
+        };
+        if (mode === "repeat" || mode === "completed-stop" || mode === "completed-stopAll") {
+          expect((yield* old.run).terminal).toEqual(f.terminal);
+          expect((yield* old.run).terminal).toEqual(f.terminal);
+          if (mode === "completed-stop" || mode === "completed-stopAll") {
+            yield* mode === "completed-stop" ? instance.requestStop(threadId) : instance.stopAll;
+            yield* rejected(old.run);
+            yield* rejected(old.run);
+          }
+        } else {
+          if (mode === "explicit-stop") yield* instance.requestStop(threadId);
+          const heldRead =
+            mode === "held-old-new-writer"
+              ? yield* Effect.gen(function* () {
+                  hold = true;
+                  const running = yield* old.run.pipe(Effect.result, Effect.forkChild);
+                  yield* Effect.raceFirst(
+                    Deferred.await(entered),
+                    Fiber.join(running).pipe(
+                      Effect.flatMap(() => Effect.die("Replay returned before held read")),
+                    ),
+                  );
+                  yield* instance.requestStop(threadId);
+                  hold = false;
+                  return running;
+                })
+              : undefined;
+          let next: PiManagedPreparedOperation;
+          if (mode === "old-new-preparing") {
+            hold = true;
+            const preparing = yield* instance
+              .prepareOperation(nextRequest, () => Effect.void)
+              .pipe(Effect.forkChild);
+            yield* Effect.raceFirst(
+              Deferred.await(entered),
+              Fiber.join(preparing).pipe(
+                Effect.flatMap(() => Effect.die("Preparation returned before held read")),
+              ),
+            );
+            yield* rejected(old.run);
+            yield* Deferred.succeed(release, undefined);
+            next = yield* Fiber.join(preparing);
+          } else next = yield* instance.prepareOperation(nextRequest, () => Effect.void);
+          expect(next.operation.operationId).toBe(nextRequest.operationId);
+          expect(f.launches).toBe(1);
+          if (heldRead) {
+            yield* Deferred.succeed(release, undefined);
+            expect((yield* Fiber.join(heldRead))._tag).toBe("Failure");
+          }
+          if (
+            ["completed-old", "canceled-old", "held-old-new-writer", "old-new-preparing"].includes(
+              mode,
+            )
+          ) {
+            yield* rejected(old.run);
+            yield* rejected(old.interrupt);
+            yield* rejected(old.steer("steer", "old control"));
+            yield* rejected(
+              instance.prepareOperation(
+                { ...nextRequest, operationId: "third-root-prompt" },
+                () => Effect.void,
+              ),
+            );
+            // A cleared JavaScript slot would preallocate before SQL detects the new writer.
+            expect(f.launches).toBe(1);
+            expect(
+              (yield* f.sql`SELECT status FROM project_team_pi_operation WHERE operation_id=${nextRequest.operationId}`)[0]
+                ?.status,
+            ).toBe("prepared");
+          }
+          yield* instance.requestStop(threadId);
+        }
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`,
+        ).toEqual(original);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_process WHERE operation_id=${f.op.operation.operationId}`,
+        ).toEqual(originalProcess);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+}
+
+for (const api of ["requestStop", "stopAll"] as const) {
+  it.effect(`replay completion retains final SQL cancellation: ${api}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor();
+        const original =
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`;
+        let instance: PiManagedRuntimeInstance | undefined;
+        let armed = false;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (!statement.compile()[0].includes("ORDER BY operation_ordinal DESC LIMIT 1"))
+              return statement;
+            return statement.pipe(
+              Effect.tap(() =>
+                Effect.suspend(() => {
+                  if (!armed || !instance) return Effect.void;
+                  return api === "requestStop" ? instance.requestStop(threadId) : instance.stopAll;
+                }),
+              ),
+            );
+          },
+        });
+        const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(
+          Effect.provideService(SqlClient.SqlClient, observedSql),
+        );
+        instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const old = yield* instance
+          .prepareOperation(f.request, () => Effect.die("unexpected replay event"))
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        armed = true;
+        yield* rejected(old.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql)));
+        armed = false;
+        yield* rejected(old.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql)));
+        expect(f.launches).toBe(0);
+        const next = yield* instance
+          .prepareOperation(
+            {
+              threadId,
+              kind: "prompt",
+              prompt: "Next approved assignment",
+              operationId: "root-after-final-stop",
+            },
+            () => Effect.void,
+          )
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        expect(next.operation.operationId).toBe("root-after-final-stop");
+        expect(f.launches).toBe(1);
+        yield* instance
+          .requestStop(threadId)
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`,
+        ).toEqual(original);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+}
