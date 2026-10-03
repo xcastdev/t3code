@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProjectWorkFoundationCommitCommand } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -32,6 +33,7 @@ import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import {
   makeProjectTeamDispatchJournal,
   type ProjectTeamDispatchRequest,
+  type ProjectTeamDispatchRecoveryPosition,
   type ProjectTeamDispatchStage,
 } from "./ProjectTeamDispatchJournal.ts";
 import type { ProjectTeamDispatchSnapshot } from "./ProjectTeamDispatch.ts";
@@ -543,7 +545,7 @@ const sqlDiscovery = Effect.fn("recoveryTest.sqlDiscovery")(
   Effect.mapError((failure) => error(failure.message)),
 );
 
-// Copy retained journal history to stress discovery. These rows never admit independent workers.
+// Corrupt copied owners exercise attention traversal; only the original retains committed effect proof.
 const addRows = Effect.fn("recoveryTest.addRows")(function* (
   f: Effect.Success<typeof fixture>,
   ids: readonly string[],
@@ -585,11 +587,10 @@ const addRows = Effect.fn("recoveryTest.addRows")(function* (
     yield* f.sql`INSERT INTO project_team_run_binding ${f.sql.insert({ ...bindingRow, record_id: id, attempt_id: id, payload_json: yield* encodeJson(binding) })}`;
     yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({ ...source, dispatch_id: id, binding_id: id, attempt_id: id, worktree: binding.worktree, branch: binding.branch, intent_json: malformedId === id ? "{}" : yield* encodeJson(intent) })}`;
   }
-  yield* f.sql`UPDATE project_team_dispatch SET stage='settled' WHERE dispatch_id=${f.request.dispatchId}`;
 });
 
 it.effect(
-  "bounded actual SQLite pages wrap fairly, retry busy rows, and preserve their original limits",
+  "bounded actual SQLite pages cross corrupt owners, wrap fairly, and retry the original Busy owner",
   () =>
     fileScoped(() =>
       Effect.gen(function* () {
@@ -610,8 +611,11 @@ it.effect(
           pages.push(input.afterDispatchId);
           return sqlDiscovery({ ...f, journal: reopened }, input);
         };
+        let claims = 0;
         h.ports.withClaim = (item) =>
           Effect.sync(() => {
+            claims++;
+            expect(item.fence.dispatchId).toBe(f.request.dispatchId);
             expect(item.intent.limits.maximumTokens).toBe(retained.intent.limits.maximumTokens);
             return { _tag: "Busy" as const };
           });
@@ -619,13 +623,25 @@ it.effect(
         const first = yield* recovery.sweep();
         const second = yield* recovery.sweep();
         const again = yield* recovery.sweep();
-        expect(first.items.map((i) => i.dispatchId)).toEqual(ids.slice(0, 128));
-        expect(first.afterDispatchId).toBe(ids[127]);
-        expect(second.items.map((i) => i.dispatchId)).toEqual(ids.slice(128));
+        expect(first.items.map((i) => i.dispatchId)).toEqual([
+          f.request.dispatchId,
+          ...ids.slice(0, 127),
+        ]);
+        expect("afterDispatchId" in first ? first.afterDispatchId : undefined).toBe(ids[126]);
+        expect(second.items.map((i) => i.dispatchId)).toEqual(ids.slice(127));
         expect(second.wrapped).toBe(true);
-        expect(again.items.map((i) => i.dispatchId)).toEqual(ids.slice(0, 128));
-        expect(pages).toEqual([undefined, ids[127], undefined]);
-        expect(h.events).toEqual([]);
+        expect(again.items.map((i) => i.dispatchId)).toEqual([
+          f.request.dispatchId,
+          ...ids.slice(0, 127),
+        ]);
+        expect(pages).toEqual([undefined, ids[126], undefined]);
+        expect(claims).toBe(2);
+        expect(h.events).toEqual([
+          ...ids.map((id) => "attention:" + id),
+          ...ids.slice(0, 127).map((id) => "attention:" + id),
+        ]);
+        expect(Exit.isSuccess(first.items[0]!.result)).toBe(true);
+        expect(first.items.slice(1).every((item) => Exit.isFailure(item.result))).toBe(true);
       }),
     ),
 );
@@ -645,30 +661,42 @@ it.effect(
             h.events.push("attention:" + id);
           }).pipe(Effect.andThen(Effect.fail(error("publication failed"))));
         h.ports.assess = () => Effect.succeed({ _tag: "Cleanup", cause: cause("revoked") });
-        const recovery = makeProjectTeamRecovery(h.ports, { pageSize: 3 });
+        const recovery = makeProjectTeamRecovery(h.ports, { pageSize: 4 });
         const result = yield* recovery.sweep();
-        expect(result.items.map((i) => i.dispatchId)).toEqual(["a", "b", "c"]);
-        expect(Exit.isSuccess(result.items[0]!.result)).toBe(true);
-        const failed = result.items[1]!.result;
-        if (!Exit.isFailure(failed)) return yield* Effect.die("Malformed discovery succeeded");
-        expect(failed.cause.reasons.filter(Cause.isFailReason).map((r) => r.error.reason)).toEqual([
-          "Dispatch intent is invalid",
-          "publication failed",
+        expect(result.items.map((i) => i.dispatchId)).toEqual([
+          "a",
+          "b",
+          "c",
+          f.request.dispatchId,
         ]);
-        expect(Exit.isSuccess(result.items[2]!.result)).toBe(true);
+        for (const [index, reason] of [
+          "Original dispatch effect identity is invalid",
+          "Dispatch intent is invalid",
+          "Original dispatch effect identity is invalid",
+        ].entries()) {
+          const failed = result.items[index]!.result;
+          if (!Exit.isFailure(failed)) return yield* Effect.die("Corrupt copied owner succeeded");
+          expect(
+            failed.cause.reasons.filter(Cause.isFailReason).map((r) => r.error.reason),
+          ).toEqual([reason, "publication failed"]);
+        }
+        expect(Exit.isSuccess(result.items[3]!.result)).toBe(true);
         expect(h.events).toEqual([
-          "claim:a",
-          "join",
-          "settle",
-          "release",
+          "attention:a",
           "attention:b",
-          "claim:c",
+          "attention:c",
+          "claim:dispatch-intent",
           "join",
           "settle",
           "release",
         ]);
         expect((yield* recovery.sweep()).items).toEqual([]);
-        expect((yield* recovery.sweep()).items.map((i) => i.dispatchId)).toEqual(["a", "b", "c"]);
+        expect((yield* recovery.sweep()).items.map((i) => i.dispatchId)).toEqual([
+          "a",
+          "b",
+          "c",
+          f.request.dispatchId,
+        ]);
       }),
     ),
 );
@@ -845,3 +873,538 @@ it.effect(
       }),
     ),
 );
+
+type PositionedFailure =
+  | Effect.Error<ReturnType<Effect.Success<typeof fixture>["journal"]["readRecoveryCandidates"]>>
+  | ProjectTeamRecoveryError;
+
+const malformedKeyFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+  const source = (yield* f.sql<Record<string, unknown>>`SELECT * FROM project_team_dispatch`)[0];
+  const binding = (yield* f.sql<
+    Record<string, unknown>
+  >`SELECT * FROM project_team_run_binding WHERE record_id='binding'`)[0];
+  if (!source || !binding) return yield* Effect.die("Missing retained SQL owner");
+  const insert = Effect.fn(function* (dispatchId: string | null | Uint8Array, ordinal: number) {
+    const bindingId = `restored-binding-${ordinal}`;
+    const attemptId = `restored-attempt-${ordinal}`;
+    yield* f.sql`INSERT INTO project_team_run_binding ${f.sql.insert({ ...binding, record_id: bindingId, attempt_id: attemptId })}`;
+    yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert({ ...source, dispatch_id: dispatchId, binding_id: bindingId, attempt_id: attemptId, worktree: `/restored-workspace-${ordinal}` })}`;
+  });
+  return { ...f, claimed, insert };
+});
+
+for (const action of ["resume", "cleanup"] as const) {
+  it.effect(
+    `actual SQL positioned discovery crosses malformed keys before one original ${action}`,
+    () =>
+      fileScoped(() =>
+        Effect.gen(function* () {
+          const f = yield* malformedKeyFixture;
+          const rawIds = [null, null, "", "a".repeat(257), f.request.dispatchId];
+          for (const [ordinal, id] of rawIds.slice(0, -1).entries()) yield* f.insert(id, ordinal);
+          if (action === "cleanup")
+            yield* f.sql`DELETE FROM project_team_run_binding WHERE record_id='binding'`;
+          const h = harness(f.claimed);
+          const reads: Parameters<typeof f.journal.readRecoveryCandidates>[0][] = [];
+          const diagnostics: {
+            dispatchId: string | null;
+            position?: ProjectTeamDispatchRecoveryPosition;
+            cause: Cause.Cause<PositionedFailure>;
+          }[] = [];
+          const discoveredFailures: Cause.Cause<PositionedFailure>[] = [];
+          const ports: ProjectTeamRecoveryPorts<Claim, Drain, PositionedFailure, Scope.Scope> = {
+            ...h.ports,
+            readPage: (input) => {
+              reads.push(input);
+              return f.journal.readRecoveryCandidates(input).pipe(
+                Effect.tap((page) =>
+                  Effect.sync(() => {
+                    for (const candidate of page)
+                      if (Exit.isFailure(candidate.snapshot))
+                        discoveredFailures.push(candidate.snapshot.cause);
+                  }),
+                ),
+              );
+            },
+            recordDiscoveryFailure: (dispatchId, discoveryCause, position) =>
+              Effect.sync(() => {
+                diagnostics.push({
+                  dispatchId,
+                  ...(position === undefined ? {} : { position }),
+                  cause: discoveryCause,
+                });
+                h.events.push("attention:" + dispatchId);
+              }),
+            assess: (claim) =>
+              f.journal.inspect(f.request.dispatchId).pipe(
+                Effect.map((snapshot) => ({ _tag: "Resume" as const, claim, snapshot })),
+                Effect.catch((failure) =>
+                  Effect.succeed({ _tag: "Cleanup" as const, cause: Cause.fail(failure) }),
+                ),
+              ),
+            joinCleanup: (claim) =>
+              Effect.sync(() => {
+                expect(h.claims).toContain(claim);
+                h.events.push("join");
+                return { _tag: "Joined" as const, receipt: { claim } };
+              }),
+            quarantine: (claim) =>
+              Effect.sync(() => {
+                expect(h.claims).toContain(claim);
+                h.events.push("quarantine");
+              }),
+          };
+          const recovery = makeProjectTeamRecovery(ports, { pageSize: 1 });
+          const visited: (string | null)[] = [];
+          for (let page = 0; page < rawIds.length; page++) {
+            const report = yield* recovery.sweep();
+            expect(report.items).toHaveLength(1);
+            visited.push(...report.items.map((item) => item.dispatchId));
+            expect("afterPosition" in report ? report.afterPosition : undefined).toBeDefined();
+            expect(
+              "afterDispatchId" in report ? report.afterDispatchId : undefined,
+            ).toBeUndefined();
+            if (page < rawIds.length - 1)
+              expect(Exit.isFailure(report.items[0]!.result)).toBe(true);
+          }
+          const end = yield* recovery.sweep();
+          expect(end.items).toEqual([]);
+          expect(end.wrapped).toBe(true);
+          expect("afterPosition" in end ? end.afterPosition : undefined).toBeUndefined();
+          expect(visited).toEqual(rawIds);
+          expect(diagnostics.map((item) => item.dispatchId)).toEqual(rawIds.slice(0, -1));
+          expect(diagnostics.map((item) => item.cause)).toEqual(discoveredFailures);
+          expect(diagnostics.every((item) => item.position !== undefined)).toBe(true);
+          expect(reads).toHaveLength(6);
+          expect(reads[0]).toEqual({ limit: 1 });
+          expect(
+            reads
+              .slice(1)
+              .every(
+                (input) =>
+                  input.afterPosition !== undefined &&
+                  input.afterDispatchId === undefined &&
+                  input.limit === 1,
+              ),
+          ).toBe(true);
+          expect(h.claims).toHaveLength(1);
+          expect(h.claims[0]?.original).toEqual(f.claimed);
+          expect(h.claims[0]?.original.intent.request.assignmentOperationId).toBe(
+            f.request.assignmentOperationId,
+          );
+          expect(h.events.filter((event) => !event.startsWith("attention:"))).toEqual(
+            action === "resume"
+              ? ["claim:dispatch-intent", "resume:assignment", "release"]
+              : ["claim:dispatch-intent", "join", "settle", "release"],
+          );
+          expect(yield* f.journal.readRetained(f.request.dispatchId)).toEqual(f.claimed);
+          expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(1);
+        }),
+      ),
+  );
+}
+
+it.effect(
+  "deleted actual SQL cursor records failure and resets only on the next bounded sweep",
+  () =>
+    fileScoped(() =>
+      Effect.gen(function* () {
+        const f = yield* malformedKeyFixture;
+        yield* f.insert("a-corrupt", 0);
+        const h = harness(f.claimed);
+        const reads: Parameters<typeof f.journal.readRecoveryCandidates>[0][] = [];
+        const recorded: {
+          dispatchId: string | null;
+          position?: ProjectTeamDispatchRecoveryPosition;
+          cause: Cause.Cause<PositionedFailure>;
+        }[] = [];
+        const ports: ProjectTeamRecoveryPorts<Claim, Drain, PositionedFailure, Scope.Scope> = {
+          ...h.ports,
+          readPage: (input) => {
+            reads.push(input);
+            return f.journal.readRecoveryCandidates(input);
+          },
+          recordDiscoveryFailure: (dispatchId, discoveryCause, position) =>
+            Effect.sync(() => {
+              recorded.push({
+                dispatchId,
+                ...(position === undefined ? {} : { position }),
+                cause: discoveryCause,
+              });
+            }),
+          joinCleanup: (claim) => Effect.succeed({ _tag: "Joined", receipt: { claim } }),
+          quarantine: () => Effect.void,
+        };
+        const recovery = makeProjectTeamRecovery(ports, { pageSize: 1 });
+        const first = yield* recovery.sweep();
+        expect(first.items[0]?.dispatchId).toBe("a-corrupt");
+        yield* f.sql`DELETE FROM project_team_dispatch WHERE dispatch_id='a-corrupt'`;
+        const failed = yield* recovery.sweep().pipe(Effect.exit);
+        expect(Exit.isFailure(failed)).toBe(true);
+        expect(reads).toHaveLength(2);
+        expect(h.claims).toEqual([]);
+        expect(recorded).toHaveLength(2);
+        if (Exit.isFailure(failed)) expect(recorded[1]?.cause).toEqual(failed.cause);
+        expect(recorded[1]?.position).toEqual(
+          "afterPosition" in first ? first.afterPosition : undefined,
+        );
+        const resumed = yield* recovery.sweep();
+        expect(reads[2]).toEqual({ limit: 1 });
+        expect(resumed.items[0]?.dispatchId).toBe(f.request.dispatchId);
+        expect(h.claims).toHaveLength(1);
+        expect(h.claims[0]?.original).toEqual(f.claimed);
+      }),
+    ),
+);
+
+const positionFor = (rowId: string): ProjectTeamDispatchRecoveryPosition => ({
+  rowId,
+  dispatchIdHash: "a".repeat(64),
+});
+
+for (const invalid of [
+  "duplicate",
+  "reused-row",
+  "noncanonical",
+  "hash",
+  "mixed",
+  "cursor-reuse",
+] as const) {
+  it.effect(`positioned pages reject ${invalid} before acquiring any claim`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const retained = yield* f.journal.reserve(f.request);
+        const h = harness(retained);
+        const first = {
+          dispatchId: retained.fence.dispatchId,
+          position: positionFor("1"),
+          snapshot: Exit.succeed(retained),
+        };
+        const second = { ...first, position: positionFor("2") };
+        const page: ProjectTeamRecoveryDiscovery<ProjectTeamRecoveryError>[] =
+          invalid === "duplicate"
+            ? [first, first]
+            : invalid === "reused-row"
+              ? [
+                  first,
+                  { ...first, position: { ...first.position, dispatchIdHash: "b".repeat(64) } },
+                ]
+              : invalid === "noncanonical"
+                ? [{ ...first, position: positionFor("01") }]
+                : invalid === "hash"
+                  ? [{ ...first, position: { ...first.position, dispatchIdHash: "invalid" } }]
+                  : invalid === "mixed"
+                    ? [
+                        first,
+                        { dispatchId: retained.fence.dispatchId, snapshot: Exit.succeed(retained) },
+                      ]
+                    : [first, second];
+        h.ports.readPage = () => Effect.succeed(page);
+        h.ports.withClaim = () => Effect.succeed({ _tag: "Busy" });
+        const recovery = makeProjectTeamRecovery(h.ports, { pageSize: 2 });
+        if (invalid === "cursor-reuse") yield* recovery.sweep();
+        expect(Exit.isFailure(yield* recovery.sweep().pipe(Effect.exit))).toBe(true);
+        expect(h.events).toEqual([]);
+        expect(h.claims).toEqual([]);
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "malformed positioned success snapshots remain attention only, including runtime non-string keys",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const h = harness(claimed);
+        const page: ProjectTeamRecoveryDiscovery<ProjectTeamRecoveryError>[] = [
+          null,
+          "",
+          "a".repeat(257),
+          null,
+          f.request.dispatchId,
+        ].map((dispatchId, index) => ({
+          dispatchId,
+          position: positionFor(String(index + 1)),
+          snapshot: Exit.succeed(claimed),
+        }));
+        // A misbehaving private port can violate its declared diagnostic type at runtime.
+        if (!page[3]) return yield* Effect.die("Missing malformed runtime fixture");
+        Object.defineProperty(page[3], "dispatchId", { value: new Uint8Array([1, 2]) });
+        const diagnostics: {
+          dispatchId: string | null;
+          position?: ProjectTeamDispatchRecoveryPosition;
+        }[] = [];
+        h.ports.readPage = () => Effect.succeed(page);
+        h.ports.recordDiscoveryFailure = (dispatchId, discoveryCause, position) =>
+          Effect.sync(() => {
+            diagnostics.push({ dispatchId, ...(position === undefined ? {} : { position }) });
+            expect(Cause.pretty(discoveryCause)).toContain(
+              "Root discovery dispatch identity is invalid",
+            );
+          });
+        const report = yield* makeProjectTeamRecovery(h.ports, { pageSize: 5 }).sweep();
+        expect(report.items.map((item) => Exit.isFailure(item.result))).toEqual([
+          true,
+          true,
+          true,
+          true,
+          false,
+        ]);
+        expect(diagnostics.map((item) => item.dispatchId)).toEqual([
+          null,
+          "",
+          "a".repeat(257),
+          null,
+        ]);
+        expect(diagnostics.every((item) => item.position !== undefined)).toBe(true);
+        expect(h.claims).toHaveLength(1);
+        expect(h.claims[0]?.original).toEqual(claimed);
+        expect(h.events).toEqual([
+          "claim:dispatch-intent",
+          "assess",
+          "resume:assignment",
+          "release",
+        ]);
+      }),
+    ),
+);
+
+it.effect("interrupting a positioned SQL page read retains the unfinished continuation", () =>
+  fileScoped(() =>
+    Effect.gen(function* () {
+      const f = yield* malformedKeyFixture;
+      yield* f.insert(null, 0);
+      const h = harness(f.claimed);
+      const entered = yield* Deferred.make<void>();
+      const reads: Parameters<typeof f.journal.readRecoveryCandidates>[0][] = [];
+      const diagnostics: (string | null)[] = [];
+      const ports: ProjectTeamRecoveryPorts<Claim, Drain, PositionedFailure, Scope.Scope> = {
+        ...h.ports,
+        readPage: (input) => {
+          reads.push(input);
+          return reads.length === 2
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+            : f.journal.readRecoveryCandidates(input);
+        },
+        recordDiscoveryFailure: (dispatchId) =>
+          Effect.sync(() => {
+            diagnostics.push(dispatchId);
+          }),
+        joinCleanup: (claim) => Effect.succeed({ _tag: "Joined", receipt: { claim } }),
+        quarantine: () => Effect.void,
+      };
+      const recovery = makeProjectTeamRecovery(ports, { pageSize: 1 });
+      const first = yield* recovery.sweep();
+      const reading = yield* recovery.sweep().pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* Fiber.interrupt(reading);
+      expect(h.claims).toEqual([]);
+      expect(diagnostics).toEqual([null]);
+      const resumed = yield* recovery.sweep();
+      expect(reads[1]).toEqual({
+        afterPosition: "afterPosition" in first ? first.afterPosition : undefined,
+        limit: 1,
+      });
+      expect(reads[2]).toEqual(reads[1]);
+      expect(resumed.items[0]?.dispatchId).toBe(f.request.dispatchId);
+      expect(h.claims).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect(
+  "actual SQL BLOB diagnostics retain opaque positions after text owners without granting authority",
+  () =>
+    fileScoped(() =>
+      Effect.gen(function* () {
+        const f = yield* malformedKeyFixture;
+        for (const [ordinal, id] of [
+          null,
+          null,
+          "",
+          "a".repeat(257),
+          new Uint8Array([255, 0, 13]),
+        ].entries())
+          yield* f.insert(id, ordinal);
+        const h = harness(f.claimed);
+        const diagnostics: {
+          dispatchId: string | null;
+          position?: ProjectTeamDispatchRecoveryPosition;
+          cause: Cause.Cause<PositionedFailure>;
+        }[] = [];
+        const reads: Parameters<typeof f.journal.readRecoveryCandidates>[0][] = [];
+        const ports: ProjectTeamRecoveryPorts<Claim, Drain, PositionedFailure, Scope.Scope> = {
+          ...h.ports,
+          readPage: (input) => {
+            reads.push(input);
+            return f.journal.readRecoveryCandidates(input);
+          },
+          recordDiscoveryFailure: (dispatchId, discoveryCause, position) =>
+            Effect.sync(() => {
+              diagnostics.push({
+                dispatchId,
+                cause: discoveryCause,
+                ...(position === undefined ? {} : { position }),
+              });
+            }),
+          joinCleanup: (claim) => Effect.succeed({ _tag: "Joined", receipt: { claim } }),
+          quarantine: () => Effect.void,
+        };
+        const recovery = makeProjectTeamRecovery(ports, { pageSize: 2 });
+        const first = yield* recovery.sweep();
+        const second = yield* recovery.sweep();
+        const third = yield* recovery.sweep();
+        expect(first.items.map((item) => item.dispatchId)).toEqual([null, null]);
+        expect(second.items.map((item) => item.dispatchId)).toEqual(["", "a".repeat(257)]);
+        expect(third.items.map((item) => item.dispatchId)).toEqual([f.request.dispatchId, null]);
+        expect(Exit.isSuccess(third.items[0]!.result)).toBe(true);
+        expect(Exit.isFailure(third.items[1]!.result)).toBe(true);
+        expect("afterPosition" in third ? third.afterPosition : undefined).toBeDefined();
+        expect("afterDispatchId" in third ? third.afterDispatchId : undefined).toBeUndefined();
+        expect((yield* recovery.sweep()).wrapped).toBe(true);
+        expect(reads).toHaveLength(4);
+        expect(
+          reads
+            .slice(1)
+            .every(
+              (input) =>
+                input.afterPosition !== undefined &&
+                input.afterDispatchId === undefined &&
+                input.limit === 2,
+            ),
+        ).toBe(true);
+        expect(diagnostics.map((item) => item.dispatchId)).toEqual([
+          null,
+          null,
+          "",
+          "a".repeat(257),
+          null,
+        ]);
+        expect(new Set(diagnostics.map((item) => item.position?.rowId)).size).toBe(5);
+        expect(h.claims).toHaveLength(1);
+        expect(h.claims[0]?.original).toEqual(f.claimed);
+        expect(h.events).toEqual([
+          "claim:dispatch-intent",
+          "assess",
+          "resume:assignment",
+          "release",
+        ]);
+        expect(yield* f.journal.readRetained(f.request.dispatchId)).toEqual(f.claimed);
+      }),
+    ),
+);
+
+for (const positioned of [false, true]) {
+  for (const publication of ["success", "failure", "defect"] as const) {
+    it.effect(
+      `${positioned ? "positioned" : "legacy"} joined attention ${publication} retains full causes and repeated interruption without cursor advance`,
+      () =>
+        scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture;
+            const h = harness(yield* f.journal.reserve(f.request));
+            const entered = yield* Deferred.make<void>();
+            const proceed = yield* Deferred.make<void>();
+            const decodeReason = Cause.makeFailReason(error("decode failure")).annotate(
+              Context.makeUnsafe(new Map([["origin", "decode"]])),
+            );
+            const decodeCause = Cause.fromReasons([decodeReason, decodeReason]);
+            const publicationReason = (
+              publication === "defect"
+                ? Cause.makeDieReason(error("publication defect"))
+                : Cause.makeFailReason(error("publication failure"))
+            ).annotate(Context.makeUnsafe(new Map([["origin", "publication"]])));
+            const publicationCause = Cause.fromReasons([publicationReason, publicationReason]);
+            const reads: Parameters<Ports["readPage"]>[0][] = [];
+            let held = true;
+            let drained = false;
+            let published = 0;
+            h.ports.readPage = (input) => {
+              reads.push(input);
+              const second = positioned
+                ? input.afterPosition !== undefined
+                : input.afterDispatchId !== undefined;
+              return Effect.succeed([
+                {
+                  dispatchId: second ? "b" : "a",
+                  ...(positioned ? { position: positionFor(second ? "2" : "1") } : {}),
+                  snapshot: Exit.failCause(second ? decodeCause : cause("initial malformed")),
+                },
+              ]);
+            };
+            h.ports.recordDiscoveryFailure = (id, observed) =>
+              Effect.gen(function* () {
+                published++;
+                if (id !== "b") return;
+                expect(observed).toEqual(decodeCause);
+                if (held) {
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(proceed);
+                }
+                drained = true;
+                if (publication !== "success") return yield* Effect.failCause(publicationCause);
+              });
+            const recovery = makeProjectTeamRecovery(h.ports, { pageSize: 1 });
+            yield* recovery.sweep();
+            const fiber = yield* recovery.sweep().pipe(Effect.forkChild);
+            yield* Deferred.await(entered);
+            yield* Effect.sync(() => {
+              fiber.interruptUnsafe(
+                101,
+                Context.makeUnsafe(new Map([["interrupt-origin", "first"]])),
+              );
+              fiber.interruptUnsafe(
+                202,
+                Context.makeUnsafe(new Map([["interrupt-origin", "second"]])),
+              );
+            });
+            expect(drained).toBe(false);
+            expect(h.claims).toEqual([]);
+            held = false;
+            yield* Deferred.succeed(proceed, undefined);
+            const interrupted = yield* Fiber.await(fiber);
+            expect(drained).toBe(true);
+            expect(published).toBe(2);
+            expect(reads).toHaveLength(2);
+            if (!Exit.isFailure(interrupted))
+              return yield* Effect.die("Canceled attention succeeded");
+            expect(Cause.hasInterrupts(interrupted.cause)).toBe(true);
+            const decoded = interrupted.cause.reasons
+              .filter(Cause.isFailReason)
+              .filter((reason) => reason.error.reason === "decode failure");
+            expect(decoded).toHaveLength(2);
+            expect(decoded.every((reason) => reason.annotations.get("origin") === "decode")).toBe(
+              true,
+            );
+            const publications = interrupted.cause.reasons.filter(
+              (reason) => reason.annotations.get("origin") === "publication",
+            );
+            expect(publications).toHaveLength(publication === "success" ? 0 : 2);
+            expect(
+              publications.every(
+                (reason) => reason._tag === (publication === "defect" ? "Die" : "Fail"),
+              ),
+            ).toBe(true);
+            const interrupts = interrupted.cause.reasons.filter(Cause.isInterruptReason);
+            expect(interrupts.map((reason) => reason.fiberId)).toEqual([101, 202]);
+            expect(interrupts.map((reason) => reason.annotations.get("interrupt-origin"))).toEqual([
+              "first",
+              "second",
+            ]);
+            const retry = yield* recovery.sweep();
+            expect(reads[2]).toEqual(reads[1]);
+            expect(Exit.isFailure(retry.items[0]!.result)).toBe(true);
+            expect(published).toBe(3);
+            expect(h.claims).toEqual([]);
+            expect(h.events).toEqual([]);
+          }),
+        ),
+    );
+  }
+}
