@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
@@ -16,6 +17,7 @@ import {
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
 import { runMigrations } from "../../persistence/Migrations.ts";
+import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import {
   ProjectWorkRepository,
   ProjectWorkRepositoryLive,
@@ -702,3 +704,183 @@ it.effect("fences and redacts newly known secrets hidden by cached JSON escaping
     }),
   ),
 );
+
+for (const scenario of ["live", "guard-expiry", "after-writes-expiry", "duplicate-expiry"] as const)
+  it.effect(`repair capture final authority ${scenario}`, () =>
+    ManagedFixture.scoped(
+      Effect.gen(function* () {
+        const f = yield* ManagedFixture.seed();
+        const role = ManagedFixture.decodeRecord({
+          ...f.role,
+          recordId: "repair-memory-role",
+          memoryAccess: "project",
+        });
+        if (role.kind !== "role-revision") return yield* Effect.die("Invalid repair role");
+        yield* f.change(role);
+        yield* f.change(
+          ManagedFixture.decodeRecord({
+            ...f.member,
+            recordId: "repair-memory-member",
+            roleRevisionId: role.recordId,
+          }),
+        );
+        const taskId = ProjectWorkTaskId.make("repair-managed-task");
+        const threadId = ThreadId.make("repair-managed-thread");
+        const binding = yield* ManagedFixture.createManagedAssignment({
+          taskId,
+          threadId,
+          recordId: "repair-managed-binding",
+          attemptId: "repair-managed-attempt",
+          commandId: "repair-managed-dispatch",
+          providerInstanceId: f.binding.providerInstanceId,
+          memberId: "repair-memory-member",
+          role,
+          status: "running",
+          configuration: f.binding.configuration,
+          sessionId: "repair-managed-session",
+        });
+        const issued = yield* f.auth.issueCredential({
+          providerInstanceId: binding.providerInstanceId,
+          threadId,
+        });
+        const principal = {
+          actor: { kind: "agent" as const, id: Authorization.managedActorId(issued!.credential) },
+          managed: issued!.credential,
+        };
+        const comment = commentFixture({
+          commentId: "repair-managed-comment",
+          projectId: binding.projectId,
+          taskId,
+          body: "Current scoped finding",
+          revision: 0,
+          createdAt: memoryTestAt,
+          attribution,
+        });
+        yield* f.repo.execute({
+          type: "project-work.comment.add",
+          projectId: binding.projectId,
+          commandId: CommandId.make("repair-managed-comment-add"),
+          comment,
+          attribution,
+          addedAt: memoryTestAt,
+        });
+        const originalGuard = yield* ContentGuard.ProjectWorkContentGuard;
+        const dependencies = {
+          sql: f.sql,
+          repository: f.repo,
+          contentGuard: originalGuard,
+          authorization: f.auth,
+          environmentId: "fixture-environment",
+        };
+        const selector = { kind: "comment", retainedId: comment.commentId };
+        if (scenario === "duplicate-expiry")
+          yield* makeProjectMemoryService(dependencies).capture(principal, selector);
+        const beforeEvents = yield* f.sql`SELECT * FROM project_work_events`;
+        const beforeState = yield* readCurrentState(f.sql, binding.projectId);
+        const beforeJobs = yield* f.sql`SELECT * FROM project_team_memory_job`;
+        const beforeSources = yield* f.sql`SELECT * FROM project_team_memory_source`;
+        const beforeExtractions = yield* f.sql`SELECT * FROM project_team_memory_extraction`;
+        let finalObservedWrites = false;
+        const repository: typeof f.repo = {
+          ...f.repo,
+          executeAtomic: (prepare, finalValidate) =>
+            f.repo.executeAtomic(
+              prepare,
+              Effect.gen(function* () {
+                // Observe real command and journal writes inside the repository-owned transaction.
+                const jobs = yield* f.sql`SELECT * FROM project_team_memory_job`.pipe(
+                  Effect.mapError(toPersistenceSqlError("repair.finalObservation")),
+                );
+                const state = yield* readCurrentState(f.sql, binding.projectId).pipe(
+                  Effect.mapError(toPersistenceSqlError("repair.finalObservation")),
+                );
+                finalObservedWrites =
+                  jobs.length === 1 &&
+                  state.foundationRecords!.some((record) => record.kind === "memory-source");
+                if (scenario === "after-writes-expiry")
+                  yield* TestClock.setTime(Date.parse("2031-01-01T00:00:00.000Z"));
+                if (finalValidate !== undefined) yield* finalValidate;
+              }),
+            ),
+        };
+        const contentGuard = {
+          ...originalGuard,
+          assertSafe: (value: unknown) =>
+            Effect.gen(function* () {
+              yield* originalGuard.assertSafe(value);
+              if (scenario === "guard-expiry" || scenario === "duplicate-expiry")
+                yield* TestClock.setTime(Date.parse("2031-01-01T00:00:00.000Z"));
+            }),
+        };
+        const service = makeProjectMemoryService({ ...dependencies, repository, contentGuard });
+        const result = yield* service.capture(principal, selector).pipe(Effect.exit);
+        expect(finalObservedWrites).toBe(true);
+        if (scenario === "live") {
+          expect(result._tag).toBe("Success");
+          expect(yield* f.sql`SELECT * FROM project_team_memory_job`).toHaveLength(1);
+          expect((yield* f.auth.resolve(principal).pipe(Effect.exit))._tag).toBe("Success");
+        } else {
+          expect((yield* f.auth.resolve(principal).pipe(Effect.exit))._tag).toBe("Failure");
+          expect(result._tag).toBe("Failure");
+          expect(yield* f.sql`SELECT * FROM project_work_events`).toEqual(beforeEvents);
+          expect(yield* readCurrentState(f.sql, binding.projectId)).toEqual(beforeState);
+          expect(yield* f.sql`SELECT * FROM project_team_memory_job`).toEqual(beforeJobs);
+          expect(yield* f.sql`SELECT * FROM project_team_memory_source`).toEqual(beforeSources);
+          expect(yield* f.sql`SELECT * FROM project_team_memory_extraction`).toEqual(
+            beforeExtractions,
+          );
+        }
+      }).pipe(Effect.provide(ContentGuard.layer)),
+    ),
+  );
+
+for (const scenario of ["plain", "escaped", "absent", "metadata"] as const)
+  it.effect(`repair extraction quotes use original text ${scenario}`, () =>
+    withMemoryDatabase(
+      Effect.gen(function* () {
+        const escaped = 'line one\n"quoted" line \\two';
+        const quote =
+          scenario === "plain"
+            ? "source provenance"
+            : scenario === "escaped"
+              ? escaped
+              : scenario === "metadata"
+                ? "repair-quote-comment"
+                : "genuinely absent quote";
+        const f = yield* memorySetup(
+          memoryModels([{ key: "quoted", body: "Sourced retained finding.", quote }]),
+        );
+        const comment = commentFixture({
+          ...f.comment,
+          commentId: "repair-quote-comment",
+          body: `A retained finding preserves source provenance and ${escaped}.`,
+        });
+        yield* f.repository.execute({
+          type: "project-work.comment.add",
+          projectId: f.projectId,
+          commandId: CommandId.make("repair-quote-comment-add"),
+          comment,
+          attribution,
+          addedAt: memoryTestAt,
+        });
+        const source = yield* f.service.captureRetained(f.projectId, {
+          kind: "comment",
+          retainedId: comment.commentId,
+        });
+        const effect = (yield* readCurrentState(f.sql, f.projectId)).foundationRecords!.find(
+          (record) => record.kind === "effect" && record.targetId === source.recordId,
+        )!;
+        const owner = yield* f.service.claim(f.projectId, effect.recordId);
+        const result = yield* f.service
+          .extract(f.projectId, effect.recordId, owner!)
+          .pipe(Effect.exit);
+        const success = scenario === "plain" || scenario === "escaped";
+        expect(result._tag).toBe(success ? "Success" : "Failure");
+        const work = yield* f.service.readWork(f.projectId, effect.recordId);
+        expect(work.observations).toHaveLength(success ? 1 : 0);
+        expect(work.source.contentHash).toBe(projectMemoryHash(work.source.content));
+        expect(work.source.sourceRevision).toBe(comment.revision);
+        expect(work.source.attribution).toEqual(comment.attribution);
+      }),
+    ),
+  );

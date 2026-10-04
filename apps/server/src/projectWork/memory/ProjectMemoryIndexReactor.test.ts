@@ -3,6 +3,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -714,4 +716,128 @@ it.effect(
         filename,
       );
     }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+for (const kind of ["model", "delete"] as const)
+  for (const persistFails of [false, true])
+    it.effect(
+      `repair retains complete ${kind} cause with uncertainty write ${persistFails ? "failure" : "success"}`,
+      () =>
+        withMemoryDatabase(
+          Effect.gen(function* () {
+            const marker = Context.Reference<string>("repair-marker", { defaultValue: () => "" });
+            const modelError = new ProjectMemoryServiceError({
+              reason: "repair-original-model-response-lost",
+            });
+            const deleteError = new MemoryBackendError({
+              code: "unavailable",
+              message: "repair-original-delete-response-lost",
+            });
+            const modelReason = Cause.makeFailReason(modelError).annotate(
+              Context.make(marker, "original"),
+            );
+            const deleteReason = Cause.makeFailReason(deleteError).annotate(
+              Context.make(marker, "original"),
+            );
+            const defect = Cause.makeDieReason("repair-original-defect").annotate(
+              Context.make(marker, "defect"),
+            );
+            // Equal reason occurrences are deliberately retained; Cause.combine would deduplicate them.
+            const modelCause = Cause.fromReasons([modelReason, modelReason, defect]);
+            const deleteCause = Cause.fromReasons([deleteReason, deleteReason, defect]);
+            const original = kind === "model" ? modelCause : deleteCause;
+            const error = kind === "model" ? modelError : deleteError;
+            const models = { ...memoryModels(), extract: () => Effect.failCause(modelCause) };
+            const f = yield* memorySetup(kind === "model" ? models : memoryModels());
+            const source = yield* f.service.captureRetained(f.projectId, {
+              kind: "comment",
+              retainedId: f.comment.commentId,
+            });
+            if (kind === "delete") yield* f.service.retract(f.projectId, source.recordId);
+            const effect = (yield* readCurrentState(f.sql, f.projectId)).foundationRecords!.find(
+              (record) =>
+                record.kind === "effect" &&
+                record.effectKind === (kind === "model" ? "memory-index" : "memory-delete"),
+            )!;
+            const companion = simulatedCompanion();
+            const backend =
+              kind === "delete"
+                ? { ...companion.backend, deleteSource: () => Effect.failCause(deleteCause) }
+                : companion.backend;
+            const reactor = makeProjectMemoryIndexReactor({
+              ...f,
+              backend,
+              environmentId: "fixture-environment",
+            });
+            if (persistFails)
+              yield* f.sql`CREATE TRIGGER repair_uncertainty_failure BEFORE UPDATE ON project_team_memory_job WHEN NEW.status='uncertain' BEGIN SELECT RAISE(ABORT,'repair-uncertainty-write-lost'); END`;
+            const result = yield* reactor.consume(f.projectId, effect.recordId).pipe(Effect.exit);
+            expect(result._tag).toBe("Failure");
+            if (result._tag !== "Failure") return;
+            if (persistFails)
+              expect(result.cause.reasons.length).toBeGreaterThan(original.reasons.length);
+            else expect(result.cause.reasons).toHaveLength(original.reasons.length);
+            expect(result.cause.reasons.slice(0, 3).map((entry) => entry._tag)).toEqual([
+              "Fail",
+              "Fail",
+              "Die",
+            ]);
+            for (const entry of result.cause.reasons.slice(0, 2)) {
+              expect(Cause.isFailReason(entry) && entry.error === error).toBe(true);
+              expect(entry.annotations.get("repair-marker")).toBe("original");
+            }
+            expect(result.cause.reasons[2]!.annotations.get("repair-marker")).toBe("defect");
+            if (persistFails)
+              expect(Cause.pretty(result.cause)).toContain("repair-uncertainty-write-lost");
+            expect((yield* reactor.load(effect.recordId))?.status).toBe(
+              persistFails ? "claimed" : "uncertain",
+            );
+            expect((yield* reactor.load(effect.recordId))?.receipt).toBeUndefined();
+          }),
+        ),
+    );
+
+it.effect(
+  "repair interrupted extraction remains claimed and drained recovery does not repeat extraction",
+  () =>
+    withMemoryDatabase(
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        let calls = 0;
+        const models = {
+          ...memoryModels(),
+          extract: () =>
+            Effect.gen(function* () {
+              calls++;
+              yield* Deferred.succeed(entered, undefined);
+              return yield* Effect.never;
+            }),
+        };
+        const f = yield* memorySetup(models);
+        const source = yield* f.service.captureRetained(f.projectId, {
+          kind: "comment",
+          retainedId: f.comment.commentId,
+        });
+        const effect = (yield* readCurrentState(f.sql, f.projectId)).foundationRecords!.find(
+          (record) => record.kind === "effect" && record.targetId === source.recordId,
+        )!;
+        const companion = simulatedCompanion();
+        const reactor = makeProjectMemoryIndexReactor({
+          ...f,
+          backend: companion.backend,
+          environmentId: "fixture-environment",
+        });
+        const child = yield* reactor.consume(f.projectId, effect.recordId).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* Fiber.interrupt(child);
+        expect((yield* reactor.load(effect.recordId))?.status).toBe("claimed");
+        const resumed = yield* reactor
+          .consume(f.projectId, effect.recordId, { generation: 1, confirmDrained: Effect.void })
+          .pipe(Effect.exit);
+        expect(resumed._tag).toBe("Failure");
+        expect(calls).toBe(1);
+        expect((yield* reactor.load(effect.recordId))?.status).toBe("uncertain");
+        expect((yield* reactor.load(effect.recordId))?.receipt).toBeUndefined();
+      }),
+    ),
 );

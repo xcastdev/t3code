@@ -1,6 +1,8 @@
 import { canonicalProjectWorkPayload } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectWorkRepositoryShape } from "../ProjectWorkRepository.ts";
@@ -392,8 +394,16 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
       return { status: "disabled" as const };
     const generation = yield* claim(effectId, recovery);
     if (generation === undefined) return { status: "owned-elsewhere" as const };
-    return yield* perform(effectId, generation, recovery !== undefined).pipe(
-      Effect.tapError(() => uncertain(effectId, generation)),
+    const result = yield* perform(effectId, generation, recovery !== undefined).pipe(Effect.exit);
+    if (Exit.isSuccess(result)) return result.value;
+    // Interruptions retain the claimed owner until Root confirms its drain. Do
+    // not issue more SQL work from an interrupted owner or repeat unknown calls.
+    if (Cause.hasInterrupts(result.cause)) return yield* Effect.failCause(result.cause);
+    const recorded = yield* uncertain(effectId, generation).pipe(Effect.exit);
+    return yield* Effect.failCause(
+      Exit.isFailure(recorded)
+        ? Cause.fromReasons([...result.cause.reasons, ...recorded.cause.reasons])
+        : result.cause,
     );
   });
   /** One bounded pass over committed jobs; Root owns wake scheduling and lifetime. */

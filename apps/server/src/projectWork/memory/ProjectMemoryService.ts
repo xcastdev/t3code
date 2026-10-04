@@ -512,6 +512,36 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
         );
         return yield* commit(state, changed, at);
       }),
+      Effect.gen(function* () {
+        // Final validation runs after auxiliary and command writes in the same SQL
+        // transaction, including duplicate captures that prepare no commands.
+        yield* requireProject(projectId);
+        const state = yield* readCurrentState(sql, projectId);
+        const current = retained(state, selector);
+        if (
+          current === undefined ||
+          captured === undefined ||
+          current.record.attribution === undefined ||
+          current.record.revision !== captured.sourceRevision ||
+          projectMemoryHash(
+            canonicalProjectWorkPayload({ kind: selector.kind, record: current.record }),
+          ) !== captured.contentHash ||
+          (selector.kind !== "decision" &&
+            (current.taskId === undefined ||
+              !state.tasks.some((task) => task.taskId === current.taskId)))
+        )
+          return yield* deny("Retained source changed before capture committed");
+        if (principal !== undefined) {
+          const authority = yield* authorization.resolve(principal);
+          if (
+            authority === undefined ||
+            authority.binding.projectId !== projectId ||
+            authority.role.memoryAccess === "none" ||
+            (current.taskId !== undefined && current.taskId !== authority.binding.taskId)
+          )
+            return yield* deny("Current managed memory scope does not include this source");
+        }
+      }),
     );
     if (captured === undefined) return yield* deny("Source capture did not commit");
     return captured;
@@ -791,7 +821,14 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
       }),
     );
     yield* contentGuard.assertSafe(facts);
-    if (facts.some((fact) => !work.source.content.includes(fact.quote)))
+    const body = yield* validate(Schema.fromJsonString(RetainedSourceBody), work.source.content);
+    const sourceTexts =
+      body.kind === "evidence"
+        ? [body.record.summary, ...(body.record.detail === undefined ? [] : [body.record.detail])]
+        : body.kind === "decision"
+          ? [body.record.title, body.record.body]
+          : [body.record.body];
+    if (facts.some((fact) => !sourceTexts.some((text) => text.includes(fact.quote))))
       return yield* deny("Extraction quote is not in the retained source");
     const observationIds = facts.map((fact) =>
       projectMemoryId("memory-observation", [work.extraction!.recordId, fact.key]),
