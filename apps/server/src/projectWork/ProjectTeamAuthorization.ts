@@ -107,6 +107,26 @@ export class ProjectTeamAuthorization extends Context.Service<
   }
 >()("t3/projectWork/ProjectTeamAuthorization") {}
 
+type SessionAuthorityReader = (
+  identity: Pick<ProjectTeamCredential, "providerInstanceId" | "threadId">,
+) => Effect.Effect<ProjectTeamAuthority | undefined, ProjectTeamAuthorizationError>;
+const sessionAuthorityReaders = new WeakMap<
+  ProjectTeamAuthorization["Service"],
+  SessionAuthorityReader
+>();
+
+/** Root rechecks a reserved session's authority without revoking or issuing credentials. */
+export const inspectProjectTeamSessionAuthority = (
+  service: ProjectTeamAuthorization["Service"],
+  identity: Parameters<SessionAuthorityReader>[0],
+) =>
+  Effect.suspend(() => {
+    const read = sessionAuthorityReaders.get(service);
+    return read
+      ? read(identity)
+      : Effect.fail(deny("Owned session authority reader is unavailable"));
+  });
+
 export const layer = Layer.effect(
   ProjectTeamAuthorization,
   Effect.gen(function* () {
@@ -869,7 +889,7 @@ export const layer = Layer.effect(
           isAuthorizationError(error) ? error : deny("Managed authority unavailable"),
         ),
       );
-    return ProjectTeamAuthorization.of({
+    const service = ProjectTeamAuthorization.of({
       discover: (identity) => discover(identity),
       hasManagedThread,
       issueCredential: (identity) =>
@@ -891,5 +911,27 @@ export const layer = Layer.effect(
       intent: (p, i, a, d) => guard(intent(p, i, a, d)),
       guided: (p, i, a, d) => guard(guided(p, i, a, d)),
     });
+    sessionAuthorityReaders.set(service, (identity) =>
+      guard(
+        Effect.gen(function* () {
+          const credential = yield* discover(identity);
+          return credential === undefined
+            ? undefined
+            : yield* resolve(
+                {
+                  actor: { kind: "agent", id: managedActorId(credential) },
+                  managed: credential,
+                },
+                true,
+              );
+        }),
+      ),
+    );
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        sessionAuthorityReaders.delete(service);
+      }),
+    );
+    return service;
   }),
 );
