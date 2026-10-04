@@ -19,6 +19,7 @@ import { PiDriverConfiguration } from "../provider/pi/PiManagedRuntime.ts";
 import { resolvePiManagedSkillSelection } from "../provider/pi/PiManagedSkillSelection.ts";
 import { PiModelCatalogue } from "../provider/pi/PiModelCatalogue.ts";
 import { ManagedSkillRepository } from "../skills/ManagedSkillRepository.ts";
+import { DEFAULT_SKILL_PACKAGE_LIMITS } from "../skills/SkillPackage.ts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import {
   makeProjectTeamDispatchJournal,
@@ -69,7 +70,9 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
     const skills = yield* ManagedSkillRepository;
     const path = yield* Path.Path;
     const clock = yield* Clock.Clock;
-    const context = (yield* Effect.context<never>()).pipe(Context.omit(Scope.Scope));
+    const context = (yield* Effect.context<never>()).pipe(
+      Context.omit(Scope.Scope, sql.transactionService),
+    );
     const journal = yield* makeProjectTeamDispatchJournal(options);
     const inside = (parent: string, child: string) =>
       child === parent || child.startsWith(parent + path.sep);
@@ -118,6 +121,64 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
       if (stat.uid !== BigInt(process.getuid?.() ?? -1) || (stat.mode & 0o077n) !== 0n)
         throw deny("Managed resource root must be private to this server");
       return { managed, protected: options.protectedRoots.map((root) => physical(root, true)) };
+    };
+    // A receipt brackets the owned asynchronous selector with synchronous metadata checks.
+    // It grants no staging authority; PiSkillResources still owns native admission.
+    const skillTree = (root: string, allowMissing = false) => {
+      const ancestors = physical(root, allowMissing);
+      const entries = [];
+      const queue = [{ entry: root, depth: 0 }];
+      let files = 0;
+      let bytes = 0n;
+      while (queue.length > 0) {
+        const next = queue.pop()!;
+        const stat = fs.lstatSync(next.entry, { bigint: true, throwIfNoEntry: false });
+        if (!stat) {
+          if (!allowMissing || next.entry !== root) throw deny("Selected skill disappeared");
+          continue;
+        }
+        if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()))
+          throw deny("Selected skill receipt is not an owned file tree");
+        if (
+          next.depth > DEFAULT_SKILL_PACKAGE_LIMITS.maxDepth ||
+          entries.length > DEFAULT_SKILL_PACKAGE_LIMITS.maxEntries
+        )
+          throw deny("Selected skill receipt exceeds traversal bounds");
+        entries.push({
+          path: next.entry,
+          dev: String(stat.dev),
+          ino: String(stat.ino),
+          mode: String(stat.mode),
+          uid: String(stat.uid),
+          size: String(stat.size),
+          mtime: String(stat.mtimeNs),
+          ctime: String(stat.ctimeNs),
+        });
+        if (stat.isDirectory()) {
+          const directory = fs.opendirSync(next.entry);
+          try {
+            for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
+              if (queue.length + entries.length >= DEFAULT_SKILL_PACKAGE_LIMITS.maxEntries + 1)
+                throw deny("Selected skill receipt exceeds entry bounds");
+              queue.push({ entry: path.join(next.entry, entry.name), depth: next.depth + 1 });
+            }
+          } finally {
+            directory.closeSync();
+          }
+        } else {
+          files++;
+          bytes += stat.size;
+          if (
+            files > DEFAULT_SKILL_PACKAGE_LIMITS.maxFiles ||
+            bytes > BigInt(DEFAULT_SKILL_PACKAGE_LIMITS.maxBytes)
+          )
+            throw deny("Selected skill receipt exceeds package bounds");
+        }
+      }
+      return {
+        ancestors,
+        entries: entries.sort((left, right) => left.path.localeCompare(right.path)),
+      };
     };
     const originalRoots = yield* Effect.try({
       try: roots,
@@ -211,78 +272,111 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
                             runtime.maxOutputTokens > fresh.selectedEntry.max_output_tokens)
                         )
                           return yield* deny("Actual runtime exceeds original model metadata");
-                        const rows = yield* sql<{
-                          source: string;
-                          fetched_at: string;
-                          payload: string | null;
-                        }>`
+                        const sample = Effect.gen(function* () {
+                          const rows = yield* sql<{
+                            source: string;
+                            fetched_at: string;
+                            payload: string | null;
+                          }>`
             SELECT source,fetched_at,CASE WHEN length(CAST(payload_json AS BLOB)) <= 262144
             THEN payload_json ELSE NULL END AS payload FROM project_team_pi_catalogue
             WHERE source=${fresh.source} LIMIT 2`;
-                        const row = rows[0];
-                        if (
-                          rows.length !== 1 ||
-                          !row ||
-                          row.source !== fresh.source ||
-                          row.fetched_at !== fresh.fetchedAt ||
-                          row.payload === null ||
-                          !same(yield* decodeJson(row.payload), fresh)
-                        )
-                          return yield* deny("Original model catalogue changed");
-                        const primaryRows = yield* sql<{
-                          root: string;
-                        }>`SELECT workspace_root AS root
-            FROM projection_projects WHERE project_id=${binding.projectId} LIMIT 2`;
-                        const primaryRoot = original.intent.request.git.primaryRoot;
-                        const worktree = binding.worktree;
-                        if (
-                          !worktree ||
-                          !path.isAbsolute(worktree) ||
-                          path.normalize(worktree) !== worktree ||
-                          worktree !== original.intent.request.git.worktreePath ||
-                          binding.branch !== original.intent.request.git.branchRef
-                        )
-                          return yield* deny("Original managed workspace identity changed");
-                        if (
-                          primaryRows.length !== 1 ||
-                          primaryRows[0]?.root !== primaryRoot ||
-                          overlap(primaryRoot, options.managedWorktreesRoot) ||
-                          !inside(options.managedWorktreesRoot, worktree) ||
-                          worktree === options.managedWorktreesRoot ||
-                          options.protectedRoots.some(
-                            (root) =>
-                              overlap(root, options.managedWorktreesRoot) ||
-                              overlap(root, worktree),
+                          const row = rows[0];
+                          if (
+                            rows.length !== 1 ||
+                            !row ||
+                            row.source !== fresh.source ||
+                            row.fetched_at !== fresh.fetchedAt ||
+                            row.payload === null ||
+                            !same(yield* decodeJson(row.payload), fresh)
                           )
-                        )
-                          return yield* deny(
-                            "Original project and managed resource topology changed",
+                            return yield* deny("Original model catalogue changed");
+                          const primaryRows = yield* sql<{
+                            root: string;
+                          }>`SELECT workspace_root AS root
+            FROM projection_projects WHERE project_id=${binding.projectId} LIMIT 2`;
+                          const primaryRoot = original.intent.request.git.primaryRoot;
+                          const worktree = binding.worktree;
+                          if (
+                            !worktree ||
+                            !path.isAbsolute(worktree) ||
+                            path.normalize(worktree) !== worktree ||
+                            worktree !== original.intent.request.git.worktreePath ||
+                            binding.branch !== original.intent.request.git.branchRef
+                          )
+                            return yield* deny("Original managed workspace identity changed");
+                          if (
+                            primaryRows.length !== 1 ||
+                            primaryRows[0]?.root !== primaryRoot ||
+                            overlap(primaryRoot, options.managedWorktreesRoot) ||
+                            !inside(options.managedWorktreesRoot, worktree) ||
+                            worktree === options.managedWorktreesRoot ||
+                            options.protectedRoots.some(
+                              (root) =>
+                                overlap(root, options.managedWorktreesRoot) ||
+                                overlap(root, worktree),
+                            )
+                          )
+                            return yield* deny(
+                              "Original project and managed resource topology changed",
+                            );
+                          const state = yield* readCurrentState(sql, binding.projectId);
+                          const roles = (state.foundationRecords ?? []).filter(
+                            (record) =>
+                              record.kind === "role-revision" &&
+                              record.recordId === binding.roleRevisionId,
                           );
-                        const state = yield* readCurrentState(sql, binding.projectId);
-                        const roles = (state.foundationRecords ?? []).filter(
-                          (record) =>
-                            record.kind === "role-revision" &&
-                            record.recordId === binding.roleRevisionId,
-                        );
-                        const role = roles[0];
-                        if (
-                          roles.length !== 1 ||
-                          role?.kind !== "role-revision" ||
-                          role.status !== "available" ||
-                          role.model !== binding.model ||
-                          NodeCrypto.createHash("sha256")
-                            .update(role.instructions)
-                            .digest("hex") !== binding.configuration.instructionsHash ||
-                          !same(role.tools, binding.configuration.toolIds) ||
-                          !same(role.skills, binding.configuration.skillIds)
-                        )
-                          return yield* deny("Original role resources changed");
-                        const selected = yield* resolvePiManagedSkillSelection({
-                          projectRoot: primaryRoot,
-                          selectedSkillIds: binding.configuration.skillIds,
-                          roleSkillIds: role.skills,
-                        }).pipe(Effect.provideService(ManagedSkillRepository, skills));
+                          const role = roles[0];
+                          if (
+                            roles.length !== 1 ||
+                            role?.kind !== "role-revision" ||
+                            role.status !== "available" ||
+                            role.model !== binding.model ||
+                            NodeCrypto.createHash("sha256")
+                              .update(role.instructions)
+                              .digest("hex") !== binding.configuration.instructionsHash ||
+                            binding.configuration.toolIds.some((id) => !role.tools.includes(id)) ||
+                            binding.configuration.skillIds.some((id) => !role.skills.includes(id))
+                          )
+                            return yield* deny("Original role resources changed");
+                          const selected = yield* resolvePiManagedSkillSelection({
+                            projectRoot: primaryRoot,
+                            selectedSkillIds: binding.configuration.skillIds,
+                            roleSkillIds: role.skills,
+                          }).pipe(Effect.provideService(ManagedSkillRepository, skills));
+                          return { row, role, selected, primaryRoot };
+                        });
+                        // These SQLite receipts also cover the async getter tail after COMMIT.
+                        // Interference, including unrelated writes, conservatively denies this check.
+                        const sqlReceipt = sql<{ changes: string; version: string }>`
+                          SELECT CAST(total_changes() AS TEXT) AS changes,
+                          CAST(data_version AS TEXT) AS version FROM pragma_data_version`;
+                        const beforeSql = yield* sqlReceipt;
+                        if (beforeSql.length !== 1)
+                          return yield* deny("SQL resource receipt is unavailable");
+                        const first = yield* sample;
+                        const receipt = () =>
+                          first.selected.map((selection) => ({
+                            selected: skillTree(selection.packagePath),
+                            project: skillTree(
+                              path.join(first.primaryRoot, ".t3code", "skills", selection.key),
+                              true,
+                            ),
+                          }));
+                        const beforeSkills = yield* Effect.try({
+                          try: receipt,
+                          catch: (cause) =>
+                            unavailable("Selected skill receipt could not be captured", cause),
+                        });
                         yield* borrowed.assets.revalidate;
+                        // Reuse the actual caller transaction: final journal admission must not
+                        // issue a nested savepoint after its last physical/clock checks.
+                        const final = yield* Effect.contextWith(
+                          (ambient: Context.Context<never>) =>
+                            Option.isSome(Context.getOption(ambient, sql.transactionService))
+                              ? sample
+                              : sql.withTransaction(sample),
+                        );
                         const finalSettings = yield* settings.getSettings;
                         if (
                           !finalSettings.projectWorkEnabled ||
@@ -296,32 +390,56 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
                           return yield* deny(
                             "Original Pi execution changed during resource verification",
                           );
-                        const physicalRoots = yield* Effect.try({
-                          try: () => ({ roots: roots(), primary: physical(primaryRoot) }),
-                          catch: () => deny("Original resource roots changed"),
-                        });
-                        if (!same(physicalRoots.roots, originalRoots))
-                          return yield* deny("Original managed or protected roots changed");
-                        yield* borrowed.assertCurrent;
-                        const now = clock.currentTimeMillisUnsafe();
-                        const fetchedAt = Date.parse(fresh.fetchedAt);
+                        if (!same(first, final))
+                          return yield* deny(
+                            "Original SQL or selected skill resources changed during verification",
+                          );
                         if (
-                          !active ||
-                          now < fetchedAt ||
-                          now - fetchedAt >= 86_400_000 ||
-                          now >=
-                            Math.min(
-                              original.intent.limits.deadlineAtMs,
-                              original.intent.limits.rootDeadlineAtMs,
-                            )
+                          !same(
+                            yield* decodeActualConfiguration(borrowed.assets.instanceConfiguration),
+                            actual,
+                          ) ||
+                          !same(yield* decodeRuntime(borrowed.assets.runtimeFacts), runtime)
                         )
-                          return yield* deny("Original resource loan or model metadata expired");
+                          return yield* deny("Actual runtime changed during resource verification");
+                        if (!same(beforeSql, yield* sqlReceipt))
+                          return yield* deny("SQL changed during resource verification");
+                        yield* borrowed.assertCurrent;
+                        const physicalRoots = yield* Effect.try({
+                          try: () => {
+                            const physicalRoots = {
+                              roots: roots(),
+                              primary: physical(final.primaryRoot),
+                            };
+                            if (!same(beforeSkills, receipt()))
+                              throw deny("Selected skill resources changed during verification");
+                            if (!same(physicalRoots.roots, originalRoots))
+                              throw deny("Original managed or protected roots changed");
+                            const now = clock.currentTimeMillisUnsafe();
+                            const fetchedAt = Date.parse(fresh.fetchedAt);
+                            if (
+                              !active ||
+                              now < fetchedAt ||
+                              now - fetchedAt >= 86_400_000 ||
+                              now >=
+                                Math.min(
+                                  original.intent.limits.deadlineAtMs,
+                                  original.intent.limits.rootDeadlineAtMs,
+                                )
+                            )
+                              throw deny("Original resource loan or model metadata expired");
+                            return physicalRoots;
+                          },
+                          catch: (cause) =>
+                            unavailable("Final physical resources could not be verified", cause),
+                        });
                         return {
                           configured,
                           runtime,
-                          selected,
+                          selected: final.selected,
+                          role: final.role,
                           primary: physicalRoots.primary,
-                          catalogue: row,
+                          catalogue: final.row,
                         };
                       },
                       Effect.mapError((cause) =>
