@@ -36,6 +36,7 @@ import { mobileTaskPage } from "./workData";
 import { useWorkFoundation } from "./useWorkFoundation";
 import { createWorkActionSession, reviewMobileWork, type MobileWorkCurrent } from "./workActions";
 import { WorkQuestions, WorkTeam } from "./WorkTeam";
+import { WorkEvidence } from "./WorkEvidence";
 
 const decodeContext = Schema.decodeUnknownOption(ProjectWorkTaskContext);
 const isIssue = Schema.is(ProjectIssueIntakeRead);
@@ -191,6 +192,8 @@ function ProjectWorkSession({
   const foundationSupported =
     supported && config?.environment.capabilities.projectTeamFoundationReads === true;
   const foundation = useWorkFoundation(target, foundationSupported);
+  const [foundationOwner] = useState(() => target);
+  const [showEvidence, setShowEvidence] = useState(false);
   const [offset, setOffset] = useState(0);
   const [issuePage, setIssuePage] = useState(0);
   const query = useEnvironmentQuery(
@@ -241,103 +244,124 @@ function ProjectWorkSession({
       ) : null}
       {query.error ? <Notice>{query.error}</Notice> : null}
       {foundation.error ? <Notice>{foundation.error}</Notice> : null}
-      <WorkTeam target={target} foundation={foundation.snapshot} supported={foundationSupported} />
-      <WorkCard title="Issue intake">
-        {!foundationSupported ? (
-          <Notice>
-            This server does not support issue intake reads. Existing tasks remain available when
-            Project Work is enabled.
-          </Notice>
-        ) : null}
-        {sync.map((cursor) => (
-          <Notice key={cursor.recordId}>
-            {cursor.status}
-            {cursor.lastSuccessfulPageAt
-              ? ` · Last successful sync ${cursor.lastSuccessfulPageAt}`
-              : " · No successful sync recorded"}
-            {cursor.error ? ` · ${cursor.error}` : ""}
-          </Notice>
-        ))}
-        {issues.slice(currentIssuePage * 25, (currentIssuePage + 1) * 25).map((issue) => (
-          <View key={issue.recordId} className="gap-2 border-t border-border pt-3">
-            <Text className="font-t3-medium text-foreground">
-              {issue.repositoryName} #{issue.identity.number} · {issue.status}
-            </Text>
-            <Text selectable className="text-foreground">
-              {issue.title}
-            </Text>
-            <Notice>Observed {issue.observedAt}</Notice>
-            <Text selectable className="text-sm text-foreground-muted">
-              {issue.body}
-            </Text>
-            {issue.taskId ? (
-              <WorkButton onPress={() => openTask(issue.taskId!)}>Open linked task</WorkButton>
-            ) : (
+      <WorkButton onPress={() => setShowEvidence((visible) => !visible)}>
+        {showEvidence ? "Show project work" : "Show evidence"}
+      </WorkButton>
+      {showEvidence ? (
+        <WorkEvidence
+          target={target}
+          foundationOwner={foundationOwner}
+          foundation={foundation.snapshot}
+          current={foundation.current && foundation.error === null}
+          connected={runtime?.connectionState === "connected"}
+          enabled={supported}
+          supported={foundationSupported}
+        />
+      ) : (
+        <>
+          <WorkTeam
+            target={target}
+            foundation={foundation.snapshot}
+            supported={foundationSupported}
+          />
+          <WorkCard title="Issue intake">
+            {!foundationSupported ? (
               <Notice>
-                This issue has no linked task. Refine it in the web or desktop Work view.
+                This server does not support issue intake reads. Existing tasks remain available
+                when Project Work is enabled.
               </Notice>
-            )}
-          </View>
-        ))}
-        {foundationSupported && issues.length === 0 ? (
-          <Notice>
-            {foundation.current ? "No issues in this project." : "Loading issue intake…"}
-          </Notice>
-        ) : null}
-        <View className="flex-row flex-wrap gap-2">
-          <WorkButton
-            disabled={currentIssuePage === 0}
-            onPress={() => setIssuePage(currentIssuePage - 1)}
-          >
-            Previous issues
-          </WorkButton>
-          <WorkButton
-            disabled={currentIssuePage + 1 >= pageCount}
-            onPress={() => setIssuePage(currentIssuePage + 1)}
-          >
-            Next issues
-          </WorkButton>
-        </View>
-        <Notice>
-          Issue page {currentIssuePage + 1} of {pageCount}
-        </Notice>
-      </WorkCard>
-      <WorkCard title="Tasks">
-        {query.isPending ? <Notice>Refreshing tasks…</Notice> : null}
-        {tasks?.records.map((task) => (
-          <Pressable
-            key={task.taskId}
-            accessibilityRole="button"
-            onPress={() => openTask(task.taskId)}
-            className="gap-1 border-t border-border py-3"
-          >
-            <Text className="font-t3-medium text-foreground">{task.title}</Text>
-            <Notice>{task.state}</Notice>
-          </Pressable>
-        ))}
-        {tasks?.records.length === 0 ? <Notice>No tasks on this page.</Notice> : null}
-        {query.data !== null && tasks === null ? (
-          <Notice>This server returned an unsupported task page.</Notice>
-        ) : null}
-        <View className="flex-row flex-wrap gap-2">
-          <WorkButton
-            disabled={offset === 0 || query.isPending}
-            onPress={() => setOffset(Math.max(0, offset - 50))}
-          >
-            Previous tasks
-          </WorkButton>
-          <WorkButton
-            disabled={tasks?.nextOffset === null || tasks === null || query.isPending}
-            onPress={() => {
-              if (tasks?.nextOffset !== null && tasks?.nextOffset !== undefined)
-                setOffset(tasks.nextOffset);
-            }}
-          >
-            Next tasks
-          </WorkButton>
-        </View>
-        <Notice>Task page {Math.floor(offset / 50) + 1}</Notice>
-      </WorkCard>
+            ) : null}
+            {sync.map((cursor) => (
+              <Notice key={cursor.recordId}>
+                {cursor.status}
+                {cursor.lastSuccessfulPageAt
+                  ? ` · Last successful sync ${cursor.lastSuccessfulPageAt}`
+                  : " · No successful sync recorded"}
+                {cursor.error ? ` · ${cursor.error}` : ""}
+              </Notice>
+            ))}
+            {issues.slice(currentIssuePage * 25, (currentIssuePage + 1) * 25).map((issue) => (
+              <View key={issue.recordId} className="gap-2 border-t border-border pt-3">
+                <Text className="font-t3-medium text-foreground">
+                  {issue.repositoryName} #{issue.identity.number} · {issue.status}
+                </Text>
+                <Text selectable className="text-foreground">
+                  {issue.title}
+                </Text>
+                <Notice>Observed {issue.observedAt}</Notice>
+                <Text selectable className="text-sm text-foreground-muted">
+                  {issue.body}
+                </Text>
+                {issue.taskId ? (
+                  <WorkButton onPress={() => openTask(issue.taskId!)}>Open linked task</WorkButton>
+                ) : (
+                  <Notice>
+                    This issue has no linked task. Refine it in the web or desktop Work view.
+                  </Notice>
+                )}
+              </View>
+            ))}
+            {foundationSupported && issues.length === 0 ? (
+              <Notice>
+                {foundation.current ? "No issues in this project." : "Loading issue intake…"}
+              </Notice>
+            ) : null}
+            <View className="flex-row flex-wrap gap-2">
+              <WorkButton
+                disabled={currentIssuePage === 0}
+                onPress={() => setIssuePage(currentIssuePage - 1)}
+              >
+                Previous issues
+              </WorkButton>
+              <WorkButton
+                disabled={currentIssuePage + 1 >= pageCount}
+                onPress={() => setIssuePage(currentIssuePage + 1)}
+              >
+                Next issues
+              </WorkButton>
+            </View>
+            <Notice>
+              Issue page {currentIssuePage + 1} of {pageCount}
+            </Notice>
+          </WorkCard>
+          <WorkCard title="Tasks">
+            {query.isPending ? <Notice>Refreshing tasks…</Notice> : null}
+            {tasks?.records.map((task) => (
+              <Pressable
+                key={task.taskId}
+                accessibilityRole="button"
+                onPress={() => openTask(task.taskId)}
+                className="gap-1 border-t border-border py-3"
+              >
+                <Text className="font-t3-medium text-foreground">{task.title}</Text>
+                <Notice>{task.state}</Notice>
+              </Pressable>
+            ))}
+            {tasks?.records.length === 0 ? <Notice>No tasks on this page.</Notice> : null}
+            {query.data !== null && tasks === null ? (
+              <Notice>This server returned an unsupported task page.</Notice>
+            ) : null}
+            <View className="flex-row flex-wrap gap-2">
+              <WorkButton
+                disabled={offset === 0 || query.isPending}
+                onPress={() => setOffset(Math.max(0, offset - 50))}
+              >
+                Previous tasks
+              </WorkButton>
+              <WorkButton
+                disabled={tasks?.nextOffset === null || tasks === null || query.isPending}
+                onPress={() => {
+                  if (tasks?.nextOffset !== null && tasks?.nextOffset !== undefined)
+                    setOffset(tasks.nextOffset);
+                }}
+              >
+                Next tasks
+              </WorkButton>
+            </View>
+            <Notice>Task page {Math.floor(offset / 50) + 1}</Notice>
+          </WorkCard>
+        </>
+      )}
     </WorkSurface>
   );
 }
