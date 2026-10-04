@@ -9,6 +9,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
+import * as Scheduler from "effect/Scheduler";
 import * as ServerSecrets from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
@@ -117,6 +118,192 @@ const control = Effect.gen(function* () {
 });
 
 it.layer(NodeServices.layer)("project team execution reactor", (it) => {
+  for (const [budget, maxOps] of [
+    [0, 2048],
+    [26, 2048],
+    [27, 2048],
+    [28, 2048],
+    [undefined, 27],
+    [undefined, 2048],
+  ] as const) {
+    it.effect(
+      `settles concurrent drains after joined stop with ${budget === undefined ? `ordinary scheduler budget ${maxOps}` : `one scheduler yield at ${budget}`}`,
+      () =>
+        Effect.gen(function* () {
+          yield* enable;
+          const entered = yield* Deferred.make<void>();
+          let stops = 0;
+          let finalized = 0;
+          const reactor = yield* makeProjectTeamExecutionReactor({
+            start: Effect.gen(function* () {
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  finalized++;
+                }),
+              );
+              return {
+                ready: Effect.void,
+                sweep: Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+                stop: Effect.sync(() => {
+                  stops++;
+                }),
+              };
+            }),
+          });
+          yield* Deferred.await(entered);
+          const base = new Scheduler.MixedScheduler("sync", () => () => {});
+          const dispatcher = base.makeDispatcher();
+          const yielded = new Set<number>();
+          const scheduler: Scheduler.Scheduler = {
+            executionMode: "sync",
+            shouldYield: (fiber) => {
+              if (budget === undefined) return base.shouldYield(fiber);
+              if (budget !== 0 && !yielded.has(fiber.id) && fiber.currentOpCount >= budget) {
+                yielded.add(fiber.id);
+                return true;
+              }
+              return false;
+            },
+            makeDispatcher: () => dispatcher,
+          };
+          const drains = yield* Effect.forEach(Array.from({ length: 24 }), () =>
+            Effect.forkChild(
+              reactor
+                .drain()
+                .pipe(
+                  Effect.provideService(Scheduler.Scheduler, scheduler),
+                  Effect.provideService(Scheduler.MaxOpsBeforeYield, maxOps),
+                ),
+              { startImmediately: true },
+            ),
+          );
+          yield* Effect.sync(() => dispatcher.flush());
+          yield* reactor.stop;
+          const exits = yield* Effect.sync(() => {
+            dispatcher.flush();
+            return drains.map((fiber) => fiber.pollUnsafe());
+          });
+          // A quiescent dispatcher after joined stop proves a lost waiter without a timeout.
+          yield* Effect.sync(() => {
+            for (const fiber of drains) fiber.interruptUnsafe();
+            dispatcher.flush();
+          });
+          yield* Effect.forEach(drains, Fiber.await);
+          assert.equal(exits.filter((exit) => exit === undefined).length, 0);
+          assert.isTrue(
+            exits.every(
+              (exit) =>
+                exit !== undefined && Exit.isSuccess(exit) && exit.value.status === "stopped",
+            ),
+          );
+          if (budget !== undefined) assert.equal(yielded.size, budget === 0 ? 0 : 24);
+          assert.equal(stops, 1);
+          assert.equal(finalized, 1);
+        }).pipe(Effect.scoped, Effect.provide(services())),
+    );
+  }
+  for (const [budget, maxOps] of [
+    [0, 2048],
+    [7, 2048],
+    [8, 2048],
+    [9, 2048],
+    [undefined, 8],
+    [undefined, 2048],
+  ] as const) {
+    it.effect(
+      `joins concurrent stop callers with ${budget === undefined ? `ordinary scheduler budget ${maxOps}` : `one scheduler yield at ${budget}`}`,
+      () =>
+        Effect.gen(function* () {
+          yield* enable;
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          let stops = 0;
+          let finalized = 0;
+          const reactor = yield* makeProjectTeamExecutionReactor({
+            start: Effect.gen(function* () {
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  finalized++;
+                }),
+              );
+              return {
+                ready: Effect.void,
+                sweep: Effect.void,
+                stop: Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(
+                    Effect.sync(() => {
+                      stops++;
+                    }),
+                  ),
+                ),
+              };
+            }),
+          });
+          yield* reactor.ready;
+          const parentId = yield* Effect.fiberId;
+          const ordinary = new Scheduler.MixedScheduler("sync");
+          let automatic = false;
+          const makeScheduler = () => {
+            const base = new Scheduler.MixedScheduler("sync", (task) =>
+              automatic ? ordinary.setImmediate(task) : () => {},
+            );
+            const dispatcher = base.makeDispatcher();
+            const yielded = new Set<number>();
+            const scheduler: Scheduler.Scheduler = {
+              executionMode: "sync",
+              shouldYield: (fiber) => {
+                if (fiber.id === parentId) return false;
+                if (budget === undefined) return base.shouldYield(fiber);
+                if (budget !== 0 && !yielded.has(fiber.id) && fiber.currentOpCount >= budget) {
+                  yielded.add(fiber.id);
+                  return true;
+                }
+                return false;
+              },
+              makeDispatcher: () => dispatcher,
+            };
+            return { scheduler, dispatcher };
+          };
+          const a = makeScheduler();
+          const b = makeScheduler();
+          // Detached test fibers expose the failing baseline; successful shutdown joins them all.
+          const first = yield* Effect.forkDetach(reactor.stop, { startImmediately: true }).pipe(
+            Effect.provideService(Scheduler.Scheduler, a.scheduler),
+            Effect.provideService(Scheduler.MaxOpsBeforeYield, maxOps),
+          );
+          const second = yield* Effect.forkDetach(reactor.stop, { startImmediately: true }).pipe(
+            Effect.provideService(Scheduler.Scheduler, b.scheduler),
+            Effect.provideService(Scheduler.MaxOpsBeforeYield, maxOps),
+          );
+          yield* Effect.sync(() => a.dispatcher.flush());
+          yield* Deferred.await(entered);
+          const observer = yield* Effect.forkDetach(reactor.stop, { startImmediately: true }).pipe(
+            Effect.provideService(Scheduler.Scheduler, {
+              executionMode: "sync",
+              shouldYield: () => false,
+              makeDispatcher: () => ordinary.makeDispatcher(),
+            }),
+          );
+          yield* Effect.sync(() => b.dispatcher.flush());
+          automatic = true;
+          yield* Deferred.succeed(release, undefined);
+          yield* Effect.sync(() => {
+            a.dispatcher.flush();
+            b.dispatcher.flush();
+          });
+          assert.isTrue(Exit.isSuccess(yield* Fiber.await(first)));
+          assert.isTrue(Exit.isSuccess(yield* Fiber.await(second)));
+          yield* reactor.stop;
+          const exit = yield* Effect.sync(() => observer.pollUnsafe());
+          if (exit === undefined) yield* Effect.sync(() => observer.interruptUnsafe());
+          assert.isDefined(exit);
+          assert.isTrue(Exit.isSuccess(yield* Fiber.await(observer)));
+          assert.equal(stops, 1);
+          assert.equal(finalized, 1);
+        }).pipe(Effect.scoped, Effect.provide(services())),
+    );
+  }
   it.effect(
     "subscribes before the snapshot so concurrent settings and work commits survive startup",
     () =>

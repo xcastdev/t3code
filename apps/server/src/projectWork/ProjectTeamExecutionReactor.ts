@@ -188,7 +188,9 @@ export const makeProjectTeamExecutionReactor = Effect.fn("ProjectTeamExecutionRe
     const close = Effect.uninterruptible(
       Effect.gen(function* () {
         if (stopResult !== undefined) return yield* Deferred.await(stopResult);
-        stopResult = yield* Deferred.make<void, Error>();
+        // Publish the join and revoke scheduling before yielding to cleanup.
+        const joined = Deferred.makeUnsafe<void, Error>();
+        stopResult = joined;
         stopped = true;
         if (active !== undefined) {
           yield* closeGeneration(active).pipe(Effect.exit);
@@ -202,11 +204,8 @@ export const makeProjectTeamExecutionReactor = Effect.fn("ProjectTeamExecutionRe
         yield* finish(pending);
         yield* finish(processing);
         pending = undefined;
-        yield* Deferred.done(
-          stopResult,
-          failure === undefined ? Exit.void : Exit.failCause(failure),
-        );
-        return yield* Deferred.await(stopResult);
+        yield* Deferred.done(joined, failure === undefined ? Exit.void : Exit.failCause(failure));
+        return yield* Deferred.await(joined);
       }),
     );
     const stop = Effect.uninterruptibleMask((restore) =>
@@ -356,8 +355,8 @@ export const makeProjectTeamExecutionReactor = Effect.fn("ProjectTeamExecutionRe
             ) {
               yield* observed(afterCursor);
               if (stopped) return receipt();
-              if (pending === undefined)
-                pending = yield* Deferred.make<ProjectTeamExecutionReceipt, Error>();
+              // Publishing and capturing the shared waiter must not yield.
+              pending ??= Deferred.makeUnsafe<ProjectTeamExecutionReceipt, Error>();
               const waiter = pending;
               yield* Queue.offer(wake, undefined);
               return yield* Deferred.await(waiter);
