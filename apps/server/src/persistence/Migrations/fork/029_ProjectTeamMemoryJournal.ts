@@ -16,6 +16,10 @@ export default Effect.gen(function* () {
     manifest_json TEXT NOT NULL CHECK(json_valid(manifest_json)
       AND length(CAST(manifest_json AS BLOB)) <= 4194304)
   )`;
+  yield* sql`CREATE TRIGGER project_team_memory_manifest_first_winner
+    BEFORE INSERT ON project_team_memory_manifest WHEN EXISTS (
+      SELECT 1 FROM project_team_memory_manifest WHERE extraction_id=NEW.extraction_id
+    ) BEGIN SELECT RAISE(IGNORE); END`;
   yield* sql`CREATE TRIGGER project_team_memory_manifest_immutable
     BEFORE UPDATE ON project_team_memory_manifest WHEN
       NEW.extraction_id <> OLD.extraction_id OR NEW.environment_id <> OLD.environment_id
@@ -38,6 +42,11 @@ export default Effect.gen(function* () {
       OR (status IN ('claimed','uncertain') AND claim_generation>0 AND receipt_json IS NULL)
       OR (status='settled' AND claim_generation>0 AND receipt_json IS NOT NULL))
   )`;
+  // Duplicate creation preserves the current epoch and receipt; only UPDATE progresses it.
+  yield* sql`CREATE TRIGGER project_team_memory_job_first_winner
+    BEFORE INSERT ON project_team_memory_job WHEN EXISTS (
+      SELECT 1 FROM project_team_memory_job WHERE effect_id=NEW.effect_id
+    ) BEGIN SELECT RAISE(IGNORE); END`;
   yield* sql`CREATE TRIGGER project_team_memory_job_identity_immutable
     BEFORE UPDATE ON project_team_memory_job WHEN
       NEW.effect_id <> OLD.effect_id OR NEW.environment_id <> OLD.environment_id

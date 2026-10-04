@@ -49,6 +49,10 @@ it.effect("retains immutable cleanup and manifest bytes after source projections
       ).toBe("Failure");
     yield* sql`INSERT INTO project_team_memory_job VALUES
       ('effect','foreign','foreign','{}',0,'pending',NULL) ON CONFLICT(effect_id) DO NOTHING`;
+    const manifest = yield* sql`SELECT * FROM project_team_memory_manifest`;
+    yield* sql`INSERT OR REPLACE INTO project_team_memory_manifest VALUES
+      ('extraction','foreign','foreign','foreign',3,4,'{}')`;
+    expect(yield* sql`SELECT * FROM project_team_memory_manifest`).toEqual(manifest);
     yield* sql.withTransaction(purgeProjectTeamRecords(sql, "project"));
     expect(yield* sql`SELECT * FROM project_team_memory_source`).toEqual([]);
     expect(
@@ -87,7 +91,17 @@ it.effect("fences recovery epochs and makes completed receipts absorbing", () =>
       (yield* sql`UPDATE project_team_memory_job SET status='claimed'`.pipe(Effect.result))._tag,
     ).toBe("Failure");
     yield* sql`UPDATE project_team_memory_job SET status='claimed',claim_generation=2`;
+    const claimed = yield* sql`SELECT * FROM project_team_memory_job`;
+    yield* sql`INSERT INTO project_team_memory_job VALUES
+      ('effect','foreign','foreign','{}',0,'pending',NULL) ON CONFLICT(effect_id) DO NOTHING`;
+    expect(yield* sql`SELECT * FROM project_team_memory_job`).toEqual(claimed);
     yield* sql`UPDATE project_team_memory_job SET status='settled',receipt_json='{"complete":true}'`;
+    const settled = yield* sql`SELECT * FROM project_team_memory_job`;
+    yield* sql`INSERT OR REPLACE INTO project_team_memory_job VALUES
+      ('effect','foreign','foreign','{}',0,'pending',NULL)`;
+    yield* sql`INSERT INTO project_team_memory_job VALUES
+      ('effect','environment','project','{}',0,'pending',NULL) ON CONFLICT(effect_id) DO NOTHING`;
+    expect(yield* sql`SELECT * FROM project_team_memory_job`).toEqual(settled);
     for (const mutation of [
       sql`UPDATE project_team_memory_job SET status='claimed',receipt_json=NULL`,
       sql`UPDATE project_team_memory_job SET receipt_json='{}'`,

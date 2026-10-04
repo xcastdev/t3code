@@ -17,6 +17,11 @@ export default Effect.gen(function* () {
     receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)
       AND length(CAST(receipt_json AS BLOB)) <= 262144)
   )`;
+  // BEFORE INSERT also fences OR REPLACE, which bypasses UPDATE immutability.
+  yield* sql`CREATE TRIGGER project_team_workspace_receipt_first_winner
+    BEFORE INSERT ON project_team_workspace_receipt WHEN EXISTS (
+      SELECT 1 FROM project_team_workspace_receipt WHERE dispatch_id=NEW.dispatch_id
+    ) BEGIN SELECT RAISE(IGNORE); END`;
   yield* sql`CREATE TRIGGER project_team_workspace_receipt_immutable
     BEFORE UPDATE ON project_team_workspace_receipt WHEN
       NEW.dispatch_id <> OLD.dispatch_id OR NEW.environment_id <> OLD.environment_id

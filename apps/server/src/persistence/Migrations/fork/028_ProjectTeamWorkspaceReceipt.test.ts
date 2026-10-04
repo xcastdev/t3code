@@ -61,6 +61,10 @@ it.effect("retains the original workspace receipt without changing prior dispatc
     }
     yield* sql`INSERT INTO project_team_workspace_receipt VALUES
       ('dispatch','changed','changed',1,2,'{}','{}') ON CONFLICT(dispatch_id) DO NOTHING`;
+    const winner = yield* sql`SELECT * FROM project_team_workspace_receipt`;
+    yield* sql`INSERT OR REPLACE INTO project_team_workspace_receipt VALUES
+      ('dispatch','foreign','foreign',4,8,'{}','{}')`;
+    expect(yield* sql`SELECT * FROM project_team_workspace_receipt`).toEqual(winner);
     expect((yield* sql`SELECT receipt_json FROM project_team_workspace_receipt`)[0]).toEqual({
       receipt_json: '{"receipt":true}',
     });
