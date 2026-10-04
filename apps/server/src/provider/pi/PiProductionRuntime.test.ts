@@ -357,6 +357,9 @@ for (const alias of [
 // This opt-in group consumes real built npm assets and the actual factory/Runtime/SQL.
 // It stages and inspects only; it does not activate the SDK or contact a model provider.
 const product = distribution ? it.effect : it.effect.skip;
+const decodeSdkVersion = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ version: Schema.String })),
+);
 const enabledFixture = Effect.gen(function* () {
   const f = yield* fixture;
   const service = yield* construct(f);
@@ -368,6 +371,72 @@ const stageFrom = (f: Effect.Success<typeof fixture>) => {
   const source = files![0]!.source;
   return source.slice(0, source.lastIndexOf("/"));
 };
+product("publishes immutable limits from captured options and the owned SDK metadata", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const published: PiProductionRuntimeAssets[] = [];
+      const service = yield* construct(f, {
+        publishAssets: (_id, assets) =>
+          Effect.sync(() => published.push(assets)).pipe(Effect.asVoid),
+      });
+      Reflect.set(f.options, "maxInputTokens", 90000);
+      Reflect.set(f.options, "maxOutputTokens", 4096);
+      yield* service.forInstance(instance);
+      const assets = published[0]!;
+      const metadata = assets.runtimeFiles.find(
+        (file) => file.target === "/runtime/dist/pi-sdk/package.json",
+      );
+      expect(metadata).toBeDefined();
+      const sdk = yield* decodeSdkVersion(yield* f.fs.readFileString(metadata!.source));
+      expect(assets.runtimeFacts).toEqual({
+        runtimeVersion: sdk.version,
+        maxInputTokens: 10000,
+        maxOutputTokens: 512,
+      });
+      expect(f.captured[0]!.maxInputTokens).toBe(10000);
+      expect(f.captured[0]!.maxOutputTokens).toBe(512);
+      expect(assets.instanceConfiguration).toEqual({ enabled: true, configuration: {} });
+      expect(Object.isFrozen(assets.runtimeFacts)).toBe(true);
+      expect(Reflect.set(assets.runtimeFacts!, "maxInputTokens", 1)).toBe(false);
+      yield* assets.borrow(assets.revalidate);
+      expect(f.fetch).not.toHaveBeenCalled();
+    }),
+  ),
+);
+product("publishes the original instance configuration during a held owned asset publication", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const mutable = { ...instance, configuration: { agentDirectory: f.options.agentDirectory } };
+      let published: PiProductionRuntimeAssets | undefined;
+      const service = yield* construct(f, {
+        publishAssets: (_id, assets) =>
+          Effect.gen(function* () {
+            published = assets;
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+          }),
+      });
+      const starting = yield* service.forInstance(mutable).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      mutable.configuration.agentDirectory = f.root + "/foreign";
+      mutable.enabled = false;
+      expect(published!.instanceConfiguration).toEqual({
+        enabled: true,
+        configuration: { agentDirectory: f.options.agentDirectory },
+      });
+      expect(Object.isFrozen(published!.instanceConfiguration)).toBe(true);
+      expect(Object.isFrozen(published!.instanceConfiguration!.configuration)).toBe(true);
+      yield* published!.borrow(published!.revalidate);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(starting);
+      expect(f.fetch).not.toHaveBeenCalled();
+    }),
+  ),
+);
 product("published runtime and assets belong to the exact returned instance scope", () =>
   scoped(
     Effect.gen(function* () {

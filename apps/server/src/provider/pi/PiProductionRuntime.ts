@@ -9,6 +9,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import {
   PiManagedRuntime,
+  PiDriverConfiguration,
   PiManagedRuntimeError,
   type PiManagedRuntimeInstance,
   type PiManagedOperationRequest,
@@ -51,6 +52,16 @@ const Options = Schema.Struct({
 export type PiProductionRuntimeOptions = typeof Options.Type;
 /** Private Root handoff. Assets and runtime are owned by the same instance scope. */
 export interface PiProductionRuntimeAssets {
+  readonly instanceConfiguration?: {
+    readonly enabled: boolean;
+    readonly configuration: PiDriverConfiguration;
+  };
+  /** Captured limits and version from the owned validated SDK closure; never caller metadata. */
+  readonly runtimeFacts?: {
+    readonly runtimeVersion: "0.99.1";
+    readonly maxInputTokens: number;
+    readonly maxOutputTokens: number;
+  };
   readonly runtimeFiles: ReadonlyArray<{ readonly source: string; readonly target: string }>;
   readonly revalidate: Effect.Effect<void, PiManagedRuntimeError>;
   readonly borrow: <A, E, R>(
@@ -69,6 +80,9 @@ export interface PiProductionRuntimeHooks {
   ) => Effect.Effect<void, PiManagedRuntimeError, Scope.Scope>;
 }
 const decodeOptions = Schema.decodeEffect(Options, { onExcessProperty: "error" });
+const decodeConfiguration = Schema.decodeUnknownEffect(PiDriverConfiguration, {
+  onExcessProperty: "error",
+});
 const FileIdentity = Schema.Struct({
   source: absolute,
   target: absolute,
@@ -319,7 +333,11 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
 ) {
   const publishAssets = hooks?.publishAssets;
   const resolveOperationId = hooks?.resolveOperationId;
-  const options = yield* decodeOptions(supplied).pipe(Effect.mapError(unavailable));
+  const decodedOptions = yield* decodeOptions(supplied).pipe(Effect.mapError(unavailable));
+  const options = Object.freeze({
+    ...decodedOptions,
+    protectedRoots: Object.freeze([...decodedOptions.protectedRoots]),
+  });
   const sql = yield* SqlClient.SqlClient;
   const outsideTransaction = Effect.gen(function* () {
     if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
@@ -359,8 +377,15 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       credentials: "omit",
       signal: init.signal,
     });
-  const forInstance: PiManagedRuntime["Service"]["forInstance"] = (instance) =>
+  const forInstance: PiManagedRuntime["Service"]["forInstance"] = (suppliedInstance) =>
     Effect.gen(function* () {
+      const configuration = yield* decodeConfiguration(suppliedInstance.configuration).pipe(
+        Effect.mapError(unavailable),
+      );
+      const instance = Object.freeze({
+        ...suppliedInstance,
+        configuration: Object.freeze({ ...configuration }),
+      });
       yield* outsideTransaction;
       if (!instance.enabled) {
         const runtime = yield* makePiManagedRuntimeLive({
@@ -588,6 +613,15 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       });
       if (publishAssets) {
         const published: PiProductionRuntimeAssets = Object.freeze({
+          instanceConfiguration: Object.freeze({
+            enabled: instance.enabled,
+            configuration: instance.configuration,
+          }),
+          runtimeFacts: Object.freeze({
+            runtimeVersion: assets.sdkVersion,
+            maxInputTokens: options.maxInputTokens,
+            maxOutputTokens: options.maxOutputTokens,
+          }),
           runtimeFiles: Object.freeze(
             assets.runtimeFiles.map((file) => Object.freeze({ ...file })),
           ),
