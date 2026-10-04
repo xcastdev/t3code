@@ -258,6 +258,8 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     readonly maximumEnvironmentModelCalls: number;
     /** Trusted Root checks actual retained Git/setup/native receipts. No client or worker predicate. */
     readonly verifyStage?: ProjectTeamDispatchStageVerifier;
+    /** Root checks original worker/setup/model owners joined, including retained transport accounting. */
+    readonly verifySettlement?: ProjectTeamDispatchStageVerifier;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const repository = yield* ProjectWorkRepository;
@@ -803,6 +805,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           // Implementation also reserves its setup writes, even when its local tool subset is read-only.
           const writable =
             role.role === "implementer" ||
+            role.role === "integrator" ||
             ["pi.write", "pi.edit", "pi.bash"].some((tool) =>
               binding.configuration.toolIds.includes(tool),
             );
@@ -1326,6 +1329,119 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         }),
       );
     });
+    const settleAfterJoined = Effect.fn("ProjectTeamDispatchJournal.settleAfterJoined")(function* (
+      expected: ProjectTeamDispatchFence,
+      input: ProjectTeamDispatchStageReceipt,
+    ) {
+      const receipt = yield* decodeStageReceipt(input).pipe(
+        Effect.mapError(() => deny("Invalid joined settlement receipt")),
+      );
+      const verify = options.verifySettlement;
+      if (receipt.stage !== "settled" || verify === undefined)
+        return yield* deny("Original joined-owner settlement verification is unavailable");
+      let settled: Effect.Success<ReturnType<typeof advanceStage>> | undefined;
+      const assertDomainSettled = Effect.gen(function* () {
+        const value = yield* read(expected.dispatchId);
+        yield* readStageHistory(value.row, value.intent);
+        if (value.row.stage !== "settled") return yield* deny("Dispatch has no terminal receipt");
+        yield* verify(receipt, { fence: fence(value.row), intent: value.intent });
+        if (yield* isProjectWorkTombstoned(sql, value.row.project_id)) return;
+        const state = yield* readCurrentState(sql, value.row.project_id);
+        const records = state.foundationRecords ?? [];
+        const binding = records.find(
+          (r) => r.kind === "run-binding" && r.recordId === value.row.binding_id,
+        );
+        const writer = records.find((r) => r.recordId === value.intent.writableReservationId);
+        const attempt = state.attempts.find((a) => a.attemptId === value.row.attempt_id);
+        if (
+          binding?.kind !== "run-binding" ||
+          binding.status !== "settled" ||
+          binding.generation !== value.row.generation ||
+          (value.intent.writableReservationId !== undefined &&
+            (writer?.kind !== "reservation" ||
+              writer.status !== "released" ||
+              writer.runId !== binding.recordId)) ||
+          attempt === undefined ||
+          attempt.state === "leased" ||
+          attempt.state === "running" ||
+          records.some(
+            (r) =>
+              r.kind === "effect" &&
+              r.runId === binding.recordId &&
+              (r.effectKind === "dispatch" || r.effectKind === "stop") &&
+              (r.status === "pending" || r.status === "claimed" || r.status === "uncertain"),
+          )
+        )
+          return yield* deny("Joined settlement has incomplete domain ownership");
+      });
+      yield* repository.executeAtomic(
+        Effect.gen(function* () {
+          const original = yield* read(expected.dispatchId);
+          yield* readStageHistory(original.row, original.intent);
+          yield* verify(receipt, { fence: fence(original.row), intent: original.intent });
+          settled = yield* advanceStage(expected, receipt);
+          if (yield* isProjectWorkTombstoned(sql, original.row.project_id)) return [];
+          const state = yield* readCurrentState(sql, original.row.project_id);
+          const records = state.foundationRecords ?? [];
+          const binding = records.find(
+            (r) => r.kind === "run-binding" && r.recordId === original.row.binding_id,
+          );
+          if (binding?.kind !== "run-binding" || binding.generation !== original.row.generation)
+            return yield* deny("Original settlement binding is missing or replaced");
+          if (binding.status === "settled") return [];
+          const task = state.tasks.find((t) => t.taskId === original.row.task_id);
+          const attempt = state.attempts.find((a) => a.attemptId === original.row.attempt_id);
+          if (task === undefined || attempt === undefined)
+            return yield* deny("Original settlement task or attempt is missing");
+          const at = time(yield* Clock.currentTimeMillis);
+          const command: typeof ProjectWorkFoundationCommitCommand.Type = {
+            type: "project-work.foundation.commit",
+            projectId: original.intent.compiledClaim.projectId,
+            commandId: CommandId.make(
+              projectTeamDerivedRecordId(receipt.receiptId, "joined-domain"),
+            ),
+            expectedRevision: state.revision,
+            attribution: {
+              actor: { kind: "system", id: "project-team-runtime" },
+              source: { kind: "system", id: "project-team-runtime" },
+              recordedAt: at,
+            },
+            records: [],
+            committedAt: at,
+            transition: {
+              kind: "run.settle",
+              bindingId: binding.recordId,
+              generation: binding.generation,
+              expectedBindingRevision: binding.revision,
+              taskId: task.taskId,
+              expectedTaskRevision: task.revision,
+              attemptId: attempt.attemptId,
+              expectedAttemptRevision: attempt.revision,
+              dispatchId: expected.dispatchId,
+              receiptId: receipt.receiptId,
+              ...(original.intent.writableReservationId === undefined
+                ? {}
+                : {
+                    writableReservationId: original.intent.writableReservationId,
+                  }),
+              effectIds: records.flatMap((r) =>
+                r.kind === "effect" &&
+                r.runId === binding.recordId &&
+                (r.effectKind === "dispatch" || r.effectKind === "stop") &&
+                (r.status === "pending" || r.status === "claimed" || r.status === "uncertain")
+                  ? [r.recordId]
+                  : [],
+              ),
+            },
+          };
+          return [command];
+        }),
+        assertDomainSettled,
+      );
+      if (settled === undefined)
+        return yield* deny("Joined settlement returned no durable receipt");
+      return settled;
+    });
     return {
       reserve,
       inspect,
@@ -1335,6 +1451,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       readRecoveryCandidates,
       advanceStage,
       readStageReceipts,
+      settleAfterJoined,
     };
   },
 );

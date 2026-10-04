@@ -58,6 +58,11 @@ export const validateProjectTeamRecord = (
     readonly commandId: string;
     readonly inheritedGateId?: string;
   },
+  settlement?: {
+    readonly bindingId: string;
+    readonly generation: number;
+    readonly receiptId: string;
+  },
 ): TeamRecord => {
   const r = decodeTeamRecord(input);
   const records = state.foundationRecords ?? [];
@@ -372,6 +377,8 @@ export const validateProjectTeamRecord = (
         reject("Stale evidence cannot be blessed for a later revision");
       break;
     case "reservation": {
+      if (old?.kind === "reservation" && old.status === "released" && r.status === "held")
+        reject("Released reservation cannot regain capacity");
       if (
         old?.kind === "reservation" &&
         (r.maximumTokens !== old.maximumTokens ||
@@ -392,6 +399,18 @@ export const validateProjectTeamRecord = (
       )
         reject("Reservation requires exact run ownership");
       if (r.consumedTokens > r.maximumTokens) reject("Reservation exceeds maximum tokens");
+      // Only the private joined-run transition may release an original reservation
+      // after configuration/authority has been revoked. It grants no new capacity.
+      if (
+        settlement !== undefined &&
+        old?.kind === "reservation" &&
+        old.status === "held" &&
+        r.status === "released" &&
+        run.recordId === settlement.bindingId &&
+        run.generation === settlement.generation &&
+        run.status === "settled"
+      )
+        break;
       const limits = records.find(
         (entry) =>
           entry.kind === "limits" && entry.status === "configured" && entry.model === run.model,

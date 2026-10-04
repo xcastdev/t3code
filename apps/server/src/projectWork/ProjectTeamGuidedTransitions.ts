@@ -1,4 +1,5 @@
 import {
+  canonicalProjectWorkPayload,
   ProjectWorkBlockerId,
   ProjectWorkTaskId,
   type ProjectTeamRecord,
@@ -64,10 +65,11 @@ export const decideProjectTeamGuidedTransition = (
   const record = (
     r: ProjectTeamRecord,
     consumption?: { runId: string; commandId: string; inheritedGateId?: string },
+    settlement?: { bindingId: string; generation: number; receiptId: string },
   ) =>
     emit({
       type: "project-work.foundation.recorded",
-      record: validateProjectTeamRecord(state, r, command.attribution, consumption),
+      record: validateProjectTeamRecord(state, r, command.attribution, consumption, settlement),
       occurredAt: at,
     });
   const records = () => state.foundationRecords ?? [];
@@ -223,6 +225,100 @@ export const decideProjectTeamGuidedTransition = (
     });
   };
   switch (transition!.kind) {
+    case "run.settle": {
+      const t = transition!;
+      if (
+        command.attribution.actor.kind !== "system" ||
+        command.attribution.actor.id !== "project-team-runtime"
+      )
+        reject("Joined run settlement requires the private runtime producer");
+      const run = records().find(
+        (r): r is Binding => r.kind === "run-binding" && r.recordId === t.bindingId,
+      );
+      const task = assertKnownTask(state, t.taskId);
+      const attempt = state.attempts.find((a) => a.attemptId === t.attemptId);
+      if (
+        run === undefined ||
+        run.status === "settled" ||
+        run.generation !== t.generation ||
+        run.leaseGeneration !== t.generation ||
+        run.revision !== t.expectedBindingRevision ||
+        run.taskId !== t.taskId ||
+        run.attemptId !== t.attemptId ||
+        task.revision !== t.expectedTaskRevision ||
+        attempt === undefined ||
+        attempt.taskId !== task.taskId ||
+        attempt.revision !== t.expectedAttemptRevision
+      )
+        reject("Joined run settlement identity changed");
+      const effects = records().filter(
+        (r): r is Extract<ProjectTeamRecord, { kind: "effect" }> =>
+          r.kind === "effect" &&
+          r.runId === run!.recordId &&
+          (r.effectKind === "dispatch" || r.effectKind === "stop") &&
+          (r.status === "pending" || r.status === "claimed" || r.status === "uncertain"),
+      );
+      if (
+        new Set(t.effectIds).size !== t.effectIds.length ||
+        effects.length !== t.effectIds.length ||
+        effects.some((e) => !t.effectIds.includes(e.recordId)) ||
+        !effects.some((e) => e.effectKind === "dispatch" && e.effectId === t.dispatchId)
+      )
+        reject("Joined run settlement must close the exact original dispatch and stop effects");
+      const writers = records().filter(
+        (r): r is Extract<ProjectTeamRecord, { kind: "reservation" }> =>
+          r.kind === "reservation" &&
+          r.runId === run!.recordId &&
+          r.scope === "project" &&
+          r.resourceKey === "writable",
+      );
+      if (
+        writers.length !== (t.writableReservationId === undefined ? 0 : 1) ||
+        writers.some((r) => r.recordId !== t.writableReservationId || r.status !== "held")
+      )
+        reject("Joined run settlement writer ownership changed");
+      const revisions = [
+        run!.revision,
+        ...effects.map((r) => r.revision),
+        ...writers.map((r) => r.revision),
+      ];
+      if (attempt!.state === "leased" || attempt!.state === "running")
+        revisions.push(attempt!.revision, task.revision);
+      if (
+        revisions.some((value) => !Number.isSafeInteger(value) || value >= Number.MAX_SAFE_INTEGER)
+      )
+        reject("Joined run settlement revision is exhausted");
+      record({ ...run!, status: "settled", revision: run!.revision + 1, updatedAt: at });
+      for (const writer of writers)
+        record(
+          { ...writer, status: "released", revision: writer.revision + 1, updatedAt: at },
+          undefined,
+          { bindingId: run!.recordId, generation: run!.generation, receiptId: t.receiptId },
+        );
+      const outcome = canonicalProjectWorkPayload({
+        dispatchId: t.dispatchId,
+        receiptId: t.receiptId,
+      });
+      for (const effect of effects)
+        record({
+          ...effect,
+          status: "canceled",
+          outcome,
+          revision: effect.revision + 1,
+          updatedAt: at,
+        });
+      if (attempt!.state === "leased" || attempt!.state === "running")
+        emit({
+          type: "project-work.attempt.stopped",
+          taskId: task.taskId,
+          attemptId: attempt!.attemptId,
+          bindingId: run!.recordId,
+          receiptId: t.receiptId,
+          stoppedAt: at,
+          occurredAt: at,
+        });
+      break;
+    }
     case "claim": {
       const t = transition!;
       const task = assertKnownTask(state, t.taskId);
