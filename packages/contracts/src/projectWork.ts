@@ -1502,6 +1502,7 @@ export type ProjectWorkReadRecord = typeof ProjectWorkReadRecord.Type;
 
 /** Stable read surface used by both the WebSocket RPC and MCP adapters. */
 export const ProjectWorkReadOperation = Schema.Literals([
+  "supervision",
   "foundation-records",
   "issue-comments",
   "snapshot",

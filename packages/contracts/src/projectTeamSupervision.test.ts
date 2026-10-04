@@ -1,0 +1,212 @@
+import * as Schema from "effect/Schema";
+import { describe, expect, it } from "vite-plus/test";
+import { ExecutionEnvironmentDescriptor } from "./environment.ts";
+import { ProjectWorkReadIntent } from "./projectWork.ts";
+import { ProjectTeamSupervisionSummary } from "./projectTeamSupervision.ts";
+
+const decode = Schema.decodeUnknownSync(ProjectTeamSupervisionSummary);
+const decodeRead = Schema.decodeUnknownSync(ProjectWorkReadIntent);
+const decodeEnvironment = Schema.decodeUnknownSync(ExecutionEnvironmentDescriptor);
+const counts = {
+  draft: 0,
+  specified: 0,
+  ready: 0,
+  "in-progress": 0,
+  blocked: 0,
+  "in-review": 0,
+  completed: 0,
+  failed: 0,
+  canceled: 0,
+  unknown: 0,
+  total: 0,
+};
+const summary = {
+  projectId: "project",
+  availability: "available",
+  revision: 7,
+  taskCounts: counts,
+  missions: { items: [], hasMore: false },
+  bindings: { items: [], hasMore: false },
+  blockers: { items: [], hasMore: false },
+  questions: { items: [], hasMore: false },
+};
+const common = {
+  recordId: "binding",
+  revision: 5,
+  generation: 1,
+  status: "running",
+  supported: true,
+};
+const binding = {
+  ...common,
+  taskId: "task",
+  attemptId: "attempt",
+  memberId: "member",
+  roleRevisionId: "role-at-start",
+  providerInstanceId: "pi",
+  model: "recorded-cheap-model",
+  workerThreadId: "thread",
+  profile: {
+    ...common,
+    recordId: "role-at-start",
+    status: "retired",
+    roleId: "implementer",
+    roleRevision: 1,
+    role: "implementer",
+    model: "profile-model",
+  },
+};
+
+describe("bounded team supervision contract", () => {
+  it("keeps the frozen binding model separate from the inspected role model", () => {
+    const result = decode({ ...summary, bindings: { items: [binding], hasMore: false } });
+    expect(result).toMatchObject({
+      bindings: { items: [{ model: "recorded-cheap-model", profile: { model: "profile-model" } }] },
+    });
+  });
+
+  it.each(["missing", "deleted", "archived", "tombstoned", "unsupported"])(
+    "has no records for unavailable %s projects",
+    (availability) => {
+      expect(
+        decode({
+          projectId: "project",
+          availability,
+          bindings: { items: [binding], hasMore: false },
+        }),
+      ).toEqual({ projectId: "project", availability });
+    },
+  );
+
+  it("preserves future states and roles as unsupported metadata", () => {
+    expect(
+      decode({
+        ...summary,
+        bindings: {
+          items: [
+            {
+              ...binding,
+              status: "future-state",
+              supported: false,
+              profile: { ...binding.profile, role: "future-role", supported: false },
+            },
+          ],
+          hasMore: true,
+        },
+      }),
+    ).toMatchObject({
+      bindings: {
+        hasMore: true,
+        items: [
+          {
+            status: "future-state",
+            supported: false,
+            profile: { role: "future-role", supported: false },
+          },
+        ],
+      },
+    });
+  });
+
+  it("removes actionable fields and body content from physical malformed markers", () => {
+    const marker = {
+      recordId: "corrupt",
+      revision: 7,
+      status: "running",
+      supported: false,
+      issue: "malformed",
+      taskId: "foreign",
+      workerThreadId: "foreign-thread",
+      objective: "secret",
+      model: "foreign-model",
+    };
+    expect(decode({ ...summary, bindings: { items: [marker], hasMore: false } })).toMatchObject({
+      bindings: {
+        items: [
+          {
+            recordId: "corrupt",
+            revision: 7,
+            status: "running",
+            supported: false,
+            issue: "malformed",
+          },
+        ],
+      },
+    });
+    const result = decode({ ...summary, bindings: { items: [marker], hasMore: false } });
+    if (result.availability !== "available") throw new Error("Expected available metadata");
+    expect(result.bindings.items[0]).toEqual({
+      recordId: "corrupt",
+      revision: 7,
+      status: "running",
+      supported: false,
+      issue: "malformed",
+    });
+  });
+
+  it.each(["missions", "bindings", "blockers", "questions"])(
+    "rejects an oversized %s preview",
+    (key) => {
+      const items =
+        key === "bindings"
+          ? Array.from({ length: 9 }, () => binding)
+          : key === "missions"
+            ? Array.from({ length: 6 }, () => ({ ...common, title: "Mission" }))
+            : key === "blockers"
+              ? Array.from({ length: 6 }, () => ({
+                  recordId: "blocker",
+                  taskId: "task",
+                  revision: 7,
+                  reason: "Waiting",
+                  resolver: "human",
+                }))
+              : Array.from({ length: 6 }, () => ({
+                  ...common,
+                  taskId: "task",
+                  senderId: "member",
+                  targetGateId: "gate",
+                  targetRevision: 7,
+                }));
+      expect(() => decode({ ...summary, [key]: { items, hasMore: true } })).toThrow();
+    },
+  );
+
+  it("bounds captions and rejects unsafe or negative revisions and counts", () => {
+    expect(() =>
+      decode({
+        ...summary,
+        missions: { items: [{ ...common, title: "x".repeat(241) }], hasMore: false },
+      }),
+    ).toThrow();
+    for (const revision of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => decode({ ...summary, revision })).toThrow();
+      expect(() => decode({ ...summary, taskCounts: { ...counts, total: revision } })).toThrow();
+    }
+  });
+
+  it("accepts the project-owned read without implying mutation authority", () => {
+    expect(
+      decodeRead({
+        projectId: "project",
+        operation: "supervision",
+      }),
+    ).toMatchObject({ operation: "supervision" });
+  });
+
+  it("requires an explicit supervision capability under version skew", () => {
+    const old = {
+      environmentId: "environment",
+      label: "Local",
+      platform: { os: "linux", arch: "x64" },
+      serverVersion: "old",
+      capabilities: { repositoryIdentity: true },
+    };
+    expect(decodeEnvironment(old).capabilities.projectTeamSupervisionReads).toBeUndefined();
+    expect(
+      decodeEnvironment({
+        ...old,
+        capabilities: { ...old.capabilities, projectTeamSupervisionReads: true },
+      }).capabilities.projectTeamSupervisionReads,
+    ).toBe(true);
+  });
+});
