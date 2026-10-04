@@ -94,6 +94,10 @@ import type {
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
+import {
+  getProviderTurnEventSubscription,
+  makeProviderTurnPublications,
+} from "../ProviderTurnPublications.ts";
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
@@ -574,6 +578,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const pathService = yield* Path.Path;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const turnPublications = yield* makeProviderTurnPublications();
   const projectMcpLeaseScopes = yield* Ref.make(new Map<ThreadId, ProjectMcpLeaseOwner>());
   const pendingSessionReplacements = yield* Ref.make(
     new Map<ThreadId, PendingSessionReplacement>(),
@@ -1420,7 +1425,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ? canonicalEventLogger.write(canonicalEvent, canonicalEvent.threadId)
           : Effect.void,
       ),
-      Effect.flatMap((canonicalEvent) => PubSub.publish(runtimeEventPubSub, canonicalEvent)),
+      Effect.flatMap((canonicalEvent) =>
+        turnPublications.publish(
+          canonicalEvent,
+          PubSub.publish(runtimeEventPubSub, canonicalEvent).pipe(Effect.asVoid),
+        ),
+      ),
       Effect.asVoid,
     );
 
@@ -1434,10 +1444,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   ): ProviderRuntimeEvent =>
     pending.requestId === undefined
       ? event
-      : {
+      : turnPublications.inherit(event, {
           ...event,
           requestId: RuntimeRequestId.make(String(pending.requestId)),
-        };
+        });
   const compactionTerminal = (event: ProviderRuntimeEvent): string | null =>
     event.type === "turn.completed"
       ? event.payload.state
@@ -1586,9 +1596,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     event: ProviderRuntimeEvent,
   ): Effect.Effect<void> =>
     Effect.gen(function* () {
-      const canonicalEvent = yield* Effect.sync(() =>
-        correlateRuntimeEventWithInstance(source, event),
-      );
+      const canonicalEvent = yield* Effect.sync(() => {
+        const canonical = correlateRuntimeEventWithInstance(source, event);
+        if (
+          source.provider === "piAgent" &&
+          (canonical.type === "turn.completed" || canonical.type === "turn.aborted")
+        )
+          turnPublications.remember(canonical, source);
+        return canonical;
+      });
       yield* increment(providerRuntimeEventsTotal, {
         provider: canonicalEvent.provider,
         eventType: canonicalEvent.type,
@@ -1731,16 +1747,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const adapter = adapterOption.value;
       next.set(id, adapter);
       if (previous.get(id) !== adapter) {
-        yield* Stream.runForEach(adapter.streamEvents, (event) =>
-          processRuntimeEvent(
-            {
-              instanceId: id,
-              provider: adapter.provider,
-              adapter,
-            },
-            event,
-          ),
-        ).pipe(Effect.forkScoped);
+        const source = { instanceId: id, provider: adapter.provider, adapter };
+        const ownedSubscription =
+          adapter.provider === "piAgent" ? getProviderTurnEventSubscription(adapter) : undefined;
+        if (!ownedSubscription) {
+          yield* Stream.runForEach(adapter.streamEvents, (event) =>
+            processRuntimeEvent(source, event),
+          ).pipe(Effect.forkScoped);
+          continue;
+        }
+        const ended = yield* turnPublications.source(source, adapter, id, adapter.provider);
+        // The public Stream is lazy. Acquire the real adapter subscription before
+        // making the factory source available to any registration/send caller.
+        const subscription = yield* ownedSubscription;
+        yield* Stream.runForEach(Stream.fromSubscription(subscription), (event) =>
+          processRuntimeEvent(source, event),
+        ).pipe(Effect.onExit(ended), Effect.forkScoped);
       }
     }
     yield* Ref.set(subscribedAdapters, next);
@@ -3932,7 +3954,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     ),
   );
 
-  return {
+  const service = {
     startSession,
     sendTurn,
     continueFromTerminalCompletion,
@@ -3961,6 +3983,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return Stream.fromPubSub(runtimeEventPubSub);
     },
   } satisfies ProviderService.ProviderService["Service"];
+  turnPublications.bind(service, (id) =>
+    registry.getByInstance(id).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderValidationError({
+            operation: "ProviderService.turnPublications",
+            issue: "Original adapter is unavailable",
+            cause,
+          }),
+      ),
+    ),
+  );
+  return service;
 });
 
 export const ProviderServiceLive = Layer.effect(

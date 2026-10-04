@@ -40,6 +40,8 @@ import { PiWorkerOperation } from "../pi/PiWorkerProtocol.ts";
 import type { PiSessionTerminal } from "../pi/PiSessionRuntime.ts";
 import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
 
+import { registerProviderTurnEventSubscription } from "../ProviderTurnPublications.ts";
+
 const provider = ProviderDriverKind.make("piAgent");
 const invalid = (operation: string, issue: string) =>
   new ProviderAdapterValidationError({ provider, operation, issue });
@@ -1067,7 +1069,7 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
       ),
     ),
   );
-  return {
+  const adapter = {
     provider,
     capabilities: {
       sessionModelSwitch: "unsupported",
@@ -1107,7 +1109,9 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
       Effect.fail(invalid("rollbackThread", "Pi conversation rollback is unsupported.")),
     stopAll,
     streamEvents: Stream.fromPubSub(events),
-  };
+  } satisfies ProviderAdapterShape<ProviderAdapterError>;
+  registerProviderTurnEventSubscription(adapter, PubSub.subscribe(events));
+  return adapter;
 });
 
 /** Capture factory ports synchronously; deferred construction cannot replace Root's resolver. */
