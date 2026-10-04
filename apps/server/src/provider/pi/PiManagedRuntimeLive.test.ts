@@ -2095,79 +2095,71 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
 
 it.effect(
   "selects native workspace access from only the frozen tools and rejects unavailable grants",
-  () =>
-    scoped(
-      Effect.gen(function* () {
-        const f = yield* fixture;
-        const role = {
-          ...f.role,
-          revision: f.role.revision + 1,
-          tools: [
-            "pi.read",
-            "pi.write",
-            "pi.edit",
-            "pi.bash",
-            "terminal",
-            "pull-requests",
-            "external-mcp",
-          ],
-        };
-        yield* restoreHistoricalBinding(role);
-        let revision = f.binding.revision + 1;
-        for (const toolIds of [[], ["pi.read"], ["pi.write"], ["pi.edit"], ["pi.bash"]]) {
+  () => {
+    const checkSelection = (
+      toolIds: string[],
+      available: boolean,
+      roleTools = [
+        "pi.read",
+        "pi.write",
+        "pi.edit",
+        "pi.bash",
+        "terminal",
+        "pull-requests",
+        "external-mcp",
+      ],
+    ) =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          yield* restoreHistoricalBinding({
+            ...f.role,
+            revision: f.role.revision + 1,
+            tools: roleTools,
+          });
           yield* restoreHistoricalBinding({
             ...f.binding,
-            revision: revision++,
+            revision: f.binding.revision + 1,
             configuration: { ...f.binding.configuration, toolIds },
           });
-          const prepared = yield* f.instance.prepareOperation(
-            { threadId, kind: "initialize" },
-            () => Effect.void,
-          );
-          const allocations = yield* f.sql<{
-            allocation_json: string;
-          }>`SELECT allocation_json FROM project_team_pi_process ORDER BY rowid DESC LIMIT 1`;
-          const allocation = yield* decodeWorkspaceAccess(allocations[0]!.allocation_json);
-          expect(allocation.launch.workspaceAccess).toBe(
-            toolIds.some((tool) => tool !== "pi.read") ? "readwrite" : "readonly",
-          );
-          yield* f.instance.requestStop(threadId);
-          yield* rejected(prepared.run);
-        }
-        const before = (yield* f.sql`SELECT * FROM project_team_pi_process`).length;
-        for (const toolIds of [
-          ["terminal"],
-          ["pull-requests"],
-          ["external-mcp"],
-          ["pi.search"],
-          ["pi.delegate"],
-        ]) {
-          yield* restoreHistoricalBinding({
-            ...f.binding,
-            revision: revision++,
-            configuration: { ...f.binding.configuration, toolIds },
-          });
-          yield* rejected(
-            f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
-          );
-        }
-        yield* restoreHistoricalBinding({
-          ...role,
-          revision: role.revision + 1,
-          tools: ["pi.read"],
-        });
-        yield* restoreHistoricalBinding({
-          ...f.binding,
-          revision: revision++,
-          configuration: { ...f.binding.configuration, toolIds: ["pi.write"] },
-        });
-        yield* rejected(
-          f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
-        );
-        expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(before);
-        expect(f.transports).toBe(0);
-      }),
-    ),
+          const before = (yield* f.sql`SELECT * FROM project_team_pi_process`).length;
+          if (available) {
+            const prepared = yield* f.instance.prepareOperation(
+              { threadId, kind: "initialize" },
+              () => Effect.void,
+            );
+            const allocations = yield* f.sql<{
+              allocation_json: string;
+            }>`SELECT allocation_json FROM project_team_pi_process ORDER BY rowid DESC LIMIT 1`;
+            const allocation = yield* decodeWorkspaceAccess(allocations[0]!.allocation_json);
+            expect(allocation.launch.workspaceAccess).toBe(
+              toolIds.some((tool) => tool !== "pi.read") ? "readwrite" : "readonly",
+            );
+            yield* f.instance.requestStop(threadId);
+            yield* rejected(prepared.run);
+          } else {
+            yield* rejected(
+              f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+            );
+            expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(before);
+          }
+          expect(f.transports).toBe(0);
+        }),
+      );
+    return Effect.gen(function* () {
+      for (const toolIds of [[], ["pi.read"], ["pi.write"], ["pi.edit"], ["pi.bash"]])
+        yield* checkSelection(toolIds, true);
+      for (const toolIds of [
+        ["terminal"],
+        ["pull-requests"],
+        ["external-mcp"],
+        ["pi.search"],
+        ["pi.delegate"],
+      ])
+        yield* checkSelection(toolIds, false);
+      yield* checkSelection(["pi.write"], false, ["pi.read"]);
+    });
+  },
 );
 
 const decodeWorkspaceAccess = Schema.decodeEffect(
@@ -4317,13 +4309,6 @@ const stableReplayFixtureFor = (prompt = false) =>
           operationId: "root-stable-assignment",
         }
       : { threadId, kind: "initialize", operationId: "root-stable-initialize" };
-    if (prompt)
-      yield* restoreHistoricalBinding({
-        ...f.binding,
-        revision: f.binding.revision + 1,
-        status: "running",
-        sessionId: "original-native",
-      });
     const operationDirectory =
       f.options.nativeStateRoot +
       "/" +
@@ -4339,7 +4324,7 @@ const stableReplayFixtureFor = (prompt = false) =>
         )
         .digest("hex");
     yield* f.fs.makeDirectory(operationDirectory + "/sessions", { recursive: true });
-    const allocation = yield* preallocatePiManagedProcess({
+    const allocate = preallocatePiManagedProcess({
       workspaceRoot: f.worktree,
       workspaceAccess: "readonly",
       nativeStateRoot: operationDirectory,
@@ -4350,6 +4335,50 @@ const stableReplayFixtureFor = (prompt = false) =>
       runtimeSeconds: 10,
     });
     const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+    if (prompt) {
+      const initializeRequest: PiManagedOperationRequest = {
+        threadId,
+        kind: "initialize",
+        operationId: "root-stable-initialize",
+      };
+      const initialize = yield* operations.prepare(
+        { providerInstanceId, threadId },
+        initializeRequest,
+        NodeCrypto.createHash("sha256")
+          .update(canonicalProjectWorkPayload(initializeRequest))
+          .digest("hex"),
+        {
+          allocation: yield* allocate,
+          operationId: initializeRequest.operationId!,
+          workerId: "original-initialize-worker",
+          resourceHash: piManagedSkillResourceIdentity([]),
+        },
+      );
+      expect(
+        yield* operations.persistTerminal(initialize, {
+          identity: { workerId: initialize.workerId, generation: 0 },
+          operation: initialize.operation,
+          outcome: "canceled",
+          ownerCaptured: false,
+          native: null,
+          drain: null,
+          accountingReceipts: [],
+        }),
+      ).toBe("drained");
+      expect(yield* f.sql`SELECT operation_kind,status FROM project_team_pi_operation`).toEqual([
+        { operation_kind: "initialize", status: "settled" },
+      ]);
+      expect(yield* f.sql`SELECT status FROM project_team_pi_process`).toEqual([
+        { status: "drained" },
+      ]);
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        status: "running",
+        sessionId: "original-native",
+      });
+    }
+    const allocation = yield* allocate;
     const requestHash = NodeCrypto.createHash("sha256")
       .update(canonicalProjectWorkPayload(request))
       .digest("hex");
@@ -4466,6 +4495,7 @@ for (const mode of [
     scoped(
       Effect.gen(function* () {
         const f = yield* stableReplayFixtureFor(mode === "prompt-restart");
+        const originalOperations = yield* f.sql`SELECT operation_id FROM project_team_pi_operation`;
         let request: PiManagedOperationRequest = f.request;
         if (mode === "changed-request")
           request = { ...request, kind: "prompt", prompt: "different" };
@@ -4576,7 +4606,9 @@ for (const mode of [
         expect(f.transports).toBe(0);
         expect(allocations).toBe(0);
         expect(events).toBe(0);
-        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(1);
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual(
+          originalOperations,
+        );
         expect((yield* f.sql`SELECT reservation_id FROM project_team_model_request`).length).toBe(
           0,
         );
