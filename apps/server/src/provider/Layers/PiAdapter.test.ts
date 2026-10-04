@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
+import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -34,6 +35,7 @@ import type { PiSessionTerminal } from "../pi/PiSessionRuntime.ts";
 import type { ProviderAdapterError } from "../Errors.ts";
 import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
+import { getProviderTurnEventSubscription } from "../ProviderTurnPublications.ts";
 
 const instanceId = ProviderInstanceId.make("pi-one");
 const threadId = ThreadId.make("managed-thread");
@@ -131,6 +133,24 @@ const initialSession = (instance = instanceId): ProviderSession => ({
   updatedAt: timestamp,
 });
 const startInput = { threadId, runtimeMode: "full-access" as const };
+
+it.effect(
+  "the actual adapter exposes an eager owned event subscription before initialization",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      const eager = getProviderTurnEventSubscription(adapter);
+      if (!eager) return yield* Effect.die("Actual Pi adapter has no eager source");
+      const subscription = yield* eager;
+      yield* adapter.startSession(startInput);
+      const event = yield* PubSub.take(subscription);
+      expect(event.type).toBe("session.started");
+      expect(event.providerInstanceId).toBe(instanceId);
+      expect(event.threadId).toBe(threadId);
+      expect(getProviderTurnEventSubscription({ ...adapter })).toBeUndefined();
+    }),
+);
 
 it.effect("carries an isolated explicit skill plan into initialization and subsequent turns", () =>
   Effect.gen(function* () {

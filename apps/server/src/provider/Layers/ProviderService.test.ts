@@ -74,6 +74,11 @@ import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "./ProviderService.ts";
+import {
+  acquireProviderTurnPublications,
+  registerProviderTurnEventSubscription,
+} from "../ProviderTurnPublications.ts";
+import { makeProjectTeamTurnObserver } from "../../projectWork/ProjectTeamTurnObserver.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -348,6 +353,7 @@ function makeFakeCodexAdapter(
 
   return {
     adapter,
+    runtimeEventPubSub,
     emit,
     updateSession,
     startSession,
@@ -687,6 +693,7 @@ function makeProviderServiceLayer(
     readonly directory?: ProviderSessionDirectory.ProviderSessionDirectory["Service"];
     readonly supportsConversationRollback?: boolean;
     readonly analyticsLayer?: Layer.Layer<AnalyticsService.AnalyticsService>;
+    readonly eventLoggers?: ProviderEventLoggers.ProviderEventLoggers["Service"];
     readonly registry?: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"];
   } = {},
 ) {
@@ -725,7 +732,7 @@ function makeProviderServiceLayer(
         Layer.provide(
           Layer.succeed(
             ProviderEventLoggers.ProviderEventLoggers,
-            ProviderEventLoggers.NoOpProviderEventLoggers,
+            input.eventLoggers ?? ProviderEventLoggers.NoOpProviderEventLoggers,
           ),
         ),
       ),
@@ -1256,6 +1263,354 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
 );
 
 const routing = makeProviderServiceLayer();
+
+const publicationPiInstanceId = ProviderInstanceId.make("publication-pi");
+const publicationPi = makeFakeCodexAdapter(ProviderDriverKind.make("piAgent"));
+const publicationAdapterEvents = publicationPi.runtimeEventPubSub;
+const publicationAdapterSubscribed = Deferred.makeUnsafe<void>();
+const publicationAdapter = {
+  ...publicationPi.adapter,
+  streamEvents: Stream.fromPubSub(publicationAdapterEvents),
+};
+registerProviderTurnEventSubscription(
+  publicationAdapter,
+  PubSub.subscribe(publicationAdapterEvents).pipe(
+    Effect.tap(() => Deferred.succeed(publicationAdapterSubscribed, undefined)),
+  ),
+);
+const publicationFixture = makeProviderServiceLayer({
+  registry: makeStaticInstanceRegistry([[publicationPiInstanceId, publicationAdapter]]),
+});
+publicationFixture.layer("ProviderService owned turn publications", (it) => {
+  it.effect("acquires the actual factory subscription and stamps only terminal events", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const source = yield* acquireProviderTurnPublications(service, publicationPiInstanceId);
+        const subscription = yield* source.subscribe;
+        assert.isTrue(yield* Deferred.isDone(publicationAdapterSubscribed));
+        assert.equal(source.currentPublicationSequence(), 0n);
+        const threadId = asThreadId("publication-thread");
+        yield* PubSub.publish(publicationAdapterEvents, {
+          type: "content.delta",
+          eventId: asEventId("delta"),
+          provider: publicationPi.adapter.provider,
+          threadId,
+          turnId: asTurnId("original"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          payload: { streamKind: "assistant_text", delta: "ordinary content" },
+        });
+        yield* PubSub.publish(publicationAdapterEvents, {
+          type: "turn.completed",
+          eventId: asEventId("terminal"),
+          provider: publicationPi.adapter.provider,
+          threadId,
+          turnId: asTurnId("original"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          payload: { state: "completed" },
+        });
+        const publication = yield* PubSub.take(subscription);
+        assert.equal(publication.sequence, 1n);
+        assert.equal(publication.event.eventId, asEventId("terminal"));
+        assert.equal(publication.event.providerInstanceId, publicationPiInstanceId);
+        assert.equal(source.currentPublicationSequence(), 1n);
+        yield* source.assertCurrent;
+      }),
+    ),
+  );
+  it.effect("the acquired observer retains a terminal emitted before send returns", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const source = yield* acquireProviderTurnPublications(service, publicationPiInstanceId);
+        const observer = yield* makeProjectTeamTurnObserver({
+          subscribe: source.subscribe,
+          currentPublicationSequence: source.currentPublicationSequence,
+          maximumPending: 2,
+        });
+        const identity = {
+          providerInstanceId: publicationPiInstanceId,
+          threadId: asThreadId("publication-before-return"),
+          turnId: asTurnId("original-operation"),
+        };
+        const result = yield* observer.withObservation(
+          identity,
+          PubSub.publish(publicationAdapterEvents, {
+            ...identity,
+            eventId: asEventId("terminal-before-return"),
+            provider: publicationPi.adapter.provider,
+            type: "turn.completed",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            payload: { state: "completed" },
+          }).pipe(Effect.as("original send receipt")),
+        );
+        assert.equal(result.sent, "original send receipt");
+        assert.equal(result.event.turnId, identity.turnId);
+        assert.equal(result.event.eventId, asEventId("terminal-before-return"));
+        yield* observer.stop;
+        assert.isTrue(Exit.isFailure(yield* source.assertCurrent.pipe(Effect.exit)));
+      }),
+    ),
+  );
+  it.effect("rejects a duplicate source loan and a second subscription", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const source = yield* acquireProviderTurnPublications(service, publicationPiInstanceId);
+        yield* source.subscribe;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* acquireProviderTurnPublications(service, publicationPiInstanceId).pipe(
+              Effect.exit,
+            ),
+          ),
+        );
+        assert.isTrue(Exit.isFailure(yield* source.subscribe.pipe(Effect.exit)));
+      }),
+    ),
+  );
+  it.effect("private closure leaves two ordinary consumers and the source alive", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const ordinaryOne = yield* Stream.toPull(service.streamEvents);
+        const ordinaryTwo = yield* Stream.toPull(service.streamEvents);
+        const firstConsumer = yield* Effect.forkChild(ordinaryOne, { startImmediately: true });
+        const secondConsumer = yield* Effect.forkChild(ordinaryTwo, { startImmediately: true });
+        const scope = yield* Scope.make();
+        const source = yield* acquireProviderTurnPublications(
+          service,
+          publicationPiInstanceId,
+        ).pipe(Effect.provideService(Scope.Scope, scope));
+        yield* source.subscribe.pipe(Effect.provideService(Scope.Scope, scope));
+        yield* Scope.close(scope, Exit.void);
+        assert.isTrue(Exit.isFailure(yield* source.ended));
+        assert.isTrue(Exit.isFailure(yield* source.assertCurrent.pipe(Effect.exit)));
+        yield* PubSub.publish(publicationAdapterEvents, {
+          providerInstanceId: publicationPiInstanceId,
+          threadId: asThreadId("ordinary-after-close"),
+          turnId: asTurnId("ordinary"),
+          eventId: asEventId("ordinary-terminal"),
+          provider: publicationPi.adapter.provider,
+          type: "turn.completed",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          payload: { state: "completed" },
+        });
+        const first = yield* Fiber.join(firstConsumer);
+        const second = yield* Fiber.join(secondConsumer);
+        assert.equal(first.length, 1);
+        assert.equal(second.length, 1);
+        assert.equal(first[0]?.eventId, asEventId("ordinary-terminal"));
+        assert.deepEqual(first, second);
+      }),
+    ),
+  );
+  it.effect("closing the owned loan drains overflow without stopping ordinary delivery", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const overflow = yield* Deferred.make<void>();
+        const delivered = yield* Deferred.make<void>();
+        let seen = 0;
+        yield* Stream.runForEach(service.streamEvents, () =>
+          Effect.gen(function* () {
+            seen++;
+            if (seen === 129) yield* Deferred.succeed(overflow, undefined);
+            if (seen === 130) yield* Deferred.succeed(delivered, undefined);
+          }),
+        ).pipe(Effect.forkChild({ startImmediately: true }));
+        const scope = yield* Scope.make();
+        const source = yield* acquireProviderTurnPublications(
+          service,
+          publicationPiInstanceId,
+        ).pipe(Effect.provideService(Scope.Scope, scope));
+        yield* source.subscribe.pipe(Effect.provideService(Scope.Scope, scope));
+        for (let i = 0; i < 130; i++) {
+          yield* PubSub.publish(publicationAdapterEvents, {
+            providerInstanceId: publicationPiInstanceId,
+            threadId: asThreadId("overflow-thread"),
+            turnId: asTurnId(`overflow-${i}`),
+            eventId: asEventId(`overflow-event-${i}`),
+            provider: publicationPi.adapter.provider,
+            type: "turn.completed",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            payload: { state: "completed" },
+          });
+        }
+        yield* Deferred.await(overflow);
+        assert.equal(source.currentPublicationSequence(), 129n);
+        yield* Scope.close(scope, Exit.void);
+        yield* Deferred.await(delivered);
+        assert.equal(seen, 130);
+        assert.equal(source.currentPublicationSequence(), 129n);
+        assert.isTrue(Exit.isFailure(yield* source.ended));
+      }),
+    ),
+  );
+
+  it.effect("does not restamp a terminal queued before its observation window", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const source = yield* acquireProviderTurnPublications(service, publicationPiInstanceId);
+        const observer = yield* makeProjectTeamTurnObserver({
+          subscribe: source.subscribe,
+          currentPublicationSequence: source.currentPublicationSequence,
+          maximumPending: 2,
+        });
+        const stalePublished = yield* Deferred.make<void>();
+        yield* Stream.runForEach(service.streamEvents, (event) =>
+          event.eventId === asEventId("stale-publication")
+            ? Deferred.succeed(stalePublished, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        ).pipe(Effect.forkChild({ startImmediately: true }));
+        const identity = {
+          providerInstanceId: publicationPiInstanceId,
+          threadId: asThreadId("window-thread"),
+          turnId: asTurnId("window-turn"),
+        };
+        const terminal = {
+          ...identity,
+          provider: publicationPi.adapter.provider,
+          type: "turn.completed" as const,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          payload: { state: "completed" as const },
+        };
+        yield* PubSub.publish(publicationAdapterEvents, {
+          ...terminal,
+          eventId: asEventId("stale-publication"),
+        });
+        yield* Deferred.await(stalePublished);
+        assert.equal(source.currentPublicationSequence(), 1n);
+        const result = yield* observer.withObservation(
+          identity,
+          PubSub.publish(publicationAdapterEvents, {
+            ...terminal,
+            eventId: asEventId("fresh-publication"),
+          }),
+        );
+        assert.equal(result.event.eventId, asEventId("fresh-publication"));
+        assert.equal(source.currentPublicationSequence(), 2n);
+      }),
+    ),
+  );
+});
+
+const unregisteredPublicationFixture = makeProviderServiceLayer({
+  registry: makeStaticInstanceRegistry([[publicationPiInstanceId, { ...publicationAdapter }]]),
+});
+unregisteredPublicationFixture.layer("ProviderService unregistered turn source", (it) => {
+  it.effect("denies a Pi-shaped adapter without an owned eager subscription", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const exit = yield* acquireProviderTurnPublications(service, publicationPiInstanceId).pipe(
+          Effect.exit,
+        );
+        assert.isTrue(Exit.isFailure(exit));
+      }),
+    ),
+  );
+});
+
+const failedPublicationPi = makeFakeCodexAdapter(ProviderDriverKind.make("piAgent"));
+const failedPublicationEvents = failedPublicationPi.runtimeEventPubSub;
+const failedPublicationAdapter = {
+  ...publicationPi.adapter,
+  streamEvents: Stream.fromPubSub(failedPublicationEvents),
+};
+registerProviderTurnEventSubscription(
+  failedPublicationAdapter,
+  PubSub.subscribe(failedPublicationEvents),
+);
+const originalPublicationFailure = Cause.fromReasons<never>([
+  Cause.makeDieReason("canonical-publication-failure"),
+  Cause.makeInterruptReason(800001),
+  Cause.makeInterruptReason(800002),
+  Cause.makeInterruptReason(800002),
+]);
+const failedPublicationFixture = makeProviderServiceLayer({
+  registry: makeStaticInstanceRegistry([[publicationPiInstanceId, failedPublicationAdapter]]),
+  eventLoggers: {
+    native: undefined,
+    canonical: {
+      filePath: "/unused-fixture-logger",
+      write: () => Effect.failCause(originalPublicationFailure),
+      close: () => Effect.void,
+    },
+  },
+});
+failedPublicationFixture.layer("ProviderService failed turn publications", (it) => {
+  it.effect("retains canonical publisher defects and every interruption occurrence", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        const source = yield* acquireProviderTurnPublications(service, publicationPiInstanceId);
+        yield* source.subscribe;
+        yield* PubSub.publish(failedPublicationEvents, {
+          providerInstanceId: publicationPiInstanceId,
+          threadId: asThreadId("failed-publisher-thread"),
+          turnId: asTurnId("original-failed-turn"),
+          eventId: asEventId("failed-publisher-event"),
+          provider: publicationPi.adapter.provider,
+          type: "turn.completed",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          payload: { state: "completed" },
+        });
+        const exit = yield* source.ended;
+        if (Exit.isSuccess(exit)) return yield* Effect.die("Canonical publisher failure was lost");
+        assert.deepEqual(
+          exit.cause.reasons.map((reason) => reason._tag),
+          ["Die", "Interrupt", "Interrupt", "Interrupt"],
+        );
+        assert.deepEqual(
+          exit.cause.reasons.flatMap((reason) =>
+            Cause.isInterruptReason(reason) ? [reason.fiberId] : [],
+          ),
+          [800001, 800002, 800002],
+        );
+        assert.equal(source.currentPublicationSequence(), 0n);
+        assert.isTrue(Exit.isFailure(yield* source.assertCurrent.pipe(Effect.exit)));
+      }),
+    ),
+  );
+});
+
+let currentPublicationAdapter = publicationAdapter;
+const changingPublicationFixture = makeProviderServiceLayer({
+  registry: {
+    ...makeStaticInstanceRegistry([[publicationPiInstanceId, publicationAdapter]]),
+    getByInstance: () => Effect.suspend(() => Effect.succeed(currentPublicationAdapter)),
+  },
+});
+changingPublicationFixture.layer("ProviderService replaced turn publications", (it) => {
+  it.effect(
+    "does not lend a replacement adapter the original source under the same instance ID",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const service = yield* ProviderService.ProviderService;
+          const source = yield* acquireProviderTurnPublications(service, publicationPiInstanceId);
+          yield* source.subscribe;
+          currentPublicationAdapter = { ...publicationAdapter };
+          assert.isTrue(Exit.isFailure(yield* source.assertCurrent.pipe(Effect.exit)));
+          assert.isTrue(
+            Exit.isFailure(
+              yield* acquireProviderTurnPublications(service, publicationPiInstanceId).pipe(
+                Effect.exit,
+              ),
+            ),
+          );
+        }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            currentPublicationAdapter = publicationAdapter;
+          }),
+        ),
+      ),
+  );
+});
 
 const agentActionsInstanceId = ProviderInstanceId.make("agent-actions-test");
 const agentActionsFixture = makeFakeCodexAdapter(CODEX_DRIVER);
