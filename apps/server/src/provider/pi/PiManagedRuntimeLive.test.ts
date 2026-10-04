@@ -827,6 +827,75 @@ it.effect(
     ),
 );
 
+for (const branch of ["task", "refs/heads/task"]) {
+  it.effect(
+    `admits an isolated branch ${branch} through real Git without allocating a worker`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          yield* restoreHistoricalBinding({
+            ...f.binding,
+            revision: f.binding.revision + 1,
+            branch,
+          });
+          const skills = yield* f.instance.authorizeSkills({
+            runtime: {
+              providerInstanceId,
+              cwd: f.worktree,
+              sessionId: `thread-${NodeCrypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24)}`,
+              threadId,
+            },
+            desiredRevision: SkillCatalogRevision.make(0),
+            skills: [],
+          });
+          expect(skills).toEqual([]);
+          expect(f.launches).toBe(0);
+          expect(f.transports).toBe(0);
+          expect((yield* f.sql`SELECT * FROM project_team_pi_operation`).length).toBe(0);
+          expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(0);
+        }),
+      ),
+  );
+}
+it.effect("denies full primary and mismatching Git refs before worker allocation", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const request = {
+        runtime: {
+          providerInstanceId,
+          cwd: f.worktree,
+          sessionId: `thread-${NodeCrypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24)}`,
+          threadId,
+        },
+        desiredRevision: SkillCatalogRevision.make(0),
+        skills: [],
+      };
+      for (const [index, branch] of ["refs/heads/other", "refs/tags/task"].entries()) {
+        yield* restoreHistoricalBinding({
+          ...f.binding,
+          revision: f.binding.revision + index + 1,
+          branch,
+        });
+        yield* rejected(f.instance.authorizeSkills(request));
+      }
+      yield* f.git(["-C", f.main, "branch", "-m", "primary-protected"]);
+      yield* f.git(["-C", f.worktree, "branch", "-m", "main"]);
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 3,
+        branch: "refs/heads/main",
+      });
+      yield* rejected(f.instance.authorizeSkills(request));
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+      expect((yield* f.sql`SELECT * FROM project_team_pi_operation`).length).toBe(0);
+      expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(0);
+    }),
+  ),
+);
+
 describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
   "required Linux ownership proof",
   () => {
