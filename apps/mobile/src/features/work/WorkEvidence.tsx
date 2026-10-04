@@ -84,10 +84,14 @@ function EvidenceSession(props: WorkEvidenceProps) {
         (record.kind === "effect" && record.effectKind === "publication")
       );
     });
-    const updatedAt = owned.reduce(
-      (latest, record) => (record.updatedAt > latest ? record.updatedAt : latest),
-      "",
-    );
+    let latestUpdate: { value: string; instant: number } | null = null;
+    let invalidTimestamps = false;
+    for (const record of owned) {
+      const instant = Date.parse(record.updatedAt);
+      if (!Number.isFinite(instant)) invalidTimestamps = true;
+      else if (latestUpdate === null || instant > latestUpdate.instant)
+        latestUpdate = { value: record.updatedAt, instant };
+    }
     return {
       items,
       gates,
@@ -95,7 +99,8 @@ function EvidenceSession(props: WorkEvidenceProps) {
       runs,
       roles,
       unsupported,
-      updatedAt,
+      latestUpdate,
+      invalidTimestamps,
       foreign: owned.length !== props.foundation.records.length,
     };
   }, [props.foundation, props.target.projectId, taskId]);
@@ -110,10 +115,12 @@ function EvidenceSession(props: WorkEvidenceProps) {
     props.foundation.error === null &&
     props.foundation.revision !== null &&
     !view.foreign &&
+    !view.invalidTimestamps &&
     view.unsupported.length === 0;
-  const age = view.updatedAt
-    ? Math.max(0, Math.floor((inspectedAt - Date.parse(view.updatedAt)) / 60000))
-    : null;
+  const age =
+    view.latestUpdate !== null && !view.invalidTimestamps
+      ? Math.max(0, Math.floor((inspectedAt - view.latestUpdate.instant) / 60000))
+      : null;
   const changeTask = (id: ProjectWorkTaskId | undefined) => {
     selectTask(id);
     setPage(0);
@@ -127,13 +134,17 @@ function EvidenceSession(props: WorkEvidenceProps) {
             ? "Revision unknown"
             : `Project revision ${props.foundation.revision}`}
         </Notice>
-        {view.updatedAt ? (
-          <Notice>
-            Last recorded update {view.updatedAt} · Recorded age {age} minutes at inspection
-          </Notice>
+        {view.latestUpdate ? <Notice>Last recorded update {view.latestUpdate.value}</Notice> : null}
+        {age !== null ? (
+          <Notice>Recorded age {age} minutes at inspection</Notice>
         ) : (
           <Notice>Recorded age unavailable.</Notice>
         )}
+        {view.invalidTimestamps ? (
+          <Notice>
+            Recorded freshness unavailable: one or more record timestamps are invalid.
+          </Notice>
+        ) : null}
         <Notice>
           Recorded applicability does not establish current approval or live delivery qualification.
           Publication receipts do not confirm a merge.

@@ -206,6 +206,7 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount());
   host.remove();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 async function render(overrides: Partial<WorkEvidenceProps> = {}) {
@@ -223,6 +224,51 @@ async function click(label: string) {
 
 // Removing owner fencing, record validation, page bounds, or the recorded/live wording breaks these observed views.
 describe("mounted mobile evidence inspection", () => {
+  it("orders offset timestamps by their recorded instants", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-01T15:00:00Z"));
+    await render({
+      foundation: snapshot([
+        { ...evidence, updatedAt: "2026-10-01T09:00:00-05:00" },
+        { ...publication, updatedAt: "2026-10-01T12:00:00Z" },
+      ]),
+    });
+    const summary = host.querySelector("section")?.textContent;
+    expect(summary).toContain("Last recorded update 2026-10-01T09:00:00-05:00");
+    expect(summary).toContain("Recorded age 60 minutes at inspection");
+    expect(summary).not.toContain("Recorded age 180 minutes");
+    expect(summary).toContain("Complete recorded snapshot");
+    expect(host.textContent).toContain("Last recorded update 2026-10-01T12:00:00Z");
+  });
+
+  it("keeps malformed raw timestamps visible without claiming complete freshness", async () => {
+    await render({ foundation: snapshot([{ ...evidence, updatedAt: "not-a-date" }]) });
+    expect(host.textContent).toContain("Last recorded update not-a-date");
+    expect(host.textContent).toContain("Recorded age unavailable");
+    expect(host.textContent).toContain("Recorded freshness unavailable");
+    expect(host.textContent).toContain("Cached or incomplete evidence");
+    expect(host.textContent).not.toContain("Complete recorded snapshot");
+    expect(host.textContent).not.toContain("NaN");
+  });
+
+  it("withholds snapshot age when a valid timestamp is mixed with a malformed one", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-01T15:00:00Z"));
+    await render({
+      foundation: snapshot([
+        { ...evidence, updatedAt: "2026-10-01T14:00:00Z" },
+        { ...publication, updatedAt: "not-a-date" },
+      ]),
+    });
+    expect(host.querySelector("section")?.textContent).toContain(
+      "Last recorded update 2026-10-01T14:00:00Z",
+    );
+    expect(host.textContent).toContain("Last recorded update not-a-date");
+    expect(host.textContent).toContain("Recorded age unavailable");
+    expect(host.textContent).toContain("Recorded freshness unavailable");
+    expect(host.textContent).not.toContain("Recorded age 60 minutes");
+    expect(host.textContent).not.toContain("Complete recorded snapshot");
+    expect(host.textContent).not.toContain("NaN");
+  });
+
   it("shows exact recorded command, tree, artifact and frozen PR metadata without qualification", async () => {
     await render();
     for (const text of [
