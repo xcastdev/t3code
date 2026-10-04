@@ -510,19 +510,22 @@ for (const change of ["execution flag", "revocation", "expiry"] as const)
         const observedSettings: ServerSettingsService["Service"] = {
           ...settings,
           getSettings: Effect.gen(function* () {
-            observations++;
-            if (observations === 2) {
-              if (change === "execution flag")
-                yield* settings.updateSettings({ projectTeamExecutionEnabled: false });
-              else if (change === "expiry")
-                yield* TestClock.setTime(ready.intent.limits.deadlineAtMs);
-              else {
-                const record = (yield* readCurrentState(f.sql, projectId)).foundationRecords!.find(
-                  (record) => record.kind === "run-binding",
-                )!;
-                yield* f.change({ ...record, revision: record.revision + 1, status: "revoked" });
+            yield* Effect.gen(function* () {
+              observations++;
+              if (observations === 2) {
+                if (change === "execution flag")
+                  yield* settings.updateSettings({ projectTeamExecutionEnabled: false });
+                else if (change === "expiry")
+                  yield* TestClock.setTime(ready.intent.limits.deadlineAtMs);
+                else {
+                  const record = (yield* readCurrentState(
+                    f.sql,
+                    projectId,
+                  )).foundationRecords!.find((record) => record.kind === "run-binding")!;
+                  yield* f.change({ ...record, revision: record.revision + 1, status: "revoked" });
+                }
               }
-            }
+            }).pipe(Effect.orDie);
             return yield* settings.getSettings;
           }),
         };
