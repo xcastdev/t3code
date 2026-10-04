@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../../Migrations.ts";
+const encodeString = Schema.encodeEffect(Schema.fromJsonString(Schema.String));
 
 const fixture = Effect.gen(function* () {
   yield* runMigrations({ toForkMigrationInclusive: 27 });
@@ -79,20 +80,8 @@ it.effect("refuses unclaimed, foreign, malformed and oversized workspace receipt
       ["dispatch", 0, 1.5, "{}", "{}"],
       ["dispatch", 0, 1, "bad", "{}"],
       ["dispatch", 0, 1, "{}", "bad"],
-      [
-        "dispatch",
-        0,
-        1,
-        yield* Schema.encodeEffect(Schema.fromJsonString(Schema.String))("x".repeat(262144)),
-        "{}",
-      ],
-      [
-        "dispatch",
-        0,
-        1,
-        "{}",
-        yield* Schema.encodeEffect(Schema.fromJsonString(Schema.String))("é".repeat(131072)),
-      ],
+      ["dispatch", 0, 1, yield* encodeString("x".repeat(262144)), "{}"],
+      ["dispatch", 0, 1, "{}", yield* encodeString("é".repeat(131072))],
     ] as const) {
       expect(
         (yield* sql`INSERT INTO project_team_workspace_receipt VALUES
