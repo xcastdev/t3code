@@ -30,6 +30,7 @@ import {
   type ProjectTeamDispatchRequest,
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
+import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
@@ -493,7 +494,8 @@ for (const change of ["stage", "revision", "claim generation", "final expiry"] a
           Effect.provideService(SqlClient.SqlClient, observedSql),
         );
         yield* expectDenied(runtime.resolve(providerInstanceId, initialize));
-        expect(observations).toBe(2);
+        // Corrupt claim generation now fails inside the second journal transaction.
+        expect(observations).toBe(change === "claim generation" ? 1 : 2);
         expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
       }),
     ),
@@ -534,6 +536,92 @@ for (const change of ["execution flag", "revocation", "expiry"] as const)
         );
         yield* expectDenied(runtime.resolve(providerInstanceId, initialize));
         expect(observations).toBe(2);
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+      }),
+    ),
+  );
+
+for (const corruption of [
+  "positive unclaimed header",
+  "missing claim receipt",
+  "missing claim event",
+  "disagreeing effect projection",
+  "terminal consistent claim",
+] as const)
+  it.effect(`denies ${corruption} using original claim evidence`, () =>
+    test(
+      Effect.gen(function* () {
+        const f = yield* managedFixture();
+        if (corruption === "positive unclaimed header") {
+          yield* f.sql`UPDATE project_team_dispatch SET stage='setup-complete',revision=2,claim_generation=1`;
+        } else {
+          yield* f.setup;
+          const claimId = projectTeamDerivedRecordId(
+            f.reserved.intent.compiledClaim.commandId,
+            "claim-dispatch",
+          );
+          if (corruption === "missing claim receipt") {
+            expect(
+              (yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE command_id=${claimId}`)
+                .length,
+            ).toBe(1);
+            yield* f.sql`DELETE FROM project_work_command_receipts WHERE command_id=${claimId}`;
+          } else if (corruption === "missing claim event") {
+            expect(
+              (yield* f.sql`SELECT event_id FROM project_work_events WHERE command_id=${claimId}`)
+                .length,
+            ).toBe(1);
+            yield* f.sql`DELETE FROM project_work_events WHERE command_id=${claimId}`;
+          } else if (corruption === "disagreeing effect projection") {
+            yield* f.sql`UPDATE project_team_effect SET status='completed' WHERE unique_key=${f.request.dispatchId}`;
+          } else {
+            const effect = (yield* readCurrentState(f.sql, projectId)).foundationRecords!.find(
+              (record) => record.kind === "effect" && record.effectId === f.request.dispatchId,
+            )!;
+            yield* f.change({ ...effect, revision: effect.revision + 1, status: "canceled" });
+            // Consistent terminal proof remains available for cleanup; it grants no forward lookup.
+            expect(
+              (yield* f.journal.readRetained(f.request.dispatchId)).fence.claimGeneration,
+            ).toBe(1);
+          }
+        }
+        const runtime = yield* install();
+        yield* expectDenied(runtime.resolve(providerInstanceId, initialize));
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+      }),
+    ),
+  );
+
+for (const proof of ["receipt", "event"] as const)
+  it.effect(`revalidates original claim ${proof} after final settings read`, () =>
+    test(
+      Effect.gen(function* () {
+        const f = yield* managedFixture();
+        yield* f.setup;
+        const claimId = projectTeamDerivedRecordId(
+          f.reserved.intent.compiledClaim.commandId,
+          "claim-dispatch",
+        );
+        const settings = yield* ServerSettingsService;
+        let reads = 0;
+        const observedSettings: ServerSettingsService["Service"] = {
+          ...settings,
+          getSettings: Effect.gen(function* () {
+            yield* Effect.gen(function* () {
+              if (++reads === 2) {
+                if (proof === "receipt")
+                  yield* f.sql`DELETE FROM project_work_command_receipts WHERE command_id=${claimId}`;
+                else yield* f.sql`DELETE FROM project_work_events WHERE command_id=${claimId}`;
+              }
+            }).pipe(Effect.orDie);
+            return yield* settings.getSettings;
+          }),
+        };
+        const runtime = yield* install().pipe(
+          Effect.provideService(ServerSettingsService, observedSettings),
+        );
+        yield* expectDenied(runtime.resolve(providerInstanceId, initialize));
+        expect(reads).toBe(2);
         expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
       }),
     ),

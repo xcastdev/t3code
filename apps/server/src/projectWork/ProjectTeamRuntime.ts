@@ -57,7 +57,7 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
     );
     if (rows.length !== 1)
       return yield* denied("Managed assignment has no unique original dispatch");
-    const original = yield* journal.inspect(rows[0]!.dispatch_id);
+    const original = yield* journal.inspect(rows[0]!.dispatch_id, { requireClaim: true });
     const transition = original.intent.compiledClaim.transition;
     if (
       transition?.kind !== "claim" ||
@@ -90,7 +90,7 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
       return yield* denied("Managed compaction requires a separately retained context operation");
     }
     const currentSettings = yield* settings.getSettings;
-    const fresh = yield* journal.inspect(original.fence.dispatchId);
+    const fresh = yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });
     const now = yield* Clock.currentTimeMillis;
     if (
       stopped ||
