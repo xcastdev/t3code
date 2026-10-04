@@ -124,6 +124,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["name icon emoji image checkout remove delete"],
   },
   {
+    id: "project-team",
+    title: "Project team",
+    to: "/settings/projects",
+    scope: "project",
+    searchTerms: [
+      "pi roles profiles model workers tokens time delegation repair priorities limits disable enable",
+    ],
+  },
+  {
     id: "default-model",
     title: "Default model",
     to: "/settings/general",
