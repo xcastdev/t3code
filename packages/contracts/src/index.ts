@@ -55,5 +55,6 @@ export * from "./skills.ts";
 export * from "./managedTextResources.ts";
 
 export * from "./projectTeams.ts";
+export * from "./projectTeamSupervision.ts";
 export * from "./projectIssueIntake.ts";
 export * from "./projectMemory.ts";
