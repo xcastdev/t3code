@@ -31,6 +31,9 @@ import {
 } from "./projectMemory.ts";
 const Text = TrimmedNonEmptyString.check(Schema.isMaxLength(4_000));
 const Body = Schema.String.check(Schema.isMaxLength(32_000));
+const Priority = Schema.Int.check(
+  Schema.isBetween({ minimum: Number.MIN_SAFE_INTEGER, maximum: Number.MAX_SAFE_INTEGER }),
+);
 const Ids = Schema.Array(Text.check(Schema.isMaxLength(256))).check(Schema.isMaxLength(64));
 const Fields = {
   recordId: Text.check(Schema.isMaxLength(256)),
@@ -302,6 +305,14 @@ export const ProjectTeamLimits = Schema.Struct({
   model: Text,
   tokenLimit: NonNegativeInt,
   durationLimitMs: NonNegativeInt,
+  providerInstanceId: Schema.optionalKey(ProviderInstanceId),
+  projectPriority: Schema.optionalKey(Priority),
+  taskPriorities: Schema.optionalKey(
+    Schema.Array(Schema.Struct({ taskId: ProjectWorkTaskId, priority: Priority })).check(
+      Schema.isMaxLength(128),
+    ),
+  ),
+  profileRecordIds: Schema.optionalKey(Ids),
 });
 export const ProjectTeamReservation = Schema.Struct({
   ...Fields,
@@ -443,7 +454,66 @@ const IntentFields = {
   specRevision: NonNegativeInt,
   planRevision: NonNegativeInt,
 };
+const ConfiguredPositive = Schema.Int.check(
+  Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+);
+const Profile = Schema.Struct({
+  role: ProjectTeamRoleRevision.fields.role,
+  instructions: Body,
+  skills: Ids,
+  tools: Ids,
+  model: Text,
+  memoryAccess: ProjectTeamRoleRevision.fields.memoryAccess,
+  delegationDepth: ProjectTeamRoleRevision.fields.delegationDepth,
+});
+/** Human configuration installs profiles and policy; it does not start an assignment. */
+export const ProjectTeamConfigurationIntent = Schema.Struct({
+  type: Schema.Literal("project-team.configure"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  expectedRevision: NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
+  expectedConfigurationGeneration: NonNegativeInt.check(
+    Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+  ),
+  enabled: Schema.Boolean,
+  providerInstanceId: ProviderInstanceId,
+  projectPriority: Priority,
+  taskPriorities: Schema.Array(
+    Schema.Struct({ taskId: ProjectWorkTaskId, priority: Priority }),
+  ).check(Schema.isMaxLength(128)),
+  profiles: Schema.Array(Profile).check(
+    Schema.isMinLength(6),
+    Schema.isMaxLength(6),
+    Schema.makeFilter((profiles) => new Set(profiles.map((profile) => profile.role)).size === 6, {
+      message: "Configure exactly one profile for each initial team role",
+    }),
+  ),
+  modelPolicies: Schema.Array(
+    Schema.Struct({
+      model: Text,
+      tokenLimit: ConfiguredPositive,
+      durationLimitMs: ConfiguredPositive,
+      modelCalls: ConfiguredPositive.check(Schema.isLessThanOrEqualTo(128)),
+    }),
+  ).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(6),
+    Schema.makeFilter(
+      (policies) => new Set(policies.map((policy) => policy.model)).size === policies.length,
+      {
+        message: "Model policies must be unique",
+      },
+    ),
+  ),
+  environmentModelCalls: Schema.optionalKey(NonNegativeInt.check(Schema.isLessThanOrEqualTo(128))),
+  projectWritableWorkers: Schema.optionalKey(NonNegativeInt.check(Schema.isLessThanOrEqualTo(64))),
+  delegationDepth: Schema.optionalKey(NonNegativeInt.check(Schema.isLessThanOrEqualTo(8))),
+  repairAllowance: Schema.optionalKey(NonNegativeInt.check(Schema.isLessThanOrEqualTo(16))),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamConfigurationIntent = typeof ProjectTeamConfigurationIntent.Type;
+
 export const ProjectTeamWriteIntent = Schema.Union([
+  ProjectTeamConfigurationIntent,
   Schema.Struct({
     ...IntentFields,
     type: Schema.Literal("project-team.gate.respond"),
