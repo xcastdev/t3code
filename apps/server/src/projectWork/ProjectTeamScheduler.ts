@@ -1,4 +1,5 @@
 import type { ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
+import * as NodeBuffer from "node:buffer";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -70,16 +71,21 @@ const validPriority = Schema.is(
 const validId = Schema.is(
   Schema.String.check(Schema.isTrimmed(), Schema.isNonEmpty(), Schema.isMaxLength(256)),
 );
+/** SQLite BINARY keysets compare UTF-8 bytes, including IDs outside the BMP. */
+export const compareProjectTeamSchedulingIds = (a: string, b: string) =>
+  NodeBuffer.Buffer.compare(NodeBuffer.Buffer.from(a), NodeBuffer.Buffer.from(b));
 const ascending = <T>(page: ReadonlyArray<T>, id: (entry: T) => string, after?: string) =>
   page.every(
     (entry, index) =>
       validId(id(entry)) &&
-      (index === 0 ? after === undefined || id(entry) > after : id(entry) > id(page[index - 1]!)),
+      (index === 0
+        ? after === undefined || compareProjectTeamSchedulingIds(id(entry), after) > 0
+        : compareProjectTeamSchedulingIds(id(entry), id(page[index - 1]!)) > 0),
   );
 const byPriority =
   <T extends { readonly priority: number }>(id: (entry: T) => string) =>
   (a: T, b: T) =>
-    b.priority - a.priority || (id(a) < id(b) ? -1 : id(a) > id(b) ? 1 : 0);
+    b.priority - a.priority || compareProjectTeamSchedulingIds(id(a), id(b));
 
 type TaskWindow = {
   readonly afterTaskId?: ProjectWorkTaskId;

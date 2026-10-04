@@ -177,6 +177,54 @@ const snapshotPorts = (f: Fixture, state: ProjectWorkReducerState) => ({
 });
 
 it.effect(
+  "rejects project keyset order that agrees with UTF-16 but differs from SQLite binary",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const scheduler = yield* schedulerWith(f, {
+          readProjectPage: () =>
+            Effect.succeed([
+              { projectId: ProjectId.make("unicode-\u{10000}"), priority: 0 },
+              { projectId: ProjectId.make("unicode-\uE000"), priority: 0 },
+            ]),
+        });
+        const result = yield* scheduler.sweep().pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure).toMatchObject({ reason: "Invalid project keyset page" });
+      }),
+    ),
+);
+
+it.effect("rejects task keyset order that agrees with UTF-16 but differs from SQLite binary", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const state = yield* readCurrentState(f.sql, projectId);
+      const astral = ProjectWorkTaskId.make("unicode-\u{10000}");
+      const highBmp = ProjectWorkTaskId.make("unicode-\uE000");
+      const scheduler = yield* schedulerWith(f, {
+        readProjectState: () =>
+          Effect.succeed({
+            state: {
+              ...state,
+              tasks: [astral, highBmp].map((id) => ({ ...state.tasks[0]!, taskId: id })),
+            },
+            candidates: [
+              { taskId: astral, priority: 0 },
+              { taskId: highBmp, priority: 0 },
+            ],
+          }),
+      });
+      expect((yield* scheduler.sweep()).blocked).toEqual([
+        { projectId, phase: "read", reason: "invalid-task-keyset-page" },
+      ]);
+    }),
+  ),
+);
+
+it.effect(
   "a lost notification leaves the original committed dispatch recoverable and never reserves a replacement",
   () =>
     scoped(

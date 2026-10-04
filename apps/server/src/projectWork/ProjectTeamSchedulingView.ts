@@ -12,7 +12,10 @@ import type * as SqlError from "effect/unstable/sql/SqlError";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
-import type { ProjectTeamSchedulerPorts } from "./ProjectTeamScheduler.ts";
+import {
+  compareProjectTeamSchedulingIds,
+  type ProjectTeamSchedulerPorts,
+} from "./ProjectTeamScheduler.ts";
 
 type ReadPorts = Pick<
   ProjectTeamSchedulerPorts<SqlError.SqlError | ProjectWorkPolicyError>,
@@ -98,7 +101,7 @@ const readPolicy = Effect.fn("ProjectTeamSchedulingView.readPolicy")(function* (
       projectPriority,
       taskPriorities: [...priorities]
         .filter(([, priority]) => priority !== 0)
-        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+        .sort(([a], [b]) => compareProjectTeamSchedulingIds(a, b)),
       generation: limits.generation,
       providerInstanceId: limits.providerInstanceId ?? null,
       profileRecordIds:
@@ -169,9 +172,11 @@ export const makeProjectTeamSchedulingView = Effect.fn("makeProjectTeamSchedulin
               ? []
               : state.tasks
                   .filter(
-                    (task) => page.afterTaskId === undefined || task.taskId > page.afterTaskId,
+                    (task) =>
+                      page.afterTaskId === undefined ||
+                      compareProjectTeamSchedulingIds(task.taskId, page.afterTaskId) > 0,
                   )
-                  .sort((a, b) => (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0))
+                  .sort((a, b) => compareProjectTeamSchedulingIds(a.taskId, b.taskId))
                   .slice(0, page.limit)
                   .map((task) => ({
                     taskId: task.taskId,

@@ -27,6 +27,7 @@ import {
   readCurrentState,
 } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamSchedulingView } from "./ProjectTeamSchedulingView.ts";
+import { makeProjectTeamScheduler } from "./ProjectTeamScheduler.ts";
 
 const at = "2026-01-01T00:00:00.000Z";
 const attribution = {
@@ -598,3 +599,111 @@ for (const read of ["projects", "tasks"] as const)
         );
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+it.effect("sweeps SQLite project keysets across high BMP and astral IDs without skipping", () =>
+  scoped(
+    Effect.gen(function* () {
+      const highBmp = yield* register("unicode-\uE000");
+      const astral = yield* register("unicode-\u{10000}");
+      for (const projectId of [highBmp, astral]) {
+        yield* createTask(projectId, `task-${projectId}`);
+        yield* configure(projectId, { projectPriority: 1 });
+      }
+      const view = yield* makeProjectTeamSchedulingView();
+      const scheduler = yield* makeProjectTeamScheduler({
+        environmentId: "unicode-environment",
+        ports: {
+          ...view,
+          prepareRequest: () =>
+            Effect.succeed({ _tag: "Blocked", reason: "no managed membership" }),
+          reserve: () => Effect.die("Unexpected reservation"),
+        },
+      });
+      const visited: Array<ProjectId> = [];
+      for (let index = 0; index < 3; index++) {
+        const result = yield* scheduler.sweep({ projects: 1, tasksPerProject: 1 });
+        visited.push(...result.blocked.map((entry) => entry.projectId));
+      }
+      expect(visited).toEqual([highBmp, astral]);
+    }),
+  ),
+);
+
+it.effect("sweeps task keysets in SQLite binary order with equal-priority ties", () =>
+  scoped(
+    Effect.gen(function* () {
+      const projectId = yield* register("unicode-tasks");
+      const astral = yield* createTask(projectId, "task-\u{10000}");
+      const highBmp = yield* createTask(projectId, "task-\uE000");
+      yield* configure(projectId);
+      const view = yield* makeProjectTeamSchedulingView();
+      const sql = yield* SqlClient.SqlClient;
+      const physical = yield* sql<{ taskId: ProjectWorkTaskId }>`SELECT task_id AS taskId
+        FROM project_work_tasks WHERE project_id = ${projectId} ORDER BY task_id ASC`;
+      expect(physical.map((entry) => entry.taskId)).toEqual([highBmp, astral]);
+      expect((yield* view.readProjectState({ projectId, limit: 1 })).candidates).toEqual([
+        { taskId: highBmp, priority: 0 },
+      ]);
+      expect(
+        (yield* view.readProjectState({ projectId, afterTaskId: highBmp, limit: 1 })).candidates,
+      ).toEqual([{ taskId: astral, priority: 0 }]);
+      const scheduler = yield* makeProjectTeamScheduler({
+        environmentId: "unicode-environment",
+        ports: {
+          ...view,
+          prepareRequest: () =>
+            Effect.succeed({ _tag: "Blocked", reason: "no managed membership" }),
+          reserve: () => Effect.die("Unexpected reservation"),
+        },
+      });
+      const first = yield* scheduler.sweep({ projects: 1, tasksPerProject: 1 });
+      const second = yield* scheduler.sweep({ projects: 1, tasksPerProject: 1 });
+      const third = yield* scheduler.sweep({ projects: 1, tasksPerProject: 1 });
+      expect(
+        [...first.blocked, ...second.blocked, ...third.blocked].map((entry) => entry.taskId),
+      ).toEqual([highBmp, astral]);
+      const tied = yield* makeProjectTeamScheduler({
+        environmentId: "unicode-environment",
+        ports: {
+          ...view,
+          prepareRequest: () =>
+            Effect.succeed({ _tag: "Blocked", reason: "no managed membership" }),
+          reserve: () => Effect.die("Unexpected reservation"),
+        },
+      });
+      expect(
+        (yield* tied.sweep({ projects: 1, tasksPerProject: 2 })).blocked.map(
+          (entry) => entry.taskId,
+        ),
+      ).toEqual([highBmp, astral]);
+    }),
+  ),
+);
+
+it.effect("breaks equal project priorities in SQLite binary order", () =>
+  scoped(
+    Effect.gen(function* () {
+      const astral = yield* register("tie-\u{10000}");
+      const highBmp = yield* register("tie-\uE000");
+      for (const projectId of [astral, highBmp]) {
+        yield* createTask(projectId, `task-${projectId}`);
+        yield* configure(projectId, { projectPriority: 5 });
+      }
+      const view = yield* makeProjectTeamSchedulingView();
+      const scheduler = yield* makeProjectTeamScheduler({
+        environmentId: "unicode-environment",
+        ports: {
+          ...view,
+          prepareRequest: () =>
+            Effect.succeed({ _tag: "Blocked", reason: "no managed membership" }),
+          reserve: () => Effect.die("Unexpected reservation"),
+        },
+      });
+      expect(
+        (yield* scheduler.sweep({ projects: 2, tasksPerProject: 1 })).blocked.map(
+          (entry) => entry.projectId,
+        ),
+      ).toEqual([highBmp, astral]);
+    }),
+  ),
+);
