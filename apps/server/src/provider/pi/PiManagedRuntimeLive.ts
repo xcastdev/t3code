@@ -688,6 +688,9 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     },
   ) {
     const cwd = authority.binding.worktree;
+    const branchRef = authority.binding.branch.startsWith("refs/heads/")
+      ? authority.binding.branch
+      : `refs/heads/${authority.binding.branch}`;
     const directoryIdentity = Effect.fn("PiManagedRuntimeLive.directoryIdentity")(function* (
       directory: string,
     ) {
@@ -702,7 +705,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     const agent = yield* directoryIdentity(agentDirectory);
     if (
       (yield* git(cwd, ["rev-parse", "--show-toplevel"])).trim() !== cwd ||
-      (yield* git(cwd, ["symbolic-ref", "--short", "HEAD"])).trim() !== authority.binding.branch
+      (yield* git(cwd, ["symbolic-ref", "HEAD"])).trim() !== branchRef
     )
       return yield* deny("Assigned canonical Git worktree or branch changed");
     const records = (yield* git(cwd, ["worktree", "list", "--porcelain", "-z"]))
@@ -712,16 +715,14 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     const primaryRecord = records[0];
     const primaryEntries = primaryRecord?.filter((entry) => entry.startsWith("worktree "));
     if (
-      authority.binding.branch === "main" ||
-      authority.binding.branch === "master" ||
-      primaryRecord?.includes(`branch refs/heads/${authority.binding.branch}`) ||
+      branchRef === "refs/heads/main" ||
+      branchRef === "refs/heads/master" ||
+      primaryRecord?.includes(`branch ${branchRef}`) ||
       primaryRecord?.includes(`worktree ${cwd}`) ||
       !primaryEntries ||
       primaryEntries.length !== 1 ||
       !records.some(
-        (record) =>
-          record.includes(`worktree ${cwd}`) &&
-          record.includes(`branch refs/heads/${authority.binding.branch}`),
+        (record) => record.includes(`worktree ${cwd}`) && record.includes(`branch ${branchRef}`),
       )
     )
       return yield* deny("Pi requires a registered isolated worktree");
@@ -792,7 +793,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             primary: primaryDirectory,
             common: commonDirectory,
             gitDirectory,
-            assignedHead: `ref: refs/heads/${authority.binding.branch}`,
+            assignedHead: `ref: ${branchRef}`,
             primaryHead: primaryBranch ? `ref: ${primaryBranch}` : null,
           }),
         catch: () => deny("Pi fixed workspace metadata is unavailable"),
