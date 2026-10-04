@@ -14,6 +14,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import type * as Fiber from "effect/Fiber";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -393,17 +394,22 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
   const stopContext = Effect.fn("PiAdapter.stopContext")((context: SessionContext) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
+        // Global shutdown owns cleanup, including callers arriving after scope closure.
+        if (shuttingDown) return yield* joinShutdown(restore);
         if (!context.stop) {
           const result = yield* Deferred.make<void, ProviderAdapterError>();
+          if (shuttingDown) return yield* joinShutdown(restore);
           context.stop = result;
           context.closing = true;
           if (context.active) context.active.acceptingEvents = false;
           const stop = Effect.gen(function* () {
-            yield* Effect.suspend(() => runtime.requestStop(context.threadId)).pipe(
+            yield* Effect.suspend(() =>
+              shuttingDown ? Effect.void : runtime.requestStop(context.threadId),
+            ).pipe(
               Effect.catchCause((cause) => Effect.failCause(safeStopCause("stopSession", cause))),
             );
             if (context.active) yield* Deferred.await(context.active.done);
-            if (sessions.get(context.threadId) !== context) return;
+            if (shuttingDown || sessions.get(context.threadId) !== context) return;
             // Retain the ownership fence until the exit has been published.
             yield* emit({
               eventId: EventId.make(
@@ -448,12 +454,47 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             Effect.onExit((exit) => Deferred.done(result, exit)),
             Effect.ignore,
           );
-          yield* Effect.forkIn(stop, operationScope);
+          // Install the existing producer's onExit before a concurrent scope close can cancel it.
+          yield* Effect.forkIn(stop, operationScope, { startImmediately: true });
         }
-        yield* restore(Deferred.await(context.stop));
+        const stopped = yield* Effect.exit(restore(Deferred.await(context.stop)));
+        if (shuttingDown) return yield* joinShutdown(restore);
+        return yield* stopped;
       }),
     ),
   );
+
+  const joinInterrupted = Effect.fn("PiAdapter.joinInterrupted")(function* (
+    context: SessionContext,
+    cause: Cause.Cause<ProviderAdapterError>,
+    restore: (effect: Effect.Effect<void>) => Effect.Effect<void>,
+    ownedInterruption: boolean,
+  ) {
+    if (!Cause.hasInterrupts(cause)) return yield* Effect.failCause(cause);
+    const cleanup = yield* Effect.exit(
+      stopContext(context).pipe(
+        Effect.catchCause((cleanupCause) =>
+          shuttingDown
+            ? Effect.failCause(cleanupCause)
+            : Effect.failCause(cleanupCause).pipe(Effect.ignore),
+        ),
+      ),
+    );
+    const pending = yield* Effect.exit(restore(Effect.void));
+    return yield* Effect.failCause(
+      Cause.fromReasons([
+        ...(ownedInterruption && Exit.isFailure(pending) ? pending.cause.reasons : cause.reasons),
+        ...(!ownedInterruption && Exit.isFailure(pending) ? pending.cause.reasons : []),
+        ...(Exit.isFailure(cleanup) ? cleanup.cause.reasons : []),
+      ]),
+    );
+  });
+  // Pinned Effect's Failure/getCont synchronously selects this restored wait's handler
+  // from the caller's pending interruption before invoking catchCause. Its StackTrace
+  // annotation copies the Cause, so object identity cannot recover that provenance.
+  // No public accessor exists; an absent field conservatively retains both causes.
+  const ownsInterruption = (fiber: Fiber.Fiber<unknown, unknown>) =>
+    "_interruptedCause" in fiber && Cause.isCause(fiber._interruptedCause);
 
   const launch = Effect.fn("PiAdapter.launch")(function* (
     context: SessionContext,
@@ -883,8 +924,11 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           ...(hints.resumeCursor !== undefined ? { resumeCursor: hints.resumeCursor } : {}),
         };
         const active = yield* launch(context, request, hints);
+        const caller = yield* Effect.fiber;
         return yield* restore(Deferred.await(active.result)).pipe(
-          Effect.onInterrupt(() => stopContext(context).pipe(Effect.ignore)),
+          Effect.catchCause((cause) =>
+            joinInterrupted(context, cause, restore, ownsInterruption(caller)),
+          ),
         );
       }),
     ),
@@ -923,8 +967,11 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             ? { modelSelection: structuredClone(turn.modelSelection) }
             : {}),
         });
+        const caller = yield* Effect.fiber;
         const prepared = yield* restore(Deferred.await(active.prepared)).pipe(
-          Effect.onInterrupt(() => stopContext(context).pipe(Effect.ignore)),
+          Effect.catchCause((cause) =>
+            joinInterrupted(context, cause, restore, ownsInterruption(caller)),
+          ),
         );
         if (prepared.kind !== "prompt")
           return yield* invalid("sendTurn", "Pi did not prepare a prompt turn.");
@@ -988,21 +1035,20 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
   });
   // Cache only cleanup's outcome; each waiter owns its cancellation after joining it.
   const shutdown = yield* Effect.cached(Effect.exit(stopAllWork()));
-  const stopAll = Effect.fn("PiAdapter.stopAll.join")(() =>
-    Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const cleanup = yield* shutdown;
-        const interrupted = yield* Effect.exit(restore(Effect.void));
-        if (Exit.isFailure(interrupted) || Exit.isFailure(cleanup))
-          return yield* Effect.failCause(
-            Cause.fromReasons([
-              ...(Exit.isFailure(interrupted) ? interrupted.cause.reasons : []),
-              ...(Exit.isFailure(cleanup) ? cleanup.cause.reasons : []),
-            ]),
-          );
-      }),
-    ),
-  );
+  const joinShutdown = Effect.fn("PiAdapter.stopAll.join")(function* (
+    restore: (effect: Effect.Effect<void>) => Effect.Effect<void>,
+  ) {
+    const cleanup = yield* shutdown;
+    const interrupted = yield* Effect.exit(restore(Effect.void));
+    if (Exit.isFailure(interrupted) || Exit.isFailure(cleanup))
+      return yield* Effect.failCause(
+        Cause.fromReasons([
+          ...(Exit.isFailure(interrupted) ? interrupted.cause.reasons : []),
+          ...(Exit.isFailure(cleanup) ? cleanup.cause.reasons : []),
+        ]),
+      );
+  });
+  const stopAll = () => Effect.uninterruptibleMask(joinShutdown);
   yield* Effect.addFinalizer(() =>
     stopAll().pipe(
       Effect.catch((error) =>

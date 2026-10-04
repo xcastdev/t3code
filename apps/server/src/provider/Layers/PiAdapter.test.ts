@@ -2571,3 +2571,401 @@ for (const mode of ["success", ...stopReasonModes] as const)
           expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
         }),
     );
+
+for (const path of ["initialize", "prompt", "stopSession"] as const)
+  for (const mode of ["success", ...stopReasonModes] as const)
+    for (const cancel of [false, true])
+      it.effect(
+        `closed scope repair ${path} joins global ${mode} with caller cancel ${cancel}`,
+        () =>
+          Effect.gen(function* () {
+            const fake = yield* makeFake();
+            fake.state.autoInitialize = path !== "initialize";
+            const prepareRelease = yield* Deferred.make<void>();
+            const entered = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const interruptSent = yield* Deferred.make<void>();
+            const stopChildExit = yield* Deferred.make<void>();
+            const callerYielded = yield* Deferred.make<void>();
+            const reasons = mode === "success" ? [] : stopReasons(mode);
+            let allCalls = 0;
+            let observeCaller = false;
+            let caller: Fiber.Fiber<void, ProviderAdapterError> | undefined;
+            let history:
+              | {
+                  done: Deferred.Deferred<void>;
+                  result: Deferred.Deferred<ProviderSession, ProviderAdapterError>;
+                  prepared: Deferred.Deferred<PiManagedPreparedOperation, ProviderAdapterError>;
+                }
+              | undefined;
+            const original = yield* Effect.tracer;
+            const tracer: Tracer.Tracer = {
+              span: (options) => original.span(options),
+              context(primitive, fiber) {
+                if ("_tag" in primitive && primitive._tag === "Success" && "value" in primitive) {
+                  const value = primitive.value;
+                  if (
+                    typeof value === "object" &&
+                    value !== null &&
+                    "acceptingEvents" in value &&
+                    "done" in value &&
+                    "result" in value &&
+                    "prepared" in value &&
+                    Deferred.isDeferred<void, never>(value.done) &&
+                    Deferred.isDeferred<ProviderSession, ProviderAdapterError>(value.result) &&
+                    Deferred.isDeferred<PiManagedPreparedOperation, ProviderAdapterError>(
+                      value.prepared,
+                    )
+                  )
+                    history = { done: value.done, result: value.result, prepared: value.prepared };
+                  if (observeCaller && caller?.id === fiber.id && Fiber.isFiber(value))
+                    value.addObserver(() => Deferred.doneUnsafe(stopChildExit, Effect.void));
+                }
+                const next = primitive["~effect/Effect/evaluate"](fiber);
+                if (
+                  observeCaller &&
+                  caller?.id === fiber.id &&
+                  "_yielded" in fiber &&
+                  fiber._yielded !== undefined
+                )
+                  Deferred.doneUnsafe(callerYielded, Effect.void);
+                return next;
+              },
+            };
+            yield* Effect.gen(function* () {
+              const scope = yield* Scope.make();
+              yield* Effect.addFinalizer(() =>
+                Scope.close(scope, Exit.void).pipe(Effect.ignoreCause),
+              );
+              const runtime: PiManagedRuntimeInstance = {
+                ...fake.runtime,
+                stopAll: Effect.gen(function* () {
+                  allCalls++;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                  if (mode !== "success")
+                    return yield* Effect.failCause(Cause.fromReasons(reasons));
+                  if (path === "initialize") yield* fake.settle(fake.operations[0]!, "canceled");
+                  if (path === "prompt") yield* Deferred.succeed(prepareRelease, undefined);
+                  if (path !== "stopSession") {
+                    expect(history).toBeDefined();
+                    if (history) yield* Deferred.await(history.done).pipe(Effect.ignoreCause);
+                  }
+                }),
+              };
+              const adapter = yield* makePiAdapter({ instanceId, runtime }).pipe(
+                Effect.provideService(Scope.Scope, scope),
+              );
+              if (path !== "initialize") yield* adapter.startSession(startInput);
+              if (path === "prompt") fake.state.prepareGate = prepareRelease;
+              if (path !== "stopSession") {
+                caller = yield* Effect.forkDetach(
+                  path === "initialize"
+                    ? adapter.startSession(startInput).pipe(Effect.asVoid)
+                    : adapter.sendTurn({ threadId, input: "held preparation" }).pipe(Effect.asVoid),
+                );
+                yield* Queue.take(fake.requestsQueue);
+                if (path === "prompt") yield* Queue.take(fake.requestsQueue);
+                if (path === "initialize")
+                  yield* Deferred.await((yield* Queue.take(fake.preparedQueue)).started);
+              }
+              const stopping = yield* Effect.forkScoped(Effect.exit(adapter.stopAll()));
+              yield* Deferred.await(entered);
+              yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+              observeCaller = true;
+              if (path === "stopSession")
+                caller = yield* Effect.forkDetach(adapter.stopSession(threadId), {
+                  startImmediately: true,
+                });
+              const capturedCaller = caller!;
+              if (cancel) {
+                const sent = yield* Effect.forkScoped(
+                  Effect.sync(() => {
+                    for (const id of [608101, 608102])
+                      capturedCaller.interruptUnsafe(
+                        id,
+                        Context.makeUnsafe(new Map([["caller", path]])),
+                      );
+                  }).pipe(Effect.andThen(Deferred.succeed(interruptSent, undefined))),
+                  { startImmediately: true },
+                );
+                yield* Deferred.await(interruptSent);
+                yield* Fiber.join(sent);
+              }
+              expect(stopping.pollUnsafe()).toBeUndefined();
+              expect(capturedCaller.pollUnsafe()).toBeUndefined();
+              expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(
+                true,
+              );
+              yield* Deferred.succeed(release, undefined);
+              const stopped = yield* Fiber.join(stopping);
+              if (mode === "success") expect(Exit.isSuccess(stopped)).toBe(true);
+              else expectSafeStop(stopped, reasons, "stopAll");
+              const resolution = yield* Effect.raceFirst(
+                Fiber.await(capturedCaller).pipe(
+                  Effect.map((exit) => ({ kind: "complete" as const, exit })),
+                ),
+                Deferred.await(stopChildExit).pipe(
+                  Effect.andThen(Deferred.await(callerYielded)),
+                  Effect.as({ kind: "orphaned-stop" as const }),
+                ),
+              );
+              expect(resolution.kind).toBe("complete");
+              if (resolution.kind !== "complete") return;
+              const exit = resolution.exit;
+              if (cancel) {
+                expect(Exit.isFailure(exit)).toBe(true);
+                if (Exit.isFailure(exit)) {
+                  expect(
+                    exit.cause.reasons
+                      .slice(0, 2)
+                      .map((reason) =>
+                        Cause.isInterruptReason(reason) ? reason.fiberId : undefined,
+                      ),
+                  ).toEqual([608101, 608102]);
+                  for (const reason of exit.cause.reasons.slice(0, 2))
+                    expect(reason.annotations.get("caller")).toBe(path);
+                  if (mode === "success") expect(exit.cause.reasons).toHaveLength(2);
+                  else
+                    expectSafeStop(
+                      Exit.failCause(Cause.fromReasons(exit.cause.reasons.slice(2))),
+                      reasons,
+                      "stopAll",
+                    );
+                }
+              } else if (mode !== "success") {
+                expect(Exit.isFailure(exit)).toBe(true);
+                if (Exit.isFailure(exit)) {
+                  const prefix = path === "stopSession" ? 0 : 1;
+                  if (prefix) expect(Cause.isInterruptReason(exit.cause.reasons[0]!)).toBe(true);
+                  expectSafeStop(
+                    Exit.failCause(Cause.fromReasons(exit.cause.reasons.slice(prefix))),
+                    reasons,
+                    "stopAll",
+                  );
+                }
+              } else
+                expect(path === "stopSession" ? Exit.isSuccess(exit) : Exit.isFailure(exit)).toBe(
+                  true,
+                );
+              expect(json(exit)).not.toContain("private-stop");
+              expect(fake.state.stopCalls).toBe(0);
+              expect(allCalls).toBe(1);
+              expect(fake.requests).toHaveLength(path === "prompt" ? 2 : 1);
+              expect(yield* adapter.hasSession(threadId)).toBe(false);
+              if (mode !== "success") {
+                const repeated = yield* Effect.raceFirst(
+                  Effect.exit(adapter.stopSession(threadId)).pipe(
+                    Effect.map((exit) => ({ kind: "complete" as const, exit })),
+                  ),
+                  Deferred.await(stopChildExit).pipe(Effect.as({ kind: "orphaned-stop" as const })),
+                );
+                expect(repeated.kind).toBe("complete");
+                if (repeated.kind === "complete") expectSafeStop(repeated.exit, reasons, "stopAll");
+              }
+            }).pipe(Effect.provideService(Tracer.Tracer, tracer));
+          }),
+      );
+
+for (const mode of ["success", ...stopReasonModes] as const)
+  for (const cancel of [false, true])
+    it.effect(
+      `closed scope repair joins an existing stop child ${mode} with caller cancel ${cancel}`,
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFake();
+          const stopEntered = yield* Deferred.make<void>();
+          const stopRelease = yield* Deferred.make<void>();
+          const stopDone = yield* Deferred.make<void>();
+          const allEntered = yield* Deferred.make<void>();
+          const allRelease = yield* Deferred.make<void>();
+          const interruptSent = yield* Deferred.make<void>();
+          const reasons = mode === "success" ? [] : stopReasons(mode);
+          let stopCalls = 0;
+          let allCalls = 0;
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void).pipe(Effect.ignoreCause));
+          const adapter = yield* makePiAdapter({
+            instanceId,
+            runtime: {
+              ...fake.runtime,
+              requestStop: () =>
+                Effect.gen(function* () {
+                  stopCalls++;
+                  yield* Deferred.succeed(stopEntered, undefined);
+                  yield* Deferred.await(stopRelease);
+                }).pipe(Effect.onExit(() => Deferred.succeed(stopDone, undefined))),
+              stopAll: Effect.gen(function* () {
+                allCalls++;
+                yield* Deferred.succeed(allEntered, undefined);
+                yield* Deferred.await(allRelease);
+                if (mode !== "success") return yield* Effect.failCause(Cause.fromReasons(reasons));
+                yield* Deferred.succeed(stopRelease, undefined);
+                yield* Deferred.await(stopDone);
+              }),
+            },
+          }).pipe(Effect.provideService(Scope.Scope, scope));
+          yield* adapter.startSession(startInput);
+          const caller = yield* Effect.forkScoped(adapter.stopSession(threadId));
+          yield* Deferred.await(stopEntered);
+          const stopping = yield* Effect.forkScoped(Effect.exit(adapter.stopAll()));
+          yield* Deferred.await(allEntered);
+          yield* Effect.addFinalizer(() => Deferred.succeed(allRelease, undefined));
+          if (cancel) {
+            const sent = yield* Effect.forkScoped(
+              Effect.sync(() => {
+                for (const id of [609101, 609102])
+                  caller.interruptUnsafe(
+                    id,
+                    Context.makeUnsafe(new Map([["caller", "existing-stop"]])),
+                  );
+              }).pipe(Effect.andThen(Deferred.succeed(interruptSent, undefined))),
+              { startImmediately: true },
+            );
+            yield* Deferred.await(interruptSent);
+            yield* Fiber.join(sent);
+          }
+          expect(caller.pollUnsafe()).toBeUndefined();
+          expect(stopping.pollUnsafe()).toBeUndefined();
+          expect(yield* Deferred.isDone(stopDone)).toBe(false);
+          yield* Deferred.succeed(allRelease, undefined);
+          const stopped = yield* Fiber.join(stopping);
+          yield* Deferred.await(stopDone);
+          if (mode === "success") expect(Exit.isSuccess(stopped)).toBe(true);
+          else expectSafeStop(stopped, reasons, "stopAll");
+          const exit = yield* Fiber.await(caller);
+          if (cancel) {
+            expect(Exit.isFailure(exit)).toBe(true);
+            if (Exit.isFailure(exit)) {
+              expect(
+                exit.cause.reasons
+                  .slice(0, 2)
+                  .map((reason) => (Cause.isInterruptReason(reason) ? reason.fiberId : undefined)),
+              ).toEqual([609101, 609102]);
+              for (const reason of exit.cause.reasons.slice(0, 2))
+                expect(reason.annotations.get("caller")).toBe("existing-stop");
+              if (mode === "success") expect(exit.cause.reasons).toHaveLength(2);
+              else
+                expectSafeStop(
+                  Exit.failCause(Cause.fromReasons(exit.cause.reasons.slice(2))),
+                  reasons,
+                  "stopAll",
+                );
+            }
+          } else if (mode === "success") expect(Exit.isSuccess(exit)).toBe(true);
+          else expectSafeStop(exit, reasons, "stopAll");
+          expect(stopCalls).toBe(1);
+          expect(allCalls).toBe(1);
+          expect(fake.requests).toHaveLength(1);
+          expect(yield* adapter.hasSession(threadId)).toBe(false);
+        }),
+    );
+
+for (const kind of ["initialize", "prompt"] as const)
+  for (const mode of ["success", "mixed-interrupts"] as const)
+    it.effect(
+      `closed scope repair retains published ${kind} interruptions and later actual cancellation ${mode}`,
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFake();
+          const stopRelease = yield* Deferred.make<void>();
+          const stopDone = yield* Deferred.make<void>();
+          const allEntered = yield* Deferred.make<void>();
+          const allRelease = yield* Deferred.make<void>();
+          const interruptSent = yield* Deferred.make<void>();
+          const correlation = { operation: "published-before-caller-cancel" };
+          const annotations = Context.makeUnsafe(
+            new Map<string, unknown>([
+              ["caller", kind],
+              ["correlation", correlation],
+            ]),
+          );
+          const published = [
+            Cause.makeInterruptReason(610101).annotate(annotations),
+            Cause.makeInterruptReason(610101).annotate(annotations),
+          ];
+          const reasons = mode === "success" ? [] : stopReasons(mode);
+          let stopCalls = 0;
+          let allCalls = 0;
+          const scope = yield* Scope.make();
+          yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void).pipe(Effect.ignoreCause));
+          const adapter = yield* makePiAdapter({
+            instanceId,
+            runtime: {
+              ...fake.runtime,
+              prepareOperation: (request, observe) =>
+                fake.runtime
+                  .prepareOperation(request, observe)
+                  .pipe(
+                    Effect.flatMap((prepared) =>
+                      request.kind === kind
+                        ? Effect.failCause(Cause.fromReasons<never>(published))
+                        : Effect.succeed(prepared),
+                    ),
+                  ),
+              requestStop: (thread) =>
+                Effect.gen(function* () {
+                  stopCalls++;
+                  yield* Queue.offer(fake.stopped, thread);
+                  yield* Deferred.await(stopRelease);
+                }).pipe(Effect.onExit(() => Deferred.succeed(stopDone, undefined))),
+              stopAll: Effect.gen(function* () {
+                allCalls++;
+                yield* Deferred.succeed(allEntered, undefined);
+                yield* Deferred.await(allRelease);
+                if (mode !== "success") return yield* Effect.failCause(Cause.fromReasons(reasons));
+                yield* Deferred.succeed(stopRelease, undefined);
+                yield* Deferred.await(stopDone);
+              }),
+            },
+          }).pipe(Effect.provideService(Scope.Scope, scope));
+          if (kind === "prompt") yield* adapter.startSession(startInput);
+          const caller = yield* Effect.forkScoped(
+            kind === "initialize"
+              ? adapter.startSession(startInput).pipe(Effect.asVoid)
+              : adapter.sendTurn({ threadId, input: "published interruption" }).pipe(Effect.asVoid),
+          );
+          // The real Runtime-published interruption reached the real Adapter waiter before cancellation.
+          yield* Queue.take(fake.stopped);
+          const stopping = yield* Effect.forkScoped(Effect.exit(adapter.stopAll()));
+          yield* Deferred.await(allEntered);
+          yield* Effect.addFinalizer(() => Deferred.succeed(allRelease, undefined));
+          const sent = yield* Effect.forkScoped(
+            Effect.sync(() => {
+              for (const id of [610101, 610102]) caller.interruptUnsafe(id, annotations);
+            }).pipe(Effect.andThen(Deferred.succeed(interruptSent, undefined))),
+            { startImmediately: true },
+          );
+          yield* Deferred.await(interruptSent);
+          yield* Fiber.join(sent);
+          expect(caller.pollUnsafe()).toBeUndefined();
+          yield* Deferred.succeed(allRelease, undefined);
+          const stopped = yield* Fiber.join(stopping);
+          if (mode === "success") expect(Exit.isSuccess(stopped)).toBe(true);
+          else expectSafeStop(stopped, reasons, "stopAll");
+          yield* Deferred.await(stopDone);
+          const exit = yield* Fiber.await(caller);
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isFailure(exit)) {
+            expect(
+              exit.cause.reasons
+                .slice(0, 4)
+                .map((reason) => (Cause.isInterruptReason(reason) ? reason.fiberId : undefined)),
+            ).toEqual([610101, 610101, 610101, 610102]);
+            for (const reason of exit.cause.reasons.slice(0, 4)) {
+              expect(reason.annotations.get("caller")).toBe(kind);
+              expect(reason.annotations.get("correlation")).toBe(correlation);
+            }
+            if (mode === "success") expect(exit.cause.reasons).toHaveLength(4);
+            else
+              expectSafeStop(
+                Exit.failCause(Cause.fromReasons(exit.cause.reasons.slice(4))),
+                reasons,
+                "stopAll",
+              );
+          }
+          expect(stopCalls).toBe(1);
+          expect(allCalls).toBe(1);
+          expect(fake.requests).toHaveLength(kind === "initialize" ? 1 : 2);
+        }),
+    );
