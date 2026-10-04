@@ -34,12 +34,15 @@ import {
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { makeProjectTeamSchedulingView } from "./ProjectTeamSchedulingView.ts";
+import { PROJECT_WORK_CHECKPOINT_VERSION } from "./ProjectTeamsPersistence.ts";
 import {
   makeProjectTeamScheduler,
   type ProjectTeamSchedulerPorts,
 } from "./ProjectTeamScheduler.ts";
 
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const fixture = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -152,6 +155,64 @@ it.effect("commits the authorized attempt and pending intent before notification
         claimGeneration: 0,
         stage: "reserved",
       });
+      expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(1);
+      expect(yield* f.sql`SELECT dispatch_id FROM project_team_dispatch`).toEqual([
+        { dispatch_id: "scheduler-dispatch" },
+      ]);
+    }),
+  ),
+);
+
+it.effect("isolates malformed project priority while a healthy SQL claim commits", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const bad = ProjectId.make("a-malformed");
+      yield* f.sql`INSERT INTO projection_projects
+        (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (${bad},'Malformed policy','/workspace','[]',${at},${at})`;
+      const healthy = yield* readCurrentState(f.sql, projectId);
+      const limits = healthy.foundationRecords!.find((record) => record.kind === "limits");
+      if (limits?.kind !== "limits") return yield* Effect.die("Missing fixture limits");
+      yield* f.repository.execute(
+        yield* decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId: bad,
+          commandId: "malformed-project-limits",
+          expectedRevision: 0,
+          attribution,
+          committedAt: at,
+          records: [
+            { ...limits, projectId: bad, recordId: "malformed-limits", projectPriority: 1 },
+          ],
+        }),
+      );
+      const current = yield* readCurrentState(f.sql, bad);
+      const broken = yield* encodeJson({
+        ...current,
+        checkpointVersion: PROJECT_WORK_CHECKPOINT_VERSION,
+        foundationRecords: current.foundationRecords!.map((record) =>
+          record.kind === "limits" ? { ...record, projectPriority: 0.5 } : record,
+        ),
+      });
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json = ${broken} WHERE project_id = ${bad}`;
+      const view = yield* makeProjectTeamSchedulingView();
+      const scheduler = yield* makeProjectTeamScheduler({
+        environmentId: "environment",
+        ports: { ...f.ports, ...view },
+      });
+      const results = yield* Effect.forEach([0, 1, 2], () => scheduler.sweep());
+      expect(
+        results.flatMap((result) => result.committed.map((entry) => entry.fence.dispatchId)),
+      ).toEqual(["scheduler-dispatch"]);
+      for (const result of results)
+        expect(result.blocked).toContainEqual({
+          projectId: bad,
+          phase: "read",
+          reason: "project-read-failed",
+          error: expect.objectContaining({ _tag: "ProjectWorkPolicyError", code: "invalid-state" }),
+        });
+      expect((yield* readCurrentState(f.sql, bad)).attempts).toEqual([]);
       expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(1);
       expect(yield* f.sql`SELECT dispatch_id FROM project_team_dispatch`).toEqual([
         { dispatch_id: "scheduler-dispatch" },

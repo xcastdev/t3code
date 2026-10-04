@@ -1,9 +1,9 @@
 import {
   canonicalProjectWorkPayload,
-  ProjectId,
+  type ProjectId,
   ProjectTeamRecord,
   ProjectWorkTask,
-  ProjectWorkTaskId,
+  type ProjectWorkTaskId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -21,12 +21,10 @@ type ReadPorts = Pick<
   ProjectTeamSchedulerPorts<SqlError.SqlError | ProjectWorkPolicyError>,
   "readProjectPage" | "readProjectState"
 >;
-const Id = ProjectId.check(Schema.isTrimmed(), Schema.isNonEmpty(), Schema.isMaxLength(256));
-const TaskId = ProjectWorkTaskId.check(
-  Schema.isTrimmed(),
-  Schema.isNonEmpty(),
-  Schema.isMaxLength(256),
-);
+const RawId = Schema.String.check(Schema.isTrimmed(), Schema.isNonEmpty(), Schema.isMaxLength(256));
+// Shared ID codecs trim input. Selection identities must preserve the physical SQL key.
+const Id = RawId.pipe(Schema.brand("ProjectId"));
+const TaskId = RawId.pipe(Schema.brand("ProjectWorkTaskId"));
 const Positive = Schema.Int.check(Schema.isGreaterThan(0));
 const decodeProjectPage = Schema.decodeEffect(
   Schema.Struct({
@@ -144,9 +142,14 @@ export const makeProjectTeamSchedulingView = Effect.fn("makeProjectTeamSchedulin
             Effect.gen(function* () {
               const state = yield* readCurrentState(sql, projectId);
               const policy = yield* readPolicy(state, projectId);
-              // Keep the full SQL window so disabled projects cannot shorten a keyset page.
               return { projectId, priority: policy?.projectPriority ?? 0 };
-            }),
+            }).pipe(
+              // Selection grants no authority. Preserve the SQL window; the scheduler's
+              // per-project state read reports policy denial while healthy work continues.
+              Effect.catchTag("ProjectWorkPolicyError", () =>
+                Effect.succeed({ projectId, priority: 0 }),
+              ),
+            ),
           );
         }),
       );

@@ -126,17 +126,16 @@ const replaceCheckpoint = Effect.fn("schedulingTest.replaceCheckpoint")(function
     WHERE project_id = ${projectId}`;
 });
 
-const rejectBoth = Effect.fn("schedulingTest.rejectBoth")(function* (projectId: ProjectId) {
+const assertPolicyDenied = Effect.fn("schedulingTest.assertPolicyDenied")(function* (
+  projectId: ProjectId,
+) {
   const view = yield* makeProjectTeamSchedulingView();
-  for (const result of [
-    yield* view.readProjectPage({ limit: 32 }).pipe(Effect.result),
-    yield* view.readProjectState({ projectId, limit: 64 }).pipe(Effect.result),
-  ]) {
-    expect(result._tag).toBe("Failure");
-    if (result._tag === "Failure") {
-      expect(result.failure).toBeInstanceOf(ProjectWorkPolicyError);
-      expect(result.failure._tag).toBe("ProjectWorkPolicyError");
-    }
+  expect(yield* view.readProjectPage({ limit: 32 })).toEqual([{ projectId, priority: 0 }]);
+  const result = yield* view.readProjectState({ projectId, limit: 64 }).pipe(Effect.result);
+  expect(result._tag).toBe("Failure");
+  if (result._tag === "Failure") {
+    expect(result.failure).toBeInstanceOf(ProjectWorkPolicyError);
+    expect(result.failure._tag).toBe("ProjectWorkPolicyError");
   }
 });
 
@@ -153,6 +152,65 @@ it.effect("reads installed project priority and refreshes it after reconfigurati
       expect(yield* view.readProjectPage({ limit: 32 })).toEqual([
         { projectId: "priority-project", priority: -3 },
       ]);
+    }),
+  ),
+);
+
+it.effect("rejects malformed physical IDs before they can change a SQL keyset cursor", () =>
+  scoped(
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const valid = yield* register("B-healthy");
+      yield* configure(valid, { projectPriority: 10 });
+      yield* sql`INSERT INTO projection_projects
+        (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (' a','Malformed identity','/workspace','[]',${at},${at})`;
+      const view = yield* makeProjectTeamSchedulingView();
+      const first = yield* view.readProjectPage({ limit: 1 }).pipe(Effect.result);
+      expect(first._tag).toBe("Failure");
+      if (first._tag === "Failure") expect(first.failure).toBeInstanceOf(ProjectWorkPolicyError);
+      expect(yield* sql`SELECT project_id FROM projection_projects ORDER BY project_id`).toEqual([
+        { project_id: " a" },
+        { project_id: valid },
+      ]);
+      yield* sql`DELETE FROM projection_projects WHERE project_id = ' a'`;
+      expect(yield* view.readProjectPage({ limit: 1 })).toEqual([
+        { projectId: valid, priority: 10 },
+      ]);
+    }),
+  ),
+);
+
+it.effect("rejects raw request identities instead of silently trimming them", () =>
+  scoped(
+    Effect.gen(function* () {
+      const projectId = yield* register("B-healthy");
+      yield* createTask(projectId, "task-a");
+      yield* createTask(projectId, "task-b");
+      yield* configure(projectId);
+      const view = yield* makeProjectTeamSchedulingView();
+      for (const result of [
+        yield* view
+          .readProjectPage({ afterProjectId: ProjectId.make(" B-healthy"), limit: 1 })
+          .pipe(Effect.result),
+        yield* view
+          .readProjectState({ projectId: ProjectId.make(" B-healthy"), limit: 1 })
+          .pipe(Effect.result),
+        yield* view
+          .readProjectState({ projectId, afterTaskId: ProjectWorkTaskId.make(" task-a"), limit: 1 })
+          .pipe(Effect.result),
+      ]) {
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure).toBeInstanceOf(ProjectWorkPolicyError);
+      }
+      expect(
+        (yield* view.readProjectState({
+          projectId,
+          afterTaskId: ProjectWorkTaskId.make("task-a"),
+          limit: 1,
+        })).candidates,
+      ).toEqual([{ taskId: "task-b", priority: 0 }]);
     }),
   ),
 );
@@ -392,7 +450,7 @@ for (const corrupt of [
             record.kind === "limits" ? { ...record, ...corrupt.fields } : record,
           ),
         }));
-        yield* rejectBoth(projectId);
+        yield* assertPolicyDenied(projectId);
       }),
     ),
   );
@@ -422,7 +480,7 @@ for (const mismatch of [
               : record,
           ),
         }));
-        yield* rejectBoth(projectId);
+        yield* assertPolicyDenied(projectId);
       }),
     ),
   );
@@ -451,7 +509,7 @@ for (const fault of ["duplicate-policy", "duplicate-task", "foreign-task"] as co
                 ]
               : state.foundationRecords,
         }));
-        yield* rejectBoth(projectId);
+        yield* assertPolicyDenied(projectId);
       }),
     ),
   );
