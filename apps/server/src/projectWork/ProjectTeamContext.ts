@@ -17,11 +17,17 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { Fragment } from "effect/unstable/sql/Statement";
 import {
   makeProjectTeamDispatchJournal,
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
+import {
+  evaluateProjectTeamGate,
+  projectTeamSpecificationHash,
+  projectTeamPlanHash,
+} from "./ProjectTeamPolicy.ts";
 
 // These private codecs match ProjectTeamModelAccounting's retained producer protocol.
 const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
@@ -251,7 +257,138 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
     if (transition?.kind !== "claim") return yield* deny("Original claim is missing");
     const binding = transition.binding;
     const limits = snapshot.intent.limits;
-    // Membership includes original run IDs so a moved physical owner partition cannot free tokens.
+    let historyBytes = 0;
+    const readOriginals = Effect.fn("ProjectTeamContext.readOriginals")(function* (
+      kind: "task-membership" | "run-binding" | "effect",
+      selection: Fragment,
+    ) {
+      const rows = yield* sql<{
+        sequence: number;
+        event_id: string;
+        project_id: string;
+        occurred_at: string;
+        command_id: string;
+        bytes: number;
+      }>`SELECT sequence,event_id,project_id,occurred_at,command_id,
+        length(CAST(payload_json AS BLOB)) AS bytes
+        FROM project_work_events WHERE project_id=${binding.projectId}
+        AND event_type='project-work.foundation.recorded'
+        AND json_extract(payload_json,'$.record.kind')=${kind}
+        AND json_extract(payload_json,'$.record.revision')=0 AND ${selection}
+        ORDER BY sequence LIMIT 4097`;
+      if (rows.length > Bounds.ledgerRows) return yield* deny("Root claim history exceeds bounds");
+      for (const row of rows) {
+        if (
+          !Number.isSafeInteger(row.sequence) ||
+          row.sequence <= 0 ||
+          !Number.isSafeInteger(row.bytes) ||
+          row.bytes < 0 ||
+          row.bytes > Bounds.contextBytes
+        )
+          return yield* deny("Root claim event exceeds bounds");
+        historyBytes = add(historyBytes, row.bytes);
+      }
+      if (historyBytes > Bounds.ledgerBytes)
+        return yield* deny("Root claim history exceeds byte bounds");
+      return yield* Effect.forEach(
+        rows,
+        Effect.fn("ProjectTeamContext.decodeOriginal")(function* (row) {
+          const payloads = yield* sql<{
+            payload_json: string;
+          }>`SELECT payload_json FROM project_work_events
+            WHERE project_id=${binding.projectId} AND sequence=${row.sequence} AND event_id=${row.event_id}`;
+          if (payloads.length !== 1 || payloads[0] === undefined)
+            return yield* deny("Original root claim event is missing");
+          const event = yield* decodeFoundationEvent(payloads[0].payload_json);
+          if (
+            event.eventId !== row.event_id ||
+            event.projectId !== binding.projectId ||
+            event.projectId !== row.project_id ||
+            event.occurredAt !== row.occurred_at ||
+            event.record.kind !== kind ||
+            event.record.projectId !== binding.projectId ||
+            event.record.revision !== 0
+          )
+            return yield* deny("Root claim retained identity changed");
+          return { commandId: row.command_id, record: event.record };
+        }),
+      );
+    });
+    // Original domain memberships and claims survive physical dispatch/ledger loss.
+    // Parent membership is immutable; read only its original edge, not a replay of task events.
+    const roots = yield* readOriginals(
+      "task-membership",
+      sql`json_extract(payload_json,'$.record.taskId')=${limits.rootTaskId}`,
+    );
+    if (
+      roots.length !== 1 ||
+      roots[0]?.record.kind !== "task-membership" ||
+      roots[0].record.parentTaskId !== undefined
+    )
+      return yield* deny("Original root membership is missing or ambiguous");
+    const tasks = new Set<string>([limits.rootTaskId]);
+    let frontier = [limits.rootTaskId as string];
+    let depth = 0;
+    while (frontier.length > 0) {
+      const children = yield* readOriginals(
+        "task-membership",
+        sql`json_extract(payload_json,'$.record.parentTaskId') IN ${sql.in(frontier)}`,
+      );
+      if (children.length > 0 && ++depth >= 9)
+        return yield* deny("Original root task lineage exceeds bounds");
+      const next: string[] = [];
+      for (const child of children) {
+        const membership = child.record;
+        if (
+          membership.kind !== "task-membership" ||
+          membership.parentTaskId === undefined ||
+          !frontier.includes(membership.parentTaskId) ||
+          tasks.has(membership.taskId) ||
+          tasks.size >= Bounds.ledgerRows
+        )
+          return yield* deny("Original root task membership is inconsistent");
+        tasks.add(membership.taskId);
+        next.push(membership.taskId);
+      }
+      frontier = next;
+    }
+    const originals = yield* readOriginals(
+      "run-binding",
+      sql`json_extract(payload_json,'$.record.environmentId')=${options.environmentId}
+      AND json_extract(payload_json,'$.record.taskId') IN ${sql.in([...tasks])}`,
+    );
+    const owners = new Map<string, ProjectTeamDispatchSnapshot>();
+    for (const original of originals) {
+      const run = original.record;
+      if (
+        run.kind !== "run-binding" ||
+        run.environmentId !== options.environmentId ||
+        owners.has(run.recordId)
+      )
+        return yield* deny("Original root run membership is inconsistent");
+      const effects = yield* readOriginals(
+        "effect",
+        sql`command_id=${original.commandId}
+        AND json_extract(payload_json,'$.record.effectKind')='dispatch'
+        AND json_extract(payload_json,'$.record.runId')=${run.recordId}`,
+      );
+      const effect = effects[0]?.record;
+      if (effects.length !== 1 || effect?.kind !== "effect")
+        return yield* deny("Original root dispatch claim is missing");
+      const owner = yield* journal.readRetained(effect.effectId);
+      const claim = owner.intent.compiledClaim.transition;
+      if (
+        claim?.kind !== "claim" ||
+        !same(claim.binding, run) ||
+        !same(claim.dispatch?.effect, effect) ||
+        owner.intent.compiledClaim.commandId !== original.commandId ||
+        owner.intent.limits.rootTaskId !== limits.rootTaskId ||
+        owner.intent.limits.maximumTokens !== limits.maximumTokens ||
+        owner.intent.limits.rootDeadlineAtMs !== limits.rootDeadlineAtMs
+      )
+        return yield* deny("Root dispatch history is inconsistent");
+      owners.set(run.recordId, owner);
+    }
     const members = yield* sql<{
       dispatch_id: string;
       binding_id: string;
@@ -259,26 +396,13 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       FROM project_team_dispatch WHERE environment_id=${options.environmentId}
       AND project_id=${binding.projectId} AND root_task_id=${limits.rootTaskId} ORDER BY dispatch_id LIMIT 4097`;
     if (
-      members.length > Bounds.ledgerRows ||
-      !members.some((m) => m.binding_id === binding.recordId)
-    )
-      return yield* deny("Root dispatch history exceeds required limits or is missing");
-    const owners = new Map<string, ProjectTeamDispatchSnapshot>();
-    for (const member of members) {
-      const owner = yield* journal.readRetained(member.dispatch_id);
-      const claim = owner.intent.compiledClaim.transition;
-      if (
-        claim?.kind !== "claim" ||
-        claim.binding.recordId !== member.binding_id ||
-        owners.has(member.binding_id) ||
-        claim.binding.projectId !== binding.projectId ||
-        owner.intent.limits.rootTaskId !== limits.rootTaskId ||
-        owner.intent.limits.maximumTokens !== limits.maximumTokens ||
-        owner.intent.limits.rootDeadlineAtMs !== limits.rootDeadlineAtMs
+      !owners.has(binding.recordId) ||
+      members.length !== owners.size ||
+      members.some(
+        (member) => owners.get(member.binding_id)?.fence.dispatchId !== member.dispatch_id,
       )
-        return yield* deny("Root dispatch history is inconsistent");
-      owners.set(member.binding_id, owner);
-    }
+    )
+      return yield* deny("Root physical owners disagree with original claims");
     const selection = sql`(environment_id=${options.environmentId} AND project_id=${binding.projectId}
       AND root_task_id=${limits.rootTaskId}) OR run_id IN ${sql.in([...owners.keys()])}`;
     const metadata = yield* sql<{ reservation_id: string; bytes: number }>`SELECT reservation_id,
@@ -654,6 +778,36 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             if (plans[1]?.planRevision === plan?.planRevision)
               return yield* deny("Required plan revision is ambiguous");
             if (plan !== undefined) requiredRecords.set(plan.recordId, plan);
+            if (taskId !== binding.taskId) {
+              const targets = [
+                ["specification", projectTeamSpecificationHash(state, task.taskId), 0],
+                ...(plan === undefined
+                  ? []
+                  : [["plan", projectTeamPlanHash(plan), plan.planRevision] as const]),
+              ] as const;
+              for (const [kind, contentHash, planRevision] of targets) {
+                const approvals = records.filter(
+                  (record): record is RecordOf<"gate"> =>
+                    record.kind === "gate" &&
+                    evaluateProjectTeamGate(record, {
+                      projectId: task.projectId,
+                      taskId: task.taskId,
+                      gate: kind,
+                      specRevision: task.specRevision,
+                      planRevision,
+                      contentHash,
+                      evidenceIds: [],
+                    }).available,
+                );
+                if (
+                  approvals.length !== 1 ||
+                  (kind === "plan" &&
+                    (plan?.specRevision !== task.specRevision || plan.contentHash !== contentHash))
+                )
+                  return yield* deny("Required ancestor approval is missing, stale or ambiguous");
+                gateIds.add(approvals[0]!.recordId);
+              }
+            }
             const criteria = yield* Effect.forEach(
               state.criteria.filter((c) => c.taskId === taskId),
               (criterion) => decodeCriterion(criterion),

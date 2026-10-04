@@ -2,6 +2,9 @@ import { expect, it } from "@effect/vitest";
 import {
   ProjectWorkFoundationCommitCommand,
   EventId,
+  ProjectWorkTaskId,
+  ProviderInstanceId,
+  ThreadId,
   ProjectWorkCommand,
   ProjectTeamRecord as TeamRecordSchema,
   type ProjectTeamRecord,
@@ -17,6 +20,7 @@ import {
   projectId,
   seed,
   scoped,
+  createManagedAssignment,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { ProjectWorkProjection } from "./ProjectWorkProjection.ts";
@@ -39,7 +43,7 @@ const decodeCommand = Schema.decodeUnknownEffect(ProjectWorkCommand);
 const decodeRecord = Schema.decodeUnknownEffect(TeamRecordSchema);
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 
-const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
+const makeFixture = (role: "implementer" | "integrator" = "implementer", writableWorkers = 1) =>
   Effect.gen(function* () {
     const repository = yield* ProjectWorkRepository;
     const sql = yield* SqlClient.SqlClient;
@@ -88,7 +92,7 @@ const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
             updatedAt: at,
             status: "configured",
             environmentModelCalls: 4,
-            projectWritableWorkers: 1,
+            projectWritableWorkers: writableWorkers,
             modelCalls: 2,
             delegationDepth: 2,
             repairAllowance: 2,
@@ -166,74 +170,77 @@ const denied = Effect.fn("contextFixture.denied")(function* <A, E, R>(
   expect(result._tag).toBe("Failure");
   if (result._tag === "Failure") expect(result.failure).toBeInstanceOf(ProjectTeamContextError);
 });
-const budgetFixture = Effect.gen(function* () {
-  const f = yield* makeFixture();
-  const claim = f.snapshot.intent.compiledClaim.transition;
-  if (claim?.kind !== "claim") return yield* Effect.die("Fixture claim missing");
-  const binding = { ...claim.binding, status: "running" as const, revision: 1 };
-  yield* f.change(binding);
-  const managed = {
-    projectId,
-    bindingId: binding.recordId,
-    generation: binding.generation,
-    providerInstanceId: binding.providerInstanceId,
-    threadId: binding.threadId,
-  };
-  const principal = { actor: { kind: "agent" as const, id: managedActorId(managed) }, managed };
-  const accounting = yield* Accounting.make({
-    environmentId: "environment",
-    routeId: "configured",
-    model: "test",
-    acceptedReportedModels: ["test"],
-    resolveOperation: (_authority, reservation) =>
-      Effect.succeed({
-        workerId: reservation.workerId,
-        operationId: reservation.operationId,
-        rootTaskId: f.snapshot.intent.limits.rootTaskId,
-        maximumTokens: f.snapshot.intent.limits.maximumTokens,
-        deadlineAtMs: f.snapshot.intent.limits.rootDeadlineAtMs,
-        operationMaximumTokens: f.snapshot.intent.limits.attemptMaximumTokens,
-        operationDeadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
-      }),
-  });
-  const reservation = (requestId: number): PiModelRequestReservation => ({
-    workerId: "worker",
-    generation: binding.generation,
-    operationId: "assignment",
-    requestId,
-    routeId: "configured",
-    provider: "command-code",
-    model: "test",
-    maxInputTokens: 100,
-    maxOutputTokens: 100,
-    callCount: 1,
-    deadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
-  });
-  const reserve = (id: number) => accounting.reserve(principal, reservation(id));
-  const settle = (
-    reservationId: string,
-    id: number,
-    outcome: "reported" | "failed" | "unknown",
-    drained = true,
-  ) => {
-    const value: PiModelRequestSettlement = {
-      ...reservation(id),
-      reservationId,
-      transportDrained: drained,
-      outcome,
-      chargedInputTokens: outcome === "reported" ? 10 : 100,
-      chargedOutputTokens: outcome === "reported" ? 20 : 100,
-      ...(outcome === "reported"
-        ? {
-            reportedModel: "test",
-            reportedUsage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
-          }
-        : {}),
+const makeBudgetFixture = (writableWorkers = 1) =>
+  Effect.gen(function* () {
+    const f = yield* makeFixture("implementer", writableWorkers);
+    const claim = f.snapshot.intent.compiledClaim.transition;
+    if (claim?.kind !== "claim") return yield* Effect.die("Fixture claim missing");
+    const binding = { ...claim.binding, status: "running" as const, revision: 1 };
+    yield* f.change(binding);
+    const managed = {
+      projectId,
+      bindingId: binding.recordId,
+      generation: binding.generation,
+      providerInstanceId: binding.providerInstanceId,
+      threadId: binding.threadId,
     };
-    return accounting.settle(value);
-  };
-  return { ...f, reserve, settle, reservation, accounting };
-});
+    const principal = { actor: { kind: "agent" as const, id: managedActorId(managed) }, managed };
+    const accounting = yield* Accounting.make({
+      environmentId: "environment",
+      routeId: "configured",
+      model: "test",
+      acceptedReportedModels: ["test"],
+      resolveOperation: (_authority, reservation) =>
+        Effect.succeed({
+          workerId: reservation.workerId,
+          operationId: reservation.operationId,
+          rootTaskId: f.snapshot.intent.limits.rootTaskId,
+          maximumTokens: f.snapshot.intent.limits.maximumTokens,
+          deadlineAtMs: f.snapshot.intent.limits.rootDeadlineAtMs,
+          operationMaximumTokens: f.snapshot.intent.limits.attemptMaximumTokens,
+          operationDeadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
+        }),
+    });
+    const reservation = (requestId: number): PiModelRequestReservation => ({
+      workerId: "worker",
+      generation: binding.generation,
+      operationId: "assignment",
+      requestId,
+      routeId: "configured",
+      provider: "command-code",
+      model: "test",
+      maxInputTokens: 100,
+      maxOutputTokens: 100,
+      callCount: 1,
+      deadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
+    });
+    const reserve = (id: number) => accounting.reserve(principal, reservation(id));
+    const settle = (
+      reservationId: string,
+      id: number,
+      outcome: "reported" | "failed" | "unknown",
+      drained = true,
+    ) => {
+      const value: PiModelRequestSettlement = {
+        ...reservation(id),
+        reservationId,
+        transportDrained: drained,
+        outcome,
+        chargedInputTokens: outcome === "reported" ? 10 : 100,
+        chargedOutputTokens: outcome === "reported" ? 20 : 100,
+        ...(outcome === "reported"
+          ? {
+              reportedModel: "test",
+              reportedUsage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+            }
+          : {}),
+      };
+      return accounting.settle(value);
+    };
+    return { ...f, reserve, settle, reservation, accounting };
+  });
+
+const budgetFixture = makeBudgetFixture();
 
 it.effect(
   "reconstructs exact original scope, outputs, role, approvals and caps after checkpoint loss",
@@ -816,4 +823,180 @@ it.effect(
         yield* denied(f.reader.readRequired(f.snapshot));
       }),
     ),
+);
+
+const lineageFixture = Effect.gen(function* () {
+  const f = yield* makeBudgetFixture(2);
+  const a = yield* f.reserve(1);
+  yield* f.settle(a.reservationId, 1, "reported");
+  const state = yield* readCurrentState(f.sql, projectId);
+  const limits = state.foundationRecords!.find((r) => r.kind === "limits")!;
+  if (limits.kind !== "limits") return yield* Effect.die("Missing limits");
+  yield* f.change({ ...limits, revision: limits.revision + 1, projectWritableWorkers: 2 });
+  const role = state.foundationRecords!.find((r) => r.kind === "role-revision")!;
+  const oldClaim = f.snapshot.intent.compiledClaim.transition;
+  if (role.kind !== "role-revision" || oldClaim?.kind !== "claim")
+    return yield* Effect.die("Missing role/claim");
+  yield* f.repository.execute(
+    yield* decodeCommand({
+      type: "project-work.task.create",
+      projectId,
+      taskId: "sibling-task",
+      commandId: "sibling-create",
+      title: "Sibling",
+      createdAt: at,
+    }),
+  );
+  yield* f.change(
+    yield* decodeRecord({
+      kind: "task-membership",
+      projectId,
+      recordId: "sibling-membership",
+      revision: 0,
+      generation: 0,
+      updatedAt: at,
+      status: "active",
+      taskId: "sibling-task",
+      executionKind: "managed",
+      deliverableKind: "code",
+      controlState: "active",
+      parentTaskId: oldClaim.binding.taskId,
+    }),
+  );
+  let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+  yield* createManagedAssignment({
+    taskId: ProjectWorkTaskId.make("sibling-task"),
+    recordId: "sibling-binding",
+    attemptId: "sibling-attempt",
+    commandId: "sibling-dispatch",
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    threadId: ThreadId.make("sibling-thread"),
+    role,
+    status: "reserved",
+    configuration: oldClaim.binding.configuration,
+  }).pipe(
+    Effect.provideService(ProjectWorkRepository, {
+      ...f.repository,
+      execute: (command) => {
+        if (
+          command.type === "project-work.foundation.commit" &&
+          command.transition?.kind === "claim"
+        ) {
+          pending = command;
+          return Effect.fail(
+            new ProjectWorkPolicyError("invalid-state", "Control captures second claim"),
+          );
+        }
+        return f.repository.execute(command);
+      },
+    }),
+    Effect.result,
+  );
+  if (!pending || pending.transition?.kind !== "claim")
+    return yield* Effect.die("Second claim not captured");
+  const nextState = yield* readCurrentState(f.sql, projectId);
+  const membership = nextState.foundationRecords!.find(
+    (r) => r.kind === "task-membership" && r.taskId === "sibling-task",
+  )!;
+  if (membership.kind !== "task-membership") return yield* Effect.die("Missing sibling membership");
+  expect(membership.parentTaskId).toBe(oldClaim.binding.taskId);
+  const request: ProjectTeamDispatchRequest = {
+    ...f.request,
+    dispatchId: "sibling-dispatch",
+    claim: {
+      ...pending,
+      expectedRevision: (yield* readCurrentState(f.sql, projectId)).revision,
+      transition: {
+        ...pending.transition,
+        binding: {
+          ...pending.transition.binding,
+          branch: "refs/heads/sibling",
+          worktree: "/sibling-worktree",
+        },
+      },
+    },
+    git: {
+      ...f.request.git,
+      effectId: "sibling-dispatch",
+      runId: "sibling-binding",
+      branchRef: "refs/heads/sibling",
+      worktreePath: "/sibling-worktree",
+      ownershipToken: "sibling-owner",
+    },
+    setupId: "sibling-setup",
+    initializeOperationId: "sibling-init",
+    assignmentOperationId: "sibling-assignment",
+  };
+  const next = yield* f.journal.claimEffect((yield* f.journal.reserve(request)).fence);
+  return { ...f, next, a };
+});
+
+it.effect(
+  "denies historical owner loss with a relocated charge and accepts exact restoration",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* lineageFixture;
+        const before = yield* f.reader.readRequired(f.next);
+        expect(before.required.remaining).toMatchObject({
+          rootUsedTokens: 30,
+          rootRemainingTokens: 970,
+        });
+        const dispatch =
+          (yield* f.sql`SELECT * FROM project_team_dispatch WHERE dispatch_id='dispatch-intent'`)[0]!;
+        yield* f.sql`INSERT INTO project_team_model_budget SELECT environment_id,project_id,'moved-root',maximum_tokens,deadline_at_ms FROM project_team_model_budget`;
+        yield* f.sql`UPDATE project_team_model_request SET root_task_id='moved-root' WHERE reservation_id=${f.a.reservationId}`;
+        yield* denied(f.reader.readRequired(f.next));
+        yield* f.sql`UPDATE project_team_model_request SET root_task_id=${f.snapshot.intent.limits.rootTaskId} WHERE reservation_id=${f.a.reservationId}`;
+        expect(yield* f.reader.readRequired(f.next)).toEqual(before);
+        yield* f.sql`DELETE FROM project_team_dispatch WHERE dispatch_id='dispatch-intent'`;
+        yield* denied(f.reader.readRequired(f.next));
+        yield* f.sql`UPDATE project_team_model_request SET root_task_id='moved-root' WHERE reservation_id=${f.a.reservationId}`;
+        yield* f.journal.inspect(f.next.fence.dispatchId, { requireClaim: true });
+        const altered = yield* f.reader.readRequired(f.next).pipe(Effect.result);
+        yield* f.sql`INSERT INTO project_team_dispatch ${f.sql.insert(dispatch)}`;
+        yield* f.sql`UPDATE project_team_model_request SET root_task_id=${f.snapshot.intent.limits.rootTaskId} WHERE reservation_id=${f.a.reservationId}`;
+        const restored = yield* f.reader.readRequired(f.next);
+        expect(restored).toEqual(before);
+        expect(altered._tag).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect("denies unapproved ancestor scope despite agreeing physical and checkpoint copies", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* lineageFixture;
+      const before = yield* f.reader.readRequired(f.next);
+      expect(before.required.tasks[1]?.task.specification?.scopeIn).toBe("Task");
+      const parentBefore = yield* f.reader.readRequired(f.snapshot);
+      const retainedBefore =
+        yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`;
+      yield* f.sql`UPDATE project_work_tasks SET specification_json=json_set(specification_json,'$.scopeIn','Unapproved ancestor scope') WHERE task_id='authorization-task'`;
+      yield* denied(f.reader.readRequired(f.next));
+      yield* f.sql`UPDATE project_work_tasks SET specification_json=json_set(specification_json,'$.scopeIn','Task') WHERE task_id='authorization-task'`;
+      expect(yield* f.reader.readRequired(f.next)).toEqual(before);
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,'$.tasks[0].specification.scopeIn','Unapproved ancestor scope') WHERE project_id=${projectId}`;
+      yield* denied(f.reader.readRequired(f.next));
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,'$.tasks[0].specification.scopeIn','Task') WHERE project_id=${projectId}`;
+      expect(yield* f.reader.readRequired(f.next)).toEqual(before);
+      yield* f.sql`UPDATE project_work_tasks SET specification_json=json_set(specification_json,'$.scopeIn','Unapproved ancestor scope') WHERE task_id='authorization-task'`;
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,'$.tasks[0].specification.scopeIn','Unapproved ancestor scope') WHERE project_id=${projectId}`;
+      const state = yield* readCurrentState(f.sql, projectId);
+      expect(
+        state.tasks.find((t) => t.taskId === "authorization-task")?.specification?.scopeIn,
+      ).toBe("Unapproved ancestor scope");
+      expect(
+        yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`,
+      ).toEqual(retainedBefore);
+      yield* denied(f.reader.readRequired(f.snapshot));
+      yield* f.journal.inspect(f.next.fence.dispatchId, { requireClaim: true });
+      const result = yield* f.reader.readRequired(f.next).pipe(Effect.result);
+      yield* f.sql`UPDATE project_work_tasks SET specification_json=json_set(specification_json,'$.scopeIn','Task') WHERE task_id='authorization-task'`;
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,'$.tasks[0].specification.scopeIn','Task') WHERE project_id=${projectId}`;
+      expect(yield* f.reader.readRequired(f.next)).toEqual(before);
+      expect(yield* f.reader.readRequired(f.snapshot)).toEqual(parentBefore);
+      expect(result._tag).toBe("Failure");
+    }),
+  ),
 );
