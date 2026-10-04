@@ -176,6 +176,7 @@ const decodeIntent = Schema.decodeUnknownEffect(Schema.fromJsonString(Intent), s
 const decodeRow = Schema.decodeUnknownEffect(RowSchema, strict);
 const decodeJsonRecord = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectTeamRecordSchema));
 const encodeIntent = Schema.encodeSync(Schema.fromJsonString(Intent));
+const encodeProjectionJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const fingerprint = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
@@ -1373,6 +1374,141 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           )
         )
           return yield* deny("Joined settlement has incomplete domain ownership");
+        // The reducer checkpoint is not proof that the corresponding SQL writes landed.
+        // Check the original ownership rows and projections while all writes can still roll back.
+        const ownership = records.filter(
+          (r) =>
+            (r.kind === "run-binding" && r.recordId === binding.recordId) ||
+            (r.kind === "reservation" && r.recordId === value.intent.writableReservationId) ||
+            (r.kind === "effect" &&
+              r.runId === binding.recordId &&
+              (r.effectKind === "dispatch" || r.effectKind === "stop")),
+        );
+        for (const record of ownership) {
+          if (
+            record.kind !== "run-binding" &&
+            record.kind !== "reservation" &&
+            record.kind !== "effect"
+          )
+            return yield* deny("Joined settlement ownership has an invalid kind");
+          const rows = yield* sql<{
+            payload_json: string;
+          }>`SELECT record_id,project_id,status,revision,generation,
+            updated_at,task_id,attempt_id,member_id,scope_key,slot,unique_key,
+            provider_instance_id,thread_id,session_id,payload_json
+            FROM ${sql("project_team_" + record.kind.replaceAll("-", "_"))}
+            WHERE record_id=${record.recordId} AND project_id=${value.row.project_id}`;
+          const row = rows[0];
+          if (rows.length !== 1 || row === undefined)
+            return yield* deny("Joined settlement physical ownership is missing");
+          const payload = yield* decodeJsonRecord(row.payload_json).pipe(
+            Effect.mapError(() => deny("Joined settlement physical ownership payload is invalid")),
+          );
+          const { payload_json: _, ...columns } = row;
+          const expectedColumns = {
+            record_id: record.recordId,
+            project_id: record.projectId,
+            status: record.status,
+            revision: record.revision,
+            generation: record.generation,
+            updated_at: record.updatedAt,
+            task_id: record.taskId ?? null,
+            attempt_id: "attemptId" in record ? record.attemptId : null,
+            member_id: "memberId" in record ? record.memberId : null,
+            scope_key:
+              record.kind === "reservation"
+                ? canonicalProjectWorkPayload([
+                    record.environmentId,
+                    record.scope,
+                    record.scope === "environment"
+                      ? "model-call"
+                      : record.scope === "project"
+                        ? record.projectId
+                        : record.resourceKey,
+                  ])
+                : null,
+            slot: record.kind === "reservation" ? record.slot : null,
+            unique_key: record.kind === "effect" ? record.effectId : null,
+            provider_instance_id: record.kind === "run-binding" ? record.providerInstanceId : null,
+            thread_id: record.kind === "run-binding" ? record.threadId : null,
+            session_id: record.kind === "run-binding" ? (record.sessionId ?? null) : null,
+          };
+          if (
+            fingerprint(columns) !== fingerprint(expectedColumns) ||
+            fingerprint(payload) !== fingerprint(record)
+          )
+            return yield* deny("Joined settlement physical ownership disagrees with domain state");
+        }
+        const task = state.tasks.find((t) => t.taskId === value.row.task_id);
+        if (
+          task === undefined ||
+          attempt.taskId !== task.taskId ||
+          task.activeAttemptId === attempt.attemptId
+        )
+          return yield* deny("Joined settlement task ownership is incomplete");
+        const tasks =
+          yield* sql`SELECT * FROM project_work_tasks WHERE project_id=${value.row.project_id} AND task_id=${task.taskId}`;
+        const attempts =
+          yield* sql`SELECT * FROM project_work_attempts WHERE project_id=${value.row.project_id} AND attempt_id=${attempt.attemptId}`;
+        const expectedTask = {
+          task_id: task.taskId,
+          project_id: value.row.project_id,
+          title: task.title,
+          summary: task.summary ?? null,
+          state: task.state,
+          specification_json:
+            task.specification === undefined ? null : encodeProjectionJson(task.specification),
+          assignee_json: task.assignee === undefined ? null : encodeProjectionJson(task.assignee),
+          watchers_json: encodeProjectionJson(task.watchers ?? []),
+          approval_json: task.approval === undefined ? null : encodeProjectionJson(task.approval),
+          revision: task.revision,
+          spec_revision: task.specRevision,
+          active_attempt_id: task.activeAttemptId ?? null,
+          failure_kind: task.failureKind ?? null,
+          blocker_id: task.blockerId ?? null,
+          created_at: task.createdAt,
+          updated_at: task.updatedAt,
+          completed_at: task.completedAt ?? null,
+          canceled_at: task.canceledAt ?? null,
+          attribution_json:
+            task.attribution === undefined ? null : encodeProjectionJson(task.attribution),
+        };
+        const expectedAttempt = {
+          attempt_id: attempt.attemptId,
+          project_id: value.row.project_id,
+          task_id: attempt.taskId,
+          state: attempt.state,
+          lease_token: attempt.leaseToken ?? null,
+          leased_until: attempt.leasedUntil ?? null,
+          started_at: attempt.startedAt ?? null,
+          ended_at: attempt.endedAt ?? null,
+          failure_kind: attempt.failureKind ?? null,
+          failure_reason: attempt.failureReason ?? null,
+          failure_evidence_ids_json: encodeProjectionJson(attempt.failureEvidenceIds ?? []),
+          failure_resolved_at: attempt.failureResolvedAt ?? null,
+          failure_resolution_reason: attempt.failureResolutionReason ?? null,
+          failure_resolution_evidence_ids_json: encodeProjectionJson(
+            attempt.failureResolutionEvidenceIds ?? [],
+          ),
+          failure_resolution_attribution_json:
+            attempt.failureResolutionAttribution === undefined
+              ? null
+              : encodeProjectionJson(attempt.failureResolutionAttribution),
+          checkpoint_ids_json: encodeProjectionJson(attempt.checkpointIds),
+          revision: attempt.revision,
+          updated_at: attempt.endedAt ?? attempt.startedAt ?? "",
+          attribution_json:
+            attempt.attribution === undefined ? null : encodeProjectionJson(attempt.attribution),
+        };
+        if (
+          tasks.length !== 1 ||
+          attempts.length !== 1 ||
+          fingerprint(tasks[0]) !== fingerprint(expectedTask) ||
+          fingerprint(attempts[0]) !== fingerprint(expectedAttempt)
+        )
+          return yield* deny(
+            "Joined settlement physical task or attempt disagrees with domain state",
+          );
       });
       yield* repository.executeAtomic(
         Effect.gen(function* () {
