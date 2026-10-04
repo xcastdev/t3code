@@ -56,6 +56,22 @@ const requestError = (method: string, error: PiManagedRuntimeError) =>
     }[error.code],
   });
 
+const safeStopCause = (
+  method: "stopSession" | "stopAll",
+  cause: Cause.Cause<PiManagedRuntimeError>,
+) =>
+  Cause.fromReasons(
+    cause.reasons.map((reason) => {
+      if (Cause.isInterruptReason(reason)) return reason;
+      const error = Cause.isFailReason(reason)
+        ? reason.error
+        : new PiManagedRuntimeError({ code: "uncertain", detail: "Pi owned stop failed." });
+      return Cause.makeFailReason(requestError(method, error)).annotate(
+        Context.makeUnsafe(reason.annotations),
+      );
+    }),
+  );
+
 const decodeOperationId = Schema.decodeEffect(PiWorkerOperation.fields.operationId);
 
 function freezeRequest<A>(value: A, seen = new WeakSet<object>()): A {
@@ -377,17 +393,22 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
   const stopContext = Effect.fn("PiAdapter.stopContext")((context: SessionContext) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
+        // Global shutdown owns cleanup, including callers arriving after scope closure.
+        if (shuttingDown) return yield* joinShutdown(restore);
         if (!context.stop) {
           const result = yield* Deferred.make<void, ProviderAdapterError>();
+          if (shuttingDown) return yield* joinShutdown(restore);
           context.stop = result;
           context.closing = true;
           if (context.active) context.active.acceptingEvents = false;
           const stop = Effect.gen(function* () {
-            yield* runtime
-              .requestStop(context.threadId)
-              .pipe(Effect.mapError((error) => requestError("stopSession", error)));
+            yield* Effect.suspend(() =>
+              shuttingDown ? Effect.void : runtime.requestStop(context.threadId),
+            ).pipe(
+              Effect.catchCause((cause) => Effect.failCause(safeStopCause("stopSession", cause))),
+            );
             if (context.active) yield* Deferred.await(context.active.done);
-            if (sessions.get(context.threadId) !== context) return;
+            if (shuttingDown || sessions.get(context.threadId) !== context) return;
             // Retain the ownership fence until the exit has been published.
             yield* emit({
               eventId: EventId.make(
@@ -432,12 +453,61 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             Effect.onExit((exit) => Deferred.done(result, exit)),
             Effect.ignore,
           );
-          yield* Effect.forkIn(stop, operationScope);
+          // Install the existing producer's onExit before a concurrent scope close can cancel it.
+          yield* Effect.forkIn(stop, operationScope, { startImmediately: true });
         }
-        yield* restore(Deferred.await(context.stop));
+        const stopped = yield* Effect.exit(restore(Deferred.await(context.stop)));
+        if (shuttingDown) return yield* joinShutdown(restore);
+        return yield* stopped;
       }),
     ),
   );
+
+  const joinInterrupted = Effect.fn("PiAdapter.joinInterrupted")(function* (
+    context: SessionContext,
+    cause: Cause.Cause<ProviderAdapterError>,
+    restore: (effect: Effect.Effect<void>) => Effect.Effect<void>,
+    publication: Exit.Exit<unknown, ProviderAdapterError> | undefined | null,
+  ) {
+    if (!Cause.hasInterrupts(cause)) return yield* Effect.failCause(cause);
+    const cleanup = yield* Effect.exit(
+      stopContext(context).pipe(
+        Effect.catchCause((cleanupCause) =>
+          shuttingDown
+            ? Effect.failCause(cleanupCause)
+            : Effect.failCause(cleanupCause).pipe(Effect.ignore),
+        ),
+      ),
+    );
+    const pending = yield* Effect.exit(restore(Effect.void));
+    return yield* Effect.failCause(
+      Cause.fromReasons([
+        ...(Exit.isFailure(pending)
+          ? publication && Exit.isFailure(publication)
+            ? publication.cause.reasons
+            : publication === undefined
+              ? cause.reasons
+              : []
+          : cause.reasons),
+        ...(Exit.isFailure(pending) ? pending.cause.reasons : []),
+        ...(Exit.isFailure(cleanup) ? cleanup.cause.reasons : []),
+      ]),
+    );
+  });
+  // These Adapter-owned Deferreds are completed only with done/failCause/succeed.
+  // Snapshot their published Exit synchronously at the wait handler, before cleanup
+  // can publish another outcome. Caller interruption comes separately from restore.
+  // A non-Exit completion conservatively retains the caught cause as well.
+  const snapshotPublication = (
+    effect: Effect.Effect<unknown, ProviderAdapterError> | undefined,
+  ): Exit.Exit<unknown, ProviderAdapterError> | undefined | null => {
+    if (effect === undefined) return null;
+    if (isPublishedExit(effect)) return effect;
+    return undefined;
+  };
+  const isPublishedExit = (
+    effect: Effect.Effect<unknown, ProviderAdapterError>,
+  ): effect is Exit.Exit<unknown, ProviderAdapterError> => Exit.isExit(effect);
 
   const launch = Effect.fn("PiAdapter.launch")(function* (
     context: SessionContext,
@@ -538,18 +608,7 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
               Effect.suspend(() => runtime.requestStop(context.threadId)),
             );
             const cleanupReasons = Exit.isFailure(cleanup)
-              ? cleanup.cause.reasons.map((reason) => {
-                  if (Cause.isInterruptReason(reason)) return reason;
-                  const error = Cause.isFailReason(reason)
-                    ? reason.error
-                    : new PiManagedRuntimeError({
-                        code: "uncertain",
-                        detail: "Pi prepared identity cleanup failed.",
-                      });
-                  return Cause.makeFailReason(requestError("stopSession", error)).annotate(
-                    Context.makeUnsafe(reason.annotations),
-                  );
-                })
+              ? safeStopCause("stopSession", cleanup.cause).reasons
               : [];
             // Equal sanitized reasons still represent separate owned cleanup occurrences.
             return yield* Effect.failCause(
@@ -879,7 +938,9 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
         };
         const active = yield* launch(context, request, hints);
         return yield* restore(Deferred.await(active.result)).pipe(
-          Effect.onInterrupt(() => stopContext(context).pipe(Effect.ignore)),
+          Effect.catchCause((cause) =>
+            joinInterrupted(context, cause, restore, snapshotPublication(active.result.effect)),
+          ),
         );
       }),
     ),
@@ -919,7 +980,9 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             : {}),
         });
         const prepared = yield* restore(Deferred.await(active.prepared)).pipe(
-          Effect.onInterrupt(() => stopContext(context).pipe(Effect.ignore)),
+          Effect.catchCause((cause) =>
+            joinInterrupted(context, cause, restore, snapshotPublication(active.prepared.effect)),
+          ),
         );
         if (prepared.kind !== "prompt")
           return yield* invalid("sendTurn", "Pi did not prepare a prompt turn.");
@@ -964,8 +1027,8 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     }
     yield* PubSub.shutdown(events);
     const stop = yield* Effect.exit(
-      runtime.stopAll.pipe(
-        Effect.mapError((error) => requestError("stopAll", error)),
+      Effect.suspend(() => runtime.stopAll).pipe(
+        Effect.catchCause((cause) => Effect.failCause(safeStopCause("stopAll", cause))),
         Effect.tapError((error) =>
           Effect.sync(() => {
             for (const context of sessions.values()) {
@@ -981,8 +1044,22 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     if (Exit.isFailure(stop)) return yield* Effect.failCause(stop.cause);
     sessions.clear();
   });
-  const shutdown = yield* Effect.cached(Effect.uninterruptible(stopAllWork()));
-  const stopAll = () => shutdown;
+  // Cache only cleanup's outcome; each waiter owns its cancellation after joining it.
+  const shutdown = yield* Effect.cached(Effect.exit(stopAllWork()));
+  const joinShutdown = Effect.fn("PiAdapter.stopAll.join")(function* (
+    restore: (effect: Effect.Effect<void>) => Effect.Effect<void>,
+  ) {
+    const cleanup = yield* shutdown;
+    const interrupted = yield* Effect.exit(restore(Effect.void));
+    if (Exit.isFailure(interrupted) || Exit.isFailure(cleanup))
+      return yield* Effect.failCause(
+        Cause.fromReasons([
+          ...(Exit.isFailure(interrupted) ? interrupted.cause.reasons : []),
+          ...(Exit.isFailure(cleanup) ? cleanup.cause.reasons : []),
+        ]),
+      );
+  });
+  const stopAll = () => Effect.uninterruptibleMask(joinShutdown);
   yield* Effect.addFinalizer(() =>
     stopAll().pipe(
       Effect.catch((error) =>
