@@ -369,6 +369,91 @@ describe("ProjectTeamMailbox consumption and reconciliation", () => {
     );
   }
 
+  for (const mode of ["typed", "defect"] as const) {
+    it.effect(`retains equal ${mode} failures from native entry and uncertainty persistence`, () =>
+      Effect.gen(function* () {
+        const h = fixture();
+        const error = new PortError("both operations failed with this same error");
+        const failed = mode === "typed" ? Cause.fail(error) : Cause.die(error);
+        h.ports.consume = (claim) =>
+          Effect.sync(() => h.consumed.set(claim.operationId, 1)).pipe(
+            Effect.andThen(Effect.failCause(failed)),
+          );
+        const record = h.ports.recordUncertain;
+        h.ports.recordUncertain = (claim, cause) =>
+          record(claim, cause).pipe(Effect.andThen(Effect.failCause(failed)));
+        const cause = failures(yield* makeProjectTeamMailbox(h.ports).sweep().pipe(Effect.exit));
+        expect(cause.reasons).toHaveLength(2);
+        for (const reason of cause.reasons) {
+          expect(reason._tag).toBe(failed.reasons[0]?._tag);
+          if (Cause.isFailReason(reason)) expect(reason.error).toBe(error);
+          if (Cause.isDieReason(reason)) expect(reason.defect).toBe(error);
+        }
+        expect(h.recorded[0]?.cause.reasons).toHaveLength(1);
+        expect(h.consumed.get("original:a")).toBe(1);
+        expect(h.rows.get("a")?._tag).toBe("Uncertain");
+        expect(h.owners.size).toBe(0);
+      }),
+    );
+  }
+
+  it.effect("retains repeated annotated reasons in native then persistence occurrence order", () =>
+    Effect.gen(function* () {
+      const h = fixture();
+      const native = Cause.makeFailReason(new PortError("native failure")).annotate(
+        Context.make(Context.Service<object>("t3/projectWork/ProjectTeamMailbox.test/Native"), {
+          operationId: "original:a",
+        }),
+      );
+      const defect = Cause.makeDieReason(new PortError("native defect")).annotate(
+        Context.make(Context.Service<object>("t3/projectWork/ProjectTeamMailbox.test/Defect"), {
+          originalTarget: "a",
+        }),
+      );
+      const persistence = Cause.makeFailReason(new PortError("persistence failure")).annotate(
+        Context.make(
+          Context.Service<object>("t3/projectWork/ProjectTeamMailbox.test/Persistence"),
+          {
+            retainedOperationId: "original:a",
+          },
+        ),
+      );
+      const nativeReasons = [native, defect, native];
+      const persistenceReasons = [defect, native, persistence];
+      h.ports.consume = (claim) =>
+        Effect.sync(() => h.consumed.set(claim.operationId, 1)).pipe(
+          Effect.andThen(Effect.failCause(Cause.fromReasons(nativeReasons))),
+        );
+      const record = h.ports.recordUncertain;
+      h.ports.recordUncertain = (claim, cause) =>
+        record(claim, cause).pipe(
+          Effect.andThen(Effect.failCause(Cause.fromReasons(persistenceReasons))),
+        );
+      const cause = failures(yield* makeProjectTeamMailbox(h.ports).sweep().pipe(Effect.exit));
+      const expected = [...nativeReasons, ...persistenceReasons];
+      expect(cause.reasons).toHaveLength(expected.length);
+      for (const [index, reason] of expected.entries()) {
+        // Effect adds tracing annotations; the original error and annotation values stay intact.
+        expect(cause.reasons[index]?._tag).toBe(reason._tag);
+        const propagated = cause.reasons[index];
+        if (propagated && Cause.isFailReason(reason) && Cause.isFailReason(propagated))
+          expect(propagated.error).toBe(reason.error);
+        if (propagated && Cause.isDieReason(reason) && Cause.isDieReason(propagated))
+          expect(propagated.defect).toBe(reason.defect);
+        for (const [key, value] of reason.annotations)
+          expect(propagated?.annotations.get(key)).toBe(value);
+      }
+      expect(h.recorded[0]?.cause.reasons).toHaveLength(nativeReasons.length);
+      for (const [index, reason] of nativeReasons.entries())
+        for (const [key, value] of reason.annotations)
+          expect(h.recorded[0]?.cause.reasons[index]?.annotations.get(key)).toBe(value);
+      expect(h.consumed.get("original:a")).toBe(1);
+      expect(h.rows.get("a")?._tag).toBe("Uncertain");
+      expect(h.committed.size).toBe(0);
+      expect(h.owners.size).toBe(0);
+    }),
+  );
+
   for (const mode of ["typed", "defect", "synchronous"] as const) {
     it.effect(
       `retains ${mode} native failure and failed uncertainty persistence in the Cause`,

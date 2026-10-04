@@ -113,7 +113,8 @@ export function makeProjectTeamMailbox<
               const recorded = yield* Effect.suspend(() =>
                 ports.recordUncertain(claim, cause),
               ).pipe(Effect.exit);
-              if (Exit.isFailure(recorded)) cause = Cause.combine(cause, recorded.cause);
+              if (Exit.isFailure(recorded))
+                cause = Cause.fromReasons([...cause.reasons, ...recorded.cause.reasons]);
             }
             return yield* Effect.failCause(cause);
           }),
