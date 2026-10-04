@@ -172,6 +172,14 @@ export type ProjectWorkEvent =
       readonly attribution?: ProjectWorkAttribution;
     })
   | (EventBase & {
+      readonly type: "project-work.attempt.stopped";
+      readonly taskId: ProjectWorkTaskId;
+      readonly attemptId: ProjectWorkAttemptId;
+      readonly bindingId: string;
+      readonly receiptId: string;
+      readonly stoppedAt: string;
+    })
+  | (EventBase & {
       readonly type: "project-work.task.failure-resolved";
       readonly taskId: ProjectWorkTaskId;
       readonly failedAttemptId?: ProjectWorkAttemptId;
@@ -2668,6 +2676,28 @@ export function applyProjectWorkEvents(
           kind: "attempt.checkpointed",
           summary: checkpoint.checkpointId,
         });
+        break;
+      }
+      case "project-work.attempt.stopped": {
+        next.attempts = next.attempts.map((attempt) =>
+          attempt.attemptId === event.attemptId &&
+          (attempt.state === "leased" || attempt.state === "running")
+            ? {
+                ...attempt,
+                state: "canceled",
+                endedAt: event.stoppedAt,
+                revision: attempt.revision + 1,
+              }
+            : attempt,
+        );
+        const task = currentTask(next, event.taskId);
+        if (task.activeAttemptId === event.attemptId)
+          updateTask(next, event.taskId, {
+            state: task.state === "in-progress" ? "ready" : task.state,
+            activeAttemptId: undefined,
+            updatedAt: event.stoppedAt,
+            revision: task.revision + 1,
+          });
         break;
       }
       case "project-work.attempt.expired": {

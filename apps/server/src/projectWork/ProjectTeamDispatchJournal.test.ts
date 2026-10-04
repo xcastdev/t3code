@@ -30,105 +30,107 @@ import {
 
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 
-const fixture = Effect.gen(function* () {
-  const repository = yield* ProjectWorkRepository;
-  const sql = yield* SqlClient.SqlClient;
-  let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
-  // The real fixture commits approvals and the execution grant; intercept only its final claim.
-  const result = yield* seed("implementer", "reserved", {
-    roleTools: ["pi.read", "pi.write"],
-    toolIds: ["pi.read", "pi.write"],
-    issueCredential: false,
-  }).pipe(
-    Effect.provideService(ProjectWorkRepository, {
-      ...repository,
-      execute: (command) => {
-        if (
-          command.type === "project-work.foundation.commit" &&
-          command.transition?.kind === "claim"
-        ) {
-          pending = command;
-          return Effect.fail(
-            new ProjectWorkPolicyError("invalid-state", "Fixture retains the uncommitted claim"),
-          );
-        }
-        return repository.execute(command);
-      },
-    }),
-    Effect.result,
-  );
-  expect(result._tag).toBe("Failure");
-  if (!pending || pending.transition?.kind !== "claim")
-    return yield* Effect.die("Fixture did not capture its claim");
-  yield* repository.execute(
-    yield* decodeCommit({
-      type: "project-work.foundation.commit",
-      projectId,
-      commandId: "configure-limits",
-      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
-      attribution,
-      committedAt: at,
-      records: [
-        {
-          kind: "limits",
-          projectId,
-          recordId: "limits",
-          revision: 0,
-          generation: 0,
-          updatedAt: at,
-          status: "configured",
-          environmentModelCalls: 4,
-          projectWritableWorkers: 1,
-          modelCalls: 2,
-          delegationDepth: 2,
-          repairAllowance: 2,
-          model: "test",
-          tokenLimit: 2000,
-          durationLimitMs: 2000,
+const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
+  Effect.gen(function* () {
+    const repository = yield* ProjectWorkRepository;
+    const sql = yield* SqlClient.SqlClient;
+    let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+    // The real fixture commits approvals and the execution grant; intercept only its final claim.
+    const result = yield* seed(role, "reserved", {
+      roleTools: role === "integrator" ? ["pi.read"] : ["pi.read", "pi.write"],
+      toolIds: role === "integrator" ? ["pi.read"] : ["pi.read", "pi.write"],
+      issueCredential: false,
+    }).pipe(
+      Effect.provideService(ProjectWorkRepository, {
+        ...repository,
+        execute: (command) => {
+          if (
+            command.type === "project-work.foundation.commit" &&
+            command.transition?.kind === "claim"
+          ) {
+            pending = command;
+            return Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Fixture retains the uncommitted claim"),
+            );
+          }
+          return repository.execute(command);
         },
-      ],
-    }),
-  );
-  yield* TestClock.setTime(Date.parse(at) + 1);
-  const claim = {
-    ...pending,
-    expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
-    transition: {
-      ...pending.transition,
-      binding: {
-        ...pending.transition.binding,
-        branch: "refs/heads/assigned",
-        worktree: "/workspace-assigned",
+      }),
+      Effect.result,
+    );
+    expect(result._tag).toBe("Failure");
+    if (!pending || pending.transition?.kind !== "claim")
+      return yield* Effect.die("Fixture did not capture its claim");
+    yield* repository.execute(
+      yield* decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "configure-limits",
+        expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+        attribution,
+        committedAt: at,
+        records: [
+          {
+            kind: "limits",
+            projectId,
+            recordId: "limits",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "configured",
+            environmentModelCalls: 4,
+            projectWritableWorkers: 1,
+            modelCalls: 2,
+            delegationDepth: 2,
+            repairAllowance: 2,
+            model: "test",
+            tokenLimit: 2000,
+            durationLimitMs: 2000,
+          },
+        ],
+      }),
+    );
+    yield* TestClock.setTime(Date.parse(at) + 1);
+    const claim = {
+      ...pending,
+      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+      transition: {
+        ...pending.transition,
+        binding: {
+          ...pending.transition.binding,
+          branch: "refs/heads/assigned",
+          worktree: "/workspace-assigned",
+        },
       },
-    },
-  };
-  const request: ProjectTeamDispatchRequest = {
-    dispatchId: "dispatch-intent",
-    claim,
-    git: {
-      effectId: "dispatch-intent",
-      runId: "binding",
-      generation: 0,
-      primaryRoot: "/workspace",
-      commonGitDirectory: "/workspace/.git",
-      worktreePath: "/workspace-assigned",
-      branchRef: "refs/heads/assigned",
-      baseRef: "refs/heads/main",
-      baseOid: "a".repeat(40),
-      ownershipToken: "owner",
-      policyHash: "b".repeat(64),
-    },
-    setupId: "setup",
-    initializeOperationId: "initialize",
-    assignmentOperationId: "assignment",
-    assignment: "Implement the approved task",
-  };
-  const journal = yield* makeProjectTeamDispatchJournal({
-    environmentId: "environment",
-    maximumEnvironmentModelCalls: 4,
+    };
+    const request: ProjectTeamDispatchRequest = {
+      dispatchId: "dispatch-intent",
+      claim,
+      git: {
+        effectId: "dispatch-intent",
+        runId: "binding",
+        generation: 0,
+        primaryRoot: "/workspace",
+        commonGitDirectory: "/workspace/.git",
+        worktreePath: "/workspace-assigned",
+        branchRef: "refs/heads/assigned",
+        baseRef: "refs/heads/main",
+        baseOid: "a".repeat(40),
+        ownershipToken: "owner",
+        policyHash: "b".repeat(64),
+      },
+      setupId: "setup",
+      initializeOperationId: "initialize",
+      assignmentOperationId: "assignment",
+      assignment: "Implement the approved task",
+    };
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    return { sql, repository, request, journal };
   });
-  return { sql, repository, request, journal };
-});
+const fixture = makeFixture();
 
 it.effect(
   "atomically admits one run, writer reservation and pending dispatch; exact retries add nothing",
@@ -2018,3 +2020,331 @@ it.effect("settlement rejects retained cleanup appended after the terminal recei
     }),
   ),
 );
+
+const joinedReceipt = {
+  receiptId: "original-joined-owners",
+  stage: "settled" as const,
+  evidence: { worker: "joined", setup: "joined", transport: "drained" },
+};
+
+it.effect("joined settlement atomically closes binding, writer, effects and active attempt", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: () => Effect.void,
+        verifySettlement: () => Effect.void,
+      });
+      const settled = yield* journal.settleAfterJoined(claimed.fence, joinedReceipt);
+      const state = yield* readCurrentState(f.sql, projectId);
+      expect(state.foundationRecords?.find((r) => r.kind === "run-binding")?.status).toBe(
+        "settled",
+      );
+      expect(
+        state.foundationRecords?.filter((r) => r.kind === "reservation" && r.status === "held"),
+      ).toEqual([]);
+      expect(state.foundationRecords?.find((r) => r.kind === "reservation")?.status).toBe(
+        "released",
+      );
+      expect(
+        state.foundationRecords?.find((r) => r.kind === "effect" && r.effectKind === "dispatch")
+          ?.status,
+      ).toBe("canceled");
+      expect(state.attempts[0]?.state).toBe("canceled");
+      expect(
+        state.tasks.find((t) => t.taskId === state.attempts[0]?.taskId)?.activeAttemptId,
+      ).toBeUndefined();
+      expect((yield* journal.readRetained(f.request.dispatchId)).fence).toEqual(settled.fence);
+      const before = state.revision;
+      expect((yield* journal.settleAfterJoined(claimed.fence, joinedReceipt)).duplicate).toBe(true);
+      expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(before);
+      expect(
+        (yield* journal
+          .settleAfterJoined(settled.fence, { ...joinedReceipt, receiptId: "different-owner" })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }),
+  ),
+);
+
+for (const failureAt of ["before", "final"] as const)
+  it.effect(
+    `unjoined ${failureAt} verification preserves writer and rolls back every settlement write`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+          const before = yield* readCurrentState(f.sql, projectId);
+          let checks = 0;
+          const journal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 4,
+            verifyStage: () => Effect.void,
+            verifySettlement: () =>
+              Effect.suspend(() => {
+                checks++;
+                return checks === (failureAt === "before" ? 1 : 2)
+                  ? Effect.fail(
+                      new ProjectTeamDispatchJournalError({
+                        reason: "Original parent transport is still uncertain",
+                      }),
+                    )
+                  : Effect.void;
+              }),
+          });
+          expect(
+            (yield* journal.settleAfterJoined(claimed.fence, joinedReceipt).pipe(Effect.result))
+              ._tag,
+          ).toBe("Failure");
+          expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+          expect((yield* journal.readRetained(f.request.dispatchId)).fence).toEqual(claimed.fence);
+          expect(yield* journal.readStageReceipts(f.request.dispatchId)).toEqual([]);
+        }),
+      ),
+  );
+
+it.effect(
+  "joined cleanup releases original writer after authority and configured capacity are revoked",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const state = yield* readCurrentState(f.sql, projectId);
+        const binding = state.foundationRecords?.find((r) => r.kind === "run-binding");
+        const limits = state.foundationRecords?.find((r) => r.kind === "limits");
+        if (binding?.kind !== "run-binding" || limits?.kind !== "limits")
+          return yield* Effect.die("missing original records");
+        yield* f.repository.execute(
+          yield* decodeCommit({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "revoke-before-join",
+            expectedRevision: state.revision,
+            attribution,
+            committedAt: at,
+            records: [
+              { ...binding, status: "revoked", revision: binding.revision + 1 },
+              {
+                ...limits,
+                status: "disabled",
+                revision: limits.revision + 1,
+                projectWritableWorkers: 0,
+              },
+            ],
+          }),
+        );
+        yield* TestClock.setTime(Date.parse(at) + 10000);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+        });
+        expect((yield* journal.inspect(f.request.dispatchId).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        yield* journal.settleAfterJoined(claimed.fence, joinedReceipt);
+        const final = yield* readCurrentState(f.sql, projectId);
+        expect(final.foundationRecords?.find((r) => r.kind === "run-binding")?.status).toBe(
+          "settled",
+        );
+        expect(final.foundationRecords?.find((r) => r.kind === "reservation")?.status).toBe(
+          "released",
+        );
+        expect(final.foundationRecords?.find((r) => r.kind === "limits")?.status).toBe("disabled");
+      }),
+    ),
+);
+
+it.effect("missing joined-owner verifier grants no terminal domain transition", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const reserved = yield* f.journal.reserve(f.request);
+      const before = yield* readCurrentState(f.sql, projectId);
+      expect(
+        (yield* f.journal.settleAfterJoined(reserved.fence, joinedReceipt).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+      expect((yield* f.journal.readRetained(f.request.dispatchId)).fence).toEqual(reserved.fence);
+    }),
+  ),
+);
+
+it.effect("integrator with only read tools still reserves its isolated setup writer", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture("integrator");
+      const admitted = yield* f.journal.reserve(f.request);
+      expect(admitted.intent.limits.writable).toBe(true);
+      expect(admitted.intent.writableReservationId).toBeDefined();
+      const state = yield* readCurrentState(f.sql, projectId);
+      expect(
+        state.foundationRecords?.filter((r) => r.kind === "reservation" && r.status === "held"),
+      ).toHaveLength(1);
+    }),
+  ),
+);
+
+for (const table of [
+  "project_team_run_binding",
+  "project_team_reservation",
+  "project_team_effect",
+  "project_work_tasks",
+  "project_work_attempts",
+] as const)
+  it.effect(`joined repair rejects ignored physical write: ${table}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const before = yield* readCurrentState(f.sql, projectId);
+        const projection = table === "project_work_tasks" || table === "project_work_attempts";
+        const status =
+          table === "project_team_run_binding"
+            ? "settled"
+            : table === "project_team_reservation"
+              ? "released"
+              : "canceled";
+        yield* f.sql
+          .unsafe(`CREATE TRIGGER ignore_joined_write BEFORE ${projection ? "INSERT" : "UPDATE"} ON ${table}
+      ${projection ? "" : `WHEN NEW.status='${status}'`} BEGIN SELECT RAISE(IGNORE); END`);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+        });
+        expect(
+          (yield* journal.settleAfterJoined(claimed.fence, joinedReceipt).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+        expect(yield* journal.readStageReceipts(f.request.dispatchId)).toEqual([]);
+        expect((yield* journal.readRetained(f.request.dispatchId)).fence).toEqual(claimed.fence);
+        expect(yield* f.sql`SELECT status FROM project_team_reservation`).toEqual([
+          { status: "held" },
+        ]);
+        yield* f.sql`DROP TRIGGER ignore_joined_write`;
+        expect((yield* journal.settleAfterJoined(claimed.fence, joinedReceipt)).duplicate).toBe(
+          false,
+        );
+      }),
+    ),
+  );
+
+for (const target of [
+  "binding-payload",
+  "writer-slot",
+  "task-active-attempt",
+  "attempt-ended-at",
+] as const)
+  it.effect(`joined repair rejects physical identity disagreement: ${target}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const before = yield* readCurrentState(f.sql, projectId);
+        const queries = {
+          "binding-payload":
+            "CREATE TRIGGER corrupt_joined_write AFTER UPDATE ON project_team_run_binding WHEN NEW.status='settled' BEGIN UPDATE project_team_run_binding SET payload_json=json_set(payload_json,'$.threadId','wrong-thread') WHERE record_id=NEW.record_id; END",
+          "writer-slot":
+            "CREATE TRIGGER corrupt_joined_write AFTER UPDATE ON project_team_reservation WHEN NEW.status='released' BEGIN UPDATE project_team_reservation SET slot=slot+1 WHERE record_id=NEW.record_id; END",
+          "task-active-attempt":
+            "CREATE TRIGGER corrupt_joined_write AFTER INSERT ON project_work_tasks WHEN NEW.active_attempt_id IS NULL BEGIN UPDATE project_work_tasks SET active_attempt_id='wrong-attempt' WHERE task_id=NEW.task_id; END",
+          "attempt-ended-at":
+            "CREATE TRIGGER corrupt_joined_write AFTER INSERT ON project_work_attempts WHEN NEW.state='canceled' BEGIN UPDATE project_work_attempts SET ended_at=NULL WHERE attempt_id=NEW.attempt_id; END",
+        };
+        yield* f.sql.unsafe(queries[target]);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+        });
+        expect(
+          (yield* journal.settleAfterJoined(claimed.fence, joinedReceipt).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+        expect(yield* journal.readStageReceipts(f.request.dispatchId)).toEqual([]);
+        yield* f.sql`DROP TRIGGER corrupt_joined_write`;
+        expect((yield* journal.settleAfterJoined(claimed.fence, joinedReceipt)).duplicate).toBe(
+          false,
+        );
+      }),
+    ),
+  );
+
+for (const extraStop of [false, true])
+  for (const exhausted of [false, true])
+    it.effect(
+      `joined repair checks complete aggregate event headroom: extraStop=${extraStop} exhausted=${exhausted}`,
+      () =>
+        scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture;
+            const claimed = yield* f.journal.claimEffect(
+              (yield* f.journal.reserve(f.request)).fence,
+            );
+            if (extraStop) {
+              const current = yield* readCurrentState(f.sql, projectId);
+              const dispatch = current.foundationRecords?.find((r) => r.kind === "effect");
+              if (dispatch?.kind !== "effect") return yield* Effect.die("missing original effect");
+              yield* f.repository.execute(
+                yield* decodeCommit({
+                  type: "project-work.foundation.commit",
+                  projectId,
+                  commandId: "extra-stop-effect",
+                  expectedRevision: current.revision,
+                  attribution,
+                  committedAt: at,
+                  records: [
+                    {
+                      ...dispatch,
+                      recordId: "extra-stop",
+                      effectId: "extra-stop-effect",
+                      effectKind: "stop",
+                      status: "pending",
+                      claimGeneration: 0,
+                      revision: 0,
+                    },
+                  ],
+                }),
+              );
+            }
+            const count = extraStop ? 5 : 4;
+            const initialRevision = Number.MAX_SAFE_INTEGER - count + (exhausted ? 1 : 0);
+            yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,'$.revision',${initialRevision}) WHERE project_id=${projectId}`;
+            const before = yield* readCurrentState(f.sql, projectId);
+            const journal = yield* makeProjectTeamDispatchJournal({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              verifyStage: () => Effect.void,
+              verifySettlement: () => Effect.void,
+            });
+            const result = yield* journal
+              .settleAfterJoined(claimed.fence, joinedReceipt)
+              .pipe(Effect.result);
+            const final = yield* readCurrentState(f.sql, projectId);
+            if (exhausted) {
+              expect(result._tag).toBe("Failure");
+              expect(final).toEqual(before);
+              expect(yield* journal.readStageReceipts(f.request.dispatchId)).toEqual([]);
+            } else {
+              expect(result._tag).toBe("Success");
+              expect(final.revision).toBe(Number.MAX_SAFE_INTEGER);
+              const rows = yield* f.sql<{
+                revision: number;
+              }>`SELECT json_extract(payload_json,'$.revision') AS revision FROM project_work_events WHERE event_type IN ('project-work.foundation.recorded','project-work.attempt.stopped') AND json_extract(payload_json,'$.revision')>${initialRevision} ORDER BY sequence`;
+              expect(rows.map((r) => r.revision)).toEqual(
+                Array.from({ length: count }, (_, i) => initialRevision + i + 1),
+              );
+            }
+          }),
+        ),
+    );
