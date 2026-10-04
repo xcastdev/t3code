@@ -99,6 +99,7 @@ const makeObserver = Effect.fn("makeProjectTeamTurnObserver")(function* <RootErr
   let closed: Cause.Cause<ProjectTeamTurnObserverError> | undefined;
   let lastSequence = -1n;
   let stopping: Deferred.Deferred<ProjectTeamTurnObserverStopReceipt> | undefined;
+  let stopObserved = false;
 
   const close = (cause: Cause.Cause<ProjectTeamTurnObserverError>) => {
     closed ??= cause;
@@ -154,7 +155,7 @@ const makeObserver = Effect.fn("makeProjectTeamTurnObserver")(function* <RootErr
   );
   const consumer = yield* Effect.forkIn(consume, rootScope);
 
-  const stop = Effect.uninterruptible(
+  const joinStop = Effect.uninterruptible(
     Effect.suspend(() => {
       if (stopping !== undefined) return Deferred.await(stopping);
       // Allocate and publish the shared stop waiter without an intervening Effect yield.
@@ -180,12 +181,22 @@ const makeObserver = Effect.fn("makeProjectTeamTurnObserver")(function* <RootErr
       });
     }),
   );
+  const stop = joinStop.pipe(
+    // Keep the drain protected, then check pending cancellation before acknowledging delivery.
+    Effect.flatMap((receipt) =>
+      Effect.interruptible(
+        Effect.sync(() => {
+          stopObserved = true;
+          return receipt;
+        }),
+      ),
+    ),
+  );
   yield* Effect.addFinalizer(() =>
-    Effect.suspend(() => {
-      const explicitlyStopped = stopping !== undefined;
-      return stop.pipe(
+    Effect.suspend(() =>
+      joinStop.pipe(
         Effect.flatMap((receipt) => {
-          if (explicitlyStopped) return Effect.void;
+          if (stopObserved) return Effect.void;
           const reasons = [receipt.consumer, receipt.subscription, ...receipt.observations].flatMap(
             (exit) =>
               Exit.isFailure(exit)
@@ -194,8 +205,8 @@ const makeObserver = Effect.fn("makeProjectTeamTurnObserver")(function* <RootErr
           );
           return reasons.length === 0 ? Effect.void : Effect.die(Cause.fromReasons(reasons));
         }),
-      );
-    }),
+      ),
+    ),
   );
 
   const withObservation = <A, E, R>(
@@ -271,12 +282,7 @@ const makeObserver = Effect.fn("makeProjectTeamTurnObserver")(function* <RootErr
         // Assemble original reason occurrences after joining; finalizer Cause.combine deduplicates them.
         const reasons: Cause.Reason<E | ProjectTeamTurnObserverError>[] = [];
         if (Exit.isFailure(awaited)) reasons.push(...awaited.cause.reasons);
-        if (Exit.isFailure(joined))
-          reasons.push(
-            ...joined.cause.reasons.filter(
-              (reason) => Exit.isSuccess(awaited) || !Cause.isInterruptReason(reason),
-            ),
-          );
+        if (Exit.isFailure(joined)) reasons.push(...joined.cause.reasons);
         if (Exit.isFailure(scopeExit)) reasons.push(...scopeExit.cause.reasons);
         if (closed !== undefined)
           reasons.push(...closed.reasons.filter((reason) => !reasons.includes(reason)));

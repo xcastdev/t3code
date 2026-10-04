@@ -361,6 +361,132 @@ it.effect("caller interruption preserves repeated independent cleanup defects af
   ),
 );
 
+it.effect.each(["direct send", "observation"] as const)(
+  "%s cancellation preserves original independent interrupt occurrences after joining",
+  (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { observer } = yield* fixture();
+        const held = yield* barrier;
+        const defect = new Error("original cancellation cleanup");
+        const send = Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const cancelled = yield* restore(held.wait).pipe(Effect.exit);
+            if (Exit.isFailure(cancelled))
+              return yield* Effect.failCause(
+                Cause.fromReasons([
+                  ...cancelled.cause.reasons,
+                  Cause.makeInterruptReason(700001),
+                  Cause.makeInterruptReason(700002),
+                  Cause.makeInterruptReason(700002),
+                  Cause.makeDieReason(defect),
+                ]),
+              );
+          }),
+        );
+        const operation =
+          mode === "direct send"
+            ? send
+            : observer.withObservation(identity, send).pipe(Effect.asVoid);
+        const run = yield* operation.pipe(Effect.forkChild);
+        yield* Deferred.await(held.entered);
+        yield* Fiber.interrupt(run);
+        const exit = yield* Fiber.await(run);
+        const receipt = yield* observer.stop;
+        expect(receipt.observations).toEqual([]);
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(
+            exit.cause.reasons.flatMap((reason) =>
+              Cause.isDieReason(reason) ? [reason.defect] : [],
+            ),
+          ).toEqual([defect]);
+          expect(
+            exit.cause.reasons.flatMap((reason) =>
+              Cause.isInterruptReason(reason) &&
+              (reason.fiberId === 700001 || reason.fiberId === 700002)
+                ? [reason.fiberId]
+                : [],
+            ),
+          ).toEqual([700001, 700002, 700002]);
+        }
+      }),
+    ),
+);
+
+it.effect.each(["implicit", "interrupted explicit", "interrupted masked explicit"] as const)(
+  "%s stop leaves unobserved subscription cleanup failure visible at Root closure",
+  (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const events = yield* PubSub.unbounded<ProjectTeamTurnPublication>();
+        const rootScope = yield* Scope.make();
+        const cleanup = yield* barrier;
+        const defect = new Error("unobserved subscription cleanup");
+        const observer = yield* makeProjectTeamTurnObserver({
+          subscribe: Effect.gen(function* () {
+            const subscription = yield* PubSub.subscribe(events);
+            yield* Effect.addFinalizer(() => cleanup.wait.pipe(Effect.andThen(Effect.die(defect))));
+            return subscription;
+          }),
+          currentPublicationSequence: () => 0n,
+          maximumPending: 1,
+        }).pipe(Effect.provideService(Scope.Scope, rootScope));
+        const stop =
+          mode === "interrupted masked explicit"
+            ? Effect.uninterruptible(observer.stop)
+            : observer.stop;
+        const stopped = mode === "implicit" ? undefined : yield* stop.pipe(Effect.forkChild);
+        if (stopped !== undefined) {
+          yield* Deferred.await(cleanup.entered);
+          yield* Effect.sync(() => stopped.interruptUnsafe(720000));
+        }
+        const closed = yield* Scope.close(rootScope, Exit.void).pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(cleanup.entered);
+        expect(closed.pollUnsafe()).toBeUndefined();
+        if (stopped !== undefined) expect(stopped.pollUnsafe()).toBeUndefined();
+        yield* Deferred.succeed(cleanup.release, undefined);
+        const scopeExit = yield* Fiber.join(closed);
+        const stopExit = stopped === undefined ? undefined : yield* Fiber.await(stopped);
+        if (stopExit !== undefined) {
+          expect(Exit.isFailure(stopExit)).toBe(true);
+          if (Exit.isFailure(stopExit))
+            expect(
+              stopExit.cause.reasons.flatMap((reason) =>
+                Cause.isInterruptReason(reason) ? [reason.fiberId] : [],
+              ),
+            ).toContain(720000);
+        }
+        const receipt = yield* observer.stop;
+        expect(
+          [receipt.consumer, receipt.subscription].flatMap((exit) =>
+            Exit.isFailure(exit)
+              ? exit.cause.reasons.flatMap((reason) =>
+                  Cause.isDieReason(reason) ? [reason.defect] : [],
+                )
+              : [],
+          ),
+        ).toContain(defect);
+        const returned = stopExit === undefined ? [scopeExit] : [Exit.asVoid(stopExit), scopeExit];
+        expect(
+          returned.flatMap((exit) =>
+            Exit.isFailure(exit)
+              ? exit.cause.reasons.flatMap((reason) =>
+                  Cause.isDieReason(reason)
+                    ? Cause.isCause(reason.defect)
+                      ? reason.defect.reasons.flatMap((inner) =>
+                          Cause.isDieReason(inner) ? [inner.defect] : [],
+                        )
+                      : [reason.defect]
+                    : [],
+                )
+              : [],
+          ),
+        ).toContain(defect);
+      }),
+    ),
+);
+
 it.effect(
   "actual PubSub shutdown unblocks and joins a held send without successful completion",
   () =>
