@@ -672,4 +672,61 @@ describe("Project team Settings through real configuration and encoded RPC", () 
       expect(host.textContent).toContain("Configuration saved in the recorded project");
     },
   );
+  interaction("removing a grouped selection requires choosing the singleton survivor", async () => {
+    await render([first, second]);
+    await choose(first);
+    await click("Edit configuration");
+    const before = reads.length;
+    await render([second]);
+    expect(host.textContent).toContain("Choose one checkout");
+    expect(button("Edit configuration")).toBeUndefined();
+    expect(reads.slice(before)).toEqual([]);
+    await choose(second);
+    await click("Edit configuration");
+    await click("Save configuration");
+    await act(async () => settle({ environmentId: otherEnvironmentId, projectId }));
+    expect(writeEnvironments).toEqual([otherEnvironmentId]);
+  });
+  interaction("an unselected group narrowing to one checkout still requires a choice", async () => {
+    await render([first, second]);
+    await render([second]);
+    expect(host.textContent).toContain("Choose one checkout");
+    expect(reads).toEqual([]);
+    expect(lifecycleQueries).toEqual([]);
+    expect(writes).toEqual([]);
+  });
+  interaction("a group passing through zero checkouts never selects a new singleton", async () => {
+    await render([first, second]);
+    await render([]);
+    await render([second]);
+    expect(host.textContent).toContain("Choose one checkout");
+    expect(reads).toEqual([]);
+    expect(writes).toEqual([]);
+  });
+  interaction(
+    "an initial single checkout cannot be substituted by a different singleton",
+    async () => {
+      await render();
+      await edit();
+      const before = reads.length;
+      await render([second]);
+      expect(host.textContent).toContain("Choose one checkout");
+      expect(button("Save configuration")).toBeUndefined();
+      expect(reads.slice(before)).toEqual([]);
+      expect(writes).toEqual([]);
+    },
+  );
+  interaction(
+    "an explicitly selected owner retains its draft when only that checkout remains",
+    async () => {
+      await render([first, second]);
+      await choose(first);
+      await click("Edit configuration");
+      await render([first]);
+      expect(button("Save configuration")).toBeDefined();
+      await click("Save configuration");
+      await act(async () => settle());
+      expect(writeEnvironments).toEqual([environmentId]);
+    },
+  );
 });

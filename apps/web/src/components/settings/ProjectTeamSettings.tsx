@@ -28,9 +28,15 @@ export function ProjectTeamSettings({
   readonly checkouts: ReadonlyArray<Checkout>;
 }) {
   const { environments } = useEnvironments();
-  const [selection, select] = useState("");
+  // The initial single checkout is convenient; another owner always needs a choice.
+  const [selection, select] = useState(() => ({
+    key: checkouts.length === 1 && checkouts[0] ? keyOf(checkouts[0]) : null,
+    explicit: false,
+  }));
   const checkout =
-    checkouts.length === 1 ? checkouts[0] : checkouts.find((item) => keyOf(item) === selection);
+    selection.explicit || checkouts.length === 1
+      ? checkouts.find((item) => keyOf(item) === selection.key)
+      : undefined;
   const environment = environments.find((item) => item.environmentId === checkout?.environmentId);
   const config = environment?.serverConfig;
   const providers = config
@@ -49,14 +55,14 @@ export function ProjectTeamSettings({
     : [];
   return (
     <SettingsSection id="project-team" title="Project team">
-      {checkouts.length > 1 ? (
+      {checkouts.length > 1 || !checkout ? (
         <label className="flex flex-col gap-1 text-sm">
           Team checkout
           <select
             aria-label="Team checkout"
             className="rounded-md border border-input bg-background p-2"
             value={checkout ? keyOf(checkout) : ""}
-            onChange={(event) => select(event.target.value)}
+            onChange={(event) => select({ key: event.target.value, explicit: true })}
           >
             <option value="">Choose a checkout</option>
             {checkouts.map((item) => (
