@@ -52,6 +52,7 @@ import {
 } from "./ProjectFaviconPickerDialog";
 import { ProjectActionsSettings } from "./ProjectActionsSettings";
 import { ProjectMcpSettings } from "./ProjectMcpSettings";
+import { ProjectTeamSettings } from "./ProjectTeamSettings";
 import {
   projectGroupTitleNeedsUpdate,
   resolveProjectPickerRouting,
@@ -905,6 +906,7 @@ function ProjectDetail({
             }
           />
         </SettingsSection>
+        <ProjectTeamSettings checkouts={group.memberProjects} />
         {hasMultipleCheckouts ? checkoutChoices : null}
         <ProjectMcpSettings
           environmentId={representative.environmentId}
