@@ -541,6 +541,8 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
       run: (
         facts: ProjectTeamConfiguredAdmissionFacts,
         revalidateCurrent: Effect.Effect<void, ProjectTeamAdmissionFactsError>,
+        /** Resources only: the journal separately validates its post-write authority. */
+        revalidateResources: Effect.Effect<void, ProjectTeamAdmissionFactsError>,
       ) => Effect.Effect<A, E, R>,
     ) =>
       Effect.gen(function* () {
@@ -565,12 +567,23 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
               if (!instance || !instance.enabled || instance.driverKind !== "piAgent")
                 return yield* denied("Current enabled Pi driver is unavailable");
               let active = true;
-              const measure = Effect.fn("ProjectTeamAdmissionFacts.measure")(function* () {
+              let originalRootAnchor: ProjectTeamConfiguredAdmissionFacts["rootAnchor"] | undefined;
+              const measure = Effect.fn("ProjectTeamAdmissionFacts.measure")(function* (
+                validateAuthority = true,
+              ) {
                 if (!active) return yield* denied("Admission facts loan ended");
                 yield* borrowed.assertCurrent;
                 yield* borrowed.assets.revalidate;
-                const actual = yield* readCurrentState(sql, input.state.projectId);
-                if (!equal(actual, input.state))
+                const ambient = Context.getOption(
+                  yield* Effect.context<never>(),
+                  SqlClient.SqlClient,
+                );
+                if (Option.isSome(ambient) && ambient.value !== sql)
+                  return yield* denied("Admission resources belong to another SQL client");
+                const actual = validateAuthority
+                  ? yield* readCurrentState(sql, input.state.projectId)
+                  : undefined;
+                if (validateAuthority && !equal(actual, input.state))
                   return yield* denied("Current reducer snapshot changed");
                 const configured = (yield* settings.getSettings).providerInstances[
                   selected.instanceId
@@ -770,7 +783,11 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                   )
                 )
                   return yield* denied("Configured tool capability is unavailable");
-                const rootAnchor = yield* readRootAnchor(input, selected);
+                const rootAnchor = validateAuthority
+                  ? yield* readRootAnchor(input, selected)
+                  : originalRootAnchor;
+                if (rootAnchor === undefined)
+                  return yield* denied("Original resource loan is missing");
                 const gitFacts = {
                   primaryRoot,
                   commonGitDirectory,
@@ -830,7 +847,8 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                 yield* borrowed.assets.revalidate;
                 yield* borrowed.assertCurrent;
                 if (
-                  !equal(yield* readCurrentState(sql, input.state.projectId), input.state) ||
+                  (validateAuthority &&
+                    !equal(yield* readCurrentState(sql, input.state.projectId), input.state)) ||
                   !equal(
                     (yield* settings.getSettings).providerInstances[selected.instanceId],
                     configured,
@@ -873,21 +891,23 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                 };
               });
               const initial = yield* measure();
-              const revalidateCurrent = Effect.gen(function* () {
-                const loan = Context.getOption(yield* Effect.context<never>(), AdmissionLoan);
-                if (Option.isNone(loan) || loan.value.token !== token)
-                  return yield* denied("Admission revalidation belongs to another callback");
-                const current = yield* measure();
-                if (current.proof !== initial.proof)
-                  return yield* denied("Measured admission resources changed");
-              }).pipe(
-                Effect.mapError((error) =>
-                  isFactsError(error)
-                    ? error
-                    : denied("Admission resources could not be revalidated"),
-                ),
-              );
-              return yield* run(initial.facts, revalidateCurrent).pipe(
+              originalRootAnchor = initial.facts.rootAnchor;
+              const revalidate = (validateAuthority: boolean) =>
+                Effect.gen(function* () {
+                  const loan = Context.getOption(yield* Effect.context<never>(), AdmissionLoan);
+                  if (Option.isNone(loan) || loan.value.token !== token)
+                    return yield* denied("Admission revalidation belongs to another callback");
+                  const current = yield* measure(validateAuthority);
+                  if (current.proof !== initial.proof)
+                    return yield* denied("Measured admission resources changed");
+                }).pipe(
+                  Effect.mapError((error) =>
+                    isFactsError(error)
+                      ? error
+                      : denied("Admission resources could not be revalidated"),
+                  ),
+                );
+              return yield* run(initial.facts, revalidate(true), revalidate(false)).pipe(
                 Effect.exit,
                 Effect.tap((exit) =>
                   Effect.sync(() => {

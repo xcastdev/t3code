@@ -257,6 +257,12 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
   function* (options: {
     readonly environmentId: string;
     readonly maximumEnvironmentModelCalls: number;
+    /** Private Root resource loan; checks execute in the repository-owned transaction. */
+    readonly verifyAdmission?: (
+      input:
+        | { readonly stage: "before"; readonly request: ProjectTeamDispatchRequest }
+        | { readonly stage: "after"; readonly request: ProjectTeamDispatchRequest },
+    ) => Effect.Effect<void, ProjectTeamDispatchJournalError>;
     /** Trusted Root checks actual retained Git/setup/native receipts. No client or worker predicate. */
     readonly verifyStage?: ProjectTeamDispatchStageVerifier;
     /** Root checks original worker/setup/model owners joined, including retained transport accounting. */
@@ -264,6 +270,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
   }) {
     const sql = yield* SqlClient.SqlClient;
     const repository = yield* ProjectWorkRepository;
+    const verifyAdmission = options.verifyAdmission;
     const environmentId = yield* decodeEnvironment(options.environmentId);
     const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
     const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
@@ -745,6 +752,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       let admitted: { row: Row; intent: typeof Intent.Type } | undefined;
       yield* repository.executeAtomic(
         Effect.gen(function* () {
+          if (verifyAdmission) yield* verifyAdmission({ stage: "before", request });
           const existing = yield* sql<Row>`SELECT dispatch_id,project_id,environment_id,binding_id,
         generation,revision,claim_generation,stage,intent_json FROM project_team_dispatch
         WHERE dispatch_id=${request.dispatchId}`;
@@ -997,6 +1005,8 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           const committed = yield* read(row.dispatch_id);
           if (committed.row.intent_json !== row.intent_json)
             return yield* deny("Dispatch identity conflicts");
+          if (verifyAdmission) yield* verifyAdmission({ stage: "after", request });
+          yield* current(committed.row, committed.intent);
         }),
       );
       if (!admitted) return yield* deny("Dispatch commit is missing");
