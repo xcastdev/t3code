@@ -68,6 +68,7 @@ export function makePiDriver(input: {
   readonly makeAdapter: (input: {
     readonly instanceId: ProviderInstanceId;
     readonly runtime: PiManagedRuntimeInstance;
+    readonly resolveOperationId?: NonNullable<PiManagedRuntimeInstance["resolveOperationId"]>;
   }) => Effect.Effect<ProviderAdapterShape<ProviderAdapterError>, never, Scope.Scope>;
 }): ProviderDriver<PiDriverConfiguration, PiManagedRuntime | SkillMaterializationService> {
   return {
@@ -212,7 +213,13 @@ export function makePiDriver(input: {
             ),
           ),
       });
-      const adapter = yield* input.makeAdapter({ instanceId, runtime });
+      const adapter = yield* input.makeAdapter({
+        instanceId,
+        runtime,
+        ...(runtime.resolveOperationId === undefined
+          ? {}
+          : { resolveOperationId: runtime.resolveOperationId }),
+      });
       if (adapter.provider !== DRIVER) {
         return yield* new ProviderDriverError({
           driver: DRIVER,
