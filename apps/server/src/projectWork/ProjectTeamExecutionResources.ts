@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
+  ManagedSkillManifest,
   resolveProviderInstanceEnabled,
   type ModelSelection,
 } from "@t3tools/contracts";
@@ -14,6 +15,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ServerConfig } from "../config.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { PiDriverConfiguration } from "../provider/pi/PiManagedRuntime.ts";
 import { resolvePiManagedSkillSelection } from "../provider/pi/PiManagedSkillSelection.ts";
@@ -38,6 +40,9 @@ const decodeConfiguration = Schema.decodeUnknownEffect(PiDriverConfiguration);
 const isJournalError = Schema.is(ProjectTeamDispatchJournalError);
 const decodeActualConfiguration = Schema.decodeUnknownEffect(
   Schema.Struct({ enabled: Schema.Boolean, configuration: PiDriverConfiguration }),
+);
+const decodeManifestIdentity = Schema.decodeUnknownOption(
+  Schema.fromJsonString(ManagedSkillManifest),
 );
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeRuntime = Schema.decodeUnknownEffect(
@@ -68,6 +73,7 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
     const pi = yield* ProjectTeamPiRuntime;
     const catalogue = yield* PiModelCatalogue;
     const skills = yield* ManagedSkillRepository;
+    const config = yield* ServerConfig;
     const path = yield* Path.Path;
     const clock = yield* Clock.Clock;
     const context = (yield* Effect.context<never>()).pipe(
@@ -179,6 +185,119 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
         ancestors,
         entries: entries.sort((left, right) => left.path.localeCompare(right.path)),
       };
+    };
+    // Catalogue identity can change at another key without touching a selected tree.
+    // Bracket the real selector, including empty scopes and newly added candidates.
+    const catalogueReceipt = (projectRoot: string, selectedIds: readonly string[]) => {
+      const metadata = (value: string, version: boolean) => {
+        const stat = fs.lstatSync(value, { bigint: true, throwIfNoEntry: false });
+        return stat
+          ? {
+              dev: String(stat.dev),
+              ino: String(stat.ino),
+              mode: String(stat.mode),
+              uid: String(stat.uid),
+              ...(version
+                ? {
+                    size: String(stat.size),
+                    mtime: String(stat.mtimeNs),
+                    ctime: String(stat.ctimeNs),
+                  }
+                : {}),
+            }
+          : null;
+      };
+      const manifestId = (manifestPath: string, expected: ReturnType<typeof metadata>) => {
+        const descriptor = fs.openSync(
+          manifestPath,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+        );
+        try {
+          const stat = fs.fstatSync(descriptor, { bigint: true });
+          const opened = {
+            dev: String(stat.dev),
+            ino: String(stat.ino),
+            mode: String(stat.mode),
+            uid: String(stat.uid),
+            size: String(stat.size),
+            mtime: String(stat.mtimeNs),
+            ctime: String(stat.ctimeNs),
+          };
+          if (
+            !stat.isFile() ||
+            stat.size > BigInt(DEFAULT_SKILL_PACKAGE_LIMITS.maxManifestBytes) ||
+            !same(opened, expected)
+          )
+            throw deny("Managed skill manifest changed during identity inspection");
+          const bytes = Buffer.alloc(Number(stat.size) + 1);
+          let offset = 0;
+          while (offset < bytes.length) {
+            const read = fs.readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+            if (read === 0) break;
+            offset += read;
+          }
+          if (offset !== Number(stat.size) || !same(opened, metadata(manifestPath, true)))
+            throw deny("Managed skill manifest changed during identity inspection");
+          const manifest = decodeManifestIdentity(
+            new TextDecoder().decode(bytes.subarray(0, offset)),
+          );
+          return Option.isSome(manifest) ? manifest.value.id : null;
+        } finally {
+          fs.closeSync(descriptor);
+        }
+      };
+      const counts = new Map<string, number>();
+      const scopes = [config.managedSkillsDir, path.join(projectRoot, ".t3code", "skills")].map(
+        (root) => {
+          const ancestors = physical(root, true);
+          const rootIdentity = metadata(root, true);
+          const entries = [];
+          if (rootIdentity !== null) {
+            const directory = fs.opendirSync(root);
+            try {
+              for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
+                if (entries.length >= DEFAULT_SKILL_PACKAGE_LIMITS.maxEntries)
+                  throw deny("Managed skill catalogue receipt exceeds entry bounds");
+                const candidate = path.join(root, entry.name);
+                // Only bounded regular manifests are read. The actual selector still
+                // owns package validity/effectiveness and selected body verification.
+                const identity = metadata(candidate, false);
+                const candidateStat = fs.lstatSync(candidate, { throwIfNoEntry: false });
+                const manifestPath = path.join(candidate, "t3-skill.json");
+                const manifest = candidateStat?.isDirectory() ? metadata(manifestPath, true) : null;
+                const manifestStat = candidateStat?.isDirectory()
+                  ? fs.lstatSync(manifestPath, { bigint: true, throwIfNoEntry: false })
+                  : undefined;
+                const id =
+                  manifestStat?.isFile() &&
+                  manifestStat.size <= BigInt(DEFAULT_SKILL_PACKAGE_LIMITS.maxManifestBytes)
+                    ? manifestId(manifestPath, manifest)
+                    : null;
+                if (id !== null && selectedIds.includes(id))
+                  counts.set(id, (counts.get(id) ?? 0) + 1);
+                entries.push({
+                  name: entry.name,
+                  identity,
+                  manifest,
+                  id,
+                });
+              }
+            } finally {
+              directory.closeSync();
+            }
+          }
+          return {
+            ancestors,
+            rootIdentity,
+            entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
+          };
+        },
+      );
+      // An invalid body scan can hide an otherwise valid manifest from the repository.
+      // Such a duplicate selected ID must not become admissible when the body is repaired.
+      if (selectedIds.some((id) => counts.get(id) !== 1))
+        throw deny("Selected managed skill manifest identity is missing or ambiguous");
+      return scopes;
     };
     const originalRoots = yield* Effect.try({
       try: roots,
@@ -351,6 +470,17 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
                         const sqlReceipt = sql<{ changes: string; version: string }>`
                           SELECT CAST(total_changes() AS TEXT) AS changes,
                           CAST(data_version AS TEXT) AS version FROM pragma_data_version`;
+                        const beforeCatalogue = yield* Effect.try({
+                          try: () =>
+                            binding.configuration.skillIds.length === 0
+                              ? []
+                              : catalogueReceipt(
+                                  original.intent.request.git.primaryRoot,
+                                  binding.configuration.skillIds,
+                                ),
+                          catch: (cause) =>
+                            unavailable("Managed skill catalogue receipt is unavailable", cause),
+                        });
                         const beforeSql = yield* sqlReceipt;
                         if (beforeSql.length !== 1)
                           return yield* deny("SQL resource receipt is unavailable");
@@ -411,6 +541,20 @@ export const makeProjectTeamExecutionResources = Effect.fn("makeProjectTeamExecu
                               roots: roots(),
                               primary: physical(final.primaryRoot),
                             };
+                            if (
+                              !same(
+                                beforeCatalogue,
+                                binding.configuration.skillIds.length === 0
+                                  ? []
+                                  : catalogueReceipt(
+                                      final.primaryRoot,
+                                      binding.configuration.skillIds,
+                                    ),
+                              )
+                            )
+                              throw deny(
+                                "Managed skill catalogue membership changed during verification",
+                              );
                             if (!same(beforeSkills, receipt()))
                               throw deny("Selected skill resources changed during verification");
                             if (!same(physicalRoots.roots, originalRoots))

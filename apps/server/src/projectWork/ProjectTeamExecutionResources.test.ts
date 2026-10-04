@@ -83,7 +83,7 @@ const withServices = <A, E, R>(body: Effect.Effect<A, E, R>) =>
         Layer.mergeAll(
           Settings.layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true }),
           Skills.layer.pipe(
-            Layer.provide(
+            Layer.provideMerge(
               ServerConfig.layerTest(process.cwd(), { prefix: "execution-resources-" }),
             ),
           ),
@@ -97,6 +97,7 @@ const fixtureForSelection = (roleHasMore = false) =>
     const repository = yield* ProjectWorkRepository;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const config = yield* ServerConfig;
     const scratch = yield* fs.makeTempDirectoryScoped({ prefix: "execution-resources-" });
     const primary = path.join(scratch, "primary");
     const managed = path.join(scratch, "managed");
@@ -337,6 +338,8 @@ const fixtureForSelection = (roleHasMore = false) =>
     );
     return {
       sql,
+      config,
+      projectWorkRepository: repository,
       skillRepository,
       ownedSkill,
       fs,
@@ -861,6 +864,9 @@ const resourcesWith = (
     protectedRoots: [f.primary, f.protectedRoot],
   }).pipe(
     Effect.provideService(SqlClient.SqlClient, sql),
+    Effect.provideService(ServerConfig, f.config),
+    Effect.provideService(ProjectWorkRepository, f.projectWorkRepository),
+    Effect.provideService(Path.Path, f.path),
     Effect.provideService(Settings.ServerSettingsService, settings),
     Effect.provideService(Skills.ManagedSkillRepository, repository),
     Effect.provideService(ProjectTeamPiRuntime, f.pi),
@@ -1201,3 +1207,292 @@ it.effect("resource callback retains its caller Scope and finalizer lifetime", (
     ),
   ),
 );
+
+for (const collision of ["unchanged", "global-id", "project-id", "unrelated-body"] as const) {
+  control(`regression R3 final getter catalogue ${collision} collision`, (f) =>
+    Effect.gen(function* () {
+      const extra = yield* collision === "project-id"
+        ? f.skillRepository.setProjectOverride({
+            projectRoot: f.primary,
+            key: ManagedSkillKey.make("additional"),
+            content: { name: "Additional", body: "Unselected content" },
+          })
+        : f.skillRepository.createGlobal({
+            expectedRevision: 0,
+            content: {
+              key: ManagedSkillKey.make("additional"),
+              name: "Additional",
+              body: "Unselected content",
+            },
+          });
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      let hold = false;
+      let reads = 0;
+      const settings = Settings.ServerSettingsService.of({
+        ...f.settings,
+        getSettings: f.settings.getSettings.pipe(
+          Effect.tap(() =>
+            Effect.suspend(() =>
+              hold && ++reads === 2
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+                : Effect.void,
+            ),
+          ),
+        ),
+      });
+      const resources = yield* resourcesWith(f, f.sql, f.skillRepository, settings);
+      yield* resources.withCurrent(f.snapshot, (loan) =>
+        Effect.gen(function* () {
+          hold = true;
+          const fiber = yield* loan.assertResources.pipe(Effect.result, Effect.forkScoped);
+          yield* Deferred.await(entered);
+          if (collision === "unrelated-body")
+            yield* f.fs.writeFileString(
+              f.path.join(extra.packagePath, "SKILL.md"),
+              "Changed unselected body",
+            );
+          if (collision === "global-id")
+            yield* f.fs.writeFileString(
+              f.path.join(extra.packagePath, "t3-skill.json"),
+              encodeJson({ ...extra.manifest, id: f.ownedSkill.manifest.id }),
+            );
+          if (collision === "project-id")
+            yield* f.fs.writeFileString(
+              f.path.join(extra.packagePath, "t3-skill.json"),
+              encodeJson({
+                ...extra.manifest,
+                id: f.ownedSkill.manifest.id,
+                projectState: "override",
+              }),
+            );
+          yield* Deferred.succeed(resume, undefined);
+          const result = yield* Fiber.join(fiber);
+          hold = false;
+          const next = yield* loan.assertResources.pipe(Effect.result);
+          if (collision === "global-id" || collision === "project-id") {
+            const entries = [
+              ...(yield* f.skillRepository.listGlobal()),
+              ...(yield* f.skillRepository.listProject(f.primary)),
+            ];
+            const matching = entries.filter(
+              (entry) => entry.manifest?.id === f.ownedSkill.manifest.id,
+            );
+            expect(matching).toHaveLength(2);
+            expect(matching.every((entry) => entry.diagnostics.length === 0)).toBe(true);
+          }
+          expect(next._tag).toBe(
+            collision === "unchanged" || collision === "unrelated-body" ? "Success" : "Failure",
+          );
+          expect(result._tag).toBe(
+            collision === "unchanged" || collision === "unrelated-body" ? "Success" : "Failure",
+          );
+        }),
+      );
+    }),
+  );
+}
+
+for (const scope of ["global", "project"] as const) {
+  for (const collision of ["unchanged", "duplicate-id"] as const) {
+    control(`regression R3 initial callback ${scope} ${collision} catalogue receipt`, (f) =>
+      Effect.gen(function* () {
+        const extra = yield* scope === "global"
+          ? f.skillRepository.createGlobal({
+              expectedRevision: 0,
+              content: {
+                key: ManagedSkillKey.make("additional"),
+                name: "Additional",
+                body: "Unselected content",
+              },
+            })
+          : f.skillRepository.setProjectOverride({
+              projectRoot: f.primary,
+              key: ManagedSkillKey.make("additional"),
+              content: { name: "Additional", body: "Unselected content" },
+            });
+        const entered = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        let reads = 0;
+        let entries = 0;
+        const settings = Settings.ServerSettingsService.of({
+          ...f.settings,
+          getSettings: f.settings.getSettings.pipe(
+            Effect.tap(() =>
+              Effect.suspend(() =>
+                ++reads === 4
+                  ? Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(resume)),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          ),
+        });
+        const resources = yield* resourcesWith(f, f.sql, f.skillRepository, settings);
+        const fiber = yield* resources
+          .withCurrent(f.snapshot, () =>
+            Effect.sync(() => {
+              entries++;
+            }),
+          )
+          .pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        if (collision === "duplicate-id")
+          yield* f.fs.writeFileString(
+            f.path.join(extra.packagePath, "t3-skill.json"),
+            encodeJson({
+              ...extra.manifest,
+              id: f.ownedSkill.manifest.id,
+              ...(scope === "project" ? { projectState: "override" } : {}),
+            }),
+          );
+        yield* Deferred.succeed(resume, undefined);
+        const outcome = yield* Fiber.join(fiber);
+        expect(outcome._tag).toBe(collision === "unchanged" ? "Success" : "Failure");
+        expect(entries).toBe(collision === "unchanged" ? 1 : 0);
+      }),
+    );
+  }
+}
+
+for (const scope of ["global", "project"] as const) {
+  for (const mutation of ["unchanged", "new-duplicate"] as const) {
+    control(`regression R3 empty ${scope} catalogue ${mutation}`, (f) =>
+      Effect.gen(function* () {
+        if (scope === "global") {
+          const project = yield* f.skillRepository.setProjectOverride({
+            projectRoot: f.primary,
+            key: f.ownedSkill.manifest.key,
+            content: { name: "Owned", body: f.ownedSkill.content.body },
+          });
+          yield* f.fs.writeFileString(
+            f.path.join(project.packagePath, "t3-skill.json"),
+            encodeJson({
+              ...project.manifest,
+              id: f.ownedSkill.manifest.id,
+              projectState: "override",
+            }),
+          );
+          yield* f.skillRepository.deleteGlobal({
+            skillId: f.ownedSkill.manifest.id,
+            expectedHash: f.ownedSkill.manifest.revision.hash,
+          });
+          expect(yield* f.skillRepository.listGlobal()).toEqual([]);
+        } else expect(yield* f.skillRepository.listProject(f.primary)).toEqual([]);
+        const entered = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        let hold = false;
+        let reads = 0;
+        const settings = Settings.ServerSettingsService.of({
+          ...f.settings,
+          getSettings: f.settings.getSettings.pipe(
+            Effect.tap(() =>
+              Effect.suspend(() =>
+                hold && ++reads === 2
+                  ? Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(resume)),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          ),
+        });
+        const resources = yield* resourcesWith(f, f.sql, f.skillRepository, settings);
+        yield* resources.withCurrent(f.snapshot, (loan) =>
+          Effect.gen(function* () {
+            hold = true;
+            const fiber = yield* loan.assertResources.pipe(Effect.result, Effect.forkScoped);
+            yield* Deferred.await(entered);
+            if (mutation === "new-duplicate") {
+              const extra = yield* scope === "global"
+                ? f.skillRepository.createGlobal({
+                    expectedRevision: 0,
+                    content: {
+                      key: ManagedSkillKey.make("additional"),
+                      name: "Additional",
+                      body: "Unselected content",
+                    },
+                  })
+                : f.skillRepository.setProjectOverride({
+                    projectRoot: f.primary,
+                    key: ManagedSkillKey.make("additional"),
+                    content: { name: "Additional", body: "Unselected content" },
+                  });
+              yield* f.fs.writeFileString(
+                f.path.join(extra.packagePath, "t3-skill.json"),
+                encodeJson({
+                  ...extra.manifest,
+                  id: f.ownedSkill.manifest.id,
+                  ...(scope === "project" ? { projectState: "override" } : {}),
+                }),
+              );
+            }
+            yield* Deferred.succeed(resume, undefined);
+            expect((yield* Fiber.join(fiber))._tag).toBe(
+              mutation === "unchanged" ? "Success" : "Failure",
+            );
+            hold = false;
+            expect((yield* loan.assertResources.pipe(Effect.result))._tag).toBe(
+              mutation === "unchanged" ? "Success" : "Failure",
+            );
+          }),
+        );
+      }),
+    );
+  }
+}
+
+for (const scope of ["global", "project"] as const) {
+  for (const duplicate of [false, true] as const) {
+    control(`regression R3 hidden ${scope} manifest duplicate ${duplicate}`, (f) =>
+      Effect.gen(function* () {
+        const extra = yield* scope === "global"
+          ? f.skillRepository.createGlobal({
+              expectedRevision: 0,
+              content: {
+                key: ManagedSkillKey.make("additional"),
+                name: "Additional",
+                body: "Unselected content",
+              },
+            })
+          : f.skillRepository.setProjectOverride({
+              projectRoot: f.primary,
+              key: ManagedSkillKey.make("additional"),
+              content: { name: "Additional", body: "Unselected content" },
+            });
+        if (duplicate)
+          yield* f.fs.writeFileString(
+            f.path.join(extra.packagePath, "t3-skill.json"),
+            encodeJson({
+              ...extra.manifest,
+              id: f.ownedSkill.manifest.id,
+              ...(scope === "project" ? { projectState: "override" } : {}),
+            }),
+          );
+        const blocked = f.path.join(extra.packagePath, "blocked");
+        yield* f.fs.symlink("SKILL.md", blocked);
+        const before = yield* scope === "global"
+          ? f.skillRepository.listGlobal()
+          : f.skillRepository.listProject(f.primary);
+        expect(
+          before.find((entry) => entry.directoryName === "additional")?.manifest,
+        ).toBeUndefined();
+        let entries = 0;
+        const outcome = yield* f.resources
+          .withCurrent(f.snapshot, (loan) =>
+            Effect.gen(function* () {
+              entries++;
+              yield* f.fs.remove(blocked);
+              expect((yield* loan.assertResources.pipe(Effect.result))._tag).toBe(
+                duplicate ? "Failure" : "Success",
+              );
+            }),
+          )
+          .pipe(Effect.result);
+        expect(outcome._tag).toBe(duplicate ? "Failure" : "Success");
+        expect(entries).toBe(duplicate ? 0 : 1);
+      }),
+    );
+  }
+}
