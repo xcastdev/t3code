@@ -416,7 +416,9 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
     const metadataSource = path.join(value.distributionDirectory, "pi-sdk/package.json");
     const metadataStat = yield* add(metadataSource, "/runtime/dist/pi-sdk/package.json");
     const metadata = yield* native(() => readFile(metadataSource, metadataStat, path, 65536));
-    yield* decodeMetadata(metadata.toString("utf8")).pipe(Effect.mapError(invalid));
+    const sdkMetadata = yield* decodeMetadata(metadata.toString("utf8")).pipe(
+      Effect.mapError(invalid),
+    );
     const executableSource = yield* fs.realPath(yield* HostProcessExecutablePath);
     const executableStat = yield* add(
       executableSource,
@@ -642,6 +644,7 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
       copied.map(({ source, target }) => Object.freeze({ source, target })),
     );
     return Object.freeze({
+      sdkVersion: sdkMetadata.version,
       runtimeFiles,
       workerArgv: (
         identity: PiWorkerIdentity,
