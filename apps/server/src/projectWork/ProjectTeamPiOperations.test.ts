@@ -1947,6 +1947,17 @@ for (const mode of [
   "changed-root",
   "pending",
   "budget",
+  "transport-missing",
+  "transport-false",
+  "release-proof-missing",
+  "capacity-held",
+  "capacity-quarantine",
+  "capacity-legacy",
+  "settlement-unknown",
+  "settlement-corrupt",
+  "receipt-empty",
+  "receipt-oversize",
+  "receipt-boundary",
 ] as const) {
   it.effect(`stable Pi replay preserves original accounting: ${mode}`, () =>
     fileTest(
@@ -1979,6 +1990,7 @@ for (const mode of [
           ...reservation,
           reservationId: reserved.reservationId,
           outcome: "reported",
+          ...(mode === "transport-missing" ? {} : { transportDrained: mode !== "transport-false" }),
           chargedInputTokens: 10,
           chargedOutputTokens: 20,
           reportedModel: model,
@@ -2000,6 +2012,43 @@ for (const mode of [
           ],
         };
         yield* f.operations.persistTerminal(f.op, terminal);
+        if (mode.startsWith("receipt-")) {
+          const snapshot = Effect.fn("snapshotPiReplayDatabase")(function* () {
+            const tables = yield* f.sql<{
+              name: string;
+            }>`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`;
+            return yield* Effect.forEach(tables, (table) =>
+              f.sql
+                .unsafe(`SELECT * FROM "${table.name.replaceAll('"', '""')}"`)
+                .pipe(Effect.map((rows) => ({ table: table.name, rows }))),
+            );
+          });
+          const changed =
+            mode === "receipt-empty" ? "" : "x".repeat(mode === "receipt-boundary" ? 256 : 257);
+          for (const id of [settled.accountingReceiptId, changed, settled.accountingReceiptId]) {
+            const retained = {
+              ...terminal,
+              accountingReceipts: terminal.accountingReceipts.map((receipt) => ({
+                ...receipt,
+                accountingReceiptId: id,
+              })),
+            };
+            yield* f.sql`UPDATE project_team_model_request SET accounting_receipt_id=${id}`;
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson(retained)} WHERE operation_id=${f.op.operation.operationId}`;
+            const before = yield* snapshot();
+            const restarted = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+            const replay = restarted.lookup(f.identity, f.request, f.requestHash, f.resourceHash);
+            if (id.length >= 1 && id.length <= 256) {
+              expect((yield* replay)?.terminal).toEqual(retained);
+              expect((yield* replay)?.terminal).toEqual(retained);
+            } else {
+              yield* typedDenial(replay, "uncertain");
+              yield* typedDenial(replay, "uncertain");
+            }
+            expect(yield* snapshot()).toEqual(before);
+          }
+          return;
+        }
         if (mode === "lost-receipt")
           yield* f.sql`UPDATE project_team_model_request SET accounting_receipt_id=NULL`;
         if (mode === "changed-settlement")
@@ -2013,14 +2062,129 @@ for (const mode of [
         if (mode === "pending") yield* f.sql`UPDATE project_team_model_request SET status='held'`;
         if (mode === "budget")
           yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=maximum_tokens+1`;
+        if (mode === "release-proof-missing")
+          yield* f.sql`UPDATE project_team_model_request SET settlement_json=json_remove(settlement_json,'$.transportDrained')`;
+        if (mode.startsWith("capacity-"))
+          yield* f.sql`UPDATE project_team_model_request SET capacity_state=${mode.slice("capacity-".length)}`;
+        if (mode === "settlement-unknown")
+          yield* f.sql`UPDATE project_team_model_request SET status='unknown'`;
+        if (mode === "settlement-corrupt")
+          yield* f.sql`UPDATE project_team_model_request SET settlement_json='{'`;
+        const before = yield* f.sql`SELECT * FROM project_team_model_request`;
         const replay = f.operations.lookup(f.identity, f.request, f.requestHash, f.resourceHash);
         if (mode === "reported") {
           expect((yield* replay)?.terminal).toEqual(terminal);
           expect((yield* replay)?.terminal).toEqual(terminal);
         } else yield* typedDenial(replay, "uncertain");
-        expect((yield* f.sql`SELECT reservation_id FROM project_team_model_request`).length).toBe(
-          1,
+        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(before);
+      }),
+    ),
+  );
+}
+for (const mode of [
+  "reported",
+  "exact-budget",
+  "aggregate-budget",
+  "duplicate-receipt",
+  "duplicate-reservation",
+  "duplicate-request",
+  "unsafe-reservation-sum",
+  "missing-request",
+] as const) {
+  it.effect(`stable Pi replay checks released sequential accounting: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixtureFor(true);
+        yield* f.activate;
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "command-code-ling-free",
+          model,
+          acceptedReportedModels: [model],
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const receipts: PiSessionTerminal["accountingReceipts"][number][] = [];
+        for (let requestId = 1; requestId <= (mode === "exact-budget" ? 2 : 3); requestId++) {
+          const reservation = {
+            workerId: f.op.workerId,
+            operationId: f.op.operation.operationId,
+            generation: 0,
+            requestId,
+            routeId: "command-code-ling-free",
+            provider: "command-code" as const,
+            model,
+            maxInputTokens: mode === "exact-budget" ? 5000 : 6000,
+            maxOutputTokens: mode === "exact-budget" ? 5000 : 6000,
+            callCount: 1 as const,
+            deadlineAtMs: time + 10000,
+          };
+          const reserved = yield* accounting.reserve(f.op.principal, reservation);
+          const tokens = mode === "exact-budget" ? 5000 : 1000;
+          const usage = {
+            prompt_tokens: tokens,
+            completion_tokens: tokens,
+            total_tokens: tokens * 2,
+          };
+          const settled = yield* accounting.settle({
+            ...reservation,
+            reservationId: reserved.reservationId,
+            outcome: "reported",
+            transportDrained: true,
+            chargedInputTokens: tokens,
+            chargedOutputTokens: tokens,
+            reportedModel: model,
+            reportedUsage: usage,
+          });
+          receipts.push({
+            requestId,
+            routeId: reservation.routeId,
+            provider: reservation.provider,
+            model,
+            reportedModel: model,
+            usage,
+            reservationId: reserved.reservationId,
+            accountingReceiptId: settled.accountingReceiptId,
+          });
+        }
+        const terminal = { ...f.terminal("success", true), accountingReceipts: receipts };
+        yield* f.operations.persistTerminal(f.op, terminal);
+        // Corrupt retained SQL after actual producer settlement; no transport or kernel was run.
+        if (mode === "aggregate-budget") {
+          yield* f.sql`UPDATE project_team_model_request SET charged_input_tokens=4000,charged_output_tokens=4000,settlement_json=json_set(settlement_json,'$.chargedInputTokens',4000,'$.chargedOutputTokens',4000,'$.reportedUsage.prompt_tokens',4000,'$.reportedUsage.completion_tokens',4000,'$.reportedUsage.total_tokens',8000)`;
+          for (let i = 0; i < receipts.length; i++)
+            receipts[i] = {
+              ...receipts[i]!,
+              usage: { prompt_tokens: 4000, completion_tokens: 4000, total_tokens: 8000 },
+            };
+        }
+        if (mode === "duplicate-receipt") {
+          yield* f.sql`UPDATE project_team_model_request SET accounting_receipt_id=${receipts[0]!.accountingReceiptId}`;
+          for (let i = 1; i < receipts.length; i++)
+            receipts[i] = {
+              ...receipts[i]!,
+              accountingReceiptId: receipts[0]!.accountingReceiptId,
+            };
+        }
+        if (mode === "duplicate-reservation") receipts[1] = receipts[0]!;
+        if (mode === "duplicate-request")
+          receipts[1] = { ...receipts[1]!, requestId: receipts[0]!.requestId };
+        if (mode === "unsafe-reservation-sum")
+          yield* f.sql`UPDATE project_team_model_request SET maximum_input_tokens=${Number.MAX_SAFE_INTEGER},maximum_output_tokens=${Number.MAX_SAFE_INTEGER}`;
+        if (mode === "missing-request")
+          yield* f.sql`DELETE FROM project_team_model_request WHERE reservation_id=${receipts[0]!.reservationId}`;
+        yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson(terminal)} WHERE operation_id=${f.op.operation.operationId}`;
+        const before = yield* f.sql`SELECT * FROM project_team_model_request ORDER BY request_id`;
+        const budgets = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        const restarted = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+        const replay = restarted.lookup(f.identity, f.request, f.requestHash, f.resourceHash);
+        if (mode === "reported" || mode === "exact-budget") {
+          expect((yield* replay)?.terminal).toEqual(terminal);
+          expect((yield* replay)?.terminal).toEqual(terminal);
+        } else yield* typedDenial(replay, "uncertain");
+        expect(yield* f.sql`SELECT * FROM project_team_model_request ORDER BY request_id`).toEqual(
+          before,
         );
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budgets);
       }),
     ),
   );
