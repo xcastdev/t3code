@@ -14,7 +14,6 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import type * as Fiber from "effect/Fiber";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -468,7 +467,7 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     context: SessionContext,
     cause: Cause.Cause<ProviderAdapterError>,
     restore: (effect: Effect.Effect<void>) => Effect.Effect<void>,
-    ownedInterruption: boolean,
+    publication: Exit.Exit<unknown, ProviderAdapterError> | undefined | null,
   ) {
     if (!Cause.hasInterrupts(cause)) return yield* Effect.failCause(cause);
     const cleanup = yield* Effect.exit(
@@ -483,18 +482,32 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     const pending = yield* Effect.exit(restore(Effect.void));
     return yield* Effect.failCause(
       Cause.fromReasons([
-        ...(ownedInterruption && Exit.isFailure(pending) ? pending.cause.reasons : cause.reasons),
-        ...(!ownedInterruption && Exit.isFailure(pending) ? pending.cause.reasons : []),
+        ...(Exit.isFailure(pending)
+          ? publication && Exit.isFailure(publication)
+            ? publication.cause.reasons
+            : publication === undefined
+              ? cause.reasons
+              : []
+          : cause.reasons),
+        ...(Exit.isFailure(pending) ? pending.cause.reasons : []),
         ...(Exit.isFailure(cleanup) ? cleanup.cause.reasons : []),
       ]),
     );
   });
-  // Pinned Effect's Failure/getCont synchronously selects this restored wait's handler
-  // from the caller's pending interruption before invoking catchCause. Its StackTrace
-  // annotation copies the Cause, so object identity cannot recover that provenance.
-  // No public accessor exists; an absent field conservatively retains both causes.
-  const ownsInterruption = (fiber: Fiber.Fiber<unknown, unknown>) =>
-    "_interruptedCause" in fiber && Cause.isCause(fiber._interruptedCause);
+  // These Adapter-owned Deferreds are completed only with done/failCause/succeed.
+  // Snapshot their published Exit synchronously at the wait handler, before cleanup
+  // can publish another outcome. Caller interruption comes separately from restore.
+  // A non-Exit completion conservatively retains the caught cause as well.
+  const snapshotPublication = (
+    effect: Effect.Effect<unknown, ProviderAdapterError> | undefined,
+  ): Exit.Exit<unknown, ProviderAdapterError> | undefined | null => {
+    if (effect === undefined) return null;
+    if (isPublishedExit(effect)) return effect;
+    return undefined;
+  };
+  const isPublishedExit = (
+    effect: Effect.Effect<unknown, ProviderAdapterError>,
+  ): effect is Exit.Exit<unknown, ProviderAdapterError> => Exit.isExit(effect);
 
   const launch = Effect.fn("PiAdapter.launch")(function* (
     context: SessionContext,
@@ -924,10 +937,9 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           ...(hints.resumeCursor !== undefined ? { resumeCursor: hints.resumeCursor } : {}),
         };
         const active = yield* launch(context, request, hints);
-        const caller = yield* Effect.fiber;
         return yield* restore(Deferred.await(active.result)).pipe(
           Effect.catchCause((cause) =>
-            joinInterrupted(context, cause, restore, ownsInterruption(caller)),
+            joinInterrupted(context, cause, restore, snapshotPublication(active.result.effect)),
           ),
         );
       }),
@@ -967,10 +979,9 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             ? { modelSelection: structuredClone(turn.modelSelection) }
             : {}),
         });
-        const caller = yield* Effect.fiber;
         const prepared = yield* restore(Deferred.await(active.prepared)).pipe(
           Effect.catchCause((cause) =>
-            joinInterrupted(context, cause, restore, ownsInterruption(caller)),
+            joinInterrupted(context, cause, restore, snapshotPublication(active.prepared.effect)),
           ),
         );
         if (prepared.kind !== "prompt")
