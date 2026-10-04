@@ -1077,6 +1077,7 @@ describe("required actual Linux executable closure", () => {
           protectedRoots: [input.distributionDirectory],
         });
         expect(Object.isFrozen(result)).toBe(true);
+        expect(result.sdkVersion).toBe("0.99.1");
         expect(Object.isFrozen(result.runtimeFiles)).toBe(true);
         const mounted = new Map(result.runtimeFiles.map((file) => [file.target, file.source]));
         expect(mounted.has("/runtime/dist/extra.mjs")).toBe(true);
