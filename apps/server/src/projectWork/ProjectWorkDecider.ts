@@ -1,6 +1,7 @@
 import type { ProjectTeamRecord } from "@t3tools/contracts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
 import { decideProjectTeamGuidedLifecycle } from "./ProjectTeamGuidedLifecycle.ts";
+import { decideProjectTeamMemoryReflection } from "./ProjectTeamMemoryTransitions.ts";
 import { decideProjectTeamGuidedTransition } from "./ProjectTeamGuidedTransitions.ts";
 import { isGuidedProjectTeamTask, projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import {
@@ -750,6 +751,13 @@ export function decideProjectWorkCommand(
       return events;
     }
     case "project-work.foundation.commit": {
+      if (command.transition?.kind === "memory.reflect")
+        return decideProjectTeamMemoryReflection(
+          mutableState(state),
+          command,
+          event,
+          applyProjectWorkEvents,
+        );
       if (command.transition !== undefined)
         return decideProjectTeamGuidedTransition(
           mutableState(state),

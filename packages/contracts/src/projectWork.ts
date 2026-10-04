@@ -1324,6 +1324,21 @@ export type ProjectWorkGuidedTransition = typeof ProjectWorkGuidedTransition.Typ
 const JoinedRunCounter = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
 export const ProjectWorkTeamTransition = Schema.Union([
   Schema.Struct({
+    kind: Schema.Literal("memory.reflect"),
+    effectId: GuidedId,
+    claimGeneration: JoinedRunCounter,
+    outcomeKind: Schema.Literals(["index-complete", "delete-source-complete", "no-facts"]),
+    sourceId: GuidedId,
+    sourceRevision: JoinedRunCounter,
+    sourceGeneration: JoinedRunCounter,
+    observationIds: Schema.Array(GuidedId).check(
+      Schema.isMaxLength(32),
+      Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+    ),
+    expectedEffectRevision: JoinedRunCounter,
+    expectedExtractionRevision: Schema.optionalKey(JoinedRunCounter),
+  }),
+  Schema.Struct({
     kind: Schema.Literal("run.settle"),
     bindingId: GuidedId,
     generation: JoinedRunCounter,

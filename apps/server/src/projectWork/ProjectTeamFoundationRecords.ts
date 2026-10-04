@@ -3,6 +3,7 @@ import {
   ProjectTeamRecord,
   type ProjectTeamRecord as TeamRecord,
   type ProjectWorkAttribution,
+  type ProjectWorkTeamTransition,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
@@ -63,11 +64,45 @@ export const validateProjectTeamRecord = (
     readonly generation: number;
     readonly receiptId: string;
   },
+  memoryReflection?: Extract<ProjectWorkTeamTransition, { kind: "memory.reflect" }>,
 ): TeamRecord => {
   const r = decodeTeamRecord(input);
   const records = state.foundationRecords ?? [];
   if (r.projectId !== state.projectId) reject("Foundation record project does not match command");
   const old = records.find((entry) => entry.recordId === r.recordId);
+  // Only the dedicated private transition can reconcile an original memory effect.
+  const reflectedMemory =
+    memoryReflection !== undefined &&
+    origin.actor.kind === "system" &&
+    origin.actor.id === "project-memory-indexer" &&
+    old?.kind === "effect" &&
+    r.kind === "effect" &&
+    r.effectId === memoryReflection.effectId &&
+    r.revision === memoryReflection.expectedEffectRevision + 1 &&
+    old.revision === memoryReflection.expectedEffectRevision &&
+    r.claimGeneration === old.claimGeneration &&
+    r.targetId === memoryReflection.sourceId &&
+    r.generation === memoryReflection.sourceGeneration &&
+    r.payload.expectedRevision === memoryReflection.sourceRevision &&
+    r.status === "succeeded" &&
+    ((r.effectKind === "memory-delete" &&
+      memoryReflection.outcomeKind === "delete-source-complete" &&
+      memoryReflection.observationIds.length === 0) ||
+      (r.effectKind === "memory-index" &&
+        memoryReflection.outcomeKind !== "delete-source-complete" &&
+        r.claimGeneration === memoryReflection.claimGeneration)) &&
+    r.outcome ===
+      canonicalProjectWorkPayload({
+        effectId: memoryReflection.effectId,
+        claimGeneration: memoryReflection.claimGeneration,
+        kind: memoryReflection.outcomeKind,
+        sourceId: memoryReflection.sourceId,
+        sourceRevision: memoryReflection.sourceRevision,
+        sourceGeneration: memoryReflection.sourceGeneration,
+        observationIds: memoryReflection.observationIds,
+      });
+  const memoryCleanup = reflectedMemory && r.kind === "effect" && r.effectKind === "memory-delete";
+
   if (old !== undefined) {
     if (old.kind !== r.kind) reject("Record identity cannot change kind");
     if (r.revision !== old.revision + 1 || r.generation < old.generation)
@@ -88,7 +123,8 @@ export const validateProjectTeamRecord = (
   if (
     "taskId" in r &&
     r.taskId !== undefined &&
-    !state.tasks.some((entry) => entry.taskId === r.taskId)
+    !state.tasks.some((entry) => entry.taskId === r.taskId) &&
+    !memoryCleanup
   )
     reject("Unknown task in foundation record");
   switch (r.kind) {
@@ -541,7 +577,7 @@ export const validateProjectTeamRecord = (
     case "effect":
       if (old?.kind === "effect" && stable(old) !== stable(r))
         reject("Effect identity and semantic envelope are immutable");
-      if (r.runId !== undefined) requireRecord(r.runId, "run-binding");
+      if (r.runId !== undefined && !memoryCleanup) requireRecord(r.runId, "run-binding");
       if (r.sourceId !== undefined) {
         const source = requireRecord(r.sourceId, "memory-source");
         if (source.generation !== r.sourceGeneration) reject("Effect source generation is stale");
@@ -553,7 +589,8 @@ export const validateProjectTeamRecord = (
         old?.kind === "effect" &&
         old.status === "uncertain" &&
         r.status !== "uncertain" &&
-        r.status !== "canceled"
+        r.status !== "canceled" &&
+        !reflectedMemory
       )
         reject("Uncertain effect requires durable reconciliation");
       if (old?.kind === "effect" && old.status === "claimed" && r.status === "pending")

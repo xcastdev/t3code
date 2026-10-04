@@ -243,6 +243,7 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
           job.input.projectId,
           effectId,
           job.claimGeneration,
+          job.receipt,
         );
         if (
           job.receipt!.observationIds.length !== work.extraction!.expectedObservationIds.length ||

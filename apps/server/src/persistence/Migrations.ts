@@ -97,6 +97,7 @@ import ForkMigration0026 from "./Migrations/fork/026_ProjectTeamTransportCapacit
 import ForkMigration0027 from "./Migrations/fork/027_ProjectTeamSetupJournal.ts";
 import ForkMigration0028 from "./Migrations/fork/028_ProjectTeamWorkspaceReceipt.ts";
 import ForkMigration0029 from "./Migrations/fork/029_ProjectTeamMemoryJournal.ts";
+import ForkMigration0030 from "./Migrations/fork/030_ProjectTeamMemoryOutcome.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -194,6 +195,7 @@ export const forkMigrationEntries = [
   [27, "ProjectTeamSetupJournal", ForkMigration0027],
   [28, "ProjectTeamWorkspaceReceipt", ForkMigration0028],
   [29, "ProjectTeamMemoryJournal", ForkMigration0029],
+  [30, "ProjectTeamMemoryOutcome", ForkMigration0030],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
