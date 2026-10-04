@@ -152,7 +152,7 @@ const decodeTerminal = Schema.decodeEffect(
         Schema.Struct({
           requestId: Positive,
           reservationId: Schema.String,
-          accountingReceiptId: Schema.String,
+          accountingReceiptId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
           routeId: Schema.String,
           provider: Schema.Literal("command-code"),
           model: Schema.String,

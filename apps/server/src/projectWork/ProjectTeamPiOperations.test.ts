@@ -1955,6 +1955,9 @@ for (const mode of [
   "capacity-legacy",
   "settlement-unknown",
   "settlement-corrupt",
+  "receipt-empty",
+  "receipt-oversize",
+  "receipt-boundary",
 ] as const) {
   it.effect(`stable Pi replay preserves original accounting: ${mode}`, () =>
     fileTest(
@@ -2009,6 +2012,43 @@ for (const mode of [
           ],
         };
         yield* f.operations.persistTerminal(f.op, terminal);
+        if (mode.startsWith("receipt-")) {
+          const snapshot = Effect.fn("snapshotPiReplayDatabase")(function* () {
+            const tables = yield* f.sql<{
+              name: string;
+            }>`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`;
+            return yield* Effect.forEach(tables, (table) =>
+              f.sql
+                .unsafe(`SELECT * FROM "${table.name.replaceAll('"', '""')}"`)
+                .pipe(Effect.map((rows) => ({ table: table.name, rows }))),
+            );
+          });
+          const changed =
+            mode === "receipt-empty" ? "" : "x".repeat(mode === "receipt-boundary" ? 256 : 257);
+          for (const id of [settled.accountingReceiptId, changed, settled.accountingReceiptId]) {
+            const retained = {
+              ...terminal,
+              accountingReceipts: terminal.accountingReceipts.map((receipt) => ({
+                ...receipt,
+                accountingReceiptId: id,
+              })),
+            };
+            yield* f.sql`UPDATE project_team_model_request SET accounting_receipt_id=${id}`;
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson(retained)} WHERE operation_id=${f.op.operation.operationId}`;
+            const before = yield* snapshot();
+            const restarted = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+            const replay = restarted.lookup(f.identity, f.request, f.requestHash, f.resourceHash);
+            if (id.length >= 1 && id.length <= 256) {
+              expect((yield* replay)?.terminal).toEqual(retained);
+              expect((yield* replay)?.terminal).toEqual(retained);
+            } else {
+              yield* typedDenial(replay, "uncertain");
+              yield* typedDenial(replay, "uncertain");
+            }
+            expect(yield* snapshot()).toEqual(before);
+          }
+          return;
+        }
         if (mode === "lost-receipt")
           yield* f.sql`UPDATE project_team_model_request SET accounting_receipt_id=NULL`;
         if (mode === "changed-settlement")
