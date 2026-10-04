@@ -267,6 +267,10 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     readonly verifyStage?: ProjectTeamDispatchStageVerifier;
     /** Read-only resource loan checked after final SQL reads, inside the stage transaction. */
     readonly verifyStageFinal?: ProjectTeamDispatchStageVerifier;
+    /** Private owner resources revalidated after claim writes, before atomic commit. */
+    readonly verifyClaimFinal?: (
+      snapshot: ProjectTeamDispatchSnapshot,
+    ) => Effect.Effect<void, ProjectTeamDispatchJournalError>;
     /** Root checks original worker/setup/model owners joined, including retained transport accounting. */
     readonly verifySettlement?: ProjectTeamDispatchStageVerifier;
   }) {
@@ -274,6 +278,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     const repository = yield* ProjectWorkRepository;
     const verifyAdmission = options.verifyAdmission;
     const verifyStageFinal = options.verifyStageFinal;
+    const verifyClaimFinal = options.verifyClaimFinal;
     const environmentId = yield* decodeEnvironment(options.environmentId);
     const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
     const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
@@ -1101,6 +1106,15 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           AND revision=${expected.revision} AND claim_generation=${expected.claimGeneration} AND stage='reserved'
         RETURNING dispatch_id`;
           if (changed.length !== 1) return yield* deny("Dispatch effect claim was superseded");
+          const final = yield* read(expected.dispatchId);
+          const authority = yield* currentClaim(final.row, final.intent);
+          if (verifyClaimFinal)
+            yield* verifyClaimFinal({ fence: fence(final.row), intent: final.intent });
+          yield* assertExecutionTime(
+            final.intent,
+            authority.leaseDeadlineAtMs,
+            yield* Clock.currentTimeMillis,
+          );
         }),
       );
       if (!claimed) return yield* deny("Dispatch effect claim did not commit");
