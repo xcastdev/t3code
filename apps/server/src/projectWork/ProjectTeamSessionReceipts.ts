@@ -554,12 +554,15 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         decodeAccounting(r).pipe(Effect.mapError(corrupt)),
       );
       const seenReceipts = new Set<string>();
+      const seenAccountingReceipts = new Set<string>();
       const seenRequests = new Set<number>();
+      let chargedTokens = 0;
       for (const receipt of terminal.accountingReceipts) {
         const r = requests.find((r) => r.reservation_id === receipt.reservationId);
         if (
           !r ||
           seenReceipts.has(receipt.reservationId) ||
+          seenAccountingReceipts.has(receipt.accountingReceiptId) ||
           seenRequests.has(receipt.requestId) ||
           r.status !== "reported" ||
           r.capacity_state !== "released" ||
@@ -632,7 +635,17 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
           r.charged_output_tokens !== receipt.usage.completion_tokens
         )
           return yield* deny("Original Pi accounting payload differs");
+        const requestCharge = r.charged_input_tokens + r.charged_output_tokens;
+        const totalCharge = chargedTokens + requestCharge;
+        if (
+          !Number.isSafeInteger(requestCharge) ||
+          !Number.isSafeInteger(totalCharge) ||
+          totalCharge > row.maximum_tokens
+        )
+          return yield* deny("Original Pi aggregate accounting exceeds operation limit");
+        chargedTokens = totalCharge;
         seenReceipts.add(receipt.reservationId);
+        seenAccountingReceipts.add(receipt.accountingReceiptId);
         seenRequests.add(receipt.requestId);
       }
       return {

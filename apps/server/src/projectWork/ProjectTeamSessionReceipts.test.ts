@@ -635,3 +635,95 @@ for (const mode of [
       }),
     ),
   );
+
+for (const mode of [
+  "unmodified",
+  "exact-cap",
+  "released-reservations",
+  "over-cap",
+  "duplicate-receipt",
+  "unsafe-charge",
+] as const)
+  it.effect(`verifies accounting across sequential released requests: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* producer;
+        yield* f.initialize;
+        const p = yield* f.prompt;
+        yield* f.activate(p.op, { ...native, leafId: "final-leaf" });
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "command-code-ling-free",
+          model,
+          acceptedReportedModels: [model],
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const receipts: PiSessionTerminal["accountingReceipts"][number][] = [];
+        for (const requestId of [1, 2]) {
+          const fields = {
+            workerId: p.op.workerId,
+            operationId: p.op.operation.operationId,
+            generation: p.op.authority.binding.generation,
+            requestId,
+            routeId: "command-code-ling-free",
+            provider: "command-code" as const,
+            model,
+            maxInputTokens: 1000,
+            maxOutputTokens: 100,
+            callCount: 1 as const,
+            deadlineAtMs: p.op.deadlineAtMs,
+          };
+          const reservation = yield* accounting.reserve(p.op.principal, fields);
+          const usage =
+            mode === "released-reservations"
+              ? { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+              : { prompt_tokens: 1000, completion_tokens: 100, total_tokens: 1100 };
+          const settlement = yield* accounting.settle({
+            ...fields,
+            reservationId: reservation.reservationId,
+            outcome: "reported",
+            transportDrained: true,
+            chargedInputTokens: usage.prompt_tokens,
+            chargedOutputTokens: usage.completion_tokens,
+            reportedModel: model,
+            reportedUsage: usage,
+          });
+          receipts.push({
+            requestId,
+            reservationId: reservation.reservationId,
+            accountingReceiptId: settlement.accountingReceiptId,
+            routeId: fields.routeId,
+            provider: fields.provider,
+            model,
+            reportedModel: model,
+            usage,
+          });
+        }
+        yield* f.complete(p.op, { ...native, leafId: "final-leaf" }, "success", receipts);
+        expect(new Set(receipts.map((r) => r.accountingReceiptId)).size).toBe(2);
+        expect((yield* f.readers.readAssignment(f.snapshot))?.terminal.accountingReceipts).toEqual(
+          receipts,
+        );
+        const id = p.op.operation.operationId;
+        if (mode === "exact-cap" || mode === "over-cap" || mode === "released-reservations") {
+          const maximumTokens = mode === "exact-cap" ? 2200 : 1100;
+          yield* f.sql`UPDATE project_team_pi_operation SET maximum_tokens=${maximumTokens},intent_json=json_set(intent_json,'$.operationLimits.maximumTokens',${maximumTokens}) WHERE operation_id=${id}`;
+        }
+        if (mode === "duplicate-receipt") {
+          const reused = receipts[0]!.accountingReceiptId;
+          yield* f.sql`UPDATE project_team_model_request SET accounting_receipt_id=${reused} WHERE operation_id=${id} AND request_id=2`;
+          receipts[1] = { ...receipts[1]!, accountingReceiptId: reused };
+          yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=json_set(terminal_json,'$.accountingReceipts',json(${encodeJson(receipts)})) WHERE operation_id=${id}`;
+        }
+        // Corrupt SQL at the safe-integer boundary; no actual producer can report this charge.
+        if (mode === "unsafe-charge")
+          yield* f.sql`UPDATE project_team_model_request SET charged_input_tokens=${Number.MAX_SAFE_INTEGER + 1} WHERE operation_id=${id} AND request_id=2`;
+        if (mode === "over-cap" || mode === "duplicate-receipt" || mode === "unsafe-charge")
+          yield* denial(f.readers.readAssignment(f.snapshot));
+        else
+          expect(
+            (yield* f.readers.readAssignment(f.snapshot))?.terminal.accountingReceipts,
+          ).toEqual(receipts);
+      }),
+    ),
+  );
