@@ -1057,6 +1057,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             provider: string;
             model: string;
             status: string;
+            capacity_state: string;
             accounting_receipt_id: string | null;
             settlement_json: string | null;
             reservation_json: string;
@@ -1068,14 +1069,20 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           }>`SELECT * FROM project_team_model_request WHERE operation_id=${row.operation_id} LIMIT 257`;
           if (requests.length !== terminal.accountingReceipts.length || requests.length > 256)
             return yield* deny("Stable Pi accounting receipt incomplete", "uncertain");
-          const seen = new Set<string>();
+          const reservations = new Set<string>();
+          const accountingReceipts = new Set<string>();
+          const requestIds = new Set<number>();
+          let chargedTokens = 0;
           for (const receipt of terminal.accountingReceipts) {
             const requestRow = requests.find(
               (entry) => entry.reservation_id === receipt.reservationId,
             );
             if (
               !requestRow ||
-              seen.has(receipt.reservationId) ||
+              reservations.has(receipt.reservationId) ||
+              accountingReceipts.has(receipt.accountingReceiptId) ||
+              requestIds.has(receipt.requestId) ||
+              requestRow.capacity_state !== "released" ||
               requestRow.status !== "reported" ||
               requestRow.environment_id !== row.environment_id ||
               requestRow.project_id !== row.project_id ||
@@ -1097,6 +1104,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               requestRow.maximum_input_tokens < 1 ||
               !Number.isSafeInteger(requestRow.maximum_output_tokens) ||
               requestRow.maximum_output_tokens < 1 ||
+              !Number.isSafeInteger(
+                requestRow.maximum_input_tokens + requestRow.maximum_output_tokens,
+              ) ||
               requestRow.maximum_input_tokens + requestRow.maximum_output_tokens >
                 row.maximum_tokens ||
               !Number.isSafeInteger(requestRow.deadline_at_ms) ||
@@ -1130,8 +1140,12 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               callCount: 1,
               deadlineAtMs: requestRow.deadline_at_ms,
             };
-            const reservation = yield* decodeJson(requestRow.reservation_json);
-            const settlement = yield* decodeJson(requestRow.settlement_json);
+            const reservation = yield* decodeJson(requestRow.reservation_json).pipe(
+              Effect.mapError(() => deny("Stable Pi reservation unavailable", "uncertain")),
+            );
+            const settlement = yield* decodeJson(requestRow.settlement_json).pipe(
+              Effect.mapError(() => deny("Stable Pi settlement unavailable", "uncertain")),
+            );
             if (
               encode(reservation) !== encode(fields) ||
               encode(settlement) !==
@@ -1139,6 +1153,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
                   ...fields,
                   reservationId: receipt.reservationId,
                   outcome: "reported",
+                  transportDrained: true,
                   chargedInputTokens: requestRow.charged_input_tokens,
                   chargedOutputTokens: requestRow.charged_output_tokens,
                   reportedModel: receipt.reportedModel,
@@ -1150,7 +1165,13 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               requestRow.charged_output_tokens !== receipt.usage.completion_tokens
             )
               return yield* deny("Stable Pi accounting evidence differs", "uncertain");
-            seen.add(receipt.reservationId);
+            // Released calls consume actual usage, not each sequential reservation's ceiling.
+            chargedTokens += receipt.usage.total_tokens;
+            if (!Number.isSafeInteger(chargedTokens) || chargedTokens > row.maximum_tokens)
+              return yield* deny("Stable Pi accounting exceeds original budget", "uncertain");
+            reservations.add(receipt.reservationId);
+            accountingReceipts.add(receipt.accountingReceiptId);
+            requestIds.add(receipt.requestId);
           }
           const active =
             yield* sql`SELECT operation_id FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId} AND status IN ('prepared','starting','running','quarantine')`;
