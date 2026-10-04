@@ -15,6 +15,8 @@ describe("work presentation", () => {
     expect(isWorkTab("knowledge")).toBe(true);
     expect(isWorkTab("team")).toBe(true);
     expect(isWorkTab("inbox")).toBe(true);
+    expect(isWorkTab("memory")).toBe(true);
+    expect(isWorkTab("evidence")).toBe(true);
     expect(isWorkTab("activity")).toBe(false);
   });
 
