@@ -582,3 +582,355 @@ for (const noFacts of [false, true])
       }),
     ),
   );
+
+const purgeMemoryDomain = Effect.fn("outcome.test.purge")(function* (
+  f: Effect.Success<ReturnType<typeof setup>>,
+  retainedTable?: string,
+) {
+  yield* f.sql.withTransaction(
+    Effect.gen(function* () {
+      for (const table of [
+        ...PROJECT_TEAM_TABLES,
+        "project_work_events",
+        "project_work_command_receipts",
+        "project_work_reducer_checkpoints",
+        "projection_projects",
+      ])
+        if (table !== retainedTable)
+          yield* f.sql`DELETE FROM ${f.sql(table)} WHERE project_id=${f.projectId}`;
+    }),
+  );
+});
+
+const prepareCleanup = Effect.fn("outcome.test.cleanup")(function* (
+  f: Effect.Success<ReturnType<typeof setup>>,
+) {
+  yield* f.reactor.consume(f.projectId, f.effectId);
+  yield* f.service.retract(f.projectId, f.source.recordId);
+  const state = yield* readCurrentState(f.sql, f.projectId);
+  const effect = state.foundationRecords!.find(
+    (record) => record.kind === "effect" && record.effectKind === "memory-delete",
+  )!;
+  return effect.recordId;
+});
+
+it.effect(
+  "review regression: original successful domain cleanup stays recoverable after purge",
+  () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        const id = yield* prepareCleanup(f);
+        expect((yield* f.reactor.consume(f.projectId, id)).status).toBe("reflected");
+        const original =
+          yield* f.sql`SELECT * FROM project_team_memory_outcome WHERE effect_id=${id}`;
+        yield* purgeMemoryDomain(f);
+        const before = yield* f.snapshot;
+        const recreated = makeProjectMemoryIndexReactor({
+          ...f,
+          backend: {
+            health: () => Effect.die("unexpected backend health"),
+            index: () => Effect.die("unexpected backend index"),
+            reconcile: () => Effect.die("unexpected backend reconcile"),
+            search: () => Effect.die("unexpected backend search"),
+            deleteSource: () => Effect.die("unexpected backend delete"),
+            deleteProject: () => Effect.die("unexpected backend project delete"),
+          },
+          outcomes: makeProjectMemoryOutcome(f),
+        });
+        for (let retry = 0; retry < 2; retry++)
+          expect((yield* recreated.consume(f.projectId, id)).status).toBe("reflected");
+        expect(yield* f.snapshot).toEqual(before);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_memory_outcome WHERE effect_id=${id}`,
+        ).toEqual(original);
+      }),
+    ),
+);
+
+it.effect(
+  "review regression: final validation rejects an event with the wrong completion record",
+  () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        const pending = yield* f.pending.consume(f.projectId, f.effectId);
+        if (pending.status !== "pending-reflection") return yield* Effect.die("unsettled fixture");
+        const before = yield* f.snapshot;
+        yield* f.sql`CREATE TRIGGER change_reflection_record AFTER INSERT ON project_work_events
+    WHEN NEW.command_id LIKE 'memory-reflection:%' AND json_extract(NEW.payload_json,'$.record.kind')='memory-extraction'
+    BEGIN
+      UPDATE project_work_events SET payload_json=json_set(NEW.payload_json,'$.record',json((
+        SELECT json_set(e.payload_json,'$.status','succeeded','$.revision',e.revision+1,
+          '$.updatedAt',json_extract(NEW.payload_json,'$.occurredAt'),
+          '$.outcome',(SELECT receipt_json FROM project_team_memory_job WHERE effect_id=e.record_id))
+        FROM project_team_effect e WHERE e.project_id=NEW.project_id
+          AND json_extract(e.payload_json,'$.effectKind')='memory-index'
+          AND json_extract(e.payload_json,'$.targetId')=json_extract(NEW.payload_json,'$.record.sourceId')))) WHERE sequence=NEW.sequence;
+    END`;
+        const result = yield* f.outcomes
+          .commitVerifiedOutcome(pending.receipt, Effect.void)
+          .pipe(Effect.exit);
+        expect(result._tag).toBe("Failure");
+        expect(yield* f.snapshot).toEqual(before);
+      }),
+    ),
+);
+
+for (const projectState of ["current", "soft-deleted", "absent"] as const)
+  for (const corruption of ["missing", "tampered"] as const)
+    it.effect(
+      `cleanup replay rejects ${corruption} original command receipt with ${projectState} project`,
+      () =>
+        database(
+          Effect.gen(function* () {
+            const f = yield* setup();
+            const id = yield* prepareCleanup(f);
+            yield* f.reactor.consume(f.projectId, id);
+            const job = yield* f.reactor.load(id);
+            if (job?.receipt === undefined) return yield* Effect.die("missing cleanup receipt");
+            if (projectState === "soft-deleted")
+              yield* f.sql`UPDATE projection_projects SET deleted_at=${at} WHERE project_id=${f.projectId}`;
+            if (projectState === "absent")
+              yield* f.sql`DELETE FROM projection_projects WHERE project_id=${f.projectId}`;
+            if (corruption === "missing")
+              yield* f.sql`DELETE FROM project_work_command_receipts WHERE command_id=(
+        SELECT json_extract(reflection_json,'$.commandId') FROM project_team_memory_outcome WHERE effect_id=${id})`;
+            else
+              yield* f.sql`UPDATE project_work_command_receipts SET payload_fingerprint='tampered' WHERE command_id=(
+        SELECT json_extract(reflection_json,'$.commandId') FROM project_team_memory_outcome WHERE effect_id=${id})`;
+            const before = yield* f.snapshot;
+            expect(
+              (yield* makeProjectMemoryOutcome(f)
+                .commitVerifiedOutcome(job.receipt, Effect.void)
+                .pipe(Effect.exit))._tag,
+            ).toBe("Failure");
+            expect(yield* f.snapshot).toEqual(before);
+            expect(f.counts().deleteCalls).toBe(1);
+          }),
+        ),
+    );
+
+for (const retainedTable of [
+  "project_team_effect",
+  "project_team_memory_source",
+  "project_team_memory_observation",
+  "project_work_events",
+  "project_work_command_receipts",
+  "project_work_reducer_checkpoints",
+  "projection_projects",
+])
+  it.effect(`cleanup replay rejects partial purge retaining ${retainedTable}`, () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        const id = yield* prepareCleanup(f);
+        yield* f.reactor.consume(f.projectId, id);
+        const job = yield* f.reactor.load(id);
+        if (job?.receipt === undefined) return yield* Effect.die("missing cleanup receipt");
+        yield* purgeMemoryDomain(f, retainedTable);
+        const before = yield* f.snapshot;
+        expect(
+          (yield* makeProjectMemoryOutcome(f)
+            .commitVerifiedOutcome(job.receipt, Effect.void)
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect(yield* f.snapshot).toEqual(before);
+        expect(f.counts().deleteCalls).toBe(1);
+      }),
+    ),
+  );
+
+for (const foreign of [false, true])
+  it.effect(
+    `cleanup replay rejects revived ${foreign ? "foreign" : "original"} physical source after purge`,
+    () =>
+      database(
+        Effect.gen(function* () {
+          const f = yield* setup();
+          const id = yield* prepareCleanup(f);
+          yield* f.reactor.consume(f.projectId, id);
+          const job = yield* f.reactor.load(id);
+          if (job?.receipt === undefined) return yield* Effect.die("missing cleanup receipt");
+          yield* purgeMemoryDomain(f);
+          const source = {
+            ...f.source,
+            projectId: foreign ? ProjectId.make("foreign-project") : f.projectId,
+          };
+          yield* f.sql`INSERT INTO project_team_memory_source(record_id,project_id,status,revision,generation,updated_at,payload_json)
+      VALUES(${source.recordId},${source.projectId},${source.status},${source.revision},${source.generation},${source.updatedAt},${canonicalProjectWorkPayload(source)})`;
+          const before = yield* f.snapshot;
+          expect(
+            (yield* makeProjectMemoryOutcome(f)
+              .commitVerifiedOutcome(job.receipt, Effect.void)
+              .pipe(Effect.exit))._tag,
+          ).toBe("Failure");
+          expect(yield* f.snapshot).toEqual(before);
+          expect(f.counts().deleteCalls).toBe(1);
+        }),
+      ),
+  );
+
+for (const noFacts of [false, true]) {
+  it.effect(
+    `${noFacts ? "no-facts" : "index"} original success has no cleanup fallback after purge`,
+    () =>
+      database(
+        Effect.gen(function* () {
+          const f = yield* setup(noFacts);
+          yield* f.reactor.consume(f.projectId, f.effectId);
+          const job = yield* f.reactor.load(f.effectId);
+          if (job?.receipt === undefined) return yield* Effect.die("missing index receipt");
+          yield* purgeMemoryDomain(f);
+          const before = yield* f.snapshot;
+          expect(
+            (yield* makeProjectMemoryOutcome(f)
+              .commitVerifiedOutcome(job.receipt, Effect.void)
+              .pipe(Effect.exit))._tag,
+          ).toBe("Failure");
+          expect(yield* f.snapshot).toEqual(before);
+          expect(f.counts().deleteCalls).toBe(0);
+        }),
+      ),
+  );
+  it.effect(
+    `${noFacts ? "no-facts" : "index"} rejects exact extraction substituted for its effect event and retries atomically`,
+    () =>
+      database(
+        Effect.gen(function* () {
+          const f = yield* setup(noFacts);
+          const pending = yield* f.pending.consume(f.projectId, f.effectId);
+          if (pending.status !== "pending-reflection")
+            return yield* Effect.die("unsettled fixture");
+          const before = yield* f.snapshot;
+          yield* f.sql`CREATE TRIGGER substitute_reflection_effect AFTER INSERT ON project_work_events
+      WHEN NEW.command_id LIKE 'memory-reflection:%' AND json_extract(NEW.payload_json,'$.record.kind')='effect'
+      BEGIN UPDATE project_work_events SET payload_json=json_set(NEW.payload_json,'$.record',json((
+        SELECT json_set(x.payload_json,'$.status',${f.sql.literal(noFacts ? "'no-facts'" : "'indexed'")},'$.revision',x.revision+${f.sql.literal(noFacts ? "0" : "1")},
+          '$.updatedAt',CASE WHEN ${f.sql.literal(noFacts ? "1" : "0")}=1 THEN json_extract(x.payload_json,'$.updatedAt') ELSE json_extract(NEW.payload_json,'$.occurredAt') END,
+          '$.completedObservationIds',json(CASE WHEN ${f.sql.literal(noFacts ? "1" : "0")}=1 THEN '[]' ELSE json_extract(x.payload_json,'$.expectedObservationIds') END))
+        FROM project_team_memory_extraction x WHERE x.project_id=NEW.project_id))) WHERE sequence=NEW.sequence; END`;
+          expect(
+            (yield* f.outcomes
+              .commitVerifiedOutcome(pending.receipt, Effect.void)
+              .pipe(Effect.exit))._tag,
+          ).toBe("Failure");
+          expect(yield* f.snapshot).toEqual(before);
+          yield* f.sql`DROP TRIGGER substitute_reflection_effect`;
+          expect((yield* f.reactor.reflect(f.effectId)).status).toBe("reflected");
+          expect(f.counts()).toEqual({
+            extractCalls: 1,
+            embedCalls: noFacts ? 0 : 1,
+            indexCalls: noFacts ? 0 : 1,
+            deleteCalls: 0,
+          });
+        }),
+      ),
+  );
+}
+
+for (const corruption of ["physical-type", "physical-time", "payload-time"] as const)
+  it.effect(`rejects ${corruption} reflection event metadata atomically`, () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        const pending = yield* f.pending.consume(f.projectId, f.effectId);
+        if (pending.status !== "pending-reflection") return yield* Effect.die("unsettled fixture");
+        const before = yield* f.snapshot;
+        if (corruption === "physical-type")
+          yield* f.sql`CREATE TRIGGER corrupt_reflection_metadata AFTER INSERT ON project_work_events
+      WHEN NEW.command_id LIKE 'memory-reflection:%' BEGIN UPDATE project_work_events SET event_type='project-work.task.created' WHERE sequence=NEW.sequence; END`;
+        if (corruption === "physical-time")
+          yield* f.sql`CREATE TRIGGER corrupt_reflection_metadata AFTER INSERT ON project_work_events
+      WHEN NEW.command_id LIKE 'memory-reflection:%' BEGIN UPDATE project_work_events SET occurred_at='2026-10-03T00:00:00.000Z' WHERE sequence=NEW.sequence; END`;
+        if (corruption === "payload-time")
+          yield* f.sql`CREATE TRIGGER corrupt_reflection_metadata AFTER INSERT ON project_work_events
+      WHEN NEW.command_id LIKE 'memory-reflection:%' BEGIN UPDATE project_work_events SET payload_json=json_set(payload_json,'$.occurredAt','2026-10-03T00:00:00.000Z') WHERE sequence=NEW.sequence; END`;
+        expect(
+          (yield* f.outcomes.commitVerifiedOutcome(pending.receipt, Effect.void).pipe(Effect.exit))
+            ._tag,
+        ).toBe("Failure");
+        expect(yield* f.snapshot).toEqual(before);
+      }),
+    ),
+  );
+
+for (const noFacts of [false, true])
+  it.effect(
+    `${noFacts ? "no-facts" : "index"} reflection authoritative events rebuild the exact completed records and retry`,
+    () =>
+      database(
+        Effect.gen(function* () {
+          const f = yield* setup(noFacts);
+          expect((yield* f.reactor.consume(f.projectId, f.effectId)).status).toBe("reflected");
+          const completed = yield* readCurrentState(f.sql, f.projectId);
+          yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.projectId}`;
+          const rebuilt = yield* readCurrentState(f.sql, f.projectId);
+          expect(rebuilt.revision).toBe(completed.revision);
+          expect(rebuilt.foundationRecords).toEqual(completed.foundationRecords);
+          const before = yield* f.snapshot;
+          expect((yield* f.reactor.consume(f.projectId, f.effectId)).status).toBe("reflected");
+          expect(yield* f.snapshot).toEqual(before);
+        }),
+      ),
+  );
+
+for (const projectState of ["soft-deleted", "absent"] as const)
+  it.effect(
+    `cleanup replay verifies intact original domain receipts with ${projectState} project`,
+    () =>
+      database(
+        Effect.gen(function* () {
+          const f = yield* setup();
+          const id = yield* prepareCleanup(f);
+          yield* f.reactor.consume(f.projectId, id);
+          if (projectState === "soft-deleted")
+            yield* f.sql`UPDATE projection_projects SET deleted_at=${at} WHERE project_id=${f.projectId}`;
+          else yield* f.sql`DELETE FROM projection_projects WHERE project_id=${f.projectId}`;
+          const before = yield* f.snapshot;
+          expect((yield* f.reactor.consume(f.projectId, id)).status).toBe("reflected");
+          expect(yield* f.snapshot).toEqual(before);
+          expect(f.counts().deleteCalls).toBe(1);
+        }),
+      ),
+  );
+
+for (const corruption of [
+  "journal-missing",
+  "journal-receipt",
+  "outcome-receipt",
+  "reflection-events",
+] as const)
+  it.effect(`completed cleanup after purge rejects ${corruption} retained proof`, () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        const id = yield* prepareCleanup(f);
+        yield* f.reactor.consume(f.projectId, id);
+        const job = yield* f.reactor.load(id);
+        if (job?.receipt === undefined) return yield* Effect.die("missing cleanup receipt");
+        yield* purgeMemoryDomain(f);
+        if (corruption === "journal-missing")
+          yield* f.sql`DELETE FROM project_team_memory_job WHERE effect_id=${id}`;
+        if (corruption === "journal-receipt") {
+          yield* f.sql`DROP TRIGGER project_team_memory_job_transition`;
+          yield* f.sql`UPDATE project_team_memory_job SET receipt_json=json_set(receipt_json,'$.sourceGeneration',99) WHERE effect_id=${id}`;
+        }
+        if (corruption === "outcome-receipt" || corruption === "reflection-events") {
+          yield* f.sql`DROP TRIGGER project_team_memory_outcome_immutable`;
+          if (corruption === "outcome-receipt")
+            yield* f.sql`UPDATE project_team_memory_outcome SET receipt_json=json_set(receipt_json,'$.sourceGeneration',99) WHERE effect_id=${id}`;
+          else
+            yield* f.sql`UPDATE project_team_memory_outcome SET reflection_json=json_set(reflection_json,'$.eventIds',json('[]')) WHERE effect_id=${id}`;
+        }
+        const before = yield* f.snapshot;
+        expect(
+          (yield* makeProjectMemoryOutcome(f)
+            .commitVerifiedOutcome(job.receipt, Effect.void)
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect(yield* f.snapshot).toEqual(before);
+        expect(f.counts().deleteCalls).toBe(1);
+      }),
+    ),
+  );

@@ -17,6 +17,7 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import { decideProjectWorkCommand, type ProjectWorkReducerState } from "../ProjectWorkDecider.ts";
 import { readCurrentState, type ProjectWorkRepositoryShape } from "../ProjectWorkRepository.ts";
+import { PROJECT_TEAM_TABLES } from "../ProjectTeamsPersistence.ts";
 import type {
   ProjectMemoryOutcomePort,
   ProjectMemoryVerifiedOutcome,
@@ -487,6 +488,30 @@ export const makeProjectMemoryOutcome = (dependencies: {
       yield* suppressed(job);
       return;
     }
+    if (job.receipt.kind === "delete-source-complete") {
+      // A completed domain cleanup survives the later permanent purge. Its original
+      // immutable receipt remains the acknowledgment; partial deletion cannot hide
+      // a missing or corrupt domain event/command receipt.
+      let purged = true;
+      for (const table of [
+        "projection_projects",
+        ...PROJECT_TEAM_TABLES,
+        "project_work_events",
+        "project_work_command_receipts",
+        "project_work_reducer_checkpoints",
+      ]) {
+        const retained =
+          yield* sql`SELECT project_id FROM ${sql(table)} WHERE project_id=${job.input.projectId} LIMIT 1`;
+        if (retained.length !== 0) {
+          purged = false;
+          break;
+        }
+      }
+      if (purged) {
+        yield* suppressed(job);
+        return;
+      }
+    }
     const state = yield* readCurrentState(sql, job.input.projectId);
     const work = yield* current(job, state, true);
     const metadata = yield* sql<{
@@ -497,7 +522,10 @@ export const makeProjectMemoryOutcome = (dependencies: {
       return yield* deny("Memory reflection event receipt exceeds its exact bounded budget");
     const rows = yield* sql<{
       payload: string;
-    }>`SELECT payload_json AS payload FROM project_work_events
+      eventId: string;
+      eventType: string;
+      occurredAt: string;
+    }>`SELECT payload_json AS payload,event_id AS eventId,event_type AS eventType,occurred_at AS occurredAt FROM project_work_events
       WHERE project_id=${job.input.projectId} AND command_id=${expected.commandId!}
       AND length(CAST(payload_json AS BLOB))<=262144 ORDER BY sequence LIMIT 3`;
     if (rows.length !== expected.eventIds.length)
@@ -505,16 +533,7 @@ export const makeProjectMemoryOutcome = (dependencies: {
     const events = yield* Effect.forEach(rows, (row) =>
       decode(Schema.fromJsonString(Recorded), row.payload),
     );
-    for (const [index, event] of events.entries()) {
-      if (
-        event.eventId !== expected.eventIds[index] ||
-        event.projectId !== job.input.projectId ||
-        event.revision !== expected.projectRevision! - events.length + index + 1 ||
-        !equal(event.record, event.record.kind === "effect" ? work.effect : work.extraction)
-      )
-        return yield* deny("Memory reflection durable event/current record mismatch");
-    }
-    const first = events[0]!;
+    const at = work.effect.updatedAt;
     const command = yield* decode(ProjectWorkFoundationCommitCommand, {
       type: "project-work.foundation.commit",
       commandId: expected.commandId,
@@ -538,9 +557,55 @@ export const makeProjectMemoryOutcome = (dependencies: {
                 work.extraction.revision - (job.receipt.kind === "index-complete" ? 1 : 0),
             }),
       },
-      attribution: systemAttribution(first.occurredAt),
-      committedAt: first.occurredAt,
+      attribution: systemAttribution(at),
+      committedAt: at,
     });
+    // Derive order, identity, timestamps and records from the verified private
+    // transition. The returned event kind must never select its own comparator.
+    const before: ProjectWorkReducerState = {
+      ...state,
+      revision: command.expectedRevision,
+      foundationRecords: state.foundationRecords!.map((record) => {
+        if (record.recordId === work.effect.recordId) {
+          const { outcome: _outcome, ...effect } = work.effect;
+          return {
+            ...effect,
+            revision: work.effect.revision - 1,
+            status: work.effect.claimGeneration === 0 ? "pending" : "claimed",
+          };
+        }
+        if (job.receipt.kind === "index-complete" && record.recordId === work.extraction?.recordId)
+          return {
+            ...work.extraction,
+            revision: work.extraction.revision - 1,
+            status: "extracted",
+            completedObservationIds: [],
+          };
+        return record;
+      }),
+    };
+    const required = yield* Effect.try({
+      try: () => decideProjectWorkCommand(before, command),
+      catch: () => deny("Memory original typed reflection cannot be reconstructed"),
+    });
+    if (
+      !equal(
+        required.map((event) => event.eventId),
+        expected.eventIds,
+      ) ||
+      required.length !== events.length
+    )
+      return yield* deny("Memory original reflection event order or identity changed");
+    for (const [index, event] of events.entries()) {
+      const row = rows[index]!;
+      if (
+        !equal(event, required[index]) ||
+        row.eventId !== event.eventId ||
+        row.eventType !== event.type ||
+        row.occurredAt !== event.occurredAt
+      )
+        return yield* deny("Memory reflection durable event/current record mismatch");
+    }
     const receiptRows = yield* sql<{
       fingerprint: string;
       actorKind: string;
