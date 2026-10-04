@@ -1,7 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
-import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import { BookOpenIcon, ListTodoIcon, PanelTopIcon } from "lucide-react";
+import type { EnvironmentId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
+import { BookOpenIcon, InboxIcon, ListTodoIcon, PanelTopIcon, UsersIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useCallback, useRef } from "react";
 import * as Option from "effect/Option";
@@ -21,6 +21,8 @@ import { WorkOverview } from "./WorkOverview";
 import { WorkTasks } from "./WorkTasks";
 import { projectWorkEnvironment } from "../../state/projectWork";
 import { type WorkTab } from "./workPresentation";
+import { Team } from "../../features/projectTeams/Team";
+import { Inbox } from "../../features/projectTeams/Inbox";
 
 const TAB_ITEMS: ReadonlyArray<{
   readonly id: WorkTab;
@@ -29,6 +31,8 @@ const TAB_ITEMS: ReadonlyArray<{
 }> = [
   { id: "overview", label: "Overview", icon: PanelTopIcon },
   { id: "tasks", label: "Tasks", icon: ListTodoIcon },
+  { id: "team", label: "Team", icon: UsersIcon },
+  { id: "inbox", label: "Inbox", icon: InboxIcon },
   { id: "knowledge", label: "Knowledge", icon: BookOpenIcon },
 ];
 
@@ -43,6 +47,12 @@ export function WorkPage({
   const project = useProject(scopeProjectRef(environmentId, projectId));
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const [tab, setTab] = useState<WorkTab>("overview");
+  const [inboxVisited, setInboxVisited] = useState(false);
+  const [targetTask, setTargetTask] = useState<ProjectWorkTaskId | undefined>();
+  const openTask = (taskId: ProjectWorkTaskId) => {
+    setTargetTask(taskId);
+    setTab("tasks");
+  };
   const connected = environment?.connection.phase === "connected";
   const enabled = serverConfig?.settings.projectWorkEnabled === true;
   const streamCapable = serverConfig?.environment?.capabilities?.projectWorkStream === true;
@@ -88,6 +98,8 @@ export function WorkPage({
 
   useEffect(() => {
     setTab("overview");
+    setInboxVisited(false);
+    setTargetTask(undefined);
     cursorRef.current = 0;
     setResumeCursor(0);
     setPoll(true);
@@ -146,7 +158,10 @@ export function WorkPage({
                       ? "border-primary text-foreground"
                       : "border-transparent text-muted-foreground hover:text-foreground"
                   }`}
-                  onClick={() => setTab(id)}
+                  onClick={() => {
+                    if (id === "inbox") setInboxVisited(true);
+                    setTab(id);
+                  }}
                 >
                   <Icon className="size-4" />
                   {label}
@@ -174,8 +189,20 @@ export function WorkPage({
                 guidedWritesSupported={
                   serverConfig?.environment?.capabilities?.projectTeamGuidedWrites === true
                 }
+                {...(targetTask ? { targetTaskId: targetTask } : {})}
               />
-            ) : (
+            ) : tab === "team" ? (
+              <Team
+                environmentId={environmentId}
+                projectId={projectId}
+                connected={connected}
+                enabled={enabled}
+                supported={
+                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                }
+                onOpenTask={openTask}
+              />
+            ) : tab === "inbox" ? null : (
               <WorkKnowledge
                 key={`${environmentId}:${projectId}:knowledge`}
                 environmentId={environmentId}
@@ -185,6 +212,23 @@ export function WorkPage({
                 streamAvailable={!poll}
               />
             )}
+            {inboxVisited ? (
+              <div hidden={tab !== "inbox"}>
+                <Inbox
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  connected={connected}
+                  enabled={enabled}
+                  supported={
+                    serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                  }
+                  writesSupported={
+                    serverConfig?.environment?.capabilities?.projectTeamGuidedWrites === true
+                  }
+                  onOpenTask={openTask}
+                />
+              </div>
+            ) : null}
           </>
         )}
       </WorkspacePageContainer>

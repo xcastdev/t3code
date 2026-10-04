@@ -9,10 +9,12 @@ import {
 } from "./workPresentation";
 
 describe("work presentation", () => {
-  it("recognizes the three first-release tabs", () => {
+  it("recognizes project Work supervision tabs", () => {
     expect(isWorkTab("overview")).toBe(true);
     expect(isWorkTab("tasks")).toBe(true);
     expect(isWorkTab("knowledge")).toBe(true);
+    expect(isWorkTab("team")).toBe(true);
+    expect(isWorkTab("inbox")).toBe(true);
     expect(isWorkTab("activity")).toBe(false);
   });
 

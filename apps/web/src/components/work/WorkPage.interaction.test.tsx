@@ -142,6 +142,29 @@ describe("WorkPage project-scoped sections", () => {
     host.remove();
   });
 
+  it("opens Team and Inbox with an explicit unsupported environment state", async () => {
+    await act(async () =>
+      root.render(
+        <WorkPage
+          environmentId={EnvironmentId.make("environment-1")}
+          projectId={ProjectId.make("project-1")}
+        />,
+      ),
+    );
+    for (const [tab, notice] of [
+      ["Team", "does not support team supervision"],
+      ["Inbox", "does not support the question inbox"],
+    ]) {
+      await act(async () =>
+        [...host.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+          .find((button) => button.textContent?.includes(tab!))!
+          .click(),
+      );
+      expect(host.textContent).toContain(notice);
+    }
+    expect(testState.environment.page).not.toHaveBeenCalled();
+  });
+
   it("resets a loaded task page when switching projects", async () => {
     const environmentId = EnvironmentId.make("environment-1");
     const firstProjectId = ProjectId.make("project-1");
