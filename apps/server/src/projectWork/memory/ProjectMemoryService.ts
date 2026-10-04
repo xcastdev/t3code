@@ -28,6 +28,7 @@ import type {
   ProjectTeamAuthorization,
   ProjectTeamPrincipal,
 } from "../ProjectTeamAuthorization.ts";
+import type { ProjectMemoryVerifiedOutcome } from "./ProjectMemoryIndexReactor.ts";
 import { MemoryIndexManifest, MemoryVector } from "./MemoryBackend.ts";
 
 const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
@@ -730,6 +731,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     projectId: string,
     effectId: string,
     ownerGeneration: number,
+    reflectedOutcome?: ProjectMemoryVerifiedOutcome,
   ) {
     yield* requireProject(projectId);
     const work = yield* readWork(projectId, effectId);
@@ -744,7 +746,24 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     )
       return yield* deny("Retained memory source has changed");
     if (
-      work.effect.status !== "claimed" ||
+      (work.effect.status !== "claimed" &&
+        !(
+          reflectedOutcome !== undefined &&
+          work.effect.status === "succeeded" &&
+          work.effect.outcome === canonicalProjectWorkPayload(reflectedOutcome) &&
+          reflectedOutcome.effectId === effectId &&
+          reflectedOutcome.claimGeneration === ownerGeneration &&
+          reflectedOutcome.sourceId === work.source.recordId &&
+          reflectedOutcome.sourceRevision === work.source.sourceRevision &&
+          reflectedOutcome.sourceGeneration === work.source.generation &&
+          ((reflectedOutcome.kind === "no-facts" &&
+            work.extraction?.status === "no-facts" &&
+            reflectedOutcome.observationIds.length === 0) ||
+            (reflectedOutcome.kind === "index-complete" &&
+              work.extraction?.status === "indexed" &&
+              canonicalProjectWorkPayload([...work.extraction.completedObservationIds].sort()) ===
+                canonicalProjectWorkPayload([...reflectedOutcome.observationIds].sort())))
+        )) ||
       work.effect.claimGeneration !== ownerGeneration ||
       work.source.status !== "current" ||
       work.extraction === undefined ||

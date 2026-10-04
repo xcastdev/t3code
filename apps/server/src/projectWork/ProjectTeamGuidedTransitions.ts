@@ -225,6 +225,8 @@ export const decideProjectTeamGuidedTransition = (
     });
   };
   switch (transition!.kind) {
+    case "memory.reflect":
+      return reject("Memory reflection requires its dedicated private producer");
     case "run.settle": {
       const t = transition!;
       if (
