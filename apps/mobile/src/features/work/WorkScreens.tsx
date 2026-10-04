@@ -35,12 +35,13 @@ import { decodeWorkRoute } from "./workNavigation";
 import { mobileTaskPage } from "./workData";
 import { useWorkFoundation } from "./useWorkFoundation";
 import { createWorkActionSession, reviewMobileWork, type MobileWorkCurrent } from "./workActions";
+import { WorkQuestions, WorkTeam } from "./WorkTeam";
 
 const decodeContext = Schema.decodeUnknownOption(ProjectWorkTaskContext);
 const isIssue = Schema.is(ProjectIssueIntakeRead);
 const isCursor = Schema.is(ProjectIssueRepositoryCursorRead);
 const decodeTaskId = Schema.decodeUnknownOption(ProjectWorkTaskId);
-function WorkButton(props: {
+export function WorkButton(props: {
   readonly children: ReactNode;
   readonly onPress: () => void;
   readonly disabled?: boolean;
@@ -77,14 +78,14 @@ function WorkSurface(props: { readonly title: string; readonly children: ReactNo
     </View>
   );
 }
-function Notice(props: { readonly children: ReactNode }) {
+export function Notice(props: { readonly children: ReactNode }) {
   return (
     <Text accessibilityRole="text" className="text-sm text-foreground-muted">
       {props.children}
     </Text>
   );
 }
-function WorkCard(props: { readonly title: string; readonly children: ReactNode }) {
+export function WorkCard(props: { readonly title: string; readonly children: ReactNode }) {
   return (
     <View className="gap-3 rounded-2xl border border-border bg-card p-4">
       <Text className="text-base font-t3-semibold text-foreground">{props.title}</Text>
@@ -234,12 +235,13 @@ function ProjectWorkSession({
       </View>
       {foundation.loadedAt ? (
         <Notice>
-          Last complete intake read: {foundation.loadedAt}
+          Last complete project read: {foundation.loadedAt}
           {foundation.current ? "" : " · cached"}
         </Notice>
       ) : null}
       {query.error ? <Notice>{query.error}</Notice> : null}
       {foundation.error ? <Notice>{foundation.error}</Notice> : null}
+      <WorkTeam target={target} foundation={foundation.snapshot} supported={foundationSupported} />
       <WorkCard title="Issue intake">
         {!foundationSupported ? (
           <Notice>
@@ -401,35 +403,36 @@ function WorkTaskSession({
       () => changed((value) => value + 1),
     ),
   );
+  const readCurrent = () => {
+    const presentation = appAtomRegistry.get(
+      environmentPresentations.presentationAtom(target.environmentId),
+    );
+    const ownProject = appAtomRegistry.get(environmentProjects.projectAtom(target));
+    const verified = foundation.verify();
+    const result = contextAtom === null ? null : appAtomRegistry.get(contextAtom);
+    const freshContext =
+      result === null
+        ? null
+        : Option.getOrNull(decodeContext(Option.getOrNull(AsyncResult.value(result))));
+    return {
+      ...current,
+      context: freshContext,
+      foundation: verified.snapshot,
+      connected:
+        navigation.isFocused() &&
+        presentation?.entry.enabled === true &&
+        presentation.connection.phase === "connected",
+      enabled:
+        ownProject !== null && presentation?.serverConfig?.settings.projectWorkEnabled === true,
+      foundationSupported:
+        presentation?.serverConfig?.environment.capabilities.projectTeamFoundationReads === true,
+      guidedSupported:
+        presentation?.serverConfig?.environment.capabilities.projectTeamGuidedWrites === true,
+      fresh: verified.current && result?._tag === "Success" && !result.waiting,
+    };
+  };
   useLayoutEffect(() => {
-    session.setCurrent(() => {
-      const presentation = appAtomRegistry.get(
-        environmentPresentations.presentationAtom(target.environmentId),
-      );
-      const ownProject = appAtomRegistry.get(environmentProjects.projectAtom(target));
-      const verified = foundation.verify();
-      const result = contextAtom === null ? null : appAtomRegistry.get(contextAtom);
-      const freshContext =
-        result === null
-          ? null
-          : Option.getOrNull(decodeContext(Option.getOrNull(AsyncResult.value(result))));
-      return {
-        ...current,
-        context: freshContext,
-        foundation: verified.snapshot,
-        connected:
-          navigation.isFocused() &&
-          presentation?.entry.enabled === true &&
-          presentation.connection.phase === "connected",
-        enabled:
-          ownProject !== null && presentation?.serverConfig?.settings.projectWorkEnabled === true,
-        foundationSupported:
-          presentation?.serverConfig?.environment.capabilities.projectTeamFoundationReads === true,
-        guidedSupported:
-          presentation?.serverConfig?.environment.capabilities.projectTeamGuidedWrites === true,
-        fresh: verified.current && result?._tag === "Success" && !result.waiting,
-      };
-    });
+    session.setCurrent(readCurrent);
   });
   useLayoutEffect(() => {
     session.activate();
@@ -456,6 +459,12 @@ function WorkTaskSession({
       </WorkButton>
       {raw.error ? <Notice>{raw.error}</Notice> : null}
       {foundation.error ? <Notice>{foundation.error}</Notice> : null}
+      {foundation.loadedAt ? (
+        <Notice>
+          Last complete project read: {foundation.loadedAt}
+          {foundation.current ? "" : " · cached"}
+        </Notice>
+      ) : null}
       {review.reason ? <Notice>{review.reason}</Notice> : null}
       {state.notice ? <Notice>{state.notice}</Notice> : null}
       {state.status === "sending" ? <Notice>Sending…</Notice> : null}
@@ -482,6 +491,14 @@ function WorkTaskSession({
               <Notice key={blocker.blockerId}>{blocker.reason}</Notice>
             ))}
           </WorkCard>
+          <WorkQuestions
+            current={current}
+            readCurrent={readCurrent}
+            send={async (input) => {
+              const result = await write({ environmentId: target.environmentId, input });
+              if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+            }}
+          />
           <WorkCard title={`Specification ${ownContext.task.specRevision}`}>
             <Text selectable>
               {ownContext.task.specification?.objective ?? "No specification proposed."}
