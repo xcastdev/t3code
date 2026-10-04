@@ -391,3 +391,50 @@ it("round-trips opaque foundation continuation cursors without changing their by
     ).toThrow();
   }
 });
+
+it("accepts bounded project configuration without granting caller-created execution identity", () => {
+  const roles = ["coordinator", "investigator", "planner", "implementer", "reviewer", "integrator"];
+  const configure = {
+    type: "project-team.configure",
+    commandId: "configure",
+    projectId: "project",
+    expectedRevision: 0,
+    expectedConfigurationGeneration: 0,
+    enabled: true,
+    providerInstanceId: "pi-instance",
+    projectPriority: 3,
+    taskPriorities: [{ taskId: "task", priority: 1 }],
+    profiles: roles.map((role) => ({
+      role,
+      instructions: "Follow the approved assignment",
+      skills: [],
+      tools: ["read", "search"],
+      model: "inclusionai/ling-3.1-flash:free",
+      memoryAccess: "project",
+      delegationDepth: 0,
+    })),
+    modelPolicies: [
+      {
+        model: "inclusionai/ling-3.1-flash:free",
+        tokenLimit: 8192,
+        durationLimitMs: 60000,
+        modelCalls: 2,
+      },
+    ],
+  };
+  expect(decodeIntent(configure)).toEqual(configure);
+  for (const mutation of [
+    { bindingId: "caller-binding" },
+    { actor: { kind: "human" } },
+    { profiles: configure.profiles.slice(1) },
+    { profiles: [...configure.profiles.slice(1), configure.profiles[1]] },
+    { modelPolicies: [{ ...configure.modelPolicies[0], tokenLimit: 0 }] },
+    { taskPriorities: [{ taskId: "task", priority: 1.5 }] },
+    { paidFallback: true },
+    { projectPriority: Number.MAX_SAFE_INTEGER + 1 },
+    { expectedRevision: Number.MAX_SAFE_INTEGER + 1 },
+    { expectedConfigurationGeneration: Number.MAX_SAFE_INTEGER + 1 },
+    { taskPriorities: [{ taskId: "task", priority: Number.MIN_SAFE_INTEGER - 1 }] },
+  ])
+    expect(() => decodeIntent({ ...configure, ...mutation })).toThrow();
+});

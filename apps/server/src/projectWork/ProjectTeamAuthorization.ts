@@ -24,6 +24,10 @@ import { readCurrentState } from "./ProjectWorkRepository.ts";
 import { decodeProjectWorkEvent } from "./ProjectWorkEventStore.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import {
+  compileProjectTeamConfiguration,
+  assertProjectTeamConfigurationReplay,
+} from "./ProjectTeamConfiguration.ts";
+import {
   assertProjectTeamRunAuthority,
   assertProjectTeamSemanticWork,
   projectTeamSpecificationHash,
@@ -422,6 +426,47 @@ export const layer = Layer.effect(
     ) {
       const authority = yield* resolve(principal);
       const state = authority?.state ?? (yield* stateFor(input.projectId));
+      if (input.type === "project-team.configure") {
+        if (
+          principal.actor.kind !== "human" ||
+          principal.managed !== undefined ||
+          attribution.actor.kind !== principal.actor.kind ||
+          attribution.actor.id !== principal.actor.id
+        )
+          return yield* deny("Only the authenticated human can configure a project team");
+        if (duplicate) {
+          const rows = yield* sql<{
+            payload: string;
+          }>`SELECT payload_json AS payload FROM project_work_events
+            WHERE project_id=${input.projectId} AND command_id=${input.commandId} ORDER BY sequence ASC`;
+          const records = yield* Effect.try({
+            try: () =>
+              rows
+                .map((row) => decodeProjectWorkEvent(decodeUnknownJson(row.payload)))
+                .flatMap((event) =>
+                  event.type === "project-work.foundation.recorded" ? [event.record] : [],
+                ),
+            catch: () => deny("Configuration receipt is invalid"),
+          });
+          yield* Effect.try({
+            try: () => assertProjectTeamConfigurationReplay(state, records),
+            catch: () => deny("Configuration receipt target changed"),
+          });
+          return {
+            type: "project-work.foundation.commit",
+            commandId: input.commandId,
+            projectId: input.projectId,
+            expectedRevision: input.expectedRevision,
+            attribution,
+            records,
+            committedAt: attribution.recordedAt,
+          } satisfies ProjectWorkCommand;
+        }
+        return yield* Effect.try({
+          try: () => compileProjectTeamConfiguration(state, input, attribution),
+          catch: () => deny("Configuration is stale, invalid, or existing work has not drained"),
+        });
+      }
       if (
         authority &&
         (input.projectId !== authority.binding.projectId ||
