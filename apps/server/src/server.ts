@@ -60,6 +60,7 @@ import {
   ProjectTeamPiRuntime,
   makeProjectTeamPiRuntime,
 } from "./projectWork/ProjectTeamPiRuntime.ts";
+import { makeProjectTeamRuntime } from "./projectWork/ProjectTeamRuntime.ts";
 import * as CodexResetCredit from "./provider/Layers/codexResetCredit.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
@@ -669,7 +670,21 @@ const PiModelCatalogueLayerLive = PiModelCatalogue.layer.pipe(
 
 const ProjectTeamPiRuntimeLayerLive = Layer.effect(
   ProjectTeamPiRuntime,
-  makeProjectTeamPiRuntime(),
+  Effect.gen(function* () {
+    const registry = yield* makeProjectTeamPiRuntime();
+    const environment = yield* ServerEnvironment.ServerEnvironment;
+    yield* makeProjectTeamRuntime({
+      environmentId: yield* environment.getEnvironmentId,
+      maximumEnvironmentModelCalls: 128,
+    }).pipe(Effect.provideService(ProjectTeamPiRuntime, registry));
+    return registry;
+  }),
+).pipe(
+  Layer.provide(ProjectWorkCoreLive),
+  Layer.provide(ProjectTeamAuthorizationLive),
+  Layer.provide(ServerSettingsLayerLive),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(PersistenceLayerLive),
 );
 
 const PiProductionRuntimeLayerLive = Layer.effect(

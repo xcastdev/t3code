@@ -1002,11 +1002,15 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       if (!admitted) return yield* deny("Dispatch commit is missing");
       return { fence: fence(admitted.row), intent: admitted.intent };
     });
-    const inspect = Effect.fn("ProjectTeamDispatchJournal.inspect")(function* (dispatchId: string) {
+    const inspect = Effect.fn("ProjectTeamDispatchJournal.inspect")(function* (
+      dispatchId: string,
+      options?: { readonly requireClaim: true },
+    ) {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           const value = yield* read(dispatchId);
-          yield* current(value.row, value.intent);
+          if (options?.requireClaim) yield* currentClaim(value.row, value.intent);
+          else yield* current(value.row, value.intent);
           return { fence: fence(value.row), intent: value.intent };
         }),
       );
