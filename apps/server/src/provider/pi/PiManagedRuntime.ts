@@ -82,6 +82,10 @@ export type PiManagedPreparedOperation = {
 );
 
 export interface PiManagedRuntimeInstance {
+  /** Root's durable dispatch lookup; an identity alone grants no execution authority. */
+  readonly resolveOperationId?: (
+    request: PiManagedOperationRequest,
+  ) => Effect.Effect<PiWorkerOperation["operationId"] | undefined, PiManagedRuntimeError>;
   /** No inference, extension activation, credential resolution, or implicit catalog fetch. */
   readonly inspect: Effect.Effect<ServerProviderDraft, PiManagedRuntimeError>;
   /** Current SQL intent, gates and reservations must commit before returning an operation. */

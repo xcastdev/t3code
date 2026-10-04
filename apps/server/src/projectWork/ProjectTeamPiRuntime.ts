@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import {
   PiManagedRuntimeError,
   type PiManagedRuntimeInstance,
+  type PiManagedOperationRequest,
 } from "../provider/pi/PiManagedRuntime.ts";
 import type {
   PiProductionRuntimeAssets,
@@ -22,6 +23,21 @@ export const makeProjectTeamPiRuntime = Effect.fn("makeProjectTeamPiRuntime")(fu
         { readonly runtime: PiManagedRuntimeInstance; readonly assets: PiProductionRuntimeAssets }
       >(),
   );
+  type Resolver = NonNullable<PiProductionRuntimeHooks["resolveOperationId"]>;
+  let resolver: { readonly resolve: Resolver } | undefined;
+  const installOperationResolver = (resolve: Resolver) =>
+    Effect.acquireRelease(
+      Effect.suspend(() => {
+        if (resolver !== undefined) return Effect.fail(denied());
+        const owned = Object.freeze({ resolve });
+        resolver = owned;
+        return Effect.succeed(owned);
+      }),
+      (owned) =>
+        Effect.sync(() => {
+          if (resolver === owned) resolver = undefined;
+        }),
+    ).pipe(Effect.asVoid);
   const publishAssets: NonNullable<PiProductionRuntimeHooks["publishAssets"]> = (
     instanceId,
     assets,
@@ -61,7 +77,21 @@ export const makeProjectTeamPiRuntime = Effect.fn("makeProjectTeamPiRuntime")(fu
         ),
       );
     });
-  return { publishAssets, withInstance };
+  const resolveOperationId: Resolver = (instanceId, request: PiManagedOperationRequest) =>
+    withInstance(instanceId, () =>
+      Effect.suspend(() => {
+        const owned = resolver;
+        if (owned === undefined) return Effect.succeed(undefined);
+        return owned
+          .resolve(instanceId, request)
+          .pipe(
+            Effect.tap(() =>
+              Effect.suspend(() => (resolver === owned ? Effect.void : Effect.fail(denied()))),
+            ),
+          );
+      }),
+    );
+  return { publishAssets, withInstance, installOperationResolver, resolveOperationId };
 });
 
 export class ProjectTeamPiRuntime extends Context.Service<

@@ -1249,6 +1249,11 @@ it.effect(
             [22, "ProjectIssueRepositories"],
             [23, "ProjectTeamModelRequests"],
             [24, "ProjectTeamPiOperations"],
+            [25, "ProjectTeamDispatch"],
+            [26, "ProjectTeamTransportCapacity"],
+            [27, "ProjectTeamSetupJournal"],
+            [28, "ProjectTeamWorkspaceReceipt"],
+            [29, "ProjectTeamMemoryJournal"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(
