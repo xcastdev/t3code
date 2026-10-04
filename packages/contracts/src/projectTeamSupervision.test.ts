@@ -65,6 +65,22 @@ describe("bounded team supervision contract", () => {
     });
   });
 
+  it("bounds worker thread identifiers while retaining their trimmed identity", () => {
+    const thread = "t".repeat(256);
+    expect(
+      decode({
+        ...summary,
+        bindings: { items: [{ ...binding, workerThreadId: ` ${thread} ` }], hasMore: false },
+      }),
+    ).toMatchObject({ bindings: { items: [{ workerThreadId: thread }] } });
+    expect(() =>
+      decode({
+        ...summary,
+        bindings: { items: [{ ...binding, workerThreadId: "t".repeat(257) }], hasMore: false },
+      }),
+    ).toThrow();
+  });
+
   it.each(["missing", "deleted", "archived", "tombstoned", "unsupported"])(
     "has no records for unavailable %s projects",
     (availability) => {

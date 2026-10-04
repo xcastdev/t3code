@@ -53,7 +53,7 @@ const Binding = Schema.Union([
     roleRevisionId: Id,
     providerInstanceId: Text,
     model: Text,
-    workerThreadId: Schema.optionalKey(ThreadId),
+    workerThreadId: Schema.optionalKey(ThreadId.check(Schema.isMaxLength(256))),
     profile: Schema.optionalKey(Profile),
   }),
 ]);
