@@ -1324,6 +1324,103 @@ describe("ProviderService private managed sessions", () => {
     );
   }
 
+  it.effect(
+    "rejects a reentrant public start before the held thread lock while completing initialization",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        const originalPrepare = fixture.prepare.getMockImplementation()!;
+        fixture.prepare.mockImplementationOnce((input) =>
+          Effect.gen(function* () {
+            assertManagedDenial(
+              yield* service.startSession(request.input.threadId, request.input).pipe(Effect.exit),
+              "already entered",
+            );
+            assert.equal(pi.startSession.mock.calls.length, 0);
+            return yield* originalPrepare(input);
+          }),
+        );
+        const session = yield* startManagedProviderSession(service, request);
+        assert.equal(session.threadId, request.input.threadId);
+        assert.equal(fixture.prepare.mock.calls.length, 1);
+        assert.equal(pi.startSession.mock.calls.length, 1);
+        assert.deepStrictEqual(
+          pi.startSession.mock.calls[0]?.[0].modelSelection,
+          request.input.modelSelection,
+        );
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  for (const changeModel of [false, true]) {
+    it.effect(
+      `rejects a same-loan public send with ${changeModel ? "changed" : "original"} model while dispatching the original assignment once`,
+      () => {
+        const pi = makeFakeCodexAdapter(PI_DRIVER);
+        const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+        return Effect.gen(function* () {
+          const request = yield* createManagedPiThread;
+          const service = yield* ProviderService.ProviderService;
+          yield* startManagedProviderSession(service, request);
+          const assignment = managedAssignment(request.input, " \noriginal assignment\t ");
+          const originalSend = pi.sendTurn.getMockImplementation()!;
+          pi.sendTurn.mockImplementationOnce((input) =>
+            Effect.gen(function* () {
+              const reentrantInput = {
+                ...input,
+                modelSelection: {
+                  ...assignment.input.modelSelection,
+                  model: changeModel
+                    ? "fixture-other-model"
+                    : assignment.input.modelSelection.model,
+                },
+              };
+              assertManagedDenial(
+                yield* service.sendTurn(reentrantInput).pipe(Effect.exit),
+                "already entered",
+              );
+              assert.equal(pi.sendTurn.mock.calls.length, 1);
+              return yield* originalSend(input);
+            }),
+          );
+          const result = yield* sendManagedProviderAssignment(service, assignment);
+          assert.equal(result.threadId, request.input.threadId);
+          assert.equal(pi.startSession.mock.calls.length, 1);
+          assert.equal(pi.sendTurn.mock.calls.length, 1);
+          assert.deepStrictEqual(pi.sendTurn.mock.calls[0]?.[0], assignment.input);
+        }).pipe(Effect.provide(fixture.layer));
+      },
+    );
+  }
+
+  it.effect("allows ordinary public sends to change the model outside a managed loan", () => {
+    const pi = makeFakeCodexAdapter(PI_DRIVER);
+    const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+    return Effect.gen(function* () {
+      const request = yield* createManagedPiThread;
+      const service = yield* ProviderService.ProviderService;
+      yield* service.startSession(request.input.threadId, request.input);
+      const modelSelection = {
+        ...request.input.modelSelection,
+        model: "fixture-other-model",
+        options: [{ id: "thinkingLevel", value: "high" }],
+      };
+      const result = yield* service.sendTurn({
+        threadId: request.input.threadId,
+        modelSelection,
+        input: "ordinary model change",
+      });
+      assert.equal(result.threadId, request.input.threadId);
+      assert.equal(pi.startSession.mock.calls.length, 1);
+      assert.equal(pi.sendTurn.mock.calls.length, 1);
+      assert.deepStrictEqual(pi.sendTurn.mock.calls[0]?.[0].modelSelection, modelSelection);
+      assert.equal(pi.sendTurn.mock.calls[0]?.[0].input, "ordinary model change");
+    }).pipe(Effect.provide(fixture.layer));
+  });
+
   it.effect("prevents borrowing one factory's managed assignment inside another factory", () => {
     const pi = makeFakeCodexAdapter(PI_DRIVER);
     const otherPi = makeFakeCodexAdapter(PI_DRIVER);
@@ -1368,7 +1465,7 @@ describe("ProviderService private managed sessions", () => {
               yield* service
                 .sendTurn({ ...input, threadId: asThreadId("unrelated-managed-thread") })
                 .pipe(Effect.exit),
-              "original factory or assignment",
+              "already entered",
             );
             const borrowedContext = yield* Effect.context<never>();
             yield* Deferred.succeed(

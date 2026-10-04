@@ -2495,7 +2495,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const startSession: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
     function* (threadId, rawInput) {
-      const managed = yield* managedSessions.current("start");
+      const managed = yield* managedSessions.enter("start", rawInput);
       const parsed = yield* decodeInputOrValidationError({
         operation: "ProviderService.startSession",
         schema: ProviderSessionStartInput,
@@ -2918,7 +2918,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   );
 
   const sendTurn: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(function* (rawInput) {
-    const managed = yield* managedSessions.current("assignment");
+    const managed = yield* managedSessions.enter("assignment", rawInput);
     const parsed = yield* decodeInputOrValidationError({
       operation: "ProviderService.sendTurn",
       schema: managed === undefined ? ProviderSendTurnInput : ManagedAssignmentInput,

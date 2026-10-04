@@ -1,3 +1,4 @@
+import { canonicalProjectWorkPayload } from "@t3tools/contracts";
 import type {
   ProviderInstanceId,
   ProviderSendTurnInput,
@@ -30,6 +31,7 @@ interface Borrow {
   readonly primaryProjectRoot?: string;
   readonly assignment?: string;
   readonly assertCurrent: Effect.Effect<void, ProviderServiceError>;
+  readonly enter: (input: unknown) => Effect.Effect<void, ProviderServiceError>;
 }
 class ManagedCall extends Context.Service<ManagedCall, Borrow>()(
   "t3/provider/ProviderManagedSessions/ManagedCall",
@@ -96,18 +98,41 @@ export const makeProviderManagedSessions = Effect.fn("makeProviderManagedSession
   );
 
   const withCall = <A>(
-    request: Omit<Borrow, "factory" | "adapter">,
+    request: Omit<Borrow, "factory" | "adapter" | "enter">,
+    input: unknown,
     call: Effect.Effect<A, ProviderServiceError>,
   ) =>
     Effect.gen(function* () {
+      const expectedInput = yield* Effect.try({
+        try: () => canonicalProjectWorkPayload(input),
+        catch: () => denied("Managed method input cannot be compared"),
+      });
       const original = yield* resolve(request.instanceId);
       let borrowed = true;
+      let entered = false;
+      const enter = (actualInput: unknown) =>
+        Effect.suspend(() => {
+          if (entered) return Effect.fail(denied("Managed method was already entered"));
+          entered = true;
+          return Effect.try({
+            try: () => canonicalProjectWorkPayload(actualInput),
+            catch: () => denied("Managed method input cannot be compared"),
+          }).pipe(
+            Effect.flatMap((actual) =>
+              actual === expectedInput
+                ? Effect.void
+                : Effect.fail(denied("Managed method input differs from its original assignment")),
+            ),
+          );
+        });
       const assertCurrent = Effect.gen(function* () {
         if (!active || !borrowed) return yield* denied("Managed session loan has ended");
         yield* request.assertCurrent;
         const current = yield* resolve(request.instanceId);
         if (!active || !borrowed || current !== original)
           return yield* denied("Original managed adapter changed");
+        yield* request.assertCurrent;
+        if (!active || !borrowed) return yield* denied("Managed session loan has ended");
       });
       yield* assertCurrent;
       return yield* call.pipe(
@@ -116,6 +141,7 @@ export const makeProviderManagedSessions = Effect.fn("makeProviderManagedSession
           factory,
           adapter: original,
           assertCurrent,
+          enter,
         }),
         Effect.tap(() => assertCurrent),
         Effect.ensuring(
@@ -147,6 +173,15 @@ export const makeProviderManagedSessions = Effect.fn("makeProviderManagedSession
     return borrow;
   });
 
+  const enter = Effect.fn("ProviderService.enterManagedCall")(function* (
+    operation: Borrow["operation"],
+    input: unknown,
+  ) {
+    const borrow = yield* current(operation);
+    if (borrow !== undefined) yield* borrow.enter(input);
+    return borrow;
+  });
+
   const bind = (service: ProviderServiceShape) => {
     ports.set(service, {
       start: (request) =>
@@ -173,6 +208,7 @@ export const makeProviderManagedSessions = Effect.fn("makeProviderManagedSession
               primaryProjectRoot: request.primaryProjectRoot,
               assertCurrent: request.assertCurrent,
             },
+            input,
             service.startSession(input.threadId, input),
           );
         }),
@@ -193,10 +229,11 @@ export const makeProviderManagedSessions = Effect.fn("makeProviderManagedSession
               assignment: input.input,
               assertCurrent: request.assertCurrent,
             },
+            input,
             service.sendTurn(input),
           );
         }),
     });
   };
-  return { bind, current };
+  return { bind, current, enter };
 });
