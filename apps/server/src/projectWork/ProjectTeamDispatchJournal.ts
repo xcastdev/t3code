@@ -265,12 +265,15 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     ) => Effect.Effect<void, ProjectTeamDispatchJournalError>;
     /** Trusted Root checks actual retained Git/setup/native receipts. No client or worker predicate. */
     readonly verifyStage?: ProjectTeamDispatchStageVerifier;
+    /** Read-only resource loan checked after final SQL reads, inside the stage transaction. */
+    readonly verifyStageFinal?: ProjectTeamDispatchStageVerifier;
     /** Root checks original worker/setup/model owners joined, including retained transport accounting. */
     readonly verifySettlement?: ProjectTeamDispatchStageVerifier;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const repository = yield* ProjectWorkRepository;
     const verifyAdmission = options.verifyAdmission;
+    const verifyStageFinal = options.verifyStageFinal;
     const environmentId = yield* decodeEnvironment(options.environmentId);
     const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
     const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
@@ -1005,8 +1008,15 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           const committed = yield* read(row.dispatch_id);
           if (committed.row.intent_json !== row.intent_json)
             return yield* deny("Dispatch identity conflicts");
+          // Complete awaited SQL authority reads before the last resource/settings loan.
+          // Its own legitimate writes changed the reducer snapshot, not the frozen resources.
+          const finalAuthority = yield* current(committed.row, committed.intent);
           if (verifyAdmission) yield* verifyAdmission({ stage: "after", request });
-          yield* current(committed.row, committed.intent);
+          yield* assertExecutionTime(
+            committed.intent,
+            finalAuthority.leaseDeadlineAtMs,
+            yield* Clock.currentTimeMillis,
+          );
         }),
       );
       if (!admitted) return yield* deny("Dispatch commit is missing");
@@ -1273,7 +1283,17 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
             )
               return yield* deny("Stage receipt identity was reused");
             // Exact replay never grants another external effect. Forward replays still require current authority.
-            if (!isCleanupStage(receipt.stage)) yield* currentClaim(value.row, value.intent);
+            const authority = isCleanupStage(receipt.stage)
+              ? undefined
+              : yield* currentClaim(value.row, value.intent);
+            if (verifyStageFinal)
+              yield* verifyStageFinal(receipt, { fence: fence(value.row), intent: value.intent });
+            if (authority)
+              yield* assertExecutionTime(
+                value.intent,
+                authority.leaseDeadlineAtMs,
+                yield* Clock.currentTimeMillis,
+              );
             return { fence: fence(value.row), intent: value.intent, duplicate: true };
           }
           if (
@@ -1319,6 +1339,8 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           if (!cleanup) {
             authority = yield* currentClaim(final.row, final.intent);
           }
+          if (verifyStageFinal)
+            yield* verifyStageFinal(receipt, { fence: fence(final.row), intent: final.intent });
           // An awaited write or history read can exhaust authority; fail while both writes can still roll back.
           if (authority)
             yield* assertExecutionTime(
