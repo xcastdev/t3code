@@ -95,6 +95,7 @@ type WorkTasksProps = {
   readonly streamAvailable?: boolean;
   readonly teamReadSupported?: boolean;
   readonly guidedWritesSupported?: boolean;
+  readonly targetTaskId?: ProjectWorkTaskId;
 };
 
 export function WorkTasks(props: WorkTasksProps) {
@@ -126,6 +127,7 @@ function WorkTaskQueue({
   enabled,
   streamAvailable = false,
   guidedWritesSupported = false,
+  targetTaskId,
   foundation,
 }: WorkTasksProps & { readonly foundation?: WorkTeamFoundationView }) {
   const canWrite = projectWorkWritesAvailable({
@@ -531,6 +533,21 @@ function WorkTaskQueue({
           onCreated={() => setShowNewTask(false)}
           onCancel={() => setShowNewTask(false)}
         />
+      ) : null}
+      {targetTaskId && foundation ? (
+        <LinkedTaskDetail
+          key={targetTaskId}
+          environmentId={environmentId}
+          projectId={projectId}
+          taskId={targetTaskId}
+          foundation={foundation}
+          canWrite={guidedCanWrite}
+          access={{ connected, enabled, supported: guidedWritesSupported }}
+          streamAvailable={streamAvailable}
+          onWrite={send}
+        />
+      ) : targetTaskId ? (
+        <p>The linked task requires current team records on this environment.</p>
       ) : null}
       <div className="flex min-w-0 flex-col gap-3">
         {offsets.map((offset) => (
@@ -961,6 +978,45 @@ function TaskRow({
           ) : null}
         </div>
       ) : null}
+    </WorkCard>
+  );
+}
+
+/** A task link reads one bounded context, independently of the loaded queue page. */
+function LinkedTaskDetail({
+  taskId,
+  ...props
+}: Omit<Parameters<typeof ManagedTaskDetail>[0], "task"> & { readonly taskId: ProjectWorkTaskId }) {
+  const result = useAtomValue(
+    projectWorkEnvironment.taskContext({
+      environmentId: props.environmentId,
+      projectId: props.projectId,
+      taskId,
+      ...(props.streamAvailable ? { poll: false } : {}),
+    }),
+  );
+  const context = asProjectWorkTaskContext(Option.getOrNull(AsyncResult.value(result)));
+  if (
+    !context ||
+    context.projectId !== props.projectId ||
+    context.task.projectId !== props.projectId ||
+    context.task.taskId !== taskId ||
+    !knownTask(context.task)
+  )
+    return <p>The linked task is unavailable or unsupported. Refresh the current project.</p>;
+  return (
+    <WorkCard>
+      <h3 className="mb-3 font-medium">{context.task.title}</h3>
+      <ManagedTaskDetail
+        {...props}
+        task={context.task}
+        canWrite={
+          props.canWrite &&
+          result._tag === "Success" &&
+          !result.waiting &&
+          context.revision === props.foundation.snapshot.revision
+        }
+      />
     </WorkCard>
   );
 }
