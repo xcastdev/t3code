@@ -48,6 +48,28 @@ const unavailable = () => ({
     "Question changed or current task data is unavailable. Refresh and review before answering.",
 });
 
+function failedAnswer(draft: Draft, error: unknown, command?: Answer): Draft {
+  const explicit =
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    [
+      "stale-revision",
+      "invalid-state",
+      "permission-denied",
+      "forbidden",
+      "unauthorized",
+      "not-found",
+      "invalid-request",
+    ].includes(String(error.code));
+  return {
+    ...draft,
+    ...(command ? { command } : {}),
+    status: draft.status === "uncertain" || (command && !explicit) ? "uncertain" : "rejected",
+    notice: projectWorkCommandFailure(error).message,
+  };
+}
+
 export interface InboxProps {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
@@ -64,6 +86,17 @@ export function Inbox(props: InboxProps) {
 }
 
 function InboxSession(props: InboxProps) {
+  const write = useAtomCommand(projectWorkEnvironment.write, {
+    reportFailure: false,
+    reportDefect: false,
+  });
+  const owner = useRef(false);
+  useLayoutEffect(() => {
+    owner.current = true;
+    return () => {
+      owner.current = false;
+    };
+  }, []);
   const [filter, setFilter] = useState<Question["status"]>("pending");
   const [offset, setOffset] = useState(0);
   const [selected, select] = useState<string | null>(null);
@@ -74,6 +107,30 @@ function InboxSession(props: InboxProps) {
     draftsRef.current = next;
     saveDrafts(next);
   };
+  // The environment/project session owns results even when its selected editor disappears.
+  async function sendAnswer(command: Answer, refresh: () => void, wasUncertain: boolean) {
+    const previous = draftsRef.current.get(command.questionId);
+    if (!owner.current || previous?.command !== command) return;
+    let completed: Draft;
+    try {
+      const outcome = await write({ environmentId: props.environmentId, input: command });
+      if (outcome._tag === "Failure") throw squashAtomCommandFailure(outcome);
+      completed = {
+        ...previous,
+        status: "accepted",
+        notice: "Answer submitted. Waiting for the recorded question to refresh.",
+      };
+    } catch (error) {
+      completed = failedAnswer(
+        wasUncertain ? { ...previous, status: "uncertain" } : previous,
+        error,
+        command,
+      );
+    }
+    if (!owner.current || draftsRef.current.get(command.questionId)?.command !== command) return;
+    storeDraft(command.questionId, completed);
+    if (completed.status === "accepted") refresh();
+  }
   const unsettledQuestion = [...drafts].find(
     ([, draft]) => draft.status === "sending" || draft.status === "uncertain",
   )?.[0];
@@ -189,6 +246,7 @@ function InboxSession(props: InboxProps) {
                 foundation={foundation}
                 draft={drafts.get(question.recordId)}
                 onDraft={(draft) => storeDraft(question.recordId, draft)}
+                onSend={sendAnswer}
               />
             ) : selected !== null && !question ? (
               <p>
@@ -224,6 +282,7 @@ function QuestionEditor(
     readonly foundation: WorkTeamFoundationView;
     readonly draft: Draft | undefined;
     readonly onDraft: (draft: Draft) => void;
+    readonly onSend: (command: Answer, refresh: () => void, wasUncertain: boolean) => Promise<void>;
   },
 ) {
   const registry = useContext(RegistryContext);
@@ -235,10 +294,6 @@ function QuestionEditor(
   const atom = projectWorkEnvironment.taskContext(target);
   const result = useAtomValue(atom);
   const context = asProjectWorkTaskContext(Option.getOrNull(AsyncResult.value(result)));
-  const write = useAtomCommand(projectWorkEnvironment.write, {
-    reportFailure: false,
-    reportDefect: false,
-  });
   const mounted = useRef(false);
   const busy = useRef(false);
   const access = useRef(props);
@@ -405,7 +460,6 @@ function QuestionEditor(
     )
       return;
     busy.current = true;
-    const wasUncertain = draftRef.current.status === "uncertain";
     let command: Answer | undefined;
     try {
       const previous = draftRef.current;
@@ -435,39 +489,9 @@ function QuestionEditor(
         answer,
       };
       update({ ...previous, command, status: "sending" });
-      const outcome = await write({ environmentId: props.environmentId, input: command });
-      if (outcome._tag === "Failure") throw squashAtomCommandFailure(outcome);
-      if (mounted.current) {
-        update({
-          ...draftRef.current,
-          status: "accepted",
-          notice: "Answer submitted. Waiting for the recorded question to refresh.",
-        });
-        props.foundation.refresh();
-      }
+      await props.onSend(command, props.foundation.refresh, previous.status === "uncertain");
     } catch (error) {
-      if (mounted.current) {
-        const failure = projectWorkCommandFailure(error);
-        const explicit =
-          typeof error === "object" &&
-          error !== null &&
-          "code" in error &&
-          [
-            "stale-revision",
-            "invalid-state",
-            "permission-denied",
-            "forbidden",
-            "unauthorized",
-            "not-found",
-            "invalid-request",
-          ].includes(String(error.code));
-        update({
-          ...draftRef.current,
-          ...(command ? { command } : {}),
-          status: wasUncertain || (command && !explicit) ? "uncertain" : "rejected",
-          notice: failure.message,
-        });
-      }
+      if (mounted.current) update(failedAnswer(draftRef.current, error, command));
     } finally {
       busy.current = false;
     }

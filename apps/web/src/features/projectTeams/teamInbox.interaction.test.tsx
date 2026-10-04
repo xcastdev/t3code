@@ -20,6 +20,7 @@ import {
   type ProjectWorkReadIntent,
   ProjectWorkWriteIntent,
   ProjectWorkTaskId,
+  ProjectTeamRecord,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as Data from "effect/Data";
@@ -973,5 +974,226 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
       await click("Submit answer");
       expect(writes).toHaveLength(allowed ? 1 : 0);
     });
+  }
+  const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
+  const checkRecords = () => records.forEach((record) => decodeRecord(record));
+  async function renderTeam(connected = true) {
+    checkRecords();
+    await act(async () => {
+      root.render(
+        <RegistryContext.Provider value={registry}>
+          <Team
+            environmentId={environmentId}
+            projectId={projectId}
+            connected={connected}
+            enabled
+            supported
+            onOpenTask={() => {}}
+          />
+        </RegistryContext.Provider>,
+      );
+      await settle(atoms.foundationPage({ environmentId, projectId }));
+    });
+  }
+  async function beginHeldAnswer() {
+    checkRecords();
+    await render();
+    await openAnswer();
+    await click("Keep history");
+    holdWrite = true;
+    await act(async () => {
+      button("Submit answer")!.click();
+      await writeStarted;
+    });
+    expect(writes).toHaveLength(1);
+  }
+  interaction(
+    "control: a held answer keeps its receipt across a same-owner disconnect",
+    async () => {
+      await beginHeldAnswer();
+      await render(false);
+      await act(async () => releaseWrite());
+      await render();
+      expect(host.textContent).toContain("Answer submitted");
+      expect(host.textContent).not.toContain("Sending answer…");
+    },
+  );
+  interaction(
+    "R1: a held receipt survives a same-owner unsupported capability interlude",
+    async () => {
+      await beginHeldAnswer();
+      await render(true, false);
+      expect(host.textContent).toContain("does not support the question inbox");
+      await act(async () => releaseWrite());
+      await render();
+      await openAnswer();
+      expect(host.textContent).toContain("Answer submitted");
+      expect(host.textContent).not.toContain("Sending answer…");
+    },
+  );
+  interaction("R1b: a temporarily unknown question cannot strand a completed write", async () => {
+    await beginHeldAnswer();
+    records = records.map((item) =>
+      item === question ? { ...question, status: "future-question-status" } : item,
+    );
+    revision = taskRevision = 11;
+    await refresh();
+    expect(host.textContent).toContain("selected question is no longer available");
+    await act(async () => releaseWrite());
+    records = records.map((item) =>
+      typeof item === "object" &&
+      item !== null &&
+      "recordId" in item &&
+      item.recordId === question.recordId
+        ? question
+        : item,
+    );
+    checkRecords();
+    revision = taskRevision = 12;
+    await refresh();
+    expect(host.textContent).toContain("Answer submitted");
+    expect(host.textContent).not.toContain("Sending answer…");
+  });
+  interaction(
+    "control: foundation read failure preserves a held editor and success receipt",
+    async () => {
+      await beginHeldAnswer();
+      foundationFailure = true;
+      await refresh();
+      await act(async () => releaseWrite());
+      foundationFailure = false;
+      await refresh();
+      expect(host.textContent).toContain("Answer submitted");
+      expect(writes).toHaveLength(1);
+    },
+  );
+  interaction(
+    "R2: a settled run keeps its terminal badge while a task question is pending",
+    async () => {
+      records = records.map((item) =>
+        item === binding ? { ...binding, status: "settled" } : item,
+      );
+      await renderTeam();
+      const card = host.querySelector("section")!;
+      expect(card.textContent).toContain("Recorded state settled");
+      expect(card.textContent).not.toContain("Waiting for human answer");
+    },
+  );
+  interaction(
+    "R2b: another member's pending question does not put a running member into waiting",
+    async () => {
+      records.push({ ...member, recordId: "member-2", name: "Second worker" });
+      records.push({
+        ...binding,
+        recordId: "run-2",
+        memberId: "member-2",
+        attemptId: "attempt-2",
+        threadId: "thread-2",
+      });
+      await renderTeam();
+      const other = [...host.querySelectorAll("section")].find((item) =>
+        item.textContent?.includes("Second worker"),
+      )!;
+      expect(other.textContent).toContain("Recorded state running");
+      expect(other.textContent).not.toContain("Waiting for human answer");
+    },
+  );
+
+  interaction("control: another project's late receipt cannot reach a fresh owner", async () => {
+    await beginHeldAnswer();
+    records = [];
+    await render(true, true, ProjectId.make("other-project"));
+    await act(async () => releaseWrite());
+    expect(host.textContent).not.toContain("Answer submitted");
+    expect(host.textContent).not.toContain(question.body);
+    expect(writes).toHaveLength(1);
+  });
+  interaction(
+    "R1 current receipt: answered state cannot strand another pending question",
+    async () => {
+      records.push({ ...question, recordId: "other-question", body: "Another current request" });
+      await beginHeldAnswer();
+      await render(true, false);
+      records = records.map((item) =>
+        item === question
+          ? { ...question, status: "answered", answer: "Keep history", revision: 3 }
+          : item,
+      );
+      revision = taskRevision = 11;
+      checkRecords();
+      await act(async () => releaseWrite());
+      await render();
+      await refresh();
+      const other = button("Answer question")!;
+      expect(other.disabled).toBe(false);
+      expect(host.textContent).not.toContain("Sending answer…");
+      await click("Answer question");
+      await click("Keep history");
+      await click("Submit answer");
+      expect(writes).toHaveLength(2);
+      expect(writes[1]?.type).toBe("project-team.question.answer");
+      expect(writes[1] && "questionId" in writes[1] ? writes[1].questionId : undefined).toBe(
+        "other-question",
+      );
+    },
+  );
+  interaction(
+    "R1 uncertain receipt: temporary editor unmount must retain a retryable exact command",
+    async () => {
+      await beginHeldAnswer();
+      await render(true, false);
+      failWrite = true;
+      await act(async () => releaseWrite());
+      await render();
+      await openAnswer();
+      expect(button("Retry exact answer")?.disabled).toBe(false);
+      expect(host.textContent).not.toContain("Sending answer…");
+      const original = writes[0];
+      failWrite = false;
+      await click("Retry exact answer");
+      expect(writes).toHaveLength(2);
+      expect(writes[1]).toBe(original);
+      expect(host.textContent).toContain("Answer submitted");
+    },
+  );
+
+  interaction("R1 unknown question retains uncertainty and retries its exact command", async () => {
+    await beginHeldAnswer();
+    const original = writes[0];
+    records = records.map((item) =>
+      item === question ? { ...question, status: "future-question-status" } : item,
+    );
+    revision = taskRevision = 11;
+    await refresh();
+    failWrite = true;
+    await act(async () => releaseWrite());
+    records = [member, role, binding, membership, gate, question];
+    revision = taskRevision = 12;
+    await refresh();
+    expect(button("Retry exact answer")?.disabled).toBe(false);
+    failWrite = false;
+    await click("Retry exact answer");
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toBe(original);
+    expect(host.textContent).toContain("Answer submitted");
+  });
+  for (const status of ["settled", "revoked", "reserved"]) {
+    interaction(
+      "R2 preserves recorded " + status + " over a sender's pending question",
+      async () => {
+        records = records.map((item) =>
+          item === binding
+            ? { ...binding, status }
+            : item === membership && status !== "reserved"
+              ? { ...membership, controlState: "canceling" }
+              : item,
+        );
+        await renderTeam();
+        expect(host.textContent).toContain("Recorded state " + status);
+        expect(host.textContent).not.toContain("Waiting for human answer");
+        if (status !== "reserved") expect(host.textContent).not.toContain("Stopping");
+        else expect(host.textContent).toContain("Queued");
+      },
+    );
   }
 });

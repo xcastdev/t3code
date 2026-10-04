@@ -80,7 +80,11 @@ function TeamSession(props: TeamViewProps) {
                 ? records.filter((record) => "taskId" in record && record.taskId === run.taskId)
                 : [];
               const question = related.find(
-                (record) => record.kind === "question" && record.status === "pending",
+                (record) =>
+                  run?.status === "running" &&
+                  record.kind === "question" &&
+                  record.status === "pending" &&
+                  record.senderId === run.memberId,
               );
               const stopping =
                 run?.status === "stopping" ||
@@ -96,19 +100,21 @@ function TeamSession(props: TeamViewProps) {
               );
               const status = !props.connected
                 ? "Disconnected"
-                : stopping
-                  ? "Stopping"
-                  : run?.status === "quarantined"
-                    ? "Quarantined"
-                    : failed
-                      ? `Effect ${failed.status}`
-                      : question
-                        ? "Waiting for human answer"
-                        : run?.status === "reserved"
-                          ? "Queued"
-                          : run
-                            ? run.status
-                            : (member?.status ?? "Unknown member");
+                : run?.status === "settled" || run?.status === "revoked"
+                  ? run.status
+                  : stopping
+                    ? "Stopping"
+                    : run?.status === "quarantined"
+                      ? "Quarantined"
+                      : failed
+                        ? `Effect ${failed.status}`
+                        : question
+                          ? "Waiting for human answer"
+                          : run?.status === "reserved"
+                            ? "Queued"
+                            : run
+                              ? run.status
+                              : (member?.status ?? "Unknown member");
               const activity = related
                 .filter((record) => record.kind === "message")
                 .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
