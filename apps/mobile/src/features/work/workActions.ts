@@ -206,8 +206,9 @@ const changedTeamTarget = new Set([
   "Gate response changed since receipt",
   "Guided project or task revision changed",
   "Guided receipt target changed",
+  "Question target changed",
 ]);
-function publicWorkRejection(error: unknown) {
+export function publicWorkRejection(error: unknown) {
   if (!knownPublicRejection(error)) return null;
   if (
     (error._tag === "ProjectTeamAuthorizationError" && changedTeamTarget.has(error.reason)) ||
