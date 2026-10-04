@@ -1,7 +1,15 @@
 import { useAtomValue } from "@effect/atom-react";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
-import { BookOpenIcon, InboxIcon, ListTodoIcon, PanelTopIcon, UsersIcon } from "lucide-react";
+import {
+  BookOpenIcon,
+  BrainIcon,
+  FileCheckIcon,
+  InboxIcon,
+  ListTodoIcon,
+  PanelTopIcon,
+  UsersIcon,
+} from "lucide-react";
 import { useEffect, useState } from "react";
 import { useCallback, useRef } from "react";
 import * as Option from "effect/Option";
@@ -23,6 +31,8 @@ import { projectWorkEnvironment } from "../../state/projectWork";
 import { type WorkTab } from "./workPresentation";
 import { Team } from "../../features/projectTeams/Team";
 import { Inbox } from "../../features/projectTeams/Inbox";
+import { Memory } from "../../features/projectTeams/Memory";
+import { Evidence } from "../../features/projectTeams/Evidence";
 
 const TAB_ITEMS: ReadonlyArray<{
   readonly id: WorkTab;
@@ -34,9 +44,27 @@ const TAB_ITEMS: ReadonlyArray<{
   { id: "team", label: "Team", icon: UsersIcon },
   { id: "inbox", label: "Inbox", icon: InboxIcon },
   { id: "knowledge", label: "Knowledge", icon: BookOpenIcon },
+  { id: "memory", label: "Memory", icon: BrainIcon },
+  { id: "evidence", label: "Evidence", icon: FileCheckIcon },
 ];
 
 export function WorkPage({
+  environmentId,
+  projectId,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+}) {
+  return (
+    <ProjectWorkPage
+      key={JSON.stringify([environmentId, projectId])}
+      environmentId={environmentId}
+      projectId={projectId}
+    />
+  );
+}
+
+function ProjectWorkPage({
   environmentId,
   projectId,
 }: {
@@ -61,17 +89,10 @@ export function WorkPage({
     connectionPhase: environment?.connection.phase ?? "disconnected",
   });
   const projectTitle = project?.title ?? String(projectId);
-  const ownerKey = `${environmentId}:${projectId}`;
-  const ownerRef = useRef(ownerKey);
   const cursorRef = useRef(0);
   const [resumeCursor, setResumeCursor] = useState(0);
   const [streamGeneration, setStreamGeneration] = useState(0);
   const [poll, setPoll] = useState(true);
-  const ownerChanged = ownerRef.current !== ownerKey;
-  if (ownerChanged) {
-    ownerRef.current = ownerKey;
-    cursorRef.current = 0;
-  }
 
   const onStreamState = useCallback(
     (state: { cursor: number; healthy: boolean; resyncRequired: boolean } | null) => {
@@ -95,15 +116,6 @@ export function WorkPage({
     },
     [],
   );
-
-  useEffect(() => {
-    setTab("overview");
-    setInboxVisited(false);
-    setTargetTask(undefined);
-    cursorRef.current = 0;
-    setResumeCursor(0);
-    setPoll(true);
-  }, [environmentId, projectId]);
 
   useEffect(() => {
     if (!connected) setResumeCursor(cursorRef.current);
@@ -130,7 +142,7 @@ export function WorkPage({
                 key={`${environmentId}:${projectId}:${streamGeneration}`}
                 environmentId={environmentId}
                 projectId={projectId}
-                afterCursor={ownerChanged ? 0 : resumeCursor}
+                afterCursor={resumeCursor}
                 onState={onStreamState}
               />
             ) : null}
@@ -193,6 +205,27 @@ export function WorkPage({
               />
             ) : tab === "team" ? (
               <Team
+                environmentId={environmentId}
+                projectId={projectId}
+                connected={connected}
+                enabled={enabled}
+                supported={
+                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                }
+                onOpenTask={openTask}
+              />
+            ) : tab === "memory" ? (
+              <Memory
+                environmentId={environmentId}
+                projectId={projectId}
+                connected={connected}
+                enabled={enabled}
+                supported={
+                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                }
+              />
+            ) : tab === "evidence" ? (
+              <Evidence
                 environmentId={environmentId}
                 projectId={projectId}
                 connected={connected}

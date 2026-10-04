@@ -1,6 +1,14 @@
 import type { ProjectWorkTaskRead } from "@t3tools/contracts";
 
-export const WORK_TABS = ["overview", "tasks", "team", "inbox", "knowledge"] as const;
+export const WORK_TABS = [
+  "overview",
+  "tasks",
+  "team",
+  "inbox",
+  "knowledge",
+  "memory",
+  "evidence",
+] as const;
 export type WorkTab = (typeof WORK_TABS)[number];
 
 export function isWorkTab(value: string | undefined): value is WorkTab {
