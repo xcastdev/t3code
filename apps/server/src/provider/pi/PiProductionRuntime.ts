@@ -11,6 +11,7 @@ import {
   PiManagedRuntime,
   PiManagedRuntimeError,
   type PiManagedRuntimeInstance,
+  type PiManagedOperationRequest,
 } from "./PiManagedRuntime.ts";
 import { makePiManagedRuntimeLive } from "./PiManagedRuntimeLive.ts";
 import { PiModelCatalogue } from "./PiModelCatalogue.ts";
@@ -57,6 +58,10 @@ export interface PiProductionRuntimeAssets {
   ) => Effect.Effect<A, E | PiManagedRuntimeError, R>;
 }
 export interface PiProductionRuntimeHooks {
+  readonly resolveOperationId?: (
+    instanceId: Parameters<PiManagedRuntime["Service"]["forInstance"]>[0]["instanceId"],
+    request: PiManagedOperationRequest,
+  ) => ReturnType<NonNullable<PiManagedRuntimeInstance["resolveOperationId"]>>;
   readonly publishAssets?: (
     instanceId: Parameters<PiManagedRuntime["Service"]["forInstance"]>[0]["instanceId"],
     assets: PiProductionRuntimeAssets,
@@ -313,6 +318,7 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
   hooks?: PiProductionRuntimeHooks,
 ) {
   const publishAssets = hooks?.publishAssets;
+  const resolveOperationId = hooks?.resolveOperationId;
   const options = yield* decodeOptions(supplied).pipe(Effect.mapError(unavailable));
   const sql = yield* SqlClient.SqlClient;
   const outsideTransaction = Effect.gen(function* () {
@@ -551,6 +557,16 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       );
       const ownedRuntime = Object.freeze({
         ...managed,
+        ...(resolveOperationId === undefined
+          ? {}
+          : {
+              resolveOperationId: (request: PiManagedOperationRequest) =>
+                Effect.suspend(() =>
+                  accepting
+                    ? resolveOperationId(instance.instanceId, request)
+                    : Effect.fail(closed()),
+                ),
+            }),
         prepareOperation: (...args: Parameters<typeof managed.prepareOperation>) => {
           const preparation = managed.prepareOperation(...args);
           return Effect.suspend(() => {
