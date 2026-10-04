@@ -5,6 +5,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import {
   PiManagedRuntimeError,
@@ -15,6 +16,7 @@ import type { PiProductionRuntimeAssets } from "../provider/pi/PiProductionRunti
 import { makeProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 
 const instanceId = ProviderInstanceId.make("pi_registry");
+const isManagedRuntimeError = Schema.is(PiManagedRuntimeError);
 const request: PiManagedOperationRequest = {
   kind: "initialize",
   threadId: ThreadId.make("registry-thread"),
@@ -84,7 +86,7 @@ const expectDenied = Effect.fn("registryTest.expectDenied")(function* <A, E, R>(
   expect(result._tag).toBe("Failure");
   if (result._tag === "Failure") {
     expect(result.failure).toBeInstanceOf(PiManagedRuntimeError);
-    if (result.failure instanceof PiManagedRuntimeError) expect(result.failure.code).toBe("denied");
+    if (isManagedRuntimeError(result.failure)) expect(result.failure.code).toBe("denied");
   }
 });
 
