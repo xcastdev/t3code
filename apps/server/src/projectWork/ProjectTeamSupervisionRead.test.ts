@@ -143,6 +143,89 @@ const summary = Effect.fn("supervisionSummary")(function* (
 const isolated = <E>(name: string, body: () => Effect.Effect<void, E, SqlClient.SqlClient>) =>
   it.effect(name, () => body().pipe(Effect.provide(NodeSqliteClient.layerMemory())));
 
+for (const [label, caption, expected] of [
+  ["240 ASCII units", "A".repeat(240), "A".repeat(240)],
+  ["239 ASCII units plus emoji", "A".repeat(239) + "😀", "A".repeat(239)],
+  ["121 emoji", "😀".repeat(121), "😀".repeat(120)],
+] as const) {
+  isolated("bounds Unicode mission/coordinator/blocker captions: " + label, () =>
+    Effect.gen(function* () {
+      const sql = yield* fixture();
+      yield* task(sql);
+      yield* record(sql, "mission", "mission", { title: caption });
+      yield* record(sql, "member", "coordinator", { coordinator: true, name: caption });
+      yield* sql`INSERT INTO project_work_blockers(blocker_id,project_id,task_id,reason,resolver,reference_ids_json,attention,revision)
+        VALUES ('blocker','project-a','task',${caption},'human','[]',1,1)`;
+      const value = yield* summary(sql);
+      expect(value.missions.items[0]).toEqual(
+        expect.objectContaining({ title: expected, supported: true }),
+      );
+      expect(value.coordinator).toEqual(
+        expect.objectContaining({ name: expected, supported: true }),
+      );
+      expect(value.blockers.items[0]?.reason).toBe(expected);
+      expect(expected.length).toBeLessThanOrEqual(240);
+    }),
+  );
+}
+
+for (const [label, threadId, navigate] of [
+  ["256-unit identity", "t".repeat(256), true],
+  ["257-unit identity", "t".repeat(257), false],
+  ["leading whitespace", " thread", false],
+  ["trailing whitespace", "thread ", false],
+  ["blank identity", "   ", false],
+] as const) {
+  isolated("keeps inspection metadata with bounded exact worker navigation: " + label, () =>
+    Effect.gen(function* () {
+      const sql = yield* fixture();
+      yield* ownedRun(sql);
+      yield* sql`UPDATE projection_threads SET thread_id=${threadId} WHERE thread_id='thread'`;
+      yield* sql`UPDATE project_team_run_binding SET thread_id=${threadId},payload_json=json_set(payload_json,'$.threadId',${threadId}) WHERE record_id='run'`;
+      const value = (yield* summary(sql)).bindings.items[0];
+      expect(value).toEqual(
+        expect.objectContaining({ model: "frozen-binding-model", taskId: "task", supported: true }),
+      );
+      if (navigate) expect(value).toHaveProperty("workerThreadId", threadId);
+      else expect(value).not.toHaveProperty("workerThreadId");
+    }),
+  );
+}
+
+for (const [label, ownerRevision] of [
+  ["future", 21],
+  ["negative", -1],
+  ["fractional", 1.5],
+  ["text", "invalid"],
+  ["unsafe", 9_007_199_254_740_992],
+] as const) {
+  for (const owner of ["attempt", "gate"] as const) {
+    isolated("returns only a physical marker for " + label + " " + owner + " owner revision", () =>
+      Effect.gen(function* () {
+        const sql = yield* fixture();
+        yield* ownedRun(sql);
+        yield* record(sql, "gate", "gate");
+        yield* record(sql, "question", "question");
+        yield* sql`PRAGMA ignore_check_constraints=ON`;
+        if (owner === "attempt")
+          yield* sql`UPDATE project_work_attempts SET revision=${ownerRevision} WHERE attempt_id='attempt'`;
+        else
+          yield* sql`UPDATE project_team_gate SET revision=${ownerRevision} WHERE record_id='gate'`;
+        const value = yield* summary(sql);
+        expect(owner === "attempt" ? value.bindings.items : value.questions.items).toEqual([
+          {
+            recordId: owner === "attempt" ? "run" : "question",
+            revision: 1,
+            status: owner === "attempt" ? "running" : "pending",
+            supported: false,
+            issue: "malformed",
+          },
+        ]);
+      }),
+    );
+  }
+}
+
 isolated("reads empty projected projects and preserves their independent revision", () =>
   Effect.gen(function* () {
     const sql = yield* fixture();

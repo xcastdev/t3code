@@ -9,7 +9,10 @@ const Integer = Schema.Int.check(
 );
 const Text = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4_000));
 const Id = Text.check(Schema.isMaxLength(256));
-const Caption = Schema.String.check(Schema.isMaxLength(240));
+// SQLite substr counts code points; its bounded projection can contain twice as many UTF-16 units.
+const Caption = Schema.String.check(Schema.isMaxLength(480));
+const boundedCaption = (value: string) =>
+  value.slice(0, (value.codePointAt(239) ?? 0) > 0xffff ? 239 : 240);
 const base = {
   recordId: Id,
   projectId: Text,
@@ -323,7 +326,7 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
               ? marker(coordinatorRow)
               : {
                   ...common(coordinatorValue),
-                  name: coordinatorValue.name,
+                  name: boundedCaption(coordinatorValue.name),
                   roleRevisionId: coordinatorValue.roleRevisionId,
                   profile: yield* role(coordinatorValue.roleRevisionId),
                 };
@@ -333,7 +336,7 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
           Effect.fn(function* (row) {
             const value = yield* parse(row, "mission", revision);
             return value?.kind === "mission"
-              ? { ...common(value), title: value.title }
+              ? { ...common(value), title: boundedCaption(value.title) }
               : marker(row);
           }),
         );
@@ -346,7 +349,8 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
             const owners =
               yield* sql`SELECT 1 FROM project_work_tasks task JOIN project_work_attempts attempt
         ON attempt.project_id = task.project_id AND attempt.task_id = task.task_id
-        WHERE task.project_id = ${projectId} AND task.task_id = ${value.taskId} AND attempt.attempt_id = ${value.attemptId} LIMIT 1`;
+        WHERE task.project_id = ${projectId} AND task.task_id = ${value.taskId} AND attempt.attempt_id = ${value.attemptId}
+          AND typeof(attempt.revision) = 'integer' AND attempt.revision BETWEEN 0 AND ${revision} LIMIT 1`;
             const members = yield* readRows(sql, projectId, "member", 1, value.memberId);
             const memberRow = members[0];
             const member =
@@ -362,7 +366,11 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
               roleRevisionId: value.roleRevisionId,
               providerInstanceId: value.providerInstanceId,
               model: value.model,
-              ...(threads.length === 0 ? {} : { workerThreadId: value.threadId }),
+              ...(threads.length === 0 ||
+              value.threadId.length > 256 ||
+              value.threadId.trim() !== value.threadId
+                ? {}
+                : { workerThreadId: value.threadId }),
               profile: yield* role(value.roleRevisionId),
             };
           }),
@@ -375,6 +383,9 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
       WHERE blocker.project_id = ${projectId} AND blocker.resolved_at IS NULL
       ORDER BY blocker.blocker_id LIMIT 6`;
         const blockers = yield* decodeBlockers(blockerRows.slice(0, 5)).pipe(
+          Effect.map((items) =>
+            items.map((item) => ({ ...item, reason: boundedCaption(item.reason) })),
+          ),
           Effect.mapError(toPersistenceDecodeError(operation)),
         );
         yield* decodeFence({
@@ -390,7 +401,8 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
             const owners =
               yield* sql`SELECT 1 FROM project_work_tasks task JOIN project_team_gate gate
         ON gate.project_id = task.project_id AND gate.task_id = task.task_id
-        WHERE task.project_id = ${projectId} AND task.task_id = ${value.taskId} AND gate.record_id = ${value.targetGateId} LIMIT 1`;
+        WHERE task.project_id = ${projectId} AND task.task_id = ${value.taskId} AND gate.record_id = ${value.targetGateId}
+          AND typeof(gate.revision) = 'integer' AND gate.revision BETWEEN 0 AND ${revision} LIMIT 1`;
             return owners.length === 0
               ? marker(row)
               : {
