@@ -1,6 +1,8 @@
 import { expect, it } from "@effect/vitest";
 import {
   ProjectWorkFoundationCommitCommand,
+  EventId,
+  ProjectWorkCommand,
   ProjectTeamRecord as TeamRecordSchema,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
@@ -24,6 +26,7 @@ import {
   type ProjectTeamDispatchRequest,
 } from "./ProjectTeamDispatchJournal.ts";
 import { makeProjectTeamContext, ProjectTeamContextError } from "./ProjectTeamContext.ts";
+import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 import * as Accounting from "./ProjectTeamModelAccounting.ts";
 import { managedActorId } from "./ProjectTeamAuthorization.ts";
 import type {
@@ -31,6 +34,8 @@ import type {
   PiModelRequestSettlement,
 } from "../provider/pi/PiModelBroker.ts";
 
+const encodeRetainedEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeCommand = Schema.decodeUnknownEffect(ProjectWorkCommand);
 const decodeRecord = Schema.decodeUnknownEffect(TeamRecordSchema);
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 
@@ -601,4 +606,214 @@ it.effect("bounds total retained ledger bytes before decoding request content", 
       yield* denied(f.reader.readRequired(f.snapshot));
     }),
   ),
+);
+
+it.effect(
+  "denies coordinated checkpoint and task scope corruption against retained approval history",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        yield* f.sql`UPDATE project_work_tasks SET specification_json=replace(specification_json,'"scopeIn":"Task"','"scopeIn":"False approved scope"')`;
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=replace(state_json,'"scopeIn":"Task"','"scopeIn":"False approved scope"')`;
+        expect(
+          (yield* f.sql<{
+            scope: string;
+          }>`SELECT json_extract(specification_json,'$.scopeIn') AS scope FROM project_work_tasks`)[0]
+            ?.scope,
+        ).toBe("False approved scope");
+        expect((yield* readCurrentState(f.sql, projectId)).tasks[0]?.specification?.scopeIn).toBe(
+          "False approved scope",
+        );
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }),
+    ),
+);
+
+it.effect(
+  "denies coordinated checkpoint and required criterion corruption against original gate content",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        yield* f.sql`UPDATE project_work_criteria SET description='False approved output'`;
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=replace(state_json,'"description":"Requirement"','"description":"False approved output"')`;
+        expect(
+          (yield* f.sql<{ description: string }>`SELECT description FROM project_work_criteria`)[0]
+            ?.description,
+        ).toBe("False approved output");
+        expect((yield* readCurrentState(f.sql, projectId)).criteria[0]?.description).toBe(
+          "False approved output",
+        );
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }),
+    ),
+);
+
+it.effect(
+  "denies coordinated criterion completion corruption without retained completion evidence",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        yield* f.sql`UPDATE project_work_criteria SET status='satisfied'`;
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=replace(state_json,'"status":"unsatisfied"','"status":"satisfied"')`;
+        expect(
+          (yield* f.sql<{ status: string }>`SELECT status FROM project_work_criteria`)[0]?.status,
+        ).toBe("satisfied");
+        expect((yield* readCurrentState(f.sql, projectId)).criteria[0]?.status).toBe("satisfied");
+        yield* f.journal.inspect(f.snapshot.fence.dispatchId, { requireClaim: true });
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }),
+    ),
+);
+
+it.effect("accepts exact retained typed criterion progress after actual projection replay", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture();
+      const state = yield* readCurrentState(f.sql, projectId);
+      const criterion = state.criteria[0];
+      if (criterion === undefined) return yield* Effect.die("Missing fixture criterion");
+      // Restore an actual historical event shape; no worker receipt or new approval is minted.
+      const event: ProjectWorkEvent = {
+        eventId: EventId.make("retained-criterion-progress"),
+        projectId,
+        revision: state.revision + 1,
+        occurredAt: at,
+        type: "project-work.criterion.upserted",
+        taskId: criterion.taskId,
+        criterion: {
+          ...criterion,
+          status: "satisfied",
+          revision: criterion.revision + 1,
+          updatedAt: at,
+        },
+        updatedAt: at,
+      };
+      const payload = yield* encodeRetainedEvent(event);
+      yield* f.sql`INSERT INTO project_work_events(event_id,project_id,event_type,occurred_at,command_id,payload_json)
+    VALUES(${event.eventId},${projectId},${event.type},${at},'retained-progress-fixture',${payload})`;
+      yield* (yield* ProjectWorkProjection).rebuild(projectId);
+      const result = yield* f.reader.readRequired(f.snapshot);
+      expect(result.required.tasks[0]?.criteria[0]).toEqual(event.criterion);
+      expect(result.provenance.criterionEventIds).toContain(event.eventId);
+      expect(result.required.frozenLimits).toEqual(f.snapshot.intent.limits);
+    }),
+  ),
+);
+
+it.effect("denies malformed retained criterion progress despite agreeing derived copies", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture();
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.criterion.status','invented')
+    WHERE project_id=${projectId} AND event_type='project-work.criterion.upserted'`;
+      yield* denied(f.reader.readRequired(f.snapshot));
+    }),
+  ),
+);
+
+it.effect("keeps unrelated project history outside required criterion bounds and content", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture();
+      const before = yield* f.reader.readRequired(f.snapshot);
+      yield* f.sql`WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<4097)
+    INSERT INTO project_work_events(event_id,project_id,event_type,occurred_at,command_id,payload_json)
+    SELECT 'foreign-history-'||n,'foreign-project','project-work.criterion.upserted',${at},'foreign-command-'||n,'{}' FROM numbers`;
+      expect(yield* f.reader.readRequired(f.snapshot)).toEqual(before);
+    }),
+  ),
+);
+
+it.effect("bounds retained criterion history before decoding completion payloads", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture();
+      const claim = f.snapshot.intent.compiledClaim.transition;
+      if (claim?.kind !== "claim") return yield* Effect.die("Missing fixture claim");
+      yield* f.sql`WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<4097)
+    INSERT INTO project_work_events(event_id,project_id,event_type,occurred_at,command_id,payload_json)
+    SELECT 'criterion-bound-'||n,${projectId},'project-work.task.completed',${at},'criterion-command-'||n,
+      json_object('eventId','criterion-bound-'||n,'projectId',${projectId},'type','project-work.task.completed','taskId',${claim.taskId}) FROM numbers`;
+      // Corrupt the checkpoint's cursor so current derived authority cannot expose the tail itself.
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET last_sequence=(SELECT max(sequence) FROM project_work_events WHERE project_id=${projectId}) WHERE project_id=${projectId}`;
+      yield* f.journal.inspect(f.snapshot.fence.dispatchId, { requireClaim: true });
+      yield* denied(f.reader.readRequired(f.snapshot));
+    }),
+  ),
+);
+
+it.effect(
+  "preserves actual initial-upsert timestamp semantics and denies an unsupported derived timestamp",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const older = "2025-12-31T00:00:00.000Z";
+        yield* f.repository.execute(
+          yield* decodeCommand({
+            type: "project-work.task.create",
+            projectId,
+            commandId: "timestamp-legacy-task",
+            taskId: "timestamp-task",
+            title: "Legacy timestamp control",
+            createdAt: at,
+          }),
+        );
+        yield* f.repository.execute(
+          yield* decodeCommand({
+            type: "project-work.criterion.upsert",
+            projectId,
+            commandId: "timestamp-legacy-criterion",
+            taskId: "timestamp-task",
+            updatedAt: at,
+            criterion: {
+              criterionId: "timestamp-criterion",
+              taskId: "timestamp-task",
+              description: "Legacy output",
+              required: true,
+              status: "unsatisfied",
+              satisfiedByEvidenceIds: [],
+              revision: 0,
+              updatedAt: older,
+            },
+          }),
+        );
+        const events = yield* f.repository.replay(projectId);
+        const produced = events.find(
+          (e) =>
+            e.type === "project-work.criterion.upserted" &&
+            e.criterion.criterionId === "timestamp-criterion",
+        );
+        const original = events.find(
+          (e) =>
+            e.type === "project-work.criterion.upserted" &&
+            e.criterion.criterionId !== "timestamp-criterion",
+        );
+        if (
+          produced?.type !== "project-work.criterion.upserted" ||
+          original?.type !== "project-work.criterion.upserted"
+        )
+          return yield* Effect.die("Missing actual timestamp producer events");
+        expect(produced.updatedAt).toBe(at);
+        expect(produced.criterion.updatedAt).toBe(older);
+        // Restore that verified initial-upsert date relationship to the original retained criterion.
+        const restored = {
+          ...original,
+          criterion: { ...original.criterion, updatedAt: produced.criterion.updatedAt },
+        };
+        const payload = yield* encodeRetainedEvent(restored);
+        yield* f.sql`UPDATE project_work_events SET payload_json=${payload} WHERE event_id=${original.eventId}`;
+        yield* (yield* ProjectWorkProjection).rebuild(projectId);
+        expect(
+          (yield* f.reader.readRequired(f.snapshot)).required.tasks[0]?.criteria[0]?.updatedAt,
+        ).toBe(older);
+        yield* f.sql`UPDATE project_work_criteria SET updated_at=${at} WHERE criterion_id=${original.criterion.criterionId}`;
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=replace(state_json,${older},${at}) WHERE project_id=${projectId}`;
+        yield* f.journal.inspect(f.snapshot.fence.dispatchId, { requireClaim: true });
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }),
+    ),
 );

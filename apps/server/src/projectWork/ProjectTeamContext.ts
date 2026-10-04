@@ -3,6 +3,12 @@ import {
   ProjectTeamRecord as TeamRecordSchema,
   ProjectWorkTask,
   ProjectWorkCriterion,
+  ProjectWorkCriterionWaiver,
+  ProjectWorkTaskId,
+  ProjectWorkCriterionId,
+  ProjectWorkAttemptId,
+  EventId,
+  IsoDateTime,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -95,6 +101,42 @@ const decodeRecordJson = Schema.decodeUnknownEffect(
 );
 const decodeTask = Schema.decodeUnknownEffect(ProjectWorkTask, strict);
 const decodeCriterion = Schema.decodeUnknownEffect(ProjectWorkCriterion, strict);
+const eventFields = {
+  eventId: EventId,
+  projectId: Schema.String,
+  revision: Safe,
+  occurredAt: IsoDateTime,
+};
+// Match the actual retained Decider criterion progress event protocol.
+const CriterionEvent = Schema.Union([
+  Schema.Struct({
+    ...eventFields,
+    type: Schema.Literal("project-work.criterion.upserted"),
+    taskId: ProjectWorkTaskId,
+    criterion: ProjectWorkCriterion,
+    updatedAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...eventFields,
+    type: Schema.Literal("project-work.criterion.waived"),
+    taskId: ProjectWorkTaskId,
+    criterionId: ProjectWorkCriterionId,
+    waiver: ProjectWorkCriterionWaiver,
+    waivedAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...eventFields,
+    type: Schema.Literal("project-work.task.completed"),
+    taskId: ProjectWorkTaskId,
+    attemptId: Schema.optionalKey(ProjectWorkAttemptId),
+    satisfiedCriterionIds: Schema.Array(ProjectWorkCriterionId),
+    completedAt: IsoDateTime,
+  }),
+]);
+const decodeCriterionEvent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(CriterionEvent),
+  strict,
+);
 const decodeReservation = Schema.decodeUnknownEffect(Schema.fromJsonString(Reservation), strict);
 const decodeSettlement = Schema.decodeUnknownEffect(Schema.fromJsonString(Settlement), strict);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -396,6 +438,130 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       receipts,
     };
   });
+  const verifyRetainedCriteria = Effect.fn("ProjectTeamContext.verifyRetainedCriteria")(function* (
+    task: ProjectWorkTask,
+    criteria: ReadonlyArray<ProjectWorkCriterion>,
+    retained: {
+      rows: number;
+      bytes: number;
+      eventIds: Set<string>;
+      events: Map<string, typeof CriterionEvent.Type>;
+    },
+  ) {
+    type EventRow = {
+      sequence: number;
+      event_id: string;
+      project_id: string;
+      event_type: string;
+      occurred_at: string;
+      bytes: number;
+      payload_json: string;
+    };
+    const consume = (row: EventRow) => {
+      if (
+        !Number.isSafeInteger(row.sequence) ||
+        row.sequence <= 0 ||
+        !Number.isSafeInteger(row.bytes) ||
+        row.bytes < 0 ||
+        row.bytes > Bounds.contextBytes
+      )
+        throw deny("Required retained scope event exceeds bounds");
+      if (!retained.eventIds.has(row.event_id)) {
+        retained.rows++;
+        retained.bytes = add(retained.bytes, row.bytes);
+        retained.eventIds.add(row.event_id);
+      }
+      if (retained.rows > Bounds.ledgerRows || retained.bytes > Bounds.ledgerBytes)
+        throw deny("Required retained scope history exceeds bounds");
+    };
+    const verify = (
+      row: EventRow,
+      event: { eventId: string; projectId: string; type: string; occurredAt: string },
+    ) => {
+      if (
+        event.eventId !== row.event_id ||
+        event.projectId !== task.projectId ||
+        event.projectId !== row.project_id ||
+        event.type !== row.event_type ||
+        event.occurredAt !== row.occurred_at
+      )
+        throw deny("Required retained scope event identity changed");
+    };
+    const column = sql`sequence,event_id,project_id,event_type,occurred_at,length(CAST(payload_json AS BLOB)) AS bytes,
+      CASE WHEN length(CAST(payload_json AS BLOB))<=${Bounds.contextBytes} THEN payload_json ELSE NULL END AS payload_json`;
+    // Approved specification content is already bound through actual Journal policy
+    // to the exact original gate digest, whose full retained event is checked below.
+    for (const criterion of criteria) {
+      const sources =
+        yield* sql<EventRow>`SELECT ${column} FROM project_work_events WHERE project_id=${task.projectId}
+        AND event_type='project-work.criterion.upserted' AND json_extract(payload_json,'$.criterion.criterionId')=${criterion.criterionId}
+        ORDER BY sequence DESC LIMIT 1`;
+      const sourceRow = sources[0];
+      if (sourceRow === undefined) return yield* deny("Required criterion origin is missing");
+      consume(sourceRow);
+      const source = yield* decodeCriterionEvent(sourceRow.payload_json);
+      verify(sourceRow, source);
+      retained.events.set(sourceRow.event_id, source);
+      if (
+        source.type !== "project-work.criterion.upserted" ||
+        source.taskId !== task.taskId ||
+        source.criterion.taskId !== task.taskId ||
+        source.criterion.criterionId !== criterion.criterionId
+      )
+        return yield* deny("Required criterion source is inconsistent");
+      const reconstructed = { ...source.criterion };
+      const changes =
+        yield* sql<EventRow>`SELECT sequence,event_id,project_id,event_type,occurred_at,
+        length(CAST(payload_json AS BLOB)) AS bytes,NULL AS payload_json FROM project_work_events WHERE project_id=${task.projectId}
+        AND event_type IN ('project-work.criterion.waived','project-work.task.completed') AND sequence>${sourceRow.sequence}
+        AND json_extract(payload_json,'$.taskId')=${task.taskId}
+        AND (event_type='project-work.task.completed' OR json_extract(payload_json,'$.criterionId')=${criterion.criterionId})
+        ORDER BY sequence ASC LIMIT 4097`;
+      if (changes.length > Bounds.ledgerRows)
+        return yield* deny("Required criterion history exceeds bounds");
+      for (const row of changes) {
+        consume(row);
+        let change = retained.events.get(row.event_id);
+        if (change === undefined) {
+          const payloads =
+            yield* sql<EventRow>`SELECT ${column} FROM project_work_events WHERE project_id=${task.projectId}
+          AND sequence=${row.sequence} AND event_id=${row.event_id}`;
+          const payload = payloads[0];
+          if (
+            payloads.length !== 1 ||
+            payload === undefined ||
+            payload.bytes !== row.bytes ||
+            payload.event_type !== row.event_type ||
+            payload.occurred_at !== row.occurred_at
+          )
+            return yield* deny("Required criterion history changed during read");
+          change = yield* decodeCriterionEvent(payload.payload_json);
+          retained.events.set(row.event_id, change);
+        }
+        verify(row, change);
+        if (change.taskId !== task.taskId)
+          return yield* deny("Required criterion history is foreign");
+        if (change.type === "project-work.criterion.waived") {
+          if (change.criterionId !== criterion.criterionId)
+            return yield* deny("Required waiver target changed");
+          reconstructed.status = "waived";
+          reconstructed.waiver = change.waiver;
+          reconstructed.revision = add(reconstructed.revision, 1);
+          reconstructed.updatedAt = change.waivedAt;
+        } else if (
+          change.type === "project-work.task.completed" &&
+          change.satisfiedCriterionIds.includes(criterion.criterionId)
+        ) {
+          reconstructed.status = "satisfied";
+          reconstructed.revision = add(reconstructed.revision, 1);
+          reconstructed.updatedAt = change.completedAt;
+        } else if (change.type === "project-work.criterion.upserted")
+          return yield* deny("Required criterion event kind changed");
+      }
+      if (!same(reconstructed, criterion))
+        return yield* deny("Required criterion progress disagrees with retained history");
+    }
+  });
   const readRequired = Effect.fn("ProjectTeamContext.readRequired")(
     function* (snapshot: ProjectTeamDispatchSnapshot) {
       const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
@@ -421,6 +587,12 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             return yield* deny("Required project is archived, deleted or missing");
           const state = yield* readCurrentState(sql, binding.projectId);
           const records = state.foundationRecords ?? [];
+          const retained = {
+            rows: 0,
+            bytes: 0,
+            eventIds: new Set<string>(),
+            events: new Map<string, typeof CriterionEvent.Type>(),
+          };
           const requiredRecords = new Map<string, ProjectTeamRecord>();
           const recordById = (id: string | undefined) => {
             const matches = records.filter((r) => r.recordId === id);
@@ -525,6 +697,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
               }));
             if (!same(physicalCriteria, expected))
               return yield* deny("Required output criteria SQL disagrees with authority");
+            yield* verifyRetainedCriteria(task, criteria, retained);
             tasks.push({ task, membership, criteria, ...(plan === undefined ? {} : { plan }) });
             taskId = membership.parentTaskId;
           }
@@ -617,6 +790,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
               dispatch: original.fence,
               sourceRevision: state.revision,
               recordIds: [...requiredRecords.keys()].sort(),
+              criterionEventIds: [...retained.eventIds].sort(),
               ledgerReservationIds: ledger.receipts.map((r) => r.reservationId),
             },
           };
