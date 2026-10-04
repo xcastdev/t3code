@@ -1321,7 +1321,22 @@ export const ProjectWorkGuidedTransition = Schema.Struct({
 export type ProjectWorkGuidedTransition = typeof ProjectWorkGuidedTransition.Type;
 
 /** Private scheduler/runtime transitions. Public transports deny foundation commands. */
+const JoinedRunCounter = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
 export const ProjectWorkTeamTransition = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("run.settle"),
+    bindingId: GuidedId,
+    generation: JoinedRunCounter,
+    expectedBindingRevision: JoinedRunCounter,
+    taskId: ProjectWorkTaskId,
+    expectedTaskRevision: JoinedRunCounter,
+    attemptId: ProjectWorkAttemptId,
+    expectedAttemptRevision: JoinedRunCounter,
+    dispatchId: GuidedId,
+    receiptId: GuidedId,
+    writableReservationId: Schema.optionalKey(GuidedId),
+    effectIds: Schema.Array(GuidedId).check(Schema.isMaxLength(64)),
+  }),
   Schema.Struct({
     kind: Schema.Literal("claim"),
     taskId: ProjectWorkTaskId,
@@ -1573,6 +1588,7 @@ export const ProjectWorkEventType = Schema.Literals([
   "project-work.attempt.renewed",
   "project-work.attempt.checkpointed",
   "project-work.attempt.expired",
+  "project-work.attempt.stopped",
   "project-work.attempt.reclaimed",
   "project-work.attempt.taken-over",
   "project-work.activity.recorded",
