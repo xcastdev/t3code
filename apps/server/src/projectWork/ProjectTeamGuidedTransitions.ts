@@ -288,6 +288,17 @@ export const decideProjectTeamGuidedTransition = (
         revisions.some((value) => !Number.isSafeInteger(value) || value >= Number.MAX_SAFE_INTEGER)
       )
         reject("Joined run settlement revision is exhausted");
+      const eventCount =
+        1 +
+        writers.length +
+        effects.length +
+        (attempt!.state === "leased" || attempt!.state === "running" ? 1 : 0);
+      if (
+        !Number.isSafeInteger(state.revision) ||
+        state.revision < 0 ||
+        state.revision > Number.MAX_SAFE_INTEGER - eventCount
+      )
+        reject("Joined run settlement aggregate revision is exhausted");
       record({ ...run!, status: "settled", revision: run!.revision + 1, updatedAt: at });
       for (const writer of writers)
         record(
