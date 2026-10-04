@@ -1,4 +1,4 @@
-import { expect, it } from "@effect/vitest";
+import { expect, it, vi } from "@effect/vitest";
 import {
   CommandId,
   ManagedSkillKey,
@@ -770,6 +770,180 @@ it.effect("refuses a retained root cap tuple that disagrees with its verified or
       yield* f.sql`UPDATE project_team_dispatch SET intent_json=json_set(intent_json,'$.rootCaps.maximumDelegationDepth',0)`;
       const state = yield* readCurrentState(f.sql, projectId);
       expect((yield* f.service.read({ state, taskId: f.taskId }))._tag).toBe("Blocked");
+    }),
+  ),
+);
+
+for (const packed of [false, true]) {
+  it.effect(`admits nested current branch packed=${packed}`, () =>
+    withServices(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* git(f.primary, ["branch", "-m", "feature/admission"]);
+        if (packed) yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+        expect(yield* git(f.primary, ["symbolic-ref", "HEAD"])).toBe(
+          "refs/heads/feature/admission",
+        );
+        expect(yield* git(f.primary, ["rev-parse", "HEAD"])).toBe(f.baseOid);
+        expect(nativeFs.existsSync(f.primary + "/.git/refs/heads/feature")).toBe(!packed);
+        const result = yield* f.service.read({ state: f.state, taskId: f.taskId });
+        expect(result._tag).toBe("Facts");
+        if (result._tag !== "Facts") return;
+        expect(result.facts.git.baseRef).toBe("refs/heads/feature/admission");
+        expect(result.facts.git.baseOid).toBe(f.baseOid);
+        yield* f.service.withCurrent({ state: f.state, taskId: f.taskId }, (_, revalidate) =>
+          f.sql.withTransaction(revalidate),
+        );
+        const prepared = prepareProjectTeamConfiguredAdmission({
+          state: f.state,
+          taskId: f.taskId,
+          nowMs,
+          facts: result.facts,
+        });
+        expect(prepared._tag).toBe("Prepared");
+        if (prepared._tag !== "Prepared") return;
+        expect((yield* f.journal.reserve(prepared.request)).intent.request).toEqual(
+          prepared.request,
+        );
+        expect(nativeFs.existsSync(result.facts.git.worktreePath)).toBe(false);
+      }),
+    ),
+  );
+}
+
+for (const change of ["oid", "ref", "bytes"] as const) {
+  it.effect(`rejects changed packed ${change} before admission writes`, () =>
+    withServices(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* git(f.primary, ["branch", "-m", "feature/admission"]);
+        yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+        yield* f.service.withCurrent({ state: f.state, taskId: f.taskId }, (_, revalidate) =>
+          Effect.gen(function* () {
+            if (change === "oid") {
+              yield* git(f.primary, [
+                "-c",
+                "user.name=Facts fixture",
+                "-c",
+                "user.email=facts@test.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Changed base",
+              ]);
+              yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+              expect(yield* git(f.primary, ["rev-parse", "HEAD"])).not.toBe(f.baseOid);
+            } else if (change === "ref") {
+              yield* git(f.primary, ["branch", "-m", "feature/changed"]);
+              yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+              expect(yield* git(f.primary, ["symbolic-ref", "HEAD"])).toBe(
+                "refs/heads/feature/changed",
+              );
+            } else {
+              const file = f.primary + "/.git/packed-refs";
+              const original = nativeFs.readFileSync(file, "utf8");
+              nativeFs.writeFileSync(file, original.replace("sorted", "sorted sorted"));
+              expect(nativeFs.readFileSync(file, "utf8")).not.toBe(original);
+              expect(yield* git(f.primary, ["symbolic-ref", "HEAD"])).toBe(
+                "refs/heads/feature/admission",
+              );
+              expect(yield* git(f.primary, ["rev-parse", "HEAD"])).toBe(f.baseOid);
+            }
+            expect((yield* f.sql.withTransaction(revalidate).pipe(Effect.result))._tag).toBe(
+              "Failure",
+            );
+            expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
+          }),
+        );
+      }),
+    ),
+  );
+}
+
+for (const alias of ["loose-parent", "packed-file"] as const) {
+  it.effect(`refuses packed refs with ${alias} symlink`, () =>
+    withServices(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* git(f.primary, ["branch", "-m", "feature/admission"]);
+        yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+        if (alias === "loose-parent") {
+          nativeFs.symlinkSync(f.root, f.primary + "/.git/refs/heads/feature");
+        } else {
+          nativeFs.renameSync(f.primary + "/.git/packed-refs", f.root + "/foreign-packed");
+          nativeFs.symlinkSync(f.root + "/foreign-packed", f.primary + "/.git/packed-refs");
+        }
+        expect((yield* f.service.read({ state: f.state, taskId: f.taskId }))._tag).toBe("Blocked");
+        expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
+      }),
+    ),
+  );
+}
+
+it.effect("refuses packed metadata changed during its bounded owned read", () =>
+  withServices(
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* git(f.primary, ["branch", "-m", "feature/admission"]);
+      yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+      const filename = f.primary + "/.git/packed-refs";
+      const target = nativeFs.statSync(filename, { bigint: true });
+      const originalRead = nativeFs.readSync;
+      let changed = false;
+      const intercepted = vi.spyOn(nativeFs, "readSync").mockImplementation((...args) => {
+        const stat = nativeFs.fstatSync(args[0], { bigint: true });
+        if (!changed && stat.dev === target.dev && stat.ino === target.ino) {
+          changed = true;
+          nativeFs.writeFileSync(
+            filename,
+            nativeFs.readFileSync(filename, "utf8").replace("sorted", "sorted sorted"),
+          );
+        }
+        return originalRead(...args);
+      });
+      const read = yield* f.service
+        .read({ state: f.state, taskId: f.taskId })
+        .pipe(Effect.ensuring(Effect.sync(() => intercepted.mockRestore())));
+      expect(changed).toBe(true);
+      expect(read._tag).toBe("Blocked");
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
+    }),
+  ),
+);
+
+for (const required of ["config", "HEAD"] as const) {
+  it.effect(`refuses absent required ${required} with packed refs`, () =>
+    withServices(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* git(f.primary, ["branch", "-m", "feature/admission"]);
+        yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+        nativeFs.unlinkSync(f.primary + "/.git/" + required);
+        expect((yield* f.service.read({ state: f.state, taskId: f.taskId }))._tag).toBe("Blocked");
+      }),
+    ),
+  );
+}
+
+it.effect("invalidates an existing loose-ref snapshot when the same branch becomes packed", () =>
+  withServices(
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      yield* git(f.primary, ["branch", "-m", "feature/admission"]);
+      yield* f.service.withCurrent({ state: f.state, taskId: f.taskId }, (_, revalidate) =>
+        Effect.gen(function* () {
+          yield* git(f.primary, ["pack-refs", "--all", "--prune"]);
+          expect(yield* git(f.primary, ["symbolic-ref", "HEAD"])).toBe(
+            "refs/heads/feature/admission",
+          );
+          expect(yield* git(f.primary, ["rev-parse", "HEAD"])).toBe(f.baseOid);
+          expect((yield* f.sql.withTransaction(revalidate).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+        }),
+      );
+      expect((yield* f.service.read({ state: f.state, taskId: f.taskId }))._tag).toBe("Facts");
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
     }),
   ),
 );

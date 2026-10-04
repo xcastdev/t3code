@@ -481,7 +481,8 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
           reject("Git metadata uses unsupported foreign storage");
       return ["config", "HEAD", "packed-refs", baseRef].map((relative) => {
         const filename = path.join(common, relative);
-        physical(path.dirname(filename));
+        // Packing refs can remove optional loose-ref directories; existing ancestors stay physical.
+        physical(path.dirname(filename), relative !== "config" && relative !== "HEAD");
         const stat = nativeFs.lstatSync(filename, { bigint: true, throwIfNoEntry: false });
         if (stat === undefined) {
           if (relative === "config" || relative === "HEAD")
