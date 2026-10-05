@@ -37,6 +37,7 @@ import { useWorkFoundation } from "./useWorkFoundation";
 import { createWorkActionSession, reviewMobileWork, type MobileWorkCurrent } from "./workActions";
 import { WorkQuestions, WorkTeam } from "./WorkTeam";
 import { WorkEvidence } from "./WorkEvidence";
+import { WorkSupervisionSource } from "./WorkSupervisionSource";
 
 const decodeContext = Schema.decodeUnknownOption(ProjectWorkTaskContext);
 const isIssue = Schema.is(ProjectIssueIntakeRead);
@@ -194,6 +195,8 @@ function ProjectWorkSession({
   const foundation = useWorkFoundation(target, foundationSupported);
   const [foundationOwner] = useState(() => target);
   const [showEvidence, setShowEvidence] = useState(false);
+  const [showSupervision, setShowSupervision] = useState(false);
+  const focused = useIsFocused();
   const [offset, setOffset] = useState(0);
   const [issuePage, setIssuePage] = useState(0);
   const query = useEnvironmentQuery(
@@ -244,10 +247,51 @@ function ProjectWorkSession({
       ) : null}
       {query.error ? <Notice>{query.error}</Notice> : null}
       {foundation.error ? <Notice>{foundation.error}</Notice> : null}
-      <WorkButton onPress={() => setShowEvidence((visible) => !visible)}>
+      <WorkButton
+        onPress={() => {
+          setShowSupervision(false);
+          setShowEvidence((visible) => !visible);
+        }}
+      >
         {showEvidence ? "Show project work" : "Show evidence"}
       </WorkButton>
-      {showEvidence ? (
+      <WorkButton
+        onPress={() => {
+          setShowEvidence(false);
+          setShowSupervision((visible) => !visible);
+        }}
+      >
+        {showSupervision ? "Show project work" : "Show supervision"}
+      </WorkButton>
+      {showSupervision ? (
+        <WorkSupervisionSource
+          {...target}
+          title={project?.title ?? String(target.projectId)}
+          connected={focused && runtime?.connectionState === "connected"}
+          enabled={supported}
+          supported={config?.environment.capabilities.projectTeamSupervisionReads === true}
+          onOpenTask={(owner) => {
+            const taskId = Option.getOrNull(decodeTaskId(owner.taskId));
+            if (
+              taskId &&
+              owner.environmentId === target.environmentId &&
+              owner.projectId === target.projectId
+            )
+              openTask(taskId);
+          }}
+          onOpenWorker={(owner) => {
+            if (
+              owner.environmentId === target.environmentId &&
+              owner.projectId === target.projectId
+            )
+              navigation.navigate("Thread", {
+                environmentId: owner.environmentId,
+                threadId: owner.threadId,
+              });
+          }}
+          onInspectProject={() => setShowSupervision(false)}
+        />
+      ) : showEvidence ? (
         <WorkEvidence
           target={target}
           foundationOwner={foundationOwner}
