@@ -4,6 +4,7 @@ import {
   type ProjectWorkWriteIntent,
   ProjectTeamWriteIntent,
   ProjectTeamGuidedIntent,
+  ProjectTeamSupervisionSummary,
   type ProjectWorkAttribution,
   type ProjectWorkCommand,
   type ProjectWorkCriterion,
@@ -318,6 +319,41 @@ const sanitizePublicValue = (value: unknown, depth = 0, foundation = false): unk
       .map(([key, entry]) => [key, sanitizePublicValue(entry, depth + 1, foundation)]),
   );
 };
+
+const decodeSupervision = Schema.decodeUnknownEffect(ProjectTeamSupervisionSummary);
+const SUPERVISION_CAPTIONS = new Set(["name", "title", "reason"]);
+const SUPERVISION_IDENTITY = /\.(?:[A-Za-z]*Id|availability)$/u;
+
+// Redaction may expand a short secret. Bound display text after that expansion,
+// without changing the authoritative identities used by inspection links.
+const boundSupervisionText = (value: unknown, key = ""): unknown => {
+  if (typeof value === "string") {
+    const limit = SUPERVISION_CAPTIONS.has(key) ? 240 : 4_000;
+    if (value.length <= limit) return value;
+    const bounded = value.slice(0, limit);
+    const last = bounded.charCodeAt(bounded.length - 1);
+    return last >= 0xd800 && last <= 0xdbff ? bounded.slice(0, -1) : bounded;
+  }
+  if (Array.isArray(value)) return value.map((entry) => boundSupervisionText(entry));
+  if (value !== null && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, entry]) => entry !== undefined)
+        .map(([key, entry]) => [key, boundSupervisionText(entry, key)]),
+    );
+  return value;
+};
+const publicSupervision = Effect.fn("ProjectWorkGateway.publicSupervision")(function* (
+  value: unknown,
+  redactions: ReadonlyArray<string>,
+) {
+  const changedIdentities = redactions.filter((path) => SUPERVISION_IDENTITY.test(path));
+  if (changedIdentities.length > 0)
+    return yield* new ProjectWorkContentRejectedError({
+      matches: changedIdentities.map((path) => ({ path, kind: "redacted-identity" })),
+    });
+  return yield* decodeSupervision(boundSupervisionText(value));
+});
 
 const makeProjectWorkGateway = Effect.gen(function* () {
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
@@ -677,21 +713,18 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     if (boundedInput.operation === "export-json") return shaped;
     return shaped.pipe(
       Effect.flatMap((value: unknown) =>
-        contentGuard._tag === "Some"
-          ? contentGuard.value
-              .redact(value)
-              .pipe(
-                Effect.map(({ value: redacted }) =>
+        (contentGuard._tag === "Some"
+          ? contentGuard.value.redact(value)
+          : Effect.succeed(redactProjectWorkContent(value))
+        ).pipe(
+          Effect.flatMap(({ value: redacted, redactions }) =>
+            boundedInput.operation === "supervision"
+              ? publicSupervision(sanitizePublicValue(redacted), redactions)
+              : Effect.succeed(
                   sanitizePublicValue(redacted, 0, boundedInput.operation === "foundation-records"),
                 ),
-              )
-          : Effect.succeed(
-              sanitizePublicValue(
-                redactProjectWorkContent(value).value,
-                0,
-                boundedInput.operation === "foundation-records",
-              ),
-            ),
+          ),
+        ),
       ),
     );
   };
