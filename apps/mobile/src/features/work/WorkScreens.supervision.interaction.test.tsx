@@ -257,6 +257,21 @@ async function click(label: string) {
 }
 
 describe("actual project screen supervision read", () => {
+  it("withholds navigation for a non-finite receive timestamp without a render loop", async () => {
+    first = Atom.make<AsyncResult.AsyncResult<unknown, unknown>>(
+      AsyncResult.success(available, { timestamp: Number.NaN }),
+    );
+    await render();
+    await click("Show supervision");
+    expect(host.textContent).toContain("Coordinator Alpha");
+    expect(host.textContent).toContain("Receive age unavailable: invalid or future receive time.");
+    expect(host.textContent).toContain("Cached or unavailable summary");
+    expect(host.textContent).not.toContain("Current recorded summary");
+    expect(host.textContent).not.toContain("Inspect task task-1");
+    expect(host.textContent).not.toContain("Inspect worker worker-1");
+    expect(fixture.navigate).not.toHaveBeenCalled();
+    expect(fixture.command).not.toHaveBeenCalled();
+  });
   it("opens bounded supervision lazily and returns to work", async () => {
     await render();
     expect(fixture.supervision).not.toHaveBeenCalled();

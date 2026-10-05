@@ -62,7 +62,9 @@ function SupervisionRead(props: Props) {
   if (
     success &&
     decoded &&
-    (!saved || saved.raw !== success.value || saved.snapshot.receivedAt !== success.timestamp)
+    (!saved ||
+      saved.raw !== success.value ||
+      !Object.is(saved.snapshot.receivedAt, success.timestamp))
   ) {
     save({
       raw: success.value,
