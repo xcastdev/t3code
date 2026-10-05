@@ -97,6 +97,7 @@ function PortfolioPageRead({
       onPrevious={() => setPage(Math.max(0, page - 1))}
       onNext={() => setPage(Math.min(lastPage, page + 1))}
       onRefresh={() => registry.refresh(environmentProjects.projectsAtom)}
+      canRefreshProject={currentWork}
       onOpenProject={(target) => openProject(target)}
       onOpenTask={(target) => openTask(target)}
       onOpenWorker={(target) => openWorker(target)}

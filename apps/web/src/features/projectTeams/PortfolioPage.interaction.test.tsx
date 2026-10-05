@@ -211,6 +211,46 @@ describe("mounted bounded Portfolio project catalogue", () => {
     if (typeof handler !== "function") throw new Error("Missing mounted callback");
     return () => handler({});
   }
+  it("refreshes a live owner's query", async () => {
+    await render([project(0)]);
+    reads.clear();
+    await click("Refresh portfolio");
+    expect(reads.size).toBe(1);
+  });
+  it.each(["disabled", "unsupported", "removed", "disconnected"])(
+    "does not refresh a retained owner's query after it is %s before commit",
+    async (change) => {
+      await render([project(0)]);
+      const refresh = held("Refresh portfolio");
+      reads.clear();
+      await act(async () => {
+        if (change === "removed") registry.set(fixture.projects, []);
+        else if (change === "disconnected") {
+          registry.set(
+            fixture.environments,
+            new Map([[environmentId, { connection: { phase: "disconnected" } }]]),
+          );
+        } else {
+          registry.set(
+            fixture.configs,
+            new Map([
+              [
+                environmentId,
+                {
+                  settings: { projectWorkEnabled: change !== "disabled" },
+                  environment: {
+                    capabilities: { projectTeamSupervisionReads: change !== "unsupported" },
+                  },
+                },
+              ],
+            ]),
+          );
+        }
+        refresh();
+      });
+      expect(reads.size).toBe(0);
+    },
+  );
   it("subscribes only to the visible25 unique owners and advances to the remaining owner", async () => {
     const projects = Array.from({ length: 26 }, (_, index) => project(index));
     await render([projects[0]!, ...projects]);
