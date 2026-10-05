@@ -33,6 +33,8 @@ import {
   type ProjectWorkWriteTarget,
   PROJECT_WORK_PAGE_SIZE,
   asProjectWorkArray,
+  asProjectTeamSupervisionSummary,
+  projectTeamSupervisionAvailable,
   asProjectWorkFoundationPage,
   combineProjectWorkFoundationPages,
   asProjectWorkBriefing,
@@ -659,6 +661,214 @@ describe("foundation page transport", () => {
           limit: 128,
           cursor: "opaque",
         });
+      }),
+    ),
+  );
+});
+
+const supervisionSummary = (owner = projectId) => ({
+  projectId: owner,
+  availability: "available",
+  revision: 20,
+  taskCounts: {
+    draft: 0,
+    specified: 0,
+    ready: 1,
+    "in-progress": 0,
+    blocked: 0,
+    "in-review": 0,
+    completed: 0,
+    failed: 0,
+    canceled: 0,
+    unknown: 0,
+    total: 1,
+  },
+  missions: { items: [], hasMore: false },
+  bindings: { items: [], hasMore: false },
+  blockers: { items: [], hasMore: false },
+  questions: { items: [], hasMore: false },
+});
+
+describe("supervision snapshot bounds and compatibility", () => {
+  it.each([undefined, false])("never probes a server with capability %s", (capability) => {
+    expect(
+      projectTeamSupervisionAvailable({ enabled: true, capability, connectionPhase: "connected" }),
+    ).toBe(false);
+  });
+  it.each(["available", "offline", "connecting", "backoff", "blocked"])(
+    "never probes a %s environment",
+    (connectionPhase) => {
+      expect(
+        projectTeamSupervisionAvailable({ enabled: true, capability: true, connectionPhase }),
+      ).toBe(false);
+    },
+  );
+  it("requires the enabled feature and an affirmative connected capability", () => {
+    expect(
+      projectTeamSupervisionAvailable({
+        enabled: false,
+        capability: true,
+        connectionPhase: "connected",
+      }),
+    ).toBe(false);
+    expect(
+      projectTeamSupervisionAvailable({
+        enabled: true,
+        capability: true,
+        connectionPhase: "connected",
+      }),
+    ).toBe(true);
+  });
+  it("decodes an exact-owner summary while removing unselected body/config fields", () => {
+    const summary = supervisionSummary();
+    expect(
+      asProjectTeamSupervisionSummary(
+        { ...summary, body: "private", configuration: { token: "private" } },
+        projectId,
+      ),
+    ).toEqual(summary);
+    expect(
+      asProjectTeamSupervisionSummary(supervisionSummary(ProjectId.make("foreign")), projectId),
+    ).toBeNull();
+    expect(
+      asProjectTeamSupervisionSummary({ ...summary, projectId: ` ${projectId} ` }, projectId),
+    ).toBeNull();
+  });
+  it.each(["missing", "deleted", "archived", "tombstoned", "unsupported"])(
+    "preserves %s availability without records",
+    (availability) => {
+      expect(
+        asProjectTeamSupervisionSummary({ ...supervisionSummary(), availability }, projectId),
+      ).toEqual({ projectId, availability });
+    },
+  );
+  it("rejects invalid, overflowing and inconsistent counts", () => {
+    for (const count of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN]) {
+      const summary = supervisionSummary();
+      expect(
+        asProjectTeamSupervisionSummary(
+          { ...summary, taskCounts: { ...summary.taskCounts, ready: count } },
+          projectId,
+        ),
+      ).toBeNull();
+    }
+    const summary = supervisionSummary();
+    expect(
+      asProjectTeamSupervisionSummary(
+        { ...summary, taskCounts: { ...summary.taskCounts, total: 2 } },
+        projectId,
+      ),
+    ).toBeNull();
+  });
+  it("rejects a future or repeated physical metadata identity", () => {
+    const mission = {
+      recordId: "mission",
+      revision: 20,
+      generation: 0,
+      status: "future-status",
+      supported: false,
+      title: "Mission",
+    };
+    const summary = supervisionSummary();
+    expect(
+      asProjectTeamSupervisionSummary(
+        { ...summary, missions: { items: [mission], hasMore: true } },
+        projectId,
+      ),
+    ).toMatchObject({ missions: { items: [mission], hasMore: true } });
+    expect(
+      asProjectTeamSupervisionSummary(
+        { ...summary, missions: { items: [{ ...mission, revision: 21 }], hasMore: false } },
+        projectId,
+      ),
+    ).toBeNull();
+    expect(
+      asProjectTeamSupervisionSummary(
+        { ...summary, missions: { items: [mission, mission], hasMore: false } },
+        projectId,
+      ),
+    ).toBeNull();
+  });
+  it("rejects foreign profile revision even when a binding is bounded", () => {
+    const summary = supervisionSummary();
+    const profile = {
+      recordId: "role",
+      revision: 21,
+      generation: 0,
+      status: "available",
+      supported: true,
+      roleId: "role",
+      roleRevision: 1,
+      role: "implementer",
+      model: "profile-model",
+    };
+    expect(
+      asProjectTeamSupervisionSummary(
+        {
+          ...summary,
+          coordinator: {
+            recordId: "coordinator",
+            revision: 20,
+            generation: 0,
+            status: "active",
+            supported: true,
+            name: "Coordinator",
+            roleRevisionId: "role",
+            profile,
+          },
+        },
+        projectId,
+      ),
+    ).toBeNull();
+  });
+  it.effect("disabled or unsupported atom mounts perform no transport reads", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { registry, atoms, reads } = yield* makeFoundationHarness();
+        for (const state of [
+          { enabled: true, capability: undefined, connectionPhase: "connected" },
+          { enabled: true, capability: false, connectionPhase: "connected" },
+          { enabled: false, capability: true, connectionPhase: "connected" },
+          { enabled: true, capability: true, connectionPhase: "offline" },
+        ]) {
+          const atom = atoms.supervision({ environmentId, projectId, ...state });
+          const unmount = registry.mount(atom);
+          expect(AsyncResult.isInitial(registry.get(atom))).toBe(true);
+          unmount();
+        }
+        expect(reads).toEqual([]);
+      }),
+    ),
+  );
+  it.effect("enabled reads keep environment/project cache identity and bounded operation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { registry, atoms, reads } = yield* makeFoundationHarness();
+        const state = {
+          enabled: true,
+          capability: true,
+          connectionPhase: "connected",
+          poll: false,
+        };
+        const targets = [
+          { environmentId, projectId, ...state },
+          { environmentId: otherEnvironmentId, projectId, ...state },
+          { environmentId, projectId: ProjectId.make("second-project"), ...state },
+        ];
+        for (const target of targets) {
+          const atom = atoms.supervision(target);
+          expect(atoms.supervision({ ...target })).toBe(atom);
+          yield* awaitFoundationRead(registry, atom);
+        }
+        expect(reads).toEqual(
+          targets.map((target) => ({
+            environmentId: target.environmentId,
+            input: { projectId: target.projectId, operation: "supervision" },
+          })),
+        );
+        expect(atoms.supervision({ ...targets[0]!, poll: true })).not.toBe(
+          atoms.supervision(targets[0]!),
+        );
       }),
     ),
   );

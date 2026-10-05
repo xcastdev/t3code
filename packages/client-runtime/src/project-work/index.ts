@@ -14,13 +14,17 @@ import type {
   ProjectWorkTaskContext,
   ProjectWorkWriteResult,
 } from "@t3tools/contracts";
-import { ProjectTeamRecordPage, WS_METHODS } from "@t3tools/contracts";
+import {
+  ProjectTeamRecordPage,
+  ProjectTeamSupervisionSummary,
+  WS_METHODS,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
-import { Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import type { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -192,6 +196,55 @@ export function asProjectWorkFoundationPage(
   return { ...page, ...cursor.value };
 }
 
+const decodeSupervisionSummary = Schema.decodeUnknownOption(ProjectTeamSupervisionSummary);
+
+/** Decode bounded metadata only for the exact requested project and revision fence. */
+export function asProjectTeamSupervisionSummary(
+  value: unknown,
+  projectId: ProjectId,
+): ProjectTeamSupervisionSummary | null {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !("projectId" in value) ||
+    value.projectId !== projectId
+  )
+    return null;
+  const decoded = decodeSupervisionSummary(value);
+  if (Option.isNone(decoded)) return null;
+  const summary = decoded.value;
+  if (summary.availability !== "available") return summary;
+  const { total, ...counts } = summary.taskCounts;
+  const sum = Object.values(counts).reduce((count, next) => count + next, 0);
+  if (!Number.isSafeInteger(sum) || sum !== total) return null;
+  const coherent = (record: { readonly revision: number }) => record.revision <= summary.revision;
+  for (const page of [summary.missions, summary.bindings, summary.blockers, summary.questions]) {
+    const ids = new Set<string>();
+    for (const record of page.items) {
+      if (!coherent(record) || ids.has(record.recordId)) return null;
+      ids.add(record.recordId);
+    }
+  }
+  for (const record of [summary.coordinator, ...summary.bindings.items]) {
+    if (record === undefined) continue;
+    if (
+      !coherent(record) ||
+      ("profile" in record && record.profile !== undefined && !coherent(record.profile))
+    )
+      return null;
+  }
+  return summary;
+}
+
+/** Never probe an older server or start work reads for an unavailable environment. */
+export function projectTeamSupervisionAvailable(input: {
+  readonly enabled: boolean;
+  readonly capability: boolean | undefined;
+  readonly connectionPhase: string;
+}): boolean {
+  return input.enabled && input.capability === true && input.connectionPhase === "connected";
+}
+
 type ProjectWorkFoundationPageError =
   | "invalid-page"
   | "revision-changed"
@@ -356,6 +409,15 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
   const exportJson = read("environment-data:project-work:export-json");
   const exportMarkdown = read("environment-data:project-work:export-markdown");
 
+  const supervisionRead = read("environment-data:project-work:supervision");
+  const unavailableSupervision = Atom.make(AsyncResult.initial<unknown>());
+  const pollingSupervision = Atom.family((key: string) => {
+    const [environmentId, input] = JSON.parse(key) as [EnvironmentId, ProjectWorkReadIntent];
+    return supervisionRead({ environmentId, input }).pipe(
+      Atom.withRefresh(PROJECT_WORK_REFRESH_INTERVAL_MS),
+    );
+  });
+
   const foundationRead = read("environment-data:project-work:foundation-page");
   const foundationFamily = Atom.family((key: string) => {
     const [environmentId, projectId, cursor] = JSON.parse(key) as [
@@ -448,6 +510,23 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
   });
 
   return {
+    supervision: (
+      target: ProjectWorkReadTarget & {
+        readonly enabled: boolean;
+        readonly capability: boolean | undefined;
+        readonly connectionPhase: string;
+        readonly poll?: boolean;
+      },
+    ) => {
+      if (!projectTeamSupervisionAvailable(target)) return unavailableSupervision;
+      const rpcTarget = {
+        environmentId: target.environmentId,
+        input: { projectId: target.projectId, operation: "supervision" as const },
+      };
+      return target.poll === false
+        ? supervisionRead(rpcTarget)
+        : pollingSupervision(environmentRpcKey(rpcTarget));
+    },
     briefing: (target: ProjectWorkReadTarget & { readonly poll?: boolean }) => {
       const input = { ...inputFor(target.projectId, "briefing"), kind: "standard" } as const;
       const rpcTarget = { environmentId: target.environmentId, input };
