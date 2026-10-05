@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
+import { useNavigate } from "@tanstack/react-router";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
-import type { EnvironmentId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
+import { ProjectWorkTaskId, type EnvironmentId, type ProjectId } from "@t3tools/contracts";
 import {
   BookOpenIcon,
   BrainIcon,
@@ -33,6 +34,7 @@ import { Team } from "../../features/projectTeams/Team";
 import { Inbox } from "../../features/projectTeams/Inbox";
 import { Memory } from "../../features/projectTeams/Memory";
 import { Evidence } from "../../features/projectTeams/Evidence";
+import { WorkSupervisionSource } from "./WorkSupervisionSource";
 
 const TAB_ITEMS: ReadonlyArray<{
   readonly id: WorkTab;
@@ -40,6 +42,7 @@ const TAB_ITEMS: ReadonlyArray<{
   readonly icon: typeof PanelTopIcon;
 }> = [
   { id: "overview", label: "Overview", icon: PanelTopIcon },
+  { id: "supervision", label: "Supervision", icon: UsersIcon },
   { id: "tasks", label: "Tasks", icon: ListTodoIcon },
   { id: "team", label: "Team", icon: UsersIcon },
   { id: "inbox", label: "Inbox", icon: InboxIcon },
@@ -187,6 +190,19 @@ function ProjectWorkPage({
                 connected={connected}
                 streamAvailable={!poll}
               />
+            ) : tab === "supervision" ? (
+              <ProjectSupervision
+                environmentId={environmentId}
+                projectId={projectId}
+                title={projectTitle}
+                connected={connected}
+                enabled={enabled}
+                supported={
+                  serverConfig?.environment?.capabilities?.projectTeamSupervisionReads === true
+                }
+                onOpenTask={openTask}
+                onInspectProject={() => setTab("team")}
+              />
             ) : tab === "tasks" ? (
               <WorkTasks
                 key={`${environmentId}:${projectId}:tasks`}
@@ -266,6 +282,47 @@ function ProjectWorkPage({
         )}
       </WorkspacePageContainer>
     </SidebarInset>
+  );
+}
+
+function ProjectSupervision({
+  environmentId,
+  projectId,
+  onOpenTask,
+  onInspectProject,
+  ...props
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly title: string;
+  readonly connected: boolean;
+  readonly enabled: boolean;
+  readonly supported: boolean;
+  readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
+  readonly onInspectProject: () => void;
+}) {
+  const navigate = useNavigate();
+  const owns = (target: { readonly environmentId: EnvironmentId; readonly projectId: ProjectId }) =>
+    target.environmentId === environmentId && target.projectId === projectId;
+  return (
+    <WorkSupervisionSource
+      {...props}
+      environmentId={environmentId}
+      projectId={projectId}
+      onOpenTask={(target) => {
+        if (owns(target)) onOpenTask(ProjectWorkTaskId.make(target.taskId));
+      }}
+      onOpenWorker={(target) => {
+        if (owns(target))
+          void navigate({
+            to: "/$environmentId/$threadId",
+            params: { environmentId, threadId: target.threadId },
+          });
+      }}
+      onInspectProject={(target) => {
+        if (owns(target)) onInspectProject();
+      }}
+    />
   );
 }
 

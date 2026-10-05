@@ -11,6 +11,7 @@ import {
 describe("work presentation", () => {
   it("recognizes project Work supervision tabs", () => {
     expect(isWorkTab("overview")).toBe(true);
+    expect(isWorkTab("supervision")).toBe(true);
     expect(isWorkTab("tasks")).toBe(true);
     expect(isWorkTab("knowledge")).toBe(true);
     expect(isWorkTab("team")).toBe(true);
