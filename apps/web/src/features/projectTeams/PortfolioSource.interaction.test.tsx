@@ -456,6 +456,54 @@ describe("mounted Portfolio page query source", () => {
     await click("Refresh portfolio");
     expect([...reads.values()].every((count) => count === 2)).toBe(true);
   });
+  for (const [name, result] of [
+    ["Initial", AsyncResult.initial()],
+    ["waiting Success", AsyncResult.success(summary, { timestamp: receivedAt, waiting: true })],
+    [
+      "waiting Failure",
+      AsyncResult.failure(Cause.fail("unavailable"), {
+        waiting: true,
+        previousSuccess: Option.some(AsyncResult.success(summary, { timestamp: receivedAt })),
+      }),
+    ],
+  ] as const) {
+    it(`fences held top controls during a precommit ${name} registry update`, async () => {
+      await render();
+      const refresh = held("Refresh portfolio"),
+        previous = held("Previous portfolio page"),
+        next = held("Next portfolio page");
+      const refreshQuery = vi.spyOn(registry, "refresh");
+      await act(async () => {
+        registry.set(states.get(ownerKey(owner))!, result);
+        refresh();
+        previous();
+        next();
+      });
+      expect({
+        queryRefresh: refreshQuery.mock.calls.length,
+        parentRefresh: vi.mocked(props.onRefresh).mock.calls.length,
+        previous: vi.mocked(props.onPrevious).mock.calls.length,
+        next: vi.mocked(props.onNext).mock.calls.length,
+      }).toEqual({ queryRefresh: 0, parentRefresh: 0, previous: 0, next: 0 });
+    });
+  }
+  it("allows held top controls after a committed nonwaiting read failure", async () => {
+    await render();
+    const refresh = held("Refresh portfolio"),
+      previous = held("Previous portfolio page"),
+      next = held("Next portfolio page");
+    await update(AsyncResult.failure(Cause.fail("unavailable")));
+    const refreshQuery = vi.spyOn(registry, "refresh");
+    await act(async () => {
+      refresh();
+      previous();
+      next();
+    });
+    expect(refreshQuery).toHaveBeenCalledExactlyOnceWith(queries.get(ownerKey(owner)));
+    expect(props.onRefresh).toHaveBeenCalledOnce();
+    expect(props.onPrevious).toHaveBeenCalledOnce();
+    expect(props.onNext).toHaveBeenCalledOnce();
+  });
   it("fences actual registry changes before a newer React commit", async () => {
     await render();
     const task = held("Inspect task task-1"),
