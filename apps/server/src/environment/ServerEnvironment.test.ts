@@ -165,6 +165,7 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
       expect(first.environmentId).toBe(second.environmentId);
       expect(second.capabilities.repositoryIdentity).toBe(true);
       expect(second.capabilities.projectTeamGuidedWrites).toBe(true);
+      expect(second.capabilities.projectTeamSupervisionReads).toBe(true);
       expect(second.capabilities.projectTeamExecution).toBe(false);
       expect(second.capabilities.connectionProbe).toBe(true);
       expect(second.capabilities.attachmentUploads).toBe(true);
