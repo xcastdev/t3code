@@ -38,6 +38,7 @@ import {
   redactProjectWorkContent,
 } from "./ProjectWorkContentGuard.ts";
 import * as ProjectWorkQuery from "./ProjectWorkQuery.ts";
+import { readProjectTeamSupervision } from "./ProjectTeamSupervisionRead.ts";
 import * as ProjectWorkRepository from "./ProjectWorkRepository.ts";
 import * as ProjectWorkSearch from "./ProjectWorkSearch.ts";
 import * as ProjectLifecycle from "../project/ProjectLifecycle.ts";
@@ -416,6 +417,15 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     };
     const result: Effect.Effect<unknown, ProjectionRepositoryError> = (() => {
       switch (boundedInput.operation) {
+        case "supervision":
+          return Effect.gen(function* () {
+            const settings = yield* serverSettings.getSettings.pipe(
+              Effect.mapError(toPersistenceSqlError("ProjectWorkGateway.read")),
+            );
+            if (!settings.projectWorkEnabled)
+              return { ...base, availability: "unsupported" as const };
+            return yield* readProjectTeamSupervision(sql, base);
+          });
         case "issue-comments":
           return Effect.fail(
             toPersistenceSqlError("ProjectWorkGateway.read")(
