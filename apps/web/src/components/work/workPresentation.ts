@@ -2,6 +2,7 @@ import type { ProjectWorkTaskRead } from "@t3tools/contracts";
 
 export const WORK_TABS = [
   "overview",
+  "supervision",
   "tasks",
   "team",
   "inbox",
