@@ -14,6 +14,20 @@ import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+const callbacks = vi.hoisted(() => new Map<string, () => void>());
+vi.mock("../ui/button", async (original) => {
+  const actual = await original<typeof import("../ui/button")>();
+  return {
+    ...actual,
+    Button: (props: React.ComponentProps<typeof actual.Button>) => {
+      const label = Array.isArray(props.children) ? props.children.join("") : props.children;
+      if (typeof label === "string" && props.onClick)
+        callbacks.set(label, () => props.onClick?.({} as React.MouseEvent<HTMLButtonElement>));
+      return <actual.Button {...props} />;
+    },
+  };
+});
+
 import { GuidedTaskDetail } from "./GuidedTaskDetail";
 
 const at = "2026-10-01T10:00:00.000Z";
@@ -245,6 +259,7 @@ describe("GuidedTaskDetail human interactions", () => {
 
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    callbacks.clear();
     current = context();
     foundation = records(current);
     emitted = [];
@@ -310,6 +325,186 @@ describe("GuidedTaskDetail human interactions", () => {
     select.value = value;
     await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
   }
+
+  it("requests reassignment with the explicitly selected member revision and human reason", async () => {
+    foundation = [
+      ...foundation,
+      decodeRecord({
+        projectId,
+        revision: 7,
+        generation: 0,
+        updatedAt: at,
+        recordId: "successor",
+        kind: "member",
+        status: "active",
+        name: "Next worker",
+        coordinator: true,
+        roleRevisionId: "unrestricted-role",
+      }),
+    ];
+    await render();
+    await action("reassign");
+    const recipient = host.querySelector<HTMLSelectElement>(
+      'select[aria-label="Reassignment recipient"]',
+    );
+    expect(recipient).not.toBeNull();
+    if (!recipient) return;
+    recipient.value = JSON.stringify(["successor", 7]);
+    await act(async () => recipient.dispatchEvent(new Event("change", { bubbles: true })));
+    await fill("Control reason", "Continue with the available teammate");
+    await click("Apply reassign");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.task.control",
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      control: {
+        action: "reassign",
+        reason: "Continue with the available teammate",
+        recipientMemberId: "successor",
+        expectedMemberRevision: 7,
+      },
+    });
+  });
+
+  it("denies a retained task control callback after disconnect and owner replacement", async () => {
+    await render();
+    await action("pause");
+    await fill("Control reason", "Review the ownership");
+    const retained = callbacks.get("Apply pause");
+    expect(retained).toBeDefined();
+    await render({ connected: false });
+    await act(async () => retained?.());
+    expect(emitted).toEqual([]);
+    await render({ environmentId: EnvironmentId.make("other-owner") });
+    await act(async () => retained?.());
+    expect(emitted).toEqual([]);
+  });
+
+  async function selectMember(revision = 7) {
+    const select = host.querySelector<HTMLSelectElement>(
+      'select[aria-label="Reassignment recipient"]',
+    );
+    if (!select) throw Error("Missing reassignment recipient");
+    select.value = JSON.stringify(["successor", revision]);
+    await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
+  }
+  function member(revision = 7, status = "active") {
+    return decodeRecord({
+      projectId,
+      revision,
+      generation: 0,
+      updatedAt: at,
+      recordId: "successor",
+      kind: "member",
+      status,
+      name: "Next worker",
+      coordinator: true,
+      roleRevisionId: "any-role",
+    });
+  }
+  it.each([
+    "revision",
+    "missing",
+    "inactive",
+    "duplicate",
+    "incomplete",
+    "disconnected",
+    "foreign",
+  ])("requires recipient review after %s changes", async (change) => {
+    foundation = [...foundation, member()];
+    await render();
+    await action("reassign");
+    await selectMember();
+    await fill("Control reason", "Preserve ownership history");
+    const retained = callbacks.get("Apply reassign");
+    expect(retained).toBeDefined();
+    if (change === "revision") foundation = [...records(current), member(8)];
+    if (change === "missing") foundation = records(current);
+    if (change === "inactive") foundation = [...records(current), member(7, "paused")];
+    if (change === "duplicate") foundation = [...foundation, member()];
+    if (change === "foreign")
+      foundation = [...records(current), decodeRecord({ ...member(), projectId: "foreign" })];
+    await render({
+      foundationComplete: change !== "incomplete",
+      connected: change !== "disconnected",
+    });
+    await act(async () => retained?.());
+    expect(button("Apply reassign").disabled).toBe(true);
+    await click("Apply reassign");
+    expect(emitted).toEqual([]);
+    if (change === "revision") {
+      expect(host.textContent).toContain("Recipient changed");
+      await selectMember(8);
+      expect(button("Apply reassign").disabled).toBe(true);
+      await click("Keep edits against reviewed revisions");
+      await click("Apply reassign");
+      expect(emitted[0]).toMatchObject({
+        control: {
+          recipientMemberId: "successor",
+          expectedMemberRevision: 8,
+          reason: "Preserve ownership history",
+        },
+      });
+    }
+  });
+  it("shows retained requested ownership beside settled worker history and withholds unresolved Resume", async () => {
+    foundation = records(current).map((record) =>
+      record.kind === "task-membership"
+        ? decodeRecord({
+            ...record,
+            controlState: "paused",
+            requestedSuccessorMemberId: "successor",
+          })
+        : record,
+    );
+    foundation = [...foundation, member(), ...workerRecords({ status: "settled" })];
+    await render();
+    expect(host.textContent).toContain("Task controls · paused");
+    expect(host.textContent).toContain("Requested successor: Next worker · successor");
+    expect(host.textContent).toContain("frozen-model · settled");
+    expect(host.querySelector("a")?.getAttribute("href")).toBe("/environment-1/worker%2Fthread");
+    await action("resume");
+    await fill("Control reason", "Review after drain");
+    expect(button("Apply resume").disabled).toBe(false);
+    foundation = foundation.filter((record) => record.recordId !== "successor");
+    await render();
+    expect(host.textContent).toContain("Requested successor: successor · successor");
+    expect(button("Apply resume").disabled).toBe(true);
+    const retained = callbacks.get("Apply resume");
+    await act(async () => retained?.());
+    expect(emitted).toEqual([]);
+  });
+  it("retries the original reassignment envelope after its response is lost and paused history arrives", async () => {
+    foundation = [...foundation, member()];
+    write.mockImplementationOnce(async (intent) => {
+      emitted.push(decodeWrite(intent));
+      throw Error("lost response");
+    });
+    await render();
+    await action("reassign");
+    await selectMember();
+    await fill("Control reason", "Preserve history");
+    await click("Apply reassign");
+    const original = emitted[0];
+    current = decodeContext({ ...current, revision: 11, task: { ...current.task, revision: 5 } });
+    foundation = [
+      ...records(current).map((record) =>
+        record.kind === "task-membership"
+          ? decodeRecord({
+              ...record,
+              controlState: "paused",
+              requestedSuccessorMemberId: "successor",
+            })
+          : record,
+      ),
+      member(8),
+    ];
+    await render();
+    await click("Retry exact request");
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toEqual(original);
+  });
 
   it("shows recorded running and settled workers with frozen configuration and thread links", async () => {
     foundation = [

@@ -16,7 +16,7 @@ import {
   type ProjectWorkTaskContext,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
@@ -73,7 +73,7 @@ const digest = (value: unknown) =>
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 const one = <T,>(items: ReadonlyArray<T>) => (items.length === 1 ? items[0] : undefined);
-const controls = ["defer", "reopen", "pause", "resume", "cancel"] as const;
+const controls = ["defer", "reopen", "pause", "resume", "cancel", "reassign"] as const;
 
 /** Ownership changes remount local drafts and fence callbacks from the previous task. */
 export function GuidedTaskDetail(props: GuidedTaskDetailProps) {
@@ -95,11 +95,27 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   const { taskContext: context, projectId, environmentId, onWrite, onRefresh } = props;
   const [drafts, setDrafts] = useState(createGuidedTaskDraftState);
   const state = useRef(drafts);
+  const liveProps = useRef(props);
+  const mounted = useRef(false);
+  useLayoutEffect(() => {
+    liveProps.current = props;
+  });
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const currentCallback = () => mounted.current && liveProps.current === props;
   const lifetime = useRef(0);
   const [workerPage, setWorkerPage] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [acceptedRevision, setAcceptedRevision] = useState<number | null>(null);
   const [controlAction, setControlAction] = useState<(typeof controls)[number]>("defer");
+  const [recipient, setRecipient] = useState<{
+    readonly id: string;
+    readonly revision: number;
+  } | null>(null);
   const [newCriterionId] = useState(() => ProjectWorkCriterionId.make(randomUUID()));
   useEffect(
     () => () => {
@@ -113,7 +129,8 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   const owned = context?.projectId === projectId && task?.projectId === projectId;
   const complete = props.foundationComplete && props.foundationRevision === context?.revision;
   const taskRecords = records.filter(
-    (record) => "taskId" in record && record.taskId === task?.taskId,
+    (record) =>
+      record.projectId === projectId && "taskId" in record && record.taskId === task?.taskId,
   );
   const recordCounts = new Map<string, number>();
   for (const record of props.foundationRecords)
@@ -150,6 +167,16 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     new Set(records.map((record) => record.recordId)).size === records.length &&
     criteria.every((criterion) => criterion.taskId === task.taskId) &&
     new Set(criteria.map((criterion) => criterion.criterionId)).size === criteria.length;
+  const members = records
+    .filter((record) => record.kind === "member")
+    .filter((record) => record.projectId === projectId && recordCounts.get(record.recordId) === 1);
+  const recipients =
+    owned && complete && known ? members.filter((member) => member.status === "active") : [];
+  const selectedMember = recipients.find(
+    (member) => member.recordId === recipient?.id && member.revision === recipient.revision,
+  );
+  const requestedSuccessor = membership?.requestedSuccessorMemberId;
+  const successor = members.find((member) => member.recordId === requestedSuccessor);
   const specificationComplete =
     task?.specification === undefined ||
     (task.specification.revision === task.specRevision &&
@@ -391,6 +418,25 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             }
           : null;
       case "project-team.task.control":
+        if (
+          (controlAction === "resume" || controlAction === "reopen") &&
+          (writer || repair || (requestedSuccessor !== undefined && successor?.status !== "active"))
+        )
+          return null;
+        if ((controlAction === "pause" || controlAction === "defer") && terminal) return null;
+        if (controlAction === "reassign") {
+          if (!recipient || !selectedMember || terminal) return null;
+          return {
+            ...base,
+            type: kind,
+            control: {
+              action: "reassign",
+              reason: fields.reason ?? "Describe why this work should change state",
+              recipientMemberId: recipient.id,
+              expectedMemberRevision: recipient.revision,
+            },
+          };
+        }
         return {
           ...base,
           type: kind,
@@ -454,6 +500,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   }
 
   async function send(submission: GuidedTaskDraftSubmission) {
+    if (!currentCallback() || !access || !baselineReady) return;
     const owner = lifetime.current;
     let outcome: GuidedTaskDraftOutcome = "success";
     let message: string | null = null;
@@ -490,6 +537,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
 
   function submit(kind: Kind, patch: Readonly<Record<string, string>> = {}) {
     if (
+      !currentCallback() ||
       !canWrite ||
       state.current.entries.some(
         (draft) => draft.pending?.status === "sending" || draft.pending?.status === "uncertain",
@@ -1040,6 +1088,52 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               ))}
             </select>
           </label>
+          {requestedSuccessor ? (
+            <p>
+              Requested successor: {successor?.name ?? requestedSuccessor} · {requestedSuccessor}
+            </p>
+          ) : null}
+          <p className="text-xs text-muted-foreground">
+            Reassignment requests a successor and pauses owned work. Resume is separate and rechecks
+            ownership, drains, and approvals on the server.
+          </p>
+          {controlAction === "reassign" ? (
+            <label className="block text-sm">
+              Recipient
+              <select
+                aria-label="Reassignment recipient"
+                value={recipient ? JSON.stringify([recipient.id, recipient.revision]) : ""}
+                disabled={
+                  !access ||
+                  !baselineReady ||
+                  Boolean(draftFor("project-team.task.control")?.pending)
+                }
+                onChange={(event) => {
+                  const member = recipients.find(
+                    (entry) =>
+                      JSON.stringify([entry.recordId, entry.revision]) === event.target.value,
+                  );
+                  setRecipient(member ? { id: member.recordId, revision: member.revision } : null);
+                }}
+              >
+                <option value="">Select a current active member</option>
+                {recipients.map((member) => (
+                  <option
+                    key={member.recordId}
+                    value={JSON.stringify([member.recordId, member.revision])}
+                  >
+                    {member.name} · {member.recordId} · revision {member.revision}
+                  </option>
+                ))}
+              </select>
+              {recipient && !selectedMember ? (
+                <p>
+                  Recipient changed or is unavailable. Select and review a current member before
+                  sending.
+                </p>
+              ) : null}
+            </label>
+          ) : null}
           {field("project-team.task.control", "reason", "Control reason", "")}
           <Button
             size="sm"
@@ -1048,8 +1142,15 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               !canWrite ||
               blockedDraft("project-team.task.control") ||
               !draftFor("project-team.task.control")?.fields.reason?.trim() ||
-              ((controlAction === "defer" || controlAction === "pause") && terminal) ||
-              ((controlAction === "resume" || controlAction === "reopen") && (writer || repair))
+              ((controlAction === "defer" ||
+                controlAction === "pause" ||
+                controlAction === "reassign") &&
+                terminal) ||
+              (controlAction === "reassign" && !selectedMember) ||
+              ((controlAction === "resume" || controlAction === "reopen") &&
+                (writer ||
+                  repair ||
+                  (requestedSuccessor !== undefined && successor?.status !== "active")))
             }
             onClick={() => submit("project-team.task.control")}
           >

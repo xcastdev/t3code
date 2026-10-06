@@ -137,6 +137,85 @@ const current = () => ({
 });
 
 describe("mobile human work", () => {
+  it("sends reassignment with the reviewed member revision and reason", async () => {
+    const member = decodeRecord({
+      ...fields,
+      recordId: "successor",
+      kind: "member",
+      status: "active",
+      revision: 7,
+      name: "Next worker",
+      coordinator: true,
+      roleRevisionId: "any-role",
+    });
+    const value = {
+      ...current(),
+      foundation: combineProjectWorkFoundationPages({
+        projectId,
+        pages: [{ value: { projectId, revision: 10, items: [...records, member] } }],
+      }),
+    };
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      () => value,
+      async (input) => {
+        sent.push(decodeWrite(input));
+      },
+      () => CommandId.make("reassignment"),
+    );
+    session.selectRecipient("successor", 7);
+    session.editControl("Continue with the available teammate");
+    await session.submit({ kind: "control", action: "reassign" });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      type: "project-team.task.control",
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      control: {
+        action: "reassign",
+        reason: "Continue with the available teammate",
+        recipientMemberId: "successor",
+        expectedMemberRevision: 7,
+      },
+    });
+  });
+
+  it("keeps stopped investigation and approval denied while lifecycle Resume is separate", async () => {
+    const paused = records.map((record) =>
+      record.kind === "task-membership"
+        ? decodeRecord({ ...record, controlState: "paused" })
+        : record,
+    );
+    const value = {
+      ...current(),
+      foundation: combineProjectWorkFoundationPages({
+        projectId,
+        pages: [{ value: { projectId, revision: 10, items: paused } }],
+      }),
+    };
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      () => value,
+      async (input) => {
+        sent.push(decodeWrite(input));
+      },
+      () => CommandId.make("resume"),
+    );
+    session.edit("Research paused work", "Findings");
+    await session.submit({ kind: "investigate" });
+    await session.submit({ kind: "gate", gateId: "spec", response: "approved" });
+    expect(sent).toEqual([]);
+    expect(reviewMobileWork(value).specificationGate).toBeNull();
+    session.editControl("Resume after inspection");
+    await session.submit({ kind: "control", action: "resume" });
+    expect(sent[0]).toMatchObject({
+      type: "project-team.task.control",
+      control: { action: "resume" },
+    });
+  });
+
   it("reviews the exact current specification and proposed plan", () => {
     const review = reviewMobileWork(current());
     expect(review.reason).toBeNull();

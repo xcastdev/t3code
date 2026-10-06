@@ -38,7 +38,7 @@ const decodeWrite = Schema.decodeUnknownSync(ProjectWorkWriteIntent);
 const only = <T>(items: ReadonlyArray<T>): T | null => (items.length === 1 ? items[0]! : null);
 
 /** Capability flags describe UI support. The server still authorizes every command. */
-export function reviewMobileWork(current: MobileWorkCurrent) {
+function reviewWork(current: MobileWorkCurrent, controls = false) {
   const { context, foundation } = current;
   let reason: string | null = null;
   if (!current.connected) reason = "Reconnect to make changes. Cached work may be out of date.";
@@ -92,7 +92,7 @@ export function reviewMobileWork(current: MobileWorkCurrent) {
     reason === null &&
     (context?.task.state === "completed" ||
       context?.task.state === "canceled" ||
-      (membership?.controlState !== undefined && membership.controlState !== "active"))
+      (!controls && membership?.controlState !== undefined && membership.controlState !== "active"))
   )
     reason = "This task is stopped. Review its recorded state before continuing.";
   const plan = only(
@@ -131,6 +131,8 @@ export function reviewMobileWork(current: MobileWorkCurrent) {
     !records.some((record) => record.kind === "run-binding" && record.status !== "settled");
   return {
     reason,
+    membership,
+    records,
     specificationGate: reason === null ? specificationGate : null,
     planGate: reason === null ? planGate : null,
     plan,
@@ -139,10 +141,80 @@ export function reviewMobileWork(current: MobileWorkCurrent) {
   };
 }
 
+export function reviewMobileWork(current: MobileWorkCurrent) {
+  return reviewWork(current);
+}
+
+/** Lifecycle return paths use the same current-owner checks while stopped approvals stay denied. */
+export function reviewMobileTaskControl(current: MobileWorkCurrent) {
+  const review = reviewWork(current, true);
+  const counts = new Map<string, number>();
+  for (const record of current.foundation.records)
+    counts.set(record.recordId, (counts.get(record.recordId) ?? 0) + 1);
+  const members = current.foundation.records
+    .filter(knownRecord)
+    .filter((record) => record.kind === "member")
+    .filter(
+      (record) => record.projectId === current.projectId && counts.get(record.recordId) === 1,
+    );
+  const recipients =
+    review.reason === null ? members.filter((member) => member.status === "active") : [];
+  const requested = review.membership?.requestedSuccessorMemberId;
+  const successor = members.find((member) => member.recordId === requested);
+  const undrainedAttempt =
+    current.context?.reclaimableAttempt !== undefined &&
+    !review.records.some(
+      (record) =>
+        record.kind === "run-binding" &&
+        record.attemptId === current.context?.reclaimableAttempt?.attemptId &&
+        record.status === "settled",
+    );
+  const writer =
+    undrainedAttempt ||
+    current.context?.activeAttempt !== undefined ||
+    current.context?.task.activeAttemptId !== undefined ||
+    review.records.some((record) => record.kind === "run-binding" && record.status !== "settled");
+  const repair =
+    current.context?.task.state === "failed" ||
+    current.context?.task.state === "blocked" ||
+    review.records.some(
+      (record) =>
+        record.kind === "repair-episode" &&
+        (record.status === "exhausted" ||
+          (record.status === "active" && record.pendingSemanticRepair !== false)),
+    );
+  const stopped =
+    review.membership?.controlState === "paused" || review.membership?.controlState === "deferred";
+  const ownership = requested === undefined || successor?.status === "active";
+  const resumeReason =
+    review.reason ??
+    (!stopped
+      ? "Resume is available for paused or deferred work."
+      : !ownership
+        ? "Resolve the requested successor before resuming."
+        : writer
+          ? "Wait for the prior worker to authoritatively drain."
+          : repair
+            ? "Resolve the recorded failure or repair before resuming."
+            : null);
+  return {
+    ...review,
+    members,
+    recipients,
+    successor,
+    resumeReason,
+    canResume: resumeReason === null,
+    canReassign: review.reason === null,
+  };
+}
+
 export type MobileWorkAction =
   | { readonly kind: "investigate" }
+  | { readonly kind: "control"; readonly action: "reassign" | "resume" }
   | { readonly kind: "gate"; readonly gateId: string; readonly response: "approved" | "rejected" };
 export interface MobileWorkActionState {
+  readonly reason: string;
+  readonly recipient: { readonly id: string; readonly revision: number } | null;
   readonly objective: string;
   readonly outputs: string;
   readonly status: "idle" | "sending" | "uncertain" | "stale" | "denied" | "accepted";
@@ -239,6 +311,8 @@ export function createWorkActionSession(
   let alive = true;
   let blockedRevision: number | null = null;
   let state: MobileWorkActionState = {
+    reason: "",
+    recipient: null,
     objective: "",
     outputs: "Findings, sources, and open questions",
     status: "idle",
@@ -249,7 +323,7 @@ export function createWorkActionSession(
     state = { ...state, ...patch };
     if (alive) changed();
   };
-  const available = () => {
+  const available = (control = false) => {
     const value = readCurrent();
     if (
       !alive ||
@@ -258,7 +332,8 @@ export function createWorkActionSession(
       value.taskId !== scope.taskId
     )
       return null;
-    if (reviewMobileWork(value).reason !== null) return null;
+    if ((control ? reviewMobileTaskControl(value) : reviewMobileWork(value)).reason !== null)
+      return null;
     return value;
   };
   const execute = async (intent: ProjectWorkWriteIntent) => {
@@ -300,9 +375,24 @@ export function createWorkActionSession(
       if (state.status !== "sending" && state.status !== "uncertain")
         update({ objective, outputs });
     },
+    editControl(reason: string) {
+      if (state.status !== "sending" && state.status !== "uncertain") update({ reason });
+    },
+    selectRecipient(memberId: string, revision: number) {
+      const value = available(true);
+      if (
+        state.status !== "sending" &&
+        state.status !== "uncertain" &&
+        value &&
+        reviewMobileTaskControl(value).recipients.some(
+          (member) => member.recordId === memberId && member.revision === revision,
+        )
+      )
+        update({ recipient: { id: memberId, revision } });
+    },
     async submit(action: MobileWorkAction) {
       if (state.status !== "idle") return;
-      const value = available();
+      const value = available(action.kind === "control");
       if (value === null || value.context === null || value.context.revision === blockedRevision) {
         update({ notice: "Load current work in this environment and project before sending." });
         return;
@@ -317,7 +407,38 @@ export function createWorkActionSession(
       };
       let intent: ProjectWorkWriteIntent;
       try {
-        if (action.kind === "investigate") {
+        if (action.kind === "control") {
+          const control = reviewMobileTaskControl(value);
+          const recipient = state.recipient;
+          if (
+            !state.reason.trim() ||
+            (action.action === "resume" && !control.canResume) ||
+            (action.action === "reassign" &&
+              (!recipient ||
+                !control.recipients.some(
+                  (member) =>
+                    member.recordId === recipient.id && member.revision === recipient.revision,
+                )))
+          ) {
+            update({
+              notice: "Review the reason, recipient, and current task controls before sending.",
+            });
+            return;
+          }
+          intent = decodeWrite({
+            ...base,
+            type: "project-team.task.control",
+            control:
+              action.action === "reassign" && recipient
+                ? {
+                    action: "reassign",
+                    reason: state.reason,
+                    recipientMemberId: recipient.id,
+                    expectedMemberRevision: recipient.revision,
+                  }
+                : { action: "resume", reason: state.reason },
+          });
+        } else if (action.kind === "investigate") {
           if (!review.canInvestigate) {
             update({
               notice: "Investigation is unavailable while this task has an active worker.",
@@ -362,7 +483,7 @@ export function createWorkActionSession(
     },
     async retry() {
       if (state.status !== "uncertain" || state.pending === null) return;
-      if (available() === null) {
+      if (available(state.pending.type === "project-team.task.control") === null) {
         update({
           notice:
             "Reconnect and refresh this task in its original environment and project to retry.",

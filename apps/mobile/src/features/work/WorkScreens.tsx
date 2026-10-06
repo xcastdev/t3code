@@ -36,7 +36,12 @@ import { mobileWorkEnvironment } from "./workEnvironment";
 import { decodeWorkRoute } from "./workNavigation";
 import { mobileTaskPage } from "./workData";
 import { useWorkFoundation } from "./useWorkFoundation";
-import { createWorkActionSession, reviewMobileWork, type MobileWorkCurrent } from "./workActions";
+import {
+  createWorkActionSession,
+  reviewMobileWork,
+  reviewMobileTaskControl,
+  type MobileWorkCurrent,
+} from "./workActions";
 import { WorkQuestions, WorkTeam } from "./WorkTeam";
 import { WorkEvidence } from "./WorkEvidence";
 import { WorkSupervisionSource } from "./WorkSupervisionSource";
@@ -457,12 +462,14 @@ function WorkTaskSession({
     fresh: foundation.current && raw.error === null && !raw.isPending,
   };
   const review = reviewMobileWork(current);
+  const control = reviewMobileTaskControl(current);
   const [, changed] = useState(0);
   const write = useAtomCommand(mobileWorkEnvironment.write, {
     reportFailure: false,
     reportDefect: false,
   });
   const [workerPage, setWorkerPage] = useState(0);
+  const [recipientPage, setRecipientPage] = useState(0);
   const [session] = useState(() =>
     createWorkActionSession(
       { ...target, taskId },
@@ -495,7 +502,9 @@ function WorkTaskSession({
         presentation?.entry.enabled === true &&
         presentation.connection.phase === "connected",
       enabled:
-        ownProject !== null && presentation?.serverConfig?.settings.projectWorkEnabled === true,
+        ownProject?.id === target.projectId &&
+        ownProject.environmentId === target.environmentId &&
+        presentation?.serverConfig?.settings.projectWorkEnabled === true,
       foundationSupported:
         presentation?.serverConfig?.environment.capabilities.projectTeamFoundationReads === true,
       guidedSupported:
@@ -512,6 +521,13 @@ function WorkTaskSession({
   }, [session]);
   const state = session.state;
   const locked = review.reason !== null || !session.canSubmit(context?.revision ?? null);
+  const controlLocked = control.reason !== null || !session.canSubmit(context?.revision ?? null);
+  const recipientValid = control.recipients.some(
+    (member) =>
+      member.recordId === state.recipient?.id && member.revision === state.recipient.revision,
+  );
+  const recipientPages = Math.max(1, Math.ceil(control.recipients.length / 10));
+  const visibleRecipientPage = Math.min(recipientPage, recipientPages - 1);
   const refresh = () => {
     raw.refresh();
     foundation.refresh();
@@ -558,7 +574,14 @@ function WorkTaskSession({
       {state.notice ? <Notice>{state.notice}</Notice> : null}
       {state.status === "sending" ? <Notice>Sending…</Notice> : null}
       {state.status === "uncertain" ? (
-        <WorkButton disabled={review.reason !== null} onPress={() => void session.retry()}>
+        <WorkButton
+          disabled={
+            (state.pending?.type === "project-team.task.control"
+              ? control.reason
+              : review.reason) !== null
+          }
+          onPress={() => void session.retry()}
+        >
           Retry exact command
         </WorkButton>
       ) : null}
@@ -691,6 +714,83 @@ function WorkTaskSession({
               </Notice>
             ))}
             {review.gates.length === 0 ? <Notice>No recorded approvals.</Notice> : null}
+          </WorkCard>
+          <WorkCard title="Task controls">
+            <Notice>
+              Recorded control state: {control.membership?.controlState ?? "not reported"}
+            </Notice>
+            {control.membership?.requestedSuccessorMemberId ? (
+              <Notice>
+                Requested successor:{" "}
+                {control.successor?.name ?? control.membership.requestedSuccessorMemberId} ·{" "}
+                {control.membership.requestedSuccessorMemberId}
+              </Notice>
+            ) : null}
+            <Notice>
+              Reassignment requests a successor and pauses owned work. Resume is separate and
+              rechecks ownership, drains, and approvals on the server.
+            </Notice>
+            {control.reason ? <Notice>{control.reason}</Notice> : null}
+            {control.recipients
+              .slice(visibleRecipientPage * 10, (visibleRecipientPage + 1) * 10)
+              .map((member) => (
+                <WorkButton
+                  key={member.recordId}
+                  disabled={controlLocked}
+                  onPress={() => session.selectRecipient(member.recordId, member.revision)}
+                >
+                  {`Select recipient ${member.name} · ${member.recordId} · revision ${member.revision}`}
+                </WorkButton>
+              ))}
+            {recipientPages > 1 ? (
+              <View className="gap-2">
+                <WorkButton
+                  disabled={visibleRecipientPage === 0}
+                  onPress={() => setRecipientPage(visibleRecipientPage - 1)}
+                >
+                  Previous recipients
+                </WorkButton>
+                <WorkButton
+                  disabled={visibleRecipientPage + 1 === recipientPages}
+                  onPress={() => setRecipientPage(visibleRecipientPage + 1)}
+                >
+                  Next recipients
+                </WorkButton>
+                <Notice>
+                  Page {visibleRecipientPage + 1} of {recipientPages}
+                </Notice>
+              </View>
+            ) : null}
+            {state.recipient ? (
+              <Notice>
+                Selected recipient {state.recipient.id} · reviewed revision{" "}
+                {state.recipient.revision}
+                {recipientValid ? "" : " · changed or unavailable; select and review again"}
+              </Notice>
+            ) : (
+              <Notice>Select a current active member before requesting reassignment.</Notice>
+            )}
+            <TextInput
+              accessibilityLabel="Task control reason"
+              multiline
+              maxLength={32000}
+              editable={state.status !== "sending" && state.status !== "uncertain"}
+              value={state.reason}
+              onChangeText={(reason) => session.editControl(reason)}
+            />
+            <WorkButton
+              disabled={controlLocked || !recipientValid || !state.reason.trim()}
+              onPress={() => void session.submit({ kind: "control", action: "reassign" })}
+            >
+              Request reassignment
+            </WorkButton>
+            {control.resumeReason ? <Notice>{control.resumeReason}</Notice> : null}
+            <WorkButton
+              disabled={controlLocked || !control.canResume || !state.reason.trim()}
+              onPress={() => void session.submit({ kind: "control", action: "resume" })}
+            >
+              Resume task
+            </WorkButton>
           </WorkCard>
           <WorkCard title="Investigation">
             <Notice>
