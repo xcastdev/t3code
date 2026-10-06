@@ -1602,6 +1602,377 @@ layer("GitHubPullRequestCli.layer", (it) => {
     }),
   );
 
+  const exactHead = "a".repeat(40);
+  const exactMergeInput = {
+    cwd: "/w",
+    repository: "acme/web",
+    host: "github.example.com",
+    number: 7,
+    action: "merge",
+    expectedHeadSha: exactHead,
+  } as const;
+  const mergedResponse = encodeJson({
+    merged: true,
+    sha: "b".repeat(40),
+    message: "Pull Request successfully merged",
+  });
+  const exactDetail = (overrides: Readonly<Record<string, unknown>> = {}) =>
+    encodeJson({
+      ...searchItem(7, "acme/web", "2026-07-02T00:00:00Z"),
+      headRefOid: exactHead,
+      autoMergeRequest: null,
+      ...overrides,
+    });
+
+  for (const mergeMethod of [undefined, "merge", "squash", "rebase"] as const) {
+    it.effect(`exact-head merge confirms an immediate ${mergeMethod ?? "default"} merge`, () =>
+      Effect.gen(function* () {
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail())));
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+        mockedExecute.mockReturnValueOnce(
+          Effect.succeed(
+            output(exactDetail({ state: "MERGED", mergedAt: "2026-07-03T00:00:00Z" })),
+          ),
+        );
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        yield* cli.runPullRequestAction({
+          ...exactMergeInput,
+          ...(mergeMethod === undefined ? {} : { mergeMethod }),
+        });
+        expect(mockedExecute).toHaveBeenCalledTimes(3);
+        expect(callAt(1).args).toEqual([
+          "api",
+          "--method",
+          "PUT",
+          "--hostname",
+          "github.example.com",
+          "repos/acme/web/pulls/7/merge",
+          "--input",
+          "-",
+        ]);
+        expect(callAt(1).stdin).toBe(
+          encodeJson({ sha: exactHead, merge_method: mergeMethod ?? "merge" }),
+        );
+        expect(callAt(0).args).toContain("github.example.com/acme/web");
+        expect(callAt(2).args).toEqual(callAt(0).args);
+      }),
+    );
+  }
+
+  for (const action of [
+    "enable-auto-merge",
+    "disable-auto-merge",
+    "update-branch",
+    "ready",
+    "draft",
+    "close",
+    "reopen",
+    "revert",
+    "approve-workflows",
+  ] as const) {
+    it.effect(`exact-head merge precondition refuses ${action} before any command`, () =>
+      Effect.gen(function* () {
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(cli.runPullRequestAction({ ...exactMergeInput, action }));
+        expect(error).toMatchObject({ _tag: "GitHubExactHeadMergeRefusedError", reason: "action" });
+        expect(mockedExecute).not.toHaveBeenCalled();
+      }),
+    );
+  }
+
+  for (const stackInput of [{ stackNumber: 3 }, { expectedStackHeads: [] }]) {
+    it.effect(`exact-head merge refuses stack input ${Object.keys(stackInput)[0]}`, () =>
+      Effect.gen(function* () {
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(
+          cli.runPullRequestAction({ ...exactMergeInput, ...stackInput }),
+        );
+        expect(error).toMatchObject({ _tag: "GitHubExactHeadMergeRefusedError", reason: "stack" });
+        expect(mockedExecute).not.toHaveBeenCalled();
+      }),
+    );
+  }
+
+  for (const [label, invalidInput] of [
+    ["abbreviated SHA", { expectedHeadSha: "a".repeat(7) }],
+    ["uppercase SHA", { expectedHeadSha: "A".repeat(40) }],
+    ["padded SHA", { expectedHeadSha: ` ${exactHead}` }],
+    ["oversized SHA", { expectedHeadSha: "a".repeat(65) }],
+    ["empty SHA", { expectedHeadSha: "" }],
+    ["repository qualifier", { repository: "acme/web is:open" }],
+    ["repository traversal", { repository: "acme/.." }],
+    ["host path", { host: "github.com/other" }],
+    ["host flag", { host: "--hostname=github.com" }],
+    ["unsafe PR number", { number: Number.MAX_SAFE_INTEGER + 1 }],
+    ["zero PR number", { number: 0 }],
+    ["fractional PR number", { number: 1.5 }],
+  ] as const) {
+    it.effect(`exact-head merge refuses ${label} before any command`, () =>
+      Effect.gen(function* () {
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(
+          cli.runPullRequestAction({ ...exactMergeInput, ...invalidInput }),
+        );
+        expect(error).toMatchObject({ _tag: "GitHubExactHeadMergeRefusedError", reason: "input" });
+        expect(mockedExecute).not.toHaveBeenCalled();
+      }),
+    );
+  }
+
+  for (const [label, overrides, reason] of [
+    ["changed head", { headRefOid: "c".repeat(40) }, "head"],
+    ["unknown head", { headRefOid: null }, "head"],
+    ["standing auto-merge", { autoMergeRequest: { mergeMethod: "SQUASH" } }, "auto-merge"],
+    ["unknown auto-merge", { autoMergeRequest: undefined }, "auto-merge"],
+    ["closed pull request", { state: "CLOSED" }, "state"],
+    ["already merged pull request", { state: "MERGED" }, "state"],
+    ["different pull request", { number: 8 }, "identity"],
+  ] as const) {
+    it.effect(`exact-head merge refuses ${label} before writing`, () =>
+      Effect.gen(function* () {
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail(overrides))));
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+        expect(error).toMatchObject({ _tag: "GitHubExactHeadMergeRefusedError", reason });
+        expect(mockedExecute).toHaveBeenCalledTimes(1);
+      }),
+    );
+  }
+
+  it.effect("exact-head merge preserves a remote head race rejection without retrying", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail())));
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed({
+          ...output(encodeJson({ merged: false, message: "Head branch was modified" })),
+          exitCode: ChildProcessSpawner.ExitCode(1),
+        }),
+      );
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+      const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+      expect(error).toMatchObject({
+        _tag: "GitHubExactHeadMergeRejectedError",
+        detail: "Head branch was modified",
+      });
+      expect(mockedExecute).toHaveBeenCalledTimes(2);
+      expect(callAt(1).stdin).toContain(exactHead);
+    }),
+  );
+
+  for (const [label, response] of [
+    ["queued", encodeJson({ status: "enqueued" })],
+    ["deferred", encodeJson({ status: "pending" })],
+    ["unknown", "{}"],
+    ["malformed", "not-json"],
+    ["string merged", encodeJson({ merged: "true", sha: "b".repeat(40), message: "merged" })],
+    ["missing merge commit", encodeJson({ merged: true, message: "merged" })],
+  ] as const) {
+    it.effect(`exact-head merge reports ${label} write outcome as uncertain`, () =>
+      Effect.gen(function* () {
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail())));
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(response)));
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+        expect(error).toMatchObject({ _tag: "GitHubExactHeadMergeUncertainError", phase: "write" });
+        expect(mockedExecute).toHaveBeenCalledTimes(2);
+      }),
+    );
+  }
+
+  for (const [label, overrides] of [
+    ["changed head", { headRefOid: "c".repeat(40) }],
+    ["missing head", { headRefOid: null }],
+    ["open state", { state: "OPEN" }],
+    ["closed state", { state: "CLOSED" }],
+    ["unknown state", { state: undefined }],
+    ["missing merge time", { mergedAt: null }],
+    ["different identity", { number: 8 }],
+  ] as const) {
+    it.effect(`exact-head merge reports ${label} after writing as uncertain`, () =>
+      Effect.gen(function* () {
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail())));
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+        mockedExecute.mockReturnValueOnce(
+          Effect.succeed(
+            output(
+              exactDetail({
+                state: "MERGED",
+                mergedAt: "2026-07-03T00:00:00Z",
+                ...overrides,
+              }),
+            ),
+          ),
+        );
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+        expect(error).toMatchObject({
+          _tag: "GitHubExactHeadMergeUncertainError",
+          phase: "confirmation",
+        });
+        expect(mockedExecute).toHaveBeenCalledTimes(3);
+      }),
+    );
+  }
+
+  for (const phase of ["write", "confirmation"] as const) {
+    it.effect(`exact-head merge retains ${phase} transport failure and does not retry`, () =>
+      Effect.gen(function* () {
+        const failure = new GitHubCli.GitHubCliCommandError({
+          command: "gh",
+          cwd: "/w",
+          cause: new Error("connection lost"),
+        });
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail())));
+        if (phase === "confirmation")
+          mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+        mockedExecute.mockReturnValueOnce(Effect.fail(failure));
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+        expect(error).toMatchObject({
+          _tag: "GitHubExactHeadMergeUncertainError",
+          phase,
+          cause: failure,
+        });
+        expect(mockedExecute).toHaveBeenCalledTimes(phase === "write" ? 2 : 3);
+      }),
+    );
+  }
+
+  it.effect(
+    "exact-head merge passes its condition through GitHubCli into the VcsProcess invocation",
+    () =>
+      Effect.gen(function* () {
+        const commands: VcsProcess.VcsProcessInput[] = [];
+        let merged = false;
+        const github = yield* GitHubCli.make.pipe(
+          Effect.provideService(VcsProcess.VcsProcess, {
+            run: (input) =>
+              Effect.sync(() => {
+                commands.push(input);
+                if (input.args[0] === "api") {
+                  merged = true;
+                  return output(mergedResponse);
+                }
+                return output(
+                  exactDetail(merged ? { state: "MERGED", mergedAt: "2026-07-03T00:00:00Z" } : {}),
+                );
+              }),
+          }),
+        );
+        const cli = yield* GitHubPullRequestCli.make.pipe(
+          Effect.provideService(GitHubCli.GitHubCli, github),
+          Effect.provide(GitHubGraphQlBudget.layer),
+        );
+        yield* cli.runPullRequestAction(exactMergeInput);
+        expect(commands).toHaveLength(3);
+        expect(commands[1]).toMatchObject({
+          operation: "GitHubCli.execute",
+          command: "gh",
+          cwd: "/w",
+          args: [
+            "api",
+            "--method",
+            "PUT",
+            "--hostname",
+            "github.example.com",
+            "repos/acme/web/pulls/7/merge",
+            "--input",
+            "-",
+          ],
+          stdin: encodeJson({ sha: exactHead, merge_method: "merge" }),
+          allowNonZeroExit: true,
+        });
+      }),
+  );
+
+  for (const phase of ["preflight", "write", "confirmation"] as const) {
+    it.effect(`exact-head merge refuses incomplete ${phase} output`, () =>
+      Effect.gen(function* () {
+        if (phase !== "preflight")
+          mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail())));
+        if (phase === "confirmation")
+          mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+        mockedExecute.mockReturnValueOnce(
+          Effect.succeed(
+            output(
+              phase === "write"
+                ? mergedResponse
+                : exactDetail({ state: "MERGED", mergedAt: "2026-07-03T00:00:00Z" }),
+              true,
+              true,
+            ),
+          ),
+        );
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+        const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+        expect(error).toMatchObject(
+          phase === "preflight"
+            ? { _tag: "GitHubPullRequestReadError" }
+            : { _tag: "GitHubExactHeadMergeUncertainError", phase },
+        );
+        expect(mockedExecute).toHaveBeenCalledTimes(
+          phase === "preflight" ? 1 : phase === "write" ? 2 : 3,
+        );
+      }),
+    );
+  }
+
+  for (const phase of ["preflight", "confirmation"] as const) {
+    for (const mergedAt of [
+      "not-a-timestamp",
+      " ",
+      "2026-99-99T99:99:99Z",
+      "2026-02-30T12:00:00Z",
+    ]) {
+      it.effect(`exact-head timestamp refuses ${phase} value ${mergedAt}`, () =>
+        Effect.gen(function* () {
+          mockedExecute.mockReturnValueOnce(
+            Effect.succeed(output(exactDetail(phase === "preflight" ? { mergedAt } : {}))),
+          );
+          mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+          mockedExecute.mockReturnValueOnce(
+            Effect.succeed(
+              output(
+                exactDetail({
+                  state: "MERGED",
+                  mergedAt: phase === "confirmation" ? mergedAt : "2026-07-03T00:00:00Z",
+                }),
+              ),
+            ),
+          );
+          const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+          const error = yield* Effect.flip(cli.runPullRequestAction(exactMergeInput));
+          expect(error).toMatchObject(
+            phase === "preflight"
+              ? { _tag: "GitHubPullRequestReadError" }
+              : { _tag: "GitHubExactHeadMergeUncertainError", phase: "confirmation" },
+          );
+          expect(mockedExecute).toHaveBeenCalledTimes(phase === "preflight" ? 1 : 3);
+        }),
+      );
+    }
+  }
+
+  it.effect("exact-head timestamp accepts a canonical leap-day time with milliseconds", () =>
+    Effect.gen(function* () {
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output(exactDetail({ mergedAt: null }))));
+      mockedExecute.mockReturnValueOnce(Effect.succeed(output(mergedResponse)));
+      mockedExecute.mockReturnValueOnce(
+        Effect.succeed(
+          output(
+            exactDetail({
+              state: "MERGED",
+              mergedAt: "2024-02-29T12:00:00.123Z",
+            }),
+          ),
+        ),
+      );
+      const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+      yield* cli.runPullRequestAction(exactMergeInput);
+      expect(mockedExecute).toHaveBeenCalledTimes(3);
+    }),
+  );
+
   it.effect("merges with the strategy it was asked for", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValue(Effect.succeed(output("")));

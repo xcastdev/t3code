@@ -1,9 +1,11 @@
 import { runGitHubStackAction, type GitHubStackActionError } from "./githubStackActions.ts";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -343,8 +345,83 @@ export class GitHubWorkflowApprovalHeadChangedError extends Schema.TaggedError<G
   }
 }
 
+/** A precondition failed before the immediate merge request was sent. */
+export class GitHubExactHeadMergeRefusedError extends Schema.TaggedError<GitHubExactHeadMergeRefusedError>()(
+  "GitHubExactHeadMergeRefusedError",
+  {
+    command: Schema.Literal("gh"),
+    cwd: Schema.String,
+    number: Schema.Number,
+    reason: Schema.Literals([
+      "action",
+      "stack",
+      "input",
+      "identity",
+      "state",
+      "head",
+      "auto-merge",
+    ]),
+  },
+) {
+  get detail(): string {
+    switch (this.reason) {
+      case "action":
+        return "An expected head SHA can only condition an immediate merge.";
+      case "stack":
+        return "An exact-head immediate merge cannot include a stack identity or stack heads.";
+      case "input":
+        return "The immediate merge requires a canonical repository, host, PR number and complete head SHA.";
+      case "identity":
+        return "GitHub returned a different pull request.";
+      case "state":
+        return "The pull request is not explicitly open for an immediate merge.";
+      case "head":
+        return "The pull request head does not match the expected revision.";
+      case "auto-merge":
+        return "GitHub must explicitly report standing auto-merge disabled before an immediate merge.";
+    }
+  }
+
+  override get message(): string {
+    return `GitHub CLI refused exact-head merge of #${this.number}: ${this.detail}`;
+  }
+}
+
+/** GitHub explicitly answered that the immediate merge did not happen. */
+export class GitHubExactHeadMergeRejectedError extends Schema.TaggedError<GitHubExactHeadMergeRejectedError>()(
+  "GitHubExactHeadMergeRejectedError",
+  { command: Schema.Literal("gh"), cwd: Schema.String, number: Schema.Int, detail: Schema.String },
+) {
+  override get message(): string {
+    return `GitHub CLI rejected exact-head merge of #${this.number}: ${this.detail}`;
+  }
+}
+
+/** A write may have happened; callers must reconcile it rather than retry the mutation. */
+export class GitHubExactHeadMergeUncertainError extends Schema.TaggedError<GitHubExactHeadMergeUncertainError>()(
+  "GitHubExactHeadMergeUncertainError",
+  {
+    command: Schema.Literal("gh"),
+    cwd: Schema.String,
+    number: Schema.Int,
+    phase: Schema.Literals(["write", "confirmation"]),
+    cause: Schema.Defect(),
+  },
+) {
+  get detail(): string {
+    return "The immediate merge could not be confirmed for the expected head. Reconcile the remote result before retrying.";
+  }
+
+  override get message(): string {
+    return `GitHub CLI returned an uncertain exact-head merge of #${this.number} during ${this.phase}: ${this.detail}`;
+  }
+}
+
 export type GitHubPullRequestCliError =
   | GitHubStackActionError
+  | GitHubExactHeadMergeRefusedError
+  | GitHubExactHeadMergeRejectedError
+  | GitHubExactHeadMergeUncertainError
   | GitHubCli.GitHubCliError
   | GitHubPullRequestReadError
   | GitHubDiffCursorError
@@ -659,6 +736,8 @@ export class GitHubPullRequestCli extends Context.Service<
       readonly action: PullRequestAction;
       readonly stackNumber?: number;
       readonly expectedStackHeads?: ReadonlyArray<PullRequestStackHead>;
+      /** Conditions the transport only; managed merge authorization is resolved upstream. */
+      readonly expectedHeadSha?: string;
       readonly mergeMethod?: PullRequestMergeMethod;
       readonly updateMethod?: PullRequestUpdateMethod;
     }) => Effect.Effect<void, GitHubPullRequestCliError>;
@@ -922,6 +1001,74 @@ function matchesUnsortedListing(
 
 /** What a repository selector may hold before it goes into a search as itself. */
 const SEARCH_REPOSITORY = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
+const ExactHeadSha = Schema.String.check(Schema.isPattern(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u));
+const ExactHeadMergeInput = Schema.Struct({
+  expectedHeadSha: ExactHeadSha,
+  repository: Schema.String.check(
+    Schema.isMaxLength(512),
+    Schema.isPattern(SEARCH_REPOSITORY),
+    Schema.makeFilter((value) => value.split("/").every((part) => part !== "." && part !== "..")),
+  ),
+  host: Schema.String.check(
+    Schema.isMaxLength(253),
+    Schema.isPattern(
+      /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u,
+    ),
+  ),
+  number: PositiveInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
+  mergeMethod: Schema.optional(Schema.Literals(["merge", "squash", "rebase"])),
+});
+const isExactHeadMergeInput = Schema.is(ExactHeadMergeInput);
+
+// Match GitHub's UTC spelling and round-trip it so normalized impossible dates are refused.
+const ExactHeadMergeTimestamp = Schema.String.check(
+  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u),
+  Schema.makeFilter((value) => {
+    const parsed = DateTime.make(value);
+    return (
+      Option.isSome(parsed) &&
+      DateTime.formatIso(parsed.value) ===
+        (value.includes(".") ? value : value.replace("Z", ".000Z"))
+    );
+  }),
+);
+
+// Keep the raw state and null/missing distinction: ordinary display normalization supplies
+// defaults that cannot establish an immediate merge's preconditions or its completion.
+const decodeExactHeadMergeDetail = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      number: PositiveInt,
+      state: Schema.optional(Schema.String),
+      headRefOid: Schema.optional(Schema.NullOr(Schema.String)),
+      autoMergeRequest: Schema.optional(Schema.NullOr(Schema.Unknown)),
+      mergedAt: Schema.optional(Schema.NullOr(ExactHeadMergeTimestamp)),
+    }),
+  ),
+);
+const mergeResponseMessage = TrimmedNonEmptyString.check(Schema.isMaxLength(2048));
+const decodeExactHeadMergeResponse = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Union([
+      Schema.Struct({
+        merged: Schema.Literal(true),
+        sha: ExactHeadSha,
+        message: mergeResponseMessage,
+      }),
+      Schema.Struct({ merged: Schema.Literal(false), message: mergeResponseMessage }),
+    ]),
+  ),
+  { onExcessProperty: "error" },
+);
+const encodeExactHeadMergeRequest = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      sha: ExactHeadSha,
+      merge_method: Schema.Literals(["merge", "squash", "rebase"]),
+    }),
+  ),
+);
 
 /**
  * The same listing as one GitHub search across several repositories, which is the only way to
@@ -1499,6 +1646,126 @@ export const make = Effect.gen(function* () {
               );
         }),
       );
+
+  const readExactHeadMergeDetail = Effect.fn("GitHubPullRequestCli.readExactHeadMergeDetail")(
+    function* (input: {
+      readonly cwd: string;
+      readonly host: string;
+      readonly repository: string;
+      readonly number: number;
+    }) {
+      const result = yield* github.execute({
+        cwd: input.cwd,
+        args: [
+          "pr",
+          "view",
+          String(input.number),
+          ...repositoryArgs(input),
+          "--json",
+          "number,state,headRefOid,autoMergeRequest,mergedAt",
+        ],
+        maxOutputBytes: 64 * 1024,
+      });
+      const unreadable = (cause: unknown) =>
+        new GitHubPullRequestReadError({
+          command: "gh",
+          cwd: input.cwd,
+          operation: "exactHeadMergeDetail",
+          cause,
+        });
+      if (result.stdoutTruncated || result.stdoutInvalidUtf8 || result.exitCode !== 0) {
+        return yield* unreadable(new Error("The immediate merge detail response was incomplete."));
+      }
+      return yield* decodeExactHeadMergeDetail(result.stdout).pipe(Effect.mapError(unreadable));
+    },
+  );
+
+  const mergeExactHead = Effect.fn("GitHubPullRequestCli.mergeExactHead")(function* (
+    input: Parameters<GitHubPullRequestCli["Service"]["runPullRequestAction"]>[0],
+  ) {
+    const refused = (reason: GitHubExactHeadMergeRefusedError["reason"]) =>
+      new GitHubExactHeadMergeRefusedError({
+        command: "gh",
+        cwd: input.cwd,
+        number: input.number,
+        reason,
+      });
+    if (input.action !== "merge") return yield* refused("action");
+    if (input.stackNumber !== undefined || input.expectedStackHeads !== undefined)
+      return yield* refused("stack");
+    if (!isExactHeadMergeInput(input)) return yield* refused("input");
+    const current = yield* readExactHeadMergeDetail(input);
+    if (current.number !== input.number) return yield* refused("identity");
+    if (current.state !== "OPEN") return yield* refused("state");
+    if (current.headRefOid !== input.expectedHeadSha) return yield* refused("head");
+    if (current.autoMergeRequest !== null) return yield* refused("auto-merge");
+    const uncertain = (phase: GitHubExactHeadMergeUncertainError["phase"], cause: unknown) =>
+      new GitHubExactHeadMergeUncertainError({
+        command: "gh",
+        cwd: input.cwd,
+        number: input.number,
+        phase,
+        cause,
+      });
+    const { owner, name } = parseRepositorySelector(input.repository);
+    const stdin = yield* encodeExactHeadMergeRequest({
+      sha: input.expectedHeadSha,
+      merge_method: input.mergeMethod ?? "merge",
+    }).pipe(Effect.mapError(() => refused("input")));
+    // One conditioned immediate write. Neither `gh pr merge` nor the async merge API
+    // establishes completion; they may leave standing or queued work behind.
+    const result = yield* github
+      .execute({
+        cwd: input.cwd,
+        args: [
+          "api",
+          "--method",
+          "PUT",
+          "--hostname",
+          input.host,
+          `repos/${owner}/${name}/pulls/${input.number}/merge`,
+          "--input",
+          "-",
+        ],
+        stdin,
+        maxOutputBytes: 64 * 1024,
+        allowNonZeroExit: true,
+      })
+      .pipe(Effect.mapError((cause) => uncertain("write", cause)));
+    if (result.stdoutTruncated || result.stdoutInvalidUtf8) {
+      return yield* uncertain("write", new Error("The immediate merge response was incomplete."));
+    }
+    const response = yield* decodeExactHeadMergeResponse(result.stdout).pipe(
+      Effect.mapError((cause) => uncertain("write", cause)),
+    );
+    if (!response.merged)
+      return yield* new GitHubExactHeadMergeRejectedError({
+        command: "gh",
+        cwd: input.cwd,
+        number: input.number,
+        detail: response.message,
+      });
+    if (result.exitCode !== 0)
+      return yield* uncertain(
+        "write",
+        new Error("GitHub CLI failed while reporting a merged result."),
+      );
+    const confirmed = yield* readExactHeadMergeDetail(input).pipe(
+      Effect.mapError((cause) => uncertain("confirmation", cause)),
+    );
+    // The response's sha names the merge commit; completion is tied to the PR's head.
+    if (
+      confirmed.number !== input.number ||
+      confirmed.state !== "MERGED" ||
+      confirmed.headRefOid !== input.expectedHeadSha ||
+      !confirmed.mergedAt
+    ) {
+      return yield* uncertain(
+        "confirmation",
+        new Error("GitHub did not confirm the expected pull request head as merged."),
+      );
+    }
+  });
 
   const workflowApprovalLimit = 1_000;
   const workflowApprovalProbeLimit = String(workflowApprovalLimit + 1);
@@ -2337,6 +2604,7 @@ export const make = Effect.gen(function* () {
     },
 
     runPullRequestAction: (input) => {
+      if (input.expectedHeadSha !== undefined) return mergeExactHead(input);
       if (input.stackNumber !== undefined)
         return runGitHubStackAction({ ...input, stackNumber: input.stackNumber }).pipe(
           Effect.provideService(GitHubCli.GitHubCli, github),
