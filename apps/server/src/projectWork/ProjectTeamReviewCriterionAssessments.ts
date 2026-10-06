@@ -89,12 +89,51 @@ export const snapshotReviewCriterionAssessments = (input: {
       )
         throw fail("Assessment parent scope is unavailable");
       const parentScopeHash = projectTeamScopeHash(state, target.taskId, plan);
+      if (input.assessments.length === 0) return [];
+      const selectedById = new Map<
+        string,
+        Array<ProjectVerificationJobManifest["criteria"][number]>
+      >();
+      for (const criterion of prepared.criteria) {
+        const id = criterion.criterionId;
+        const matches = selectedById.get(id);
+        if (matches) matches.push(criterion);
+        else selectedById.set(id, [criterion]);
+      }
+      const parentCriteriaById = new Map<string, Array<typeof ProjectWorkCriterion.Type>>();
+      for (const criterion of state.criteria) {
+        if (criterion.taskId !== target.taskId) continue;
+        const id = criterion.criterionId;
+        const matches = parentCriteriaById.get(id);
+        if (matches) matches.push(criterion);
+        else parentCriteriaById.set(id, [criterion]);
+      }
+      // Identity ambiguity is global, including duplicates belonging to another task.
+      const evidenceById = new Map<string, Array<typeof ProjectWorkEvidence.Type>>();
+      const referencedEvidenceIds = new Set(
+        input.assessments.flatMap((assessment) => assessment.evidenceIds),
+      );
+      if (referencedEvidenceIds.size > 0) {
+        for (const entry of state.evidence) {
+          const id = entry.evidenceId;
+          if (!referencedEvidenceIds.has(id)) continue;
+          const matches = evidenceById.get(id);
+          if (matches) matches.push(entry);
+          else evidenceById.set(id, [entry]);
+        }
+      }
+      const canonicalTarget = canonical(target);
+      const hasOpenCriticalFinding = (state.foundationRecords ?? []).some(
+        (record) =>
+          record.kind === "review-finding" &&
+          record.severity === "critical" &&
+          record.status === "open" &&
+          canonical(record.target) === canonicalTarget,
+      );
       return input.assessments.map((raw) => {
         const assessment = exact(raw, decodeAssessment);
-        const selected = prepared.criteria.filter((c) => c.criterionId === assessment.criterionId);
-        const criteria = state.criteria.filter(
-          (c) => c.criterionId === assessment.criterionId && c.taskId === target.taskId,
-        );
+        const selected = selectedById.get(assessment.criterionId) ?? [];
+        const criteria = parentCriteriaById.get(assessment.criterionId) ?? [];
         const criterion = criteria[0];
         if (
           selected.length !== 1 ||
@@ -104,19 +143,10 @@ export const snapshotReviewCriterionAssessments = (input: {
           selected[0]?.revision !== assessment.expectedRevision
         )
           throw fail("Assessment requires an exact selected parent criterion revision");
-        if (
-          assessment.verdict === "met" &&
-          (state.foundationRecords ?? []).some(
-            (r) =>
-              r.kind === "review-finding" &&
-              r.severity === "critical" &&
-              r.status === "open" &&
-              canonical(r.target) === canonical(target),
-          )
-        )
+        if (assessment.verdict === "met" && hasOpenCriticalFinding)
           throw fail("An open critical finding prevents a positive assessment");
         const evidence = assessment.evidenceIds.map((id) => {
-          const matches = state.evidence.filter((e) => e.evidenceId === id);
+          const matches = evidenceById.get(id) ?? [];
           const entry = matches[0];
           if (
             matches.length !== 1 ||

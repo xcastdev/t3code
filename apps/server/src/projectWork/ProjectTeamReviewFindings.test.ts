@@ -47,6 +47,7 @@ import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamReviewCompletion } from "./ProjectTeamReviewCompletion.ts";
+import { snapshotReviewCriterionAssessments } from "./ProjectTeamReviewCriterionAssessments.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import {
   makeProjectWorkVerificationGate,
@@ -2436,6 +2437,166 @@ const parentAssessmentFixture = Effect.gen(function* () {
   };
   return { ...f, criterion, parentEvidence: evidence, assessment };
 });
+
+it.effect(
+  "criterion assessment lookup bounds aggregate identity reads while preserving snapshots",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* parentAssessmentFixture;
+        const original = yield* f.state();
+        const prepared = f.target.prepared.manifest;
+        const target = {
+          projectId: prepared.projectId,
+          taskId: prepared.taskId,
+          specRevision: prepared.specRevision,
+          planRevision: prepared.planRevision,
+          baseSha: prepared.target.baseSha,
+          headSha: prepared.target.headSha,
+        };
+        const plan = original.foundationRecords?.find(
+          (record) =>
+            record.kind === "plan-revision" &&
+            record.taskId === target.taskId &&
+            record.planRevision === target.planRevision,
+        );
+        if (plan?.kind !== "plan-revision") return yield* Effect.die("Missing parent plan");
+        // This synthetic aggregate exercises the actual helper's bounded work; it grants no reviewer custody or admission.
+        const selectedCriteria = Array.from({ length: 64 }, (_, index) => ({
+          ...f.criterion,
+          criterionId: ProjectWorkCriterionId.make("lookup-criterion-" + index),
+        }));
+        const criteria = [
+          ...selectedCriteria,
+          ...Array.from({ length: 10000 }, (_, index) => ({
+            ...f.criterion,
+            taskId: f.running.taskId,
+            criterionId: ProjectWorkCriterionId.make("lookup-unrelated-criterion-" + index),
+          })),
+        ];
+        const state = { ...original, criteria, evidence: [] };
+        const scopeHash = projectTeamScopeHash(state, target.taskId, plan);
+        const { criterionId: _criterionId, ...unassigned } = f.parentEvidence;
+        const useful = Array.from({ length: 20 }, (_, index) => ({
+          ...unassigned,
+          evidenceId: ProjectWorkEvidenceId.make("lookup-evidence-" + index),
+          scopeHash,
+        }));
+        const evidence = [
+          ...useful,
+          ...Array.from({ length: 50000 - useful.length }, (_, index) => ({
+            ...unassigned,
+            taskId: f.running.taskId,
+            evidenceId: ProjectWorkEvidenceId.make("lookup-unrelated-evidence-" + index),
+          })),
+        ];
+        const selected = selectedCriteria.map((criterion) => ({
+          criterionId: criterion.criterionId,
+          revision: criterion.revision,
+        }));
+        const evidenceIds = useful.map((entry) => entry.evidenceId);
+        const assessments = selectedCriteria.map((criterion) => ({
+          ...f.assessment,
+          criterionId: criterion.criterionId,
+          evidenceIds,
+        }));
+        const expectedEvidence = useful.map((entry) => ({
+          id: entry.evidenceId,
+          taskId: target.taskId,
+          revision: entry.revision,
+          scopeHash,
+          sha256: digest(canonical(entry)),
+        }));
+        const expectedCriteria = selectedCriteria.map((criterion) => ({
+          id: criterion.criterionId,
+          revision: criterion.revision,
+          sha256: digest(canonical(criterion)),
+        }));
+        let evidenceReads = 0;
+        let criterionReads = 0;
+        let selectedReads = 0;
+        for (const entry of evidence) {
+          const id = entry.evidenceId;
+          Object.defineProperty(entry, "evidenceId", {
+            enumerable: true,
+            get: () => {
+              evidenceReads++;
+              return id;
+            },
+          });
+        }
+        for (const criterion of criteria) {
+          const id = criterion.criterionId;
+          Object.defineProperty(criterion, "criterionId", {
+            enumerable: true,
+            get: () => {
+              criterionReads++;
+              return id;
+            },
+          });
+        }
+        for (const criterion of selected) {
+          const id = criterion.criterionId;
+          Object.defineProperty(criterion, "criterionId", {
+            enumerable: true,
+            get: () => {
+              selectedReads++;
+              return id;
+            },
+          });
+        }
+        const snapshots = yield* snapshotReviewCriterionAssessments({
+          state: { ...state, evidence },
+          target,
+          prepared: { ...prepared, criteria: selected },
+          assessments,
+        });
+        expect(snapshots?.length).toBe(64);
+        expect(snapshots?.map((snapshot) => snapshot.criterion)).toEqual(expectedCriteria);
+        expect(snapshots?.map((snapshot) => snapshot.evidence)).toEqual(
+          selectedCriteria.map(() => expectedEvidence),
+        );
+        expect(
+          Buffer.byteLength(
+            canonical({ ...f.completionReport, criterionAssessments: assessments }),
+            "utf8",
+          ),
+        ).toBeLessThan(131072);
+        expect(Buffer.byteLength(canonical({ assessments, snapshots }), "utf8")).toBeLessThan(
+          524288 - 32768,
+        );
+        const references = assessments.length * evidenceIds.length;
+        // Generous linear ceilings allow decoding/hash accesses and expose repeated aggregate scans without timing assumptions.
+        expect(evidenceReads).toBeLessThanOrEqual(2 * evidence.length + 16 * references);
+        expect(criterionReads).toBeLessThanOrEqual(4 * criteria.length + 16 * assessments.length);
+        expect(selectedReads).toBeLessThanOrEqual(2 * selected.length + 16 * assessments.length);
+      }),
+    ),
+);
+
+it.effect("criterion assessment lookup denies global evidence ambiguity from a foreign task", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const f = yield* parentAssessmentFixture;
+      const before = yield* f.state();
+      const foreign = { ...f.parentEvidence, taskId: f.running.taskId };
+      // Disposable checkpoint corruption supplies a foreign duplicate; it is not a production evidence mutation path.
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_insert(state_json,'$.evidence[#]',json(${canonical(foreign)})) WHERE project_id=${projectId}`;
+      const corrupted = yield* f.state();
+      const report = {
+        ...f.completionReport,
+        expectedRevision: before.revision,
+        criterionAssessments: [f.assessment],
+      };
+      expect((yield* completionTool(f, report).pipe(Effect.result))._tag).toBe("Failure");
+      expect(yield* readProposal(f)).toBeUndefined();
+      expect(yield* f.state()).toEqual(corrupted);
+      expect(
+        yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${report.commandId}`,
+      ).toEqual([{ count: 0 }]);
+    }),
+  ),
+);
 
 it.effect(
   "pending criterion assessment retains exact parent snapshots without accepting work",
