@@ -582,6 +582,32 @@ export const make = Effect.gen(function* () {
         })
         .pipe(Effect.mapError(fail("setLabels"))),
 
+    mergeExactHead: (input) => {
+      // The CLI preserves ordinary callers by treating an absent SHA as an ordinary merge.
+      if (input.expectedHeadSha === undefined)
+        return Effect.fail(
+          fail("mergeExactHead")(
+            new GitHubPullRequestCli.GitHubExactHeadMergeRefusedError({
+              command: "gh",
+              cwd: input.cwd,
+              number: input.number,
+              reason: "input",
+            }),
+          ),
+        );
+      return cli
+        .runPullRequestAction({
+          cwd: input.cwd,
+          repository: input.repository,
+          host: input.host,
+          number: input.number,
+          action: "merge",
+          expectedHeadSha: input.expectedHeadSha,
+          ...(input.mergeMethod === undefined ? {} : { mergeMethod: input.mergeMethod }),
+        })
+        .pipe(Effect.mapError(fail("mergeExactHead")));
+    },
+
     runAction: (input) =>
       cli
         .runPullRequestAction({

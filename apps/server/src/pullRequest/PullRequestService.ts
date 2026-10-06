@@ -562,6 +562,9 @@ function withRateLimitBackoff(
       ? {}
       : { getDiffFileContents: wrap("getDiffFileContents", api.getDiffFileContents) }),
     runAction: interactive("runAction", api.runAction),
+    ...(api.mergeExactHead === undefined
+      ? {}
+      : { mergeExactHead: interactive("mergeExactHead", api.mergeExactHead) }),
     ...(api.updateChangeRequest === undefined
       ? {}
       : {
