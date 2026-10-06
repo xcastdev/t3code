@@ -94,6 +94,59 @@ const gate = (
 });
 
 describe("guided task drafts and exact submissions", () => {
+  it("retains an exact verification proposal and refuses changed binding or criterion targets", () => {
+    const input = {
+      type: "project-team.verification.propose" as const,
+      commandId: CommandId.make("verification-command"),
+      projectId,
+      taskId,
+      expectedRevision: 10,
+      expectedTaskRevision: 7,
+      specRevision: 2,
+      planRevision: 3,
+      jobId: "verification-job",
+      bindingId: "settled-binding",
+      expectedBindingRevision: 2,
+      generation: 8,
+      criterionIds: [ProjectWorkCriterionId.make("criterion-1")],
+      command: {
+        executable: "/opt/test runner",
+        argv: ["", "$(literal); *"],
+        environment: "clean" as const,
+        limits: { maxDurationMs: 120000, maxOutputBytes: 65536 },
+      },
+    };
+    const owner = key({ kind: "project-team.verification.propose" });
+    const state = edited(createGuidedTaskDraftState(), owner, input);
+    expectRefusal(
+      beginGuidedTaskSubmission(state, owner, { ...input, generation: 9 }),
+      state,
+      "target-changed",
+    );
+    expectRefusal(
+      beginGuidedTaskSubmission(state, owner, { ...input, criterionIds: ["criterion-2"] }),
+      state,
+      "target-changed",
+    );
+    const first = submit(state, owner, input);
+    input.command.argv[1] = "mutated";
+    const uncertain = changed(
+      recordGuidedTaskDraftOutcome(first.state, first.submission, "uncertain"),
+    );
+    const retry = retryGuidedTaskSubmission(uncertain, owner);
+    expect(retry.ok).toBe(true);
+    if (!retry.ok) throw Error("Expected exact retry");
+    expect(retry.submission.intentJson).toBe(first.submission.intentJson);
+    expect(JSON.parse(retry.submission.intentJson).command.argv).toEqual(["", "$(literal); *"]);
+    expectRefusal(
+      retryGuidedTaskSubmission(
+        uncertain,
+        key({ ...owner, environmentId: EnvironmentId.make("foreign") }),
+      ),
+      uncertain,
+      "not-uncertain",
+    );
+  });
   it("preserves edits and original targets through another device's update; comparison cannot rebase", () => {
     const first = edited();
     const original = first.entries[0]!.originalIntentJson;

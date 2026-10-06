@@ -33,6 +33,7 @@ import {
   type ProjectWorkWriteTarget,
   PROJECT_WORK_PAGE_SIZE,
   asProjectWorkArray,
+  asProjectWorkVerificationJob,
   asProjectTeamSupervisionSummary,
   projectTeamSupervisionAvailable,
   asProjectWorkFoundationPage,
@@ -872,4 +873,147 @@ describe("supervision snapshot bounds and compatibility", () => {
       }),
     ),
   );
+});
+
+describe("verification preview transport", () => {
+  it.effect(
+    "addresses exact task/job previews without reusing another environment or job cache",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const { registry, atoms, reads } = yield* makeFoundationHarness();
+          const targets = [
+            {
+              environmentId,
+              projectId,
+              taskId: ProjectWorkTaskId.make("task-1"),
+              verificationJobId: "job-1",
+            },
+            {
+              environmentId: otherEnvironmentId,
+              projectId,
+              taskId: ProjectWorkTaskId.make("task-1"),
+              verificationJobId: "job-1",
+            },
+            {
+              environmentId,
+              projectId,
+              taskId: ProjectWorkTaskId.make("task-1"),
+              verificationJobId: "job-2",
+            },
+            {
+              environmentId,
+              projectId,
+              taskId: ProjectWorkTaskId.make("task-2"),
+              verificationJobId: "job-1",
+            },
+          ];
+          const previews = targets.map((target) => atoms.verificationJob(target));
+          expect(new Set(previews).size).toBe(4);
+          for (const [index, target] of targets.entries()) {
+            const atom = previews[index]!;
+            expect(atoms.verificationJob({ ...target })).toBe(atom);
+            yield* awaitFoundationRead(registry, atom);
+          }
+          expect(reads).toEqual(
+            targets.map(({ environmentId, ...input }) => ({
+              environmentId,
+              input: { ...input, operation: "verification-job" },
+            })),
+          );
+        }),
+      ),
+  );
+});
+
+const previewManifest = {
+  version: 1,
+  jobId: "verification-1",
+  environmentId: "environment-1",
+  projectId: "project-1",
+  taskId: "task-1",
+  specRevision: 2,
+  specificationHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  planRevision: 3,
+  planHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  criteria: [
+    {
+      criterionId: "criterion-1",
+      revision: 3,
+    },
+  ],
+  dispatchId: "original-implementation",
+  bindingId: "binding",
+  generation: 7,
+  workspaceReceiptHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  command: {
+    executable: "/opt/project tools/test runner",
+    argv: ["", "  preserved  ", "--filter", "$(literal); *", "line\nbreak"],
+    limits: {
+      maxDurationMs: 120000,
+      maxOutputBytes: 65536,
+    },
+    environment: "clean",
+  },
+  target: {
+    repository: "/project",
+    worktree: "/project-worktree",
+    branchRef: "refs/heads/assigned",
+    baseSha: "dddddddddddddddddddddddddddddddddddddddd",
+    headSha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    testedCommit: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    testedTree: "ffffffffffffffffffffffffffffffffffffffff",
+    workspaceState: "clean-committed",
+  },
+  executable: {
+    target: "/opt/project tools/test runner",
+    sha256: "1111111111111111111111111111111111111111111111111111111111111111",
+    runtimeClosureSha256: "2222222222222222222222222222222222222222222222222222222222222222",
+  },
+};
+const preview = {
+  kind: "verification-job",
+  manifest: previewManifest,
+  sha256: "8f6827b531a1084ce0856362ce0ee9058c8c86187d2c9974fdcb99d812e56cd9",
+};
+
+it("keeps only bounded exact immutable previews for the selected environment, project, task and job", () => {
+  const target = {
+    environmentId: EnvironmentId.make("environment-1"),
+    projectId: ProjectId.make("project-1"),
+    taskId: ProjectWorkTaskId.make("task-1"),
+    verificationJobId: "verification-1",
+  };
+  expect(asProjectWorkVerificationJob(preview, target)).toEqual(preview);
+  for (const manifest of [
+    { ...previewManifest, environmentId: "foreign" },
+    { ...previewManifest, projectId: "foreign" },
+    { ...previewManifest, taskId: "foreign" },
+    { ...previewManifest, jobId: "foreign" },
+    { ...previewManifest, taskId: " task-1 " },
+    { ...previewManifest, version: 2 },
+    { ...previewManifest, criteria: Array(65).fill(previewManifest.criteria[0]) },
+    { ...previewManifest, command: { ...previewManifest.command, env: { TOKEN: "secret" } } },
+  ])
+    expect(asProjectWorkVerificationJob({ ...preview, manifest }, target)).toBeNull();
+  expect(asProjectWorkVerificationJob({ ...preview, sha256: "not-a-hash" }, target)).toBeNull();
+  const path = "/" + "界".repeat(4095);
+  expect(
+    asProjectWorkVerificationJob(
+      {
+        ...preview,
+        manifest: {
+          ...previewManifest,
+          target: { ...previewManifest.target, repository: path, worktree: path },
+          command: {
+            ...previewManifest.command,
+            executable: path,
+            argv: Array(4).fill("x".repeat(4096)),
+          },
+          executable: { ...previewManifest.executable, target: path },
+        },
+      },
+      target,
+    ),
+  ).toBeNull();
 });

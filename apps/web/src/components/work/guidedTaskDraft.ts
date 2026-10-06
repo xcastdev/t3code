@@ -11,7 +11,10 @@ import * as Schema from "effect/Schema";
 
 type DraftIntent =
   | ProjectTeamGuidedIntent
-  | Extract<ProjectTeamWriteIntent, { type: "project-team.gate.respond" }>;
+  | Extract<
+      ProjectTeamWriteIntent,
+      { type: "project-team.gate.respond" | "project-team.verification.propose" }
+    >;
 export interface GuidedTaskDraftKey {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
@@ -43,6 +46,12 @@ export interface GuidedTaskDraftState {
     readonly maxEntryBytes: number;
     readonly maxBytes: number;
   };
+}
+/** Owned by the environment/project page, independent of mounted task details. */
+export interface GuidedTaskDraftStore {
+  readonly snapshot: GuidedTaskDraftState;
+  readonly read: () => GuidedTaskDraftState;
+  readonly write: (state: GuidedTaskDraftState) => void;
 }
 type Refusal =
   | "invalid-input"
@@ -147,7 +156,11 @@ function snapshot(state: GuidedTaskDraftState, key: GuidedTaskDraftKey, input: u
   try {
     const intent = decodeInput(input);
     if (
-      !(isGuided(intent) || intent.type === "project-team.gate.respond") ||
+      !(
+        isGuided(intent) ||
+        intent.type === "project-team.gate.respond" ||
+        intent.type === "project-team.verification.propose"
+      ) ||
       intent.type !== key.kind ||
       intent.projectId !== key.projectId ||
       intent.taskId !== key.taskId
@@ -194,6 +207,11 @@ function targets(intent: ProjectWorkWriteIntent): string {
     "expectedEpisodeRevision",
     "failureFingerprint",
     "relevantRevision",
+    "jobId",
+    "bindingId",
+    "expectedBindingRevision",
+    "generation",
+    "criterionIds",
   ];
   const values = Object.fromEntries(
     fields.flatMap((field) => {

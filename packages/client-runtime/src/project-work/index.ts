@@ -11,10 +11,14 @@ import type {
   ProjectWorkStreamInput,
   ProjectWorkStreamItem,
   ProjectWorkTaskRead,
+  ProjectWorkTaskId,
   ProjectWorkTaskContext,
   ProjectWorkWriteResult,
 } from "@t3tools/contracts";
 import {
+  canonicalProjectWorkPayload,
+  ProjectWorkVerificationJobRead,
+  ProjectWorkReadIntent as ProjectWorkReadIntentSchema,
   ProjectTeamRecordPage,
   ProjectTeamSupervisionSummary,
   WS_METHODS,
@@ -160,6 +164,34 @@ export function asProjectWorkTaskContext(value: unknown): ProjectWorkTaskContext
     candidate.task !== undefined &&
     candidate.policy !== undefined
     ? (value as ProjectWorkTaskContext)
+    : null;
+}
+
+export interface ProjectWorkVerificationJobTarget extends ProjectWorkReadTarget {
+  readonly taskId: ProjectWorkTaskId;
+  readonly verificationJobId: string;
+}
+const decodeVerificationJob = Schema.decodeUnknownOption(ProjectWorkVerificationJobRead, {
+  onExcessProperty: "error",
+});
+const decodeVerificationRead = Schema.decodeUnknownSync(ProjectWorkReadIntentSchema);
+/** A typed retained preview is still subject to the current gate and human authorization. */
+export function asProjectWorkVerificationJob(
+  value: unknown,
+  target: ProjectWorkVerificationJobTarget,
+): typeof ProjectWorkVerificationJobRead.Type | null {
+  const decoded = decodeVerificationJob(value);
+  if (
+    Option.isNone(decoded) ||
+    canonicalProjectWorkPayload(value) !== canonicalProjectWorkPayload(decoded.value)
+  )
+    return null;
+  const { manifest } = decoded.value;
+  return manifest.environmentId === target.environmentId &&
+    manifest.projectId === target.projectId &&
+    manifest.taskId === target.taskId &&
+    manifest.jobId === target.verificationJobId
+    ? decoded.value
     : null;
 }
 
@@ -406,6 +438,19 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
   const tasks = read("environment-data:project-work:tasks");
   const knowledge = read("environment-data:project-work:knowledge");
   const attention = read("environment-data:project-work:attention");
+  const verificationJob = read("environment-data:project-work:verification-job");
+  const verificationFamily = Atom.family((key: string) => {
+    const [environmentId, input] = JSON.parse(key) as [EnvironmentId, ProjectWorkReadIntent];
+    const target = {
+      environmentId,
+      projectId: input.projectId,
+      taskId: input.taskId!,
+      verificationJobId: input.verificationJobId!,
+    };
+    return verificationJob({ environmentId, input }).pipe(
+      Atom.map(AsyncResult.map((value) => asProjectWorkVerificationJob(value, target))),
+    );
+  });
   const exportJson = read("environment-data:project-work:export-json");
   const exportMarkdown = read("environment-data:project-work:export-markdown");
 
@@ -611,6 +656,15 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
     page: (target: ProjectWorkPageTarget) => {
       const key = projectWorkPageTargetKey(target);
       return target.poll === false ? pageFamily(key) : pollingPage(key);
+    },
+    verificationJob: (target: ProjectWorkVerificationJobTarget) => {
+      const input = decodeVerificationRead({
+        projectId: target.projectId,
+        taskId: target.taskId,
+        verificationJobId: target.verificationJobId,
+        operation: "verification-job",
+      });
+      return verificationFamily(environmentRpcKey({ environmentId: target.environmentId, input }));
     },
     write,
     pageSize: PROJECT_WORK_PAGE_SIZE,

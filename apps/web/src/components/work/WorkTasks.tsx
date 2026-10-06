@@ -36,6 +36,11 @@ import { Textarea } from "../ui/textarea";
 import { WorkCard, WorkDataNotice } from "./WorkDataNotice";
 import { WorkCommandFailureNotice } from "./WorkCommandFailureNotice";
 import { projectWorkCommandFailure, type ProjectWorkCommandFailure } from "./workCommandFailure";
+import {
+  TaskVerification,
+  TaskVerificationDraftContext,
+  TaskVerificationAccessContext,
+} from "./TaskVerification";
 import { GuidedTaskDetail } from "./GuidedTaskDetail";
 import { IssueIntake } from "./IssueIntake";
 import { WorkTeamFoundation, type WorkTeamFoundationView } from "./WorkTeamFoundation";
@@ -87,7 +92,11 @@ type SpecificationRetry =
       readonly specificationRevision: number;
     };
 
+import type { GuidedTaskDraftStore } from "./guidedTaskDraft";
+
 type WorkTasksProps = {
+  readonly verificationDrafts?: GuidedTaskDraftStore;
+  readonly verifyVerificationAccess?: () => void;
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly connected: boolean;
@@ -99,6 +108,16 @@ type WorkTasksProps = {
 };
 
 export function WorkTasks(props: WorkTasksProps) {
+  return (
+    <TaskVerificationAccessContext.Provider value={props.verifyVerificationAccess ?? null}>
+      <TaskVerificationDraftContext.Provider value={props.verificationDrafts ?? null}>
+        <WorkTasksContent {...props} />
+      </TaskVerificationDraftContext.Provider>
+    </TaskVerificationAccessContext.Provider>
+  );
+}
+
+function WorkTasksContent(props: WorkTasksProps) {
   return props.teamReadSupported ? (
     <WorkTeamFoundation
       environmentId={props.environmentId}
@@ -1063,47 +1082,88 @@ function ManagedTaskDetail({
     foundation.refresh();
     void refreshContext(target);
   };
+  const submit = async (intent: ProjectWorkWriteIntent) => {
+    const latest = registry.get(atom);
+    const current = asProjectWorkTaskContext(Option.getOrNull(AsyncResult.value(latest)));
+    if (
+      latest._tag !== "Success" ||
+      latest.waiting ||
+      !current ||
+      current.projectId !== projectId ||
+      current.task.projectId !== projectId ||
+      current.task.taskId !== task.taskId ||
+      current.revision !== intent.expectedRevision ||
+      !("taskId" in intent) ||
+      intent.taskId !== task.taskId ||
+      ("expectedTaskRevision" in intent && intent.expectedTaskRevision !== current.task.revision)
+    )
+      throw {
+        code: "stale-revision",
+        message: "Refresh the current task before making changes.",
+      };
+    await onWrite(intent);
+  };
+  const current =
+    foundation.current &&
+    canWrite &&
+    result._tag === "Success" &&
+    !result.waiting &&
+    context?.task.revision === task.revision;
   return (
-    <GuidedTaskDetail
-      environmentId={environmentId}
-      projectId={projectId}
-      taskContext={context}
-      foundationRecords={foundation.snapshot.records}
-      foundationRevision={foundation.snapshot.revision}
-      foundationComplete={
-        foundation.current &&
-        canWrite &&
-        result._tag === "Success" &&
-        !result.waiting &&
-        context?.task.revision === task.revision
-      }
-      connected={access.connected}
-      enabled={access.enabled}
-      supported={access.supported}
-      onRefresh={refresh}
-      onWrite={async (intent) => {
-        const latest = registry.get(atom);
-        const current = asProjectWorkTaskContext(Option.getOrNull(AsyncResult.value(latest)));
-        if (
-          latest._tag !== "Success" ||
-          latest.waiting ||
-          !current ||
-          current.projectId !== projectId ||
-          current.task.projectId !== projectId ||
-          current.task.taskId !== task.taskId ||
-          current.revision !== intent.expectedRevision ||
-          !("taskId" in intent) ||
-          intent.taskId !== task.taskId ||
-          ("expectedTaskRevision" in intent &&
-            intent.expectedTaskRevision !== current.task.revision)
-        )
-          throw {
-            code: "stale-revision",
-            message: "Refresh the current task before making changes.",
-          };
-        await onWrite(intent);
-      }}
-    />
+    <>
+      <GuidedTaskDetail
+        environmentId={environmentId}
+        projectId={projectId}
+        taskContext={context}
+        foundationRecords={foundation.snapshot.records}
+        foundationRevision={foundation.snapshot.revision}
+        foundationComplete={
+          foundation.current &&
+          canWrite &&
+          result._tag === "Success" &&
+          !result.waiting &&
+          context?.task.revision === task.revision
+        }
+        connected={access.connected}
+        enabled={access.enabled}
+        supported={access.supported}
+        onRefresh={refresh}
+        onWrite={submit}
+      />
+      <TaskVerification
+        environmentId={environmentId}
+        projectId={projectId}
+        context={context}
+        records={foundation.snapshot.records}
+        current={current}
+        connected={access.connected}
+        enabled={access.enabled}
+        supported={access.supported}
+        onWrite={submit}
+        onRefresh={refresh}
+        verify={() => {
+          const fresh = foundation.verify();
+          const latest = registry.get(atom);
+          const currentContext = asProjectWorkTaskContext(
+            Option.getOrNull(AsyncResult.value(latest)),
+          );
+          if (
+            latest._tag !== "Success" ||
+            latest.waiting ||
+            !currentContext ||
+            currentContext.projectId !== projectId ||
+            currentContext.task.projectId !== projectId ||
+            currentContext.task.taskId !== task.taskId ||
+            currentContext.revision !== fresh.revision
+          )
+            throw {
+              code: "stale-revision",
+              message: "Refresh the current task and project before verification.",
+            };
+          return { context: currentContext, records: fresh.records };
+        }}
+      />
+    </>
   );
 }
 

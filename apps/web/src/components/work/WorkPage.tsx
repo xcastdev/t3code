@@ -1,4 +1,4 @@
-import { useAtomValue } from "@effect/atom-react";
+import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import { useNavigate } from "@tanstack/react-router";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { ProjectWorkTaskId, type EnvironmentId, type ProjectId } from "@t3tools/contracts";
@@ -11,8 +11,8 @@ import {
   PanelTopIcon,
   UsersIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
-import { useCallback, useRef } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useCallback, useContext, useRef } from "react";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { projectWorkStreamAvailable } from "@t3tools/client-runtime/project-work";
@@ -20,6 +20,7 @@ import { projectWorkStreamAvailable } from "@t3tools/client-runtime/project-work
 import { isElectron } from "../../env";
 import { useEnvironment } from "../../state/environments";
 import { useProject } from "../../state/entities";
+import { environmentPresentations } from "../../state/presentation";
 import { serverEnvironment } from "../../state/server";
 import { Badge } from "../ui/badge";
 import { SidebarInset } from "../ui/sidebar";
@@ -35,6 +36,8 @@ import { Inbox } from "../../features/projectTeams/Inbox";
 import { Memory } from "../../features/projectTeams/Memory";
 import { Evidence } from "../../features/projectTeams/Evidence";
 import { WorkSupervisionSource } from "./WorkSupervisionSource";
+
+import { createGuidedTaskDraftState, type GuidedTaskDraftStore } from "./guidedTaskDraft";
 
 const TAB_ITEMS: ReadonlyArray<{
   readonly id: WorkTab;
@@ -86,9 +89,40 @@ function ProjectWorkPage({
   selection,
   onSelectionChange,
 }: WorkPageProps) {
+  const registry = useContext(RegistryContext);
+  const verifyVerificationAccess = useCallback(() => {
+    const presentation = registry.get(environmentPresentations.presentationAtom(environmentId));
+    const config = registry.get(serverEnvironment.configValueAtom(environmentId));
+    if (
+      presentation?.entry.target.environmentId !== environmentId ||
+      presentation.entry.enabled !== true ||
+      presentation.connection.phase !== "connected" ||
+      config?.settings.projectWorkEnabled !== true ||
+      config.environment?.capabilities?.projectTeamFoundationReads !== true ||
+      config.environment?.capabilities?.projectTeamGuidedWrites !== true
+    )
+      throw {
+        code: "unavailable",
+        message:
+          "Reconnect and refresh current verification access before preparing or responding.",
+      };
+  }, [environmentId, registry]);
   const environment = useEnvironment(environmentId);
   const project = useProject(scopeProjectRef(environmentId, projectId));
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const [draftSnapshot, draftsChanged] = useState(createGuidedTaskDraftState);
+  const draftState = useRef(draftSnapshot);
+  const verificationDrafts = useMemo<GuidedTaskDraftStore>(
+    () => ({
+      snapshot: draftSnapshot,
+      read: () => draftState.current,
+      write: (state) => {
+        draftState.current = state;
+        draftsChanged(state);
+      },
+    }),
+    [draftSnapshot],
+  );
   const [localTab, setTab] = useState<WorkTab>("overview");
   const [inboxVisited, setInboxVisited] = useState(selection?.tab === "inbox");
   const [localTargetTask, setTargetTask] = useState<ProjectWorkTaskId | undefined>();
@@ -232,6 +266,8 @@ function ProjectWorkPage({
               />
             ) : tab === "tasks" ? (
               <WorkTasks
+                verifyVerificationAccess={verifyVerificationAccess}
+                verificationDrafts={verificationDrafts}
                 key={`${environmentId}:${projectId}:tasks`}
                 environmentId={environmentId}
                 projectId={projectId}
