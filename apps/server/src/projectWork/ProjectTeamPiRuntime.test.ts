@@ -7,6 +7,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import {
   PiManagedRuntimeError,
   type PiManagedOperationRequest,
@@ -16,6 +17,24 @@ import type { PiProductionRuntimeAssets } from "../provider/pi/PiProductionRunti
 import { makeProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 
 const instanceId = ProviderInstanceId.make("pi_registry");
+
+it.effect("scoped availability wakes observe registration and release without borrowing Pi", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* makeProjectTeamPiRuntime();
+      const changes = yield* registry.subscribeChanges;
+      const events = yield* Stream.runCollect(Stream.take(changes, 2)).pipe(Effect.forkScoped);
+      const driverScope = yield* ownedScope;
+      const assets = makeAssets();
+      yield* registry
+        .publishAssets(instanceId, assets.assets, makeRuntime())
+        .pipe(Effect.provideService(Scope.Scope, driverScope));
+      yield* Scope.close(driverScope, Exit.void);
+      expect(yield* Fiber.join(events)).toEqual([instanceId, instanceId]);
+      expect(assets.loans()).toEqual({ acquired: 0, released: 0, active: 0 });
+    }),
+  ),
+);
 const isManagedRuntimeError = Schema.is(PiManagedRuntimeError);
 const request: PiManagedOperationRequest = {
   kind: "initialize",

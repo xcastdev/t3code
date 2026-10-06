@@ -18,6 +18,9 @@ import * as IssueComments from "./ProjectIssueComments.ts";
 import * as IssueHumanBinding from "./ProjectIssueHumanBinding.ts";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import type { ProjectTeamExecutionError } from "./ProjectTeamExecution.ts";
+import { makeProjectTeamExecutionReactor } from "./ProjectTeamExecutionReactor.ts";
 import type { ProjectWorkPublicationRequest, ServerSettingsError } from "@t3tools/contracts";
 import * as Publication from "./ProjectWorkPullRequests.ts";
 import * as PublicationLinks from "./ProjectWorkPublicationLinks.ts";
@@ -30,6 +33,49 @@ import * as ProjectWorkStream from "./ProjectWorkStream.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 
 const isPublicationError = Schema.is(Publication.PublicationError);
+
+export interface ProjectTeamExecutionWorkerService {
+  readonly sweep: () => Effect.Effect<{ readonly hasMore: boolean }, ProjectTeamExecutionError>;
+  readonly stop: Effect.Effect<void>;
+}
+
+/** Existing generation ownership joins disable/shutdown; registry changes wake durable discovery. */
+export const makeProjectTeamExecutionWorker = Effect.fn("makeProjectTeamExecutionWorker")(
+  function* <R>(
+    start: Effect.Effect<
+      ProjectTeamExecutionWorkerService,
+      ProjectTeamExecutionError,
+      R | Scope.Scope
+    >,
+    ready: Effect.Effect<void> = Effect.void,
+  ) {
+    const pi = yield* ProjectTeamPiRuntime;
+    const providerChanges = yield* pi.subscribeChanges;
+    const reactor = yield* makeProjectTeamExecutionReactor({
+      start: ready.pipe(
+        Effect.andThen(start),
+        Effect.map((service) => {
+          const drain = Effect.gen(function* () {
+            let hasMore = true;
+            while (hasMore) hasMore = (yield* service.sweep()).hasMore;
+          });
+          return { ready: Effect.void, sweep: drain, stop: service.stop };
+        }),
+      ),
+    });
+    yield* Stream.runForEach(providerChanges, () =>
+      reactor.drain().pipe(
+        Effect.asVoid,
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.failCause(cause)
+            : Effect.logWarning("Project team availability wake failed", cause),
+        ),
+      ),
+    ).pipe(Effect.forkScoped);
+    return reactor;
+  },
+);
 
 export const runProjectWorkLeaseWorker = (
   reactor: ProjectWorkLeaseReactor.ProjectWorkLeaseReactorShape,
@@ -435,17 +481,15 @@ export const runProjectWorkPublicationLinkRecovery = Effect.fn(
       Effect.asVoid,
     );
   const recover = guarded(
-    service
-      .recoverAll()
-      .pipe(
-        Effect.tap((result) =>
-          result.failed === 0
-            ? Effect.void
-            : Effect.logWarning("project-work PR links remain unavailable", {
-                failed: result.failed,
-              }),
-        ),
+    service.recoverAll().pipe(
+      Effect.tap((result) =>
+        result.failed === 0
+          ? Effect.void
+          : Effect.logWarning("project-work PR links remain unavailable", {
+              failed: result.failed,
+            }),
       ),
+    ),
   );
   yield* ready;
   yield* recover;

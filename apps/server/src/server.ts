@@ -61,6 +61,10 @@ import {
   makeProjectTeamPiRuntime,
 } from "./projectWork/ProjectTeamPiRuntime.ts";
 import { makeProjectTeamRuntime } from "./projectWork/ProjectTeamRuntime.ts";
+import {
+  makeProjectTeamExecution,
+  ProjectTeamExecutionError,
+} from "./projectWork/ProjectTeamExecution.ts";
 import * as CodexResetCredit from "./provider/Layers/codexResetCredit.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
@@ -818,7 +822,47 @@ const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
   ),
 );
 
-const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
+const ProjectTeamExecutionLayerLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const environment = yield* ServerEnvironment.ServerEnvironment;
+    const start = makeProjectTeamExecution({
+      environmentId: yield* environment.getEnvironmentId,
+      maximumEnvironmentModelCalls: 2,
+      managedWorktreesRoot: config.worktreesDir,
+      protectedRoots: [config.stateDir, config.secretsDir],
+      launchPolicy: { memoryBytes: 536870912, runtimeSeconds: 60 },
+      // The three independent engineering verdicts remain pending. Feature settings cannot bypass
+      // this private staged gate; ordinary provider startup stays usable and no budget is reserved.
+      nativeAdmission: Effect.fail(
+        new ProjectTeamExecutionError({
+          reason: "Managed execution awaits the retained engineering verdicts",
+        }),
+      ),
+    }).pipe(
+      Effect.mapError(
+        () => new ProjectTeamExecutionError({ reason: "Managed execution service is unavailable" }),
+      ),
+    );
+    yield* ProjectWorkRuntime.makeProjectTeamExecutionWorker(
+      start,
+      (yield* ServerActivation) ?? Effect.void,
+    );
+  }),
+).pipe(
+  Layer.provide(ProjectTeamPiRuntimeLayerLive),
+  Layer.provide(ProjectWorkCoreLive),
+  Layer.provide(GitWorkflowLayerLive),
+  Layer.provide(PiModelCatalogueLayerLive),
+  Layer.provide(ManagedSkillRepository.layer),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(ServerSettingsLayerLive),
+);
+
+const ProviderRuntimeLayerLive = Layer.mergeAll(
+  ProviderSessionReaperLive,
+  ProjectTeamExecutionLayerLive,
+).pipe(
   // Subscribes to `account.rate-limits.updated` so usage bars track live
   // telemetry instead of waiting for the next status probe.
   Layer.provideMerge(ProviderUsageLimitsIngestionLive),

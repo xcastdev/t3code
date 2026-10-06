@@ -132,6 +132,35 @@ const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
   });
 const fixture = makeFixture();
 
+it.effect("revalidates the admission loan before any domain writes and rolls back denial", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const before = yield* readCurrentState(f.sql, projectId);
+      let checked = false;
+      const result = yield* f.journal
+        .reserve(f.request, {
+          beforeDomainWrite: Effect.gen(function* () {
+            checked = true;
+            expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(before.revision);
+            expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toHaveLength(0);
+            return yield* new ProjectTeamDispatchJournalError({ reason: "Physical input changed" });
+          }).pipe(
+            Effect.mapError(
+              () => new ProjectTeamDispatchJournalError({ reason: "Physical input changed" }),
+            ),
+          ),
+        })
+        .pipe(Effect.result);
+      expect(checked).toBe(true);
+      expect(result._tag).toBe("Failure");
+      expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(before.revision);
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toHaveLength(0);
+      expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toHaveLength(0);
+    }),
+  ),
+);
+
 it.effect(
   "atomically admits one run, writer reservation and pending dispatch; exact retries add nothing",
   () =>

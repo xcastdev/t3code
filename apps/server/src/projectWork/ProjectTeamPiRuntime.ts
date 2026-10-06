@@ -1,6 +1,8 @@
 import type { ProviderInstanceId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as PubSub from "effect/PubSub";
+import * as Stream from "effect/Stream";
 import {
   PiManagedRuntimeError,
   type PiManagedRuntimeInstance,
@@ -16,6 +18,9 @@ const denied = () =>
 
 /** Root borrows the driver's actual scoped instance; this service grants no task authority. */
 export const makeProjectTeamPiRuntime = Effect.fn("makeProjectTeamPiRuntime")(function* () {
+  // Wakes are disposable hints; startup discovery reads the durable dispatch journal.
+  const changes = yield* PubSub.sliding<ProviderInstanceId>(128);
+  const subscribeChanges = PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription));
   const instances = yield* Effect.sync(
     () =>
       new Map<
@@ -49,11 +54,11 @@ export const makeProjectTeamPiRuntime = Effect.fn("makeProjectTeamPiRuntime")(fu
         Effect.sync(() => {
           instances.set(instanceId, entry);
           return entry;
-        }),
+        }).pipe(Effect.tap(() => PubSub.publish(changes, instanceId))),
         () =>
           Effect.sync(() => {
             if (instances.get(instanceId) === entry) instances.delete(instanceId);
-          }),
+          }).pipe(Effect.andThen(PubSub.publish(changes, instanceId))),
       ).pipe(Effect.asVoid);
     });
   const withInstance = <A, E, R>(
@@ -91,7 +96,13 @@ export const makeProjectTeamPiRuntime = Effect.fn("makeProjectTeamPiRuntime")(fu
           );
       }),
     );
-  return { publishAssets, withInstance, installOperationResolver, resolveOperationId };
+  return {
+    publishAssets,
+    withInstance,
+    installOperationResolver,
+    resolveOperationId,
+    subscribeChanges,
+  };
 });
 
 export class ProjectTeamPiRuntime extends Context.Service<

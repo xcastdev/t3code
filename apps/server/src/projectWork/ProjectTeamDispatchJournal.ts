@@ -719,7 +719,11 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     });
     const reserve = Effect.fn("ProjectTeamDispatchJournal.reserve")(function* (
       input: ProjectTeamDispatchRequest,
+      validation?: {
+        readonly beforeDomainWrite: Effect.Effect<void, ProjectTeamDispatchJournalError>;
+      },
     ) {
+      const beforeDomainWrite = validation?.beforeDomainWrite;
       const request = yield* decodeRequest(input).pipe(
         Effect.mapError(() => deny("Invalid dispatch request")),
       );
@@ -947,6 +951,9 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           };
           if (Buffer.byteLength(encodeIntent(intent)) > 262144)
             return yield* deny("Dispatch intent exceeds its storage bound");
+          // Admission's resource loan compares the pre-claim reducer snapshot. Revalidate it
+          // after the awaited admission reads, before this transaction changes that snapshot.
+          if (beforeDomainWrite !== undefined) yield* beforeDomainWrite;
           if (budgets.length === 0)
             yield* sql`INSERT INTO project_team_model_budget VALUES
         (${environmentId},${binding.projectId},${rootTaskId},${limits.maximumTokens},${limits.rootDeadlineAtMs})`;
