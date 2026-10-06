@@ -152,7 +152,11 @@ export function makeProjectWorkArtifacts(input: typeof Options.Type) {
     });
     const readRetained = (artifactId: string) => {
       try {
-        return Effect.andThen(assertTransactionOwner, read(exact(decodeId, artifactId)));
+        // BEGIN also fences a physical transaction left open after a failed COMMIT.
+        return Effect.andThen(
+          assertTransactionOwner,
+          sql.withTransaction(read(exact(decodeId, artifactId))),
+        );
       } catch {
         return Effect.fail(deny("Invalid artifact ID"));
       }

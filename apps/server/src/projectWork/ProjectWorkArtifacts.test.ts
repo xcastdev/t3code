@@ -1,5 +1,6 @@
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -77,6 +78,44 @@ const fixture = Effect.gen(function* () {
   const artifacts = yield* makeProjectWorkArtifacts(options);
   return { sql, artifacts };
 });
+
+for (const operation of ["readRetained", "retainedIdsFor"] as const) {
+  it.effect("a failed COMMIT cannot expose uncommitted retention through " + operation, () =>
+    database(
+      Effect.gen(function* () {
+        const { sql, artifacts } = yield* fixture;
+        yield* sql`PRAGMA foreign_keys=ON`;
+        yield* sql`CREATE TABLE controlled_parent(id INTEGER PRIMARY KEY)`;
+        yield* sql`CREATE TABLE controlled_child(parent_id INTEGER REFERENCES controlled_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* sql`CREATE TRIGGER controlled_commit_failure AFTER INSERT ON project_work_artifacts BEGIN INSERT INTO controlled_child(parent_id) VALUES(1); END`;
+        const retained = yield* artifacts.retain(input).pipe(Effect.exit);
+        expect(retained._tag).toBe("Failure");
+        if (retained._tag === "Failure")
+          expect(Cause.pretty(retained.cause)).toContain("FOREIGN KEY constraint failed");
+        const pendingRead =
+          operation === "readRetained"
+            ? artifacts.readRetained(input.artifactId).pipe(Effect.asVoid)
+            : artifacts
+                .retainedIdsFor({ applicability, artifactIds: [input.artifactId] })
+                .pipe(Effect.asVoid);
+        const read = yield* pendingRead.pipe(Effect.exit);
+        const physicalRows = yield* sql`SELECT count(*) AS count FROM project_work_artifacts`;
+        // Fixture cleanup only: prove these physically visible rows were never committed.
+        yield* sql`ROLLBACK`;
+        expect(physicalRows).toEqual([{ count: 1 }]);
+        expect(yield* sql`SELECT count(*) AS count FROM project_work_artifacts`).toEqual([
+          { count: 0 },
+        ]);
+        expect(yield* artifacts.readRetained(input.artifactId)).toBeUndefined();
+        expect(read._tag).toBe("Failure");
+        if (read._tag === "Failure")
+          expect(Cause.pretty(read.cause)).toContain(
+            "cannot start a transaction within a transaction",
+          );
+      }),
+    ),
+  );
+}
 
 it.effect("binary and empty artifacts survive closing and reopening the migrated database", () =>
   Effect.gen(function* () {
