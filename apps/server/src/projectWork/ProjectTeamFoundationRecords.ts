@@ -65,6 +65,10 @@ export const validateProjectTeamRecord = (
     readonly receiptId: string;
   },
   memoryReflection?: Extract<ProjectWorkTeamTransition, { kind: "memory.reflect" }>,
+  publicationTransition?: Extract<
+    ProjectWorkTeamTransition,
+    { kind: "publication.claim" | "publication.reflect" }
+  >,
 ): TeamRecord => {
   const r = decodeTeamRecord(input);
   const records = state.foundationRecords ?? [];
@@ -102,6 +106,22 @@ export const validateProjectTeamRecord = (
         observationIds: memoryReflection.observationIds,
       });
   const memoryCleanup = reflectedMemory && r.kind === "effect" && r.effectKind === "memory-delete";
+  const reflectedPublication =
+    publicationTransition?.kind === "publication.reflect" &&
+    origin.actor.kind === "system" &&
+    origin.actor.id === "project-work-github-outbox" &&
+    origin.source.kind === "system" &&
+    origin.source.id === "project-work-github-outbox" &&
+    old?.kind === "effect" &&
+    r.kind === "effect" &&
+    r.effectKind === "publication" &&
+    r.effectId === publicationTransition.effectId &&
+    old.revision === publicationTransition.expectedEffectRevision &&
+    r.revision === old.revision + 1 &&
+    old.claimGeneration === publicationTransition.claimGeneration &&
+    r.claimGeneration === old.claimGeneration &&
+    r.outcome === canonicalProjectWorkPayload(publicationTransition.receipt) &&
+    r.status === (publicationTransition.receipt.kind === "confirmed" ? "succeeded" : "uncertain");
 
   if (old !== undefined) {
     if (old.kind !== r.kind) reject("Record identity cannot change kind");
@@ -575,6 +595,35 @@ export const validateProjectTeamRecord = (
       break;
     }
     case "effect":
+      if (r.effectKind === "publication") {
+        if (
+          old === undefined &&
+          (r.status !== "pending" || r.claimGeneration !== 0 || r.outcome !== undefined)
+        )
+          reject("New publication must be an unsent pending effect");
+        if (
+          old?.kind === "effect" &&
+          (r.status !== old.status ||
+            r.claimGeneration !== old.claimGeneration ||
+            r.outcome !== old.outcome) &&
+          !reflectedPublication &&
+          !(
+            publicationTransition?.kind === "publication.claim" &&
+            origin.actor.kind === "system" &&
+            origin.actor.id === "project-work-github-outbox" &&
+            origin.source.kind === "system" &&
+            origin.source.id === "project-work-github-outbox" &&
+            publicationTransition.effectId === r.effectId &&
+            old.status === "pending" &&
+            r.status === "claimed" &&
+            old.revision === publicationTransition.expectedEffectRevision &&
+            old.claimGeneration === publicationTransition.expectedClaimGeneration &&
+            r.claimGeneration === old.claimGeneration + 1 &&
+            r.outcome === undefined
+          )
+        )
+          reject("Publication status requires a typed private transition");
+      }
       if (old?.kind === "effect" && stable(old) !== stable(r))
         reject("Effect identity and semantic envelope are immutable");
       if (r.runId !== undefined && !memoryCleanup) requireRecord(r.runId, "run-binding");
@@ -590,7 +639,8 @@ export const validateProjectTeamRecord = (
         old.status === "uncertain" &&
         r.status !== "uncertain" &&
         r.status !== "canceled" &&
-        !reflectedMemory
+        !reflectedMemory &&
+        !reflectedPublication
       )
         reject("Uncertain effect requires durable reconciliation");
       if (old?.kind === "effect" && old.status === "claimed" && r.status === "pending")

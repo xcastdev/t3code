@@ -153,6 +153,7 @@ import * as ProjectWorkAttentionReactor from "./projectWork/ProjectWorkAttention
 import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.ts";
 import * as ProjectWorkExport from "./projectWork/ProjectWorkExport.ts";
 import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
+import * as ProjectWorkPublicationGuard from "./projectWork/ProjectWorkPublicationGuard.ts";
 import * as GitHubIssueClient from "./projectWork/github/GitHubIssueClient.ts";
 import * as IssueCredentialSnapshot from "./projectWork/ProjectIssueCredentialSnapshot.ts";
 import * as ProjectLifecycle from "./project/ProjectLifecycle.ts";
@@ -512,6 +513,9 @@ const PullRequestServiceLive = PullRequestService.layer.pipe(
 );
 
 const GitManagerLayerLive = GitManager.layer.pipe(
+  Layer.provide(
+    ProjectWorkPublicationGuard.layer.pipe(Layer.provide(ProjectTeamAuthorizationLive)),
+  ),
   Layer.provideMerge(ProjectSetupScriptRunner.layer.pipe(Layer.provide(ServerSettingsLayerLive))),
   Layer.provideMerge(WorktreeSetupTracker.layer),
   Layer.provideMerge(GitVcsDriver.layer),
@@ -635,8 +639,17 @@ const ProjectIssueServicesLive = ProjectWorkRuntime.issueCommentsLayer.pipe(
   Layer.provide(ProjectWorkCoreLive),
   Layer.provide(ServerSettingsLayerLive),
 );
+const ProjectWorkPublicationServicesLive = ProjectWorkRuntime.publicationServicesLayer.pipe(
+  Layer.provideMerge(ProjectIssueServicesLive),
+  Layer.provideMerge(ProjectWorkCoreLive),
+  Layer.provide(GitHubCli.layer),
+);
 
 const ProjectWorkServicesLive = Layer.mergeAll(
+  ProjectWorkPublicationServicesLive,
+  ProjectWorkRuntime.publicationRecoveryLayer.pipe(
+    Layer.provide(ProjectWorkPublicationServicesLive),
+  ),
   ProjectWorkRuntime.withCore(ProjectWorkCoreLive),
   ProjectIssueServicesLive,
   ProjectIssueBindingGateway.layer.pipe(Layer.provide(ProjectIssueServicesLive)),

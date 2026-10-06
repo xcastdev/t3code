@@ -31,6 +31,10 @@ import {
   TextGenerationError,
 } from "@t3tools/contracts";
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import {
+  ProjectWorkPublicationGuard,
+  ProjectWorkPublicationGuardError,
+} from "../projectWork/ProjectWorkPublicationGuard.ts";
 import * as GitLabCli from "../sourceControl/GitLabCli.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -630,6 +634,7 @@ function preparePullRequestThread(
 }
 
 function makeManager(input?: {
+  publicationGuard?: ProjectWorkPublicationGuard["Service"];
   ghScenario?: FakeGhScenario;
   sourceControlProvider?: SourceControlProvider["Service"];
   textGeneration?: Partial<FakeGitTextGeneration>;
@@ -702,6 +707,9 @@ function makeManager(input?: {
   );
 
   const managerLayer = Layer.mergeAll(
+    input?.publicationGuard === undefined
+      ? Layer.empty
+      : Layer.succeed(ProjectWorkPublicationGuard, input.publicationGuard),
     Layer.succeed(TextGeneration.TextGeneration, textGeneration),
     Layer.mock(ProviderRegistry.ProviderRegistry)({
       getProviders: Effect.succeed([]),
@@ -723,6 +731,41 @@ function makeManager(input?: {
 }
 
 const asThreadId = (threadId: string) => threadId as ThreadId;
+
+for (const action of ["create_pr", "commit_push_pr"] as const)
+  it.effect(`managed ${action} cannot enter legacy generation, commit, push or publication`, () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("managed-publication-guard-");
+      yield* initRepo(repoDir);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "uncommitted.txt"), "retained work\n");
+      const before = yield* runGit(repoDir, ["status", "--porcelain"]);
+      let generated = 0;
+      const { manager, ghCalls } = yield* makeManager({
+        publicationGuard: {
+          check: () =>
+            Effect.fail(
+              new ProjectWorkPublicationGuardError({ reason: "managed-publication-unavailable" }),
+            ),
+        },
+        textGeneration: {
+          generatePrContent: () => {
+            generated += 1;
+            return Effect.die("Managed publication must not generate content");
+          },
+        },
+      });
+      const result = yield* runStackedAction(manager, { cwd: repoDir, action }).pipe(Effect.result);
+      expect(result).toMatchObject({
+        _tag: "Failure",
+        failure: {
+          detail: expect.stringContaining("retained review and publication authorization"),
+        },
+      });
+      expect(yield* runGit(repoDir, ["status", "--porcelain"])).toEqual(before);
+      expect(generated).toBe(0);
+      expect(ghCalls).toEqual([]);
+    }).pipe(Effect.provide(GitManagerTestLayer), Effect.scoped),
+  );
 
 const GitManagerTestLayer = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-git-manager-test-" })),

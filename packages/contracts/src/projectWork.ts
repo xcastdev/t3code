@@ -19,6 +19,7 @@ import {
   ProjectId,
   TrimmedNonEmptyString,
   TrimmedString,
+  ThreadId,
 } from "./baseSchemas.ts";
 
 export * from "./projectWorkCore.ts";
@@ -1322,7 +1323,96 @@ export type ProjectWorkGuidedTransition = typeof ProjectWorkGuidedTransition.Typ
 
 /** Private scheduler/runtime transitions. Public transports deny foundation commands. */
 const JoinedRunCounter = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+const PublicationRepository = Schema.Struct({
+  host: GuidedId.check(
+    Schema.isPattern(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u),
+  ),
+  nodeId: GuidedId,
+  nameWithOwner: GuidedId.check(Schema.isPattern(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u)),
+});
+/** Private host-owned outbox envelope; transports cannot submit foundation commands. */
+export const ProjectWorkPublicationRequest = Schema.Struct({
+  version: Schema.Literal(1),
+  kind: Schema.Literal("create-pr"),
+  operationId: GuidedId,
+  marker: GuidedId.check(Schema.isPattern(/^[A-Za-z0-9_-]{16,128}$/u)),
+  repository: PublicationRepository,
+  target: Schema.Struct({
+    projectId: ProjectId,
+    taskId: ProjectWorkTaskId,
+    specRevision: JoinedRunCounter,
+    planRevision: JoinedRunCounter,
+    scopeHash: GuidedId,
+    baseSha: GuidedId,
+    headSha: GuidedId,
+    baseRef: GuidedId,
+    headRef: GuidedId,
+    headRepositoryNodeId: GuidedId,
+    headSelector: GuidedId,
+  }),
+  expectedTaskRevision: JoinedRunCounter,
+  authorizationRecordIds: Schema.Array(GuidedId).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(64),
+    Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+  ),
+  threadId: Schema.optionalKey(ThreadId),
+  title: GuidedText,
+  body: Schema.String.check(Schema.isMaxLength(32_000)),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectWorkPublicationRequest = typeof ProjectWorkPublicationRequest.Type;
+const PublicationOutcomeFields = {
+  version: Schema.Literal(1),
+  operationId: GuidedId,
+  requestHash: GuidedId.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+  claimGeneration: JoinedRunCounter,
+  observedAt: IsoDateTime,
+};
+export const ProjectWorkPublicationOutcome = Schema.Union([
+  Schema.Struct({
+    ...PublicationOutcomeFields,
+    kind: Schema.Literal("confirmed"),
+    marker: GuidedId,
+    repository: PublicationRepository,
+    pullRequest: Schema.Struct({
+      nodeId: GuidedId,
+      number: JoinedRunCounter.check(Schema.isGreaterThan(0)),
+      url: GuidedText,
+      state: Schema.Literals(["OPEN", "CLOSED", "MERGED"]),
+      baseSha: GuidedId,
+      headSha: GuidedId,
+      baseRef: GuidedId,
+      headRef: GuidedId,
+      headRepositoryNodeId: GuidedId,
+    }),
+  }),
+  Schema.Struct({
+    ...PublicationOutcomeFields,
+    kind: Schema.Literal("uncertain"),
+    reason: Schema.Literals([
+      "missing-match",
+      "ambiguous-match",
+      "changed-identity",
+      "incomplete-response",
+      "interrupted-write",
+    ]),
+  }),
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectWorkPublicationOutcome = typeof ProjectWorkPublicationOutcome.Type;
 export const ProjectWorkTeamTransition = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("publication.claim"),
+    effectId: GuidedId,
+    expectedEffectRevision: JoinedRunCounter,
+    expectedClaimGeneration: JoinedRunCounter,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("publication.reflect"),
+    effectId: GuidedId,
+    expectedEffectRevision: JoinedRunCounter,
+    claimGeneration: JoinedRunCounter,
+    receipt: ProjectWorkPublicationOutcome,
+  }),
   Schema.Struct({
     kind: Schema.Literal("memory.reflect"),
     effectId: GuidedId,

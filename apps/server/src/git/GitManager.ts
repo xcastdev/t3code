@@ -13,6 +13,7 @@ import * as Order from "effect/Order";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import { ProjectWorkPublicationGuard } from "../projectWork/ProjectWorkPublicationGuard.ts";
 import {
   GitActionProgressEvent,
   GitActionProgressPhase,
@@ -706,6 +707,8 @@ export const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  // CLI callers have no managed state. The server always supplies its durable guard.
+  const publicationGuard = yield* Effect.serviceOption(ProjectWorkPublicationGuard);
 
   const sourceControlProvider = (cwd: string) => sourceControlProviders.resolve({ cwd });
   const serverSettingsService = yield* ServerSettings.ServerSettingsService;
@@ -2917,6 +2920,26 @@ export const make = Effect.gen(function* () {
         GitRunStackedActionResult,
         GitManagerServiceError
       > {
+        if (
+          (input.action === "create_pr" || input.action === "commit_push_pr") &&
+          Option.isSome(publicationGuard)
+        )
+          yield* publicationGuard.value
+            .check({
+              cwd: input.cwd,
+              ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+            })
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new GitManagerError({
+                    operation: "runStackedAction",
+                    cwd: input.cwd,
+                    detail:
+                      "Managed pull request creation requires retained review and publication authorization. Inspect the task's delivery status.",
+                  }),
+              ),
+            );
         const initialStatus = yield* gitCore.statusDetails(input.cwd);
         // This legacy compound path can be entered from confirmations which
         // were approved before it reached the repository queue. Validate the

@@ -1,7 +1,12 @@
 import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import { DEFAULT_SERVER_SETTINGS, ProjectId, ProjectTeamCredential } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  ProjectId,
+  ProjectTeamCredential,
+  ProjectWorkPublicationRequest,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Option from "effect/Option";
 import * as Deferred from "effect/Deferred";
@@ -12,6 +17,7 @@ import type * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Redacted from "effect/Redacted";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -79,6 +85,30 @@ const rawIssue = {
   repository_url: "https://api.github.com/repos/owner/repo",
 };
 const key = { host: "github.com", repositoryNodeId: "R_repo" };
+const publicationRequest = Schema.decodeUnknownSync(ProjectWorkPublicationRequest)({
+  version: 1,
+  kind: "create-pr",
+  operationId: "publication",
+  marker: "opaque_marker_123456789",
+  repository: { host: "github.com", nodeId: "R_repo", nameWithOwner: "owner/repo" },
+  target: {
+    projectId: "project",
+    taskId: "task",
+    specRevision: 1,
+    planRevision: 1,
+    scopeHash: "scope",
+    baseSha: "base",
+    headSha: "head",
+    baseRef: "main",
+    headRef: "task",
+    headRepositoryNodeId: "R_repo",
+    headSelector: "task",
+  },
+  expectedTaskRevision: 0,
+  authorizationRecordIds: ["review"],
+  title: "Task PR",
+  body: "Retained work",
+});
 const fixture = Effect.fn("issueRuntimeTest.fixture")(function* (enabled = true) {
   yield* TestClock.setTime(1790812800000);
   yield* runMigrations();
@@ -261,6 +291,9 @@ it.effect("disabled startup performs no git/gh calls and retained handles are in
       const f = yield* fixture(false);
       const runtime = yield* f.start();
       yield* runtime.ready;
+      expect(
+        yield* runtime.resolvePublicationCredential(publicationRequest).pipe(Effect.result),
+      ).toMatchObject({ _tag: "Failure" });
       expect(f.calls).toHaveLength(0);
       expect(yield* runtime.refresh).toEqual({ repositories: [], pages: [] });
       expect(
@@ -273,6 +306,49 @@ it.effect("disabled startup performs no git/gh calls and retained handles are in
       expect(f.calls).toHaveLength(0);
     }),
   ),
+);
+
+it.effect(
+  "publication recovery borrows only the active project's verified repository credential and rejects stale or stopped handles",
+  () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const runtime = yield* f.start();
+        yield* runtime.refresh;
+        const calls = f.calls.length;
+        const credential = yield* runtime.resolvePublicationCredential(publicationRequest);
+        expect(credential).toMatchObject({
+          host: "github.com",
+          repositoryNodeId: "R_repo",
+          cwd: "/fixture/runtime",
+        });
+        expect(Redacted.isRedacted(credential.token)).toBe(true);
+        expect(f.calls).toHaveLength(calls);
+        expect(
+          yield* f.sql
+            .withTransaction(runtime.resolvePublicationCredential(publicationRequest))
+            .pipe(Effect.result),
+        ).toMatchObject({ _tag: "Failure" });
+        expect(
+          yield* runtime
+            .resolvePublicationCredential({
+              ...publicationRequest,
+              target: { ...publicationRequest.target, projectId: ProjectId.make("missing") },
+            })
+            .pipe(Effect.result),
+        ).toMatchObject({ _tag: "Failure" });
+        yield* f.sql`UPDATE projection_projects SET deleted_at=${at} WHERE project_id='project'`;
+        expect(
+          yield* runtime.resolvePublicationCredential(publicationRequest).pipe(Effect.result),
+        ).toMatchObject({ _tag: "Failure" });
+        yield* runtime.stop;
+        expect(
+          yield* runtime.resolvePublicationCredential(publicationRequest).pipe(Effect.result),
+        ).toMatchObject({ _tag: "Failure" });
+        expect(f.calls).toHaveLength(calls);
+      }),
+    ),
 );
 
 it.effect(

@@ -2,6 +2,7 @@ import type { ProjectTeamRecord } from "@t3tools/contracts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
 import { decideProjectTeamGuidedLifecycle } from "./ProjectTeamGuidedLifecycle.ts";
 import { decideProjectTeamMemoryReflection } from "./ProjectTeamMemoryTransitions.ts";
+import { decideProjectTeamPublicationTransition } from "./ProjectTeamPublicationTransitions.ts";
 import { decideProjectTeamGuidedTransition } from "./ProjectTeamGuidedTransitions.ts";
 import { isGuidedProjectTeamTask, projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import {
@@ -751,6 +752,11 @@ export function decideProjectWorkCommand(
       return events;
     }
     case "project-work.foundation.commit": {
+      if (
+        command.transition?.kind === "publication.claim" ||
+        command.transition?.kind === "publication.reflect"
+      )
+        return decideProjectTeamPublicationTransition(mutableState(state), command, event);
       if (command.transition?.kind === "memory.reflect")
         return decideProjectTeamMemoryReflection(
           mutableState(state),
@@ -2385,6 +2391,12 @@ const foundationAttentionTaskIds = (
       missionIds.add(entry.recordId);
       for (const taskId of entry.requiredTaskIds) taskIds.add(taskId);
     } else if (entry.kind === "task-membership") taskIds.add(entry.taskId);
+    else if (
+      entry.kind === "effect" &&
+      entry.effectKind === "publication" &&
+      entry.taskId !== undefined
+    )
+      taskIds.add(entry.taskId);
   };
   // Capture old edges before replacing the record, including detached/rebound
   // issue links and tasks removed from a mission.

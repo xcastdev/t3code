@@ -16,12 +16,18 @@ import * as IssueSync from "./ProjectIssueSyncWorker.ts";
 import * as IssueComments from "./ProjectIssueComments.ts";
 import * as IssueHumanBinding from "./ProjectIssueHumanBinding.ts";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
+import type { ProjectWorkPublicationRequest } from "@t3tools/contracts";
+import * as Publication from "./ProjectWorkPullRequests.ts";
+import { readIssueRepositoryState } from "./ProjectIssueRepositoryState.ts";
 
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
 import * as ProjectWorkLeaseReactor from "./ProjectWorkLeaseReactor.ts";
 import * as ProjectWorkRepository from "./ProjectWorkRepository.ts";
 import * as ProjectWorkStream from "./ProjectWorkStream.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
+
+const isPublicationError = Schema.is(Publication.PublicationError);
 
 export const runProjectWorkLeaseWorker = (
   reactor: ProjectWorkLeaseReactor.ProjectWorkLeaseReactorShape,
@@ -86,6 +92,9 @@ export class ProjectIssueRuntime extends Context.Service<
     }>;
     readonly readComments: IssueComments.ProjectIssueComments["Service"]["read"];
     readonly bindRepository: IssueHumanBinding.ProjectIssueHumanBinding["Service"]["bind"];
+    readonly resolvePublicationCredential: (
+      request: ProjectWorkPublicationRequest,
+    ) => Effect.Effect<Publication.PublicationCredential, Publication.PublicationError>;
     readonly stop: Effect.Effect<void>;
   }
 >()("t3/projectWork/ProjectWorkRuntime/ProjectIssueRuntime") {}
@@ -285,11 +294,61 @@ export const makeProjectIssueRuntime = Effect.fn("ProjectIssueRuntime.make")(fun
         );
       return receipt;
     });
+  const resolvePublicationCredential = Effect.fn(
+    "ProjectIssueRuntime.resolvePublicationCredential",
+  )(
+    function* (request: ProjectWorkPublicationRequest) {
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* new Publication.PublicationError({ reason: "credential-mismatch" });
+      yield* Deferred.await(initialized);
+      const current = active;
+      if (stopped || current === undefined)
+        return yield* new Publication.PublicationError({ reason: "credential-mismatch" });
+      yield* current.manager.ready;
+      const state = yield* readIssueRepositoryState(sql, {
+        host: request.repository.host,
+        repositoryNodeId: request.repository.nodeId,
+      });
+      if (
+        state === undefined ||
+        state.status !== "ready" ||
+        state.repositoryName !== request.repository.nameWithOwner
+      )
+        return yield* new Publication.PublicationError({ reason: "credential-mismatch" });
+      const bindings = yield* sql`
+      SELECT binding.project_id FROM project_issue_binding binding
+      JOIN projection_projects project ON project.project_id=binding.project_id
+      LEFT JOIN project_lifecycle lifecycle ON lifecycle.project_id=project.project_id
+      WHERE binding.project_id=${request.target.projectId} AND binding.host=${state.host}
+        AND binding.repository_node_id=${state.repositoryNodeId} AND binding.account_node_id=${state.accountNodeId} AND binding.status='active'
+        AND project.deleted_at IS NULL AND (lifecycle.state IS NULL OR lifecycle.state='active')
+      LIMIT 1`;
+      if (bindings.length !== 1)
+        return yield* new Publication.PublicationError({ reason: "credential-mismatch" });
+      const snapshot = yield* current.manager.resolveCredential(state);
+      if (stopped || active !== current || snapshot === undefined)
+        return yield* new Publication.PublicationError({ reason: "credential-mismatch" });
+      return {
+        cwd: snapshot.cwd,
+        host: snapshot.host,
+        repositoryNodeId: state.repositoryNodeId,
+        headRepositoryNodeId: request.target.headRepositoryNodeId,
+        credentialFingerprint: snapshot.credentialEpoch,
+        token: snapshot.token,
+      };
+    },
+    Effect.mapError((error) =>
+      isPublicationError(error)
+        ? error
+        : new Publication.PublicationError({ reason: "credential-mismatch" }),
+    ),
+  );
   return ProjectIssueRuntime.of({
     ready: Deferred.await(initialized),
     refresh,
     readComments,
     bindRepository,
+    resolvePublicationCredential,
     stop,
   });
 });
@@ -304,3 +363,50 @@ export const issueCommentsLayer = Layer.effect(
     });
   }),
 ).pipe(Layer.provideMerge(issueRuntimeLayer));
+
+/** The same service serializes live dispatch and recovery. Reflections never wake another read. */
+export const runProjectWorkPublicationRecovery = Effect.fn("runProjectWorkPublicationRecovery")(
+  function* (
+    service: Pick<Publication.ProjectWorkPullRequests["Service"], "recoverAll">,
+    ready: Effect.Effect<void>,
+  ) {
+    const bus = yield* ProjectWorkEventBus.ProjectWorkEventBus;
+    const changes = yield* bus.subscribe;
+    const recover = service.recoverAll().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : Effect.logWarning("project-work PR recovery failed", cause),
+      ),
+      Effect.asVoid,
+    );
+    yield* ready;
+    yield* recover;
+    yield* changes.pipe(
+      Stream.filter(
+        ({ event }) =>
+          event.type === "project-work.foundation.recorded" &&
+          event.record.kind === "effect" &&
+          event.record.effectKind === "publication" &&
+          event.record.status === "claimed",
+      ),
+      Stream.runForEach(() => recover),
+    );
+  },
+);
+
+export const publicationServicesLayer = Layer.effect(
+  Publication.ProjectWorkPullRequests,
+  Effect.gen(function* () {
+    const issues = yield* ProjectIssueRuntime;
+    // Deliberately no authorizer: first managed creation remains unavailable until retained evidence and review are consumed.
+    return yield* Publication.make({ resolveCredential: issues.resolvePublicationCredential });
+  }),
+);
+export const publicationRecoveryLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const service = yield* Publication.ProjectWorkPullRequests;
+    const issues = yield* ProjectIssueRuntime;
+    yield* Effect.forkScoped(runProjectWorkPublicationRecovery(service, issues.ready));
+  }),
+);
