@@ -11,6 +11,8 @@ import {
 import { ProjectTeamAuthorization } from "./ProjectTeamAuthorization.ts";
 import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
+import { makeProjectTeamMailboxTurns } from "./ProjectTeamMailboxTurns.ts";
 
 const isManagedRuntimeError = Schema.is(PiManagedRuntimeError);
 const denied = (detail: string) => new PiManagedRuntimeError({ code: "denied", detail });
@@ -33,6 +35,11 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
   const settings = yield* ServerSettingsService;
   const authorization = yield* ProjectTeamAuthorization;
   const pi = yield* ProjectTeamPiRuntime;
+  const operations = yield* makeProjectTeamPiOperations({ environmentId });
+  const mailboxTurns = yield* makeProjectTeamMailboxTurns({
+    environmentId,
+    lookupInTransaction: operations.lookupInTransaction,
+  });
   const journal = yield* makeProjectTeamDispatchJournal({
     environmentId,
     maximumEnvironmentModelCalls,
@@ -79,13 +86,25 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
         return yield* denied("Initialization requires its original completed setup");
       operationId = original.intent.request.initializeOperationId;
     } else if (request.kind === "prompt") {
-      if (
-        (original.fence.stage !== "assignment-intent" &&
-          original.fence.stage !== "assignment-observed") ||
-        request.prompt !== original.intent.request.assignment
-      )
-        return yield* denied("Prompt differs from its original durable assignment intent");
-      operationId = original.intent.request.assignmentOperationId;
+      if (request.prompt === original.intent.request.assignment) {
+        if (
+          original.fence.stage !== "assignment-intent" &&
+          original.fence.stage !== "assignment-observed"
+        )
+          return yield* denied("Prompt differs from its original durable assignment intent");
+        operationId = original.intent.request.assignmentOperationId;
+      } else {
+        const later = yield* mailboxTurns.readForOperation({
+          projectId: transition.binding.projectId,
+          bindingId: transition.binding.recordId,
+          generation: transition.binding.generation,
+          providerInstanceId,
+          request,
+        });
+        if (later._tag !== "LaterTurn" || original.fence.stage !== "assignment-observed")
+          return yield* denied("Prompt has no original retained mailbox decision");
+        operationId = later.decision.request.operationId;
+      }
     } else {
       return yield* denied("Managed compaction requires a separately retained context operation");
     }

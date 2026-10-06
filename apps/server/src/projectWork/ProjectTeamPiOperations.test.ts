@@ -1264,6 +1264,29 @@ const terminalFixtureFor = (stable = false, removedStage = false) =>
     return { ...f, op, owner, drain, activate, terminal, request, requestHash, resourceHash };
   });
 
+it.effect(
+  "transaction-affine lookup validates the original receipt without opening another transaction",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixtureFor(true);
+        yield* f.activate;
+        const terminal = f.terminal("success", true);
+        yield* f.operations.persistTerminal(f.op, terminal);
+        const read = () =>
+          f.operations.lookupInTransaction(f.identity, f.request, f.requestHash, f.resourceHash);
+        yield* typedDenial(read());
+        const receipt = yield* f.sql.withTransaction(read());
+        expect(receipt?.terminal).toEqual(terminal);
+        yield* f.sql.withTransaction(
+          typedDenial(f.operations.lookup(f.identity, f.request, f.requestHash, f.resourceHash)),
+        );
+        yield* f.sql`UPDATE project_team_pi_process SET drain_json=json_set(drain_json,'$.childExitCode',1)`;
+        yield* f.sql.withTransaction(typedDenial(read()));
+      }),
+    ),
+);
+
 const terminalFixture = terminalFixtureFor();
 
 for (const mode of [

@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
+  ProviderOptionSelection,
   ProjectTeamRunBinding,
   ProjectTeamRoleRevision,
   ProviderInstanceId,
@@ -224,7 +225,7 @@ const RequestFields = {
     Schema.Struct({
       instanceId: ProviderInstanceId,
       model: Id,
-      options: Schema.optionalKey(Schema.JsonObject),
+      options: Schema.optionalKey(Schema.Array(ProviderOptionSelection)),
     }),
   ),
   resumeCursor: Schema.optionalKey(Schema.NullOr(PiNativeReference)),

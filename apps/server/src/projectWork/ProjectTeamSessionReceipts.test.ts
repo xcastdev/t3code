@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
+  type ModelSelection,
   ProjectWorkFoundationCommitCommand,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -186,120 +187,129 @@ const fixture = Effect.gen(function* () {
   };
 });
 
-const producer = Effect.gen(function* () {
-  const f = yield* fixture;
-  const resourceHash = "a".repeat(64);
-  const initializeRequest = {
-    threadId,
-    kind: "initialize" as const,
-    operationId: f.request.initializeOperationId,
-  };
-  const init = yield* f.operations.prepare(f.identity, initializeRequest, hash(initializeRequest), {
-    allocation: f.allocation,
-    workerId: "init-worker",
-    operationId: initializeRequest.operationId,
-    resourceHash,
-  });
-  // SQL producer callbacks consume controlled owner/drain records. They do not start native workers.
-  const activated = new Set<string>();
-  const activate = Effect.fn("receiptTest.activate")(function* (
-    op: typeof init,
-    ref: typeof native,
-  ) {
-    const owner = {
-      type: "owner" as const,
-      unit: op.allocation.unit,
-      nonce: op.allocation.nonce,
-      invocation: "a".repeat(32),
-      cgroup: `/sys/fs/cgroup/${op.allocation.unit}`,
-      pid: 123,
-      memoryBytes: op.allocation.policy.memoryBytes,
-      swapBytes: 0,
-      oomGroup: 1,
+const makeProducer = (modelSelection?: ModelSelection) =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const resourceHash = "a".repeat(64);
+    const initializeRequest = {
+      threadId,
+      kind: "initialize" as const,
+      operationId: f.request.initializeOperationId,
+      ...(modelSelection === undefined ? {} : { modelSelection }),
     };
-    yield* f.operations.persistence(op).claimActivation(op.allocation);
-    yield* f.operations.persistence(op).beforeStart(owner);
-    yield* f.operations.persistNative(op, ref);
-    activated.add(op.operation.operationId);
-  });
-  const complete = Effect.fn("receiptTest.complete")(function* (
-    op: typeof init,
-    ref: typeof native,
-    outcome: PiSessionTerminal["outcome"] = "success",
-    accounting: PiSessionTerminal["accountingReceipts"] = [],
-  ) {
-    const owner = {
-      type: "owner" as const,
-      unit: op.allocation.unit,
-      nonce: op.allocation.nonce,
-      invocation: "a".repeat(32),
-      cgroup: `/sys/fs/cgroup/${op.allocation.unit}`,
-      pid: 123,
-      memoryBytes: op.allocation.policy.memoryBytes,
-      swapBytes: 0,
-      oomGroup: 1,
-    };
-    if (!activated.has(op.operation.operationId)) yield* activate(op, ref);
-    const terminal: PiSessionTerminal = {
-      identity: { workerId: op.workerId, generation: op.authority.binding.generation },
-      operation: op.operation,
-      outcome,
-      ownerCaptured: true,
-      native: ref,
-      drain: {
-        unit: owner.unit,
-        invocation: owner.invocation,
-        cgroup: owner.cgroup,
-        ownerPid: owner.pid,
-        memoryBytes: owner.memoryBytes,
+    const init = yield* f.operations.prepare(
+      f.identity,
+      initializeRequest,
+      hash(initializeRequest),
+      {
+        allocation: f.allocation,
+        workerId: "init-worker",
+        operationId: initializeRequest.operationId,
+        resourceHash,
+      },
+    );
+    // SQL producer callbacks consume controlled owner/drain records. They do not start native workers.
+    const activated = new Set<string>();
+    const activate = Effect.fn("receiptTest.activate")(function* (
+      op: typeof init,
+      ref: typeof native,
+    ) {
+      const owner = {
+        type: "owner" as const,
+        unit: op.allocation.unit,
+        nonce: op.allocation.nonce,
+        invocation: "a".repeat(32),
+        cgroup: `/sys/fs/cgroup/${op.allocation.unit}`,
+        pid: 123,
+        memoryBytes: op.allocation.policy.memoryBytes,
         swapBytes: 0,
         oomGroup: 1,
-        launcherPid: 124,
-        childPid: 125,
-        childExitCode: 0,
-        kernel: "populated 0\nfrozen 0",
-      },
-      accountingReceipts: accounting,
-    };
-    yield* f.operations.persistTerminal(op, terminal);
-    return terminal;
-  });
-  const readers = yield* makeProjectTeamSessionReceipts({
-    environmentId: "environment",
-    maximumEnvironmentModelCalls: 2,
-  });
-  const initialize = complete(init, native);
-  const prompt = Effect.gen(function* () {
-    const allocation = yield* preallocatePiManagedProcess({
-      workspaceRoot: f.binding.worktree,
-      workspaceAccess: "readonly",
-      nativeStateRoot: f.allocation.launch.nativeState!.path,
-      protectedRoots: f.allocation.launch.protectedRoots,
-      runtimeFiles: f.allocation.launch.runtimeFiles.map((file) => ({
-        source: file.source,
-        target: file.target,
-      })),
-      argv: f.allocation.launch.argv,
-      memoryBytes: 33554432,
-      runtimeSeconds: 10,
+      };
+      yield* f.operations.persistence(op).claimActivation(op.allocation);
+      yield* f.operations.persistence(op).beforeStart(owner);
+      yield* f.operations.persistNative(op, ref);
+      activated.add(op.operation.operationId);
     });
-    const request = {
-      threadId,
-      kind: "prompt" as const,
-      operationId: f.request.assignmentOperationId,
-      prompt: f.request.assignment,
-      resumeCursor: native,
-    };
-    const op = yield* f.operations.prepare(f.identity, request, hash(request), {
-      allocation,
-      workerId: "prompt-worker",
-      operationId: request.operationId,
-      resourceHash,
+    const complete = Effect.fn("receiptTest.complete")(function* (
+      op: typeof init,
+      ref: typeof native,
+      outcome: PiSessionTerminal["outcome"] = "success",
+      accounting: PiSessionTerminal["accountingReceipts"] = [],
+    ) {
+      const owner = {
+        type: "owner" as const,
+        unit: op.allocation.unit,
+        nonce: op.allocation.nonce,
+        invocation: "a".repeat(32),
+        cgroup: `/sys/fs/cgroup/${op.allocation.unit}`,
+        pid: 123,
+        memoryBytes: op.allocation.policy.memoryBytes,
+        swapBytes: 0,
+        oomGroup: 1,
+      };
+      if (!activated.has(op.operation.operationId)) yield* activate(op, ref);
+      const terminal: PiSessionTerminal = {
+        identity: { workerId: op.workerId, generation: op.authority.binding.generation },
+        operation: op.operation,
+        outcome,
+        ownerCaptured: true,
+        native: ref,
+        drain: {
+          unit: owner.unit,
+          invocation: owner.invocation,
+          cgroup: owner.cgroup,
+          ownerPid: owner.pid,
+          memoryBytes: owner.memoryBytes,
+          swapBytes: 0,
+          oomGroup: 1,
+          launcherPid: 124,
+          childPid: 125,
+          childExitCode: 0,
+          kernel: "populated 0\nfrozen 0",
+        },
+        accountingReceipts: accounting,
+      };
+      yield* f.operations.persistTerminal(op, terminal);
+      return terminal;
     });
-    return { op, request, complete: complete(op, { ...native, leafId: "final-leaf" }) };
+    const readers = yield* makeProjectTeamSessionReceipts({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 2,
+    });
+    const initialize = complete(init, native);
+    const prompt = Effect.gen(function* () {
+      const allocation = yield* preallocatePiManagedProcess({
+        workspaceRoot: f.binding.worktree,
+        workspaceAccess: "readonly",
+        nativeStateRoot: f.allocation.launch.nativeState!.path,
+        protectedRoots: f.allocation.launch.protectedRoots,
+        runtimeFiles: f.allocation.launch.runtimeFiles.map((file) => ({
+          source: file.source,
+          target: file.target,
+        })),
+        argv: f.allocation.launch.argv,
+        memoryBytes: 33554432,
+        runtimeSeconds: 10,
+      });
+      const request = {
+        threadId,
+        kind: "prompt" as const,
+        operationId: f.request.assignmentOperationId,
+        prompt: f.request.assignment,
+        ...(modelSelection === undefined ? {} : { modelSelection }),
+        resumeCursor: native,
+      };
+      const op = yield* f.operations.prepare(f.identity, request, hash(request), {
+        allocation,
+        workerId: "prompt-worker",
+        operationId: request.operationId,
+        resourceHash,
+      });
+      return { op, request, complete: complete(op, { ...native, leafId: "final-leaf" }) };
+    });
+    return { ...f, init, readers, initialize, prompt, complete, activate };
   });
-  return { ...f, init, readers, initialize, prompt, complete, activate };
-});
+const producer = makeProducer();
 const denial = Effect.fn("receiptTest.denial")(function* <A, R>(
   effect: Effect.Effect<
     A,
@@ -329,6 +339,29 @@ it.effect("returns absence only before original operation exists", () =>
     }),
   ),
 );
+it.effect("original receipts accept the actual model option array and reject an object", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeProducer({ instanceId: providerInstanceId, model, options: [] });
+      yield* f.initialize;
+      expect((yield* f.readers.readInitialization(f.snapshot))?.operation.operationId).toBe(
+        f.request.initializeOperationId,
+      );
+      const prompt = yield* f.prompt;
+      yield* prompt.complete;
+      expect((yield* f.readers.readAssignment(f.snapshot))?.native.leafId).toBe("final-leaf");
+      const malformedRequest = {
+        threadId,
+        kind: "initialize",
+        operationId: f.request.initializeOperationId,
+        modelSelection: { instanceId: providerInstanceId, model, options: {} },
+      };
+      yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.request.modelSelection.options',json('{}')), request_hash=${hash(malformedRequest)} WHERE operation_id=${f.init.operation.operationId}`;
+      yield* denial(f.readers.readInitialization(f.snapshot), "uncertain");
+    }),
+  ),
+);
+
 it.effect("replays exact completed originals after reader recreation and revoked authority", () =>
   scoped(
     Effect.gen(function* () {

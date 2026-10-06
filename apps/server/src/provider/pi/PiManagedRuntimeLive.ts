@@ -61,6 +61,7 @@ import { readPiNativeSession } from "./PiNativeSessionReader.ts";
 import { makeProjectTeamReviewFreshness } from "../../projectWork/ProjectTeamReviewFreshness.ts";
 import { makeProjectTeamContext } from "../../projectWork/ProjectTeamContext.ts";
 import { makeProjectTeamMailboxConsumption } from "../../projectWork/ProjectTeamMailboxConsumption.ts";
+import { makeProjectTeamMailboxTurns } from "../../projectWork/ProjectTeamMailboxTurns.ts";
 import { makePiRuntimeEventTranslator } from "./PiRuntimeEvents.ts";
 import { makePiSessionRuntime } from "./PiSessionRuntime.ts";
 import { piLocalToolDefinitions } from "./PiLocalTools.ts";
@@ -627,6 +628,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const mailbox = yield* makeProjectTeamMailboxConsumption({
     environmentId: options.environmentId,
   });
+  const mailboxTurns = yield* makeProjectTeamMailboxTurns({
+    environmentId: options.environmentId,
+    lookupInTransaction: operations.lookupInTransaction,
+  });
   const reviewFreshness = yield* makeProjectTeamReviewFreshness({
     environmentId: options.environmentId,
   });
@@ -1110,6 +1115,18 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   request.kind === "initialize",
                 );
                 const binding = authority.binding;
+                const laterTurn =
+                  request.kind === "prompt"
+                    ? yield* mailboxTurns.readForOperation({
+                        projectId: binding.projectId,
+                        bindingId: binding.recordId,
+                        generation: binding.generation,
+                        providerInstanceId: binding.providerInstanceId,
+                        request,
+                      })
+                    : { _tag: "NotLaterTurn" as const };
+                if (laterTurn._tag === "LaterTurn")
+                  request = structuredClone(laterTurn.decision.request);
                 if (
                   (request.cwd !== undefined && request.cwd !== binding.worktree) ||
                   (request.runtimeMode !== undefined &&
@@ -1400,7 +1417,24 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   operationId: request.operationId ?? "",
                   operationKind: request.kind,
                 };
-                const required = yield* requiredContext.readForOperation(contextOperation);
+                const readOperationContext = Effect.gen(function* () {
+                  const currentTurn = yield* mailboxTurns.readForOperation({
+                    projectId: binding.projectId,
+                    bindingId: binding.recordId,
+                    generation: binding.generation,
+                    providerInstanceId: binding.providerInstanceId,
+                    request,
+                  });
+                  if (encode(currentTurn) !== encode(laterTurn))
+                    return yield* deny(
+                      "Retained mailbox context changed before allocation",
+                      "conflict",
+                    );
+                  return yield* currentTurn._tag === "LaterTurn"
+                    ? requiredContext.readRequired(currentTurn.original)
+                    : requiredContext.readForOperation(contextOperation);
+                });
+                const required = yield* readOperationContext;
                 if (
                   required.required.projectId !== binding.projectId ||
                   required.required.runId !== binding.recordId ||
@@ -1580,7 +1614,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   identity(request.threadId),
                   request.kind === "initialize",
                 );
-                const qualified = yield* requiredContext.readForOperation(contextOperation);
+                const qualified = yield* readOperationContext;
                 if (encode(qualified.provenance) !== encode(required.provenance))
                   return yield* deny(
                     "Required context provenance changed before allocation",
@@ -1620,10 +1654,15 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   return yield* deny("Pi assignment changed before durable handoff", "conflict");
                 const sealedMailbox =
                   request.kind === "prompt"
-                    ? yield* mailbox.sealAssignmentContext({
-                        operationId: operation.operationId,
-                        baseSystemText: requiredText,
-                      })
+                    ? laterTurn._tag === "LaterTurn"
+                      ? yield* mailboxTurns.seal({
+                          operationId: operation.operationId,
+                          baseSystemText: requiredText,
+                        })
+                      : yield* mailbox.sealAssignmentContext({
+                          operationId: operation.operationId,
+                          baseSystemText: requiredText,
+                        })
                     : undefined;
                 const turnId = TurnId.make(operation.operationId);
                 const translator =
@@ -1959,15 +1998,19 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                             signal: AbortSignal,
                           ) =>
                             perform(
-                              check(signal).pipe(
-                                Effect.andThen(
-                                  mailbox.bindRequestInput({
+                              Effect.gen(function* () {
+                                yield* check(signal);
+                                if (laterTurn._tag === "LaterTurn")
+                                  yield* mailboxTurns.bindInput({
                                     operationId: operation.operationId,
                                     ...input,
-                                  }),
-                                ),
-                                Effect.asVoid,
-                              ),
+                                  });
+                                else
+                                  yield* mailbox.bindRequestInput({
+                                    operationId: operation.operationId,
+                                    ...input,
+                                  });
+                              }),
                             ),
                         }),
                     settleRequest: (settlement) => perform(accounting.settle(settlement)),

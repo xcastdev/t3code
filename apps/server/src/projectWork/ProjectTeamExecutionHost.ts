@@ -44,6 +44,11 @@ import {
 } from "./ProjectTeamSessionReceipts.ts";
 import { makeProjectTeamWorkspace } from "./ProjectTeamWorkspace.ts";
 import { makeProjectTeamMailboxConsumption } from "./ProjectTeamMailboxConsumption.ts";
+import {
+  makeProjectTeamMailboxTurns,
+  makeProjectTeamMailboxTurnDecisionReader,
+} from "./ProjectTeamMailboxTurns.ts";
+import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
@@ -129,6 +134,83 @@ export const waitForProjectTeamAssignmentChange = Effect.fn("waitForProjectTeamA
   },
 );
 
+/** Continues only the first retained mailbox decision while the original executor still owns the turn. */
+export const continueProjectTeamMailboxTurn = Effect.fn("continueProjectTeamMailboxTurn")(
+  function* (input: {
+    readonly original: Snapshot;
+    readonly turns: Effect.Success<ReturnType<typeof makeProjectTeamMailboxTurns>>;
+    readonly assertCurrent: Effect.Effect<void, ProjectTeamDispatchJournalError>;
+  }) {
+    const engine = yield* OrchestrationEngineService;
+    const binding = bindingFor(input.original);
+    const changes = yield* engine.subscribeDomainEvents;
+    const pull = yield* Stream.toPull(
+      changes.pipe(
+        Stream.filter(
+          (event) => "threadId" in event.payload && event.payload.threadId === binding.threadId,
+        ),
+      ),
+    );
+    yield* input.assertCurrent;
+    const claimed = yield* input.turns.claim(input.original);
+    if (claimed._tag === "None" || claimed._tag === "Retained") return;
+    if (claimed._tag === "Uncertain") {
+      const reflected = yield* input.turns.reflect({
+        operationId: claimed.decision.request.operationId,
+      });
+      if (reflected._tag === "Delivered" || reflected._tag === "Retained") return;
+      return yield* denied("Original mailbox turn requires reconciliation");
+    }
+    const decision = claimed.decision;
+    if (claimed._tag === "Selected") {
+      yield* input.assertCurrent;
+      yield* engine.dispatch({
+        type: "thread.turn.start",
+        commandId: decision.commandId,
+        threadId: decision.request.threadId,
+        message: {
+          messageId: decision.userMessageId,
+          role: "user",
+          text: decision.request.prompt,
+          displayText: `Team message\n\n${decision.message.body}`,
+          attachments: [],
+        },
+        ...(decision.request.modelSelection === undefined
+          ? {}
+          : { modelSelection: decision.request.modelSelection }),
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        createdAt: decision.message.updatedAt,
+      });
+    }
+    for (;;) {
+      yield* input.assertCurrent;
+      const reflected = yield* input.turns.reflect({ operationId: decision.request.operationId });
+      if (reflected._tag === "Delivered" || reflected._tag === "Retained") return;
+      if (reflected._tag === "Uncertain")
+        return yield* denied("Original mailbox turn has no qualified delivery");
+      const events = yield* waitForProjectTeamAssignmentChange(
+        pull,
+        Math.min(
+          input.original.intent.limits.deadlineAtMs,
+          input.original.intent.limits.rootDeadlineAtMs,
+        ),
+      );
+      if (
+        events.some(
+          (event) =>
+            event.type === "thread.session-set" &&
+            (event.payload.session.status === "error" ||
+              event.payload.session.status === "stopped" ||
+              event.payload.session.status === "interrupted"),
+        )
+      )
+        return yield* denied("Original mailbox turn terminated without qualified delivery");
+    }
+  },
+  Effect.scoped,
+);
+
 /** Owns only registered dispatches. A failed drain never releases the journal's reservations. */
 export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionHost")(
   function* (options: {
@@ -162,6 +244,14 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
     });
     const receipts = yield* makeProjectTeamSessionReceipts(options);
     const mailbox = yield* makeProjectTeamMailboxConsumption({
+      environmentId: options.environmentId,
+    });
+    const operations = yield* makeProjectTeamPiOperations({ environmentId: options.environmentId });
+    const mailboxTurns = yield* makeProjectTeamMailboxTurns({
+      environmentId: options.environmentId,
+      lookupInTransaction: operations.lookupInTransaction,
+    });
+    const mailboxTurnDecisions = yield* makeProjectTeamMailboxTurnDecisionReader({
       environmentId: options.environmentId,
     });
     const retainedSetup = Effect.fn("ProjectTeamExecutionHost.retainedSetup")(function* (
@@ -466,9 +556,14 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
           )
           .pipe(Effect.result);
       const evidence = yield* boundary(collectDrain(snapshot)).pipe(Effect.result);
-      return evidence._tag === "Failure"
-        ? { _tag: "Uncertain" as const, cause: Cause.fail(evidence.failure) }
-        : { _tag: "Joined" as const, receipt: evidence.success };
+      if (evidence._tag === "Failure")
+        return { _tag: "Uncertain" as const, cause: Cause.fail(evidence.failure) };
+      const decision = yield* sql.withTransaction(
+        mailboxTurnDecisions.readInTransaction({ dispatchId: snapshot.fence.dispatchId }),
+      );
+      if (decision?.kind === "one")
+        yield* mailboxTurns.reflect({ operationId: decision.request.operationId });
+      return { _tag: "Joined" as const, receipt: evidence.success };
     });
     const settle = Effect.fn("ProjectTeamExecutionHost.settle")(function* (
       owner: Owner,
@@ -798,6 +893,15 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
           Effect.gen(function* () {
             const outcome = yield* dispatch.resume(owner);
             if (outcome._tag !== "Observed") return outcome;
+            const original = yield* journal.readRetained(owner.snapshot.fence.dispatchId);
+            owner.snapshot = original;
+            yield* continueProjectTeamMailboxTurn({
+              original,
+              turns: mailboxTurns,
+              assertCurrent: boundary(assertCurrent(owner, owner.snapshot.fence)).pipe(
+                Effect.asVoid,
+              ),
+            }).pipe(Effect.provideService(OrchestrationEngineService, engine));
             // A native terminal is observation, not release. Join every original writer before settlement.
             yield* stopAndJoin(owner);
             const retained = yield* journal.readRetained(owner.snapshot.fence.dispatchId);

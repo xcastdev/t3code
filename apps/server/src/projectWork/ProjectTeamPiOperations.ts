@@ -67,6 +67,7 @@ const RootBudget = Schema.Struct({ rootTaskId: Schema.String, ...OperationLimits
 const decodeIntent = Schema.decodeEffect(
   Schema.fromJsonString(
     Schema.Struct({
+      request: Schema.optional(Schema.Json),
       binding: Schema.Struct({
         recordId: Schema.String,
         generation: Schema.Int,
@@ -336,6 +337,8 @@ const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     ),
   );
 
+import { makeProjectTeamMailboxTurnDecisionReader } from "./ProjectTeamMailboxTurns.ts";
+
 type Row = {
   operation_id: string;
   environment_id: string;
@@ -372,6 +375,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
   function* (options: { readonly environmentId: string }) {
     const sql = yield* SqlClient.SqlClient;
     const clock = yield* Clock.Clock;
+    const mailboxDecisions = yield* makeProjectTeamMailboxTurnDecisionReader({
+      environmentId: options.environmentId,
+    });
     const authorization = yield* ProjectTeamAuthorization;
     const repository = yield* ProjectWorkRepository;
     // These retained reads validate intent, claim receipts and stage history only.
@@ -651,6 +657,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       root: Effect.Success<ReturnType<typeof roots>>,
       operation: PiWorkerOperation,
       frozen?: typeof RootBudget.Type,
+      request?: unknown,
+      resourceHash?: string,
     ) {
       const binding = authority.binding;
       const budgets = yield* sql<{
@@ -692,14 +700,43 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           !anchor ||
           anchor.maximumTokens !== limits.maximumTokens ||
           anchor.deadlineAtMs !== limits.rootDeadlineAtMs ||
-          (operation.operationKind === "initialize"
-            ? snapshot.intent.request.initializeOperationId
-            : snapshot.intent.request.assignmentOperationId) !== operation.operationId ||
           snapshot.fence.stage === "stopping" ||
           snapshot.fence.stage === "quarantine" ||
           snapshot.fence.stage === "settled"
         )
           return yield* deny("Pi operation differs from its admitted dispatch");
+        const originalOperationId =
+          operation.operationKind === "initialize"
+            ? snapshot.intent.request.initializeOperationId
+            : snapshot.intent.request.assignmentOperationId;
+        if (operation.operationId !== originalOperationId) {
+          const validateMailbox = Effect.gen(function* () {
+            const decision = yield* mailboxDecisions
+              .readInTransaction({ dispatchId: snapshot.fence.dispatchId })
+              .pipe(Effect.mapError(() => deny("Mailbox operation association is unavailable")));
+            if (
+              operation.operationKind !== "prompt" ||
+              snapshot.fence.stage !== "assignment-observed" ||
+              !decision ||
+              decision.kind !== "one" ||
+              decision.request.operationId !== operation.operationId ||
+              !request ||
+              encode(decision.request) !== encode(request) ||
+              decision.resourceHash !== resourceHash ||
+              immutableBinding(decision.binding) !== immutableBinding(binding) ||
+              encode(decision.rootBudget) !== encode(anchor) ||
+              decision.attemptLimits.maximumTokens !== limits.attemptMaximumTokens ||
+              decision.attemptLimits.deadlineAtMs !== limits.deadlineAtMs
+            )
+              return yield* deny("Pi operation differs from its retained mailbox decision");
+            yield* mailboxDecisions
+              .verifyOriginalInTransaction(snapshot, decision)
+              .pipe(Effect.mapError(() => deny("Original mailbox boundary receipt differs")));
+          });
+          yield* Option.isSome(yield* Effect.serviceOption(sql.transactionService))
+            ? validateMailbox
+            : sql.withTransaction(validateMailbox);
+        }
         maximumTokens = Math.min(maximumTokens, limits.attemptMaximumTokens);
         deadlineAtMs = Math.min(deadlineAtMs, limits.deadlineAtMs);
       }
@@ -760,6 +797,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         root,
         { operationId: row.operation_id, operationKind: row.operation_kind },
         intent.rootBudget,
+        intent.request,
+        intent.resourceHash,
       );
       if (row.maximum_tokens > limits.maximumTokens || row.deadline_at_ms > limits.deadlineAtMs)
         return yield* deny("Frozen Pi operation policy changed");
@@ -899,13 +938,12 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       return authority;
     });
     // A stable dispatch ID is a receipt locator, never permission to execute again.
-    const lookup = Effect.fn("ProjectTeamPiOperations.lookup")(function* (
+    const lookupInside = Effect.fn("ProjectTeamPiOperations.lookupInside")(function* (
       identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
       request: PiManagedOperationRequest,
       requestHash: string,
       resourceHash: string,
     ) {
-      yield* ownTransaction();
       if (request.operationId === undefined) return undefined;
       const operation = yield* decodeOperation({
         operationId: request.operationId,
@@ -916,284 +954,297 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       );
       if (request.threadId !== identity.threadId || requestHash !== requestDigest(request))
         return yield* deny("Stable Pi request identity differs", "conflict");
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const authority = yield* current(identity, request.kind === "initialize");
-          const binding = authority.binding;
-          const root = yield* roots(authority);
-          yield* clockCheck(root.deadlineAtMs);
-          const rows =
-            yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE operation_id=${operation.operationId}`;
-          const row = rows[0];
-          if (!row) return undefined;
-          const intent = yield* decodeReplayIntent(row.intent_json).pipe(
-            Effect.mapError(() => deny("Stable Pi intent unavailable", "uncertain")),
-          );
-          if (
-            row.environment_id !== options.environmentId ||
-            row.project_id !== binding.projectId ||
-            row.binding_id !== binding.recordId ||
-            row.generation !== binding.generation ||
-            row.provider_instance_id !== identity.providerInstanceId ||
-            row.thread_id !== identity.threadId ||
-            row.operation_kind !== request.kind ||
-            row.request_hash !== requestHash ||
-            encode(intent.request) !== encode(request) ||
-            immutableBinding(intent.binding) !== immutableBinding(binding) ||
-            encode(intent.role) !== encode(authority.role) ||
-            intent.resourceHash !== resourceHash ||
-            row.root_binding_id !== root.root.recordId ||
-            row.root_task_id !== root.root.taskId ||
-            !Number.isSafeInteger(row.operation_ordinal) ||
-            row.operation_ordinal < 0 ||
-            !Number.isSafeInteger(row.maximum_tokens) ||
-            row.maximum_tokens < 1 ||
-            row.maximum_tokens > root.maximumTokens ||
-            !Number.isSafeInteger(row.deadline_at_ms) ||
-            row.deadline_at_ms > root.deadlineAtMs
-          )
-            return yield* deny("Stable Pi operation identity changed", "conflict");
-          yield* clockCheck(row.deadline_at_ms);
-          if (row.status !== "settled")
-            return yield* deny(
-              "Stable Pi operation requires reconciliation",
-              row.status === "prepared" ? "conflict" : "uncertain",
-            );
-          if (!row.terminal_json || !row.native_json)
-            return yield* deny("Stable Pi receipt incomplete", "uncertain");
-          const terminal = yield* decodeTerminal(row.terminal_json).pipe(
-            Effect.mapError(() => deny("Stable Pi terminal unavailable", "uncertain")),
-          );
-          const native = yield* decodeNative(row.native_json).pipe(
-            Effect.mapError(() => deny("Stable Pi native unavailable", "uncertain")),
-          );
-          if (
-            terminal.outcome !== "success" ||
-            !terminal.ownerCaptured ||
-            !terminal.native ||
-            !terminal.drain ||
-            terminal.failureCode !== undefined ||
-            !native.persisted ||
-            native.sessionId !== binding.sessionId ||
-            encode(terminal.native) !== encode(native) ||
-            encode(terminal.operation) !== encode(operation) ||
-            terminal.identity.workerId !== row.worker_id ||
-            terminal.identity.generation !== row.generation
-          )
-            return yield* deny("Stable Pi successful receipt differs", "uncertain");
-          const processes = yield* sql<{
-            unit: string;
-            allocation_json: string;
-            status: string;
-            owner_json: string | null;
-            drain_json: string | null;
-          }>`SELECT * FROM project_team_pi_process WHERE operation_id=${row.operation_id}`;
-          const process = processes[0];
-          if (
-            processes.length !== 1 ||
-            !process ||
-            process.status !== "drained" ||
-            !process.owner_json ||
-            !process.drain_json
-          )
-            return yield* deny("Stable Pi process receipt incomplete", "uncertain");
-          const allocationJson = yield* decodeReplayAllocation(process.allocation_json).pipe(
-            Effect.mapError(() => deny("Stable Pi allocation unavailable", "uncertain")),
-          );
-          const owner = yield* decodeReplayOwner(process.owner_json).pipe(
-            Effect.mapError(() => deny("Stable Pi owner unavailable", "uncertain")),
-          );
-          const drain = yield* decodeReplayDrain(process.drain_json).pipe(
-            Effect.mapError(() => deny("Stable Pi drain unavailable", "uncertain")),
-          );
-          const allocation = intent.allocation;
-          const nativeState = allocation.launch.nativeState;
-          if (
-            !nativeState ||
-            !validRetainedAllocation(allocation) ||
-            encode(allocationJson) !== encode(allocation) ||
-            process.unit !== allocation.unit ||
-            !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
-              allocation.nonce,
-            ) ||
-            allocation.unit !== `t3-pi-managed-${allocation.nonce}.service` ||
-            allocation.launch.workspaceRoot !== binding.worktree ||
-            allocation.launch.workspace.path !== binding.worktree ||
-            allocation.policy.memoryBytes !== allocation.launch.memoryBytes ||
-            allocation.policy.runtimeSeconds !== allocation.launch.runtimeSeconds ||
-            owner.unit !== allocation.unit ||
-            owner.nonce !== allocation.nonce ||
-            !/^[a-f0-9]{32}$/.test(owner.invocation) ||
-            owner.memoryBytes !== allocation.policy.memoryBytes ||
-            !owner.cgroup.startsWith("/sys/fs/cgroup/") ||
-            !owner.cgroup.endsWith(`/${owner.unit}`) ||
-            owner.cgroup.split("/").some((part) => part === "." || part === "..") ||
-            drain.unit !== owner.unit ||
-            drain.invocation !== owner.invocation ||
-            drain.cgroup !== owner.cgroup ||
-            drain.ownerPid !== owner.pid ||
-            drain.memoryBytes !== owner.memoryBytes ||
-            drain.childExitCode !== 0 ||
-            !drain.childPid ||
-            !validKernelDrain(drain.kernel) ||
-            encode(drain) !== encode(terminal.drain)
-          )
-            return yield* deny("Stable Pi process receipts differ", "uncertain");
-          yield* operationBudget(authority, root, row).pipe(
-            Effect.mapError(() => deny("Stable Pi original budget changed", "uncertain")),
-          );
-          const requests = yield* sql<{
-            reservation_id: string;
-            environment_id: string;
-            project_id: string;
-            root_task_id: string;
-            run_id: string;
-            attempt_id: string;
-            worker_id: string;
-            generation: number;
-            operation_id: string;
-            request_id: number;
-            route_id: string;
-            provider: string;
-            model: string;
-            status: string;
-            capacity_state: string;
-            accounting_receipt_id: string | null;
-            settlement_json: string | null;
-            reservation_json: string;
-            maximum_input_tokens: number;
-            maximum_output_tokens: number;
-            deadline_at_ms: number;
-            charged_input_tokens: number;
-            charged_output_tokens: number;
-          }>`SELECT * FROM project_team_model_request WHERE operation_id=${row.operation_id} LIMIT 257`;
-          if (requests.length !== terminal.accountingReceipts.length || requests.length > 256)
-            return yield* deny("Stable Pi accounting receipt incomplete", "uncertain");
-          const reservations = new Set<string>();
-          const accountingReceipts = new Set<string>();
-          const requestIds = new Set<number>();
-          let chargedTokens = 0;
-          for (const receipt of terminal.accountingReceipts) {
-            const requestRow = requests.find(
-              (entry) => entry.reservation_id === receipt.reservationId,
-            );
-            if (
-              !requestRow ||
-              reservations.has(receipt.reservationId) ||
-              accountingReceipts.has(receipt.accountingReceiptId) ||
-              requestIds.has(receipt.requestId) ||
-              requestRow.capacity_state !== "released" ||
-              requestRow.status !== "reported" ||
-              requestRow.environment_id !== row.environment_id ||
-              requestRow.project_id !== row.project_id ||
-              requestRow.root_task_id !== row.root_task_id ||
-              requestRow.run_id !== binding.recordId ||
-              requestRow.attempt_id !== binding.attemptId ||
-              requestRow.worker_id !== row.worker_id ||
-              requestRow.generation !== row.generation ||
-              requestRow.request_id !== receipt.requestId ||
-              requestRow.accounting_receipt_id !== receipt.accountingReceiptId ||
-              requestRow.route_id !== "command-code-ling-free" ||
-              receipt.routeId !== requestRow.route_id ||
-              requestRow.provider !== receipt.provider ||
-              requestRow.model !== binding.model ||
-              receipt.model !== binding.model ||
-              ![binding.model, "inclusionai/ling-3.1-flash"].includes(receipt.reportedModel) ||
-              !requestRow.settlement_json ||
-              !Number.isSafeInteger(requestRow.maximum_input_tokens) ||
-              requestRow.maximum_input_tokens < 1 ||
-              !Number.isSafeInteger(requestRow.maximum_output_tokens) ||
-              requestRow.maximum_output_tokens < 1 ||
-              !Number.isSafeInteger(
-                requestRow.maximum_input_tokens + requestRow.maximum_output_tokens,
-              ) ||
-              requestRow.maximum_input_tokens + requestRow.maximum_output_tokens >
-                row.maximum_tokens ||
-              !Number.isSafeInteger(requestRow.deadline_at_ms) ||
-              requestRow.deadline_at_ms < 1 ||
-              requestRow.deadline_at_ms > row.deadline_at_ms ||
-              receipt.usage.prompt_tokens > requestRow.maximum_input_tokens ||
-              receipt.usage.completion_tokens > requestRow.maximum_output_tokens ||
-              Object.values(receipt.usage.prompt_tokens_details ?? {}).some(
-                (value) => value !== undefined && value > receipt.usage.prompt_tokens,
-              ) ||
-              Object.values(receipt.usage.completion_tokens_details ?? {}).some(
-                (value) => value !== undefined && value > receipt.usage.completion_tokens,
-              ) ||
-              [
-                receipt.usage.prompt_cache_hit_tokens,
-                receipt.usage.prompt_cache_miss_tokens,
-                receipt.usage.cached_tokens,
-              ].some((value) => value !== undefined && value > receipt.usage.prompt_tokens)
-            )
-              return yield* deny("Stable Pi accounting identity differs", "uncertain");
-            const fields = {
-              workerId: row.worker_id,
-              operationId: row.operation_id,
-              generation: row.generation,
-              requestId: receipt.requestId,
-              routeId: receipt.routeId,
-              provider: receipt.provider,
-              model: receipt.model,
-              maxInputTokens: requestRow.maximum_input_tokens,
-              maxOutputTokens: requestRow.maximum_output_tokens,
-              callCount: 1,
-              deadlineAtMs: requestRow.deadline_at_ms,
-            };
-            const reservation = yield* decodeJson(requestRow.reservation_json).pipe(
-              Effect.mapError(() => deny("Stable Pi reservation unavailable", "uncertain")),
-            );
-            const settlement = yield* decodeJson(requestRow.settlement_json).pipe(
-              Effect.mapError(() => deny("Stable Pi settlement unavailable", "uncertain")),
-            );
-            if (
-              encode(reservation) !== encode(fields) ||
-              encode(settlement) !==
-                encode({
-                  ...fields,
-                  reservationId: receipt.reservationId,
-                  outcome: "reported",
-                  transportDrained: true,
-                  chargedInputTokens: requestRow.charged_input_tokens,
-                  chargedOutputTokens: requestRow.charged_output_tokens,
-                  reportedModel: receipt.reportedModel,
-                  reportedUsage: receipt.usage,
-                }) ||
-              receipt.usage.total_tokens !==
-                receipt.usage.prompt_tokens + receipt.usage.completion_tokens ||
-              requestRow.charged_input_tokens !== receipt.usage.prompt_tokens ||
-              requestRow.charged_output_tokens !== receipt.usage.completion_tokens
-            )
-              return yield* deny("Stable Pi accounting evidence differs", "uncertain");
-            // Released calls consume actual usage, not each sequential reservation's ceiling.
-            chargedTokens += receipt.usage.total_tokens;
-            if (!Number.isSafeInteger(chargedTokens) || chargedTokens > row.maximum_tokens)
-              return yield* deny("Stable Pi accounting exceeds original budget", "uncertain");
-            reservations.add(receipt.reservationId);
-            accountingReceipts.add(receipt.accountingReceiptId);
-            requestIds.add(receipt.requestId);
-          }
-          const active =
-            yield* sql`SELECT operation_id FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId} AND status IN ('prepared','starting','running','quarantine')`;
-          const latest = yield* sql<{
-            ordinal: number;
-          }>`SELECT MAX(operation_ordinal) AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
-          if (active.length || latest[0]?.ordinal !== row.operation_ordinal)
-            return yield* deny("Stable Pi native receipt has a successor", "conflict");
-          yield* current(identity);
-          yield* clockCheck(row.deadline_at_ms);
-          return {
-            operation,
-            terminal,
-            native,
-            authority,
-            workspace: allocation.launch.workspace,
-            nativeState,
-            deadlineAtMs: row.deadline_at_ms,
-          };
-        }),
+      const authority = yield* current(identity, request.kind === "initialize");
+      const binding = authority.binding;
+      const root = yield* roots(authority);
+      yield* clockCheck(root.deadlineAtMs);
+      const rows =
+        yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE operation_id=${operation.operationId}`;
+      const row = rows[0];
+      if (!row) return undefined;
+      const intent = yield* decodeReplayIntent(row.intent_json).pipe(
+        Effect.mapError(() => deny("Stable Pi intent unavailable", "uncertain")),
       );
+      if (
+        row.environment_id !== options.environmentId ||
+        row.project_id !== binding.projectId ||
+        row.binding_id !== binding.recordId ||
+        row.generation !== binding.generation ||
+        row.provider_instance_id !== identity.providerInstanceId ||
+        row.thread_id !== identity.threadId ||
+        row.operation_kind !== request.kind ||
+        row.request_hash !== requestHash ||
+        encode(intent.request) !== encode(request) ||
+        immutableBinding(intent.binding) !== immutableBinding(binding) ||
+        encode(intent.role) !== encode(authority.role) ||
+        intent.resourceHash !== resourceHash ||
+        row.root_binding_id !== root.root.recordId ||
+        row.root_task_id !== root.root.taskId ||
+        !Number.isSafeInteger(row.operation_ordinal) ||
+        row.operation_ordinal < 0 ||
+        !Number.isSafeInteger(row.maximum_tokens) ||
+        row.maximum_tokens < 1 ||
+        row.maximum_tokens > root.maximumTokens ||
+        !Number.isSafeInteger(row.deadline_at_ms) ||
+        row.deadline_at_ms > root.deadlineAtMs
+      )
+        return yield* deny("Stable Pi operation identity changed", "conflict");
+      yield* clockCheck(row.deadline_at_ms);
+      if (row.status !== "settled")
+        return yield* deny(
+          "Stable Pi operation requires reconciliation",
+          row.status === "prepared" ? "conflict" : "uncertain",
+        );
+      if (!row.terminal_json || !row.native_json)
+        return yield* deny("Stable Pi receipt incomplete", "uncertain");
+      const terminal = yield* decodeTerminal(row.terminal_json).pipe(
+        Effect.mapError(() => deny("Stable Pi terminal unavailable", "uncertain")),
+      );
+      const native = yield* decodeNative(row.native_json).pipe(
+        Effect.mapError(() => deny("Stable Pi native unavailable", "uncertain")),
+      );
+      if (
+        terminal.outcome !== "success" ||
+        !terminal.ownerCaptured ||
+        !terminal.native ||
+        !terminal.drain ||
+        terminal.failureCode !== undefined ||
+        !native.persisted ||
+        native.sessionId !== binding.sessionId ||
+        encode(terminal.native) !== encode(native) ||
+        encode(terminal.operation) !== encode(operation) ||
+        terminal.identity.workerId !== row.worker_id ||
+        terminal.identity.generation !== row.generation
+      )
+        return yield* deny("Stable Pi successful receipt differs", "uncertain");
+      const processes = yield* sql<{
+        unit: string;
+        allocation_json: string;
+        status: string;
+        owner_json: string | null;
+        drain_json: string | null;
+      }>`SELECT * FROM project_team_pi_process WHERE operation_id=${row.operation_id}`;
+      const process = processes[0];
+      if (
+        processes.length !== 1 ||
+        !process ||
+        process.status !== "drained" ||
+        !process.owner_json ||
+        !process.drain_json
+      )
+        return yield* deny("Stable Pi process receipt incomplete", "uncertain");
+      const allocationJson = yield* decodeReplayAllocation(process.allocation_json).pipe(
+        Effect.mapError(() => deny("Stable Pi allocation unavailable", "uncertain")),
+      );
+      const owner = yield* decodeReplayOwner(process.owner_json).pipe(
+        Effect.mapError(() => deny("Stable Pi owner unavailable", "uncertain")),
+      );
+      const drain = yield* decodeReplayDrain(process.drain_json).pipe(
+        Effect.mapError(() => deny("Stable Pi drain unavailable", "uncertain")),
+      );
+      const allocation = intent.allocation;
+      const nativeState = allocation.launch.nativeState;
+      if (
+        !nativeState ||
+        !validRetainedAllocation(allocation) ||
+        encode(allocationJson) !== encode(allocation) ||
+        process.unit !== allocation.unit ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+          allocation.nonce,
+        ) ||
+        allocation.unit !== `t3-pi-managed-${allocation.nonce}.service` ||
+        allocation.launch.workspaceRoot !== binding.worktree ||
+        allocation.launch.workspace.path !== binding.worktree ||
+        allocation.policy.memoryBytes !== allocation.launch.memoryBytes ||
+        allocation.policy.runtimeSeconds !== allocation.launch.runtimeSeconds ||
+        owner.unit !== allocation.unit ||
+        owner.nonce !== allocation.nonce ||
+        !/^[a-f0-9]{32}$/.test(owner.invocation) ||
+        owner.memoryBytes !== allocation.policy.memoryBytes ||
+        !owner.cgroup.startsWith("/sys/fs/cgroup/") ||
+        !owner.cgroup.endsWith(`/${owner.unit}`) ||
+        owner.cgroup.split("/").some((part) => part === "." || part === "..") ||
+        drain.unit !== owner.unit ||
+        drain.invocation !== owner.invocation ||
+        drain.cgroup !== owner.cgroup ||
+        drain.ownerPid !== owner.pid ||
+        drain.memoryBytes !== owner.memoryBytes ||
+        drain.childExitCode !== 0 ||
+        !drain.childPid ||
+        !validKernelDrain(drain.kernel) ||
+        encode(drain) !== encode(terminal.drain)
+      )
+        return yield* deny("Stable Pi process receipts differ", "uncertain");
+      yield* operationBudget(authority, root, row).pipe(
+        Effect.mapError(() => deny("Stable Pi original budget changed", "uncertain")),
+      );
+      const requests = yield* sql<{
+        reservation_id: string;
+        environment_id: string;
+        project_id: string;
+        root_task_id: string;
+        run_id: string;
+        attempt_id: string;
+        worker_id: string;
+        generation: number;
+        operation_id: string;
+        request_id: number;
+        route_id: string;
+        provider: string;
+        model: string;
+        status: string;
+        capacity_state: string;
+        accounting_receipt_id: string | null;
+        settlement_json: string | null;
+        reservation_json: string;
+        maximum_input_tokens: number;
+        maximum_output_tokens: number;
+        deadline_at_ms: number;
+        charged_input_tokens: number;
+        charged_output_tokens: number;
+      }>`SELECT * FROM project_team_model_request WHERE operation_id=${row.operation_id} LIMIT 257`;
+      if (requests.length !== terminal.accountingReceipts.length || requests.length > 256)
+        return yield* deny("Stable Pi accounting receipt incomplete", "uncertain");
+      const reservations = new Set<string>();
+      const accountingReceipts = new Set<string>();
+      const requestIds = new Set<number>();
+      let chargedTokens = 0;
+      for (const receipt of terminal.accountingReceipts) {
+        const requestRow = requests.find((entry) => entry.reservation_id === receipt.reservationId);
+        if (
+          !requestRow ||
+          reservations.has(receipt.reservationId) ||
+          accountingReceipts.has(receipt.accountingReceiptId) ||
+          requestIds.has(receipt.requestId) ||
+          requestRow.capacity_state !== "released" ||
+          requestRow.status !== "reported" ||
+          requestRow.environment_id !== row.environment_id ||
+          requestRow.project_id !== row.project_id ||
+          requestRow.root_task_id !== row.root_task_id ||
+          requestRow.run_id !== binding.recordId ||
+          requestRow.attempt_id !== binding.attemptId ||
+          requestRow.worker_id !== row.worker_id ||
+          requestRow.generation !== row.generation ||
+          requestRow.request_id !== receipt.requestId ||
+          requestRow.accounting_receipt_id !== receipt.accountingReceiptId ||
+          requestRow.route_id !== "command-code-ling-free" ||
+          receipt.routeId !== requestRow.route_id ||
+          requestRow.provider !== receipt.provider ||
+          requestRow.model !== binding.model ||
+          receipt.model !== binding.model ||
+          ![binding.model, "inclusionai/ling-3.1-flash"].includes(receipt.reportedModel) ||
+          !requestRow.settlement_json ||
+          !Number.isSafeInteger(requestRow.maximum_input_tokens) ||
+          requestRow.maximum_input_tokens < 1 ||
+          !Number.isSafeInteger(requestRow.maximum_output_tokens) ||
+          requestRow.maximum_output_tokens < 1 ||
+          !Number.isSafeInteger(
+            requestRow.maximum_input_tokens + requestRow.maximum_output_tokens,
+          ) ||
+          requestRow.maximum_input_tokens + requestRow.maximum_output_tokens > row.maximum_tokens ||
+          !Number.isSafeInteger(requestRow.deadline_at_ms) ||
+          requestRow.deadline_at_ms < 1 ||
+          requestRow.deadline_at_ms > row.deadline_at_ms ||
+          receipt.usage.prompt_tokens > requestRow.maximum_input_tokens ||
+          receipt.usage.completion_tokens > requestRow.maximum_output_tokens ||
+          Object.values(receipt.usage.prompt_tokens_details ?? {}).some(
+            (value) => value !== undefined && value > receipt.usage.prompt_tokens,
+          ) ||
+          Object.values(receipt.usage.completion_tokens_details ?? {}).some(
+            (value) => value !== undefined && value > receipt.usage.completion_tokens,
+          ) ||
+          [
+            receipt.usage.prompt_cache_hit_tokens,
+            receipt.usage.prompt_cache_miss_tokens,
+            receipt.usage.cached_tokens,
+          ].some((value) => value !== undefined && value > receipt.usage.prompt_tokens)
+        )
+          return yield* deny("Stable Pi accounting identity differs", "uncertain");
+        const fields = {
+          workerId: row.worker_id,
+          operationId: row.operation_id,
+          generation: row.generation,
+          requestId: receipt.requestId,
+          routeId: receipt.routeId,
+          provider: receipt.provider,
+          model: receipt.model,
+          maxInputTokens: requestRow.maximum_input_tokens,
+          maxOutputTokens: requestRow.maximum_output_tokens,
+          callCount: 1,
+          deadlineAtMs: requestRow.deadline_at_ms,
+        };
+        const reservation = yield* decodeJson(requestRow.reservation_json).pipe(
+          Effect.mapError(() => deny("Stable Pi reservation unavailable", "uncertain")),
+        );
+        const settlement = yield* decodeJson(requestRow.settlement_json).pipe(
+          Effect.mapError(() => deny("Stable Pi settlement unavailable", "uncertain")),
+        );
+        if (
+          encode(reservation) !== encode(fields) ||
+          encode(settlement) !==
+            encode({
+              ...fields,
+              reservationId: receipt.reservationId,
+              outcome: "reported",
+              transportDrained: true,
+              chargedInputTokens: requestRow.charged_input_tokens,
+              chargedOutputTokens: requestRow.charged_output_tokens,
+              reportedModel: receipt.reportedModel,
+              reportedUsage: receipt.usage,
+            }) ||
+          receipt.usage.total_tokens !==
+            receipt.usage.prompt_tokens + receipt.usage.completion_tokens ||
+          requestRow.charged_input_tokens !== receipt.usage.prompt_tokens ||
+          requestRow.charged_output_tokens !== receipt.usage.completion_tokens
+        )
+          return yield* deny("Stable Pi accounting evidence differs", "uncertain");
+        // Released calls consume actual usage, not each sequential reservation's ceiling.
+        chargedTokens += receipt.usage.total_tokens;
+        if (!Number.isSafeInteger(chargedTokens) || chargedTokens > row.maximum_tokens)
+          return yield* deny("Stable Pi accounting exceeds original budget", "uncertain");
+        reservations.add(receipt.reservationId);
+        accountingReceipts.add(receipt.accountingReceiptId);
+        requestIds.add(receipt.requestId);
+      }
+      const active =
+        yield* sql`SELECT operation_id FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId} AND status IN ('prepared','starting','running','quarantine')`;
+      const latest = yield* sql<{
+        ordinal: number;
+      }>`SELECT MAX(operation_ordinal) AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
+      if (active.length || latest[0]?.ordinal !== row.operation_ordinal)
+        return yield* deny("Stable Pi native receipt has a successor", "conflict");
+      yield* current(identity);
+      yield* clockCheck(row.deadline_at_ms);
+      return {
+        operation,
+        terminal,
+        native,
+        authority,
+        workspace: allocation.launch.workspace,
+        nativeState,
+        deadlineAtMs: row.deadline_at_ms,
+      };
     });
+    const lookup = Effect.fn("ProjectTeamPiOperations.lookup")(function* (
+      ...args: Parameters<typeof lookupInside>
+    ) {
+      yield* ownTransaction();
+      if (args[1].operationId === undefined) return undefined;
+      return yield* sql.withTransaction(lookupInside(...args));
+    });
+    const lookupTransaction = Effect.gen(function* () {
+      const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
+      if (
+        Option.isNone(supplied) ||
+        supplied.value !== sql ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny("Pi receipt lookup requires its captured SQL transaction");
+    });
+    const lookupInTransaction = (...args: Parameters<typeof lookupInside>) => {
+      const captured = structuredClone(args);
+      return guard(lookupTransaction.pipe(Effect.andThen(lookupInside(...captured))));
+    };
     const prepare = Effect.fn("ProjectTeamPiOperations.prepare")(function* (
       identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
       request: PiManagedOperationRequest,
@@ -1256,7 +1307,14 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           if (ordinal === undefined || !Number.isSafeInteger(ordinal))
             return yield* deny("Pi operation ordinal exhausted");
           const operation = { operationId, operationKind: request.kind };
-          const limits = yield* rootBudget(authority, root, operation);
+          const limits = yield* rootBudget(
+            authority,
+            root,
+            operation,
+            undefined,
+            request,
+            resourceHash,
+          );
           const { maximumTokens, deadlineAtMs } = limits;
           yield* clockCheck(deadlineAtMs);
           if (!limits.exists)
@@ -1712,6 +1770,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         guard(ownTransaction().pipe(Effect.andThen(current(...args)))),
       admitCurrent,
       lookup: (...args: Parameters<typeof lookup>) => guard(lookup(...args)),
+      lookupInTransaction,
       prepare: (...args: Parameters<typeof prepare>) => guard(prepare(...args)),
       authorize: (operation: PiDurableOperation) => guard(authorize(operation)),
       persistence,
