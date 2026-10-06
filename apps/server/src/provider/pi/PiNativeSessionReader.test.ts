@@ -7,6 +7,7 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { SessionManager, CURRENT_SESSION_VERSION, VERSION } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { readPiNativeSession } from "./PiNativeSessionReader.ts";
+import * as NativeReader from "./PiNativeSessionReader.ts";
 
 // These spies forward real filesystem calls; only receipt timing is controlled.
 vi.mock("node:fs/promises", { spy: true });
@@ -51,6 +52,20 @@ async function fixture() {
 describe.runIf(HostProcessPlatform.defaultValue() === "linux")(
   "Pi native session read-only bytes",
   () => {
+    it("returns the exact stable raw bytes without changing the original reader result", async () => {
+      const f = await fixture();
+      const original = await NodeFSP.readFile(f.file);
+      const result = await NativeReader.readPiNativeSessionWithBytes(f.input);
+      expect(result.bytes).toEqual(original);
+      expect(result.byteCount).toBe(original.length);
+      expect(result.contentSHA256).toBe(
+        NodeCrypto.createHash("sha256").update(original).digest("hex"),
+      );
+      const { bytes: _bytes, ...snapshot } = result;
+      expect(await readPiNativeSession(f.input)).toEqual(snapshot);
+      expect(await readPiNativeSession(f.input)).not.toHaveProperty("bytes");
+    });
+
     it("reads an actual pinned SDK journal without changing bytes or mtime", async () => {
       const f = await fixture();
       const before = await NodeFSP.readFile(f.file);

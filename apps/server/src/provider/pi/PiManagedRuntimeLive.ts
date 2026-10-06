@@ -57,6 +57,7 @@ import {
   readPiSavedLiteralCredential,
 } from "./PiNativeConfiguration.ts";
 import { readPiNativeSession } from "./PiNativeSessionReader.ts";
+import { makeProjectTeamReviewFreshness } from "../../projectWork/ProjectTeamReviewFreshness.ts";
 import { makePiRuntimeEventTranslator } from "./PiRuntimeEvents.ts";
 import { makePiSessionRuntime } from "./PiSessionRuntime.ts";
 import { piLocalToolDefinitions } from "./PiLocalTools.ts";
@@ -620,6 +621,9 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     protectedRoots: [...supplied.protectedRoots],
   };
   const operations = yield* makeProjectTeamPiOperations({ environmentId: options.environmentId });
+  const reviewFreshness = yield* makeProjectTeamReviewFreshness({
+    environmentId: options.environmentId,
+  });
   const authorization = yield* ProjectTeamAuthorization;
   const gateway = yield* ProjectWorkGateway;
   const skillRepository = yield* Effect.serviceOption(ManagedSkillRepository);
@@ -1171,6 +1175,41 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         contextFor(current.authority) !== context
                       )
                         return yield* deny("Pi replay receipt or authority changed", "conflict");
+                      if (current.authority.role.role === "reviewer") {
+                        const owner = current.authority.binding;
+                        const retained =
+                          request.kind === "initialize"
+                            ? yield* reviewFreshness.readRetained(current.operation.operationId)
+                            : yield* reviewFreshness.readForSession({
+                                projectId: owner.projectId,
+                                taskId: owner.taskId,
+                                bindingId: owner.recordId,
+                                generation: owner.generation,
+                                providerInstanceId: owner.providerInstanceId,
+                                threadId: owner.threadId,
+                                sessionId: current.native.sessionId,
+                                specRevision: owner.specRevision,
+                                planRevision: owner.planRevision,
+                              });
+                        if (
+                          !retained ||
+                          retained.projectId !== owner.projectId ||
+                          retained.taskId !== owner.taskId ||
+                          retained.bindingId !== owner.recordId ||
+                          retained.generation !== owner.generation ||
+                          retained.providerInstanceId !== owner.providerInstanceId ||
+                          retained.threadId !== owner.threadId ||
+                          retained.specRevision !== owner.specRevision ||
+                          retained.planRevision !== owner.planRevision ||
+                          retained.native.sessionId !== current.native.sessionId ||
+                          (request.kind === "initialize" &&
+                            encode(retained.native) !== encode(current.native))
+                        )
+                          return yield* deny(
+                            "Reviewer initialization has no retained fresh-session proof",
+                            "uncertain",
+                          );
+                      }
                       const physical = workspace.fence.directories.find(
                         (entry) => entry.path === binding.worktree,
                       );
@@ -1306,6 +1345,25 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   request.kind === "initialize" && binding.status === "reserved"
                     ? undefined
                     : yield* operations.nativeFor(identity(request.threadId));
+                if (authority.role.role === "reviewer" && request.kind !== "initialize") {
+                  if (!previous) return yield* deny("Reviewer requires its original fresh session");
+                  const retained = yield* reviewFreshness.readForSession({
+                    projectId: binding.projectId,
+                    taskId: binding.taskId,
+                    bindingId: binding.recordId,
+                    generation: binding.generation,
+                    providerInstanceId: binding.providerInstanceId,
+                    threadId: binding.threadId,
+                    sessionId: previous.native.sessionId,
+                    specRevision: binding.specRevision,
+                    planRevision: binding.planRevision,
+                  });
+                  if (!retained)
+                    return yield* deny(
+                      "Reviewer requires retained fresh-session proof",
+                      "uncertain",
+                    );
+                }
                 if (
                   previous &&
                   (previous.resourceHash ?? piManagedSkillResourceIdentity([])) !== resourceHash
@@ -1858,6 +1916,44 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           "conflict",
                         );
                       yield* verifyWorkspace(beforePublication, agentDirectory, workspace);
+                      if (
+                        request.kind === "initialize" &&
+                        beforePublication.role.role === "reviewer"
+                      ) {
+                        const assertFreshnessOwner = Effect.gen(function* () {
+                          if (
+                            cancellation.signal.aborted ||
+                            active.get(request.threadId)?.prepared.operation.operationId !==
+                              operation.operationId
+                          )
+                            return yield* deny("Reviewer initialization owner changed", "conflict");
+                          const current = yield* operations.publication(durable, terminal);
+                          if (contextFor(current) !== authorityContext)
+                            return yield* deny(
+                              "Reviewer initialization authority changed",
+                              "conflict",
+                            );
+                          yield* verifyWorkspace(current, agentDirectory, workspace);
+                          yield* verifySource(sourceFence);
+                          yield* finalWorkspaceFence(paths, workspace.fence);
+                        });
+                        yield* reviewFreshness.capture({
+                          projectId: binding.projectId,
+                          taskId: binding.taskId,
+                          bindingId: binding.recordId,
+                          generation: binding.generation,
+                          providerInstanceId: binding.providerInstanceId,
+                          threadId: binding.threadId,
+                          operationId: operation.operationId,
+                          specRevision: binding.specRevision,
+                          planRevision: binding.planRevision,
+                          native: terminal.native,
+                          expectedBriefing: context,
+                          expectedCwd: "/workspace",
+                          sessionDirectoryRoot: nativeStateDirectory + "/sessions",
+                          assertCurrent: assertFreshnessOwner,
+                        });
+                      }
                       const current = yield* operations.publication(durable, terminal);
                       yield* verifySource(sourceFence);
                       yield* finalWorkspaceFence(paths, workspace.fence);

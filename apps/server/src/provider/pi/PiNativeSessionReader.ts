@@ -205,7 +205,7 @@ async function readPass(file: NodeFSP.FileHandle, expected?: Buffer) {
  * inactivity, process drain, task authority, or native-to-T3 turn correspondence.
  * sessionDirectoryRoot is PiWorkerOptions.sessionDirectory on the parent host.
  */
-export async function readPiNativeSession(input: {
+export async function readPiNativeSessionWithBytes(input: {
   sessionDirectoryRoot: string;
   expectedCwd: string;
   native: PiNativeReference;
@@ -271,6 +271,7 @@ export async function readPiNativeSession(input: {
     const result = parseBytes(bytes, checked);
     return {
       ...result,
+      bytes,
       byteCount: bytes.length,
       contentSHA256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
     };
@@ -290,4 +291,12 @@ export async function readPiNativeSession(input: {
     }
     if (closeFailed) fail("unavailable");
   }
+}
+
+/** Ordinary readers receive the parsed snapshot without retaining the raw buffer. */
+export async function readPiNativeSession(
+  input: Parameters<typeof readPiNativeSessionWithBytes>[0],
+) {
+  const { bytes: _bytes, ...snapshot } = await readPiNativeSessionWithBytes(input);
+  return snapshot;
 }
