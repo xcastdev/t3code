@@ -70,6 +70,7 @@ import {
 import { detectSourceControlProviderFromRemoteUrl } from "@t3tools/shared/sourceControl";
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProjectWorkPullRequestActionGuard } from "../projectWork/ProjectWorkPullRequestActionGuard.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as SourceControlRateLimit from "../sourceControl/SourceControlRateLimit.ts";
 import {
@@ -593,6 +594,7 @@ export const make = Effect.gen(function* () {
   const pullRequestRefreshes = yield* SubscriptionRef.make(0);
   const registry = yield* PullRequestProviderRegistry;
   const projections = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const workActionGuard = yield* Effect.serviceOption(ProjectWorkPullRequestActionGuard);
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const rateLimits = yield* SourceControlRateLimit.SourceControlRateLimit;
   const readCache = yield* PullRequestReadCache.PullRequestReadCache;
@@ -2054,12 +2056,40 @@ export const make = Effect.gen(function* () {
         // What the host can do and what this account may ask of it are two questions, and both
         // have to say yes. The second is asked last, because it costs a request and the checks
         // above do not.
-        return viewerPermissionsOf(
-          project,
-          input,
-          "runAction",
-          input.action === "update-branch",
-        ).pipe(
+        const numbers = [
+          ...new Set([
+            input.number,
+            ...(input.expectedStackHeads ?? []).map((head) => head.number),
+          ]),
+        ];
+        const checkWork = Option.isSome(workActionGuard)
+          ? Effect.forEach(
+              numbers,
+              (number) =>
+                workActionGuard.value.check({
+                  projectId: project.project.id,
+                  host: project.host,
+                  repository: project.repository,
+                  number,
+                  action: input.action,
+                }),
+              { discard: true },
+            )
+          : Effect.void;
+        return checkWork.pipe(
+          Effect.mapError(
+            (error) =>
+              new PullRequestOperationError({
+                operation: "runAction",
+                detail:
+                  error.reason === "managed-merge-unavailable"
+                    ? "Managed work requires retained review and merge authorization before delivery."
+                    : "Managed work history could not be verified. Try again after restoring its history.",
+              }),
+          ),
+          Effect.andThen(
+            viewerPermissionsOf(project, input, "runAction", input.action === "update-branch"),
+          ),
           Effect.flatMap((viewer): Effect.Effect<string, PullRequestError> => {
             const stackRebase = input.stackNumber !== undefined && input.action === "update-branch";
             if (

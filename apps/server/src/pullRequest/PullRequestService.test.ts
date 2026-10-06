@@ -36,6 +36,10 @@ import {
 } from "./PullRequestProvider.ts";
 import { PullRequestProviderRegistry, fromProviders } from "./PullRequestProviderRegistry.ts";
 import * as PullRequestService from "./PullRequestService.ts";
+import {
+  ProjectWorkPullRequestActionGuard,
+  ProjectWorkPullRequestActionGuardError,
+} from "../projectWork/ProjectWorkPullRequestActionGuard.ts";
 import * as PullRequestReadCache from "./PullRequestReadCache.ts";
 
 function project(input: {
@@ -195,6 +199,7 @@ function makeService(input: {
   readonly realPath?: (path: string) => Effect.Effect<string>;
   readonly readFileString?: (path: string) => Effect.Effect<string>;
   readonly useRealFileSystem?: boolean;
+  readonly workActionGuard?: ProjectWorkPullRequestActionGuard["Service"];
 }) {
   const fileSystem = input.useRealFileSystem
     ? NodeFileSystem.layer
@@ -205,6 +210,9 @@ function makeService(input: {
   return PullRequestService.make.pipe(
     Effect.provide(
       Layer.mergeAll(
+        input.workActionGuard === undefined
+          ? Layer.empty
+          : Layer.succeed(ProjectWorkPullRequestActionGuard, input.workActionGuard),
         Layer.succeed(PullRequestProviderRegistry, fromProviders(input.providers)),
         Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
           resolveLink: () => undefined,
@@ -5409,5 +5417,185 @@ it.effect("keeps Azure continuation cursors separate for repositories with the s
     seen.length = 0;
     yield* service.list({ state: "open", cursors: { [key]: first.nextCursors[key]! } });
     assert.deepStrictEqual(seen, ["/org-b"]);
+  }),
+);
+
+for (const action of ["merge", "enable-auto-merge"] as const) {
+  it.effect(`managed work guard denies ${action} before remote permission or action calls`, () =>
+    Effect.gen(function* () {
+      let remoteCalls = 0;
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "managed-guard-project",
+            title: "Work",
+            workspaceRoot: "/repo",
+            repository: "owner/repo",
+          }),
+        ],
+        providers: [
+          fakeProvider("github", {
+            capabilities: {
+              ...fakeProvider("github").capabilities,
+              actions: ["merge", "enable-auto-merge"],
+            },
+            getViewerPermissions: () =>
+              Effect.sync(() => {
+                remoteCalls += 1;
+                return {
+                  actions: ["merge", "enable-auto-merge"] as const,
+                  comment: true,
+                  resolve: true,
+                  verdicts: [],
+                  requestReviewers: true,
+                };
+              }),
+            runAction: () =>
+              Effect.sync(() => {
+                remoteCalls += 1;
+              }),
+          }),
+        ],
+        workActionGuard: {
+          check: () =>
+            Effect.fail(
+              new ProjectWorkPullRequestActionGuardError({ reason: "managed-merge-unavailable" }),
+            ),
+        },
+      });
+      const result = yield* Effect.flip(
+        service.runAction({
+          projectId: "managed-guard-project" as ProjectId,
+          repository: "owner/repo",
+          number: 7,
+          action,
+        }),
+      );
+      assert(result._tag === "PullRequestOperationError");
+      assert.include(result.detail, "retained review and merge authorization");
+      assert.strictEqual(remoteCalls, 0);
+    }),
+  );
+}
+
+it.effect("managed work guard failure stops a stack merge when a neighboring PR is managed", () =>
+  Effect.gen(function* () {
+    let remoteCalls = 0;
+    const checked: number[] = [];
+    const service = yield* makeService({
+      projects: [
+        project({
+          id: "managed-guard-project",
+          title: "Work",
+          workspaceRoot: "/repo",
+          repository: "owner/repo",
+        }),
+      ],
+      providers: [
+        fakeProvider("github", {
+          capabilities: { ...fakeProvider("github").capabilities, stackActions: true },
+          getViewerPermissions: () =>
+            Effect.sync(() => {
+              remoteCalls += 1;
+              return {
+                actions: ["merge"] as const,
+                comment: true,
+                resolve: true,
+                verdicts: [],
+                requestReviewers: true,
+              };
+            }),
+          runAction: () =>
+            Effect.sync(() => {
+              remoteCalls += 1;
+            }),
+        }),
+      ],
+      workActionGuard: {
+        check: (input) =>
+          Effect.suspend(() => {
+            checked.push(input.number);
+            return input.number === 8
+              ? Effect.fail(
+                  new ProjectWorkPullRequestActionGuardError({
+                    reason: "managed-merge-unavailable",
+                  }),
+                )
+              : Effect.void;
+          }),
+      },
+    });
+    const result = yield* Effect.flip(
+      service.runAction({
+        projectId: "managed-guard-project" as ProjectId,
+        repository: "owner/repo",
+        number: 7,
+        action: "merge",
+        stackNumber: 1,
+        expectedStackHeads: [
+          { number: 7, headSha: "a".repeat(40) },
+          { number: 8, headSha: "b".repeat(40) },
+        ],
+      }),
+    );
+    assert(result._tag === "PullRequestOperationError");
+    assert.include(result.detail, "retained review and merge authorization");
+    assert.deepStrictEqual(checked, [7, 8]);
+    assert.strictEqual(remoteCalls, 0);
+  }),
+);
+
+it.effect("managed work guard allows ordinary merges through the existing permission path", () =>
+  Effect.gen(function* () {
+    const calls: string[] = [];
+    const service = yield* makeService({
+      projects: [
+        project({
+          id: "ordinary-guard-project",
+          title: "Ordinary",
+          workspaceRoot: "/repo",
+          repository: "owner/repo",
+        }),
+      ],
+      providers: [
+        fakeProvider("github", {
+          getChangeRequest: () => Effect.succeed(hostedChangeRequest("Ordinary merge")),
+          getViewerPermissions: () =>
+            Effect.sync(() => {
+              calls.push("permissions");
+              return {
+                actions: ["merge"] as const,
+                comment: true,
+                resolve: true,
+                verdicts: [],
+                requestReviewers: true,
+              };
+            }),
+          runAction: () =>
+            Effect.sync(() => {
+              calls.push("action");
+            }),
+        }),
+      ],
+      workActionGuard: {
+        check: (input) =>
+          Effect.sync(() => {
+            assert.strictEqual(input.host, "github.com");
+            assert.strictEqual(input.repository, "owner/repo");
+            assert.strictEqual(input.number, 7);
+            calls.push("guard");
+          }),
+      },
+    });
+    assert.strictEqual(
+      yield* service.runAction({
+        projectId: "ordinary-guard-project" as ProjectId,
+        repository: "owner/repo",
+        number: 7,
+        action: "merge",
+      }),
+      undefined,
+    );
+    assert.deepStrictEqual(calls, ["guard", "permissions", "action"]);
   }),
 );
