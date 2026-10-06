@@ -1045,6 +1045,12 @@ export const decideProjectTeamGuidedLifecycle = (
         (m.controlState !== undefined && m.controlState !== "active")
       )
         reject("Assignment is no longer current");
+      if (
+        intent.outcome === "complete" &&
+        m.executionKind === "managed" &&
+        m.deliverableKind === "review"
+      )
+        reject("Managed review completion requires a trusted completed review receipt");
       const plan = currentPlan(task.taskId);
       if (
         task.specRevision !== intent.specRevision ||

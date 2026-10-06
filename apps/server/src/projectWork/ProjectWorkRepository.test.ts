@@ -1,4 +1,9 @@
-import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  ProviderInstanceId,
+  ThreadId,
+  EnvironmentId,
+  canonicalProjectWorkPayload,
+} from "@t3tools/contracts";
 import {
   ProjectId,
   ProjectWorkTaskId,
@@ -12,6 +17,7 @@ import {
   type ProjectWorkAttribution,
   type ProjectWorkCommand,
   type ProjectTeamGuidedIntent,
+  type ProjectTeamRecord,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -23,6 +29,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runForkMigrations, runMigrations } from "../persistence/Migrations.ts";
+import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import { ProjectWorkRepository, ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
 import { ProjectWorkQuery, ProjectWorkQueryLive } from "./ProjectWorkQuery.ts";
@@ -37,6 +44,371 @@ const at = "2026-01-01T00:00:00.000Z";
 const layer = it.layer(Layer.fresh(Layer.mergeAll(NodeSqliteClient.layerMemory())));
 
 layer("ProjectWorkRepository", (it) => {
+  it.effect("rejects managed review completion without persisting report events or receipts", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      yield* runForkMigrations();
+      const repository = yield* ProjectWorkRepository;
+      const sql = yield* SqlClient.SqlClient;
+      const p = ProjectId.make("review-completion-sql");
+      const parentId = ProjectWorkTaskId.make("review-parent-sql");
+      const human = {
+        actor: { kind: "human" as const, id: "maintainer" },
+        source: { kind: "web" as const, id: "review-sql-client" },
+        recordedAt: at,
+      };
+      const load = Effect.fn("reviewCompletionFixture.load")(function* () {
+        return applyProjectWorkEvents(emptyProjectWorkReducerState(p), yield* repository.replay(p));
+      });
+      const guided = Effect.fn("reviewCompletionFixture.guided")(function* (
+        intent: ProjectTeamGuidedIntent,
+      ) {
+        return yield* repository.execute({
+          type: "project-work.foundation.commit",
+          projectId: p,
+          commandId: intent.commandId,
+          expectedRevision: intent.expectedRevision,
+          attribution: human,
+          records: [],
+          committedAt: at,
+          guided: { intent },
+        });
+      });
+      const approve = Effect.fn("reviewCompletionFixture.approve")(function* () {
+        const state = yield* load();
+        const records = state
+          .foundationRecords!.filter(
+            (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+              r.kind === "gate" && r.status === "pending",
+          )
+          .map((r) => ({ ...r, revision: r.revision + 1, status: "approved" as const }));
+        yield* repository.execute({
+          type: "project-work.foundation.commit",
+          projectId: p,
+          commandId: CommandId.make(`review-approve-${state.revision}`),
+          expectedRevision: state.revision,
+          attribution: human,
+          records,
+          committedAt: at,
+        });
+      });
+      yield* repository.execute({
+        type: "project-work.task.create",
+        projectId: p,
+        taskId: parentId,
+        commandId: CommandId.make("review-parent-capture"),
+        title: "Review parent",
+        createdAt: at,
+        attribution: human,
+      });
+      let state = yield* load();
+      yield* guided({
+        type: "project-team.specification.propose",
+        projectId: p,
+        taskId: parentId,
+        commandId: CommandId.make("review-parent-spec"),
+        expectedRevision: state.revision,
+        expectedTaskRevision: state.tasks[0]!.revision,
+        expectedSpecRevision: 0,
+        specification: {
+          objective: "Bounded reviewed work",
+          scopeIn: "One behavior",
+          scopeOut: "Other behaviors",
+          criterionIds: [ProjectWorkCriterionId.make("review-parent-criterion")],
+          revision: 1,
+          protected: false,
+        },
+        criterionSnapshots: [
+          {
+            criterionId: ProjectWorkCriterionId.make("review-parent-criterion"),
+            taskId: parentId,
+            description: "Verify the parent behavior",
+            required: true,
+            status: "unsatisfied",
+            satisfiedByEvidenceIds: [],
+            revision: 0,
+            updatedAt: at,
+          },
+        ],
+      });
+      yield* approve();
+      state = yield* load();
+      yield* guided({
+        type: "project-team.plan.propose",
+        projectId: p,
+        taskId: parentId,
+        commandId: CommandId.make("review-parent-plan"),
+        expectedRevision: state.revision,
+        expectedTaskRevision: state.tasks[0]!.revision,
+        specRevision: 1,
+        content: "Bounded implementation and validation",
+        dependencyTaskIds: [],
+      });
+      yield* approve();
+      state = yield* load();
+      const spec = state.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+          r.kind === "gate" && r.gate === "specification",
+      )!;
+      const plan = state.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+          r.kind === "plan-revision",
+      )!;
+      const planGate = state.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+          r.kind === "gate" && r.gate === "plan",
+      )!;
+      yield* guided({
+        type: "project-team.assignment.start",
+        projectId: p,
+        taskId: parentId,
+        commandId: CommandId.make("review-child-assignment"),
+        expectedRevision: state.revision,
+        expectedTaskRevision: state.tasks[0]!.revision,
+        assignmentKind: "review",
+        objective: "Review the exact approved parent scope",
+        outputDescriptions: ["Retained reviewer observations"],
+        specRevision: 1,
+        specificationGateId: spec.recordId,
+        expectedSpecificationGateRevision: spec.revision,
+        parentPlan: {
+          recordId: plan.recordId,
+          expectedRecordRevision: plan.revision,
+          planRevision: plan.planRevision,
+          gateId: planGate.recordId,
+          expectedGateRevision: planGate.revision,
+        },
+      });
+      state = yield* load();
+      const child = state.tasks.find((task) => task.taskId !== parentId)!;
+      const generatedRole = state.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "role-revision" }> =>
+          r.kind === "role-revision",
+      )!;
+      const role = { ...generatedRole, recordId: "reviewer-sql-role", model: "fixture-model" };
+      yield* repository.execute({
+        type: "project-work.foundation.commit",
+        projectId: p,
+        commandId: CommandId.make("reviewer-sql-configure"),
+        expectedRevision: state.revision,
+        attribution: human,
+        committedAt: at,
+        records: [
+          role,
+          {
+            recordId: "reviewer-sql-member",
+            projectId: p,
+            kind: "member",
+            status: "active",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            name: "Reviewer",
+            coordinator: false,
+            roleRevisionId: role.recordId,
+          },
+        ],
+      });
+      state = yield* load();
+      const grant = state.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+          r.kind === "gate" && r.taskId === child.taskId,
+      )!;
+      const binding: Extract<ProjectTeamRecord, { kind: "run-binding" }> = {
+        recordId: "reviewer-sql-binding",
+        projectId: p,
+        kind: "run-binding",
+        status: "reserved",
+        revision: 0,
+        generation: 0,
+        updatedAt: at,
+        taskId: child.taskId,
+        attemptId: ProjectWorkAttemptId.make("reviewer-sql-attempt"),
+        memberId: "reviewer-sql-member",
+        roleRevisionId: role.recordId,
+        providerInstanceId: ProviderInstanceId.make("pi-test"),
+        threadId: ThreadId.make("reviewer-sql-thread"),
+        environmentId: EnvironmentId.make("reviewer-sql-environment"),
+        model: role.model,
+        configuration: {
+          instructionsHash: "fixture-instructions",
+          toolIds: role.tools,
+          skillIds: [],
+          runtimeVersion: "fixture",
+          maxTokens: 1000,
+          maxDurationMs: 1000,
+          paidFallback: false,
+        },
+        worktree: "/fixture/reviewer",
+        branch: "review-fixture",
+        leaseGeneration: 0,
+        specRevision: 1,
+        planRevision: 0,
+        authorizationGateId: grant.recordId,
+        scopeHash: projectTeamScopeHash(state, child.taskId),
+      };
+      yield* repository.execute({
+        type: "project-work.foundation.commit",
+        projectId: p,
+        commandId: CommandId.make("reviewer-sql-claim"),
+        expectedRevision: state.revision,
+        attribution: {
+          actor: { kind: "system", id: "scheduler" },
+          source: { kind: "system", id: "scheduler" },
+          recordedAt: at,
+        },
+        records: [],
+        committedAt: at,
+        transition: {
+          kind: "claim",
+          taskId: child.taskId,
+          expectedTaskRevision: child.revision,
+          authorizationGateId: grant.recordId,
+          expectedGateRevision: grant.revision,
+          binding,
+          claim: {
+            type: "project-work.task.claim",
+            projectId: p,
+            taskId: child.taskId,
+            commandId: CommandId.make("reviewer-sql-claim"),
+            attemptId: binding.attemptId,
+            leaseToken: "review-sql-lease",
+            leasedUntil: "2026-01-01T01:00:00.000Z",
+            claimedAt: at,
+          },
+        },
+      });
+      state = yield* load();
+      yield* repository.execute({
+        type: "project-work.foundation.commit",
+        projectId: p,
+        commandId: CommandId.make("reviewer-sql-running"),
+        expectedRevision: state.revision,
+        attribution: human,
+        records: [{ ...binding, status: "running", revision: 1 }],
+        committedAt: at,
+      });
+      state = yield* load();
+      const assignment = state.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+          r.kind === "task-membership" && r.taskId === child.taskId,
+      )!;
+      const criteria = state.criteria.filter((criterion) => criterion.taskId === child.taskId);
+      expect(assignment).toMatchObject({ executionKind: "managed", deliverableKind: "review" });
+      expect(criteria.length).toBeGreaterThan(0);
+      const tables = [
+        "project_work_events",
+        "project_work_command_receipts",
+        "project_work_criteria",
+        "project_team_run_binding",
+        "project_team_effect",
+        "project_work_evidence",
+        "project_work_comments",
+      ];
+      const rows = Effect.fn("reviewCompletionFixture.rows")(function* () {
+        return yield* Effect.all(
+          tables.map((table) => sql`SELECT * FROM ${sql(table)} WHERE project_id=${p}`),
+        );
+      });
+      const agent = {
+        actor: { kind: "agent" as const, id: "reviewer-sql-member" },
+        source: { kind: "mcp" as const, id: "review-sql-report" },
+        recordedAt: at,
+      };
+      const makeReport = (
+        label: string,
+        actor: "agent" | "human",
+        retained = false,
+      ): ProjectWorkCommand => {
+        const intent: Extract<ProjectTeamGuidedIntent, { type: "project-team.assignment.report" }> =
+          {
+            type: "project-team.assignment.report",
+            projectId: p,
+            taskId: child.taskId,
+            commandId: CommandId.make(label),
+            expectedRevision: state.revision,
+            expectedTaskRevision: state.tasks.find((task) => task.taskId === child.taskId)!
+              .revision,
+            assignmentId: assignment.recordId,
+            expectedAssignmentRevision: assignment.revision,
+            specRevision: 1,
+            planRevision: 0,
+            summary: "Reviewer claims complete",
+            evidenceIds: retained
+              ? state.evidence
+                  .filter((e) => e.taskId === child.taskId && e.criterionId !== undefined)
+                  .map((e) => e.evidenceId)
+              : [],
+            outputArtifactIds: retained
+              ? state.evidence
+                  .filter((e) => e.taskId === child.taskId && e.criterionId !== undefined)
+                  .map((e) => e.evidenceId)
+              : [],
+            outputs: retained
+              ? []
+              : criteria.map((criterion) => ({
+                  criterionId: criterion.criterionId,
+                  kind: "artifact",
+                  detail:
+                    "Nonblank actual reviewer detail retained for this exact current criterion",
+                })),
+            outcome: "complete",
+          };
+        return {
+          type: "project-work.foundation.commit",
+          projectId: p,
+          commandId: intent.commandId,
+          expectedRevision: state.revision,
+          attribution: actor === "human" ? human : agent,
+          records: [],
+          committedAt: at,
+          guided: { intent, bindingId: binding.recordId, generation: binding.generation },
+        };
+      };
+      for (const retained of [false, true]) {
+        const originalEvents = yield* repository.replay(p);
+        const originalRows = yield* rows();
+        const originalState = canonicalProjectWorkPayload(state);
+        for (const actor of ["agent", "human"] as const) {
+          const command = makeReport(`review-sql-complete-${actor}-${retained}`, actor, retained);
+          const result = yield* repository.execute(command).pipe(Effect.result);
+          expect(result._tag).toBe("Failure");
+          if (result._tag === "Failure")
+            expect(result.failure).toMatchObject({
+              code: "invalid-state",
+              message: "Managed review completion requires a trusted completed review receipt",
+            });
+          expect(yield* repository.replay(p)).toEqual(originalEvents);
+          expect(yield* rows()).toEqual(originalRows);
+          expect(canonicalProjectWorkPayload(yield* load())).toBe(originalState);
+        }
+        if (!retained) {
+          const report = makeReport("review-sql-findings", "agent");
+          if (
+            report.type !== "project-work.foundation.commit" ||
+            report.guided?.intent.type !== "project-team.assignment.report"
+          )
+            throw new Error("Review report fixture missing");
+          const proposed = yield* repository.execute({
+            ...report,
+            guided: { ...report.guided, intent: { ...report.guided.intent, outcome: "findings" } },
+          });
+          expect(
+            proposed.events.some((event) => event.type === "project-work.task.completed"),
+          ).toBe(false);
+          const next = yield* load();
+          expect(next.criteria).toEqual(state.criteria);
+          expect(next.tasks).toEqual(state.tasks);
+          expect(next.foundationRecords).toEqual(state.foundationRecords);
+          expect(
+            next.evidence.filter((e) => e.taskId === child.taskId && e.criterionId !== undefined),
+          ).toHaveLength(criteria.length);
+          state = next;
+        }
+      }
+    }).pipe(Effect.provide(ProjectWorkRepositoryLive)),
+  );
+
   it.effect("replays an accepted zero-event receipt only after live authorization", () =>
     Effect.gen(function* () {
       yield* runMigrations();

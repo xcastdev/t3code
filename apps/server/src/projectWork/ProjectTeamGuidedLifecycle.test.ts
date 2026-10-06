@@ -9,6 +9,7 @@ import {
   ProviderInstanceId,
   ThreadId,
   EnvironmentId,
+  canonicalProjectWorkPayload,
   type ProjectTeamGuidedIntent,
   type ProjectTeamRecord,
   type ProjectWorkCommand,
@@ -1560,7 +1561,169 @@ const childRun = (input: ProjectWorkReducerState, childId: ProjectWorkTaskId) =>
   );
   return { state, preClaim, command, binding: running, role };
 };
+const reviewerReport = () => {
+  const parent = planned();
+  const assigned = run(parent, inheritedStart(parent, "review", "review-completion-assignment"));
+  const child = assigned.tasks.find((task) => task.taskId !== taskId)!;
+  const fixture = childRun(assigned, child.taskId);
+  const assignment = fixture.state.foundationRecords!.find(
+    (record) => record.kind === "task-membership" && record.taskId === child.taskId,
+  )!;
+  const criteria = fixture.state.criteria.filter((criterion) => criterion.taskId === child.taskId);
+  expect(criteria.length).toBeGreaterThan(0);
+  const intent: Extract<ProjectTeamGuidedIntent, { type: "project-team.assignment.report" }> = {
+    ...envelope(fixture.state, "reviewer-claimed-complete", child.taskId),
+    type: "project-team.assignment.report",
+    assignmentId: assignment.recordId,
+    expectedAssignmentRevision: assignment.revision,
+    specRevision: child.specRevision,
+    planRevision: 0,
+    summary: "The reviewer claims every output is complete",
+    outputs: criteria.map((criterion) => ({
+      criterionId: criterion.criterionId,
+      kind: "observation",
+      detail: "Nonblank reviewer-authored detail for the exact current criterion",
+    })),
+    evidenceIds: [],
+    outputArtifactIds: [],
+    outcome: "complete",
+  };
+  const command = {
+    ...compile(intent),
+    attribution: {
+      actor: { kind: "agent" as const, id: "child-member" },
+      source: { kind: "mcp" as const, id: "review-report" },
+      recordedAt: at,
+    },
+    guided: { intent, bindingId: fixture.binding.recordId, generation: fixture.binding.generation },
+  };
+  return { state: fixture.state, binding: fixture.binding, child, intent, command };
+};
+
 describe("bounded inherited planning and review assignments", () => {
+  it("denies managed reviewer completion from inline criterion outputs", () => {
+    const fixture = reviewerReport();
+    const before = canonicalProjectWorkPayload(fixture.state);
+    expect(() => decideProjectWorkCommand(fixture.state, fixture.command)).toThrow(
+      "trusted completed review receipt",
+    );
+    expect(canonicalProjectWorkPayload(fixture.state)).toBe(before);
+  });
+  it("denies a human-attributed completion report for the same managed reviewer assignment", () => {
+    const fixture = reviewerReport();
+    expect(() =>
+      decideProjectWorkCommand(fixture.state, { ...fixture.command, attribution }),
+    ).toThrow("trusted completed review receipt");
+  });
+  for (const actor of ["agent", "human"] as const)
+    it(`denies ${actor} managed reviewer completion from actual retained criterion artifacts`, () => {
+      const fixture = reviewerReport();
+      const proposal = {
+        ...fixture.intent,
+        outcome: "findings" as const,
+        outputs: fixture.intent.outputs!.map((output) => ({
+          ...output,
+          kind: "artifact" as const,
+        })),
+      };
+      const proposed = applyProjectWorkEvents(
+        fixture.state,
+        decideProjectWorkCommand(fixture.state, {
+          ...fixture.command,
+          guided: { ...fixture.command.guided, intent: proposal },
+        }),
+      );
+      const artifacts = proposed.evidence.filter(
+        (evidence) =>
+          evidence.taskId === fixture.child.taskId && evidence.criterionId !== undefined,
+      );
+      expect(artifacts).toHaveLength(fixture.intent.outputs!.length);
+      const intent = {
+        ...fixture.intent,
+        ...envelope(proposed, `retained-review-complete-${actor}`, fixture.child.taskId),
+        outputs: [],
+        evidenceIds: artifacts.map((artifact) => artifact.evidenceId),
+        outputArtifactIds: artifacts.map((artifact) => artifact.evidenceId),
+      };
+      const before = canonicalProjectWorkPayload(proposed);
+      expect(() =>
+        decideProjectWorkCommand(proposed, {
+          ...compile(intent),
+          attribution: actor === "human" ? attribution : fixture.command.attribution,
+          guided: { ...fixture.command.guided, intent },
+        }),
+      ).toThrow("trusted completed review receipt");
+      expect(canonicalProjectWorkPayload(proposed)).toBe(before);
+    });
+  for (const outcome of ["findings", "review-ready"] as const)
+    it(`retains managed reviewer ${outcome} as a nonterminal proposal`, () => {
+      const fixture = reviewerReport();
+      const intent = { ...fixture.intent, outcome };
+      const events = decideProjectWorkCommand(fixture.state, {
+        ...fixture.command,
+        guided: { ...fixture.command.guided, intent },
+      });
+      const next = applyProjectWorkEvents(fixture.state, events);
+      expect(next.tasks.find((task) => task.taskId === fixture.child.taskId)).toEqual(
+        fixture.state.tasks.find((task) => task.taskId === fixture.child.taskId),
+      );
+      expect(next.criteria).toEqual(fixture.state.criteria);
+      expect(next.foundationRecords).toEqual(fixture.state.foundationRecords);
+      expect(next.comments!.at(-1)?.body).toBe(intent.summary);
+      expect(
+        next.evidence.filter(
+          (evidence) =>
+            evidence.criterionId !== undefined && evidence.taskId === fixture.child.taskId,
+        ),
+      ).toHaveLength(intent.outputs!.length);
+      expect(events.some((event) => event.type === "project-work.task.completed")).toBe(false);
+      expect(() => assertProjectTeamGuidedReplayCurrent(next, intent, events)).not.toThrow();
+    });
+  it("preserves ordinary human review completion with exact criterion outputs", () => {
+    const captured = applyProjectWorkEvents(
+      emptyProjectWorkReducerState(projectId),
+      decideProjectWorkCommand(emptyProjectWorkReducerState(projectId), {
+        type: "project-work.task.create",
+        projectId,
+        taskId,
+        commandId: CommandId.make("human-review-capture"),
+        title: "Human review",
+        deliverableKind: "review",
+        createdAt: at,
+        attribution,
+      }),
+    );
+    const state = propose(captured);
+    const assignment = state.foundationRecords!.find(
+      (record) => record.kind === "task-membership",
+    )!;
+    expect(assignment).toMatchObject({ executionKind: "human", deliverableKind: "review" });
+    const next = run(state, {
+      ...envelope(state, "human-review-complete"),
+      type: "project-team.assignment.report",
+      assignmentId: assignment.recordId,
+      expectedAssignmentRevision: assignment.revision,
+      specRevision: 1,
+      planRevision: 0,
+      summary: "Human review retained",
+      evidenceIds: [],
+      outputArtifactIds: [],
+      outcome: "complete",
+      outputs: [
+        {
+          criterionId: ProjectWorkCriterionId.make("acceptance"),
+          kind: "observation",
+          detail: "The human's actual recorded review detail",
+        },
+      ],
+    });
+    expect(next.tasks[0]!.state).toBe("completed");
+    expect(next.attempts).toEqual([]);
+    expect(next.evidence.find((evidence) => evidence.criterionId === "acceptance")?.detail).toBe(
+      "The human's actual recorded review detail",
+    );
+  });
+
   it("creates a planner before the first plan only from an exact approved Human specification", () => {
     const approved = approveGates(propose());
     const intent = inheritedStart(approved, "planning", "start-planner");
