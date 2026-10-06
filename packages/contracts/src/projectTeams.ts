@@ -1,3 +1,4 @@
+import { ProjectVerificationCommandSelection } from "./projectVerification.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import * as Schema from "effect/Schema";
 import {
@@ -14,6 +15,7 @@ import {
   ProjectWorkAttemptId,
   ProjectWorkAttribution,
   ProjectWorkAttributionRead,
+  ProjectWorkCriterionId,
 } from "./projectWorkCore.ts";
 import {
   ProjectIssueIntake,
@@ -121,6 +123,18 @@ export const ProjectTeamPlanRevision = Schema.Struct({
   contentHash: Text,
   dependencyTaskIds: Schema.Array(ProjectWorkTaskId).check(Schema.isMaxLength(64)),
 });
+const VerificationId = Schema.String.check(
+  Schema.isTrimmed(),
+  Schema.isMinLength(1),
+  Schema.isMaxLength(256),
+);
+const validVerificationGate = (gate: {
+  readonly gate: string;
+  readonly verificationJobId?: string;
+  readonly contentHash: string;
+}) =>
+  gate.gate !== "verification" ||
+  (gate.verificationJobId !== undefined && /^[a-f0-9]{64}$/u.test(gate.contentHash));
 export const ProjectTeamGate = Schema.Struct({
   ...Fields,
   kind: Schema.Literal("gate"),
@@ -141,10 +155,12 @@ export const ProjectTeamGate = Schema.Struct({
     "execution",
     "merge",
     "repair",
+    "verification",
   ]),
   specRevision: NonNegativeInt,
   planRevision: NonNegativeInt,
   contentHash: Text,
+  verificationJobId: Schema.optionalKey(VerificationId),
   attribution: ProjectWorkAttribution,
   repository: Schema.optionalKey(Text),
   pullRequestNumber: Schema.optionalKey(NonNegativeInt),
@@ -182,7 +198,14 @@ export const ProjectTeamGate = Schema.Struct({
       exceptionGateId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
     }),
   ),
-});
+}).check(
+  Schema.makeFilter(
+    (gate) =>
+      validVerificationGate(gate) &&
+      (gate.gate === "verification" || gate.verificationJobId === undefined),
+    { message: "Only verification gates require an exact job pointer and SHA-256 hash" },
+  ),
+);
 export const ProjectTeamRunBinding = Schema.Struct({
   ...Fields,
   kind: Schema.Literal("run-binding"),
@@ -400,7 +423,7 @@ export const ProjectTeamRecordRead = Schema.Union([
     status: Text,
     gate: Text,
     attribution: ProjectWorkAttributionRead,
-  }),
+  }).check(Schema.makeFilter(validVerificationGate)),
   Schema.Struct({ ...ProjectTeamRunBinding.fields, status: Text }),
   Schema.Struct({ ...ProjectTeamMessage.fields, status: Text }),
   Schema.Struct({
@@ -512,7 +535,33 @@ export const ProjectTeamConfigurationIntent = Schema.Struct({
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamConfigurationIntent = typeof ProjectTeamConfigurationIntent.Type;
 
+const VerificationRevision = NonNegativeInt.check(
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+);
+export const ProjectTeamVerificationProposal = Schema.Struct({
+  ...IntentFields,
+  type: Schema.Literal("project-team.verification.propose"),
+  projectId: ProjectId.check(Schema.isMaxLength(256)),
+  taskId: ProjectWorkTaskId.check(Schema.isMaxLength(256)),
+  expectedRevision: VerificationRevision,
+  expectedTaskRevision: VerificationRevision,
+  specRevision: VerificationRevision,
+  planRevision: VerificationRevision,
+  jobId: VerificationId,
+  bindingId: VerificationId,
+  expectedBindingRevision: VerificationRevision,
+  generation: VerificationRevision,
+  criterionIds: Schema.Array(ProjectWorkCriterionId.check(Schema.isMaxLength(256))).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(64),
+    Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+  ),
+  command: ProjectVerificationCommandSelection,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamVerificationProposal = typeof ProjectTeamVerificationProposal.Type;
+
 export const ProjectTeamWriteIntent = Schema.Union([
+  ProjectTeamVerificationProposal,
   ProjectTeamConfigurationIntent,
   Schema.Struct({
     ...IntentFields,

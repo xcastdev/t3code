@@ -1,3 +1,4 @@
+import { ProjectVerificationJobManifest } from "./projectVerification.ts";
 import {
   ProjectTeamRecord,
   ProjectTeamRecordRead,
@@ -1576,7 +1577,16 @@ export const ProjectWorkWriteIntent = Schema.Union([
 ]);
 export type ProjectWorkWriteIntent = typeof ProjectWorkWriteIntent.Type;
 
+/** A retained preview describes prepared inputs; it grants no execution authority. */
+export const ProjectWorkVerificationJobRead = Schema.Struct({
+  kind: Schema.Literal("verification-job"),
+  manifest: ProjectVerificationJobManifest,
+  sha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+});
+export type ProjectWorkVerificationJobRead = typeof ProjectWorkVerificationJobRead.Type;
+
 export const ProjectWorkReadRecord = Schema.Union([
+  ProjectWorkVerificationJobRead,
   ProjectWorkTaskRead,
   ProjectWorkAttemptRead,
   ProjectWorkCriterionRead,
@@ -1598,6 +1608,7 @@ export const ProjectWorkReadOperation = Schema.Literals([
   "snapshot",
   "task",
   "task-context",
+  "verification-job",
   "tasks",
   "attempts",
   "criteria",
@@ -1621,6 +1632,9 @@ export type ProjectWorkReadOperation = typeof ProjectWorkReadOperation.Type;
 export const ProjectWorkReadIntent = Schema.Struct({
   projectId: ProjectId,
   operation: ProjectWorkReadOperation,
+  verificationJobId: Schema.optionalKey(
+    Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256)),
+  ),
   issueRecordId: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
   expectedIssueRevision: Schema.optionalKey(
     NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
@@ -1646,7 +1660,18 @@ export const ProjectWorkReadIntent = Schema.Struct({
   ),
   /** Return revision-bearing pagination metadata for collection reads. */
   envelope: Schema.optionalKey(Schema.Boolean),
-});
+}).check(
+  Schema.makeFilter(
+    (input) =>
+      input.operation !== "verification-job" ||
+      (input.verificationJobId !== undefined &&
+        input.taskId !== undefined &&
+        input.taskId.length <= 256 &&
+        input.query === undefined &&
+        input.state === undefined),
+    { message: "Verification previews require an exact task and job ID without search selectors" },
+  ),
+);
 export type ProjectWorkReadIntent = typeof ProjectWorkReadIntent.Type;
 
 export const ProjectWorkApprovalRequest = Schema.Struct({

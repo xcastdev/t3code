@@ -1,3 +1,5 @@
+import * as ProjectWorkVerification from "./projectWork/ProjectWorkVerification.ts";
+import * as AuthSessions from "./persistence/AuthSessions.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
 
@@ -698,12 +700,6 @@ const ProjectLifecycleLive = ProjectLifecycle.ProjectLifecycleLive.pipe(
   Layer.provideMerge(ServerEnvironmentLayerLive),
 );
 
-const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
-  Layer.provideMerge(ProjectTeamAuthorizationLive),
-  Layer.provideMerge(ProjectWorkServicesLive),
-  Layer.provideMerge(ProjectLifecycleLive),
-);
-
 const PiModelCatalogueLayerLive = PiModelCatalogue.layer.pipe(
   Layer.provideMerge(PersistenceLayerLive),
   Layer.provide(FetchHttpClient.layer),
@@ -726,6 +722,22 @@ const ProjectTeamPiRuntimeLayerLive = Layer.effect(
   Layer.provide(ServerSettingsLayerLive),
   Layer.provide(ServerEnvironmentLayerLive),
   Layer.provide(PersistenceLayerLive),
+);
+
+const ProjectWorkVerificationLive = ProjectWorkVerification.layer.pipe(
+  Layer.provide(ProjectTeamPiRuntimeLayerLive),
+  Layer.provide(GitWorkflowLayerLive),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(ServerSettingsLayerLive),
+  Layer.provide(PersistenceLayerLive),
+);
+
+const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
+  Layer.provideMerge(ProjectTeamAuthorizationLive),
+  Layer.provideMerge(ProjectWorkVerificationLive),
+  Layer.provideMerge(AuthSessions.layer.pipe(Layer.provide(PersistenceLayerLive))),
+  Layer.provideMerge(ProjectWorkServicesLive),
+  Layer.provideMerge(ProjectLifecycleLive),
 );
 
 const PiProductionRuntimeLayerLive = Layer.effect(

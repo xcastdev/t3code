@@ -438,3 +438,136 @@ it("accepts bounded project configuration without granting caller-created execut
   ])
     expect(() => decodeIntent({ ...configure, ...mutation })).toThrow();
 });
+
+const verificationProposal = {
+  type: "project-team.verification.propose",
+  commandId: "verification-command",
+  projectId: "project",
+  taskId: "task",
+  expectedRevision: 3,
+  expectedTaskRevision: 2,
+  specRevision: 1,
+  planRevision: 1,
+  jobId: "verification-job",
+  bindingId: "settled-implementation",
+  expectedBindingRevision: 5,
+  generation: 7,
+  criterionIds: ["criterion"],
+  command: {
+    executable: "/opt/test runner",
+    argv: ["", "  literal  ", "$(literal); *", "line\nbreak"],
+    limits: { maxDurationMs: 120_000, maxOutputBytes: 65_536 },
+    environment: "clean",
+  },
+};
+
+it("accepts a human verification selection through the public write union without changing literal arguments", () => {
+  expect(decodeIntent(verificationProposal)).toEqual(verificationProposal);
+  expect(decodePublicWrite(verificationProposal)).toEqual(verificationProposal);
+});
+
+it("rejects caller host authority and invalid ownership selections on verification proposals", () => {
+  for (const change of [
+    { manifest: {} },
+    { sha256: "a".repeat(64) },
+    { verification: { jobId: "verification-job", sha256: "a".repeat(64) } },
+    { target: { worktree: "/host" } },
+    { workspaceReceiptHash: "b".repeat(64) },
+    { criterionIds: [] },
+    { criterionIds: ["criterion", "criterion"] },
+    { criterionIds: Array.from({ length: 65 }, (_, i) => `criterion-${i}`) },
+    { criterionIds: ["x".repeat(257)] },
+    { jobId: " job " },
+    { bindingId: "" },
+    { projectId: "x".repeat(257) },
+    { taskId: "x".repeat(257) },
+    { generation: Number.MAX_SAFE_INTEGER + 1 },
+    { expectedBindingRevision: -1 },
+    { expectedRevision: Number.MAX_SAFE_INTEGER + 1 },
+    { expectedTaskRevision: 1.5 },
+    { specRevision: -1 },
+    { planRevision: Number.MAX_SAFE_INTEGER + 1 },
+    { command: { ...verificationProposal.command, env: { TOKEN: "secret" } } },
+    { command: { ...verificationProposal.command, argv: ["bad\0arg"] } },
+    {
+      command: { ...verificationProposal.command, limits: { maxDurationMs: 0, maxOutputBytes: 1 } },
+    },
+  ]) {
+    expect(() => decodeIntent({ ...verificationProposal, ...change })).toThrow();
+    expect(() => decodePublicWrite({ ...verificationProposal, ...change })).toThrow();
+  }
+});
+
+const verificationGate = {
+  kind: "gate",
+  recordId: "gate",
+  projectId: "project",
+  revision: 0,
+  generation: 0,
+  updatedAt: "2026-01-01T00:00:00.000Z",
+  status: "pending",
+  taskId: "task",
+  gate: "verification",
+  specRevision: 1,
+  planRevision: 1,
+  contentHash: "a".repeat(64),
+  verificationJobId: "verification-job",
+  evidenceIds: [],
+  attribution: {
+    actor: { kind: "human", id: "user" },
+    source: { kind: "web" },
+    recordedAt: "2026-01-01T00:00:00.000Z",
+  },
+};
+
+it("retains a verification gate's exact job pointer and hash for human approval and future read states", () => {
+  expect(decodeTeamRecord(verificationGate)).toEqual(verificationGate);
+  expect(decodeTeamRecordRead({ ...verificationGate, status: "future-state" })).toEqual({
+    ...verificationGate,
+    status: "future-state",
+  });
+});
+
+it("denies missing or malformed verification gate authority and pointers on every other known write gate", () => {
+  for (const change of [
+    { verificationJobId: undefined },
+    { verificationJobId: "" },
+    { verificationJobId: " job " },
+    { verificationJobId: "x".repeat(257) },
+    { contentHash: "hash" },
+    { contentHash: "A".repeat(64) },
+    { contentHash: "a".repeat(63) },
+  ]) {
+    expect(() => decodeTeamRecord({ ...verificationGate, ...change })).toThrow();
+    const read = decodeTeamRecordRead({ ...verificationGate, ...change });
+    expect(read).not.toHaveProperty("verificationJobId");
+    expect(read).not.toHaveProperty("contentHash");
+  }
+  const { verificationJobId: _jobId, ...legacyGate } = verificationGate;
+  for (const gate of [
+    "investigation",
+    "assignment",
+    "specification",
+    "plan",
+    "execution",
+    "merge",
+    "repair",
+  ]) {
+    expect(() => decodeTeamRecord({ ...verificationGate, gate })).toThrow();
+    expect(decodeTeamRecord({ ...legacyGate, gate, contentHash: "legacy-hash" })).toMatchObject({
+      gate,
+      contentHash: "legacy-hash",
+    });
+  }
+});
+
+it("preserves unknown gate kinds and statuses without accepting them as current write gates", () => {
+  const future = {
+    ...verificationGate,
+    gate: "future-gate",
+    status: "future-status",
+    contentHash: "future-hash",
+  };
+  expect(decodeTeamRecordRead(future)).toEqual(future);
+  expect(() => decodeTeamRecord(future)).toThrow();
+});

@@ -262,6 +262,11 @@ import * as IssueSearch from "./pullRequest/IssueSearch.ts";
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
 import { pullRequestSyncKey } from "./pullRequest/pullRequestSyncKey.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { AuthSessionRepository } from "./persistence/AuthSessions.ts";
+import {
+  ProjectWorkVerificationRequest,
+  makeProjectWorkVerificationRequest,
+} from "./projectWork/ProjectWorkVerificationRequest.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import * as SourceControlDiscovery from "./sourceControl/SourceControlDiscovery.ts";
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
@@ -1143,6 +1148,22 @@ const makeWsProjectWorkRpcLayer = (
 ) =>
   ProjectWorkWsRpcGroup.toLayer(
     Effect.gen(function* () {
+      const verificationSessions = yield* Effect.serviceOption(AuthSessionRepository);
+      const withVerificationRequest = <A, E, R>(
+        projectId: ProjectId,
+        purpose: "read" | "write",
+        effect: Effect.Effect<A, E, R>,
+      ) => {
+        if (Option.isNone(verificationSessions)) return effect;
+        const request = makeProjectWorkVerificationRequest(currentSession, projectId, purpose).pipe(
+          Effect.provideService(AuthSessionRepository, verificationSessions.value),
+        );
+        return request.pipe(
+          Effect.flatMap((guard) =>
+            Effect.provideService(effect, ProjectWorkVerificationRequest, guard),
+          ),
+        );
+      };
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       // Kept optional so lightweight router/test compositions do not have to
@@ -1232,17 +1253,19 @@ const makeWsProjectWorkRpcLayer = (
           observeRpcEffect(
             WS_METHODS.projectWorkRead,
             Option.isSome(projectWorkGateway)
-              ? authorizeRpcSession(WS_METHODS.projectWorkRead, currentSession, serverAuth).pipe(
-                  Effect.flatMap((session) =>
-                    projectWorkGateway.value.read(input, {
-                      actor: {
-                        kind: session.identity.kind === "agent" ? "agent" : "human",
-                        id: session.identity.id,
-                      },
-                      ...(session.managed === undefined ? {} : { managed: session.managed }),
-                    }),
-                  ),
-                )
+              ? authorizeRpcSession(WS_METHODS.projectWorkRead, currentSession, serverAuth)
+                  .pipe(
+                    Effect.flatMap((session) =>
+                      projectWorkGateway.value.read(input, {
+                        actor: {
+                          kind: session.identity.kind === "agent" ? "agent" : "human",
+                          id: session.identity.id,
+                        },
+                        ...(session.managed === undefined ? {} : { managed: session.managed }),
+                      }),
+                    ),
+                  )
+                  .pipe((effect) => withVerificationRequest(input.projectId, "read", effect))
               : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
             { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
           ),
@@ -1250,34 +1273,36 @@ const makeWsProjectWorkRpcLayer = (
           observeRpcEffect(
             WS_METHODS.projectWorkWrite,
             Option.isSome(projectWorkGateway)
-              ? projectWorkGateway.value.write(
-                  input,
-                  {
-                    kind: currentSession.identity.kind === "agent" ? "agent" : "human",
-                    id: currentSession.identity.id,
-                    ...(currentSession.identity.displayName
-                      ? { displayName: currentSession.identity.displayName }
-                      : {}),
-                  },
-                  {
-                    kind:
-                      clientOrigin.surface === "mobile"
-                        ? "mobile"
-                        : clientOrigin.surface === "desktop"
-                          ? "desktop"
-                          : "web",
-                    id: currentSession.identity.id,
-                  },
-                  {
-                    actor: {
+              ? projectWorkGateway.value
+                  .write(
+                    input,
+                    {
                       kind: currentSession.identity.kind === "agent" ? "agent" : "human",
                       id: currentSession.identity.id,
+                      ...(currentSession.identity.displayName
+                        ? { displayName: currentSession.identity.displayName }
+                        : {}),
                     },
-                    ...(currentSession.managed === undefined
-                      ? {}
-                      : { managed: currentSession.managed }),
-                  },
-                )
+                    {
+                      kind:
+                        clientOrigin.surface === "mobile"
+                          ? "mobile"
+                          : clientOrigin.surface === "desktop"
+                            ? "desktop"
+                            : "web",
+                      id: currentSession.identity.id,
+                    },
+                    {
+                      actor: {
+                        kind: currentSession.identity.kind === "agent" ? "agent" : "human",
+                        id: currentSession.identity.id,
+                      },
+                      ...(currentSession.managed === undefined
+                        ? {}
+                        : { managed: currentSession.managed }),
+                    },
+                  )
+                  .pipe((effect) => withVerificationRequest(input.projectId, "write", effect))
               : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
             { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
           ),

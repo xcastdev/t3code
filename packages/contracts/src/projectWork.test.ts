@@ -22,6 +22,10 @@ import {
 } from "./index.ts";
 import { DEFAULT_SERVER_SETTINGS, ServerSettings, ServerSettingsPatch } from "./settings.ts";
 
+const decodeVerificationRead = Schema.decodeUnknownSync(ProjectWorkReadIntent);
+const decodeVerificationRecord = Schema.decodeUnknownSync(ProjectWorkReadRecord);
+const decodeVerificationEnvelope = Schema.decodeUnknownSync(ProjectWorkBoundedReadEnvelope);
+
 const decodeTaskCreate = Schema.decodeUnknownSync(ProjectWorkTaskCreateCommand);
 const decodeIssueRefine = Schema.decodeUnknownSync(ProjectWorkIssueRefineCommand);
 const decodeTask = Schema.decodeUnknownSync(ProjectWorkTask);
@@ -490,4 +494,111 @@ it("round-trips opaque foundation request cursors without changing their bytes",
       decodeOpaqueWorkRead({ projectId: "project", operation: "foundation-records", cursor }),
     ).toThrow();
   }
+});
+
+it("addresses one verification preview by project, task and exact job ID rather than a generic search", () => {
+  const intent = {
+    projectId: "project",
+    taskId: "task",
+    operation: "verification-job",
+    verificationJobId: "verification-job",
+  };
+  const decode = decodeVerificationRead;
+  expect(decode(intent)).toEqual(intent);
+  for (const change of [
+    { verificationJobId: undefined },
+    { verificationJobId: "" },
+    { verificationJobId: " job " },
+    { verificationJobId: "x".repeat(257) },
+    { taskId: undefined },
+    { taskId: "" },
+    { taskId: "x".repeat(257) },
+    { query: "verification-job" },
+    { state: "approved" },
+  ])
+    expect(() => decode({ ...intent, ...change })).toThrow();
+  expect(
+    decode({ projectId: "project", operation: "search", query: "existing search" }),
+  ).toMatchObject({ query: "existing search" });
+});
+
+const previewCommand = {
+  executable: "/opt/project tools/test runner",
+  argv: ["", "  preserved  ", "--filter", "$(literal); *", "line\nbreak"],
+  limits: { maxDurationMs: 120_000, maxOutputBytes: 65_536 },
+  environment: "clean",
+};
+
+const previewManifest = {
+  version: 1,
+  jobId: "verification-1",
+  environmentId: "environment",
+  projectId: "project",
+  taskId: "task",
+  specRevision: 4,
+  specificationHash: "a".repeat(64),
+  planRevision: 2,
+  planHash: "b".repeat(64),
+  criteria: [{ criterionId: "criterion-1", revision: 3 }],
+  dispatchId: "original-implementation",
+  bindingId: "implementation-binding",
+  generation: 7,
+  workspaceReceiptHash: "c".repeat(64),
+  command: previewCommand,
+  target: {
+    repository: "/project",
+    worktree: "/project-worktree",
+    branchRef: "refs/heads/team/implementation",
+    baseSha: "d".repeat(40),
+    headSha: "e".repeat(40),
+    testedCommit: "e".repeat(40),
+    testedTree: "f".repeat(40),
+    workspaceState: "clean-committed",
+  },
+  executable: {
+    target: previewCommand.executable,
+    sha256: "1".repeat(64),
+    runtimeClosureSha256: "2".repeat(64),
+  },
+};
+
+it("retains a bounded typed verification preview through the shared read record and pagination envelope", () => {
+  const record = { kind: "verification-job", manifest: previewManifest, sha256: "3".repeat(64) };
+  const decode = decodeVerificationRecord;
+  expect(decode(record)).toEqual(record);
+  const envelope = decodeVerificationEnvelope({
+    projectId: "project",
+    revision: 5,
+    offset: 0,
+    limit: 1,
+    hasMore: false,
+    items: [record],
+  });
+  expect(decode(envelope.items[0])).toEqual(record);
+  for (const change of [
+    { sha256: "A".repeat(64) },
+    { sha256: "3".repeat(63) },
+    { manifest: { ...previewManifest, version: 2 } },
+    { manifest: { ...previewManifest, criteria: [] } },
+    { manifest: { ...previewManifest, command: { ...previewCommand, environment: "inherit" } } },
+    {
+      manifest: {
+        ...previewManifest,
+        executable: { ...previewManifest.executable, target: "/other" },
+      },
+    },
+  ])
+    expect(() => decode({ ...record, ...change })).toThrow();
+  const path = "/" + "界".repeat(4_095);
+  expect(() =>
+    decode({
+      ...record,
+      manifest: {
+        ...previewManifest,
+        target: { ...previewManifest.target, repository: path, worktree: path },
+        command: { ...previewCommand, executable: path, argv: Array(4).fill("x".repeat(4_096)) },
+        executable: { ...previewManifest.executable, target: path },
+      },
+    }),
+  ).toThrow();
 });

@@ -1,5 +1,6 @@
 import {
   CommandId,
+  canonicalProjectWorkPayload,
   ProjectTeamCredential,
   ProjectTeamRecord,
   ProjectTeamGuidedIntent,
@@ -12,6 +13,10 @@ import {
   type ProviderInstanceId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
+import * as Option from "effect/Option";
+import { ProjectWorkVerificationApproval } from "./ProjectWorkVerificationGate.ts";
+import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
@@ -467,6 +472,95 @@ export const layer = Layer.effect(
           catch: () => deny("Configuration is stale, invalid, or existing work has not drained"),
         });
       }
+      if (input.type === "project-team.verification.propose") {
+        if (
+          principal.actor.kind !== "human" ||
+          principal.managed !== undefined ||
+          attribution.actor.kind !== "human" ||
+          attribution.actor.id !== principal.actor.id
+        )
+          return yield* deny("Only the authenticated human can propose verification");
+        const trusted = yield* Effect.serviceOption(ProjectWorkVerificationApproval);
+        if (Option.isNone(trusted))
+          return yield* deny("Private verification preparation unavailable");
+        const { type: _type, commandId: _commandId, ...selection } = input;
+        if (
+          canonicalProjectWorkPayload(selection) !==
+          canonicalProjectWorkPayload(trusted.value.selection)
+        )
+          return yield* deny("Verification selection does not match its private preparation");
+        yield* trusted.value.assertCurrent(state, duplicate).pipe(
+          Effect.mapError(() => deny("Verification preparation is no longer current")),
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+        const receipt = trusted.value.receipt;
+        const recordId =
+          "verification:" +
+          NodeCrypto.createHash("sha256")
+            .update(
+              canonicalProjectWorkPayload({
+                environmentId: receipt.manifest.environmentId,
+                projectId: input.projectId,
+                taskId: input.taskId,
+                jobId: input.jobId,
+              }),
+            )
+            .digest("hex");
+        const existing = (state.foundationRecords ?? []).filter(
+          (row) => row.kind === "gate" && row.verificationJobId === input.jobId,
+        );
+        if (duplicate) {
+          const gate = existing[0];
+          if (
+            existing.length !== 1 ||
+            gate?.kind !== "gate" ||
+            gate.recordId !== recordId ||
+            gate.taskId !== input.taskId ||
+            gate.gate !== "verification" ||
+            gate.contentHash !== receipt.sha256 ||
+            gate.status !== "pending"
+          )
+            return yield* deny("Verification proposal receipt target changed");
+          return {
+            type: "project-work.foundation.commit",
+            commandId: input.commandId,
+            projectId: input.projectId,
+            expectedRevision: input.expectedRevision,
+            attribution,
+            records: [gate],
+            committedAt: attribution.recordedAt,
+          } satisfies ProjectWorkCommand;
+        }
+        if (existing.length !== 0)
+          return yield* deny("Verification job already has an approval gate");
+        return {
+          type: "project-work.foundation.commit",
+          commandId: input.commandId,
+          projectId: input.projectId,
+          expectedRevision: input.expectedRevision,
+          attribution,
+          records: [
+            {
+              kind: "gate",
+              projectId: input.projectId,
+              recordId,
+              revision: 0,
+              generation: input.generation,
+              updatedAt: attribution.recordedAt,
+              status: "pending",
+              taskId: input.taskId,
+              gate: "verification",
+              specRevision: input.specRevision,
+              planRevision: input.planRevision,
+              contentHash: receipt.sha256,
+              verificationJobId: input.jobId,
+              attribution,
+              evidenceIds: [],
+            },
+          ],
+          committedAt: attribution.recordedAt,
+        } satisfies ProjectWorkCommand;
+      }
       if (
         authority &&
         (input.projectId !== authority.binding.projectId ||
@@ -548,6 +642,31 @@ export const layer = Layer.effect(
           )
         )
           return yield* deny("Plan approval target changed");
+        if (gate.gate === "verification" && input.type === "project-team.gate.respond") {
+          const request = yield* Effect.serviceOption(ProjectWorkVerificationRequest);
+          if (Option.isNone(request))
+            return yield* deny("Current human verification request unavailable");
+          yield* request.value
+            .assertCurrent(principal, input.projectId, "write")
+            .pipe(Effect.mapError(() => deny("Human verification request is no longer current")));
+        }
+        if (
+          gate.gate === "verification" &&
+          input.type === "project-team.gate.respond" &&
+          input.response === "approved"
+        ) {
+          const trusted = yield* Effect.serviceOption(ProjectWorkVerificationApproval);
+          if (
+            Option.isNone(trusted) ||
+            trusted.value.receipt.manifest.jobId !== gate.verificationJobId ||
+            trusted.value.receipt.sha256 !== gate.contentHash
+          )
+            return yield* deny("Private verification approval target unavailable");
+          yield* trusted.value.assertCurrent(state, duplicate).pipe(
+            Effect.mapError(() => deny("Verification approval target changed")),
+            Effect.provideService(SqlClient.SqlClient, sql),
+          );
+        }
         if (input.type === "project-team.gate.respond") {
           if (!duplicate && gate.status !== "pending" && gate.status !== "proposed")
             return yield* deny("Gate response is no longer eligible");

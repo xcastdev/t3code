@@ -3,6 +3,7 @@ import {
   type ProjectWorkActor,
   type ProjectWorkWriteIntent,
   ProjectTeamWriteIntent,
+  ProjectWorkVerificationJobRead,
   ProjectTeamGuidedIntent,
   ProjectTeamSupervisionSummary,
   type ProjectWorkAttribution,
@@ -25,6 +26,14 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import { ProjectWorkVerification } from "./ProjectWorkVerification.ts";
+import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
+import {
+  ProjectWorkVerificationApproval,
+  ProjectWorkVerificationGateError,
+  makeProjectWorkVerificationGate,
+} from "./ProjectWorkVerificationGate.ts";
+import { ProjectWorkVerificationPreparationSelection } from "./ProjectWorkVerificationPreparation.ts";
 import * as ProjectTeamAuthorization from "./ProjectTeamAuthorization.ts";
 import * as ProjectWorkBriefing from "./ProjectWorkBriefing.ts";
 import * as IssueComments from "./ProjectIssueComments.ts";
@@ -320,6 +329,13 @@ const sanitizePublicValue = (value: unknown, depth = 0, foundation = false): unk
   );
 };
 
+const decodeVerificationSelection = Schema.decodeUnknownEffect(
+  ProjectWorkVerificationPreparationSelection,
+  { onExcessProperty: "error" },
+);
+const decodeVerificationPreview = Schema.decodeUnknownEffect(ProjectWorkVerificationJobRead, {
+  onExcessProperty: "error",
+});
 const decodeSupervision = Schema.decodeUnknownEffect(ProjectTeamSupervisionSummary);
 const SUPERVISION_CAPTIONS = new Set(["name", "title", "reason"]);
 const SUPERVISION_IDENTITY = /\.(?:[A-Za-z]*Id|availability)$/u;
@@ -357,6 +373,7 @@ const publicSupervision = Effect.fn("ProjectWorkGateway.publicSupervision")(func
 
 const makeProjectWorkGateway = Effect.gen(function* () {
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
+  const verification = yield* Effect.serviceOption(ProjectWorkVerification);
   const issueComments = yield* Effect.serviceOption(IssueComments.ProjectIssueComments);
   const repository = yield* ProjectWorkRepository.ProjectWorkRepository;
   const query = yield* ProjectWorkQuery.ProjectWorkQuery;
@@ -381,6 +398,17 @@ const makeProjectWorkGateway = Effect.gen(function* () {
   const teamAuthorization = yield* Effect.serviceOption(
     ProjectTeamAuthorization.ProjectTeamAuthorization,
   );
+
+  const verificationGate = (environmentId: string) =>
+    Effect.gen(function* () {
+      return yield* makeProjectWorkVerificationGate({
+        environmentId,
+        maximumEnvironmentModelCalls: 128,
+      });
+    }).pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, repository),
+    );
 
   const executeAuthorized = <E, L = never>(
     command: ProjectWorkCommand,
@@ -453,6 +481,12 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     };
     const result: Effect.Effect<unknown, ProjectionRepositoryError> = (() => {
       switch (boundedInput.operation) {
+        case "verification-job":
+          return Effect.fail(
+            toPersistenceSqlError("ProjectWorkGateway.read")(
+              new Error("Verification job requires its private read boundary"),
+            ),
+          );
         case "supervision":
           return Effect.gen(function* () {
             const settings = yield* serverSettings.getSettings.pipe(
@@ -1019,6 +1053,66 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     });
 
   const read: ProjectWorkGatewayShape["read"] = (input, principal) => {
+    if (input.operation === "verification-job")
+      return Effect.gen(function* () {
+        const denied = () =>
+          new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+            reason: "Current human verification preview unavailable",
+          });
+        const request = yield* Effect.serviceOption(ProjectWorkVerificationRequest);
+        if (
+          !principal ||
+          Option.isNone(request) ||
+          Option.isNone(verification) ||
+          input.taskId === undefined ||
+          input.verificationJobId === undefined
+        )
+          return yield* denied();
+        const projectId = input.projectId,
+          taskId = input.taskId,
+          jobId = input.verificationJobId;
+        const authorize = Effect.gen(function* () {
+          yield* request.value
+            .assertCurrent(principal, projectId, "read")
+            .pipe(Effect.mapError(denied));
+          const settings = yield* serverSettings.getSettings.pipe(Effect.mapError(denied));
+          if (!settings.projectWorkEnabled || Option.isNone(teamAuthorization))
+            return yield* denied();
+          yield* teamAuthorization.value.read(principal, input);
+          const state = yield* ProjectWorkRepository.readCurrentState(sql, projectId);
+          const gates = (state.foundationRecords ?? []).filter(
+            (row) =>
+              row.kind === "gate" &&
+              row.gate === "verification" &&
+              row.taskId === taskId &&
+              row.verificationJobId === jobId,
+          );
+          if (gates.length !== 1 || gates[0]?.kind !== "gate") return yield* denied();
+          return gates[0].contentHash;
+        });
+        const before = yield* sql.withTransaction(authorize);
+        const retained = yield* verification.value
+          .readPrepared(jobId)
+          .pipe(Effect.mapError(denied));
+        if (
+          retained === undefined ||
+          retained.manifest.projectId !== projectId ||
+          retained.manifest.taskId !== taskId ||
+          retained.sha256 !== before
+        )
+          return yield* denied();
+        const after = yield* sql.withTransaction(authorize);
+        if (after !== retained.sha256) return yield* denied();
+        return yield* decodeVerificationPreview({ kind: "verification-job", ...retained }).pipe(
+          Effect.mapError(denied),
+        );
+      }).pipe(
+        Effect.mapError((error) =>
+          isTeamAuthorizationError(error)
+            ? error
+            : toPersistenceSqlError("ProjectWorkGateway.read")(error),
+        ),
+      );
     if (input.operation === "issue-comments")
       return Effect.gen(function* () {
         const authorize = sql.withTransaction(
@@ -1107,6 +1201,131 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             }),
           )
           .digest("hex");
+      const approval = yield* Effect.gen(function* () {
+        // Agent decisions are denied by authorization inside the command transaction.
+        // Do not acquire an unrelated read connection before that boundary.
+        if (caller.actor.kind !== "human" || caller.managed !== undefined) return Option.none();
+        if (
+          input.type !== "project-team.verification.propose" &&
+          (input.type !== "project-team.gate.respond" || input.response !== "approved")
+        )
+          return Option.none();
+        const current = yield* ProjectWorkRepository.readCurrentState(sql, input.projectId).pipe(
+          Effect.mapError(toPersistenceSqlError("ProjectWorkGateway.write")),
+        );
+        const gate =
+          input.type === "project-team.gate.respond"
+            ? (current.foundationRecords ?? []).find(
+                (row) => row.kind === "gate" && row.recordId === input.gateId,
+              )
+            : undefined;
+        if (
+          input.type === "project-team.gate.respond" &&
+          (gate?.kind !== "gate" || gate.gate !== "verification")
+        )
+          return Option.none();
+        const denied = () =>
+          new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+            reason: "Private human verification preparation unavailable",
+          });
+        const request = yield* Effect.serviceOption(ProjectWorkVerificationRequest);
+        if (Option.isNone(request) || Option.isNone(verification)) return yield* denied();
+        const assertHuman = Effect.gen(function* () {
+          yield* request.value
+            .assertCurrent(caller, input.projectId, "write")
+            .pipe(Effect.mapError(denied));
+          const settings = yield* serverSettings.getSettings.pipe(Effect.mapError(denied));
+          if (!settings.projectWorkEnabled) return yield* denied();
+          yield* assertProjectAcceptsMutations(sql, input.projectId).pipe(Effect.mapError(denied));
+        });
+        yield* assertHuman;
+        const prior = yield* sql<{
+          fingerprint: string;
+        }>`SELECT payload_fingerprint AS fingerprint FROM project_work_command_receipts WHERE project_id=${input.projectId} AND command_id=${input.commandId} LIMIT 2`.pipe(
+          Effect.mapError(denied),
+        );
+        if (prior.length > 1 || (prior.length === 1 && prior[0]?.fingerprint !== fingerprint))
+          return yield* denied();
+        if (input.type === "project-team.verification.propose") {
+          const { type: _type, commandId: _commandId, ...selected } = input;
+          const selection = yield* decodeVerificationSelection(selected).pipe(
+            Effect.mapError(denied),
+          );
+          const receipt = yield* Effect.gen(function* () {
+            return yield* prior.length === 1
+              ? verification.value.readPrepared(input.jobId)
+              : verification.value.prepare(selection, caller);
+          }).pipe(Effect.mapError(denied));
+          if (receipt === undefined) return yield* denied();
+          const guard = yield* verificationGate(verification.value.environmentId).pipe(
+            Effect.mapError(denied),
+          );
+          return Option.some(
+            ProjectWorkVerificationApproval.of({
+              receipt,
+              selection,
+              assertCurrent: (state, duplicate) =>
+                assertHuman.pipe(
+                  Effect.andThen(guard.assertCurrent(state, receipt, selection, duplicate)),
+                  Effect.mapError(
+                    () =>
+                      new ProjectWorkVerificationGateError({
+                        reason: "Verification preparation changed",
+                      }),
+                  ),
+                ),
+            }),
+          );
+        }
+        if (gate?.kind !== "gate" || gate.verificationJobId === undefined) return yield* denied();
+        const receipt = yield* verification.value
+          .readPrepared(gate.verificationJobId)
+          .pipe(Effect.mapError(denied));
+        if (
+          receipt === undefined ||
+          receipt.sha256 !== gate.contentHash ||
+          receipt.manifest.projectId !== input.projectId ||
+          receipt.manifest.taskId !== input.taskId
+        )
+          return yield* denied();
+        const binding = (current.foundationRecords ?? []).find(
+          (row) => row.kind === "run-binding" && row.recordId === receipt.manifest.bindingId,
+        );
+        if (binding?.kind !== "run-binding") return yield* denied();
+        const selection = yield* decodeVerificationSelection({
+          projectId: input.projectId,
+          taskId: input.taskId,
+          expectedRevision: input.expectedRevision,
+          expectedTaskRevision: input.expectedTaskRevision,
+          specRevision: input.specRevision,
+          planRevision: input.planRevision,
+          jobId: receipt.manifest.jobId,
+          bindingId: receipt.manifest.bindingId,
+          expectedBindingRevision: binding.revision,
+          generation: receipt.manifest.generation,
+          criterionIds: receipt.manifest.criteria.map((row) => row.criterionId),
+          command: receipt.manifest.command,
+        }).pipe(Effect.mapError(denied));
+        const guard = yield* verificationGate(verification.value.environmentId).pipe(
+          Effect.mapError(denied),
+        );
+        return Option.some(
+          ProjectWorkVerificationApproval.of({
+            receipt,
+            selection,
+            assertCurrent: (state, duplicate) =>
+              assertHuman.pipe(
+                Effect.andThen(guard.assertCurrent(state, receipt, selection, duplicate)),
+                Effect.mapError(
+                  () =>
+                    new ProjectWorkVerificationGateError({
+                      reason: "Verification approval changed",
+                    }),
+                ),
+              ),
+          }),
+        );
+      });
       const envelope: ProjectWorkCommand = {
         type: "project-work.foundation.commit",
         commandId: input.commandId,
@@ -1138,6 +1357,10 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             : teamAuthorization.value.intent(caller, input, attribution, duplicate)
           ).pipe(Effect.asVoid),
         fingerprint,
+      ).pipe((effect) =>
+        Option.isSome(approval)
+          ? Effect.provideService(effect, ProjectWorkVerificationApproval, approval.value)
+          : effect,
       );
       return sanitizePublicValue(result.writeResult) as ProjectWorkWriteReceipt;
     });
