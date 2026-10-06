@@ -4,6 +4,7 @@ import {
   sourceControlRepositorySelector,
 } from "@t3tools/shared/sourceControl";
 import * as Cache from "effect/Cache";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -71,6 +72,7 @@ import { detectSourceControlProviderFromRemoteUrl } from "@t3tools/shared/source
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProjectWorkPullRequestActionGuard } from "../projectWork/ProjectWorkPullRequestActionGuard.ts";
+import { ProjectWorkEvidenceInvalidation } from "../projectWork/ProjectWorkEvidenceInvalidation.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as SourceControlRateLimit from "../sourceControl/SourceControlRateLimit.ts";
 import {
@@ -598,6 +600,7 @@ export const make = Effect.gen(function* () {
   const registry = yield* PullRequestProviderRegistry;
   const projections = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const workActionGuard = yield* Effect.serviceOption(ProjectWorkPullRequestActionGuard);
+  const evidenceInvalidation = yield* Effect.serviceOption(ProjectWorkEvidenceInvalidation);
   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
   const rateLimits = yield* SourceControlRateLimit.SourceControlRateLimit;
   const readCache = yield* PullRequestReadCache.PullRequestReadCache;
@@ -1774,21 +1777,53 @@ export const make = Effect.gen(function* () {
 
   const detailUncached: PullRequestService["Service"]["detail"] = (input) =>
     requireProject(input).pipe(
-      Effect.flatMap((project) =>
-        Effect.all(
-          [
-            project.api
-              .getChangeRequest({
-                cwd: project.project.workspaceRoot,
-                repository: project.repository,
-                host: project.host,
-                number: input.number,
-              })
-              .pipe(Effect.mapError(toPullRequestError("detail"))),
-            viewerOf(project),
-          ],
-          { concurrency: 2 },
-        ).pipe(
+      Effect.flatMap((project) => {
+        const observedRead = Effect.gen(function* () {
+          const captured = Option.isSome(evidenceInvalidation)
+            ? yield* evidenceInvalidation.value
+                .capture({
+                  projectId: project.project.id,
+                  provider: project.api.kind,
+                  host: project.host,
+                  repository: project.repository,
+                  number: input.number,
+                })
+                .pipe(
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterrupts(cause)
+                      ? Effect.failCause(
+                          Cause.fromReasons<never>(cause.reasons.filter(Cause.isInterruptReason)),
+                        )
+                      : Effect.logWarning("pr.evidence-observation-unavailable", { cause }).pipe(
+                          Effect.as(undefined),
+                        ),
+                  ),
+                )
+            : undefined;
+          const changeRequest = yield* project.api
+            .getChangeRequest({
+              cwd: project.project.workspaceRoot,
+              repository: project.repository,
+              host: project.host,
+              number: input.number,
+            })
+            .pipe(Effect.mapError(toPullRequestError("detail")));
+          if (captured !== undefined && Option.isSome(evidenceInvalidation)) {
+            yield* evidenceInvalidation.value
+              .invalidate(captured, changeRequest)
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Cause.hasInterrupts(cause)
+                    ? Effect.failCause(
+                        Cause.fromReasons<never>(cause.reasons.filter(Cause.isInterruptReason)),
+                      )
+                    : Effect.logWarning("pr.evidence-observation-rejected", { cause }),
+                ),
+              );
+          }
+          return changeRequest;
+        });
+        return Effect.all([observedRead, viewerOf(project)], { concurrency: 2 }).pipe(
           Effect.map(([changeRequest, viewer]): PullRequestDetail => ({
             provider: project.api.kind,
             capabilities: project.api.capabilities,
@@ -1845,8 +1880,8 @@ export const make = Effect.gen(function* () {
               ? {}
               : { workflowApprovalsRequired: changeRequest.workflowApprovalsRequired }),
           })),
-        ),
-      ),
+        );
+      }),
     );
 
   const activityUncached: PullRequestService["Service"]["activity"] = (input) =>

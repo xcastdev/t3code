@@ -9,8 +9,10 @@ import * as PlatformPath from "@effect/platform-node/NodePath";
 import * as KeyValueStore from "effect/unstable/persistence/KeyValueStore";
 import * as Persistence from "effect/unstable/persistence/Persistence";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -19,12 +21,20 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import type {
   OrchestrationProjectShell,
-  ProjectId,
   PullRequestReviewCapabilities,
   PullRequestReviewerCapabilities,
   SourceControlProviderKind,
 } from "@t3tools/contracts";
-import { PullRequestOperationError } from "@t3tools/contracts";
+import {
+  PullRequestOperationError,
+  ProjectId,
+  ProjectWorkTaskId,
+  CommandId,
+  canonicalProjectWorkPayload,
+  type ProjectTeamRecord,
+  type ProjectWorkPublicationRequest,
+  type ProjectWorkPublicationOutcome,
+} from "@t3tools/contracts";
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
@@ -32,6 +42,7 @@ import * as SourceControlRateLimit from "../sourceControl/SourceControlRateLimit
 import {
   PullRequestProviderError,
   type ProviderChangeRequest,
+  type ProviderChangeRequestDetail,
   type PullRequestProviderApi,
 } from "./PullRequestProvider.ts";
 import { PullRequestProviderRegistry, fromProviders } from "./PullRequestProviderRegistry.ts";
@@ -41,6 +52,17 @@ import {
   ProjectWorkPullRequestActionGuardError,
 } from "../projectWork/ProjectWorkPullRequestActionGuard.ts";
 import * as PullRequestReadCache from "./PullRequestReadCache.ts";
+import * as EvidenceInvalidation from "../projectWork/ProjectWorkEvidenceInvalidation.ts";
+import * as TeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+  readCurrentState,
+} from "../projectWork/ProjectWorkRepository.ts";
+import { publicationRequestHash } from "../projectWork/github/ProjectWorkGitHubOutbox.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 function project(input: {
   readonly id: string;
@@ -200,6 +222,7 @@ function makeService(input: {
   readonly readFileString?: (path: string) => Effect.Effect<string>;
   readonly useRealFileSystem?: boolean;
   readonly workActionGuard?: ProjectWorkPullRequestActionGuard["Service"];
+  readonly evidenceInvalidation?: EvidenceInvalidation.ProjectWorkEvidenceInvalidation["Service"];
 }) {
   const fileSystem = input.useRealFileSystem
     ? NodeFileSystem.layer
@@ -210,6 +233,12 @@ function makeService(input: {
   return PullRequestService.make.pipe(
     Effect.provide(
       Layer.mergeAll(
+        input.evidenceInvalidation === undefined
+          ? Layer.empty
+          : Layer.succeed(
+              EvidenceInvalidation.ProjectWorkEvidenceInvalidation,
+              input.evidenceInvalidation,
+            ),
         input.workActionGuard === undefined
           ? Layer.empty
           : Layer.succeed(ProjectWorkPullRequestActionGuard, input.workActionGuard),
@@ -239,6 +268,377 @@ function makeService(input: {
     ),
   );
 }
+
+const observedRuntime = EvidenceInvalidation.layer.pipe(
+  Layer.provideMerge(
+    Layer.mergeAll(
+      ProjectWorkRepositoryLive,
+      TeamAuthorization.layer,
+      ServerSettingsService.layerTest({
+        projectWorkEnabled: true,
+        projectTeamExecutionEnabled: true,
+      }),
+    ),
+  ),
+  Layer.provideMerge(SqlitePersistenceMemory),
+);
+
+const observedFixture = (read: PullRequestProviderApi["getChangeRequest"]) =>
+  Effect.gen(function* () {
+    const at = "2026-10-06T00:00:00.000Z";
+    const p = ProjectId.make("observed-pr-project");
+    const taskId = ProjectWorkTaskId.make("observed-pr-task");
+    const sql = yield* SqlClient.SqlClient;
+    const repository = yield* ProjectWorkRepository;
+    const human = {
+      actor: { kind: "human" as const, id: "maintainer" },
+      source: { kind: "web" as const },
+      recordedAt: at,
+    };
+    const fields = { projectId: p, revision: 0, generation: 0, updatedAt: at };
+    const evidence: Extract<ProjectTeamRecord, { kind: "evidence-applicability" }> = {
+      ...fields,
+      kind: "evidence-applicability",
+      recordId: "observed-evidence",
+      status: "current",
+      taskId,
+      evidenceId: "raw",
+      specRevision: 0,
+      planRevision: 0,
+      repository: "owner/repo",
+      worktree: "/fixture",
+      testedTree: "original-tree",
+      baseSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      command: "vp test run focused.test.ts",
+      exitCode: 0,
+      artifactId: "raw-log",
+      environmentSummary: "Fixture",
+      integration: true,
+    };
+    const gate: Extract<ProjectTeamRecord, { kind: "gate" }> = {
+      ...fields,
+      kind: "gate",
+      recordId: "observed-gate",
+      status: "approved",
+      taskId,
+      gate: "merge",
+      specRevision: 0,
+      planRevision: 0,
+      contentHash: "content",
+      attribution: human,
+      repository: "owner/repo",
+      pullRequestNumber: 1,
+      headSha: evidence.headSha,
+      targetBranch: "main",
+      mergeMethod: "squash",
+      evidenceIds: [evidence.recordId],
+    };
+    yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+    VALUES (${p},'Fixture','/fixture','[]',${at},${at})`;
+    yield* repository.execute({
+      type: "project-work.task.create",
+      projectId: p,
+      taskId,
+      commandId: CommandId.make("observed-create"),
+      title: "Task",
+      createdAt: at,
+    });
+    yield* repository.execute({
+      type: "project-work.foundation.commit",
+      projectId: p,
+      commandId: CommandId.make("observed-foundation"),
+      expectedRevision: 1,
+      attribution: human,
+      committedAt: at,
+      records: [
+        evidence,
+        gate,
+        {
+          ...fields,
+          kind: "limits",
+          recordId: "observed-limits",
+          status: "configured",
+          environmentModelCalls: 1,
+          projectWritableWorkers: 1,
+          modelCalls: 1,
+          delegationDepth: 1,
+          repairAllowance: 1,
+          model: "fixture",
+          tokenLimit: 100,
+          durationLimitMs: 100,
+        },
+        {
+          ...fields,
+          kind: "task-membership",
+          recordId: "observed-member",
+          status: "active",
+          taskId,
+          executionKind: "managed",
+          deliverableKind: "code",
+        },
+      ],
+    });
+    const request: ProjectWorkPublicationRequest = {
+      version: 1,
+      kind: "create-pr",
+      operationId: "observed-publication",
+      marker: "opaque-marker-one",
+      repository: { host: "github.com", nodeId: "R_owner", nameWithOwner: "owner/repo" },
+      target: {
+        projectId: p,
+        taskId,
+        specRevision: 0,
+        planRevision: 0,
+        scopeHash: "scope",
+        baseSha: evidence.baseSha,
+        headSha: evidence.headSha,
+        baseRef: "main",
+        headRef: "feature",
+        headRepositoryNodeId: "R_owner",
+        headSelector: "feature",
+      },
+      expectedTaskRevision: 0,
+      authorizationRecordIds: [evidence.recordId],
+      title: "Task",
+      body: "Body",
+    };
+    const receipt: Extract<ProjectWorkPublicationOutcome, { kind: "confirmed" }> = {
+      version: 1,
+      operationId: request.operationId,
+      requestHash: publicationRequestHash(request),
+      claimGeneration: 1,
+      observedAt: at,
+      kind: "confirmed",
+      marker: request.marker,
+      repository: request.repository,
+      pullRequest: {
+        nodeId: "PR_1",
+        number: 1,
+        url: "https://github.com/owner/repo/pull/1",
+        state: "OPEN",
+        baseSha: evidence.baseSha,
+        headSha: evidence.headSha,
+        baseRef: "main",
+        headRef: "feature",
+        headRepositoryNodeId: "R_owner",
+      },
+    };
+    const publication = {
+      ...fields,
+      kind: "effect",
+      recordId: request.operationId,
+      effectId: request.operationId,
+      revision: 2,
+      status: "succeeded",
+      effectKind: "publication",
+      taskId,
+      targetId: "github.com/owner/repo",
+      claimGeneration: 1,
+      availableAt: at,
+      payload: {
+        recordIds: request.authorizationRecordIds,
+        expectedRevision: 0,
+        summary: canonicalProjectWorkPayload(request),
+      },
+      outcome: canonicalProjectWorkPayload(receipt),
+    };
+    yield* sql`INSERT INTO project_team_effect (record_id,project_id,status,revision,generation,updated_at,task_id,unique_key,payload_json)
+    VALUES (${request.operationId},${p},'succeeded',2,0,${at},${taskId},${request.operationId},${canonicalProjectWorkPayload(publication)})`;
+    const service = yield* makeService({
+      projects: [
+        project({ id: p, title: "Fixture", workspaceRoot: "/fixture", repository: "owner/repo" }),
+      ],
+      providers: [fakeProvider("github", { getChangeRequest: read })],
+      evidenceInvalidation: yield* EvidenceInvalidation.ProjectWorkEvidenceInvalidation,
+    });
+    return {
+      service,
+      repository,
+      sql,
+      p,
+      evidence,
+      gate,
+      human,
+      reference: { projectId: p, repository: "owner/repo", number: 1 },
+    };
+  });
+const observedResponse = {
+  ...hostedChangeRequest("Body"),
+  url: "https://github.com/owner/repo/pull/1",
+  baseRevision: "a".repeat(40),
+  headRevision: "b".repeat(40),
+};
+
+for (const stage of ["capture", "invalidate"] as const) {
+  it.effect(`observed PR ${stage} interruption propagates without continuing detail`, () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const blocked = yield* Deferred.make<never>();
+      let reads = 0;
+      const interrupted = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(blocked)),
+      );
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "p1",
+            title: "Fixture",
+            workspaceRoot: "/fixture",
+            repository: "owner/repo",
+          }),
+        ],
+        providers: [
+          fakeProvider("github", {
+            getChangeRequest: () =>
+              Effect.sync(() => {
+                reads++;
+                return observedResponse;
+              }),
+          }),
+        ],
+        evidenceInvalidation: {
+          capture: (input) => (stage === "capture" ? interrupted : Effect.succeed({ input })),
+          invalidate: () => interrupted,
+        },
+      });
+      const reading = yield* service
+        .detail({ projectId: ProjectId.make("p1"), repository: "owner/repo", number: 1 })
+        .pipe(Effect.forkChild());
+      yield* Deferred.await(entered);
+      yield* Deferred.interrupt(blocked);
+      const result = yield* Fiber.await(reading);
+      assert.isTrue(Exit.isFailure(result) && Cause.hasInterrupts(result.cause));
+      assert.strictEqual(reads, stage === "capture" ? 0 : 1);
+    }),
+  );
+
+  it.effect(`observed PR ordinary ${stage} failure still returns fresh detail`, () =>
+    Effect.gen(function* () {
+      const failed = Effect.fail(
+        new EvidenceInvalidation.EvidenceInvalidationError({ reason: "unavailable" }),
+      );
+      let reads = 0;
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "p1",
+            title: "Fixture",
+            workspaceRoot: "/fixture",
+            repository: "owner/repo",
+          }),
+        ],
+        providers: [
+          fakeProvider("github", {
+            getChangeRequest: () =>
+              Effect.sync(() => {
+                reads++;
+                return observedResponse;
+              }),
+          }),
+        ],
+        evidenceInvalidation: {
+          capture: (input) => (stage === "capture" ? failed : Effect.succeed({ input })),
+          invalidate: () => failed,
+        },
+      });
+      const detail = yield* service.detail({
+        projectId: ProjectId.make("p1"),
+        repository: "owner/repo",
+        number: 1,
+      });
+      assert.strictEqual(detail.headRevision, observedResponse.headRevision);
+      assert.strictEqual(reads, 1);
+    }),
+  );
+}
+
+it.effect("observed PR detail invalidates moved evidence only after an uncached host read", () =>
+  Effect.gen(function* () {
+    let response = observedResponse;
+    let reads = 0;
+    const fixture = yield* observedFixture(() =>
+      Effect.sync(() => {
+        reads++;
+        return response;
+      }),
+    );
+    const initial = yield* fixture.repository.replay(fixture.p);
+    yield* fixture.service.detail(fixture.reference);
+    assert.deepStrictEqual(yield* fixture.repository.replay(fixture.p), initial);
+    response = { ...observedResponse, headRevision: "c".repeat(40) };
+    yield* fixture.service.detail(fixture.reference);
+    assert.strictEqual(reads, 1);
+    assert.deepStrictEqual(yield* fixture.repository.replay(fixture.p), initial);
+    yield* fixture.service.invalidate({ reference: fixture.reference });
+    yield* fixture.service.detail(fixture.reference);
+    assert.strictEqual(reads, 2);
+    const state = yield* readCurrentState(fixture.sql, fixture.p);
+    assert.strictEqual(
+      state.foundationRecords?.find((r) => r.recordId === fixture.evidence.recordId)?.status,
+      "stale",
+    );
+    assert.strictEqual(
+      state.foundationRecords?.find((r) => r.recordId === fixture.gate.recordId)?.status,
+      "invalidated",
+    );
+    assert.strictEqual((yield* fixture.repository.replay(fixture.p)).length, initial.length + 2);
+  }).pipe(Effect.provide(observedRuntime)),
+);
+
+it.effect(
+  "observed PR response held behind a Deferred cannot invalidate a concurrent foundation update",
+  () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const response = yield* Deferred.make<ProviderChangeRequestDetail>();
+      const fixture = yield* observedFixture(() =>
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(response))),
+      );
+      const reading = yield* fixture.service.detail(fixture.reference).pipe(Effect.forkChild());
+      yield* Deferred.await(started);
+      const state = yield* readCurrentState(fixture.sql, fixture.p);
+      const updated = { ...fixture.evidence, revision: 1, updatedAt: "2026-10-06T01:00:00.000Z" };
+      yield* fixture.repository.execute({
+        type: "project-work.foundation.commit",
+        projectId: fixture.p,
+        commandId: CommandId.make("observed-concurrent"),
+        expectedRevision: state.revision,
+        attribution: fixture.human,
+        committedAt: updated.updatedAt,
+        records: [updated],
+      });
+      const before = yield* fixture.repository.replay(fixture.p);
+      yield* Deferred.succeed(response, { ...observedResponse, headRevision: "c".repeat(40) });
+      const detail = yield* Fiber.join(reading);
+      assert.strictEqual(detail.headRevision, "c".repeat(40));
+      assert.deepStrictEqual(yield* fixture.repository.replay(fixture.p), before);
+      assert.deepStrictEqual(
+        (yield* readCurrentState(fixture.sql, fixture.p)).foundationRecords?.find(
+          (r) => r.recordId === updated.recordId,
+        ),
+        updated,
+      );
+    }).pipe(Effect.provide(observedRuntime)),
+);
+
+for (const mismatch of ["number", "repository", "host", "missing-oids"] as const)
+  it.effect(`observed PR ${mismatch} response cannot change retained qualification`, () =>
+    Effect.gen(function* () {
+      const response =
+        mismatch === "number"
+          ? { ...observedResponse, number: 2 }
+          : mismatch === "repository"
+            ? { ...observedResponse, url: "https://github.com/other/repo/pull/1" }
+            : mismatch === "host"
+              ? { ...observedResponse, url: "https://other.example/owner/repo/pull/1" }
+              : { ...hostedChangeRequest("Body"), url: observedResponse.url };
+      const fixture = yield* observedFixture(() => Effect.succeed(response));
+      const before = yield* fixture.repository.replay(fixture.p);
+      yield* fixture.service.detail(fixture.reference);
+      assert.deepStrictEqual(yield* fixture.repository.replay(fixture.p), before);
+    }).pipe(Effect.provide(observedRuntime)),
+  );
 
 it.effect("keeps host-authoritative comparison object ids on the PR detail", () =>
   Effect.gen(function* () {
