@@ -154,6 +154,7 @@ import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.
 import * as ProjectWorkExport from "./projectWork/ProjectWorkExport.ts";
 import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
 import * as ProjectWorkPublicationGuard from "./projectWork/ProjectWorkPublicationGuard.ts";
+import * as ProjectWorkPullRequestActionGuard from "./projectWork/ProjectWorkPullRequestActionGuard.ts";
 import * as GitHubIssueClient from "./projectWork/github/GitHubIssueClient.ts";
 import * as IssueCredentialSnapshot from "./projectWork/ProjectIssueCredentialSnapshot.ts";
 import * as ProjectLifecycle from "./project/ProjectLifecycle.ts";
@@ -506,6 +507,9 @@ const RepositoryIdentityResolverLayerLive = Layer.effect(
 ).pipe(Layer.provide(SourceControlProviderRegistryLayerLive), Layer.provide(ProcessRunner.layer));
 
 const PullRequestServiceLive = PullRequestService.layer.pipe(
+  Layer.provide(
+    ProjectWorkPullRequestActionGuard.layer.pipe(Layer.provide(ProjectTeamAuthorizationLive)),
+  ),
   Layer.provide(PullRequestProviderRegistry.layer),
   Layer.provide(PullRequestReadCache.layer),
   Layer.provide(SourceControlProviderRegistryLayerLive),
