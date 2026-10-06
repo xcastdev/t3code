@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import {
   CommandId,
   canonicalProjectWorkPayload,
+  ProjectWorkEvidenceAddCommand,
   ProjectTeamGate,
   ProjectWorkFoundationCommitCommand,
 } from "@t3tools/contracts";
@@ -11,13 +12,22 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { scoped, at } from "./ProjectTeamAuthorization.testFixtures.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
-import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+  readCurrentState,
+} from "./ProjectWorkRepository.ts";
+import { ProjectWorkEventBus, ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
+import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import { makeProjectWorkVerificationGate } from "./ProjectWorkVerificationGate.ts";
 import { makeProjectWorkArtifacts } from "./ProjectWorkArtifacts.ts";
+import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
+import { prepareVerificationEvidence } from "./ProjectWorkVerificationEvidence.ts";
 import {
   makeProjectWorkVerificationExecutionJournal,
   ProjectWorkVerificationExecutionError,
@@ -29,6 +39,7 @@ import {
 
 const decodeGate = Schema.decodeUnknownSync(ProjectTeamGate);
 const decodeCommit = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand);
+const decodeEvidence = Schema.decodeUnknownEffect(ProjectWorkEvidenceAddCommand);
 const attribution = {
   actor: { kind: "human", id: "maintainer" },
   source: { kind: "web", id: "verification-control" },
@@ -368,6 +379,26 @@ const retainedResult = (
     };
   });
 
+const observedFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const bus = yield* ProjectWorkEventBus.pipe(Effect.provide(ProjectWorkEventBusLive));
+  let publications = 0;
+  const repository = yield* ProjectWorkRepository.pipe(
+    Effect.provide(Layer.fresh(ProjectWorkRepositoryLive)),
+    Effect.provideService(ProjectWorkEventBus, {
+      ...bus,
+      publish: (events) =>
+        Effect.sync(() => {
+          publications += events.length;
+        }),
+    }),
+  );
+  const journal = yield* makeProjectWorkVerificationExecutionJournal(f.options).pipe(
+    Effect.provideService(ProjectWorkRepository, repository),
+  );
+  return { ...f, journal, repository, publications: () => publications };
+});
+
 it.effect(
   "a drained result retains exact binary artifacts and immutable retries never replace its winner",
   () =>
@@ -379,12 +410,49 @@ it.effect(
         yield* process.claimActivation(f.intent.allocation);
         yield* process.beforeStart(f.owner);
         const { result, store } = yield* retainedResult(f, claim);
+        const before = yield* readCurrentState(f.sql, f.selection.projectId);
         expect(yield* f.journal.complete(claim, result)).toEqual(result);
+        const completed = yield* readCurrentState(f.sql, f.selection.projectId);
+        const evidence = completed.evidence.filter((e) => e.kind === "test");
+        expect(evidence).toHaveLength(1);
+        expect(evidence[0]).toMatchObject({
+          taskId: f.selection.taskId,
+          outputArtifactIds: [result.stdout.artifactId, result.stderr.artifactId],
+          scopeHash: projectTeamScopeHash(
+            before,
+            f.selection.taskId,
+            before.foundationRecords?.find((r) => r.kind === "plan-revision"),
+          ),
+        });
+        expect(
+          completed.foundationRecords?.filter((r) => r.kind === "evidence-applicability"),
+        ).toMatchObject([
+          {
+            evidenceId: evidence[0]!.evidenceId,
+            taskId: f.selection.taskId,
+            status: "current",
+            integration: false,
+            artifactId: result.stdout.artifactId,
+            testedCommit: f.prepared.manifest.target.testedCommit,
+            specRevision: f.prepared.manifest.specRevision,
+            planRevision: f.prepared.manifest.planRevision,
+            repository: "/workspace",
+            worktree: "/workspace-assigned",
+            testedTree: "d".repeat(40),
+            baseSha: "a".repeat(40),
+            headSha: "c".repeat(40),
+            command: '{"argv":["-n","test.sh"],"executable":"/bin/bash"}',
+            exitCode: 0,
+            environmentSummary: "controlled-linux clean readonly",
+          },
+        ]);
+        expect(completed.criteria).toEqual(before.criteria);
         expect(yield* f.journal.readResult(f.selection.jobId)).toEqual(result);
         expect((yield* store.readRetained(result.stdout.artifactId))?.bytes).toEqual(
           new Uint8Array([0, 255, 10]),
         );
         expect(yield* f.journal.complete(claim, result)).toEqual(result);
+        expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(completed);
         expect(
           (yield* f.journal.complete(claim, { ...result, outcome: "failed" }).pipe(Effect.result))
             ._tag,
@@ -585,18 +653,21 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
+        const f = yield* observedFixture;
         const claim = yield* claimed(f);
         const process = f.journal.persistence(claim);
         yield* process.claimActivation(f.intent.allocation);
         yield* process.beforeStart(f.owner);
         const { result, store } = yield* retainedResult(f, claim);
+        const before = yield* readCurrentState(f.sql, f.selection.projectId);
+        const publications = f.publications();
         yield* f.sql`PRAGMA foreign_keys=ON`;
         yield* f.sql`CREATE TABLE controlled_parent(id INTEGER PRIMARY KEY)`;
         yield* f.sql`CREATE TABLE controlled_child(parent_id INTEGER REFERENCES controlled_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER controlled_commit_failure AFTER UPDATE ON project_work_verification_execution WHEN NEW.phase='terminal' BEGIN INSERT INTO controlled_child(parent_id) VALUES(1); END`;
         const completed = yield* f.journal.complete(claim, result).pipe(Effect.exit);
         expect(completed._tag).toBe("Failure");
+        expect(f.publications()).toBe(publications);
         if (completed._tag === "Failure")
           expect(Cause.pretty(completed.cause)).toContain("FOREIGN KEY constraint failed");
         expect(yield* f.sql`SELECT phase FROM project_work_verification_execution`).toEqual([
@@ -604,18 +675,43 @@ it.effect(
         ]);
         const reading = yield* f.journal.readResult(f.selection.jobId).pipe(Effect.exit);
         const recovery = yield* f.journal.readRecoveryPage({ limit: 1 }).pipe(Effect.exit);
+        const query = yield* ProjectWorkQuery;
+        const snapshot = yield* query.snapshot(f.selection.projectId).pipe(Effect.exit);
+        const exported = yield* query
+          .exportSnapshot(f.selection.projectId, false, true)
+          .pipe(Effect.exit);
+        const evidencePage = yield* query
+          .withProjectRevision(
+            f.selection.projectId,
+            query.listEvidence({
+              projectId: f.selection.projectId,
+              taskId: f.selection.taskId,
+              limit: 50,
+            }),
+          )
+          .pipe(Effect.exit);
         // Test-only cleanup of this disposable connection's failed physical transaction.
         yield* f.sql`ROLLBACK`;
-        for (const read of [reading, recovery]) {
-          expect(read._tag).toBe("Failure");
-          if (read._tag === "Failure")
-            expect(Cause.pretty(read.cause)).toContain(
-              "cannot start a transaction within a transaction",
-            );
-        }
+        const errors = [
+          ...[reading, recovery].map((read) =>
+            read._tag === "Failure"
+              ? Cause.pretty(read.cause)
+              : "Unexpected successful journal read",
+          ),
+          ...[snapshot, exported, evidencePage].map((read) =>
+            read._tag === "Failure"
+              ? Cause.pretty(read.cause)
+              : "Unexpected successful public read",
+          ),
+        ];
+        for (const error of errors)
+          expect(error).toContain("cannot start a transaction within a transaction");
         expect(yield* f.journal.readResult(f.selection.jobId)).toBeUndefined();
+        expect((yield* query.snapshot(f.selection.projectId)).evidence).toEqual(before.evidence);
+        expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(before);
         yield* f.sql`DROP TRIGGER controlled_commit_failure`;
         expect(yield* f.journal.complete(claim, result)).toEqual(result);
+        expect(f.publications()).toBe(publications + 2);
         expect((yield* store.readRetained(result.stdout.artifactId))?.bytes).toEqual(
           new Uint8Array([0, 255, 10]),
         );
@@ -680,6 +776,7 @@ it.effect("retained artifacts alone cannot bypass the host's actual result obser
         "Failure",
       );
       expect(yield* journal.readResult(f.selection.jobId)).toBeUndefined();
+      expect((yield* readCurrentState(f.sql, f.selection.projectId)).evidence).toEqual([]);
       expect((yield* journal.readRecoveryPage({ limit: 1 })).items[0]?.phase).toBe(
         "owner-captured",
       );
@@ -688,3 +785,180 @@ it.effect("retained artifacts alone cannot bypass the host's actual result obser
     }),
   ),
 );
+
+for (const outcome of [
+  "failed",
+  "timed-out",
+  "overflow",
+  "canceled",
+  "revoked",
+  "abandoned",
+] as const)
+  it.effect(`${outcome} completion retains history without current test evidence`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claim = yield* claimed(f);
+        yield* f.journal.persistence(claim).claimActivation(f.intent.allocation);
+        yield* f.journal.persistence(claim).beforeStart(f.owner);
+        const { result } = yield* retainedResult(f, claim, outcome);
+        const before = yield* readCurrentState(f.sql, f.selection.projectId);
+        yield* f.journal.complete(claim, result);
+        expect(yield* f.journal.readResult(f.selection.jobId)).toEqual(result);
+        expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(before);
+      }),
+    ),
+  );
+
+it.effect("historical terminal success cannot backfill evidence after restart or retry", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const claim = yield* claimed(f);
+      yield* f.journal.persistence(claim).claimActivation(f.intent.allocation);
+      yield* f.journal.persistence(claim).beforeStart(f.owner);
+      const { result } = yield* retainedResult(f, claim);
+      const before = yield* readCurrentState(f.sql, f.selection.projectId);
+      // Restore the older terminal-only format in a disposable migrated database.
+      yield* f.sql`UPDATE project_work_verification_execution SET phase='terminal', result_json=${canonicalProjectWorkPayload(result)}, result_hash=${verificationExecutionHash(result)}, revision=revision+1`;
+      const restarted = yield* makeProjectWorkVerificationExecutionJournal(f.options);
+      expect(yield* restarted.readResult(f.selection.jobId)).toEqual(result);
+      expect(yield* restarted.claim(f.intent)).toEqual({ _tag: "Retained", result });
+      expect(yield* f.journal.complete(claim, result)).toEqual(result);
+      expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(before);
+    }),
+  ),
+);
+
+it.effect("terminal success retries cannot restore evidence that was subsequently made stale", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* observedFixture;
+      const claim = yield* claimed(f);
+      yield* f.journal.persistence(claim).claimActivation(f.intent.allocation);
+      yield* f.journal.persistence(claim).beforeStart(f.owner);
+      const { result } = yield* retainedResult(f, claim);
+      yield* f.journal.complete(claim, result);
+      const state = yield* readCurrentState(f.sql, f.selection.projectId);
+      const record = state.foundationRecords?.find((r) => r.kind === "evidence-applicability");
+      if (record?.kind !== "evidence-applicability") return yield* Effect.die("Missing evidence");
+      yield* f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId: state.projectId,
+          commandId: "stale-verification-evidence",
+          expectedRevision: state.revision,
+          attribution,
+          committedAt: at,
+          records: [{ ...record, status: "stale", revision: record.revision + 1 }],
+        }),
+      );
+      const stale = yield* readCurrentState(f.sql, f.selection.projectId);
+      const publications = f.publications();
+      expect(yield* f.journal.complete(claim, result)).toEqual(result);
+      const restarted = yield* makeProjectWorkVerificationExecutionJournal(f.options);
+      expect(yield* restarted.readResult(f.selection.jobId)).toEqual(result);
+      expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(stale);
+      expect(f.publications()).toBe(publications);
+    }),
+  ),
+);
+
+for (const failure of ["projection", "final-host", "final-grant", "artifact-corruption"] as const)
+  it.effect(`${failure} failure cannot escape a terminal result, evidence, or publication`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* observedFixture;
+        let observations = 0;
+        const journal = yield* makeProjectWorkVerificationExecutionJournal({
+          ...f.options,
+          verifyResult: () =>
+            Effect.gen(function* () {
+              observations++;
+              if (failure === "final-host" && observations === 2)
+                return yield* new ProjectWorkVerificationExecutionError({
+                  reason: "Host target changed",
+                });
+              if (failure === "final-grant" && observations === 2) f.revoke();
+            }),
+        }).pipe(Effect.provideService(ProjectWorkRepository, f.repository));
+        const claimedResult = yield* journal.claim(f.intent);
+        if (claimedResult._tag !== "Claimed") return yield* Effect.die("Missing claim");
+        const claim = claimedResult.claim;
+        yield* journal.persistence(claim).claimActivation(f.intent.allocation);
+        yield* journal.persistence(claim).beforeStart(f.owner);
+        const { result } = yield* retainedResult(f, claim);
+        const before = yield* readCurrentState(f.sql, f.selection.projectId);
+        const publications = f.publications();
+        if (failure === "projection")
+          yield* f.sql`CREATE TRIGGER reject_verification_evidence BEFORE INSERT ON project_work_evidence WHEN NEW.kind='test' BEGIN SELECT RAISE(ABORT,'controlled evidence failure'); END`;
+        if (failure === "artifact-corruption") {
+          yield* f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+          yield* f.sql`UPDATE project_work_artifacts SET raw_bytes=X'000000' WHERE artifact_id=${result.stdout.artifactId}`;
+        }
+        expect((yield* journal.complete(claim, result).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(f.publications()).toBe(publications);
+        expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(before);
+        expect((yield* journal.readRecoveryPage({ limit: 1 })).items[0]?.phase).toBe(
+          "owner-captured",
+        );
+        if (failure !== "artifact-corruption")
+          expect(yield* journal.readResult(f.selection.jobId)).toBeUndefined();
+        if (failure === "projection") {
+          yield* f.sql`DROP TRIGGER reject_verification_evidence`;
+          expect(yield* journal.complete(claim, result)).toEqual(result);
+          expect(f.publications()).toBe(publications + 2);
+        }
+      }),
+    ),
+  );
+
+for (const collision of ["evidence", "applicability", "command"] as const)
+  it.effect(
+    `${collision} identity conflicts deny completion without replacing existing records`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* observedFixture;
+          const claim = yield* claimed(f);
+          yield* f.journal.persistence(claim).claimActivation(f.intent.allocation);
+          yield* f.journal.persistence(claim).beforeStart(f.owner);
+          const { result } = yield* retainedResult(f, claim);
+          const prepared = prepareVerificationEvidence(
+            yield* readCurrentState(f.sql, f.selection.projectId),
+            f.intent,
+            result,
+          );
+          if (collision === "applicability") {
+            const record = prepared.applicability.records[0];
+            yield* f.repository.execute(
+              decodeCommit({
+                ...prepared.applicability,
+                commandId: "seed-applicability-collision",
+                expectedRevision: prepared.evidence.expectedRevision,
+                records: [{ ...record, environmentSummary: "different recorded environment" }],
+              }),
+            );
+          } else {
+            yield* f.repository.execute(
+              yield* decodeEvidence({
+                ...prepared.evidence,
+                commandId:
+                  collision === "command" ? prepared.evidence.commandId : "seed-evidence-collision",
+                evidence: {
+                  ...prepared.evidence.evidence,
+                  summary: "Different original evidence",
+                  ...(collision === "command" ? { evidenceId: "different-evidence" } : {}),
+                },
+              }),
+            );
+          }
+          const before = yield* readCurrentState(f.sql, f.selection.projectId);
+          const publications = f.publications();
+          expect((yield* f.journal.complete(claim, result).pipe(Effect.exit))._tag).toBe("Failure");
+          expect(yield* f.journal.readResult(f.selection.jobId)).toBeUndefined();
+          expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(before);
+          expect(f.publications()).toBe(publications);
+        }),
+      ),
+  );

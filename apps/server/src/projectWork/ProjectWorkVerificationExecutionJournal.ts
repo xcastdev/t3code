@@ -18,6 +18,10 @@ import {
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { ProjectWorkArtifactApplicability } from "./ProjectWorkArtifacts.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
+import {
+  assertVerificationEvidence,
+  prepareVerificationEvidence,
+} from "./ProjectWorkVerificationEvidence.ts";
 
 const strict = { onExcessProperty: "error" as const };
 const Id = Schema.String.check(
@@ -312,6 +316,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
       yield* prepared(intent);
       const state = yield* readCurrentState(sql, intent.receipt.manifest.projectId);
       yield* options.assertCurrent(intent, state, phase, attemptId);
+      return state;
     });
     const bind = (attemptId: string, intent: VerificationExecutionIntent) => {
       const claim = freeze({ attemptId, intent });
@@ -784,6 +789,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
       return Effect.gen(function* () {
         yield* own;
         yield* affinity(claim);
+        let evidence: ReturnType<typeof prepareVerificationEvidence> | undefined;
         yield* repository.executeAtomic(
           Effect.gen(function* () {
             const retained = yield* get(claim);
@@ -798,19 +804,31 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
               return [];
             }
             yield* options.verifyResult(claim.intent, result);
-            if (result.outcome === "success")
-              yield* current(claim.intent, claim.attemptId, "consumed");
+            if (result.outcome === "success") {
+              const state = yield* current(claim.intent, claim.attemptId, "consumed");
+              evidence = yield* Effect.try({
+                try: () => prepareVerificationEvidence(state, claim.intent, result),
+                catch: () => deny("Verification evidence cannot qualify this result"),
+              });
+            }
             const changed =
               yield* sql`UPDATE project_work_verification_execution SET phase='terminal',result_json=${canonicalProjectWorkPayload(result)},result_hash=${verificationExecutionHash(result)},revision=revision+1 WHERE environment_id=${options.environmentId} AND job_id=${result.jobId} AND attempt_id=${claim.attemptId} AND phase=${retained.row.phase} AND revision=${retained.row.revision} RETURNING job_id`;
             if (changed.length !== 1)
               return yield* deny("Verification result owner was superseded");
-            return [];
+            return evidence ? [evidence.evidence, evidence.applicability] : [];
           }),
           Effect.gen(function* () {
             yield* verifyArtifacts(claim.intent, result);
             if (result.outcome === "success") {
               yield* options.verifyResult(claim.intent, result);
-              yield* current(claim.intent, claim.attemptId, "consumed");
+              const state = yield* current(claim.intent, claim.attemptId, "consumed");
+              if (evidence) {
+                const prepared = evidence;
+                yield* Effect.try({
+                  try: () => assertVerificationEvidence(state, prepared, claim.intent, result),
+                  catch: () => deny("Verification evidence did not persist exactly"),
+                });
+              }
             }
             const retained = yield* get(claim);
             if (!same(retained.snapshot.result, result))
