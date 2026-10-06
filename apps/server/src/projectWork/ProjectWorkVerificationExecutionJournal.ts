@@ -217,6 +217,296 @@ const decodeStoredOwner = Schema.decodeUnknownSync(
   strict,
 );
 
+const applicability = (intent: VerificationExecutionIntent, result: RetainedVerificationResult) => {
+  const job = intent.receipt.manifest;
+  return {
+    projectId: job.projectId,
+    taskId: job.taskId,
+    specRevision: job.specRevision,
+    planRevision: job.planRevision,
+    repository: job.target.repository,
+    worktree: job.target.worktree,
+    testedTree: job.target.testedTree,
+    testedCommit: job.target.testedCommit,
+    baseSha: job.target.baseSha,
+    headSha: job.target.headSha,
+    command: canonicalProjectWorkPayload({
+      executable: job.command.executable,
+      argv: job.command.argv,
+    }),
+    exitCode: result.exitCode ?? -1,
+    environmentSummary: result.environmentSummary,
+    integration: false,
+  };
+};
+const validateResult = (
+  value: VerificationExecutionSnapshot,
+  result: RetainedVerificationResult,
+) => {
+  const intent = value.intent;
+  const allocation = intent.allocation;
+  const drain = result.drain;
+  if (
+    result.jobId !== intent.receipt.manifest.jobId ||
+    result.attemptId !== value.attemptId ||
+    result.manifestHash !== intent.receipt.sha256 ||
+    result.allocationHash !== verificationExecutionHash(allocation) ||
+    result.drainHash !== verificationExecutionHash(drain)
+  )
+    throw deny("Verification result identity changed");
+  if (drain === null) {
+    if (
+      result.outcome === "success" ||
+      result.exitCode !== null ||
+      !result.reconciliation ||
+      result.reconciliation.unit !== allocation.unit ||
+      result.reconciliation.nonce !== allocation.nonce ||
+      (result.reconciliation.kernel !== "not-created" &&
+        result.reconciliation.kernel !== "removed" &&
+        !result.reconciliation.kernel.split("\n").includes("populated 0"))
+    )
+      throw deny("Verification recovery cannot infer success or an exit");
+  } else {
+    if (
+      result.reconciliation !== undefined ||
+      drain.unit !== allocation.unit ||
+      drain.memoryBytes !== allocation.policy.memoryBytes ||
+      drain.swapBytes !== 0 ||
+      drain.oomGroup !== 1 ||
+      drain.childExitCode !== result.exitCode ||
+      (drain.kernel !== "removed" && !drain.kernel.split("\n").includes("populated 0"))
+    )
+      throw deny("Verification drain identity changed");
+    if (
+      value.owner &&
+      (drain.invocation !== value.owner.invocation ||
+        drain.cgroup !== value.owner.cgroup ||
+        drain.ownerPid !== value.owner.pid)
+    )
+      throw deny("Verification drain does not match its captured owner");
+  }
+  if (
+    result.outcome === "success" &&
+    ((value.phase !== "owner-captured" && value.phase !== "terminal") ||
+      !value.owner ||
+      !drain ||
+      drain.ownerPid === null ||
+      drain.childPid === null ||
+      !result.outputComplete ||
+      result.exitCode !== 0 ||
+      result.finishedAtMs >= intent.deadlineAtMs)
+  )
+    throw deny("Verification success requires an owned exact completed drain");
+};
+const makeVerificationExecutionStorage = (sql: SqlClient.SqlClient, environmentId: string) => {
+  const read = Effect.fn("VerificationExecutionJournal.read")(function* (jobId: string) {
+    const rows =
+      yield* sql`SELECT CAST(rowid AS TEXT) AS row_id,environment_id,job_id,project_id,task_id,attempt_id,manifest_hash,gate_id,gate_revision,
+      CASE WHEN length(CAST(intent_json AS BLOB))<=262144 THEN intent_json END AS intent_json,intent_hash,allocation_hash,deadline_at_ms,phase,revision,
+      CASE WHEN length(CAST(owner_json AS BLOB))<=16384 THEN owner_json END AS owner_json,
+      CASE WHEN length(CAST(result_json AS BLOB))<=65536 THEN result_json END AS result_json,result_hash,reason
+      FROM project_work_verification_execution WHERE environment_id=${environmentId} AND job_id=${jobId} LIMIT 2`;
+    const decoded = yield* decodeRows(rows).pipe(
+      Effect.mapError(() => deny("Corrupt verification execution row")),
+    );
+    const row = decoded[0];
+    if (!row) return undefined;
+    return yield* Effect.try({
+      try: () => {
+        const intent = freeze(decodeStoredIntent(row.intent_json));
+        const result =
+          row.result_json === null ? null : freeze(decodeStoredResult(row.result_json));
+        const owner = row.owner_json === null ? null : freeze(decodeStoredOwner(row.owner_json));
+        if (
+          row.environment_id !== environmentId ||
+          row.job_id !== jobId ||
+          intent.receipt.manifest.environmentId !== environmentId ||
+          intent.receipt.manifest.jobId !== jobId ||
+          intent.receipt.manifest.projectId !== row.project_id ||
+          intent.receipt.manifest.taskId !== row.task_id ||
+          intent.receipt.sha256 !== row.manifest_hash ||
+          verificationExecutionHash(intent.receipt.manifest) !== row.manifest_hash ||
+          intent.gate.recordId !== row.gate_id ||
+          intent.gate.revision !== row.gate_revision ||
+          intent.deadlineAtMs !== row.deadline_at_ms ||
+          canonicalProjectWorkPayload(intent) !== row.intent_json ||
+          verificationExecutionHash(intent) !== row.intent_hash ||
+          verificationExecutionHash(intent.allocation) !== row.allocation_hash ||
+          (result !== null &&
+            (canonicalProjectWorkPayload(result) !== row.result_json ||
+              verificationExecutionHash(result) !== row.result_hash ||
+              result.attemptId !== row.attempt_id ||
+              result.jobId !== jobId ||
+              result.manifestHash !== row.manifest_hash ||
+              result.allocationHash !== row.allocation_hash)) ||
+          (result === null && row.result_hash !== null) ||
+          (row.phase === "terminal" && result === null) ||
+          (row.phase !== "terminal" && result !== null) ||
+          (row.phase === "owner-captured" && owner === null) ||
+          (owner !== null &&
+            (owner.unit !== intent.allocation.unit || owner.nonce !== intent.allocation.nonce))
+        )
+          throw deny("Verification execution identity changed");
+        const snapshot = freeze({
+          rowId: row.row_id,
+          attemptId: row.attempt_id,
+          intent,
+          phase: row.phase,
+          owner,
+          result,
+          reason: row.reason,
+        });
+        if (result !== null) validateResult(snapshot, result);
+        return { row, snapshot };
+      },
+      catch: () => deny("Corrupt verification execution identity"),
+    });
+  });
+  const verifyArtifacts = Effect.fn("VerificationExecutionJournal.verifyArtifacts")(function* (
+    intent: VerificationExecutionIntent,
+    result: RetainedVerificationResult,
+  ) {
+    const expected = applicability(intent, result);
+    if (
+      result.stdout.byteCount + result.stderr.byteCount >
+      intent.receipt.manifest.command.limits.maxOutputBytes
+    )
+      return yield* deny("Verification output exceeds its approved bound");
+    for (const [channel, receipt] of [
+      ["stdout", result.stdout],
+      ["stderr", result.stderr],
+    ] as const) {
+      if (
+        receipt.artifactId !== result.attemptId + ":" + channel ||
+        receipt.sourceId !== result.attemptId ||
+        !same(receipt.applicability, expected)
+      )
+        return yield* deny("Verification artifact applicability changed");
+      const rows =
+        yield* sql`SELECT environment_id,artifact_id,project_id,task_id,source_id,sha256,byte_count,length(raw_bytes) AS actual_byte_count,typeof(raw_bytes) AS blob_type,
+        CASE WHEN length(CAST(manifest_json AS BLOB))<=65536 THEN manifest_json END AS manifest_json,
+        CASE WHEN length(raw_bytes)<=${intent.receipt.manifest.command.limits.maxOutputBytes} THEN raw_bytes END AS raw_bytes
+        FROM project_work_artifacts WHERE environment_id=${environmentId} AND artifact_id=${receipt.artifactId} LIMIT 2`;
+      const decoded = yield* Schema.decodeUnknownEffect(
+        Schema.Array(
+          Schema.Struct({
+            environment_id: Id,
+            artifact_id: Id,
+            project_id: Id,
+            task_id: Id,
+            source_id: Id,
+            sha256: Digest,
+            byte_count: Safe,
+            actual_byte_count: Safe,
+            blob_type: Schema.Literal("blob"),
+            manifest_json: Schema.String,
+            raw_bytes: Schema.Uint8Array,
+          }),
+        ).check(Schema.isMaxLength(1)),
+        strict,
+      )(rows).pipe(Effect.mapError(() => deny("Invalid retained verification artifact")));
+      const row = decoded[0];
+      if (
+        !row ||
+        row.environment_id !== environmentId ||
+        row.artifact_id !== receipt.artifactId ||
+        row.project_id !== expected.projectId ||
+        row.task_id !== expected.taskId ||
+        row.source_id !== receipt.sourceId ||
+        row.sha256 !== receipt.sha256 ||
+        row.byte_count !== receipt.byteCount ||
+        row.actual_byte_count !== receipt.byteCount ||
+        row.raw_bytes.byteLength !== receipt.byteCount ||
+        bytesHash(row.raw_bytes) !== receipt.sha256 ||
+        row.manifest_json !==
+          canonicalProjectWorkPayload({
+            artifactId: receipt.artifactId,
+            sourceId: receipt.sourceId,
+            applicability: expected,
+          })
+      )
+        return yield* deny("Retained verification bytes or manifest changed");
+    }
+  });
+  const readVerified = Effect.fn("VerificationExecutionStorage.readVerified")(function* (
+    jobId: string,
+  ) {
+    const retained = yield* read(jobId);
+    if (!retained) return freeze({ _tag: "Missing" as const });
+    const { snapshot, row } = retained;
+    if (!snapshot.result) return freeze({ _tag: "Pending" as const, snapshot });
+    yield* verifyArtifacts(snapshot.intent, snapshot.result);
+    return freeze({
+      _tag: "Terminal" as const,
+      snapshot,
+      result: snapshot.result,
+      metadata: {
+        intentHash: row.intent_hash,
+        manifestHash: row.manifest_hash,
+        allocationHash: row.allocation_hash,
+        resultHash: verificationExecutionHash(snapshot.result),
+        revision: row.revision,
+      },
+    });
+  });
+  return { read, verifyArtifacts, readVerified };
+};
+const ResultReaderOptions = Schema.Struct({ environmentId: Id });
+const ResultReaderInput = Schema.Struct({ jobId: Id, expectedManifestHash: Digest });
+const decodeResultReaderOptions = Schema.decodeUnknownSync(ResultReaderOptions, strict);
+const decodeResultReaderInput = Schema.decodeUnknownSync(ResultReaderInput, strict);
+
+/** Historical storage validation inside the caller's transaction grants no execution permission. */
+export const makeProjectWorkVerificationResultReader = (input: typeof ResultReaderOptions.Type) => {
+  let options: typeof ResultReaderOptions.Type;
+  try {
+    options = capture(decodeResultReaderOptions, input);
+  } catch {
+    return Effect.fail(deny("Invalid verification result reader options"));
+  }
+  return Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const repository = yield* ProjectWorkRepository;
+    const storage = makeVerificationExecutionStorage(sql, options.environmentId);
+    const caller = Effect.gen(function* () {
+      const client = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(client) ||
+        client.value !== sql ||
+        Option.isNone(suppliedRepository) ||
+        suppliedRepository.value !== repository ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny(
+          "Verification result reader requires its original SQL, repository and caller transaction",
+        );
+    });
+    const readInside = Effect.fn("VerificationResultReader.readInside")(function* (
+      selected: typeof ResultReaderInput.Type,
+    ) {
+      const result = yield* storage.readVerified(selected.jobId);
+      if (
+        result._tag !== "Missing" &&
+        result.snapshot.intent.receipt.sha256 !== selected.expectedManifestHash
+      )
+        return yield* deny("Verification result manifest does not match expected target");
+      return result;
+    });
+    return {
+      readInTransaction(input: typeof ResultReaderInput.Type) {
+        let selected: typeof ResultReaderInput.Type;
+        try {
+          selected = capture(decodeResultReaderInput, input);
+        } catch {
+          return Effect.fail(deny("Invalid retained verification result request"));
+        }
+        return Effect.andThen(caller, readInside(selected));
+      },
+    };
+  });
+};
+
 /** Private exact-job storage; journal-affine claims confer no evidence qualification. */
 export function makeProjectWorkVerificationExecutionJournal(input: Options) {
   const options = { ...input, environmentId: decodeId(input.environmentId) };
@@ -225,75 +515,16 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
     const repository = yield* ProjectWorkRepository;
     const claims = new WeakMap<VerificationClaim, VerificationExecutionIntent>();
     const recovery = new WeakSet<VerificationExecutionSnapshot>();
+    const { read, verifyArtifacts, readVerified } = makeVerificationExecutionStorage(
+      sql,
+      options.environmentId,
+    );
     const own = Effect.gen(function* () {
       const client = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(client) && client.value !== sql)
         return yield* deny("Verification SQL client changed");
       if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
         return yield* deny("Verification execution must own its SQL transaction");
-    });
-    const read = Effect.fn("VerificationExecutionJournal.read")(function* (jobId: string) {
-      const rows =
-        yield* sql`SELECT CAST(rowid AS TEXT) AS row_id,environment_id,job_id,project_id,task_id,attempt_id,manifest_hash,gate_id,gate_revision,
-        CASE WHEN length(CAST(intent_json AS BLOB))<=262144 THEN intent_json END AS intent_json,intent_hash,allocation_hash,deadline_at_ms,phase,revision,
-        CASE WHEN length(CAST(owner_json AS BLOB))<=16384 THEN owner_json END AS owner_json,
-        CASE WHEN length(CAST(result_json AS BLOB))<=65536 THEN result_json END AS result_json,result_hash,reason
-        FROM project_work_verification_execution WHERE environment_id=${options.environmentId} AND job_id=${jobId} LIMIT 2`;
-      const decoded = yield* decodeRows(rows).pipe(
-        Effect.mapError(() => deny("Corrupt verification execution row")),
-      );
-      const row = decoded[0];
-      if (!row) return undefined;
-      return yield* Effect.try({
-        try: () => {
-          const intent = freeze(decodeStoredIntent(row.intent_json));
-          const result =
-            row.result_json === null ? null : freeze(decodeStoredResult(row.result_json));
-          const owner = row.owner_json === null ? null : freeze(decodeStoredOwner(row.owner_json));
-          if (
-            row.environment_id !== options.environmentId ||
-            row.job_id !== jobId ||
-            intent.receipt.manifest.environmentId !== options.environmentId ||
-            intent.receipt.manifest.jobId !== jobId ||
-            intent.receipt.manifest.projectId !== row.project_id ||
-            intent.receipt.manifest.taskId !== row.task_id ||
-            intent.receipt.sha256 !== row.manifest_hash ||
-            verificationExecutionHash(intent.receipt.manifest) !== row.manifest_hash ||
-            intent.gate.recordId !== row.gate_id ||
-            intent.gate.revision !== row.gate_revision ||
-            intent.deadlineAtMs !== row.deadline_at_ms ||
-            canonicalProjectWorkPayload(intent) !== row.intent_json ||
-            verificationExecutionHash(intent) !== row.intent_hash ||
-            verificationExecutionHash(intent.allocation) !== row.allocation_hash ||
-            (result !== null &&
-              (canonicalProjectWorkPayload(result) !== row.result_json ||
-                verificationExecutionHash(result) !== row.result_hash ||
-                result.attemptId !== row.attempt_id ||
-                result.jobId !== jobId ||
-                result.manifestHash !== row.manifest_hash ||
-                result.allocationHash !== row.allocation_hash)) ||
-            (result === null && row.result_hash !== null) ||
-            (row.phase === "terminal" && result === null) ||
-            (row.phase !== "terminal" && result !== null) ||
-            (row.phase === "owner-captured" && owner === null) ||
-            (owner !== null &&
-              (owner.unit !== intent.allocation.unit || owner.nonce !== intent.allocation.nonce))
-          )
-            throw deny("Verification execution identity changed");
-          const snapshot = freeze({
-            rowId: row.row_id,
-            attemptId: row.attempt_id,
-            intent,
-            phase: row.phase,
-            owner,
-            result,
-            reason: row.reason,
-          });
-          if (result !== null) validateResult(snapshot, result);
-          return { row, snapshot };
-        },
-        catch: () => deny("Corrupt verification execution identity"),
-      });
     });
     const prepared = Effect.fn("VerificationExecutionJournal.prepared")(function* (
       intent: VerificationExecutionIntent,
@@ -575,14 +806,8 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
       return Effect.andThen(
         own,
         sql.withTransaction(
-          read(jobId).pipe(
-            Effect.flatMap((value) =>
-              value?.snapshot.result
-                ? verifyArtifacts(value.snapshot.intent, value.snapshot.result).pipe(
-                    Effect.as(value.snapshot.result),
-                  )
-                : Effect.succeed(undefined),
-            ),
+          readVerified(jobId).pipe(
+            Effect.map((value) => (value._tag === "Terminal" ? value.result : undefined)),
           ),
         ),
       );
@@ -628,156 +853,6 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
           }),
         ),
       );
-    };
-    const applicability = (
-      intent: VerificationExecutionIntent,
-      result: RetainedVerificationResult,
-    ) => {
-      const job = intent.receipt.manifest;
-      return {
-        projectId: job.projectId,
-        taskId: job.taskId,
-        specRevision: job.specRevision,
-        planRevision: job.planRevision,
-        repository: job.target.repository,
-        worktree: job.target.worktree,
-        testedTree: job.target.testedTree,
-        testedCommit: job.target.testedCommit,
-        baseSha: job.target.baseSha,
-        headSha: job.target.headSha,
-        command: canonicalProjectWorkPayload({
-          executable: job.command.executable,
-          argv: job.command.argv,
-        }),
-        exitCode: result.exitCode ?? -1,
-        environmentSummary: result.environmentSummary,
-        integration: false,
-      };
-    };
-    const verifyArtifacts = Effect.fn("VerificationExecutionJournal.verifyArtifacts")(function* (
-      intent: VerificationExecutionIntent,
-      result: RetainedVerificationResult,
-    ) {
-      const expected = applicability(intent, result);
-      if (
-        result.stdout.byteCount + result.stderr.byteCount >
-        intent.receipt.manifest.command.limits.maxOutputBytes
-      )
-        return yield* deny("Verification output exceeds its approved bound");
-      for (const [channel, receipt] of [
-        ["stdout", result.stdout],
-        ["stderr", result.stderr],
-      ] as const) {
-        if (
-          receipt.artifactId !== result.attemptId + ":" + channel ||
-          receipt.sourceId !== result.attemptId ||
-          !same(receipt.applicability, expected)
-        )
-          return yield* deny("Verification artifact applicability changed");
-        const rows =
-          yield* sql`SELECT environment_id,artifact_id,project_id,task_id,source_id,sha256,byte_count,length(raw_bytes) AS actual_byte_count,typeof(raw_bytes) AS blob_type,
-          CASE WHEN length(CAST(manifest_json AS BLOB))<=65536 THEN manifest_json END AS manifest_json,
-          CASE WHEN length(raw_bytes)<=${intent.receipt.manifest.command.limits.maxOutputBytes} THEN raw_bytes END AS raw_bytes
-          FROM project_work_artifacts WHERE environment_id=${options.environmentId} AND artifact_id=${receipt.artifactId} LIMIT 2`;
-        const decoded = yield* Schema.decodeUnknownEffect(
-          Schema.Array(
-            Schema.Struct({
-              environment_id: Id,
-              artifact_id: Id,
-              project_id: Id,
-              task_id: Id,
-              source_id: Id,
-              sha256: Digest,
-              byte_count: Safe,
-              actual_byte_count: Safe,
-              blob_type: Schema.Literal("blob"),
-              manifest_json: Schema.String,
-              raw_bytes: Schema.Uint8Array,
-            }),
-          ).check(Schema.isMaxLength(1)),
-          strict,
-        )(rows).pipe(Effect.mapError(() => deny("Invalid retained verification artifact")));
-        const row = decoded[0];
-        if (
-          !row ||
-          row.environment_id !== options.environmentId ||
-          row.artifact_id !== receipt.artifactId ||
-          row.project_id !== expected.projectId ||
-          row.task_id !== expected.taskId ||
-          row.source_id !== receipt.sourceId ||
-          row.sha256 !== receipt.sha256 ||
-          row.byte_count !== receipt.byteCount ||
-          row.actual_byte_count !== receipt.byteCount ||
-          row.raw_bytes.byteLength !== receipt.byteCount ||
-          bytesHash(row.raw_bytes) !== receipt.sha256 ||
-          row.manifest_json !==
-            canonicalProjectWorkPayload({
-              artifactId: receipt.artifactId,
-              sourceId: receipt.sourceId,
-              applicability: expected,
-            })
-        )
-          return yield* deny("Retained verification bytes or manifest changed");
-      }
-    });
-    const validateResult = (
-      value: VerificationExecutionSnapshot,
-      result: RetainedVerificationResult,
-    ) => {
-      const intent = value.intent;
-      const allocation = intent.allocation;
-      const drain = result.drain;
-      if (
-        result.jobId !== intent.receipt.manifest.jobId ||
-        result.attemptId !== value.attemptId ||
-        result.manifestHash !== intent.receipt.sha256 ||
-        result.allocationHash !== verificationExecutionHash(allocation) ||
-        result.drainHash !== verificationExecutionHash(drain)
-      )
-        throw deny("Verification result identity changed");
-      if (drain === null) {
-        if (
-          result.outcome === "success" ||
-          result.exitCode !== null ||
-          !result.reconciliation ||
-          result.reconciliation.unit !== allocation.unit ||
-          result.reconciliation.nonce !== allocation.nonce ||
-          (result.reconciliation.kernel !== "not-created" &&
-            result.reconciliation.kernel !== "removed" &&
-            !result.reconciliation.kernel.split("\n").includes("populated 0"))
-        )
-          throw deny("Verification recovery cannot infer success or an exit");
-      } else {
-        if (
-          result.reconciliation !== undefined ||
-          drain.unit !== allocation.unit ||
-          drain.memoryBytes !== allocation.policy.memoryBytes ||
-          drain.swapBytes !== 0 ||
-          drain.oomGroup !== 1 ||
-          drain.childExitCode !== result.exitCode ||
-          (drain.kernel !== "removed" && !drain.kernel.split("\n").includes("populated 0"))
-        )
-          throw deny("Verification drain identity changed");
-        if (
-          value.owner &&
-          (drain.invocation !== value.owner.invocation ||
-            drain.cgroup !== value.owner.cgroup ||
-            drain.ownerPid !== value.owner.pid)
-        )
-          throw deny("Verification drain does not match its captured owner");
-      }
-      if (
-        result.outcome === "success" &&
-        ((value.phase !== "owner-captured" && value.phase !== "terminal") ||
-          !value.owner ||
-          !drain ||
-          drain.ownerPid === null ||
-          drain.childPid === null ||
-          !result.outputComplete ||
-          result.exitCode !== 0 ||
-          result.finishedAtMs >= intent.deadlineAtMs)
-      )
-        throw deny("Verification success requires an owned exact completed drain");
     };
     const complete = (claim: VerificationClaim, input: RetainedVerificationResult) => {
       let result: RetainedVerificationResult;

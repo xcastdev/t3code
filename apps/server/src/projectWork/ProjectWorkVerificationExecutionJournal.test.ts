@@ -36,6 +36,7 @@ import {
   type VerificationClaim,
   type RetainedVerificationResult,
 } from "./ProjectWorkVerificationExecutionJournal.ts";
+import * as VerificationJournal from "./ProjectWorkVerificationExecutionJournal.ts";
 
 const decodeGate = Schema.decodeUnknownSync(ProjectTeamGate);
 const decodeCommit = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand);
@@ -398,6 +399,255 @@ const observedFixture = Effect.gen(function* () {
   );
   return { ...f, journal, repository, publications: () => publications };
 });
+
+it.effect(
+  "the historical result reader composes in its captured transaction after grant revocation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claim = yield* claimed(f);
+        const process = f.journal.persistence(claim);
+        yield* process.claimActivation(f.intent.allocation);
+        yield* process.beforeStart(f.owner);
+        const { result } = yield* retainedResult(f, claim);
+        yield* f.journal.complete(claim, result);
+        f.revoke();
+        const reader = yield* VerificationJournal.makeProjectWorkVerificationResultReader({
+          environmentId: "environment",
+        });
+        const input = { jobId: f.selection.jobId, expectedManifestHash: f.prepared.sha256 };
+        const historical = yield* f.sql.withTransaction(reader.readInTransaction(input));
+        expect(historical._tag).toBe("Terminal");
+        if (historical._tag !== "Terminal")
+          return yield* Effect.die("Expected retained terminal result");
+        expect(historical.result).toEqual(result);
+        expect(historical.snapshot.intent).toEqual(f.intent);
+        expect(historical.snapshot.owner).toEqual(f.owner);
+        expect(historical.metadata.manifestHash).toBe(f.prepared.sha256);
+        expect(historical.metadata.resultHash).toBe(verificationExecutionHash(result));
+        expect(Object.isFrozen(historical.snapshot)).toBe(true);
+        expect(yield* f.journal.readResult(f.selection.jobId)).toEqual(result);
+        expect((yield* reader.readInTransaction(input).pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(f.journal.readResult(f.selection.jobId))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect(
+  "the historical result reader preserves missing and pending history without recovery authority",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const repository = yield* ProjectWorkRepository;
+        const reader = yield* VerificationJournal.makeProjectWorkVerificationResultReader({
+          environmentId: "environment",
+        });
+        const input = { jobId: f.selection.jobId, expectedManifestHash: f.prepared.sha256 };
+        expect(yield* f.sql.withTransaction(reader.readInTransaction(input))).toEqual({
+          _tag: "Missing",
+        });
+        const claim = yield* claimed(f);
+        const pending = yield* f.sql.withTransaction(reader.readInTransaction(input));
+        expect(pending._tag).toBe("Pending");
+        if (pending._tag !== "Pending")
+          return yield* Effect.die("Expected original pending attempt");
+        expect(pending.snapshot.phase).toBe("claimed");
+        expect(pending.snapshot.result).toBeNull();
+        expect(
+          (yield* f.journal
+            .quarantineRecovery(pending.snapshot, "foreign recovery")
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              reader
+                .readInTransaction(input)
+                .pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql })),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              reader
+                .readInTransaction(input)
+                .pipe(Effect.provideService(ProjectWorkRepository, { ...repository })),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              reader
+                .readInTransaction(input)
+                .pipe(Effect.updateContext<never, never>(() => Context.empty())),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              reader.readInTransaction({ ...input, expectedManifestHash: "f".repeat(64) }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const mutable = { ...input };
+        const captured = reader.readInTransaction(mutable);
+        mutable.jobId = "different-job";
+        mutable.expectedManifestHash = "f".repeat(64);
+        expect((yield* f.sql.withTransaction(captured))._tag).toBe("Pending");
+        yield* f.journal.recordUncertain(claim, "Controlled uncertainty");
+        const quarantined = yield* f.sql.withTransaction(reader.readInTransaction(input));
+        expect(quarantined._tag).toBe("Pending");
+        if (quarantined._tag === "Pending") expect(quarantined.snapshot.phase).toBe("quarantine");
+        const excess = { ...input, extra: true };
+        expect((yield* reader.readInTransaction(excess).pipe(Effect.result))._tag).toBe("Failure");
+      }),
+    ),
+);
+
+for (const channel of ["stdout", "stderr"] as const)
+  it.effect(
+    `the historical result reader rehashes retained ${channel} bytes and propagates unavailable storage`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const claim = yield* claimed(f);
+          yield* f.journal.persistence(claim).claimActivation(f.intent.allocation);
+          yield* f.journal.persistence(claim).beforeStart(f.owner);
+          const { result } = yield* retainedResult(f, claim, "failed");
+          yield* f.journal.complete(claim, result);
+          const reader = yield* VerificationJournal.makeProjectWorkVerificationResultReader({
+            environmentId: "environment",
+          });
+          const input = { jobId: f.selection.jobId, expectedManifestHash: f.prepared.sha256 };
+          const failed = yield* f.sql.withTransaction(reader.readInTransaction(input));
+          expect(failed._tag).toBe("Terminal");
+          if (failed._tag === "Terminal") expect(failed.result.outcome).toBe("failed");
+          yield* f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+          const changed =
+            channel === "stdout" ? new Uint8Array([1, 255, 10]) : new Uint8Array([27, 1]);
+          yield* f.sql`UPDATE project_work_artifacts SET raw_bytes=${changed} WHERE artifact_id=${result[channel].artifactId}`;
+          const corrupted = yield* f.sql
+            .withTransaction(reader.readInTransaction(input))
+            .pipe(Effect.result);
+          expect(corrupted._tag).toBe("Failure");
+          if (corrupted._tag === "Failure")
+            expect(corrupted.failure).toMatchObject({
+              reason: "Retained verification bytes or manifest changed",
+            });
+          expect((yield* f.journal.readResult(f.selection.jobId).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          yield* f.sql`ALTER TABLE project_work_artifacts RENAME TO controlled_unavailable_artifacts`;
+          const unavailable = yield* f.sql
+            .withTransaction(reader.readInTransaction(input))
+            .pipe(Effect.exit);
+          expect(unavailable._tag).toBe("Failure");
+          if (unavailable._tag === "Failure")
+            expect(Cause.pretty(unavailable.cause)).toContain("no such table");
+        }),
+      ),
+  );
+
+it.effect("a borrowed historical result cannot escape the owning repository's failed COMMIT", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const repository = yield* ProjectWorkRepository;
+      const claim = yield* claimed(f);
+      yield* f.journal.persistence(claim).claimActivation(f.intent.allocation);
+      yield* f.journal.persistence(claim).beforeStart(f.owner);
+      const { result } = yield* retainedResult(f, claim);
+      yield* f.journal.complete(claim, result);
+      const reader = yield* VerificationJournal.makeProjectWorkVerificationResultReader({
+        environmentId: "environment",
+      });
+      const input = { jobId: f.selection.jobId, expectedManifestHash: f.prepared.sha256 };
+      yield* f.sql`CREATE TABLE controlled_historical_parent(id INTEGER PRIMARY KEY)`;
+      yield* f.sql`CREATE TABLE controlled_historical_child(parent_id INTEGER REFERENCES controlled_historical_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      let insideTerminal = false;
+      const failed = yield* repository
+        .executeAtomic(
+          Effect.gen(function* () {
+            const historical = yield* reader.readInTransaction(input);
+            insideTerminal = historical._tag === "Terminal";
+            yield* f.sql`INSERT INTO controlled_historical_child(parent_id) VALUES(1)`;
+            return [];
+          }),
+          reader.readInTransaction(input).pipe(Effect.asVoid),
+        )
+        .pipe(Effect.exit);
+      expect(insideTerminal).toBe(true);
+      expect(failed._tag).toBe("Failure");
+      if (failed._tag === "Failure")
+        expect(Cause.pretty(failed.cause)).toContain("FOREIGN KEY constraint failed");
+      const blocked = yield* f.sql
+        .withTransaction(reader.readInTransaction(input))
+        .pipe(Effect.exit);
+      expect(blocked._tag).toBe("Failure");
+      if (blocked._tag === "Failure")
+        expect(Cause.pretty(blocked.cause)).toContain(
+          "cannot start a transaction within a transaction",
+        );
+      // Clean only this disposable connection's hidden failed physical transaction.
+      yield* f.sql`ROLLBACK`;
+      expect((yield* f.sql.withTransaction(reader.readInTransaction(input)))._tag).toBe("Terminal");
+      expect(yield* f.journal.readResult(f.selection.jobId)).toEqual(result);
+    }),
+  ),
+);
+
+for (const corruption of ["manifest", "owner", "drain", "malformed-result"] as const)
+  it.effect(
+    `the historical result reader propagates corrupt ${corruption} identity instead of missing history`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const claim = yield* claimed(f);
+          yield* f.journal.persistence(claim).claimActivation(f.intent.allocation);
+          yield* f.journal.persistence(claim).beforeStart(f.owner);
+          const { result } = yield* retainedResult(f, claim);
+          yield* f.journal.complete(claim, result);
+          const reader = yield* VerificationJournal.makeProjectWorkVerificationResultReader({
+            environmentId: "environment",
+          });
+          const input = { jobId: f.selection.jobId, expectedManifestHash: f.prepared.sha256 };
+          yield* f.sql`DROP TRIGGER project_work_verification_execution_progress`;
+          yield* f.sql`DROP TRIGGER project_work_verification_execution_intent_immutable`;
+          if (corruption === "manifest")
+            yield* f.sql`UPDATE project_work_verification_execution SET manifest_hash=${"f".repeat(64)}`;
+          else if (corruption === "owner")
+            yield* f.sql`UPDATE project_work_verification_execution SET owner_json=${canonicalProjectWorkPayload({ ...f.owner, invocation: "b".repeat(32) })}`;
+          else if (corruption === "drain") {
+            const changedDrain = { ...f.drain, childExitCode: 1 };
+            const changed = {
+              ...result,
+              exitCode: 1,
+              drain: changedDrain,
+              drainHash: verificationExecutionHash(changedDrain),
+            };
+            yield* f.sql`UPDATE project_work_verification_execution SET result_json=${canonicalProjectWorkPayload(changed)},result_hash=${verificationExecutionHash(changed)}`;
+          } else yield* f.sql`UPDATE project_work_verification_execution SET result_json='{}'`;
+          expect(
+            (yield* f.sql.withTransaction(reader.readInTransaction(input)).pipe(Effect.result))
+              ._tag,
+          ).toBe("Failure");
+          expect((yield* f.journal.readResult(f.selection.jobId).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+        }),
+      ),
+  );
 
 it.effect(
   "a drained result retains exact binary artifacts and immutable retries never replace its winner",

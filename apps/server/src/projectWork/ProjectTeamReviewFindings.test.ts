@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
+import * as Clock from "effect/Clock";
 import {
   canonicalProjectWorkPayload,
   ProjectTeamReviewFindingIntent,
@@ -70,6 +71,12 @@ import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 import { make as makeModelAccounting } from "./ProjectTeamModelAccounting.ts";
 import { makeProjectTeamMailboxConsumption } from "./ProjectTeamMailboxConsumption.ts";
 import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
+import {
+  makeProjectWorkVerificationExecutionJournal,
+  verificationExecutionHash,
+  ProjectWorkVerificationExecutionError,
+  ProjectWorkVerificationExecutionIntent,
+} from "./ProjectWorkVerificationExecutionJournal.ts";
 
 const canonical = canonicalProjectWorkPayload;
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
@@ -374,7 +381,178 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
     expect(prepared.manifest).toEqual(f.prepared.manifest);
     return { ...f, selection, prepared, reviewRootBindingId: binding.recordId };
   });
-const makeFindingFixture = (coherentCustody = false) =>
+// Actual disposable execution storage with controlled custody; no process or Git probe runs.
+const retainControlledVerification = (
+  f: Effect.Success<typeof verificationFixture>,
+  outcome: "success" | "failed",
+) =>
+  Effect.gen(function* () {
+    const current = yield* readCurrentState(f.sql, projectId);
+    const gate = current.foundationRecords?.find(
+      (r) => r.kind === "gate" && r.verificationJobId === f.selection.jobId,
+    );
+    if (gate?.kind !== "gate") return yield* Effect.die("Missing approved verification gate");
+    const job = f.prepared.manifest;
+    const nonce = "22222222-2222-4222-8222-222222222222";
+    const memoryBytes = 536870912;
+    const runtimeSeconds = Math.ceil(job.command.limits.maxDurationMs / 1000);
+    const allocation = {
+      version: 1 as const,
+      unit: `t3-pi-managed-${nonce}.service`,
+      nonce,
+      policy: { memoryBytes, runtimeSeconds },
+      launch: {
+        workspaceRoot: job.target.worktree,
+        workspaceAccess: "readonly" as const,
+        workspace: { path: job.target.worktree, dev: 1, ino: 2 },
+        protectedRoots: ["/controlled-protected"],
+        protectedWorkspaceEntries: [],
+        runtimeFiles: [
+          { source: "/controlled/executable", target: job.command.executable, dev: 1, ino: 3 },
+        ],
+        argv: [job.command.executable, ...job.command.argv],
+        memoryBytes,
+        runtimeSeconds,
+      },
+    };
+    const journal = yield* makeProjectWorkVerificationExecutionJournal({
+      environmentId: "environment",
+      assertCurrent: (intent, state, phase, attemptId) =>
+        Effect.gen(function* () {
+          const matches =
+            state.foundationRecords?.filter((r) => r.recordId === intent.gate.recordId) ?? [];
+          const selected = matches[0];
+          if (
+            matches.length !== 1 ||
+            selected?.kind !== "gate" ||
+            selected.status !== (phase === "approved" ? "approved" : "consumed") ||
+            selected.contentHash !== intent.receipt.sha256 ||
+            (phase === "consumed" && selected.consumedByRunId !== attemptId)
+          )
+            return yield* new ProjectWorkVerificationExecutionError({
+              reason: "Controlled original gate changed",
+            });
+        }),
+      consumeApproval: (intent, attemptId, state) =>
+        Effect.gen(function* () {
+          const task = state.tasks.find((t) => t.taskId === job.taskId);
+          if (!task) return yield* Effect.die("Missing verification parent");
+          return [
+            decodeCommit({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: "controlled-verification-claim:" + attemptId,
+              expectedRevision: state.revision,
+              attribution: {
+                actor: { kind: "system", id: "project-team-verification" },
+                source: { kind: "system", id: "project-team-verification" },
+                recordedAt: at,
+              },
+              committedAt: at,
+              records: [],
+              transition: {
+                kind: "verification.claim",
+                taskId: task.taskId,
+                expectedTaskRevision: task.revision,
+                gateId: intent.gate.recordId,
+                expectedGateRevision: intent.gate.revision,
+                jobId: job.jobId,
+                manifestHash: intent.receipt.sha256,
+                attemptId,
+              },
+            }),
+          ];
+        }),
+      verifyResult: () => Effect.void,
+    });
+    const claimed = yield* journal.claim({
+      receipt: f.prepared,
+      gate,
+      allocation,
+      deadlineAtMs: (yield* Clock.currentTimeMillis) + job.command.limits.maxDurationMs,
+    });
+    if (claimed._tag !== "Claimed")
+      return yield* Effect.die("Missing controlled verification claim");
+    const claim = claimed.claim;
+    const owner = {
+      type: "owner" as const,
+      unit: allocation.unit,
+      nonce,
+      invocation: "c".repeat(32),
+      cgroup: "/sys/fs/cgroup/controlled/" + allocation.unit,
+      pid: 420,
+      memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+    };
+    const persistence = journal.persistence(claim);
+    yield* persistence.claimActivation(allocation);
+    yield* persistence.beforeStart(owner);
+    const exitCode = outcome === "success" ? 0 : 1;
+    const environmentSummary = "controlled retained verification";
+    const applicability = {
+      projectId: job.projectId,
+      taskId: job.taskId,
+      specRevision: job.specRevision,
+      planRevision: job.planRevision,
+      repository: job.target.repository,
+      worktree: job.target.worktree,
+      testedTree: job.target.testedTree,
+      testedCommit: job.target.testedCommit,
+      baseSha: job.target.baseSha,
+      headSha: job.target.headSha,
+      command: canonical({ executable: job.command.executable, argv: job.command.argv }),
+      exitCode,
+      environmentSummary,
+      integration: false,
+    };
+    const artifacts = yield* makeProjectWorkArtifacts({
+      environmentId: "environment",
+      maximumArtifactBytes: 4096,
+    });
+    const stdout = yield* artifacts.retain({
+      artifactId: claim.attemptId + ":stdout",
+      sourceId: claim.attemptId,
+      applicability,
+      bytes: new Uint8Array([0, 255, 10]),
+    });
+    const stderr = yield* artifacts.retain({
+      artifactId: claim.attemptId + ":stderr",
+      sourceId: claim.attemptId,
+      applicability,
+      bytes: new Uint8Array([27, 0]),
+    });
+    const drain = {
+      unit: owner.unit,
+      invocation: owner.invocation,
+      cgroup: owner.cgroup,
+      ownerPid: owner.pid,
+      memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+      launcherPid: 410,
+      childPid: 430,
+      childExitCode: exitCode,
+      kernel: "populated 0",
+    };
+    yield* journal.complete(claim, {
+      version: 1,
+      jobId: job.jobId,
+      attemptId: claim.attemptId,
+      manifestHash: f.prepared.sha256,
+      allocationHash: verificationExecutionHash(allocation),
+      outcome,
+      exitCode,
+      outputComplete: true,
+      stdout,
+      stderr,
+      drain,
+      drainHash: verificationExecutionHash(drain),
+      environmentSummary,
+      finishedAtMs: yield* Clock.currentTimeMillis,
+    });
+  });
+const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "success" | "failed") =>
   Effect.gen(function* () {
     const initial = yield* verificationFixture;
     const f = coherentCustody
@@ -470,6 +648,7 @@ const makeFindingFixture = (coherentCustody = false) =>
           ),
         ),
     );
+    if (verificationOutcome) yield* retainControlledVerification(f, verificationOutcome);
     current = yield* state();
     const role = current.foundationRecords?.find((r) => r.kind === "role-revision");
     const member = current.foundationRecords?.find((r) => r.kind === "member");
@@ -1407,9 +1586,9 @@ it.effect("stable finding identity rejects reuse against a replaced original tar
 );
 
 const decodeCompletionReport = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, strict);
-const makeProposalFixture = (coherentCustody = false) =>
+const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "success" | "failed") =>
   Effect.gen(function* () {
-    const f = yield* makeFindingFixture(coherentCustody);
+    const f = yield* makeFindingFixture(coherentCustody, verificationOutcome);
     const current = yield* f.state();
     const task = current.tasks.find((t) => t.taskId === f.running.taskId)!;
     const memberships =
@@ -1650,10 +1829,16 @@ it.effect(
     ),
 );
 const makeConsumedReviewFixture = (
-  options: { readonly criticalFinding?: boolean; readonly referencedEvidence?: boolean } = {},
+  options: {
+    readonly criticalFinding?: boolean;
+    readonly referencedEvidence?: boolean;
+    readonly parentAssessment?: boolean | "empty";
+    readonly assessmentVerdict?: "met" | "not-met";
+    readonly verificationOutcome?: "success" | "failed";
+  } = {},
 ) =>
   Effect.gen(function* () {
-    const f = yield* makeProposalFixture(true);
+    const f = yield* makeProposalFixture(true, options.verificationOutcome);
     if (options.criticalFinding)
       yield* f.repository.execute(yield* f.compile(yield* f.report({ severity: "critical" })));
     const initial = yield* f.state();
@@ -1681,10 +1866,62 @@ const makeConsumedReviewFixture = (
           addedAt: at,
         }),
       );
+    const parentCriterion = initial.criteria.find(
+      (c) => c.criterionId === f.selection.criterionIds[0] && c.taskId === f.selection.taskId,
+    );
+    const parentReferenceId = ProjectWorkEvidenceId.make("consumed-parent-assessment");
+    if (options.parentAssessment === true) {
+      if (!parentCriterion) return yield* Effect.die("Missing original parent criterion");
+      const plan = initial.foundationRecords?.find(
+        (r) =>
+          r.kind === "plan-revision" &&
+          r.taskId === parentCriterion.taskId &&
+          r.planRevision === f.target.prepared.manifest.planRevision,
+      );
+      yield* f.repository.execute(
+        yield* decodeWorkCommand({
+          type: "project-work.evidence.add",
+          commandId: "consumed-parent-assessment-add",
+          projectId,
+          evidence: {
+            evidenceId: parentReferenceId,
+            taskId: parentCriterion.taskId,
+            criterionId: parentCriterion.criterionId,
+            kind: "observation",
+            summary: "Original parent review observation",
+            detail: "Inspected the exact original parent criterion",
+            scopeHash: projectTeamScopeHash(
+              initial,
+              parentCriterion.taskId,
+              plan?.kind === "plan-revision" ? plan : undefined,
+            ),
+            recordedAt: at,
+            revision: 0,
+            attribution,
+          },
+          addedAt: at,
+        }),
+      );
+    }
     const completionReport = decodeCompletionReport({
       ...f.completionReport,
       expectedRevision: (yield* f.state()).revision,
       evidenceIds: options.referencedEvidence ? [referenceId] : [],
+      ...(options.parentAssessment === "empty"
+        ? { criterionAssessments: [] }
+        : options.parentAssessment && parentCriterion
+          ? {
+              criterionAssessments: [
+                {
+                  criterionId: parentCriterion.criterionId,
+                  expectedRevision: parentCriterion.revision,
+                  verdict: options.assessmentVerdict ?? "met",
+                  detail: "Original pending parent assessment",
+                  evidenceIds: [parentReferenceId],
+                },
+              ],
+            }
+          : {}),
     });
     if (completionReport.type !== "project-team.assignment.report")
       return yield* Effect.die("Invalid consumed report fixture");
@@ -1847,6 +2084,200 @@ const makeConsumedReviewFixture = (
     };
   });
 const consumedReviewFixture = makeConsumedReviewFixture();
+it.effect(
+  "completed assessment qualification denies a missing verification result without changing work",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({ parentAssessment: true });
+        const before = yield* f.state();
+        const retained = yield* readProposal(f);
+        expect(retained?.manifest.criterionAssessments).toHaveLength(1);
+        expect(yield* f.prepare()).toMatchObject({ status: "denied", reason: "stale-proof" });
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+it.effect(
+  "completed assessment qualification accepts intact successful verification without parent acceptance",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const before = yield* f.state();
+        const proof = yield* f.prepare();
+        expect(proof?.status).toBe("completed");
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          before.criteria.find((c) => c.criterionId === f.selection.criterionIds[0])?.status,
+        ).toBe("unsatisfied");
+      }),
+    ),
+);
+it.effect("completed assessment qualification denies an intact failed verification result", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({
+        parentAssessment: true,
+        verificationOutcome: "failed",
+      });
+      const before = yield* f.state();
+      expect(yield* f.prepare()).toMatchObject({ status: "denied", reason: "stale-proof" });
+      expect(yield* f.state()).toEqual(before);
+    }),
+  ),
+);
+for (const channel of ["stdout", "stderr"] as const) {
+  it.effect(
+    `completed assessment qualification propagates corrupt ${channel} verification bytes`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* makeConsumedReviewFixture({
+            parentAssessment: true,
+            verificationOutcome: "success",
+          });
+          const before = yield* f.state();
+          const rows = yield* f.sql<{
+            attempt_id: string;
+          }>`SELECT attempt_id FROM project_work_verification_execution WHERE job_id=${f.selection.jobId}`;
+          const attempt = rows[0]?.attempt_id;
+          if (!attempt) return yield* Effect.die("Missing original verification execution");
+          // Corrupt the disposable database beneath its normal immutable-write protection.
+          yield* f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+          yield* f.sql`UPDATE project_work_artifacts SET raw_bytes=${new Uint8Array(channel === "stdout" ? [1, 255, 10] : [26, 0])} WHERE artifact_id=${attempt + ":" + channel}`;
+          expect((yield* f.prepare().pipe(Effect.result))._tag).toBe("Failure");
+          expect(yield* f.state()).toEqual(before);
+        }),
+      ),
+  );
+}
+it.effect("completed assessment qualification rechecks full parent evidence snapshots", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({
+        parentAssessment: true,
+        verificationOutcome: "success",
+      });
+      const before = yield* f.state();
+      const id = f.completionReport.criterionAssessments?.[0]?.evidenceIds[0];
+      const index = before.evidence.findIndex((e) => e.evidenceId === id);
+      expect(index).toBeGreaterThanOrEqual(0);
+      // Same-revision retained-detail corruption leaves the prepared target intact.
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${"$.evidence[" + index + "].detail"},'Changed parent observation') WHERE project_id=${projectId}`;
+      const changed = yield* f.state();
+      expect(yield* f.prepare()).toMatchObject({ status: "denied", reason: "stale-proof" });
+      expect(yield* f.state()).toEqual(changed);
+    }),
+  ),
+);
+it.effect("completed assessment qualification binds the original human verification approval", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({
+        parentAssessment: true,
+        verificationOutcome: "success",
+      });
+      const before = yield* f.state();
+      const rows = yield* f.sql<{
+        intent_json: string;
+      }>`SELECT intent_json FROM project_work_verification_execution WHERE job_id=${f.selection.jobId}`;
+      const original = yield* Schema.decodeUnknownEffect(
+        Schema.fromJsonString(ProjectWorkVerificationExecutionIntent),
+        strict,
+      )(rows[0]?.intent_json);
+      const changed = yield* Schema.decodeUnknownEffect(
+        ProjectWorkVerificationExecutionIntent,
+        strict,
+      )({
+        ...original,
+        gate: { ...original.gate, recordId: "different-human-approval" },
+      });
+      // Self-consistent disposable storage corruption leaves the exact job and terminal artifacts intact.
+      yield* f.sql`DROP TRIGGER project_work_verification_execution_progress`;
+      yield* f.sql`DROP TRIGGER project_work_verification_execution_intent_immutable`;
+      yield* f.sql`UPDATE project_work_verification_execution SET intent_json=${canonical(changed)},intent_hash=${verificationExecutionHash(changed)},gate_id=${changed.gate.recordId} WHERE job_id=${f.selection.jobId}`;
+      expect(yield* f.prepare()).toMatchObject({ status: "denied", reason: "stale-proof" });
+      expect(yield* f.state()).toEqual(before);
+    }),
+  ),
+);
+for (const verificationOutcome of [undefined, "success"] as const) {
+  it.effect(
+    `completed assessment qualification handles explicit empty assessments with ${verificationOutcome ?? "missing"} verification`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* makeConsumedReviewFixture({
+            parentAssessment: "empty",
+            ...(verificationOutcome === undefined ? {} : { verificationOutcome }),
+          });
+          const before = yield* f.state();
+          expect((yield* readProposal(f))?.manifest.criterionAssessments).toEqual([]);
+          expect(yield* f.prepare()).toMatchObject(
+            verificationOutcome === "success"
+              ? { status: "completed" }
+              : { status: "denied", reason: "stale-proof" },
+          );
+          expect(yield* f.state()).toEqual(before);
+        }),
+      ),
+  );
+}
+it.effect(
+  "completed assessment qualification retains a negative review of failed verification",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          assessmentVerdict: "not-met",
+          verificationOutcome: "failed",
+        });
+        const before = yield* f.state();
+        expect((yield* f.prepare())?.status).toBe("completed");
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+it.effect(
+  "completed assessment qualification settles only the reviewer child and exact replay remains stable",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const before = yield* f.state();
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+        });
+        expect(
+          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).fence.stage,
+        ).toBe("settled");
+        const after = yield* f.state();
+        expect(after.tasks.find((t) => t.taskId === f.running.taskId)?.state).toBe("completed");
+        expect(after.tasks.find((t) => t.taskId === f.selection.taskId)).toEqual(
+          before.tasks.find((t) => t.taskId === f.selection.taskId),
+        );
+        expect(after.criteria.filter((c) => c.taskId === f.selection.taskId)).toEqual(
+          before.criteria.filter((c) => c.taskId === f.selection.taskId),
+        );
+        expect(
+          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).duplicate,
+        ).toBe(true);
+        expect(yield* f.state()).toEqual(after);
+      }),
+    ),
+);
 it.effect(
   "completed review consumer qualifies only exact original consumed proof without completing the child",
   () =>
@@ -2234,7 +2665,10 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* consumedReviewFixture;
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
         expect((yield* f.prepare())?.status).toBe("completed");
         const before = yield* f.state();
         const priorReceipts = yield* f.journal.readStageReceipts(
@@ -2291,7 +2725,10 @@ it.effect(
   () =>
     scopedGateway(
       Effect.gen(function* () {
-        const f = yield* consumedReviewFixture;
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
         const before = yield* f.state();
         const priorReceipts = yield* f.journal.readStageReceipts(
           f.proposalSnapshot.fence.dispatchId,

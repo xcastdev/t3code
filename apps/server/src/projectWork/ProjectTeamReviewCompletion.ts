@@ -18,6 +18,8 @@ import { makeProjectTeamReviewCompletionProposals } from "./ProjectTeamReviewCom
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
 import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
+import { makeProjectWorkVerificationResultReader } from "./ProjectWorkVerificationExecutionJournal.ts";
+import { snapshotReviewCriterionAssessments } from "./ProjectTeamReviewCriterionAssessments.ts";
 import {
   evaluateProjectTeamDependency,
   projectTeamDerivedRecordId,
@@ -120,6 +122,19 @@ const sameBinding = (
   const { revision: _r, status: _s, updatedAt: _u, sessionId: _session, ...identity } = binding;
   return canonical(identity);
 };
+const approvalContent = (
+  gate: Extract<import("@t3tools/contracts").ProjectTeamRecord, { kind: "gate" }>,
+) => {
+  const {
+    status: _status,
+    revision: _revision,
+    updatedAt: _updatedAt,
+    consumedByRunId: _run,
+    consumedByCommandId: _command,
+    ...content
+  } = gate;
+  return content;
+};
 
 export class ProjectTeamReviewCompletionError extends Schema.TaggedError<ProjectTeamReviewCompletionError>()(
   "ProjectTeamReviewCompletionError",
@@ -146,6 +161,9 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
       environmentId: options.environmentId,
     });
     const sessions = yield* makeProjectTeamSessionReceipts(options);
+    const verificationResults = yield* makeProjectWorkVerificationResultReader({
+      environmentId: options.environmentId,
+    });
     // Only its error-preserving retained reader is used. No current authority is resolved here.
     const proposals = yield* makeProjectTeamReviewCompletionProposals(() =>
       Effect.succeed(undefined),
@@ -402,6 +420,61 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
         hash(fresh.native) !== manifest.freshness.sessionSHA256
       )
         return yield* deny("stale-proof");
+      if (report.criterionAssessments !== undefined) {
+        const verification = yield* verificationResults
+          .readInTransaction({
+            jobId: manifest.prepared.jobId,
+            expectedManifestHash: target.prepared.sha256,
+          })
+          .pipe(
+            Effect.catchTag("ProjectWorkVerificationExecutionError", (error) =>
+              error.reason === "Verification result manifest does not match expected target"
+                ? Effect.succeed(undefined)
+                : Effect.fail(error),
+            ),
+          );
+        if (
+          verification?._tag !== "Terminal" ||
+          (report.criterionAssessments.some((a) => a.verdict === "met") &&
+            (verification.result.outcome !== "success" || verification.result.exitCode !== 0))
+        )
+          return yield* deny("stale-proof");
+        const originalApproval = verification.snapshot.intent.gate;
+        const consumedApproval = records.find(
+          (r) => r.recordId === target.verificationGate.recordId,
+        );
+        if (
+          originalApproval.status !== "approved" ||
+          originalApproval.consumedByRunId !== undefined ||
+          originalApproval.consumedByCommandId !== undefined ||
+          consumedApproval?.kind !== "gate" ||
+          consumedApproval.status !== "consumed" ||
+          consumedApproval.revision !== originalApproval.revision + 1 ||
+          consumedApproval.consumedByRunId !== verification.snapshot.attemptId ||
+          !consumedApproval.consumedByCommandId ||
+          !same(approvalContent(consumedApproval), approvalContent(originalApproval))
+        )
+          return yield* deny("stale-proof");
+        const assessments = yield* snapshotReviewCriterionAssessments({
+          assessments: report.criterionAssessments,
+          state,
+          target: manifest.target,
+          prepared: target.prepared.manifest,
+        }).pipe(
+          Effect.catchTag("ProjectTeamReviewCriterionAssessmentError", (error) =>
+            [
+              "Assessment parent scope is unavailable",
+              "Assessment requires an exact selected parent criterion revision",
+              "An open critical finding prevents a positive assessment",
+              "Assessment evidence is unavailable, foreign or stale",
+            ].includes(error.reason)
+              ? Effect.succeed(undefined)
+              : Effect.fail(error),
+          ),
+        );
+        if (assessments === undefined || !same(assessments, manifest.criterionAssessments))
+          return yield* deny("stale-proof");
+      }
       for (const prior of records.filter(
         (r) => r.kind === "run-binding" && r.taskId === manifest.target.taskId,
       )) {
