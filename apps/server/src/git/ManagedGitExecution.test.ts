@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { GitCommandError } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as NodeCrypto from "node:crypto";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -839,5 +843,753 @@ describe("Managed Git execution", () => {
       for (const pid of capturedGitPids) expect(nativeFs.existsSync(`/proc/${pid}`)).toBe(false);
       yield* Effect.logInfo({ capturedGitPids, drained: true });
     }),
+  );
+});
+
+const encodeVerificationOwner = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      effectId: Schema.String,
+      runId: Schema.String,
+      generation: Schema.Int,
+      primaryRoot: Schema.String,
+      commonGitDirectory: Schema.String,
+      worktreePath: Schema.String,
+      branchRef: Schema.String,
+      baseRef: Schema.String,
+      baseOid: Schema.String,
+      ownershipToken: Schema.String,
+      policyHash: Schema.String,
+    }),
+  ),
+);
+
+// Actual temporary ownership metadata; Git answers are injected, not native Git proof.
+const verificationFixture = Effect.fn("ManagedGitExecution.test.verificationFixture")(function* () {
+  const filesystem = yield* FileSystem.FileSystem;
+  const directory = yield* filesystem.makeTempDirectoryScoped({
+    prefix: "t3-verification-target-",
+  });
+  const primary = nativePath.join(directory, "primary");
+  const common = nativePath.join(primary, ".git");
+  const assigned = nativePath.join(directory, "assigned");
+  const metadata = nativePath.join(common, "worktrees", "assigned");
+  for (const entry of [
+    primary,
+    common,
+    assigned,
+    metadata,
+    nativePath.join(common, "objects"),
+    nativePath.join(common, "refs", "heads"),
+  ])
+    yield* filesystem.makeDirectory(entry, { recursive: true });
+  const base = "1".repeat(40);
+  const head = "2".repeat(40);
+  const tree = "3".repeat(40);
+  const assignment: Managed.ManagedGitAssignment = {
+    effectId: "verification-effect",
+    runId: "settled-run",
+    generation: 1,
+    primaryRoot: primary,
+    commonGitDirectory: common,
+    worktreePath: assigned,
+    branchRef: "refs/heads/assigned",
+    baseRef: "refs/heads/main",
+    baseOid: base,
+    ownershipToken: "retained-owner",
+    policyHash: "policy",
+  };
+  const config = nativePath.join(common, "config");
+  const entries = [
+    [config, "[core]\nrepositoryformatversion = 0\nbare = false\n"],
+    [nativePath.join(assigned, ".git"), `gitdir: ${metadata}\n`],
+    [nativePath.join(metadata, "gitdir"), `${assigned}/.git\n`],
+    [nativePath.join(metadata, "commondir"), "../..\n"],
+    [nativePath.join(metadata, "HEAD"), `ref: ${assignment.branchRef}\n`],
+    [nativePath.join(metadata, "t3-managed-owner"), encodeVerificationOwner(assignment)],
+  ] as const;
+  for (const [entry, text] of entries) yield* filesystem.writeFileString(entry, text);
+  yield* filesystem.writeFileString(nativePath.join(common, assignment.baseRef), base + "\n");
+  yield* filesystem.writeFileString(nativePath.join(common, assignment.branchRef), head + "\n");
+  const sha = (bytes: string) => NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+  const inode = (entry: string) => {
+    const stat = nativeFs.statSync(entry, { bigint: true });
+    return { path: entry, dev: String(stat.dev), ino: String(stat.ino) };
+  };
+  const fingerprint = entries.map(([entry, text]) => {
+    const stat = inode(entry);
+    return `${entry}\0${stat.dev}\0${stat.ino}\0${sha(text)}`;
+  });
+  const receipt: Managed.ManagedWorkspaceReceipt = {
+    assignment,
+    primary: inode(primary),
+    common: inode(common),
+    worktree: inode(assigned),
+    gitDirectory: inode(metadata),
+    initialHeadOid: base,
+    pointerAndConfigurationHash: sha(
+      ["absent", fingerprint[0], "absent", ...fingerprint.slice(1), "absent"].join("\n"),
+    ),
+  };
+  const commands: ChildProcess.StandardCommand[] = [];
+  const answers = {
+    base,
+    head,
+    worktreeHead: head,
+    tree,
+    beforeRead: (_command: ChildProcess.StandardCommand) => {},
+    registration: null as string | null,
+    status: "",
+    indexCode: 0,
+    trackedCode: 0,
+    unmerged: "",
+    untracked: "",
+    tracked: "H file.txt\0",
+    config: "core.repositoryformatversion\n0\0core.bare\nfalse\0",
+  };
+  const spawner = ChildProcessSpawner.make((input) => {
+    if (!ChildProcess.isStandardCommand(input)) throw Error("No pipeline accepted");
+    commands.push(input);
+    answers.beforeRead(input);
+    let stdout = "";
+    let code = 0;
+    if (input.args.includes("config")) stdout = answers.config;
+    else if (input.args.includes("rev-parse")) {
+      const ref = input.args.at(-1);
+      stdout =
+        (ref === `${assignment.baseRef}^{commit}`
+          ? answers.base
+          : ref === "HEAD^{tree}"
+            ? answers.tree
+            : ref === "HEAD^{commit}"
+              ? answers.worktreeHead
+              : answers.head) + "\n";
+    } else if (input.args.includes("worktree"))
+      stdout =
+        answers.registration ??
+        `worktree ${assigned}\0HEAD ${answers.head}\0branch ${assignment.branchRef}\0\0`;
+    else if (input.args.includes("status")) stdout = answers.status;
+    else if (input.args.includes("diff"))
+      code = input.args.includes("--cached") ? answers.indexCode : answers.trackedCode;
+    else if (input.args.includes("ls-files"))
+      stdout = input.args.includes("--unmerged")
+        ? answers.unmerged
+        : input.args.includes("--others")
+          ? answers.untracked
+          : answers.tracked;
+    else throw Error("Unexpected injected command");
+    return Effect.succeed(
+      ChildProcessSpawner.makeHandle({
+        pid: ChildProcessSpawner.ProcessId(0),
+        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(code)),
+        isRunning: Effect.succeed(false),
+        kill: () => Effect.void,
+        unref: Effect.succeed(Effect.void),
+        stdin: Sink.drain,
+        stdout: Stream.encodeText(Stream.make(stdout)),
+        stderr: Stream.empty,
+        all: Stream.empty,
+        getInputFd: () => Sink.drain,
+        getOutputFd: () => Stream.empty,
+      }),
+    );
+  });
+  return {
+    filesystem,
+    directory,
+    assignment,
+    receipt,
+    config,
+    assigned,
+    metadata,
+    base,
+    head,
+    tree,
+    commands,
+    answers,
+    spawner,
+  };
+});
+
+describe("Managed verification target capture (synthetic Git)", () => {
+  it.effect("requires a retained receipt and does not call persistence or any Git command", () =>
+    Effect.gen(function* () {
+      const fixture = yield* verificationFixture();
+      let persisted = false;
+      let used = false;
+      const context = yield* Managed.make({
+        assignment: fixture.assignment,
+        revalidate: Effect.void,
+        persistWorkspace: () =>
+          Effect.sync(() => {
+            persisted = true;
+          }),
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "linux"),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fixture.spawner),
+      );
+      const result = yield* Managed.withManagedVerificationTarget(context, () =>
+        Effect.sync(() => {
+          used = true;
+        }),
+      ).pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(persisted).toBe(false);
+      expect(used).toBe(false);
+      expect(fixture.commands).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+const verificationContext = Effect.fn("ManagedGitExecution.test.verificationContext")(function* (
+  fixture: Effect.Success<ReturnType<typeof verificationFixture>>,
+  revalidate: Effect.Effect<void, GitCommandError> = Effect.void,
+  receipt: Managed.ManagedWorkspaceReceipt = fixture.receipt,
+) {
+  return yield* Managed.make({
+    assignment: fixture.assignment,
+    priorReceipt: receipt,
+    revalidate,
+    persistWorkspace: () => Effect.die("Verification must not persist workspace ownership"),
+  }).pipe(
+    Effect.provideService(HostProcessPlatform, "linux"),
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, fixture.spawner),
+  );
+});
+
+describe("Managed verification target capture (synthetic Git)", () => {
+  it.effect(
+    "captures one exact clean committed assigned target without granting execution or changing ownership",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        let authorityReads = 0;
+        const context = yield* verificationContext(
+          fixture,
+          Effect.sync(() => {
+            authorityReads += 1;
+          }),
+        );
+        const result = yield* Managed.withManagedVerificationTarget(context, (target) =>
+          Effect.sync(() => {
+            expect(target).toEqual({
+              receipt: fixture.receipt,
+              cwd: fixture.assigned,
+              baseSha: fixture.base,
+              headSha: fixture.head,
+              testedCommit: fixture.head,
+              testedTree: fixture.tree,
+            });
+            expect(Object.isFrozen(target)).toBe(true);
+            expect(Object.isFrozen(target.receipt)).toBe(true);
+            expect(Object.isFrozen(target.receipt.assignment)).toBe(true);
+            expect(Object.isFrozen(target.receipt.worktree)).toBe(true);
+            expect(target.receipt).not.toBe(fixture.receipt);
+            expect(Reflect.set(target, "headSha", "4".repeat(40))).toBe(false);
+            expect(Reflect.set(target.receipt.assignment, "ownershipToken", "foreign")).toBe(false);
+            return "persisted selection";
+          }),
+        );
+        expect(result).toBe("persisted selection");
+        expect(authorityReads).toBeGreaterThanOrEqual(4);
+        expect(fixture.commands.length).toBeGreaterThan(0);
+        for (const command of fixture.commands) {
+          expect(command.command).toBe("/usr/bin/git");
+          expect(command.options).toMatchObject({
+            cwd: "/",
+            shell: false,
+            extendEnv: false,
+            stdin: "ignore",
+            env: {
+              GIT_NO_LAZY_FETCH: "1",
+              GIT_NO_REPLACE_OBJECTS: "1",
+              GIT_OPTIONAL_LOCKS: "0",
+              GIT_CONFIG_GLOBAL: "/dev/null",
+            },
+          });
+          expect(command.args).not.toContain("add");
+          expect(command.args).not.toContain("write-tree");
+          expect(command.args).not.toContain("fetch");
+        }
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+const verificationFds = (directory: string) =>
+  nativeFs.readdirSync("/proc/self/fd").filter((entry) => {
+    try {
+      return nativeFs.readlinkSync(`/proc/self/fd/${entry}`) === directory;
+    } catch {
+      return false;
+    }
+  });
+const noVerificationUse = Effect.fn("ManagedGitExecution.test.noVerificationUse")(function* (
+  fixture: Effect.Success<ReturnType<typeof verificationFixture>>,
+  context: Managed.ManagedGitExecution,
+) {
+  let used = false;
+  const result = yield* Managed.withManagedVerificationTarget(context, () =>
+    Effect.sync(() => {
+      used = true;
+    }),
+  ).pipe(Effect.result);
+  expect(result._tag).toBe("Failure");
+  expect(used).toBe(false);
+  expect(verificationFds(fixture.assigned)).toEqual([]);
+  expect(verificationFds(fixture.metadata)).toEqual([]);
+});
+
+describe("Managed verification target capture (synthetic Git)", () => {
+  for (const state of [
+    "staged",
+    "tracked",
+    "conflict",
+    "untracked",
+    "ignored input",
+    "skip-worktree",
+    "assume-unchanged",
+    "incomplete index output",
+    "truncated output",
+  ] as const) {
+    it.effect(`rejects ${state} even if other injected cleanliness answers say clean`, () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        const context = yield* verificationContext(fixture);
+        switch (state) {
+          case "staged":
+            fixture.answers.indexCode = 1;
+            break;
+          case "tracked":
+            fixture.answers.trackedCode = 1;
+            break;
+          case "conflict":
+            fixture.answers.unmerged = "100644 object 1\tconflicted.txt\0";
+            break;
+          case "untracked":
+            fixture.answers.untracked = "untracked.txt\0";
+            break;
+          case "ignored input":
+            fixture.answers.untracked = "node_modules/dependency/index.js\0";
+            break;
+          case "skip-worktree":
+            fixture.answers.tracked = "S hidden.txt\0";
+            break;
+          case "assume-unchanged":
+            fixture.answers.tracked = "h hidden.txt\0";
+            break;
+          case "incomplete index output":
+            fixture.answers.tracked = "H incomplete.txt";
+            break;
+          case "truncated output":
+            fixture.answers.status = "x".repeat(262145);
+            break;
+        }
+        yield* noVerificationUse(fixture, context);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+  for (const state of [
+    "moved base",
+    "worktree HEAD mismatch",
+    "missing base",
+    "malformed tree",
+    "duplicate registration",
+    "wrong registered commit",
+    "unsupported configuration",
+  ] as const) {
+    it.effect(`rejects ${state} before callback persistence`, () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        const context = yield* verificationContext(fixture);
+        switch (state) {
+          case "moved base":
+            fixture.answers.base = "4".repeat(40);
+            break;
+          case "worktree HEAD mismatch":
+            fixture.answers.worktreeHead = "4".repeat(40);
+            break;
+          case "missing base":
+            fixture.answers.base = "";
+            break;
+          case "malformed tree":
+            fixture.answers.tree = "not-a-tree";
+            break;
+          case "duplicate registration":
+            fixture.answers.registration = `worktree ${fixture.assigned}\0HEAD ${fixture.head}\0branch ${fixture.assignment.branchRef}\0\0worktree ${fixture.assigned}\0HEAD ${fixture.head}\0branch ${fixture.assignment.branchRef}\0\0`;
+            break;
+          case "wrong registered commit":
+            fixture.answers.registration = `worktree ${fixture.assigned}\0HEAD ${fixture.base}\0branch ${fixture.assignment.branchRef}\0\0`;
+            break;
+          case "unsupported configuration":
+            fixture.answers.config += "include.path\n/foreign/config\0";
+            break;
+        }
+        yield* noVerificationUse(fixture, context);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+  for (const state of [
+    "missing marker",
+    "foreign marker",
+    "pointer redirection",
+    "worktree replacement",
+    "config replacement",
+    "common pointer",
+    "worktree configuration",
+    "ref ancestor redirect",
+  ] as const) {
+    it.effect(`rejects actual temporary ${state} ownership changes before callback`, () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        const context = yield* verificationContext(fixture);
+        switch (state) {
+          case "missing marker":
+            nativeFs.unlinkSync(nativePath.join(fixture.metadata, "t3-managed-owner"));
+            break;
+          case "foreign marker":
+            nativeFs.writeFileSync(
+              nativePath.join(fixture.metadata, "t3-managed-owner"),
+              "foreign",
+            );
+            break;
+          case "pointer redirection":
+            nativeFs.writeFileSync(nativePath.join(fixture.assigned, ".git"), "gitdir: /foreign\n");
+            break;
+          case "worktree replacement":
+            nativeFs.renameSync(fixture.assigned, fixture.assigned + "-original");
+            nativeFs.mkdirSync(fixture.assigned);
+            nativeFs.writeFileSync(
+              nativePath.join(fixture.assigned, ".git"),
+              `gitdir: ${fixture.metadata}\n`,
+            );
+            break;
+          case "config replacement":
+            nativeFs.renameSync(fixture.config, fixture.config + "-original");
+            nativeFs.writeFileSync(
+              fixture.config,
+              "[core]\nrepositoryformatversion = 0\nbare = false\n",
+            );
+            break;
+          case "common pointer":
+            nativeFs.writeFileSync(
+              nativePath.join(fixture.assignment.commonGitDirectory, "commondir"),
+              "/foreign\n",
+            );
+            break;
+          case "worktree configuration":
+            nativeFs.writeFileSync(
+              nativePath.join(fixture.metadata, "config.worktree"),
+              "[core]\nbare=false\n",
+            );
+            break;
+          case "ref ancestor redirect": {
+            const heads = nativePath.join(fixture.assignment.commonGitDirectory, "refs", "heads");
+            nativeFs.renameSync(heads, heads + "-original");
+            nativeFs.symlinkSync(heads + "-original", heads);
+            break;
+          }
+        }
+        yield* noVerificationUse(fixture, context);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+  it.effect("rejects a mismatched retained identity without rediscovering or adopting it", () =>
+    Effect.gen(function* () {
+      const fixture = yield* verificationFixture();
+      const context = yield* verificationContext(fixture, Effect.void, {
+        ...fixture.receipt,
+        worktree: { ...fixture.receipt.worktree, ino: "foreign-inode" },
+      });
+      yield* noVerificationUse(fixture, context);
+      expect(fixture.commands).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect("does not treat settled ownership as current authority", () =>
+    Effect.gen(function* () {
+      const fixture = yield* verificationFixture();
+      const context = yield* verificationContext(
+        fixture,
+        Effect.fail(unavailable(fixture.assigned)),
+      );
+      yield* noVerificationUse(fixture, context);
+      expect(fixture.commands).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect(
+    "revalidates current authority after the captured read before calling persistence",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        let count = 0;
+        const context = yield* verificationContext(
+          fixture,
+          Effect.suspend(() =>
+            ++count > 1 ? Effect.fail(unavailable(fixture.assigned)) : Effect.void,
+          ),
+        );
+        yield* noVerificationUse(fixture, context);
+        expect(fixture.commands.length).toBeGreaterThan(0);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  for (const state of [
+    "base",
+    "head",
+    "tree",
+    "dirty",
+    "physical worktree",
+    "marker",
+    "authority",
+  ] as const) {
+    it.effect(
+      `holds ownership handles through persistence and rejects ${state} changes afterward`,
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* verificationFixture();
+          let allowed = true;
+          let used = false;
+          const context = yield* verificationContext(
+            fixture,
+            Effect.suspend(() =>
+              allowed ? Effect.void : Effect.fail(unavailable(fixture.assigned)),
+            ),
+          );
+          const result = yield* Managed.withManagedVerificationTarget(context, () =>
+            Effect.sync(() => {
+              used = true;
+              expect(verificationFds(fixture.assigned).length).toBeGreaterThan(0);
+              expect(verificationFds(fixture.metadata).length).toBeGreaterThan(0);
+              switch (state) {
+                case "base":
+                  fixture.answers.base = "4".repeat(40);
+                  break;
+                case "head":
+                  fixture.answers.head = fixture.answers.worktreeHead = "4".repeat(40);
+                  break;
+                case "tree":
+                  fixture.answers.tree = "4".repeat(40);
+                  break;
+                case "dirty":
+                  fixture.answers.status = " M file.txt\0";
+                  break;
+                case "physical worktree":
+                  nativeFs.renameSync(fixture.assigned, fixture.assigned + "-moved");
+                  nativeFs.mkdirSync(fixture.assigned);
+                  break;
+                case "marker":
+                  nativeFs.writeFileSync(
+                    nativePath.join(fixture.metadata, "t3-managed-owner"),
+                    "foreign",
+                  );
+                  break;
+                case "authority":
+                  allowed = false;
+                  break;
+              }
+              return "cannot report successful persistence";
+            }),
+          ).pipe(Effect.result);
+          expect(used).toBe(true);
+          expect(result._tag).toBe("Failure");
+          expect(verificationFds(fixture.assigned)).toEqual([]);
+          expect(verificationFds(fixture.metadata)).toEqual([]);
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+  it.effect(
+    "rechecks commit and tree refs around the clean read before granting the callback",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        const context = yield* verificationContext(fixture);
+        fixture.answers.beforeRead = (command) => {
+          if (command.args.includes("status"))
+            fixture.answers.head = fixture.answers.worktreeHead = "4".repeat(40);
+        };
+        yield* noVerificationUse(fixture, context);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect(
+    "preserves a callback failure while still rechecking and releasing retained handles",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        let reads = 0;
+        const context = yield* verificationContext(
+          fixture,
+          Effect.sync(() => {
+            reads += 1;
+          }),
+        );
+        const failure = new Error("Selection persistence failed");
+        const result = yield* Managed.withManagedVerificationTarget(context, () =>
+          Effect.fail(failure),
+        ).pipe(Effect.result);
+        expect(result).toMatchObject({ _tag: "Failure", failure });
+        expect(reads).toBeGreaterThanOrEqual(4);
+        expect(verificationFds(fixture.assigned)).toEqual([]);
+        expect(verificationFds(fixture.metadata)).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("Managed verification target capture (synthetic Git)", () => {
+  it.effect(
+    "rejects ambiguous assigned registration fields rather than accepting any matching HEAD",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        const context = yield* verificationContext(fixture);
+        fixture.answers.registration = `worktree ${fixture.assigned}\0HEAD ${fixture.head}\0HEAD ${fixture.base}\0branch ${fixture.assignment.branchRef}\0\0`;
+        yield* noVerificationUse(fixture, context);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("Managed verification target capture (synthetic Git)", () => {
+  for (const window of ["entry", "exit"] as const) {
+    for (const change of ["base", "head", "untracked", "unchanged"] as const) {
+      it.effect(`rescans ${change} after the held ${window} authority check`, () =>
+        Effect.gen(function* () {
+          const fixture = yield* verificationFixture();
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          let authorityReads = 0;
+          let used = false;
+          const context = yield* verificationContext(
+            fixture,
+            Effect.suspend(() => {
+              authorityReads += 1;
+              return authorityReads === (window === "entry" ? 2 : 4)
+                ? Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void;
+            }),
+          );
+          const fiber = yield* Managed.withManagedVerificationTarget(context, (target) =>
+            Effect.sync(() => {
+              used = true;
+              expect(target.headSha).toBe(fixture.head);
+              return "persisted";
+            }),
+          ).pipe(Effect.result, Effect.forkChild);
+          yield* Deferred.await(held);
+          yield* Effect.sync(() => {
+            expect(used).toBe(window === "exit");
+            expect(verificationFds(fixture.assigned).length).toBeGreaterThan(0);
+            expect(verificationFds(fixture.metadata).length).toBeGreaterThan(0);
+            switch (change) {
+              case "base":
+                nativeFs.writeFileSync(
+                  nativePath.join(
+                    fixture.assignment.commonGitDirectory,
+                    fixture.assignment.baseRef,
+                  ),
+                  "4".repeat(40) + "\n",
+                );
+                fixture.answers.base = "4".repeat(40);
+                break;
+              case "head":
+                nativeFs.writeFileSync(
+                  nativePath.join(
+                    fixture.assignment.commonGitDirectory,
+                    fixture.assignment.branchRef,
+                  ),
+                  "4".repeat(40) + "\n",
+                );
+                fixture.answers.head = fixture.answers.worktreeHead = "4".repeat(40);
+                break;
+              case "untracked":
+                nativeFs.writeFileSync(nativePath.join(fixture.assigned, "generated.txt"), "input");
+                fixture.answers.status = "?? generated.txt\0";
+                fixture.answers.untracked = "generated.txt\0";
+                break;
+              case "unchanged":
+                break;
+            }
+          }).pipe(Effect.onExit(() => Deferred.succeed(release, undefined)));
+          const result = yield* Fiber.join(fiber);
+          expect(result._tag).toBe(change === "unchanged" ? "Success" : "Failure");
+          expect(used).toBe(window === "exit" || change === "unchanged");
+          expect(verificationFds(fixture.assigned)).toEqual([]);
+          expect(verificationFds(fixture.metadata)).toEqual([]);
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      );
+    }
+  }
+  it.effect("releases handles when a callback throws synchronously", () =>
+    Effect.gen(function* () {
+      const fixture = yield* verificationFixture();
+      let authorityReads = 0;
+      const context = yield* verificationContext(
+        fixture,
+        Effect.sync(() => {
+          authorityReads += 1;
+        }),
+      );
+      const failure = new Error("Synchronous persistence defect");
+      const result = yield* Managed.withManagedVerificationTarget(
+        context,
+        (): Effect.Effect<never> => {
+          throw failure;
+        },
+      ).pipe(Effect.exit);
+      expect(result._tag).toBe("Failure");
+      expect(authorityReads).toBe(4);
+      expect(verificationFds(fixture.assigned)).toEqual([]);
+      expect(verificationFds(fixture.metadata)).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect("releases handles when the held entry authority check is interrupted", () =>
+    Effect.gen(function* () {
+      const fixture = yield* verificationFixture();
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let authorityReads = 0;
+      let used = false;
+      const context = yield* verificationContext(
+        fixture,
+        Effect.suspend(() => {
+          authorityReads += 1;
+          return authorityReads === 2
+            ? Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void;
+        }),
+      );
+      const fiber = yield* Managed.withManagedVerificationTarget(context, () =>
+        Effect.sync(() => {
+          used = true;
+        }),
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(held);
+      expect(verificationFds(fixture.assigned).length).toBeGreaterThan(0);
+      yield* Fiber.interrupt(fiber);
+      expect(used).toBe(false);
+      expect(verificationFds(fixture.assigned)).toEqual([]);
+      expect(verificationFds(fixture.metadata)).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+  it.effect(
+    "rechecks and releases the captured ownership scope when persistence is interrupted",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* verificationFixture();
+        let reads = 0;
+        const context = yield* verificationContext(
+          fixture,
+          Effect.sync(() => {
+            reads += 1;
+          }),
+        );
+        const started = yield* Deferred.make<void>();
+        const waiting = yield* Deferred.make<void>();
+        const fiber = yield* Managed.withManagedVerificationTarget(context, () =>
+          Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(waiting))),
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(started);
+        expect(verificationFds(fixture.assigned).length).toBeGreaterThan(0);
+        yield* Fiber.interrupt(fiber);
+        expect(reads).toBeGreaterThanOrEqual(4);
+        expect(verificationFds(fixture.assigned)).toEqual([]);
+        expect(verificationFds(fixture.metadata)).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

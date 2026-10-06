@@ -38,6 +38,15 @@ const Receipt = Schema.Struct({
 });
 export type ManagedGitAssignment = typeof Assignment.Type;
 export type ManagedWorkspaceReceipt = typeof Receipt.Type;
+/** Captured committed identity only; it grants no permission to execute work. */
+export interface ManagedVerificationTarget {
+  readonly receipt: ManagedWorkspaceReceipt;
+  readonly cwd: string;
+  readonly baseSha: string;
+  readonly headSha: string;
+  readonly testedCommit: string;
+  readonly testedTree: string;
+}
 const encodeAssignment = Schema.encodeSync(Schema.fromJsonString(Assignment));
 const encodeReceipt = Schema.encodeSync(Schema.fromJsonString(Receipt));
 const decodeAssignment = Schema.decodeUnknownEffect(Assignment);
@@ -49,6 +58,9 @@ export interface ManagedGitExecution {
 }
 interface Execution {
   readonly assignment: ManagedGitAssignment;
+  readonly withVerificationTarget: <A, E, R>(
+    use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | GitCommandError, R>;
   readonly prepare: (input: VcsCreateWorktreeInput) => Effect.Effect<string, GitCommandError>;
   readonly create: (
     input: VcsCreateWorktreeInput,
@@ -140,6 +152,15 @@ export const createManagedWorktree = (
   context: ManagedGitExecution,
   input: VcsCreateWorktreeInput,
 ) => getExecution(context, input.cwd).pipe(Effect.flatMap((execution) => execution.create(input)));
+
+/** Hold the repository permit through this read and the callback's receipt persistence. */
+export const withManagedVerificationTarget = <A, E, R>(
+  context: ManagedGitExecution,
+  use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | GitCommandError, R> =>
+  getExecution(context, "").pipe(
+    Effect.flatMap((execution) => execution.withVerificationTarget(use)),
+  );
 
 /** Canonical common metadata is also the permit key for ordinary linked-worktree mutations. */
 export const canonicalGitMutationKey = (common: string, cwd: string) =>
@@ -734,7 +755,149 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
       }),
     );
   });
+  const inspectVerificationTarget = Effect.fn("ManagedGitExecution.inspectVerificationTarget")(
+    function* (state: ReturnType<typeof snapshot>) {
+      const receipt = state.workspace;
+      if (!receipt) return yield* deny("Managed workspace receipt is missing.");
+      const read = (args: ReadonlyArray<string>) =>
+        command(
+          [`--git-dir=${receipt.gitDirectory.path}`, `--work-tree=${a.worktreePath}`, ...args],
+          state,
+          false,
+        );
+      const oid = Effect.fn("ManagedGitExecution.verificationOid")(function* (ref: string) {
+        const result = yield* read(["rev-parse", "--verify", ref]);
+        if (result.code !== 0 || !/^[a-f0-9]{40}\n?$/.test(result.stdout))
+          return yield* deny("Verification target commit or tree is unavailable.");
+        return result.stdout.trim();
+      });
+      const baseSha = yield* oid(`${a.baseRef}^{commit}`);
+      if (baseSha !== a.baseOid)
+        return yield* deny("Approved local base ref moved or is unavailable.");
+      const headSha = yield* oid(`${a.branchRef}^{commit}`);
+      if ((yield* oid("HEAD^{commit}")) !== headSha)
+        return yield* deny("Assigned branch and worktree HEAD disagree.");
+      const testedTree = yield* oid("HEAD^{tree}");
+      const registration = yield* read(["worktree", "list", "--porcelain", "-z"]);
+      const assigned = registration.stdout
+        .split("\0\0")
+        .filter((entry) => entry.split("\0").includes(`worktree ${a.worktreePath}`));
+      const fields = assigned[0]?.split("\0") ?? [];
+      if (
+        registration.code !== 0 ||
+        !registration.stdout.endsWith("\0\0") ||
+        assigned.length !== 1 ||
+        fields.filter((field) => field.startsWith("worktree ")).length !== 1 ||
+        fields.filter((field) => field.startsWith("branch ")).length !== 1 ||
+        fields.filter((field) => field.startsWith("HEAD ")).length !== 1 ||
+        !fields.includes(`branch ${a.branchRef}`) ||
+        !fields.includes(`HEAD ${headSha}`)
+      )
+        return yield* deny(
+          "Verification worktree registration does not match its assigned branch and commit.",
+        );
+      for (const args of [
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+        [
+          "diff",
+          "--cached",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--quiet",
+          "--exit-code",
+          "HEAD",
+          "--",
+        ],
+        ["diff", "--no-ext-diff", "--no-textconv", "--quiet", "--exit-code", "--"],
+        ["ls-files", "--unmerged", "-z", "--"],
+        // Includes ignored inputs: they are not represented by the committed target.
+        ["ls-files", "--others", "-z", "--"],
+      ]) {
+        const result = yield* read(args);
+        if (result.code !== 0 || result.stdout !== "")
+          return yield* deny(
+            "Verification requires a clean committed worktree, index and untracked state.",
+          );
+      }
+      const tracked = yield* read(["ls-files", "-v", "-z", "--"]);
+      if (
+        tracked.code !== 0 ||
+        (tracked.stdout !== "" &&
+          (!tracked.stdout.endsWith("\0") ||
+            tracked.stdout
+              .slice(0, -1)
+              .split("\0")
+              .some((entry) => !entry.startsWith("H ") || entry.length <= 2)))
+      )
+        return yield* deny(
+          "Verification does not support hidden or unmerged tracked index entries.",
+        );
+      if (
+        (yield* oid(`${a.baseRef}^{commit}`)) !== baseSha ||
+        (yield* oid(`${a.branchRef}^{commit}`)) !== headSha ||
+        (yield* oid("HEAD^{commit}")) !== headSha ||
+        (yield* oid("HEAD^{tree}")) !== testedTree
+      )
+        return yield* deny("Verification refs changed while reading the clean target.");
+      return { baseSha, headSha, testedTree };
+    },
+  );
+  const withVerificationTarget = Effect.fn("ManagedGitExecution.withVerificationTarget")(function* <
+    A,
+    E,
+    R,
+  >(use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>) {
+    if (!prior) return yield* deny("A retained workspace receipt is required for verification.");
+    yield* options.revalidate;
+    const current = yield* acquireSnapshot(true);
+    const workspace = current.workspace;
+    if (!workspace || encodeReceipt(workspace) !== priorText)
+      return yield* deny("Prior receipt does not match current workspace ownership.");
+    yield* supportedConfiguration(current);
+    const captured = yield* inspectVerificationTarget(current);
+    yield* options.revalidate;
+    yield* verify(current);
+    const entered = yield* inspectVerificationTarget(current);
+    if (
+      entered.baseSha !== captured.baseSha ||
+      entered.headSha !== captured.headSha ||
+      entered.testedTree !== captured.testedTree
+    )
+      return yield* deny("Verification target changed while revalidating capture authority.");
+    const receipt = Object.freeze({
+      ...workspace,
+      assignment: Object.freeze({ ...workspace.assignment }),
+      primary: Object.freeze({ ...workspace.primary }),
+      common: Object.freeze({ ...workspace.common }),
+      worktree: Object.freeze({ ...workspace.worktree }),
+      gitDirectory: Object.freeze({ ...workspace.gitDirectory }),
+    });
+    const target: ManagedVerificationTarget = Object.freeze({
+      receipt,
+      cwd: a.worktreePath,
+      ...captured,
+      testedCommit: captured.headSha,
+    });
+    return yield* Effect.suspend(() => use(target)).pipe(
+      Effect.onExit(() =>
+        Effect.gen(function* () {
+          yield* options.revalidate;
+          yield* supportedConfiguration(current);
+          yield* inspectVerificationTarget(current);
+          yield* options.revalidate;
+          yield* verify(current);
+          const checked = yield* inspectVerificationTarget(current);
+          if (
+            checked.baseSha !== captured.baseSha ||
+            checked.headSha !== captured.headSha ||
+            checked.testedTree !== captured.testedTree
+          )
+            return yield* deny("Verification target changed during capture persistence.");
+        }),
+      ),
+    );
+  }, Effect.scoped);
   const context: ManagedGitExecution = Object.freeze({ [brand]: true as const });
-  executions.set(context, { assignment: a, prepare, create });
+  executions.set(context, { assignment: a, prepare, create, withVerificationTarget });
   return context;
 });
