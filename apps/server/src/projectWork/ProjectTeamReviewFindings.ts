@@ -13,15 +13,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectTeamAuthority, ProjectTeamPrincipal } from "./ProjectTeamAuthorization.ts";
-import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
-import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
-import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
-import {
-  evaluateReviewFindingTransition,
-  evaluateReviewSessionEligibility,
-} from "./ProjectTeamReview.ts";
-import { assertProjectTeamSemanticWork } from "./ProjectTeamPolicy.ts";
-import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
+import { evaluateReviewFindingTransition } from "./ProjectTeamReview.ts";
+import { makeProjectTeamReviewQualification } from "./ProjectTeamReviewQualification.ts";
 
 export class ProjectTeamReviewFindingsError extends Schema.TaggedError<ProjectTeamReviewFindingsError>()(
   "ProjectTeamReviewFindingsError",
@@ -57,7 +50,7 @@ export const makeProjectTeamReviewFindings = <E, R>(
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    const repository = yield* ProjectWorkRepository;
+    const qualification = yield* makeProjectTeamReviewQualification(resolveAuthority);
     const requireTransaction = Effect.gen(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (
@@ -73,151 +66,20 @@ export const makeProjectTeamReviewFindings = <E, R>(
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) {
-      const authority = yield* resolveAuthority(principal);
-      if (
-        !authority ||
-        !principal.managed ||
-        principal.actor.kind !== "agent" ||
-        canonical(attribution.actor) !== canonical(principal.actor)
-      )
-        return yield* deny("A current authenticated managed reviewer is required");
-      const { binding, role, state } = authority;
-      if (
-        role.role !== "reviewer" ||
-        !role.tools.includes("project-work.report") ||
-        !binding.configuration.toolIds.includes("project-work.report")
-      )
-        return yield* deny("The original reviewer lacks report capability");
-      yield* Effect.try({
-        try: () => assertProjectTeamSemanticWork(state, binding, role),
-        catch: () => deny("Reviewer semantic assignment changed"),
+      const { authority, retained, target, provenance } = yield* qualification.qualify({
+        principal,
+        attribution,
+        projectId: intent.projectId,
+        reviewTaskId: intent.taskId,
+        specRevision: intent.specRevision,
+        planRevision: intent.planRevision,
+        expectedTaskRevision: intent.expectedTaskRevision,
+        expectedProjectRevision: intent.expectedRevision,
+        duplicate,
       });
-      const task = state.tasks.find((t) => t.taskId === binding.taskId);
-      if (
-        intent.projectId !== binding.projectId ||
-        intent.taskId !== binding.taskId ||
-        !task ||
-        (!duplicate && intent.expectedRevision !== state.revision) ||
-        intent.expectedTaskRevision !== task.revision ||
-        intent.specRevision !== binding.specRevision ||
-        intent.planRevision !== binding.planRevision ||
-        !binding.sessionId
-      )
-        return yield* deny("Reviewer task or revisions changed");
-      const environmentId = binding.environmentId;
-      // 128 is the retained readers' decoding ceiling, not a reservation or budget grant.
-      const readers = yield* Effect.gen(function* () {
-        const journal = yield* makeProjectTeamDispatchJournal({
-          environmentId,
-          maximumEnvironmentModelCalls: 128,
-        });
-        const targets = yield* makeProjectTeamReviewTargets({
-          environmentId,
-          maximumEnvironmentModelCalls: 128,
-        });
-        const freshness = yield* makeProjectTeamReviewFreshness({ environmentId });
-        return { journal, targets, freshness };
-      }).pipe(Effect.provideService(ProjectWorkRepository, repository));
-      const dispatches = yield* sql<{
-        dispatchId: string;
-      }>`SELECT dispatch_id AS dispatchId FROM project_team_dispatch WHERE environment_id=${environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 2`;
-      if (dispatches.length !== 1)
-        return yield* deny("Original reviewer dispatch is missing or ambiguous");
-      const original = yield* readers.journal.inspect(dispatches[0]!.dispatchId, {
-        requireClaim: true,
-      });
-      const retained = yield* readers.targets.readForDispatch(original);
-      const fresh = yield* readers.freshness.readForSessionInTransaction({
-        projectId: binding.projectId,
-        taskId: binding.taskId,
-        bindingId: binding.recordId,
-        generation: binding.generation,
-        providerInstanceId: binding.providerInstanceId,
-        threadId: binding.threadId,
-        sessionId: binding.sessionId,
-        specRevision: binding.specRevision,
-        planRevision: binding.planRevision,
-      });
-      if (
-        fresh.operationId !== original.intent.request.initializeOperationId ||
-        fresh.operationId !== retained.reviewer.initializeOperationId ||
-        retained.reviewer.bindingId !== binding.recordId ||
-        retained.reviewer.generation !== binding.generation
-      )
-        return yield* deny("Original reviewer initialization changed");
+      const { state } = authority;
       const manifest = retained.prepared.manifest;
-      const target = {
-        projectId: manifest.projectId,
-        taskId: manifest.taskId,
-        specRevision: manifest.specRevision,
-        planRevision: manifest.planRevision,
-        baseSha: manifest.target.baseSha,
-        headSha: manifest.target.headSha,
-      };
-      const identity = {
-        memberId: binding.memberId,
-        runId: binding.recordId,
-        threadId: binding.threadId,
-        providerInstanceId: binding.providerInstanceId,
-        sessionId: fresh.native.sessionId,
-      };
       const records = state.foundationRecords ?? [];
-      const history = records.filter((r) => r.kind === "run-binding" && r.taskId === target.taskId);
-      for (const prior of history) {
-        if (prior.kind !== "run-binding") continue;
-        const roles = records.filter((r) => r.recordId === prior.roleRevisionId);
-        if (roles.length !== 1 || roles[0]?.kind !== "role-revision")
-          return yield* deny("Historical implementation role is missing or ambiguous");
-      }
-      const implementers = history.filter(
-        (r) =>
-          r.kind === "run-binding" &&
-          records.some(
-            (role) =>
-              role.kind === "role-revision" &&
-              role.recordId === r.roleRevisionId &&
-              (role.role === "implementer" || role.role === "integrator"),
-          ),
-      );
-      if (implementers.length > 256)
-        return yield* deny("Implementation history exceeds the independence bound");
-      for (const prior of implementers) {
-        if (prior.kind !== "run-binding") continue;
-        if (
-          prior.memberId === identity.memberId ||
-          prior.recordId === identity.runId ||
-          prior.threadId === identity.threadId ||
-          (prior.sessionId !== undefined &&
-            prior.providerInstanceId === identity.providerInstanceId &&
-            prior.sessionId === identity.sessionId)
-        )
-          return yield* deny("Reviewer overlaps retained implementation history");
-      }
-      const eligibility = evaluateReviewSessionEligibility({
-        target,
-        reviewer: { target, identity },
-        implementers: implementers.flatMap((r) =>
-          r.kind === "run-binding" && r.sessionId !== undefined
-            ? [
-                {
-                  memberId: r.memberId,
-                  runId: r.recordId,
-                  threadId: r.threadId,
-                  providerInstanceId: r.providerInstanceId,
-                  sessionId: r.sessionId,
-                },
-              ]
-            : [],
-        ),
-        sessionObservation: {
-          identity,
-          fresh: true,
-          resumed: false,
-          conversationHistoryPresent: false,
-        },
-      });
-      if (eligibility.status !== "eligible")
-        return yield* deny(`Reviewer independence denied: ${eligibility.reason}`);
       const criteria = state.criteria
         .filter((c) => c.taskId === target.taskId)
         .map((c) => c.criterionId);
@@ -243,18 +105,6 @@ export const makeProjectTeamReviewFindings = <E, R>(
       const current = matches[0]?.kind === "review-finding" ? decodeRecord(matches[0]) : undefined;
       if (current && canonical(current.target) !== canonical(target))
         return yield* deny("Original finding target changed");
-      const provenance = {
-        reviewTaskId: binding.taskId,
-        bindingId: binding.recordId,
-        generation: binding.generation,
-        memberId: binding.memberId,
-        providerInstanceId: binding.providerInstanceId,
-        threadId: binding.threadId,
-        sessionId: fresh.native.sessionId,
-        initializeOperationId: fresh.operationId,
-        dispatchId: original.fence.dispatchId,
-        targetSha256: hash(retained),
-      };
       const proposed = decodeRecord({
         kind: "review-finding",
         projectId: target.projectId,

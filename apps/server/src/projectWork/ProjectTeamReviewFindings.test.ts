@@ -6,6 +6,8 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
@@ -13,11 +15,15 @@ import * as TestClock from "effect/testing/TestClock";
 import {
   canonicalProjectWorkPayload,
   ProjectTeamReviewFindingIntent,
+  ProjectTeamReviewFindingProvenance,
   ProjectTeamRecord,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamWriteIntent,
   ProjectTeamRecordRead,
   ProjectWorkCriterionId,
+  ProjectTeamGuidedIntent,
+  ThreadId,
+  ProjectWorkEvidenceId,
 } from "@t3tools/contracts";
 import {
   scoped,
@@ -28,6 +34,12 @@ import {
   restoreHistoricalBinding,
   gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+import {
+  makeProjectTeamReviewCompletionProposals,
+  ProjectTeamReviewReportOperation,
+  ProjectTeamReviewCompletionProposalError,
+  type ProjectTeamReviewCompletionProposalManifest,
+} from "./ProjectTeamReviewCompletionProposals.ts";
 import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
@@ -535,6 +547,11 @@ const fixture = Effect.gen(function* () {
     state,
     commitRecords,
     reviewRole,
+    nativeIntent,
+    native,
+    allocation,
+    owner,
+    snapshot,
   };
 });
 
@@ -1116,4 +1133,995 @@ it.effect("stable finding identity rejects reuse against a replaced original tar
       expect((yield* f.compile(yield* f.report()).pipe(Effect.result))._tag).toBe("Failure");
     }),
   ),
+);
+
+const decodeCompletionReport = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, strict);
+const proposalFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const current = yield* f.state();
+  const task = current.tasks.find((t) => t.taskId === f.running.taskId)!;
+  const memberships =
+    current.foundationRecords?.filter(
+      (r) => r.kind === "task-membership" && r.taskId === task.taskId,
+    ) ?? [];
+  const membership = memberships[0];
+  if (memberships.length !== 1 || membership?.kind !== "task-membership")
+    return yield* Effect.die("Missing reviewer membership");
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+    verifyStage: () => Effect.void,
+  });
+  let snapshot = f.snapshot;
+  for (const stage of [
+    "workspace-ready",
+    "setup-complete",
+    "session-bound",
+    "assignment-intent",
+  ] as const) {
+    snapshot = yield* journal.advanceStage(snapshot.fence, {
+      receiptId: "proposal-stage-" + stage,
+      stage,
+      evidence: { controlledCustody: true },
+    });
+  }
+  const rootBudget = {
+    rootTaskId: snapshot.intent.limits.rootTaskId,
+    maximumTokens: snapshot.intent.limits.maximumTokens,
+    deadlineAtMs: snapshot.intent.limits.rootDeadlineAtMs,
+  };
+  const operationLimits = {
+    maximumTokens: snapshot.intent.limits.attemptMaximumTokens,
+    deadlineAtMs: snapshot.intent.limits.deadlineAtMs,
+  };
+  const roots =
+    current.foundationRecords?.filter(
+      (r) => r.kind === "run-binding" && r.taskId === rootBudget.rootTaskId,
+    ) ?? [];
+  const root = roots[0];
+  if (roots.length !== 1 || root?.kind !== "run-binding")
+    return yield* Effect.die("Missing original root binding");
+  const originalInitialize = { ...f.nativeIntent, rootBudget, operationLimits };
+  yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(originalInitialize)},root_binding_id=${root.recordId},root_task_id=${root.taskId},maximum_tokens=${operationLimits.maximumTokens},deadline_at_ms=${operationLimits.deadlineAtMs} WHERE operation_id='review-initialize'`;
+  const request = {
+    kind: "prompt",
+    operationId: "review-assignment",
+    threadId: f.running.threadId,
+    prompt: "Review the original target",
+    resumeCursor: f.native,
+  };
+  const intent = { ...originalInitialize, request, binding: f.running };
+  yield* f.sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
+    operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json)
+    VALUES ('review-assignment','environment',${projectId},${f.running.recordId},0,${f.running.providerInstanceId},${f.running.threadId},'review-assignment-worker',1,'prompt',${digest(canonical(request))},
+    ${root.recordId},${root.taskId},${operationLimits.maximumTokens},${operationLimits.deadlineAtMs},'running',${canonical(intent)})`;
+  // Synthetic retained custody only; no process is started by this fixture.
+  const allocation = { ...f.allocation, unit: f.allocation.unit + "-assignment" };
+  const assignedIntent = { ...intent, allocation };
+  yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(assignedIntent)} WHERE operation_id='review-assignment'`;
+  yield* f.sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status,owner_json) VALUES (${allocation.unit},'review-assignment',${canonical(allocation)},'captured',${canonical({ ...f.owner, unit: allocation.unit, cgroup: "/sys/fs/cgroup/" + allocation.unit })})`;
+  const operation = {
+    environmentId: "environment",
+    projectId,
+    reviewTaskId: task.taskId,
+    bindingId: f.running.recordId,
+    generation: 0,
+    providerInstanceId: f.running.providerInstanceId,
+    threadId: f.running.threadId,
+    operationId: "review-assignment",
+    operationKind: "prompt" as const,
+    workerId: "review-assignment-worker",
+    ordinal: 1,
+  };
+  const criteria = current.criteria.filter(
+    (c) =>
+      c.taskId === task.taskId &&
+      (c.required || task.specification?.criterionIds.includes(c.criterionId)),
+  );
+  const report = decodeCompletionReport({
+    type: "project-team.assignment.report",
+    commandId: "review-completion-report",
+    projectId,
+    taskId: task.taskId,
+    expectedRevision: current.revision,
+    expectedTaskRevision: task.revision,
+    specRevision: f.running.specRevision,
+    planRevision: f.running.planRevision,
+    assignmentId: membership.recordId,
+    expectedAssignmentRevision: membership.revision,
+    summary: "Original independent review completed; pending qualification",
+    evidenceIds: [],
+    outputArtifactIds: [],
+    outputs: criteria.map((c) => ({
+      criterionId: c.criterionId,
+      kind: "observation",
+      detail: "Checked the original target; no findings in this control",
+    })),
+    outcome: "complete",
+  });
+  const auth = yield* ProjectTeamAuthorization;
+  if (report.type !== "project-team.assignment.report")
+    return yield* Effect.die("Invalid completion report fixture");
+  const proposals = yield* makeProjectTeamReviewCompletionProposals(auth.resolve);
+  const compile = () =>
+    f.sql.withTransaction(
+      proposals
+        .compile(f.principal, report, f.reportAttribution)
+        .pipe(Effect.provideService(ProjectTeamReviewReportOperation, operation)),
+    );
+  return { ...f, proposals, operation, completionReport: report, compileProposal: compile };
+});
+it.effect(
+  "retains a pending original review completion proposal with explicit empty findings and no work-state changes",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const before = yield* f.state();
+        const command = yield* f.compileProposal();
+        expect(command.records).toEqual([]);
+        expect(() => decodeCommit(command)).toThrow();
+        const retained = yield* f.sql.withTransaction(
+          f.proposals.readRetained({
+            environmentId: "environment",
+            projectId,
+            commandId: f.completionReport.commandId,
+          }),
+        );
+        expect(retained?.manifest.findings).toEqual([]);
+        expect(retained?.manifest.report).toEqual(f.completionReport);
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+const completionTool = (f: Effect.Success<typeof proposalFixture>, report = f.completionReport) =>
+  executePiProjectWorkBridgeTool({
+    toolName: "project_work_report",
+    arguments: { intentJSON: canonical(report) },
+    principal: f.principal,
+    source: f.reportAttribution.source,
+  }).pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation));
+const readProposal = (f: Effect.Success<typeof proposalFixture>) =>
+  f.sql.withTransaction(
+    f.proposals.readRetained({
+      environmentId: "environment",
+      projectId,
+      commandId: f.completionReport.commandId,
+    }),
+  );
+
+it.effect(
+  "actual report tool commits only a pending proposal and zero-event receipt; exact retry survives unrelated project revision",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const before = yield* f.state();
+        yield* completionTool(f);
+        expect(yield* f.state()).toEqual(before);
+        const retained = yield* readProposal(f);
+        expect(retained?.manifest.findings).toEqual([]);
+        expect(
+          yield* f.sql`SELECT event_ids_json AS ids FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.completionReport.commandId}`,
+        ).toEqual([{ ids: "[]" }]);
+        yield* f.repository.execute({
+          type: "project-work.task.create",
+          projectId,
+          taskId: ProjectTeamReviewFindingIntent.fields.taskId.make("unrelated-task"),
+          commandId: ProjectTeamReviewFindingIntent.fields.commandId.make("unrelated-create"),
+          title: "Unrelated work",
+          createdAt: at,
+        });
+        const moved = yield* f.state();
+        yield* TestClock.setTime(Date.parse(at) + 2);
+        yield* completionTool(f);
+        expect(yield* f.state()).toEqual(moved);
+        expect(yield* readProposal(f)).toEqual(retained);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.completionReport.commandId}`,
+        ).toEqual([{ count: 1 }]);
+      }),
+    ),
+);
+
+it.effect(
+  "live validation never retains a proposal, including a duplicate marker without an original receipt",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* f.sql.withTransaction(
+          f.proposals
+            .validate(f.principal, f.completionReport, f.reportAttribution, { duplicate: false })
+            .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+        );
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              f.proposals
+                .validate(f.principal, f.completionReport, f.reportAttribution, { duplicate: true })
+                .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+      }),
+    ),
+);
+
+for (const change of [
+  "absent",
+  "human",
+  "foreign-environment",
+  "foreign-worker",
+  "later-prompt",
+  "compact",
+  "extra-host-field",
+] as const) {
+  it.effect(
+    `pending completion denies ${change} host custody without proposal, receipt or domain changes`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const f = yield* proposalFixture;
+          const before = yield* f.state();
+          const operation = {
+            ...f.operation,
+            ...(change === "foreign-environment" ? { environmentId: "foreign" } : {}),
+            ...(change === "foreign-worker" ? { workerId: "another-worker" } : {}),
+            ...(change === "later-prompt" ? { operationId: "later-prompt", ordinal: 2 } : {}),
+          };
+          // Deliberately corrupt only disposable private-context data, retaining its declared host type.
+          if (change === "compact")
+            Object.defineProperty(operation, "operationKind", { value: "compact" });
+          if (change === "extra-host-field")
+            Object.defineProperty(operation, "callerSuppliedReceipt", {
+              value: "untrusted",
+              enumerable: true,
+            });
+          const gateway = yield* ProjectWorkGateway;
+          const principal =
+            change === "human" ? { actor: { kind: "human" as const, id: "human" } } : f.principal;
+          const effect = gateway.write(
+            f.completionReport,
+            principal.actor,
+            f.reportAttribution.source,
+            principal,
+          );
+          const guarded =
+            change === "absent"
+              ? effect.pipe(
+                  Effect.updateContext((context: Context.Context<never>) =>
+                    Context.omit(ProjectTeamReviewReportOperation)(context),
+                  ),
+                )
+              : effect.pipe(Effect.provideService(ProjectTeamReviewReportOperation, operation));
+          expect((yield* guarded.pipe(Effect.result))._tag).toBe("Failure");
+          expect(yield* readProposal(f)).toBeUndefined();
+          expect(yield* f.state()).toEqual(before);
+          expect(
+            yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
+          ).toEqual([{ count: 0 }]);
+        }),
+      ),
+  );
+}
+
+it.effect(
+  "a secret-bearing completion report is rejected before any private proposal or public receipt is retained",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          summary: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+        };
+        expect((yield* completionTool(f, report).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${report.commandId}`,
+        ).toEqual([{ count: 0 }]);
+      }),
+    ),
+);
+
+it.effect(
+  "generic managed review completion remains denied even with report outputs and a retained pending proposal",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* f.compileProposal();
+        const before = yield* f.state();
+        const command = decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: f.completionReport.commandId,
+          expectedRevision: f.completionReport.expectedRevision,
+          attribution: f.reportAttribution,
+          committedAt: at,
+          records: [],
+          guided: {
+            intent: f.completionReport,
+            bindingId: f.running.recordId,
+            generation: f.running.generation,
+          },
+        });
+        expect((yield* f.repository.execute(command).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect(
+  "pending proposals accept retained nested systemd custody and reject path traversal",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const unit = f.allocation.unit + "-assignment";
+        const nested = {
+          ...f.owner,
+          unit,
+          cgroup: "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/" + unit,
+        };
+        yield* f.sql`UPDATE project_team_pi_process SET owner_json=${canonical(nested)} WHERE operation_id='review-assignment'`;
+        yield* f.compileProposal();
+        const retained = yield* readProposal(f);
+        expect(retained).toBeDefined();
+        yield* f.sql`UPDATE project_team_pi_process SET owner_json=${canonical({ ...nested, cgroup: "/sys/fs/cgroup/user.slice/../" + unit })} WHERE operation_id='review-assignment'`;
+        expect((yield* f.compileProposal().pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toEqual(retained);
+      }),
+    ),
+);
+
+it.effect(
+  "public authorization rejects foreign SQL and a missing original caller transaction for completion",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const auth = yield* ProjectTeamAuthorization;
+        const action = auth
+          .guided(f.principal, f.completionReport, f.reportAttribution, false)
+          .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation));
+        expect((yield* action.pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(action.pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql })))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+      }),
+    ),
+);
+
+it.effect(
+  "proposal inputs and private host context are captured before an awaited real authority read",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const auth = yield* ProjectTeamAuthorization;
+        const entered = yield* Deferred.make<void>();
+        const proceed = yield* Deferred.make<void>();
+        const proposals = yield* makeProjectTeamReviewCompletionProposals((principal) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(proceed);
+            return yield* auth.resolve(principal);
+          }),
+        );
+        const principal = { ...f.principal, managed: { ...f.principal.managed } };
+        const report = {
+          ...f.completionReport,
+          outputs: (f.completionReport.outputs ?? []).map((output) => ({ ...output })),
+        };
+        const attribution = { ...f.reportAttribution, source: { ...f.reportAttribution.source } };
+        const operation = { ...f.operation };
+        const original = structuredClone({ report, attribution, operation });
+        const action = proposals.compile(principal, report, attribution);
+        report.summary = "Changed before the effect even starts";
+        const running = yield* Effect.forkChild(
+          f.sql.withTransaction(
+            action.pipe(Effect.provideService(ProjectTeamReviewReportOperation, operation)),
+          ),
+        );
+        yield* Deferred.await(entered);
+        operation.workerId = "retargeted-worker";
+        operation.operationId = "replacement-prompt";
+        principal.managed.threadId = ThreadId.make("retargeted-thread");
+        attribution.source.id = "retargeted-source";
+        report.outputs[0]!.detail = "Changed after ownership capture";
+        yield* Deferred.succeed(proceed, undefined);
+        yield* Fiber.join(running);
+        const receipt = yield* readProposal(f);
+        expect(receipt?.manifest.report).toEqual(original.report);
+        expect(receipt?.manifest.attribution).toEqual(original.attribution);
+        expect(receipt?.manifest.operation).toEqual(original.operation);
+      }),
+    ),
+);
+
+it.effect(
+  "a retained original proposal forbids a changed report or a second command for the same assignment",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* f.compileProposal();
+        const first = yield* readProposal(f);
+        const before = yield* f.state();
+        for (const report of [
+          { ...f.completionReport, summary: "A materially changed report" },
+          {
+            ...f.completionReport,
+            commandId: ProjectTeamReviewFindingIntent.fields.commandId.make(
+              "second-completion-command",
+            ),
+          },
+        ]) {
+          expect(
+            (yield* f.sql
+              .withTransaction(
+                f.proposals
+                  .compile(f.principal, report, f.reportAttribution)
+                  .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        expect(yield* readProposal(f)).toEqual(first);
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_team_review_completion_proposal`,
+        ).toEqual([{ count: 1 }]);
+      }),
+    ),
+);
+
+it.effect(
+  "pending proposal replay denies new parent findings and preserves its original empty finding snapshot",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* completionTool(f);
+        const original = yield* readProposal(f);
+        yield* reportTool(f, yield* f.report());
+        const changed = yield* f.state();
+        expect((yield* completionTool(f).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* f.state()).toEqual(changed);
+        expect(yield* readProposal(f)).toEqual(original);
+        expect(original?.manifest.findings).toEqual([]);
+      }),
+    ),
+);
+
+it.effect(
+  "pending proposal replay denies a same-content required child criterion revision change",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* completionTool(f);
+        const original = yield* readProposal(f);
+        const before = yield* f.state();
+        const criterion = before.criteria.find((c) => c.taskId === f.running.taskId)!;
+        const index = before.criteria.findIndex((c) => c.criterionId === criterion.criterionId);
+        // Disposable derived-checkpoint corruption tests changed criterion metadata; raw managed writes stay denied.
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${"$.criteria[" + index + "].revision"},${criterion.revision + 1}) WHERE project_id=${projectId}`;
+        const changed = yield* f.state();
+        expect(changed.tasks.find((t) => t.taskId === f.running.taskId)?.revision).toBe(
+          before.tasks.find((t) => t.taskId === f.running.taskId)?.revision,
+        );
+        expect((yield* completionTool(f).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toEqual(original);
+        expect(yield* f.state()).toEqual(changed);
+      }),
+    ),
+);
+
+it.effect(
+  "proposal replay denies referenced evidence detail drift without refreshing the retained evidence snapshot",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const scopeHash = f.running.scopeHash;
+        if (scopeHash === undefined) return yield* Effect.die("Missing reviewer evidence scope");
+        const evidence = {
+          evidenceId: ProjectWorkEvidenceId.make("review-supporting-evidence"),
+          taskId: f.running.taskId,
+          kind: "observation" as const,
+          summary: "Retained supporting review note",
+          detail: "Original retained detail",
+          recordedAt: at,
+          revision: 0,
+          attribution: f.reportAttribution,
+          scopeHash,
+        };
+        yield* f.repository.execute({
+          type: "project-work.evidence.add",
+          projectId,
+          commandId: ProjectTeamReviewFindingIntent.fields.commandId.make("retain-review-note"),
+          evidence,
+          addedAt: at,
+        });
+        const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          evidenceIds: [evidence.evidenceId],
+        };
+        yield* completionTool(f, report);
+        const original = yield* readProposal(f);
+        const index = before.evidence.findIndex((e) => e.evidenceId === evidence.evidenceId);
+        // Disposable derived-checkpoint corruption represents changed retained evidence metadata.
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${"$.evidence[" + index + "].detail"},'Changed retained detail',${"$.evidence[" + index + "].revision"},1) WHERE project_id=${projectId}`;
+        expect((yield* completionTool(f, report).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toEqual(original);
+      }),
+    ),
+);
+
+it.effect(
+  "real final authorization revocation rolls back proposal retention and the accepted zero-event receipt",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const auth = yield* ProjectTeamAuthorization;
+        const before = yield* f.state();
+        const result = yield* f.repository
+          .executeAtomic(
+            auth.guided(f.principal, f.completionReport, f.reportAttribution, false).pipe(
+              Effect.provideService(ProjectTeamReviewReportOperation, f.operation),
+              Effect.map((command) => [command]),
+            ),
+            Effect.gen(function* () {
+              yield* restoreHistoricalBinding(
+                decodeRecord({
+                  ...f.reviewRole,
+                  status: "retired",
+                  revision: f.reviewRole.revision + 1,
+                }),
+              );
+              yield* auth.guided(
+                f.principal,
+                f.completionReport,
+                f.reportAttribution,
+                true,
+                "validate",
+              );
+            }).pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+          )
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
+        ).toEqual([{ count: 0 }]);
+      }),
+    ),
+);
+
+it.effect(
+  "proposal insertion failure rolls back the public receipt and leaves an exact original retry available",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const before = yield* f.state();
+        yield* f.sql`CREATE TRIGGER reject_pending_proposal BEFORE INSERT ON project_team_review_completion_proposal BEGIN SELECT RAISE(ABORT,'controlled proposal storage failure'); END`;
+        expect((yield* completionTool(f).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
+        ).toEqual([{ count: 0 }]);
+        yield* f.sql`DROP TRIGGER reject_pending_proposal`;
+        yield* completionTool(f);
+        expect(yield* readProposal(f)).toBeDefined();
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect(
+  "failed owning COMMIT exposes no successful proposal receipt or public state before owned test cleanup",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const gateway = yield* ProjectWorkGateway;
+        const query = yield* ProjectWorkQuery;
+        const before = yield* f.state();
+        yield* f.sql`CREATE TABLE proposal_commit_parent(id TEXT PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE proposal_commit_child(id TEXT REFERENCES proposal_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* f.sql`CREATE TRIGGER proposal_commit_failure AFTER INSERT ON project_team_review_completion_proposal BEGIN INSERT INTO proposal_commit_child VALUES ('missing'); END`;
+        let escaped = false;
+        expect(
+          (yield* completionTool(f).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                escaped = true;
+              }),
+            ),
+            Effect.exit,
+          ))._tag,
+        ).toBe("Failure");
+        expect(escaped).toBe(false);
+        expect(yield* f.sql`SELECT COUNT(*) AS count FROM proposal_commit_child`).toEqual([
+          { count: 1 },
+        ]);
+        expect((yield* readProposal(f).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(
+          (yield* gateway
+            .read({ projectId, operation: "foundation-records", recordKinds: ["review-finding"] })
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect((yield* query.snapshot(projectId).pipe(Effect.exit))._tag).toBe("Failure");
+        // This disposable connection loan is owned by the test; production never rolls back a foreign loan.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
+        ).toEqual([{ count: 0 }]);
+        yield* f.sql`DROP TRIGGER proposal_commit_failure`;
+        yield* completionTool(f);
+        expect(yield* readProposal(f)).toBeDefined();
+      }),
+    ),
+);
+
+it.effect(
+  "pending proposal captures the exact original parent finding revision and denies its later update",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* reportTool(f, yield* f.report());
+        const before = yield* f.state();
+        const finding = before.foundationRecords?.find((r) => r.kind === "review-finding");
+        if (finding?.kind !== "review-finding")
+          return yield* Effect.die("Missing retained parent finding");
+        const report = { ...f.completionReport, expectedRevision: before.revision };
+        yield* completionTool(f, report);
+        const retained = yield* readProposal(f);
+        expect(retained?.manifest.findings).toEqual([
+          {
+            findingId: finding.findingId,
+            revision: finding.revision,
+            sha256: digest(canonical(finding)),
+          },
+        ]);
+        yield* reportTool(
+          f,
+          yield* f.report({
+            commandId:
+              ProjectTeamReviewFindingIntent.fields.commandId.make("finding-after-pending"),
+            revision: 1,
+            detail: "A refined original finding",
+          }),
+        );
+        const changed = yield* f.state();
+        expect((yield* completionTool(f, report).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toEqual(retained);
+        expect(yield* f.state()).toEqual(changed);
+      }),
+    ),
+);
+
+for (const status of ["prepared", "starting", "settled", "quarantine"] as const) {
+  it.effect(`pending completion denies an original prompt with ${status} custody`, () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const before = yield* f.state();
+        yield* f.sql`UPDATE project_team_pi_operation SET status=${status} WHERE operation_id='review-assignment'`;
+        expect((yield* completionTool(f).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
+        ).toEqual([{ count: 0 }]);
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "required review output coverage and unique current output identities are mandatory",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const before = yield* f.state();
+        const outputs = f.completionReport.outputs ?? [];
+        expect(outputs.length).toBeGreaterThan(0);
+        for (const report of [
+          { ...f.completionReport, outputs: [] },
+          { ...f.completionReport, outputs: [...outputs, outputs[0]!] },
+          {
+            ...f.completionReport,
+            outputs: [
+              { ...outputs[0]!, criterionId: ProjectWorkCriterionId.make("foreign-criterion") },
+            ],
+          },
+        ]) {
+          expect((yield* completionTool(f, report).pipe(Effect.result))._tag).toBe("Failure");
+        }
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect("retained pending proposal SQL rows cannot be updated or deleted", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* proposalFixture;
+      yield* f.compileProposal();
+      const original = yield* readProposal(f);
+      expect(
+        (yield* f.sql`UPDATE project_team_review_completion_proposal SET sha256=${"a".repeat(64)}`.pipe(
+          Effect.result,
+        ))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* f.sql`DELETE FROM project_team_review_completion_proposal`.pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(yield* readProposal(f)).toEqual(original);
+    }),
+  ),
+);
+
+for (const corruption of ["noncanonical", "hash", "identity", "oversized"] as const) {
+  it.effect(`retained pending proposal denies ${corruption} stored manifest corruption`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* f.compileProposal();
+        const original = yield* readProposal(f);
+        if (!original) return yield* Effect.die("Missing proposal");
+        // Only this disposable corruption control bypasses the immutable row and physical size checks.
+        yield* f.sql`DROP TRIGGER project_team_review_completion_proposal_immutable`;
+        yield* f.sql`PRAGMA ignore_check_constraints=ON`;
+        const changed =
+          corruption === "identity"
+            ? {
+                ...original.manifest,
+                operation: { ...original.manifest.operation, bindingId: "foreign-binding" },
+              }
+            : original.manifest;
+        const json =
+          corruption === "noncanonical"
+            ? " " + canonical(changed)
+            : corruption === "oversized"
+              ? " ".repeat(524289)
+              : canonical(changed);
+        yield* f.sql`UPDATE project_team_review_completion_proposal SET manifest_json=${json},sha256=${corruption === "hash" ? "a".repeat(64) : digest(json)}`;
+        expect((yield* readProposal(f).pipe(Effect.result))._tag).toBe("Failure");
+      }),
+    ),
+  );
+}
+
+const isProposalReadError = Schema.is(ProjectTeamReviewCompletionProposalError);
+const retainedIdentityContradictions: Array<{
+  name: string;
+  change: (
+    manifest: ProjectTeamReviewCompletionProposalManifest,
+  ) => ProjectTeamReviewCompletionProposalManifest;
+}> = [
+  {
+    name: "operation-project",
+    change: (m) => ({ ...m, operation: { ...m.operation, projectId: "foreign-project" } }),
+  },
+  {
+    name: "target-project",
+    change: (m) => ({
+      ...m,
+      target: {
+        ...m.target,
+        projectId: ProjectTeamReviewFindingIntent.fields.projectId.make("foreign-project"),
+      },
+    }),
+  },
+  {
+    name: "membership-project",
+    change: (m) => ({
+      ...m,
+      assignment: {
+        ...m.assignment,
+        projectId: ProjectTeamReviewFindingIntent.fields.projectId.make("foreign-project"),
+      },
+    }),
+  },
+  {
+    name: "report-child",
+    change: (m) => ({
+      ...m,
+      report: {
+        ...m.report,
+        taskId: ProjectTeamReviewFindingIntent.fields.taskId.make("foreign-child"),
+      },
+    }),
+  },
+  {
+    name: "provenance-child",
+    change: (m) => ({
+      ...m,
+      provenance: {
+        ...m.provenance,
+        reviewTaskId: ProjectTeamReviewFindingIntent.fields.taskId.make("foreign-child"),
+      },
+    }),
+  },
+  {
+    name: "membership-child",
+    change: (m) => ({
+      ...m,
+      assignment: {
+        ...m.assignment,
+        taskId: ProjectTeamReviewFindingIntent.fields.taskId.make("foreign-child"),
+      },
+    }),
+  },
+  {
+    name: "provenance-binding",
+    change: (m) => ({ ...m, provenance: { ...m.provenance, bindingId: "foreign-binding" } }),
+  },
+  {
+    name: "provenance-generation",
+    change: (m) => ({
+      ...m,
+      provenance: { ...m.provenance, generation: m.operation.generation + 1 },
+    }),
+  },
+  {
+    name: "membership-parent",
+    change: (m) => ({
+      ...m,
+      assignment: {
+        ...m.assignment,
+        parentTaskId: ProjectTeamReviewFindingIntent.fields.taskId.make("foreign-parent"),
+      },
+    }),
+  },
+  {
+    name: "membership-record",
+    change: (m) => ({ ...m, assignment: { ...m.assignment, recordId: "foreign-membership" } }),
+  },
+  {
+    name: "report-membership",
+    change: (m) => ({ ...m, report: { ...m.report, assignmentId: "foreign-membership" } }),
+  },
+  {
+    name: "membership-revision",
+    change: (m) =>
+      m.report.type === "project-team.assignment.report"
+        ? {
+            ...m,
+            assignment: { ...m.assignment, revision: m.report.expectedAssignmentRevision + 1 },
+          }
+        : m,
+  },
+  {
+    name: "report-membership-revision",
+    change: (m) => ({
+      ...m,
+      report: { ...m.report, expectedAssignmentRevision: m.assignment.revision + 1 },
+    }),
+  },
+  {
+    name: "provenance-provider",
+    change: (m) => ({
+      ...m,
+      provenance: {
+        ...m.provenance,
+        providerInstanceId:
+          ProjectTeamReviewFindingProvenance.fields.providerInstanceId.make("foreign-provider"),
+      },
+    }),
+  },
+  {
+    name: "provenance-thread",
+    change: (m) => ({
+      ...m,
+      provenance: { ...m.provenance, threadId: ThreadId.make("foreign-thread") },
+    }),
+  },
+  {
+    name: "provenance-initialize",
+    change: (m) => ({
+      ...m,
+      provenance: { ...m.provenance, initializeOperationId: "foreign-initialize" },
+    }),
+  },
+  {
+    name: "freshness-initialize",
+    change: (m) => ({
+      ...m,
+      freshness: { ...m.freshness, initializeOperationId: "foreign-initialize" },
+    }),
+  },
+];
+
+for (const contradiction of retainedIdentityContradictions) {
+  it.effect(`R1 retained reader denies rehashed ${contradiction.name} contradiction`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* f.compileProposal();
+        const original = yield* readProposal(f);
+        if (!original) return yield* Effect.die("Missing original proposal");
+        const before = yield* f.state();
+        const json = canonical(contradiction.change(original.manifest));
+        // Bypass only UPDATE immutability in this disposable corruption control; retain real FK and namespace bindings.
+        yield* f.sql`DROP TRIGGER project_team_review_completion_proposal_immutable`;
+        yield* f.sql`UPDATE project_team_review_completion_proposal SET manifest_json=${json},sha256=${digest(json)}`;
+        const result = yield* readProposal(f).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") expect(isProposalReadError(result.failure)).toBe(true);
+        expect(yield* f.state()).toEqual(before);
+        expect(yield* f.sql`SELECT sha256 FROM project_team_review_completion_proposal`).toEqual([
+          { sha256: digest(json) },
+        ]);
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "R1 intrinsic reader permits distinct parent-child revisions and membership-binding generations without granting live authority",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* f.compileProposal();
+        const original = yield* readProposal(f);
+        if (!original) return yield* Effect.die("Missing original proposal");
+        if (original.manifest.report.type !== "project-team.assignment.report")
+          return yield* Effect.die("Original proposal must retain an assignment report");
+        expect(original.manifest.provenance.targetSha256).not.toBe(
+          digest(canonical(original.manifest.target)),
+        );
+        const before = yield* f.state();
+        // This retained-reader compatibility fixture changes only independent metadata; it is not an authenticated producer proof for the new scope.
+        const manifest = {
+          ...original.manifest,
+          target: {
+            ...original.manifest.target,
+            specRevision: original.manifest.report.specRevision + 3,
+            planRevision: original.manifest.report.planRevision + 5,
+          },
+          assignment: {
+            ...original.manifest.assignment,
+            generation: original.manifest.operation.generation + 7,
+          },
+        };
+        const json = canonical(manifest);
+        yield* f.sql`DROP TRIGGER project_team_review_completion_proposal_immutable`;
+        yield* f.sql`UPDATE project_team_review_completion_proposal SET manifest_json=${json},sha256=${digest(json)}`;
+        expect((yield* readProposal(f))?.manifest).toEqual(manifest);
+        expect((yield* f.compileProposal().pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
 );

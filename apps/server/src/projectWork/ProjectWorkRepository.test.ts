@@ -1697,6 +1697,8 @@ it.effect(
             [34, "ProjectWorkVerificationExecution"],
             [35, "ProjectTeamReviewTargets"],
             [36, "ProjectTeamReviewFindings"],
+            [37, "ProjectTeamMailboxConsumption"],
+            [38, "ProjectTeamReviewCompletionProposals"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(

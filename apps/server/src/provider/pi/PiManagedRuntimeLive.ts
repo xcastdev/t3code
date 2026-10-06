@@ -1,3 +1,4 @@
+import { ProjectTeamReviewReportOperation } from "../../projectWork/ProjectTeamReviewCompletionProposals.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   IsoDateTime,
@@ -1806,7 +1807,27 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                             arguments: input.arguments,
                             principal: durable.principal,
                             source: { kind: "mcp", id: workerId },
-                          }).pipe(Effect.provideService(ProjectWorkGateway, gateway));
+                          }).pipe(Effect.provideService(ProjectWorkGateway, gateway), (effect) =>
+                            durable.operation.operationKind === "prompt"
+                              ? Effect.provideService(
+                                  effect,
+                                  ProjectTeamReviewReportOperation,
+                                  Object.freeze({
+                                    environmentId: binding.environmentId,
+                                    projectId: binding.projectId,
+                                    reviewTaskId: binding.taskId,
+                                    bindingId: binding.recordId,
+                                    generation: binding.generation,
+                                    providerInstanceId: binding.providerInstanceId,
+                                    threadId: binding.threadId,
+                                    operationId: durable.operation.operationId,
+                                    operationKind: "prompt" as const,
+                                    workerId: durable.workerId,
+                                    ordinal: durable.ordinal,
+                                  }),
+                                )
+                              : effect,
+                          );
                           yield* check(signal);
                           return { kind: "text" as const, text: encode(result) };
                         }),

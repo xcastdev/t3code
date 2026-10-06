@@ -1353,7 +1353,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
           }),
         ({ duplicate }) =>
           (isGuidedIntent(input)
-            ? teamAuthorization.value.guided(caller, input, attribution, duplicate)
+            ? teamAuthorization.value.guided(caller, input, attribution, duplicate, "validate")
             : teamAuthorization.value.intent(caller, input, attribution, duplicate)
           ).pipe(Effect.asVoid),
         fingerprint,

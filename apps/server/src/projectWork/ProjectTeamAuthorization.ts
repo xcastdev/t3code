@@ -27,6 +27,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
+import { makeProjectTeamReviewCompletionProposals } from "./ProjectTeamReviewCompletionProposals.ts";
 import { decodeProjectWorkEvent } from "./ProjectWorkEventStore.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import {
@@ -109,6 +110,7 @@ export class ProjectTeamAuthorization extends Context.Service<
       input: ProjectTeamGuidedIntent,
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
+      mode?: "validate" | "compile",
     ) => Effect.Effect<ProjectWorkCommand, ProjectTeamAuthorizationError>;
   }
 >()("t3/projectWork/ProjectTeamAuthorization") {}
@@ -919,6 +921,7 @@ export const layer = Layer.effect(
       input: ProjectTeamGuidedIntent,
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
+      mode: "validate" | "compile" = "compile",
     ) {
       const intent = yield* Effect.try({
         try: () => decodeGuidedIntent(input),
@@ -929,6 +932,25 @@ export const layer = Layer.effect(
         principal.actor.id !== attribution.actor.id
       )
         return yield* deny("Guided attribution does not match authenticated principal");
+      const requireProposalTransaction = Effect.gen(function* () {
+        const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+        const transaction = yield* Effect.serviceOption(sql.transactionService);
+        const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+        if (
+          Option.isNone(currentSql) ||
+          currentSql.value !== sql ||
+          Option.isNone(transaction) ||
+          Option.isNone(repository)
+        )
+          return yield* deny("Review completion report requires its original transaction");
+        return repository.value;
+      });
+      if (
+        intent.type === "project-team.assignment.report" &&
+        intent.outcome === "complete" &&
+        principal.managed !== undefined
+      )
+        yield* requireProposalTransaction;
       const authority = yield* resolve(principal);
       if (principal.actor.kind !== "human") {
         if (authority === undefined)
@@ -969,6 +991,34 @@ export const layer = Layer.effect(
           return yield* deny("Frozen role does not grant this guided action");
       }
       const state = authority?.state ?? (yield* stateFor(intent.projectId));
+      if (
+        intent.type === "project-team.assignment.report" &&
+        intent.outcome === "complete" &&
+        state.foundationRecords?.some(
+          (record) =>
+            record.kind === "task-membership" &&
+            record.taskId === intent.taskId &&
+            record.executionKind === "managed" &&
+            record.deliverableKind === "review",
+        )
+      ) {
+        const repository = yield* requireProposalTransaction;
+        const proposals = yield* makeProjectTeamReviewCompletionProposals(resolve).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.provideService(ProjectWorkRepository, repository),
+        );
+        if (mode === "compile") return yield* proposals.compile(principal, intent, attribution);
+        yield* proposals.validate(principal, intent, attribution, { duplicate });
+        return {
+          type: "project-work.foundation.commit",
+          commandId: intent.commandId,
+          projectId: intent.projectId,
+          expectedRevision: intent.expectedRevision,
+          attribution,
+          records: [],
+          committedAt: attribution.recordedAt,
+        } satisfies ProjectWorkCommand;
+      }
       if (duplicate) {
         const rows = yield* sql<{ payload: string }>`
           SELECT payload_json AS payload FROM project_work_events
@@ -1034,7 +1084,13 @@ export const layer = Layer.effect(
       read: (p, i) => guard(read(p, i)),
       write: (p, c) => guard(write(p, c)),
       intent: (p, i, a, d) => guard(intent(p, i, a, d)),
-      guided: (p, i, a, d) => guard(guided(p, i, a, d)),
+      guided: (p, i, a, d, mode) => {
+        try {
+          return guard(guided(structuredClone(p), structuredClone(i), structuredClone(a), d, mode));
+        } catch {
+          return Effect.fail(deny("Invalid guided input"));
+        }
+      },
     });
   }),
 );
