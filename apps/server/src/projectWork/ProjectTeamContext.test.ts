@@ -1,6 +1,9 @@
 import { expect, it } from "@effect/vitest";
+import * as NodeCrypto from "node:crypto";
 import {
   ProjectWorkFoundationCommitCommand,
+  ProjectTeamWriteIntent,
+  canonicalProjectWorkPayload,
   EventId,
   ProjectWorkTaskId,
   ProviderInstanceId,
@@ -21,6 +24,7 @@ import {
   seed,
   scoped,
   createManagedAssignment,
+  restoreHistoricalBinding,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { ProjectWorkProjection } from "./ProjectWorkProjection.ts";
@@ -33,6 +37,15 @@ import { makeProjectTeamContext, ProjectTeamContextError } from "./ProjectTeamCo
 import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 import * as Accounting from "./ProjectTeamModelAccounting.ts";
+import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
+import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
+import { ProjectTeamAuthorization } from "./ProjectTeamAuthorization.ts";
+import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
+import {
+  makeProjectWorkVerificationGate,
+  ProjectWorkVerificationApproval,
+  ProjectWorkVerificationGateError,
+} from "./ProjectWorkVerificationGate.ts";
 import { managedActorId } from "./ProjectTeamAuthorization.ts";
 import type {
   PiModelRequestReservation,
@@ -40,6 +53,7 @@ import type {
 } from "../provider/pi/PiModelBroker.ts";
 
 const encodeRetainedEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeVerificationIntent = Schema.decodeUnknownEffect(ProjectTeamWriteIntent);
 const decodeCommand = Schema.decodeUnknownEffect(ProjectWorkCommand);
 const decodeRecord = Schema.decodeUnknownEffect(TeamRecordSchema);
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
@@ -48,43 +62,147 @@ const makeFixture = (
   role: "implementer" | "integrator" | "planner" | "reviewer" | "investigator" = "implementer",
   writableWorkers = 1,
   readonlyKind?: "planning" | "review" | "investigation",
+  verified = false,
 ) =>
   Effect.gen(function* () {
     const repository = yield* ProjectWorkRepository;
     const sql = yield* SqlClient.SqlClient;
     let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
     // The real fixture commits approvals and the execution grant; intercept only its final claim.
-    const result = yield* seed(role, "reserved", {
-      roleTools: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
-      toolIds: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
-      issueCredential: false,
-    }).pipe(
-      Effect.provideService(ProjectWorkRepository, {
-        ...repository,
-        execute: (command) => {
-          if (
-            readonlyKind !== undefined &&
-            readonlyKind !== "review" &&
-            command.type === "project-work.foundation.commit" &&
-            command.guided?.intent.type === "project-team.plan.propose"
-          )
-            return Effect.fail(
-              new ProjectWorkPolicyError("invalid-state", "Stop before first parent plan"),
-            );
-          if (
-            command.type === "project-work.foundation.commit" &&
-            command.transition?.kind === "claim"
-          ) {
-            pending = command;
-            return Effect.fail(
-              new ProjectWorkPolicyError("invalid-state", "Fixture retains the uncommitted claim"),
-            );
-          }
-          return repository.execute(command);
-        },
-      }),
-      Effect.result,
-    );
+    const parentVerification = verified ? yield* verificationFixture : undefined;
+    const reviewId = verified ? "review-binding" : "binding";
+    const roleId = verified ? "review-role" : "role";
+    const memberId = verified ? "review-member" : "member";
+    if (parentVerification) {
+      const f = parentVerification;
+      const auth = yield* ProjectTeamAuthorization;
+      const gates = yield* makeProjectWorkVerificationGate({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+      });
+      const human = {
+        actor: f.principal.actor,
+        source: { kind: "web" as const, id: "review-fixture" },
+        recordedAt: at,
+      };
+      const trust = (selection: typeof f.selection) =>
+        ProjectWorkVerificationApproval.of({
+          selection,
+          receipt: f.prepared,
+          assertCurrent: (state, duplicate) =>
+            gates.assertCurrent(state, f.prepared, selection, duplicate).pipe(
+              Effect.mapError(
+                () =>
+                  new ProjectWorkVerificationGateError({
+                    reason: "Controlled prepared target validation failed",
+                  }),
+              ),
+            ),
+        });
+      const proposal = yield* decodeVerificationIntent({
+        ...f.selection,
+        type: "project-team.verification.propose",
+        commandId: "review-verification-propose",
+      });
+      yield* repository.execute(
+        yield* auth
+          .intent(f.principal, proposal, human, false)
+          .pipe(Effect.provideService(ProjectWorkVerificationApproval, trust(f.selection))),
+      );
+      const current = yield* readCurrentState(sql, projectId);
+      const gate = current.foundationRecords?.find(
+        (r) => r.kind === "gate" && r.verificationJobId === f.selection.jobId,
+      );
+      if (gate?.kind !== "gate") return yield* Effect.die("Missing verification proposal");
+      const response = yield* decodeVerificationIntent({
+        type: "project-team.gate.respond",
+        commandId: "review-verification-approve",
+        projectId,
+        taskId: f.selection.taskId,
+        expectedRevision: current.revision,
+        expectedTaskRevision: f.selection.expectedTaskRevision,
+        specRevision: f.selection.specRevision,
+        planRevision: f.selection.planRevision,
+        gateId: gate.recordId,
+        expectedGateRevision: gate.revision,
+        response: "approved",
+      });
+      yield* repository.execute(
+        yield* auth
+          .intent(f.principal, response, human, false)
+          .pipe(
+            Effect.provideService(
+              ProjectWorkVerificationApproval,
+              trust({ ...f.selection, expectedRevision: current.revision }),
+            ),
+            Effect.provideService(
+              ProjectWorkVerificationRequest,
+              ProjectWorkVerificationRequest.of({ assertCurrent: () => Effect.void }),
+            ),
+          ),
+      );
+      const records = (yield* readCurrentState(sql, projectId)).foundationRecords ?? [];
+      const originalRole = records.find((r) => r.kind === "role-revision");
+      const originalMember = records.find((r) => r.kind === "member");
+      if (originalRole?.kind !== "role-revision" || originalMember?.kind !== "member")
+        return yield* Effect.die("Missing original fixture member");
+      yield* repository.execute(
+        yield* decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "review-member-setup",
+          expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+          attribution,
+          committedAt: at,
+          records: [
+            {
+              ...originalRole,
+              recordId: roleId,
+              roleId: "reviewer",
+              role: "reviewer",
+              tools: ["pi.read"],
+            },
+            { ...originalMember, recordId: memberId, roleRevisionId: roleId },
+          ],
+        }),
+      );
+    }
+    const result = parentVerification
+      ? { _tag: "Failure" as const }
+      : yield* seed(role, "reserved", {
+          roleTools: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
+          toolIds: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
+          issueCredential: false,
+        }).pipe(
+          Effect.provideService(ProjectWorkRepository, {
+            ...repository,
+            execute: (command) => {
+              if (
+                readonlyKind !== undefined &&
+                readonlyKind !== "review" &&
+                command.type === "project-work.foundation.commit" &&
+                command.guided?.intent.type === "project-team.plan.propose"
+              )
+                return Effect.fail(
+                  new ProjectWorkPolicyError("invalid-state", "Stop before first parent plan"),
+                );
+              if (
+                command.type === "project-work.foundation.commit" &&
+                command.transition?.kind === "claim"
+              ) {
+                pending = command;
+                return Effect.fail(
+                  new ProjectWorkPolicyError(
+                    "invalid-state",
+                    "Fixture retains the uncommitted claim",
+                  ),
+                );
+              }
+              return repository.execute(command);
+            },
+          }),
+          Effect.result,
+        );
     expect(result._tag).toBe("Failure");
     if (readonlyKind !== undefined) {
       let state = yield* readCurrentState(sql, projectId);
@@ -174,24 +292,24 @@ const makeFixture = (
         (task) => task.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
       );
       const roleRecord = state.foundationRecords?.find(
-        (r) => r.kind === "role-revision" && r.recordId === "role",
+        (r) => r.kind === "role-revision" && r.recordId === roleId,
       );
       if (!task || grant?.kind !== "gate" || roleRecord?.kind !== "role-revision")
         return yield* Effect.die("Missing real readonly child grant");
       const binding = {
         kind: "run-binding",
         projectId,
-        recordId: "binding",
+        recordId: reviewId,
         revision: 0,
         generation: 0,
         updatedAt: at,
         status: "reserved",
         taskId: task.taskId,
-        attemptId: "attempt",
-        memberId: "member",
+        attemptId: verified ? "review-attempt" : "attempt",
+        memberId,
         roleRevisionId: roleRecord.recordId,
         providerInstanceId: ProviderInstanceId.make("pi"),
-        threadId: ThreadId.make("authorization-thread"),
+        threadId: ThreadId.make(verified ? "review-thread" : "authorization-thread"),
         environmentId: "environment",
         model: roleRecord.model,
         configuration: {
@@ -231,7 +349,7 @@ const makeFixture = (
             projectId,
             taskId: task.taskId,
             commandId: "readonly-context-claim",
-            attemptId: "attempt",
+            attemptId: verified ? "review-attempt" : "attempt",
             leaseToken: "readonly-context-lease",
             leasedUntil: "2030-01-01T00:00:00.000Z",
             claimedAt: at,
@@ -245,7 +363,7 @@ const makeFixture = (
       yield* decodeCommit({
         type: "project-work.foundation.commit",
         projectId,
-        commandId: "configure-limits",
+        commandId: verified ? "review-configure-limits" : "configure-limits",
         expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
         attribution,
         committedAt: at,
@@ -254,7 +372,7 @@ const makeFixture = (
             kind: "limits",
             projectId,
             recordId: "limits",
-            revision: 0,
+            revision: verified ? 1 : 0,
             generation: 0,
             updatedAt: at,
             status: "configured",
@@ -284,11 +402,11 @@ const makeFixture = (
       },
     };
     const request: ProjectTeamDispatchRequest = {
-      dispatchId: "dispatch-intent",
+      dispatchId: verified ? "review-dispatch" : "dispatch-intent",
       claim,
       git: {
-        effectId: "dispatch-intent",
-        runId: "binding",
+        effectId: verified ? "review-dispatch" : "dispatch-intent",
+        runId: reviewId,
         generation: 0,
         primaryRoot: "/workspace",
         commonGitDirectory: "/workspace/.git",
@@ -300,8 +418,8 @@ const makeFixture = (
         policyHash: "b".repeat(64),
       },
       setupId: "setup",
-      initializeOperationId: "initialize",
-      assignmentOperationId: "assignment",
+      initializeOperationId: verified ? "review-initialize" : "initialize",
+      assignmentOperationId: verified ? "review-assignment" : "assignment",
       assignment: "Implement the approved task",
     };
     const journal = yield* makeProjectTeamDispatchJournal({
@@ -327,7 +445,7 @@ const makeFixture = (
         }),
       );
     });
-    return { sql, repository, request, journal, snapshot, reader, change };
+    return { sql, repository, request, journal, snapshot, reader, change, parentVerification };
   });
 
 const denied = Effect.fn("contextFixture.denied")(function* <A, E, R>(
@@ -410,55 +528,59 @@ const makeBudgetFixture = (writableWorkers = 1) =>
 const budgetFixture = makeBudgetFixture();
 
 for (const kind of ["planning", "review", "investigation"] as const)
-  it.effect(`required context reconstructs legal planless ${kind} original authority`, () =>
-    scoped(
-      Effect.gen(function* () {
-        const f = yield* makeFixture(
-          kind === "planning" ? "planner" : kind === "review" ? "reviewer" : "investigator",
-          1,
-          kind,
-        );
-        const claim = f.snapshot.intent.compiledClaim.transition;
-        if (claim?.kind !== "claim") return yield* Effect.die("Missing readonly original claim");
-        expect(claim.binding.planRevision).toBe(0);
-        const state = yield* readCurrentState(f.sql, projectId);
-        expect(
-          state.foundationRecords?.filter(
-            (record) => record.kind === "plan-revision" && record.taskId === claim.binding.taskId,
-          ),
-        ).toEqual([]);
-        const grant = state.foundationRecords?.find(
-          (record) => record.recordId === claim.binding.authorizationGateId,
-        );
-        expect(grant).toMatchObject({
-          kind: "gate",
-          gate: kind === "investigation" ? "investigation" : "assignment",
-          status: "consumed",
-          attribution: { actor: { kind: "human" } },
-        });
-        const required = yield* f.reader.readForOperation({
-          projectId,
-          bindingId: claim.binding.recordId,
-          generation: claim.binding.generation,
-          providerInstanceId: claim.binding.providerInstanceId,
-          threadId: claim.binding.threadId,
-          operationId: f.request.initializeOperationId,
-          operationKind: "initialize",
-        });
-        expect(required.required.tasks[0]?.plan).toBeUndefined();
-        expect(required.required.tasks[0]?.criteria[0]?.description).toBe(
-          kind === "planning"
-            ? "Proposed first plan"
-            : kind === "review"
-              ? "Independent review findings"
-              : "Sourced investigation findings",
-        );
-        expect(required.required.tasks[1]?.task.taskId).toBe("authorization-task");
-        expect(required.required.approvals).toContainEqual(
-          expect.objectContaining({ recordId: claim.binding.authorizationGateId }),
-        );
-      }),
-    ),
+  it.effect(
+    kind === "review"
+      ? "required context denies legacy review without a verification target"
+      : `required context reconstructs legal planless ${kind} original authority`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* makeFixture(
+            kind === "planning" ? "planner" : kind === "review" ? "reviewer" : "investigator",
+            1,
+            kind,
+          );
+          const claim = f.snapshot.intent.compiledClaim.transition;
+          if (claim?.kind !== "claim") return yield* Effect.die("Missing readonly original claim");
+          expect(claim.binding.planRevision).toBe(0);
+          const state = yield* readCurrentState(f.sql, projectId);
+          expect(
+            state.foundationRecords?.filter(
+              (record) => record.kind === "plan-revision" && record.taskId === claim.binding.taskId,
+            ),
+          ).toEqual([]);
+          const grant = state.foundationRecords?.find(
+            (record) => record.recordId === claim.binding.authorizationGateId,
+          );
+          expect(grant).toMatchObject({
+            kind: "gate",
+            gate: kind === "investigation" ? "investigation" : "assignment",
+            status: "consumed",
+            attribution: { actor: { kind: "human" } },
+          });
+          if (kind === "review") {
+            yield* denied(f.reader.readRequired(f.snapshot));
+            return;
+          }
+          const required = yield* f.reader.readForOperation({
+            projectId,
+            bindingId: claim.binding.recordId,
+            generation: claim.binding.generation,
+            providerInstanceId: claim.binding.providerInstanceId,
+            threadId: claim.binding.threadId,
+            operationId: f.request.initializeOperationId,
+            operationKind: "initialize",
+          });
+          expect(required.required.tasks[0]?.plan).toBeUndefined();
+          expect(required.required.tasks[0]?.criteria[0]?.description).toBe(
+            kind === "planning" ? "Proposed first plan" : "Sourced investigation findings",
+          );
+          expect(required.required.tasks[1]?.task.taskId).toBe("authorization-task");
+          expect(required.required.approvals).toContainEqual(
+            expect.objectContaining({ recordId: claim.binding.authorizationGateId }),
+          );
+        }),
+      ),
   );
 
 it.effect("required context denies actual duplicate equal plan revisions", () =>
@@ -1341,3 +1463,507 @@ it.effect("denies unapproved ancestor scope despite agreeing physical and checkp
     }),
   ),
 );
+
+it.effect(
+  "review initialization cannot expose scope without the parent's exact prepared human approval",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture("reviewer", 0, "review");
+        const result = yield* f.reader
+          .readForOperation({
+            projectId,
+            bindingId: "binding",
+            generation: 0,
+            providerInstanceId: ProviderInstanceId.make("pi"),
+            threadId: ThreadId.make("authorization-thread"),
+            operationId: "initialize",
+            operationKind: "initialize",
+          })
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect("review initialization captures exact prepared parent target into required context", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture("reviewer", 0, "review", true);
+      const claim = f.snapshot.intent.compiledClaim.transition;
+      if (claim?.kind !== "claim") return yield* Effect.die("Missing review claim");
+      const context = yield* f.reader.readForOperation({
+        projectId,
+        bindingId: claim.binding.recordId,
+        generation: 0,
+        providerInstanceId: claim.binding.providerInstanceId,
+        threadId: claim.binding.threadId,
+        operationId: f.request.initializeOperationId,
+        operationKind: "initialize",
+      });
+      expect(context.required.reviewTarget?.prepared.manifest).toEqual(
+        f.parentVerification?.prepared.manifest,
+      );
+      expect(context.text).toContain('"testedTree":"' + "d".repeat(40) + '"');
+      expect(yield* f.sql`SELECT dispatch_id FROM project_team_review_target`).toEqual([
+        { dispatch_id: "review-dispatch" },
+      ]);
+    }),
+  ),
+);
+
+const reviewFixture = () => makeFixture("reviewer", 0, "review", true);
+const reviewOperation = (
+  f: Effect.Success<ReturnType<typeof reviewFixture>>,
+  kind: "initialize" | "prompt" = "initialize",
+) => {
+  const claim = f.snapshot.intent.compiledClaim.transition;
+  if (claim?.kind !== "claim") throw new Error("Missing original review claim");
+  return {
+    projectId,
+    bindingId: claim.binding.recordId,
+    generation: claim.binding.generation,
+    providerInstanceId: claim.binding.providerInstanceId,
+    threadId: claim.binding.threadId,
+    operationId:
+      kind === "initialize" ? f.request.initializeOperationId : f.request.assignmentOperationId,
+    operationKind: kind,
+  };
+};
+const verificationGate = Effect.fn("reviewFixture.gate")(function* (
+  f: Effect.Success<ReturnType<typeof reviewFixture>>,
+) {
+  const gates =
+    (yield* readCurrentState(f.sql, projectId)).foundationRecords?.filter(
+      (r) => r.kind === "gate" && r.gate === "verification",
+    ) ?? [];
+  const gate = gates[0];
+  if (gate?.kind !== "gate" || gates.length !== 1)
+    return yield* Effect.die("Missing exact human gate");
+  return gate;
+});
+it.effect("review prompt cannot capture a missing association", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* reviewFixture();
+      yield* denied(f.reader.readForOperation(reviewOperation(f, "prompt")));
+      expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+    }),
+  ),
+);
+it.effect(
+  "review retries and a recreated reader retain the first target despite a later approved job",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewFixture();
+        const first = yield* f.reader.readForOperation(reviewOperation(f));
+        const gate = yield* verificationGate(f);
+        const parent = f.parentVerification;
+        if (!parent) return yield* Effect.die("Missing preparation");
+        const newer = yield* parent.jobs.retainPrepared({
+          ...parent.prepared.manifest,
+          jobId: "later-job",
+          target: {
+            ...parent.prepared.manifest.target,
+            testedCommit: "9".repeat(40),
+            headSha: "9".repeat(40),
+          },
+        });
+        yield* restoreHistoricalBinding({
+          ...gate,
+          recordId: "later-approved-verification",
+          verificationJobId: newer.manifest.jobId,
+          contentHash: newer.sha256,
+          revision: 0,
+        });
+        const reader = yield* makeProjectTeamContext({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+        });
+        const replay = yield* reader.readForOperation(reviewOperation(f, "prompt"));
+        expect(replay.required.reviewTarget).toEqual(first.required.reviewTarget);
+        expect(replay.required.reviewTarget?.prepared.manifest.jobId).toBe("verification-1");
+        expect(yield* f.sql`SELECT count(*) AS count FROM project_team_review_target`).toEqual([
+          { count: 1 },
+        ]);
+      }),
+    ),
+);
+for (const status of ["pending", "rejected", "invalidated"] as const)
+  it.effect(`review denies ${status} original verification gate`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewFixture();
+        const gate = yield* verificationGate(f);
+        yield* restoreHistoricalBinding({ ...gate, status, revision: gate.revision + 1 });
+        yield* denied(f.reader.readForOperation(reviewOperation(f)));
+        expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+      }),
+    ),
+  );
+it.effect("review denies ambiguous human approvals instead of choosing the newest job", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* reviewFixture();
+      const gate = yield* verificationGate(f);
+      yield* restoreHistoricalBinding({ ...gate, recordId: "other-approved-gate" });
+      yield* denied(f.reader.readForOperation(reviewOperation(f)));
+    }),
+  ),
+);
+for (const moment of ["initial", "replay"] as const)
+  it.effect(
+    `review accepts exact retained consumed human approval at ${moment} without asserting test success`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* reviewFixture();
+          if (moment === "replay") yield* f.reader.readForOperation(reviewOperation(f));
+          const gate = yield* verificationGate(f);
+          yield* restoreHistoricalBinding({
+            ...gate,
+            status: "consumed",
+            revision: gate.revision + 1,
+            consumedByRunId: "verification-attempt",
+            consumedByCommandId:
+              ProjectWorkFoundationCommitCommand.fields.commandId.make("verification-consume"),
+          });
+          const context = yield* f.reader.readForOperation(reviewOperation(f));
+          expect(context.required.reviewTarget?.prepared.manifest.jobId).toBe("verification-1");
+          expect(context.text).not.toContain('"passed"');
+        }),
+      ),
+  );
+for (const change of ["human", "revision", "hash", "job"] as const)
+  it.effect(`review denies replacement ${change} after target capture`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewFixture();
+        yield* f.reader.readForOperation(reviewOperation(f));
+        const gate = yield* verificationGate(f);
+        yield* restoreHistoricalBinding({
+          ...gate,
+          status: "consumed",
+          revision: gate.revision + (change === "revision" ? 2 : 1),
+          consumedByRunId: "verification-attempt",
+          consumedByCommandId:
+            ProjectWorkFoundationCommitCommand.fields.commandId.make("verification-consume"),
+          ...(change === "human"
+            ? {
+                attribution: {
+                  ...gate.attribution,
+                  actor: { kind: "human", id: "replacement-human" },
+                },
+              }
+            : {}),
+          ...(change === "hash" ? { contentHash: "0".repeat(64) } : {}),
+          ...(change === "job" ? { verificationJobId: "replacement-job" } : {}),
+        });
+        yield* denied(f.reader.readForOperation(reviewOperation(f, "prompt")));
+      }),
+    ),
+  );
+for (const status of ["prepared", "starting", "running", "settled", "quarantine"] as const)
+  it.effect(
+    `review association ${status === "prepared" ? "can precede" : "cannot backfill after"} ${status} initialization`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* reviewFixture();
+          const claim = f.snapshot.intent.compiledClaim.transition;
+          if (claim?.kind !== "claim") return yield* Effect.die("Missing claim");
+          const b = claim.binding;
+          yield* f.sql`INSERT INTO project_team_pi_operation VALUES (${f.request.initializeOperationId},'environment',${projectId},${b.recordId},0,${b.providerInstanceId},${b.threadId},'review-worker',0,'initialize','request-hash',${b.recordId},${b.taskId},1000,9999999999999,${status},'{}',NULL,NULL)`;
+          if (status === "prepared") {
+            const prepared = yield* preparedReviewShape(f);
+            const preparedIdentity = prepared.json;
+            yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${preparedIdentity},request_hash=${prepared.requestHash} WHERE operation_id=${f.request.initializeOperationId}`;
+            yield* f.sql`INSERT INTO project_team_pi_process VALUES ('review-unit',${f.request.initializeOperationId},'{"unit":"review-unit"}','allocated',NULL,NULL)`;
+            expect(
+              (yield* f.reader.readForOperation(reviewOperation(f))).required.reviewTarget?.prepared
+                .manifest.jobId,
+            ).toBe("verification-1");
+          } else {
+            yield* denied(f.reader.readForOperation(reviewOperation(f)));
+            expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+          }
+        }),
+      ),
+  );
+it.effect("review cannot backfill a prepared operation with a retained native entry", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* reviewFixture();
+      const b = f.request.claim.transition;
+      if (b?.kind !== "claim") return yield* Effect.die("Missing claim");
+      yield* f.sql`INSERT INTO project_team_pi_operation VALUES (${f.request.initializeOperationId},'environment',${projectId},${b.binding.recordId},0,${b.binding.providerInstanceId},${b.binding.threadId},'review-worker',0,'initialize','request-hash',${b.binding.recordId},${b.binding.taskId},1000,9999999999999,'prepared','{}','{}',NULL)`;
+      yield* denied(f.reader.readForOperation(reviewOperation(f)));
+    }),
+  ),
+);
+for (const corruption of [
+  "owner",
+  "hash",
+  "manifest",
+  "job-owner",
+  "task-revision",
+  "binding-revision",
+  "criterion-revision",
+] as const)
+  it.effect(`review denies original target ${corruption} mutation`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewFixture();
+        yield* f.reader.readForOperation(reviewOperation(f));
+        if (corruption === "owner" || corruption === "hash" || corruption === "manifest") {
+          yield* f.sql`DROP TRIGGER project_team_review_target_immutable`;
+          if (corruption === "owner")
+            yield* f.sql`UPDATE project_team_review_target SET project_id='foreign-project'`;
+          if (corruption === "hash")
+            yield* f.sql`UPDATE project_team_review_target SET sha256=${"0".repeat(64)}`;
+          if (corruption === "manifest")
+            yield* f.sql`UPDATE project_team_review_target SET manifest_json='{}'`;
+        }
+        if (corruption === "job-owner") {
+          yield* f.sql`DROP TRIGGER project_work_verification_jobs_immutable`;
+          yield* f.sql`UPDATE project_work_verification_jobs SET project_id='foreign-project'`;
+        }
+        if (corruption === "task-revision")
+          yield* f.sql`UPDATE project_work_tasks SET revision=revision+1 WHERE task_id='authorization-task'`;
+        if (corruption === "binding-revision")
+          yield* f.sql`UPDATE project_team_run_binding SET payload_json=json_set(payload_json,'$.revision',json_extract(payload_json,'$.revision')+1) WHERE record_id='binding'`;
+        if (corruption === "criterion-revision")
+          yield* f.sql`UPDATE project_work_criteria SET revision=revision+1 WHERE task_id='authorization-task'`;
+        yield* denied(f.reader.readForOperation(reviewOperation(f, "prompt")));
+      }),
+    ),
+  );
+it.effect(
+  "review context does not escape a failed capture COMMIT or the hidden failed transaction",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewFixture();
+        yield* f.sql`PRAGMA foreign_keys=ON`;
+        yield* f.sql`CREATE TABLE review_commit_parent(id INTEGER PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE review_commit_child(id INTEGER REFERENCES review_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* f.sql`CREATE TRIGGER controlled_review_commit_failure AFTER INSERT ON project_team_review_target BEGIN INSERT INTO review_commit_child VALUES(1); END`;
+        let escaped = false;
+        expect(
+          (yield* f.reader.readForOperation(reviewOperation(f)).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                escaped = true;
+              }),
+            ),
+            Effect.exit,
+          ))._tag,
+        ).toBe("Failure");
+        expect(escaped).toBe(false);
+        expect(
+          (yield* f.reader.readForOperation(reviewOperation(f, "prompt")).pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+        yield* f.sql`DROP TRIGGER controlled_review_commit_failure`;
+        expect(
+          (yield* f.reader.readForOperation(reviewOperation(f))).required.reviewTarget?.prepared
+            .manifest.jobId,
+        ).toBe("verification-1");
+      }),
+    ),
+);
+
+it.effect("review capture snapshots caller input synchronously before SQL can yield", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* reviewFixture();
+      const targets = yield* makeProjectTeamReviewTargets({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+      });
+      const input = structuredClone(f.snapshot);
+      const capture = targets.captureInitial(input);
+      Reflect.set(input.intent.request, "initializeOperationId", "substituted-initialize");
+      const retained = yield* f.sql.withTransaction(capture);
+      expect(retained.reviewer.initializeOperationId).toBe("review-initialize");
+      expect((yield* f.reader.readForOperation(reviewOperation(f))).required.reviewTarget).toEqual(
+        retained,
+      );
+    }),
+  ),
+);
+it.effect("ignored review target INSERT cannot expose a successful context", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* reviewFixture();
+      yield* f.sql`CREATE TRIGGER controlled_ignore_review BEFORE INSERT ON project_team_review_target BEGIN SELECT RAISE(IGNORE); END`;
+      yield* denied(f.reader.readForOperation(reviewOperation(f)));
+      expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+      yield* f.sql`DROP TRIGGER controlled_ignore_review`;
+      expect(
+        (yield* f.reader.readForOperation(reviewOperation(f))).required.reviewTarget?.prepared
+          .manifest.jobId,
+      ).toBe("verification-1");
+    }),
+  ),
+);
+
+for (const status of ["allocated", "claimed", "captured", "drained", "quarantine"] as const)
+  it.effect(
+    `review initial target ${status === "allocated" ? "allows an unentered" : "denies an entered"} ${status} descriptor`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* reviewFixture();
+          const claim = f.snapshot.intent.compiledClaim.transition;
+          if (claim?.kind !== "claim") return yield* Effect.die("Missing claim");
+          const b = claim.binding;
+          yield* f.sql`INSERT INTO project_team_pi_operation VALUES (${f.request.initializeOperationId},'environment',${projectId},${b.recordId},0,${b.providerInstanceId},${b.threadId},'review-worker',0,'initialize','request-hash',${b.recordId},${b.taskId},1000,9999999999999,'prepared','{}',NULL,NULL)`;
+          // A controlled retained phase row exercises the entry fence, not allocation validity or native admission.
+          const prepared = yield* preparedReviewShape(f);
+          const preparedIdentity = prepared.json;
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${preparedIdentity},request_hash=${prepared.requestHash} WHERE operation_id=${f.request.initializeOperationId}`;
+          yield* f.sql`INSERT INTO project_team_pi_process VALUES ('review-unit',${f.request.initializeOperationId},'{"unit":"review-unit"}',${status},NULL,NULL)`;
+          if (status === "allocated")
+            expect(
+              (yield* f.reader.readForOperation(reviewOperation(f))).required.reviewTarget?.prepared
+                .manifest.jobId,
+            ).toBe("verification-1");
+          else {
+            yield* denied(f.reader.readForOperation(reviewOperation(f)));
+            expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+          }
+        }),
+      ),
+  );
+
+for (const corruption of ["owner", "drain", "descriptor", "unit", "identity", "duplicate"] as const)
+  it.effect(`review prepared allocation denies ${corruption} before target capture`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewFixture();
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Missing claim");
+        const b = claim.binding;
+        const prepared = yield* preparedReviewShape(f);
+        const intent = prepared.json;
+        yield* f.sql`INSERT INTO project_team_pi_operation VALUES (${f.request.initializeOperationId},'environment',${projectId},${b.recordId},0,${b.providerInstanceId},${b.threadId},'review-worker',0,'initialize',${prepared.requestHash},${b.recordId},${b.taskId},1000,9999999999999,'prepared',${intent},NULL,NULL)`;
+        yield* f.sql`INSERT INTO project_team_pi_process VALUES ('review-unit',${f.request.initializeOperationId},'{"unit":"review-unit"}','allocated',NULL,NULL)`;
+        if (corruption === "owner")
+          yield* f.sql`UPDATE project_team_pi_process SET owner_json='{}'`;
+        if (corruption === "drain")
+          yield* f.sql`UPDATE project_team_pi_process SET drain_json='{}'`;
+        if (corruption === "descriptor")
+          yield* f.sql`UPDATE project_team_pi_process SET allocation_json='{}'`;
+        if (corruption === "unit")
+          yield* f.sql`UPDATE project_team_pi_process SET unit='replacement-unit'`;
+        if (corruption === "identity")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.binding.generation',99)`;
+        if (corruption === "duplicate")
+          yield* f.sql`INSERT INTO project_team_pi_process VALUES ('other-unit',${f.request.initializeOperationId},'{}','allocated',NULL,NULL)`;
+        yield* denied(f.reader.readForOperation(reviewOperation(f)));
+        expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+      }),
+    ),
+  );
+
+const preparedReviewShape = Effect.fn("reviewFixture.preparedShape")(function* (
+  f: Effect.Success<ReturnType<typeof reviewFixture>>,
+) {
+  const claim = f.snapshot.intent.compiledClaim.transition;
+  if (claim?.kind !== "claim") return yield* Effect.die("Missing claim");
+  const b = claim.binding;
+  const records = (yield* readCurrentState(f.sql, projectId)).foundationRecords ?? [];
+  const binding = records.find((r) => r.recordId === b.recordId);
+  const role = records.find((r) => r.recordId === b.roleRevisionId);
+  if (binding?.kind !== "run-binding" || role?.kind !== "role-revision")
+    return yield* Effect.die("Missing prepared authority");
+  const request = {
+    threadId: b.threadId,
+    kind: "initialize",
+    operationId: f.request.initializeOperationId,
+  };
+  const allocation = { unit: "review-unit" };
+  const limits = f.snapshot.intent.limits;
+  const intent = {
+    request,
+    binding,
+    role,
+    allocation,
+    rootBudget: {
+      rootTaskId: limits.rootTaskId,
+      maximumTokens: limits.maximumTokens,
+      deadlineAtMs: limits.rootDeadlineAtMs,
+    },
+    operationLimits: {
+      maximumTokens: limits.attemptMaximumTokens,
+      deadlineAtMs: limits.deadlineAtMs,
+    },
+    resourceHash: "a".repeat(64),
+  };
+  const requestHash = NodeCrypto.createHash("sha256")
+    .update(canonicalProjectWorkPayload(request))
+    .digest("hex");
+  return { b, request, intent, requestHash, json: canonicalProjectWorkPayload(intent) };
+});
+it.effect("review accepts the producer's request-containing prepared initializer shape", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* reviewFixture();
+      const p = yield* preparedReviewShape(f);
+      const b = p.b;
+      yield* f.sql`INSERT INTO project_team_pi_operation VALUES (${f.request.initializeOperationId},'environment',${projectId},${b.recordId},0,${b.providerInstanceId},${b.threadId},'review-worker',0,'initialize',${p.requestHash},${b.recordId},${b.taskId},1000,9999999999999,'prepared',${p.json},NULL,NULL)`;
+      yield* f.sql`INSERT INTO project_team_pi_process VALUES ('review-unit',${f.request.initializeOperationId},'{"unit":"review-unit"}','allocated',NULL,NULL)`;
+      expect(
+        (yield* f.reader.readForOperation(reviewOperation(f))).required.reviewTarget?.prepared
+          .manifest.jobId,
+      ).toBe("verification-1");
+    }),
+  ),
+);
+
+for (const corruption of ["missing", "malformed", "kind", "thread", "operation", "hash"] as const)
+  it.effect(`review prepared initializer denies ${corruption} request`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewFixture();
+        const p = yield* preparedReviewShape(f);
+        const b = p.b;
+        yield* f.sql`INSERT INTO project_team_pi_operation VALUES (${f.request.initializeOperationId},'environment',${projectId},${b.recordId},0,${b.providerInstanceId},${b.threadId},'review-worker',0,'initialize',${p.requestHash},${b.recordId},${b.taskId},1000,9999999999999,'prepared',${p.json},NULL,NULL)`;
+        yield* f.sql`INSERT INTO project_team_pi_process VALUES ('review-unit',${f.request.initializeOperationId},'{"unit":"review-unit"}','allocated',NULL,NULL)`;
+        if (corruption === "missing")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_remove(intent_json,'$.request')`;
+        if (corruption === "malformed")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.request',99)`;
+        if (corruption === "kind")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.request.kind','prompt')`;
+        if (corruption === "thread")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.request.threadId','foreign-thread')`;
+        if (corruption === "operation")
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.request.operationId','foreign-initialize')`;
+        if (corruption === "hash")
+          yield* f.sql`UPDATE project_team_pi_operation SET request_hash=${"0".repeat(64)}`;
+        if (corruption === "kind" || corruption === "thread" || corruption === "operation") {
+          const changed = {
+            ...p.request,
+            ...(corruption === "kind" ? { kind: "prompt" } : {}),
+            ...(corruption === "thread" ? { threadId: "foreign-thread" } : {}),
+            ...(corruption === "operation" ? { operationId: "foreign-initialize" } : {}),
+          };
+          const changedHash = NodeCrypto.createHash("sha256")
+            .update(canonicalProjectWorkPayload(changed))
+            .digest("hex");
+          yield* f.sql`UPDATE project_team_pi_operation SET request_hash=${changedHash}`;
+        }
+        yield* denied(f.reader.readForOperation(reviewOperation(f)));
+        expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
+      }),
+    ),
+  );

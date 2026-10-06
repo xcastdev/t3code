@@ -108,6 +108,23 @@ export function makeProjectWorkVerificationJobs(input: typeof Options.Type) {
         return Effect.fail(deny("Invalid prepared job ID"));
       }
     };
+    // Context owns COMMIT and must not expose this private read before it succeeds.
+    const readPreparedInTransaction = (jobId: string) => {
+      let capturedId: string;
+      try {
+        capturedId = exact(decodeId, jobId);
+      } catch {
+        return Effect.fail(deny("Invalid prepared job ID"));
+      }
+      return Effect.gen(function* () {
+        const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
+        if (Option.isNone(currentClient) || currentClient.value !== sql)
+          return yield* deny("Prepared context reads require their captured SQL client");
+        if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+          return yield* deny("Prepared context reads require the caller-owned transaction");
+        return yield* read(capturedId);
+      });
+    };
     const retainPrepared = (input: ProjectVerificationJobManifest) => {
       let manifest: ProjectVerificationJobManifest;
       let manifestJson: string;
@@ -144,6 +161,6 @@ export function makeProjectWorkVerificationJobs(input: typeof Options.Type) {
         ),
       );
     };
-    return { retainPrepared, readPrepared };
+    return { retainPrepared, readPrepared, readPreparedInTransaction };
   });
 }

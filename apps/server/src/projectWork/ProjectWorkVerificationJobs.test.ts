@@ -68,6 +68,69 @@ const fixture = Effect.gen(function* () {
 });
 
 it.effect(
+  "private prepared reads require the same caller-owned transaction and cannot publish its failed COMMIT",
+  () =>
+    database(
+      Effect.gen(function* () {
+        const { sql, jobs } = yield* fixture;
+        const receipt = yield* jobs.retainPrepared(manifest);
+        expect(
+          (yield* jobs.readPreparedInTransaction(manifest.jobId).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* sql.withTransaction(jobs.readPreparedInTransaction(manifest.jobId))).toEqual(
+          receipt,
+        );
+        expect(
+          (yield* sql
+            .withTransaction(
+              jobs
+                .readPreparedInTransaction(manifest.jobId)
+                .pipe(Effect.provideService(SqlClient.SqlClient, { ...sql })),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        yield* sql`PRAGMA foreign_keys=ON`;
+        yield* sql`CREATE TABLE controlled_parent(id INTEGER PRIMARY KEY)`;
+        yield* sql`CREATE TABLE controlled_child(parent_id INTEGER REFERENCES controlled_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        let published = false;
+        const read = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO controlled_child VALUES(1)`;
+              return yield* jobs.readPreparedInTransaction(manifest.jobId);
+            }),
+          )
+          .pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                published = true;
+              }),
+            ),
+            Effect.exit,
+          );
+        expect(read._tag).toBe("Failure");
+        expect(published).toBe(false);
+        expect((yield* jobs.readPrepared(manifest.jobId).pipe(Effect.exit))._tag).toBe("Failure");
+        // Clean only the disposable connection's failed physical transaction.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const reserved = yield* sql.reserve;
+            yield* reserved.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* jobs.readPrepared(manifest.jobId)).toEqual(receipt);
+        yield* sql`DROP TRIGGER project_work_verification_jobs_immutable`;
+        yield* sql`UPDATE project_work_verification_jobs SET sha256=${"0".repeat(64)}`;
+        expect(
+          (yield* sql
+            .withTransaction(jobs.readPreparedInTransaction(manifest.jobId))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect(
   "retains an exact prepared manifest and preserves literal arguments without authority",
   () =>
     database(

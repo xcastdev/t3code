@@ -23,6 +23,7 @@ import {
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import {
   evaluateProjectTeamGate,
   projectTeamSpecificationHash,
@@ -210,6 +211,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
 }) {
   const sql = yield* SqlClient.SqlClient;
   const journal = yield* makeProjectTeamDispatchJournal(options);
+  const reviewTargets = yield* makeProjectTeamReviewTargets(options);
   const readRecord = Effect.fn("ProjectTeamContext.readRecord")(function* (
     record: ProjectTeamRecord,
   ) {
@@ -696,8 +698,8 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         return yield* deny("Required criterion progress disagrees with retained history");
     }
   });
-  const readRequired = Effect.fn("ProjectTeamContext.readRequired")(
-    function* (snapshot: ProjectTeamDispatchSnapshot) {
+  const readRequiredContext = Effect.fn("ProjectTeamContext.readRequired")(
+    function* (snapshot: ProjectTeamDispatchSnapshot, initialReview: boolean) {
       const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(currentClient) && currentClient.value !== sql)
         return yield* deny("Required context must use its captured SQL client");
@@ -742,6 +744,16 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           };
           const role = recordById(binding.roleRevisionId);
           if (role.kind !== "role-revision") return yield* deny("Original role is missing");
+          const reviewTarget =
+            role.role === "reviewer"
+              ? yield* initialReview
+                  ? reviewTargets.captureInitial(original)
+                  : reviewTargets.readForDispatch(original)
+              : undefined;
+          if (reviewTarget) {
+            recordById(reviewTarget.verificationGate.recordId);
+            recordById(reviewTarget.prepared.manifest.bindingId);
+          }
           const member = recordById(binding.memberId);
           if (member.kind !== "member") return yield* deny("Original member is missing");
           const gateIds = new Set(
@@ -924,6 +936,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             sourceRevision: state.revision,
             dispatch: original.fence,
             originalAssignment: original.intent.request.assignment,
+            ...(reviewTarget === undefined ? {} : { reviewTarget }),
             role,
             member,
             tasks,
@@ -947,6 +960,11 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           const final = yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });
           if (!same(final, original))
             return yield* deny("Required context dispatch changed before return");
+          if (reviewTarget) {
+            const checked = yield* reviewTargets.readForDispatch(final);
+            if (!same(checked, reviewTarget))
+              return yield* deny("Original review target changed before return");
+          }
           return {
             text,
             required,
@@ -958,7 +976,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
               ledgerReservationIds: ledger.receipts.map((r) => r.reservationId),
             },
           };
-        }),
+        }).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
       );
     },
     Effect.catchCause((cause) =>
@@ -967,6 +985,11 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         : Effect.fail(deny("Required context denied by retained or current authority")),
     ),
   );
+  const readRequired = Effect.fn("ProjectTeamContext.readRequiredSnapshot")(function* (
+    snapshot: ProjectTeamDispatchSnapshot,
+  ) {
+    return yield* readRequiredContext(snapshot, false);
+  });
   const readForOperation = Effect.fn("ProjectTeamContext.readForOperation")(function* (
     input: typeof OperationInput.Type,
   ) {
@@ -1009,7 +1032,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       )
       .pipe(Effect.mapError(() => deny("Required original dispatch is unavailable")));
     // The owned reader revalidates this snapshot in its own transaction before returning content.
-    return yield* readRequired(snapshot);
+    return yield* readRequiredContext(snapshot, operation.operationKind === "initialize");
   });
   return { readRequired, readForOperation };
 });
