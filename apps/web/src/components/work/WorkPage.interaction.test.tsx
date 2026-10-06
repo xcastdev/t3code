@@ -50,7 +50,8 @@ vi.mock("@effect/atom-react", async (importOriginal) => ({
     return AsyncResult.success([]);
   },
 }));
-vi.mock("@t3tools/client-runtime/environment", () => ({
+vi.mock("@t3tools/client-runtime/environment", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@t3tools/client-runtime/environment")>()),
   scopeProjectRef: (environmentId: string, projectId: string) => ({ environmentId, projectId }),
 }));
 vi.mock("~/state/environments", () => ({
