@@ -12,6 +12,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as TestClock from "effect/testing/TestClock";
+import * as DateTime from "effect/DateTime";
 import {
   canonicalProjectWorkPayload,
   ProjectTeamReviewFindingIntent,
@@ -24,6 +25,8 @@ import {
   ProjectTeamGuidedIntent,
   ThreadId,
   ProjectWorkEvidenceId,
+  ProjectWorkCommand,
+  ProjectWorkRelationship,
 } from "@t3tools/contracts";
 import {
   scoped,
@@ -42,7 +45,8 @@ import {
 } from "./ProjectTeamReviewCompletionProposals.ts";
 import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
-import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
+import { makeProjectTeamReviewCompletion } from "./ProjectTeamReviewCompletion.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import {
   makeProjectWorkVerificationGate,
@@ -60,6 +64,11 @@ import { ProjectWorkProjection, ProjectWorkProjectionLive } from "./ProjectWorkP
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import { executePiProjectWorkBridgeTool } from "../provider/pi/PiProjectWorkTools.ts";
 import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts";
+import { makeProjectTeamPiOperations, type PiDurableOperation } from "./ProjectTeamPiOperations.ts";
+import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
+import { make as makeModelAccounting } from "./ProjectTeamModelAccounting.ts";
+import { makeProjectTeamMailboxConsumption } from "./ProjectTeamMailboxConsumption.ts";
+import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
 
 const canonical = canonicalProjectWorkPayload;
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
@@ -68,6 +77,12 @@ const decodeIntent = Schema.decodeUnknownSync(ProjectTeamReviewFindingIntent, st
 const decodeCommit = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand, strict);
 const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord, strict);
 const decodeTeamIntent = Schema.decodeUnknownSync(ProjectTeamWriteIntent, strict);
+const decodeWorkCommand = Schema.decodeUnknownEffect(ProjectWorkCommand, strict);
+const decodeControlledJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.JsonObject),
+  strict,
+);
+const decodeControlledRelationship = Schema.decodeUnknownEffect(ProjectWorkRelationship, strict);
 const input = () =>
   decodeIntent({
     type: "project-team.review.finding.record",
@@ -132,428 +147,683 @@ it.effect(
 );
 
 /** Actual migrated SQLite, real authorization and original claim; no worker or model execution. */
-const fixture = Effect.gen(function* () {
-  const f = yield* verificationFixture;
-  const { sql, repository } = f;
-  const auth = yield* ProjectTeamAuthorization;
-  const state = () => readCurrentState(sql, projectId);
-  const commitRecords = (commandId: string, records: ReadonlyArray<ProjectTeamRecord>) =>
-    Effect.gen(function* () {
-      return yield* repository.execute(
-        decodeCommit({
-          type: "project-work.foundation.commit",
-          projectId,
-          commandId,
-          expectedRevision: (yield* state()).revision,
-          attribution,
-          committedAt: at,
-          records,
-        }),
-      );
+const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixture>) =>
+  Effect.gen(function* () {
+    const state = () => readCurrentState(f.sql, projectId);
+    let current = yield* state();
+    const old = current.foundationRecords?.find((r) => r.kind === "run-binding");
+    const role = current.foundationRecords?.find((r) => r.kind === "role-revision");
+    const member = current.foundationRecords?.find((r) => r.kind === "member");
+    const limits = current.foundationRecords?.find(
+      (r) => r.kind === "limits" && r.status === "configured",
+    );
+    const task = current.tasks.find((t) => t.taskId === f.selection.taskId);
+    if (
+      old?.kind !== "run-binding" ||
+      role?.kind !== "role-revision" ||
+      member?.kind !== "member" ||
+      limits?.kind !== "limits" ||
+      !task
+    )
+      return yield* Effect.die("Missing original root fixture scope");
+    const rootRole = decodeRecord({
+      ...role,
+      recordId: "review-root-role",
+      roleId: "review-root",
+      role: "coordinator",
+      model: "inclusionai/ling-3.1-flash:free",
+      tools: ["pi.read"],
     });
-  const gates = yield* makeProjectWorkVerificationGate({
-    environmentId: "environment",
-    maximumEnvironmentModelCalls: 4,
-  });
-  const human = {
-    actor: f.principal.actor,
-    source: { kind: "web" as const, id: "findings-fixture" },
-    recordedAt: at,
-  };
-  const trust = (expectedRevision: number) =>
-    ProjectWorkVerificationApproval.of({
-      selection: { ...f.selection, expectedRevision },
-      receipt: f.prepared,
-      assertCurrent: (current, duplicate) =>
-        gates
-          .assertCurrent(current, f.prepared, { ...f.selection, expectedRevision }, duplicate)
-          .pipe(
-            Effect.mapError(
-              () =>
-                new ProjectWorkVerificationGateError({
-                  reason: "Controlled verification target changed",
-                }),
-            ),
-          ),
-    });
-  const proposal = decodeTeamIntent({
-    ...f.selection,
-    type: "project-team.verification.propose",
-    commandId: "findings-verification-propose",
-  });
-  yield* repository.execute(
-    yield* auth
-      .intent(f.principal, proposal, human, false)
-      .pipe(
-        Effect.provideService(ProjectWorkVerificationApproval, trust(f.selection.expectedRevision)),
-      ),
-  );
-  let current = yield* state();
-  const verificationGate = current.foundationRecords?.find(
-    (r) => r.kind === "gate" && r.verificationJobId === f.selection.jobId,
-  );
-  if (verificationGate?.kind !== "gate")
-    return yield* Effect.die("Missing original human verification gate");
-  const response = decodeTeamIntent({
-    type: "project-team.gate.respond",
-    commandId: "findings-verification-approve",
-    projectId,
-    taskId: f.selection.taskId,
-    expectedRevision: current.revision,
-    expectedTaskRevision: f.selection.expectedTaskRevision,
-    specRevision: f.selection.specRevision,
-    planRevision: f.selection.planRevision,
-    gateId: verificationGate.recordId,
-    expectedGateRevision: verificationGate.revision,
-    response: "approved",
-  });
-  yield* repository.execute(
-    yield* auth
-      .intent(f.principal, response, human, false)
-      .pipe(
-        Effect.provideService(ProjectWorkVerificationApproval, trust(current.revision)),
-        Effect.provideService(
-          ProjectWorkVerificationRequest,
-          ProjectWorkVerificationRequest.of({ assertCurrent: () => Effect.void }),
-        ),
-      ),
-  );
-  current = yield* state();
-  const role = current.foundationRecords?.find((r) => r.kind === "role-revision");
-  const member = current.foundationRecords?.find((r) => r.kind === "member");
-  const parent = current.tasks.find((t) => t.taskId === f.selection.taskId);
-  const spec = current.foundationRecords?.find(
-    (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "specification",
-  );
-  const plan = current.foundationRecords?.find(
-    (r) => r.kind === "plan-revision" && r.taskId === parent?.taskId,
-  );
-  const planGate = current.foundationRecords?.find(
-    (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "plan",
-  );
-  if (
-    role?.kind !== "role-revision" ||
-    member?.kind !== "member" ||
-    !parent ||
-    spec?.kind !== "gate" ||
-    plan?.kind !== "plan-revision" ||
-    planGate?.kind !== "gate"
-  )
-    return yield* Effect.die("Missing original parent scope");
-  const reviewRole = decodeRecord({
-    ...role,
-    recordId: "review-role",
-    roleId: "reviewer",
-    role: "reviewer",
-    tools: ["pi.read", "project-work.report"],
-  });
-  if (reviewRole.kind !== "role-revision") return yield* Effect.die("Invalid review role");
-  yield* commitRecords("findings-review-member", [
-    reviewRole,
-    decodeRecord({ ...member, recordId: "review-member", roleRevisionId: "review-role" }),
-  ]);
-  current = yield* state();
-  yield* repository.execute(
-    decodeCommit({
-      type: "project-work.foundation.commit",
-      commandId: "findings-assignment",
-      projectId,
-      expectedRevision: current.revision,
-      attribution: human,
-      committedAt: at,
-      records: [],
-      guided: {
-        intent: {
-          type: "project-team.assignment.start",
-          commandId: "findings-assignment",
-          projectId,
-          taskId: parent.taskId,
-          expectedRevision: current.revision,
-          expectedTaskRevision: parent.revision,
-          assignmentKind: "review",
-          objective: "Independent review",
-          outputDescriptions: ["Review findings"],
-          specRevision: parent.specRevision,
-          specificationGateId: spec.recordId,
-          expectedSpecificationGateRevision: spec.revision,
-          parentPlan: {
-            recordId: plan.recordId,
-            expectedRecordRevision: plan.revision,
-            planRevision: plan.planRevision,
-            gateId: planGate.recordId,
-            expectedGateRevision: planGate.revision,
+    if (rootRole.kind !== "role-revision") return yield* Effect.die("Invalid controlled root role");
+    yield* f.repository.execute(
+      decodeCommit({
+        type: "project-work.foundation.commit",
+        commandId: "review-root-profile",
+        projectId,
+        expectedRevision: current.revision,
+        attribution,
+        committedAt: at,
+        records: [
+          rootRole,
+          decodeRecord({
+            ...member,
+            recordId: "review-root-member",
+            roleRevisionId: rootRole.recordId,
+            coordinator: true,
+          }),
+          decodeRecord({ ...limits, recordId: "review-model-limits", model: rootRole.model }),
+        ],
+      }),
+    );
+    current = yield* state();
+    yield* f.repository.execute(
+      decodeCommit({
+        type: "project-work.foundation.commit",
+        commandId: "review-root-resume",
+        projectId,
+        expectedRevision: current.revision,
+        attribution: { ...attribution, actor: f.principal.actor },
+        committedAt: at,
+        records: [],
+        guided: {
+          intent: {
+            type: "project-team.task.control",
+            commandId: "review-root-resume",
+            projectId,
+            taskId: task.taskId,
+            expectedRevision: current.revision,
+            expectedTaskRevision: task.revision,
+            control: { action: "resume", reason: "Retain independent controlled review root" },
           },
         },
+      }),
+    );
+    current = yield* state();
+    const parent = current.tasks.find((t) => t.taskId === task.taskId)!;
+    const membership = current.foundationRecords?.find(
+      (r) => r.kind === "task-membership" && r.taskId === task.taskId,
+    );
+    const gate = current.foundationRecords?.find(
+      (r) =>
+        r.kind === "gate" &&
+        r.recordId ===
+          (membership?.kind === "task-membership"
+            ? membership.assignment?.authorizationGateId
+            : undefined),
+    );
+    if (gate?.kind !== "gate") return yield* Effect.die("Missing renewed original root grant");
+    const fs = yield* FileSystem.FileSystem;
+    const root = yield* fs.makeTempDirectoryScoped();
+    const workspace = NodePath.join(root, "workspace");
+    const nativeRoot = NodePath.join(root, "native");
+    const protectedRoot = NodePath.join(root, "protected");
+    for (const path of [workspace, nativeRoot, protectedRoot]) yield* fs.makeDirectory(path);
+    const { sessionId: _oldSession, ...oldIdentity } = old;
+    const binding = decodeRecord({
+      ...oldIdentity,
+      recordId: "review-root-binding",
+      status: "reserved",
+      revision: 0,
+      generation: 1,
+      leaseGeneration: 1,
+      updatedAt: at,
+      attemptId: "review-root-attempt",
+      memberId: "review-root-member",
+      roleRevisionId: rootRole.recordId,
+      threadId: "review-root-thread",
+      model: rootRole.model,
+      worktree: workspace,
+      branch: "refs/heads/review-root",
+      authorizationGateId: gate.recordId,
+      configuration: {
+        ...old.configuration,
+        toolIds: ["pi.read"],
+        instructionsHash: digest(rootRole.instructions),
       },
-    }),
-  );
-  current = yield* state();
-  const grant = current.foundationRecords?.find(
-    (r) => r.kind === "gate" && r.gate === "assignment" && r.taskId !== parent.taskId,
-  );
-  const child = current.tasks.find(
-    (t) => t.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
-  );
-  if (grant?.kind !== "gate" || !child) return yield* Effect.die("Missing original review child");
-  const binding = decodeRecord({
-    kind: "run-binding",
-    projectId,
-    recordId: "review-binding",
-    revision: 0,
-    generation: 0,
-    updatedAt: at,
-    status: "reserved",
-    taskId: child.taskId,
-    attemptId: "review-attempt",
-    memberId: "review-member",
-    roleRevisionId: "review-role",
-    providerInstanceId: "pi",
-    threadId: "review-thread",
-    environmentId: "environment",
-    model: reviewRole.model,
-    configuration: {
-      instructionsHash: digest(reviewRole.instructions),
-      toolIds: ["pi.read", "project-work.report"],
-      skillIds: [],
-      runtimeVersion: "test",
-      maxTokens: 1000,
-      maxDurationMs: 1000,
-      paidFallback: false,
-    },
-    worktree: "/workspace-assigned",
-    branch: "refs/heads/assigned",
-    leaseGeneration: 0,
-    specRevision: child.specRevision,
-    planRevision: 0,
-    authorizationGateId: grant.recordId,
-    scopeHash: projectTeamScopeHash(current, child.taskId),
+    });
+    if (binding.kind !== "run-binding") return yield* Effect.die("Invalid controlled root binding");
+    const rootClaim = decodeCommit({
+      type: "project-work.foundation.commit",
+      commandId: "review-root-claim",
+      projectId,
+      expectedRevision: current.revision,
+      attribution,
+      committedAt: at,
+      records: [],
+      transition: {
+        kind: "claim",
+        taskId: task.taskId,
+        expectedTaskRevision: parent.revision,
+        authorizationGateId: gate.recordId,
+        expectedGateRevision: gate.revision,
+        binding,
+        claim: {
+          type: "project-work.task.claim",
+          projectId,
+          taskId: task.taskId,
+          commandId: "review-root-claim",
+          attemptId: binding.attemptId,
+          leaseToken: "review-root-lease",
+          leasedUntil: "2030-01-01T00:00:00.000Z",
+          claimedAt: at,
+        },
+      },
+    });
+    const rootJournal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    const reservedRoot = yield* rootJournal.reserve({
+      dispatchId: "review-root-dispatch",
+      claim: rootClaim,
+      git: {
+        effectId: "review-root-dispatch",
+        runId: binding.recordId,
+        generation: binding.generation,
+        primaryRoot: "/workspace",
+        commonGitDirectory: "/workspace/.git",
+        worktreePath: workspace,
+        branchRef: binding.branch,
+        baseRef: "refs/heads/main",
+        baseOid: "a".repeat(40),
+        ownershipToken: "review-root-owner",
+        policyHash: "b".repeat(64),
+      },
+      setupId: "review-root-setup",
+      initializeOperationId: "review-root-initialize",
+      assignmentOperationId: "review-root-assignment",
+      assignment: "Own the bounded review root",
+    });
+    yield* rootJournal.claimEffect(reservedRoot.fence);
+    const allocation = yield* preallocatePiManagedProcess({
+      workspaceRoot: workspace,
+      workspaceAccess: "readonly",
+      nativeStateRoot: nativeRoot,
+      protectedRoots: [protectedRoot],
+      runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+      argv: ["/bin/true"],
+      memoryBytes: 33554432,
+      runtimeSeconds: 10,
+    });
+    const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+    const request = {
+      kind: "initialize" as const,
+      operationId: "review-root-initialize",
+      threadId: binding.threadId,
+    };
+    const initialize = yield* operations.prepare(
+      { providerInstanceId: binding.providerInstanceId, threadId: binding.threadId },
+      request,
+      digest(canonical(request)),
+      {
+        allocation,
+        workerId: "review-root-worker",
+        operationId: request.operationId,
+        resourceHash: "a".repeat(64),
+      },
+    );
+    const owner = {
+      type: "owner" as const,
+      unit: allocation.unit,
+      nonce: allocation.nonce,
+      invocation: "b".repeat(32),
+      cgroup: "/sys/fs/cgroup/" + allocation.unit,
+      pid: 223,
+      memoryBytes: allocation.policy.memoryBytes,
+      swapBytes: 0 as const,
+      oomGroup: 1 as const,
+    };
+    // Real persistence callbacks retain controlled custody. No allocation is activated on the host.
+    yield* operations.persistence(initialize).claimActivation(allocation);
+    yield* operations.persistence(initialize).beforeStart(owner);
+    yield* operations.persistNative(initialize, {
+      sessionId: "controlled-review-root",
+      sessionReference: "sessions/root.jsonl",
+      leafId: null,
+      persisted: true,
+    });
+    current = yield* state();
+    const selection = {
+      ...f.selection,
+      expectedRevision: current.revision,
+      expectedTaskRevision: current.tasks.find((t) => t.taskId === task.taskId)!.revision,
+    };
+    const prepared = yield* f.preparation.prepare(selection, f.principal);
+    expect(prepared.sha256).toBe(f.prepared.sha256);
+    expect(prepared.manifest).toEqual(f.prepared.manifest);
+    return { ...f, selection, prepared, reviewRootBindingId: binding.recordId };
   });
-  if (binding.kind !== "run-binding") return yield* Effect.die("Invalid reviewer binding");
-  yield* TestClock.setTime(Date.parse(at) + 1);
-  const journal = yield* makeProjectTeamDispatchJournal({
-    environmentId: "environment",
-    maximumEnvironmentModelCalls: 4,
-  });
-  const claim = decodeCommit({
-    type: "project-work.foundation.commit",
-    projectId,
-    commandId: "findings-review-claim",
-    expectedRevision: (yield* state()).revision,
-    attribution,
-    committedAt: at,
-    records: [],
-    transition: {
-      kind: "claim",
-      taskId: child.taskId,
-      expectedTaskRevision: child.revision,
-      authorizationGateId: grant.recordId,
-      expectedGateRevision: grant.revision,
-      binding,
-      claim: {
-        type: "project-work.task.claim",
+const makeFindingFixture = (coherentCustody = false) =>
+  Effect.gen(function* () {
+    const initial = yield* verificationFixture;
+    const f = coherentCustody
+      ? yield* establishControlledReviewRoot(initial)
+      : { ...initial, reviewRootBindingId: undefined };
+    const controlledWorkspace = coherentCustody
+      ? yield* (yield* FileSystem.FileSystem).makeTempDirectoryScoped()
+      : undefined;
+    const { sql, repository } = f;
+    const auth = yield* ProjectTeamAuthorization;
+    const state = () => readCurrentState(sql, projectId);
+    const commitRecords = (commandId: string, records: ReadonlyArray<ProjectTeamRecord>) =>
+      Effect.gen(function* () {
+        return yield* repository.execute(
+          decodeCommit({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId,
+            expectedRevision: (yield* state()).revision,
+            attribution,
+            committedAt: at,
+            records,
+          }),
+        );
+      });
+    const gates = yield* makeProjectWorkVerificationGate({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    const human = {
+      actor: f.principal.actor,
+      source: { kind: "web" as const, id: "findings-fixture" },
+      recordedAt: at,
+    };
+    const trust = (expectedRevision: number) =>
+      ProjectWorkVerificationApproval.of({
+        selection: { ...f.selection, expectedRevision },
+        receipt: f.prepared,
+        assertCurrent: (current, duplicate) =>
+          gates
+            .assertCurrent(current, f.prepared, { ...f.selection, expectedRevision }, duplicate)
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new ProjectWorkVerificationGateError({
+                    reason: "Controlled verification target changed",
+                  }),
+              ),
+            ),
+      });
+    const proposal = decodeTeamIntent({
+      ...f.selection,
+      type: "project-team.verification.propose",
+      commandId: "findings-verification-propose",
+    });
+    yield* repository.execute(
+      yield* auth
+        .intent(f.principal, proposal, human, false)
+        .pipe(
+          Effect.provideService(
+            ProjectWorkVerificationApproval,
+            trust(f.selection.expectedRevision),
+          ),
+        ),
+    );
+    let current = yield* state();
+    const verificationGate = current.foundationRecords?.find(
+      (r) => r.kind === "gate" && r.verificationJobId === f.selection.jobId,
+    );
+    if (verificationGate?.kind !== "gate")
+      return yield* Effect.die("Missing original human verification gate");
+    const response = decodeTeamIntent({
+      type: "project-team.gate.respond",
+      commandId: "findings-verification-approve",
+      projectId,
+      taskId: f.selection.taskId,
+      expectedRevision: current.revision,
+      expectedTaskRevision: f.selection.expectedTaskRevision,
+      specRevision: f.selection.specRevision,
+      planRevision: f.selection.planRevision,
+      gateId: verificationGate.recordId,
+      expectedGateRevision: verificationGate.revision,
+      response: "approved",
+    });
+    yield* repository.execute(
+      yield* auth
+        .intent(f.principal, response, human, false)
+        .pipe(
+          Effect.provideService(ProjectWorkVerificationApproval, trust(current.revision)),
+          Effect.provideService(
+            ProjectWorkVerificationRequest,
+            ProjectWorkVerificationRequest.of({ assertCurrent: () => Effect.void }),
+          ),
+        ),
+    );
+    current = yield* state();
+    const role = current.foundationRecords?.find((r) => r.kind === "role-revision");
+    const member = current.foundationRecords?.find((r) => r.kind === "member");
+    const parent = current.tasks.find((t) => t.taskId === f.selection.taskId);
+    const spec = current.foundationRecords?.find(
+      (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "specification",
+    );
+    const plan = current.foundationRecords?.find(
+      (r) => r.kind === "plan-revision" && r.taskId === parent?.taskId,
+    );
+    const planGate = current.foundationRecords?.find(
+      (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "plan",
+    );
+    if (
+      role?.kind !== "role-revision" ||
+      member?.kind !== "member" ||
+      !parent ||
+      spec?.kind !== "gate" ||
+      plan?.kind !== "plan-revision" ||
+      planGate?.kind !== "gate"
+    )
+      return yield* Effect.die("Missing original parent scope");
+    const reviewRole = decodeRecord({
+      ...role,
+      model: coherentCustody ? "inclusionai/ling-3.1-flash:free" : role.model,
+      recordId: "review-role",
+      roleId: "reviewer",
+      role: "reviewer",
+      tools: ["pi.read", "project-work.report"],
+    });
+    if (reviewRole.kind !== "role-revision") return yield* Effect.die("Invalid review role");
+    if (
+      coherentCustody &&
+      !current.foundationRecords?.some(
+        (r) => r.kind === "limits" && r.status === "configured" && r.model === reviewRole.model,
+      )
+    ) {
+      const configured = current.foundationRecords?.find(
+        (r) => r.kind === "limits" && r.status === "configured",
+      );
+      if (configured?.kind !== "limits")
+        return yield* Effect.die("Missing controlled model limits");
+      yield* commitRecords("findings-review-model-policy", [
+        decodeRecord({ ...configured, recordId: "review-model-limits", model: reviewRole.model }),
+      ]);
+    }
+    yield* commitRecords("findings-review-member", [
+      reviewRole,
+      decodeRecord({ ...member, recordId: "review-member", roleRevisionId: "review-role" }),
+    ]);
+    current = yield* state();
+    yield* repository.execute(
+      decodeCommit({
+        type: "project-work.foundation.commit",
+        commandId: "findings-assignment",
         projectId,
-        taskId: child.taskId,
-        commandId: "findings-review-claim",
-        attemptId: binding.attemptId,
-        leaseToken: "review-lease",
-        leasedUntil: "2030-01-01T00:00:00.000Z",
-        claimedAt: at,
-      },
-    },
-  });
-  const reservation = yield* journal.reserve({
-    dispatchId: "review-dispatch",
-    claim,
-    git: {
-      effectId: "review-dispatch",
-      runId: binding.recordId,
+        expectedRevision: current.revision,
+        attribution: human,
+        committedAt: at,
+        records: [],
+        guided: {
+          intent: {
+            type: "project-team.assignment.start",
+            commandId: "findings-assignment",
+            projectId,
+            taskId: parent.taskId,
+            expectedRevision: current.revision,
+            expectedTaskRevision: parent.revision,
+            assignmentKind: "review",
+            objective: "Independent review",
+            outputDescriptions: ["Review findings"],
+            specRevision: parent.specRevision,
+            specificationGateId: spec.recordId,
+            expectedSpecificationGateRevision: spec.revision,
+            parentPlan: {
+              recordId: plan.recordId,
+              expectedRecordRevision: plan.revision,
+              planRevision: plan.planRevision,
+              gateId: planGate.recordId,
+              expectedGateRevision: planGate.revision,
+            },
+          },
+        },
+      }),
+    );
+    current = yield* state();
+    const grant = current.foundationRecords?.find(
+      (r) => r.kind === "gate" && r.gate === "assignment" && r.taskId !== parent.taskId,
+    );
+    const child = current.tasks.find(
+      (t) => t.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
+    );
+    if (grant?.kind !== "gate" || !child) return yield* Effect.die("Missing original review child");
+    const binding = decodeRecord({
+      kind: "run-binding",
+      projectId,
+      recordId: "review-binding",
+      revision: 0,
       generation: 0,
-      primaryRoot: "/workspace",
-      commonGitDirectory: "/workspace/.git",
-      worktreePath: binding.worktree,
-      branchRef: binding.branch,
-      baseRef: "refs/heads/main",
-      baseOid: "a".repeat(40),
-      ownershipToken: "review-owner",
-      policyHash: "b".repeat(64),
-    },
-    setupId: "review-setup",
-    initializeOperationId: "review-initialize",
-    assignmentOperationId: "review-assignment",
-    assignment: "Review the original target",
-  });
-  const snapshot = yield* journal.claimEffect(reservation.fence);
-  const targets = yield* makeProjectTeamReviewTargets({
-    environmentId: "environment",
-    maximumEnvironmentModelCalls: 4,
-  });
-  const target = yield* sql.withTransaction(targets.captureInitial(snapshot));
-  // Only disposable SDK bytes and controlled custody receipts; no child process is launched.
-  const fs = yield* FileSystem.FileSystem;
-  const root = yield* fs.makeTempDirectoryScoped();
-  const nativeRoot = NodePath.join(root, "native");
-  const workspace = NodePath.join(root, "workspace");
-  yield* fs.makeDirectory(nativeRoot);
-  yield* fs.makeDirectory(workspace);
-  yield* fs.makeDirectory(NodePath.join(root, "protected"));
-  const sessionDirectoryRoot = NodePath.join(nativeRoot, "sessions");
-  const manager = yield* Effect.sync(() =>
-    SessionManager.create(binding.worktree, sessionDirectoryRoot),
-  );
-  const briefing = "Independent reviewer; only the original retained verification target.";
-  manager.appendModelChange("synthetic", "fixture-only");
-  const leafId = manager.appendMessage({
-    role: "user",
-    content: [{ type: "text", text: briefing }],
-    timestamp: 1,
-  });
-  const file = manager.getSessionFile();
-  if (!file) return yield* Effect.die("Missing disposable JSONL");
-  const native = {
-    sessionId: manager.getSessionId(),
-    sessionReference: `sessions/${NodePath.basename(file)}`,
-    leafId,
-    persisted: true,
-  };
-  const allocation = yield* preallocatePiManagedProcess({
-    workspaceRoot: workspace,
-    workspaceAccess: "readonly",
-    nativeStateRoot: nativeRoot,
-    protectedRoots: [NodePath.join(root, "protected")],
-    runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
-    argv: ["/bin/true"],
-    memoryBytes: 33554432,
-    runtimeSeconds: 10,
-  });
-  const request = {
-    kind: "initialize",
-    operationId: "review-initialize",
-    threadId: binding.threadId,
-    resumeCursor: null,
-  };
-  const nativeIntent = {
-    request,
-    binding,
-    role: reviewRole,
-    allocation,
-    resourceHash: "a".repeat(64),
-    rootBudget: { rootTaskId: binding.taskId, maximumTokens: 1000, deadlineAtMs: 100000 },
-    operationLimits: { maximumTokens: 1000, deadlineAtMs: 100000 },
-  };
-  const owner = {
-    type: "owner",
-    unit: allocation.unit,
-    nonce: allocation.nonce,
-    invocation: "a".repeat(32),
-    cgroup: `/sys/fs/cgroup/${allocation.unit}`,
-    pid: 123,
-    memoryBytes: allocation.policy.memoryBytes,
-    swapBytes: 0,
-    oomGroup: 1,
-  };
-  const drain = {
-    unit: owner.unit,
-    invocation: owner.invocation,
-    cgroup: owner.cgroup,
-    ownerPid: owner.pid,
-    memoryBytes: owner.memoryBytes,
-    swapBytes: 0,
-    oomGroup: 1,
-    launcherPid: 122,
-    childPid: 124,
-    childExitCode: 0,
-    kernel: "populated 0\nfrozen 0\n",
-  };
-  const terminal = {
-    identity: { workerId: "review-worker", generation: 0 },
-    operation: { operationId: "review-initialize", operationKind: "initialize" },
-    outcome: "success",
-    ownerCaptured: true,
-    native,
-    drain,
-    accountingReceipts: [],
-  };
-  yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
+      updatedAt: at,
+      status: "reserved",
+      taskId: child.taskId,
+      attemptId: "review-attempt",
+      memberId: "review-member",
+      roleRevisionId: "review-role",
+      providerInstanceId: "pi",
+      threadId: "review-thread",
+      environmentId: "environment",
+      model: reviewRole.model,
+      configuration: {
+        instructionsHash: digest(reviewRole.instructions),
+        toolIds: ["pi.read", "project-work.report"],
+        skillIds: [],
+        runtimeVersion: "test",
+        maxTokens: 1000,
+        maxDurationMs: 1000,
+        paidFallback: false,
+      },
+      worktree: controlledWorkspace ?? "/workspace-assigned",
+      branch: "refs/heads/assigned",
+      leaseGeneration: 0,
+      specRevision: child.specRevision,
+      planRevision: 0,
+      authorizationGateId: grant.recordId,
+      ...(f.reviewRootBindingId === undefined ? {} : { parentRunId: f.reviewRootBindingId }),
+      scopeHash: projectTeamScopeHash(current, child.taskId),
+    });
+    if (binding.kind !== "run-binding") return yield* Effect.die("Invalid reviewer binding");
+    yield* TestClock.setTime(Date.parse(at) + 1);
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    const claim = decodeCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "findings-review-claim",
+      expectedRevision: (yield* state()).revision,
+      attribution,
+      committedAt: at,
+      records: [],
+      transition: {
+        kind: "claim",
+        taskId: child.taskId,
+        expectedTaskRevision: child.revision,
+        authorizationGateId: grant.recordId,
+        expectedGateRevision: grant.revision,
+        binding,
+        claim: {
+          type: "project-work.task.claim",
+          projectId,
+          taskId: child.taskId,
+          commandId: "findings-review-claim",
+          attemptId: binding.attemptId,
+          leaseToken: "review-lease",
+          leasedUntil: "2030-01-01T00:00:00.000Z",
+          claimedAt: at,
+        },
+      },
+    });
+    const reservation = yield* journal.reserve({
+      dispatchId: "review-dispatch",
+      claim,
+      git: {
+        effectId: "review-dispatch",
+        runId: binding.recordId,
+        generation: 0,
+        primaryRoot: "/workspace",
+        commonGitDirectory: "/workspace/.git",
+        worktreePath: binding.worktree,
+        branchRef: binding.branch,
+        baseRef: "refs/heads/main",
+        baseOid: "a".repeat(40),
+        ownershipToken: "review-owner",
+        policyHash: "b".repeat(64),
+      },
+      setupId: "review-setup",
+      initializeOperationId: "review-initialize",
+      assignmentOperationId: "review-assignment",
+      assignment: "Review the original target",
+    });
+    const snapshot = yield* journal.claimEffect(reservation.fence);
+    const targets = yield* makeProjectTeamReviewTargets({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    const target = yield* sql.withTransaction(targets.captureInitial(snapshot));
+    // Only disposable SDK bytes and controlled custody receipts; no child process is launched.
+    const fs = yield* FileSystem.FileSystem;
+    const root = yield* fs.makeTempDirectoryScoped();
+    const nativeRoot = NodePath.join(root, "native");
+    const workspace = NodePath.join(root, "workspace");
+    yield* fs.makeDirectory(nativeRoot);
+    yield* fs.makeDirectory(workspace);
+    yield* fs.makeDirectory(NodePath.join(root, "protected"));
+    const sessionDirectoryRoot = NodePath.join(nativeRoot, "sessions");
+    const manager = yield* Effect.sync(() =>
+      SessionManager.create(binding.worktree, sessionDirectoryRoot),
+    );
+    const briefing = "Independent reviewer; only the original retained verification target.";
+    manager.appendModelChange("synthetic", "fixture-only");
+    const leafId = manager.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: briefing }],
+      timestamp: 1,
+    });
+    const file = manager.getSessionFile();
+    if (!file) return yield* Effect.die("Missing disposable JSONL");
+    const native = {
+      sessionId: manager.getSessionId(),
+      sessionReference: `sessions/${NodePath.basename(file)}`,
+      leafId,
+      persisted: true,
+    };
+    const allocation = yield* preallocatePiManagedProcess({
+      workspaceRoot: controlledWorkspace ?? workspace,
+      workspaceAccess: "readonly",
+      nativeStateRoot: nativeRoot,
+      protectedRoots: [NodePath.join(root, "protected")],
+      runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+      argv: ["/bin/true"],
+      memoryBytes: 33554432,
+      runtimeSeconds: 10,
+    });
+    const request = {
+      kind: "initialize",
+      operationId: "review-initialize",
+      threadId: binding.threadId,
+      resumeCursor: null,
+    };
+    const nativeIntent = {
+      request,
+      binding,
+      role: reviewRole,
+      allocation,
+      resourceHash: "a".repeat(64),
+      rootBudget: { rootTaskId: binding.taskId, maximumTokens: 1000, deadlineAtMs: 100000 },
+      operationLimits: { maximumTokens: 1000, deadlineAtMs: 100000 },
+    };
+    const owner = {
+      type: "owner",
+      unit: allocation.unit,
+      nonce: allocation.nonce,
+      invocation: "a".repeat(32),
+      cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+      pid: 123,
+      memoryBytes: allocation.policy.memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+    };
+    const drain = {
+      unit: owner.unit,
+      invocation: owner.invocation,
+      cgroup: owner.cgroup,
+      ownerPid: owner.pid,
+      memoryBytes: owner.memoryBytes,
+      swapBytes: 0,
+      oomGroup: 1,
+      launcherPid: 122,
+      childPid: 124,
+      childExitCode: 0,
+      kernel: "populated 0\nfrozen 0\n",
+    };
+    const terminal = {
+      identity: { workerId: "review-worker", generation: 0 },
+      operation: { operationId: "review-initialize", operationKind: "initialize" },
+      outcome: "success",
+      ownerCaptured: true,
+      native,
+      drain,
+      accountingReceipts: [],
+    };
+    yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
     operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json,native_json,terminal_json)
     VALUES ('review-initialize','environment',${projectId},${binding.recordId},0,${binding.providerInstanceId},${binding.threadId},'review-worker',0,'initialize',${digest(canonical(request))},
       ${binding.recordId},${binding.taskId},1000,100000,'settled',${canonical(nativeIntent)},${canonical(native)},${canonical(terminal)})`;
-  yield* sql`INSERT INTO project_team_pi_process (unit,operation_id,allocation_json,status,owner_json,drain_json)
+    yield* sql`INSERT INTO project_team_pi_process (unit,operation_id,allocation_json,status,owner_json,drain_json)
     VALUES (${allocation.unit},'review-initialize',${canonical(allocation)},'drained',${canonical(owner)},${canonical(drain)})`;
-  const freshness = yield* makeProjectTeamReviewFreshness({ environmentId: "environment" });
-  yield* freshness.capture({
-    projectId,
-    taskId: binding.taskId,
-    bindingId: binding.recordId,
-    generation: 0,
-    providerInstanceId: binding.providerInstanceId,
-    threadId: binding.threadId,
-    operationId: "review-initialize",
-    specRevision: binding.specRevision,
-    planRevision: 0,
-    sessionDirectoryRoot,
-    expectedCwd: binding.worktree,
-    native,
-    expectedBriefing: briefing,
-    assertCurrent: Effect.void,
-  });
-  const running = decodeRecord({
-    ...binding,
-    status: "running",
-    sessionId: native.sessionId,
-    revision: 1,
-  });
-  if (running.kind !== "run-binding") return yield* Effect.die("Invalid running binding");
-  yield* restoreHistoricalBinding(running);
-  const managed = {
-    projectId,
-    bindingId: binding.recordId,
-    generation: 0,
-    providerInstanceId: binding.providerInstanceId,
-    threadId: binding.threadId,
-  };
-  const principal = { actor: { kind: "agent" as const, id: managedActorId(managed) }, managed };
-  const reportAttribution = {
-    actor: principal.actor,
-    source: { kind: "mcp" as const, id: "project-work.report" },
-    recordedAt: at,
-  };
-  const compiler = yield* makeProjectTeamReviewFindings(auth.resolve);
-  const report = (overrides: Partial<ProjectTeamReviewFindingIntent> = {}) =>
-    Effect.gen(function* () {
-      const current = yield* state();
-      const selected = current.tasks.find((t) => t.taskId === binding.taskId)!;
-      return decodeIntent({
-        ...input(),
-        taskId: binding.taskId,
-        expectedRevision: current.revision,
-        expectedTaskRevision: selected.revision,
-        specRevision: binding.specRevision,
-        planRevision: binding.planRevision,
-        criterionIds: f.selection.criterionIds,
-        ...overrides,
-      });
+    const freshness = yield* makeProjectTeamReviewFreshness({ environmentId: "environment" });
+    yield* freshness.capture({
+      projectId,
+      taskId: binding.taskId,
+      bindingId: binding.recordId,
+      generation: 0,
+      providerInstanceId: binding.providerInstanceId,
+      threadId: binding.threadId,
+      operationId: "review-initialize",
+      specRevision: binding.specRevision,
+      planRevision: 0,
+      sessionDirectoryRoot,
+      expectedCwd: binding.worktree,
+      native,
+      expectedBriefing: briefing,
+      assertCurrent: Effect.void,
     });
-  const compile = (intent: ProjectTeamReviewFindingIntent) =>
-    sql.withTransaction(compiler.compile(principal, intent, reportAttribution, false));
-  return {
-    ...f,
-    compiler,
-    principal,
-    reportAttribution,
-    report,
-    compile,
-    target,
-    running,
-    state,
-    commitRecords,
-    reviewRole,
-    nativeIntent,
-    native,
-    allocation,
-    owner,
-    snapshot,
-  };
-});
+    const running = decodeRecord({
+      ...binding,
+      status: "running",
+      sessionId: native.sessionId,
+      revision: 1,
+      ...(coherentCustody ? { updatedAt: DateTime.formatIso(yield* DateTime.now) } : {}),
+    });
+    if (running.kind !== "run-binding") return yield* Effect.die("Invalid running binding");
+    yield* restoreHistoricalBinding(running);
+    const managed = {
+      projectId,
+      bindingId: binding.recordId,
+      generation: 0,
+      providerInstanceId: binding.providerInstanceId,
+      threadId: binding.threadId,
+    };
+    const principal = { actor: { kind: "agent" as const, id: managedActorId(managed) }, managed };
+    const reportAttribution = {
+      actor: principal.actor,
+      source: { kind: "mcp" as const, id: "project-work.report" },
+      recordedAt: at,
+    };
+    const compiler = yield* makeProjectTeamReviewFindings(auth.resolve);
+    const report = (overrides: Partial<ProjectTeamReviewFindingIntent> = {}) =>
+      Effect.gen(function* () {
+        const current = yield* state();
+        const selected = current.tasks.find((t) => t.taskId === binding.taskId)!;
+        return decodeIntent({
+          ...input(),
+          taskId: binding.taskId,
+          expectedRevision: current.revision,
+          expectedTaskRevision: selected.revision,
+          specRevision: binding.specRevision,
+          planRevision: binding.planRevision,
+          criterionIds: f.selection.criterionIds,
+          ...overrides,
+        });
+      });
+    const compile = (intent: ProjectTeamReviewFindingIntent) =>
+      sql.withTransaction(compiler.compile(principal, intent, reportAttribution, false));
+    return {
+      ...f,
+      compiler,
+      principal,
+      reportAttribution,
+      report,
+      compile,
+      target,
+      running,
+      state,
+      commitRecords,
+      reviewRole,
+      nativeIntent,
+      native,
+      allocation,
+      owner,
+      snapshot,
+    };
+  });
+const fixture = makeFindingFixture();
 
 it.effect(
   "compiles an open parent finding from exact retained reviewer custody without changing tasks or criteria",
@@ -1136,121 +1406,952 @@ it.effect("stable finding identity rejects reuse against a replaced original tar
 );
 
 const decodeCompletionReport = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, strict);
-const proposalFixture = Effect.gen(function* () {
-  const f = yield* fixture;
-  const current = yield* f.state();
-  const task = current.tasks.find((t) => t.taskId === f.running.taskId)!;
-  const memberships =
-    current.foundationRecords?.filter(
-      (r) => r.kind === "task-membership" && r.taskId === task.taskId,
-    ) ?? [];
-  const membership = memberships[0];
-  if (memberships.length !== 1 || membership?.kind !== "task-membership")
-    return yield* Effect.die("Missing reviewer membership");
-  const journal = yield* makeProjectTeamDispatchJournal({
-    environmentId: "environment",
-    maximumEnvironmentModelCalls: 4,
-    verifyStage: () => Effect.void,
-  });
-  let snapshot = f.snapshot;
-  for (const stage of [
-    "workspace-ready",
-    "setup-complete",
-    "session-bound",
-    "assignment-intent",
-  ] as const) {
-    snapshot = yield* journal.advanceStage(snapshot.fence, {
-      receiptId: "proposal-stage-" + stage,
-      stage,
-      evidence: { controlledCustody: true },
+const makeProposalFixture = (coherentCustody = false) =>
+  Effect.gen(function* () {
+    const f = yield* makeFindingFixture(coherentCustody);
+    const current = yield* f.state();
+    const task = current.tasks.find((t) => t.taskId === f.running.taskId)!;
+    const memberships =
+      current.foundationRecords?.filter(
+        (r) => r.kind === "task-membership" && r.taskId === task.taskId,
+      ) ?? [];
+    const membership = memberships[0];
+    if (memberships.length !== 1 || membership?.kind !== "task-membership")
+      return yield* Effect.die("Missing reviewer membership");
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+      verifyStage: () => Effect.void,
     });
-  }
-  const rootBudget = {
-    rootTaskId: snapshot.intent.limits.rootTaskId,
-    maximumTokens: snapshot.intent.limits.maximumTokens,
-    deadlineAtMs: snapshot.intent.limits.rootDeadlineAtMs,
-  };
-  const operationLimits = {
-    maximumTokens: snapshot.intent.limits.attemptMaximumTokens,
-    deadlineAtMs: snapshot.intent.limits.deadlineAtMs,
-  };
-  const roots =
-    current.foundationRecords?.filter(
-      (r) => r.kind === "run-binding" && r.taskId === rootBudget.rootTaskId,
-    ) ?? [];
-  const root = roots[0];
-  if (roots.length !== 1 || root?.kind !== "run-binding")
-    return yield* Effect.die("Missing original root binding");
-  const originalInitialize = { ...f.nativeIntent, rootBudget, operationLimits };
-  yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(originalInitialize)},root_binding_id=${root.recordId},root_task_id=${root.taskId},maximum_tokens=${operationLimits.maximumTokens},deadline_at_ms=${operationLimits.deadlineAtMs} WHERE operation_id='review-initialize'`;
-  const request = {
-    kind: "prompt",
-    operationId: "review-assignment",
-    threadId: f.running.threadId,
-    prompt: "Review the original target",
-    resumeCursor: f.native,
-  };
-  const intent = { ...originalInitialize, request, binding: f.running };
-  yield* f.sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
+    let snapshot = f.snapshot;
+    for (const stage of [
+      "workspace-ready",
+      "setup-complete",
+      "session-bound",
+      "assignment-intent",
+    ] as const) {
+      snapshot = yield* journal.advanceStage(snapshot.fence, {
+        receiptId: "proposal-stage-" + stage,
+        stage,
+        evidence: { controlledCustody: true },
+      });
+    }
+    const rootBudget = {
+      rootTaskId: snapshot.intent.limits.rootTaskId,
+      maximumTokens: snapshot.intent.limits.maximumTokens,
+      deadlineAtMs: snapshot.intent.limits.rootDeadlineAtMs,
+    };
+    const operationLimits = {
+      maximumTokens: snapshot.intent.limits.attemptMaximumTokens,
+      deadlineAtMs: snapshot.intent.limits.deadlineAtMs,
+    };
+    const roots =
+      current.foundationRecords?.filter(
+        (r) =>
+          r.kind === "run-binding" &&
+          (f.running.parentRunId === undefined
+            ? r.taskId === rootBudget.rootTaskId
+            : r.recordId === f.running.parentRunId),
+      ) ?? [];
+    const root = roots[0];
+    if (roots.length !== 1 || root?.kind !== "run-binding")
+      return yield* Effect.die("Missing original root binding");
+    const originalInitialize = { ...f.nativeIntent, rootBudget, operationLimits };
+    yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(originalInitialize)},root_binding_id=${root.recordId},root_task_id=${root.taskId},maximum_tokens=${operationLimits.maximumTokens},deadline_at_ms=${operationLimits.deadlineAtMs} WHERE operation_id='review-initialize'`;
+    const request = {
+      kind: "prompt",
+      operationId: "review-assignment",
+      threadId: f.running.threadId,
+      prompt: "Review the original target",
+      resumeCursor: f.native,
+    };
+    const intent = { ...originalInitialize, request, binding: f.running };
+    yield* f.sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
     operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json)
     VALUES ('review-assignment','environment',${projectId},${f.running.recordId},0,${f.running.providerInstanceId},${f.running.threadId},'review-assignment-worker',1,'prompt',${digest(canonical(request))},
     ${root.recordId},${root.taskId},${operationLimits.maximumTokens},${operationLimits.deadlineAtMs},'running',${canonical(intent)})`;
-  // Synthetic retained custody only; no process is started by this fixture.
-  const allocation = { ...f.allocation, unit: f.allocation.unit + "-assignment" };
-  const assignedIntent = { ...intent, allocation };
-  yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(assignedIntent)} WHERE operation_id='review-assignment'`;
-  yield* f.sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status,owner_json) VALUES (${allocation.unit},'review-assignment',${canonical(allocation)},'captured',${canonical({ ...f.owner, unit: allocation.unit, cgroup: "/sys/fs/cgroup/" + allocation.unit })})`;
-  const operation = {
-    environmentId: "environment",
-    projectId,
-    reviewTaskId: task.taskId,
-    bindingId: f.running.recordId,
-    generation: 0,
-    providerInstanceId: f.running.providerInstanceId,
-    threadId: f.running.threadId,
-    operationId: "review-assignment",
-    operationKind: "prompt" as const,
-    workerId: "review-assignment-worker",
-    ordinal: 1,
-  };
-  const criteria = current.criteria.filter(
-    (c) =>
-      c.taskId === task.taskId &&
-      (c.required || task.specification?.criterionIds.includes(c.criterionId)),
-  );
-  const report = decodeCompletionReport({
-    type: "project-team.assignment.report",
-    commandId: "review-completion-report",
-    projectId,
-    taskId: task.taskId,
-    expectedRevision: current.revision,
-    expectedTaskRevision: task.revision,
-    specRevision: f.running.specRevision,
-    planRevision: f.running.planRevision,
-    assignmentId: membership.recordId,
-    expectedAssignmentRevision: membership.revision,
-    summary: "Original independent review completed; pending qualification",
-    evidenceIds: [],
-    outputArtifactIds: [],
-    outputs: criteria.map((c) => ({
-      criterionId: c.criterionId,
-      kind: "observation",
-      detail: "Checked the original target; no findings in this control",
-    })),
-    outcome: "complete",
-  });
-  const auth = yield* ProjectTeamAuthorization;
-  if (report.type !== "project-team.assignment.report")
-    return yield* Effect.die("Invalid completion report fixture");
-  const proposals = yield* makeProjectTeamReviewCompletionProposals(auth.resolve);
-  const compile = () =>
-    f.sql.withTransaction(
-      proposals
-        .compile(f.principal, report, f.reportAttribution)
-        .pipe(Effect.provideService(ProjectTeamReviewReportOperation, operation)),
+    // Synthetic retained custody only; no process is started by this fixture.
+    const allocation = coherentCustody
+      ? yield* preallocatePiManagedProcess({
+          workspaceRoot: f.running.worktree,
+          workspaceAccess: "readonly",
+          nativeStateRoot: f.allocation.launch.nativeState!.path,
+          protectedRoots: f.allocation.launch.protectedRoots,
+          runtimeFiles: f.allocation.launch.runtimeFiles.map((file) => ({
+            source: file.source,
+            target: file.target,
+          })),
+          argv: f.allocation.launch.argv,
+          memoryBytes: f.allocation.policy.memoryBytes,
+          runtimeSeconds: f.allocation.policy.runtimeSeconds,
+        })
+      : { ...f.allocation, unit: f.allocation.unit + "-assignment" };
+    const assignmentOwner = {
+      ...f.owner,
+      unit: allocation.unit,
+      nonce: allocation.nonce,
+      cgroup: "/sys/fs/cgroup/" + allocation.unit,
+    };
+    const assignedIntent = { ...intent, allocation };
+    yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(assignedIntent)} WHERE operation_id='review-assignment'`;
+    yield* f.sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status,owner_json) VALUES (${allocation.unit},'review-assignment',${canonical(allocation)},'captured',${canonical(assignmentOwner)})`;
+    const operation = {
+      environmentId: "environment",
+      projectId,
+      reviewTaskId: task.taskId,
+      bindingId: f.running.recordId,
+      generation: 0,
+      providerInstanceId: f.running.providerInstanceId,
+      threadId: f.running.threadId,
+      operationId: "review-assignment",
+      operationKind: "prompt" as const,
+      workerId: "review-assignment-worker",
+      ordinal: 1,
+    };
+    const criteria = current.criteria.filter(
+      (c) =>
+        c.taskId === task.taskId &&
+        (c.required || task.specification?.criterionIds.includes(c.criterionId)),
     );
-  return { ...f, proposals, operation, completionReport: report, compileProposal: compile };
-});
+    const report = decodeCompletionReport({
+      type: "project-team.assignment.report",
+      commandId: "review-completion-report",
+      projectId,
+      taskId: task.taskId,
+      expectedRevision: current.revision,
+      expectedTaskRevision: task.revision,
+      specRevision: f.running.specRevision,
+      planRevision: f.running.planRevision,
+      assignmentId: membership.recordId,
+      expectedAssignmentRevision: membership.revision,
+      summary: "Original independent review completed; pending qualification",
+      evidenceIds: [],
+      outputArtifactIds: [],
+      outputs: criteria.map((c) => ({
+        criterionId: c.criterionId,
+        kind: "observation",
+        detail: "Checked the original target; no findings in this control",
+      })),
+      outcome: "complete",
+    });
+    const auth = yield* ProjectTeamAuthorization;
+    if (report.type !== "project-team.assignment.report")
+      return yield* Effect.die("Invalid completion report fixture");
+    const proposals = yield* makeProjectTeamReviewCompletionProposals(auth.resolve);
+    const compile = () =>
+      f.sql.withTransaction(
+        proposals
+          .compile(f.principal, report, f.reportAttribution)
+          .pipe(Effect.provideService(ProjectTeamReviewReportOperation, operation)),
+      );
+    const proposalSnapshot = yield* journal.readRetained(snapshot.fence.dispatchId);
+    return {
+      ...f,
+      proposals,
+      operation,
+      completionReport: report,
+      compileProposal: compile,
+      proposalSnapshot,
+      assignmentAllocation: allocation,
+      assignmentOwner,
+      operationLimits,
+    };
+  });
+const proposalFixture = makeProposalFixture();
+const completionJoin = {
+  receiptId: "review-joined",
+  stage: "settled" as const,
+  evidence: { controlledOwnedDrain: true },
+};
+it.effect(
+  "completed review consumer requires the original SQL, repository, and caller transaction",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const repo = yield* ProjectWorkRepository;
+        const consumer = yield* makeProjectTeamReviewCompletion({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+        });
+        expect(
+          (yield* consumer.prepare(f.proposalSnapshot, completionJoin).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              consumer
+                .prepare(f.proposalSnapshot, completionJoin)
+                .pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql })),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              consumer
+                .prepare(f.proposalSnapshot, completionJoin)
+                .pipe(Effect.provideService(ProjectWorkRepository, { ...repo })),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              consumer
+                .prepare(f.proposalSnapshot, completionJoin)
+                .pipe(
+                  Effect.updateContext((context: Context.Context<never>) =>
+                    Context.omit(SqlClient.SqlClient)(context),
+                  ),
+                ),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+it.effect("completed review consumer leaves an original review without a proposal unchanged", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* proposalFixture;
+      const before = yield* f.state();
+      const consumer = yield* makeProjectTeamReviewCompletion({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 128,
+      });
+      expect(
+        yield* f.sql.withTransaction(consumer.prepare(f.proposalSnapshot, completionJoin)),
+      ).toBeUndefined();
+      expect(yield* f.state()).toEqual(before);
+    }),
+  ),
+);
+it.effect(
+  "completed review consumer denies a pending report without original terminal consumption",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        yield* f.compileProposal();
+        const before = yield* f.state();
+        const consumer = yield* makeProjectTeamReviewCompletion({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+        });
+        const proof = yield* f.sql.withTransaction(
+          consumer.prepare(f.proposalSnapshot, completionJoin),
+        );
+        expect(proof?.status).toBe("denied");
+        if (proof?.status === "denied") expect(proof.reason).toBe("assignment-incomplete");
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+const makeConsumedReviewFixture = (
+  options: { readonly criticalFinding?: boolean; readonly referencedEvidence?: boolean } = {},
+) =>
+  Effect.gen(function* () {
+    const f = yield* makeProposalFixture(true);
+    if (options.criticalFinding)
+      yield* f.repository.execute(yield* f.compile(yield* f.report({ severity: "critical" })));
+    const initial = yield* f.state();
+    const criterion = initial.criteria.find((c) => c.taskId === f.running.taskId);
+    if (!criterion) return yield* Effect.die("Missing original child criterion");
+    const referenceId = ProjectWorkEvidenceId.make("review-reference");
+    if (options.referencedEvidence)
+      yield* f.repository.execute(
+        yield* decodeWorkCommand({
+          type: "project-work.evidence.add",
+          commandId: "review-reference-add",
+          projectId,
+          evidence: {
+            taskId: f.running.taskId,
+            evidenceId: referenceId,
+            criterionId: criterion.criterionId,
+            kind: "observation",
+            summary: "Retained review observation",
+            detail: "Exact retained review observation",
+            scopeHash: projectTeamScopeHash(initial, f.running.taskId),
+            recordedAt: at,
+            revision: 0,
+            attribution,
+          },
+          addedAt: at,
+        }),
+      );
+    const completionReport = decodeCompletionReport({
+      ...f.completionReport,
+      expectedRevision: (yield* f.state()).revision,
+      evidenceIds: options.referencedEvidence ? [referenceId] : [],
+    });
+    if (completionReport.type !== "project-team.assignment.report")
+      return yield* Effect.die("Invalid consumed report fixture");
+    yield* f.sql.withTransaction(
+      f.proposals
+        .compile(f.principal, completionReport, f.reportAttribution)
+        .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+    );
+    const authorization = yield* ProjectTeamAuthorization;
+    const authority = yield* authorization.resolve(f.principal);
+    if (!authority) return yield* Effect.die("Missing original controlled reviewer authority");
+    const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+    const prompt: PiDurableOperation = {
+      operation: { operationId: f.operation.operationId, operationKind: "prompt" },
+      workerId: f.operation.workerId,
+      ordinal: f.operation.ordinal,
+      authority,
+      principal: f.principal,
+      allocation: f.assignmentAllocation,
+      maximumTokens: f.operationLimits.maximumTokens,
+      deadlineAtMs: f.operationLimits.deadlineAtMs,
+    };
+    yield* operations.persistNative(prompt, f.native);
+    const mailbox = yield* makeProjectTeamMailboxConsumption({ environmentId: "environment" });
+    const sealed = yield* mailbox.sealInitialAssignment({
+      operationId: f.operation.operationId,
+      baseSystemText: f.reviewRole.instructions,
+    });
+    const accounting = yield* makeModelAccounting({
+      environmentId: "environment",
+      routeId: "command-code-ling-free",
+      model: authority.binding.model,
+      acceptedReportedModels: [authority.binding.model],
+      resolveOperation: operations.resolveOperation,
+    });
+    const fields = {
+      workerId: prompt.workerId,
+      operationId: prompt.operation.operationId,
+      generation: authority.binding.generation,
+      requestId: 1,
+      routeId: "command-code-ling-free",
+      provider: "command-code" as const,
+      model: authority.binding.model,
+      maxInputTokens: 10,
+      maxOutputTokens: 10,
+      callCount: 1 as const,
+      deadlineAtMs: prompt.deadlineAtMs,
+    };
+    const reservation = yield* accounting.reserve(f.principal, fields);
+    // Controlled broker-input custody, not an HTTP/model request.
+    yield* mailbox.bindRequestInput({
+      operationId: f.operation.operationId,
+      reservationId: reservation.reservationId,
+      encodedRequestSha256: digest(
+        canonical({
+          model: fields.model,
+          messages: [
+            { role: "system", content: sealed.systemText },
+            { role: "user", content: f.proposalSnapshot.intent.request.assignment },
+          ],
+        }),
+      ),
+    });
+    const usage = { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 };
+    const settlement = yield* accounting.settle({
+      ...fields,
+      reservationId: reservation.reservationId,
+      outcome: "reported",
+      transportDrained: true,
+      chargedInputTokens: 2,
+      chargedOutputTokens: 1,
+      reportedModel: fields.model,
+      reportedUsage: usage,
+    });
+    const owner = f.assignmentOwner;
+    const drain = {
+      unit: owner.unit,
+      invocation: owner.invocation,
+      cgroup: owner.cgroup,
+      ownerPid: owner.pid,
+      memoryBytes: owner.memoryBytes,
+      swapBytes: 0 as const,
+      oomGroup: 1 as const,
+      launcherPid: 122,
+      childPid: 124,
+      childExitCode: 0,
+      kernel: "populated 0\nfrozen 0\n",
+    };
+    const terminal: PiSessionTerminal = {
+      identity: { workerId: prompt.workerId, generation: authority.binding.generation },
+      operation: prompt.operation,
+      outcome: "success",
+      ownerCaptured: true,
+      native: f.native,
+      drain,
+      accountingReceipts: [
+        {
+          requestId: 1,
+          reservationId: reservation.reservationId,
+          accountingReceiptId: settlement.accountingReceiptId,
+          routeId: fields.routeId,
+          provider: fields.provider,
+          model: fields.model,
+          reportedModel: fields.model,
+          usage,
+        },
+      ],
+    };
+    yield* operations.persistTerminal(prompt, terminal);
+    const sessions = yield* makeProjectTeamSessionReceipts({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 128,
+    });
+    const originalReceipt = yield* sessions.readAssignment(f.proposalSnapshot);
+    if (!originalReceipt) return yield* Effect.die("Missing full original assignment receipt");
+    const consumer = yield* makeProjectTeamReviewCompletion({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 128,
+    });
+    const joined = {
+      receiptId: "review-original-joined",
+      stage: "settled" as const,
+      evidence: yield* decodeControlledJson(
+        canonical({
+          version: 1,
+          dispatchId: f.proposalSnapshot.fence.dispatchId,
+          bindingId: f.running.recordId,
+          generation: f.running.generation,
+          claimGeneration: f.proposalSnapshot.fence.claimGeneration,
+          setup: { controlledCustody: true },
+          operations: [
+            {
+              operationId: prompt.operation.operationId,
+              allocation: f.assignmentAllocation,
+              owner,
+              reconciliation: {
+                state: "drained",
+                unit: owner.unit,
+                invocation: owner.invocation,
+                cgroup: owner.cgroup,
+                kernel: "removed",
+              },
+            },
+          ],
+        }),
+      ),
+    };
+    const prepare = () => f.sql.withTransaction(consumer.prepare(f.proposalSnapshot, joined));
+    return {
+      ...f,
+      completionReport,
+      consumer,
+      prepare,
+      joined,
+      originalReceipt,
+      prompt,
+      reservation,
+      referenceId,
+      criterion,
+    };
+  });
+const consumedReviewFixture = makeConsumedReviewFixture();
+it.effect(
+  "completed review consumer qualifies only exact original consumed proof without completing the child",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* consumedReviewFixture;
+        const before = yield* f.state();
+        const retained = yield* readProposal(f);
+        const proof = yield* f.prepare();
+        expect(proof?.status).toBe("completed");
+        if (proof?.status !== "completed" || !retained)
+          return yield* Effect.die("Missing qualified review proof");
+        expect(proof.proposalSha256).toBe(retained.sha256);
+        expect(proof.assignmentReceiptSha256).toBe(digest(canonical(f.originalReceipt)));
+        expect(proof.report).toEqual(f.completionReport);
+        expect(proof.criteria).toEqual(retained.manifest.criteria);
+        expect(proof.findings).toEqual([]);
+        expect(yield* f.prepare()).toEqual(proof);
+        expect(yield* f.state()).toEqual(before);
+        expect(before.tasks.find((t) => t.taskId === proof.target.taskId)?.state).not.toBe(
+          "completed",
+        );
+      }),
+    ),
+);
+it.effect(
+  "completed review consumer allows a retained critical finding and unfinished parent",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({ criticalFinding: true });
+        const proof = yield* f.prepare();
+        expect(proof?.status).toBe("completed");
+        if (proof?.status !== "completed")
+          return yield* Effect.die("Missing critical-finding review proof");
+        expect(proof.findings).toHaveLength(1);
+        expect(
+          (yield* f.state()).tasks.find((t) => t.taskId === proof.target.taskId)?.state,
+        ).not.toBe("completed");
+      }),
+    ),
+);
+it.effect(
+  "completed review consumer permits expired historical leases without current authorization",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* consumedReviewFixture;
+        yield* TestClock.setTime(Date.parse("2030-01-01T00:00:00.000Z") + 1);
+        expect(
+          (yield* (yield* ProjectTeamAuthorization).resolve(f.principal).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* f.prepare())?.status).toBe("completed");
+      }),
+    ),
+);
+it.effect(
+  "completed review consumer denies newly reported findings after an explicit empty snapshot",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* consumedReviewFixture;
+        yield* f.repository.execute(yield* f.compile(yield* f.report({ severity: "critical" })));
+        const before = yield* f.state();
+        expect(yield* f.prepare()).toMatchObject({ status: "denied", reason: "stale-proof" });
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+for (const change of [
+  "criterion",
+  "evidence",
+  "target",
+  "member",
+  "control",
+  "dependency",
+  "child",
+  "failed",
+  "missing",
+  "input",
+  "freshness",
+] as const) {
+  it.effect(`completed review consumer denies changed original proof: ${change}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({ referencedEvidence: change === "evidence" });
+        if (change === "criterion" || change === "evidence") {
+          // Disposable derived-snapshot corruption; this is not a public mutation permission.
+          const changed = yield* f.state();
+          const altered =
+            change === "criterion"
+              ? {
+                  ...changed,
+                  criteria: changed.criteria.map((c) =>
+                    c.criterionId === f.criterion.criterionId
+                      ? { ...c, description: "Changed criterion content", revision: c.revision + 1 }
+                      : c,
+                  ),
+                }
+              : {
+                  ...changed,
+                  evidence: changed.evidence.map((e) =>
+                    e.evidenceId === f.referenceId
+                      ? { ...e, detail: "Changed evidence content", revision: e.revision + 1 }
+                      : e,
+                  ),
+                };
+          yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=${canonical(altered)} WHERE project_id=${projectId}`;
+        }
+        if (change === "target")
+          yield* f.sql`DELETE FROM project_team_review_target WHERE dispatch_id=${f.proposalSnapshot.fence.dispatchId}`;
+        if (change === "member") {
+          const member = (yield* f.state()).foundationRecords?.find(
+            (r) => r.kind === "member" && r.recordId === f.running.memberId,
+          );
+          if (member?.kind !== "member") return yield* Effect.die("Missing original member");
+          yield* f.commitRecords("review-member-pause", [
+            decodeRecord({ ...member, status: "paused", revision: member.revision + 1 }),
+          ]);
+        }
+        if (change === "control") {
+          const membership = (yield* f.state()).foundationRecords?.find(
+            (r) => r.kind === "task-membership" && r.taskId === f.running.taskId,
+          );
+          if (membership?.kind !== "task-membership")
+            return yield* Effect.die("Missing original membership");
+          yield* f.commitRecords("review-control-pause", [
+            decodeRecord({
+              ...membership,
+              controlState: "paused",
+              revision: membership.revision + 1,
+            }),
+          ]);
+        }
+        if (change === "dependency") {
+          // Ordinary links into a managed task are protected; corrupt only this disposable derived snapshot.
+          const changed = yield* f.state();
+          const relationship = yield* decodeControlledRelationship({
+            relationshipId: "review-explicit-dependency",
+            projectId,
+            fromTaskId: f.running.taskId,
+            toTaskId: f.selection.taskId,
+            kind: "depends-on",
+            revision: 0,
+            createdAt: at,
+            attribution,
+          });
+          yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=${canonical({ ...changed, relationships: [...changed.relationships, relationship] })} WHERE project_id=${projectId}`;
+        }
+        if (change === "child") {
+          yield* f.repository.execute(
+            yield* decodeWorkCommand({
+              type: "project-work.task.create",
+              commandId: "review-active-child",
+              projectId,
+              taskId: "review-active-child",
+              title: "Explicit dependent review child",
+              createdAt: at,
+              attribution,
+            }),
+          );
+          yield* f.commitRecords("review-child-membership", [
+            decodeRecord({
+              kind: "task-membership",
+              recordId: "review-child-membership",
+              projectId,
+              revision: 0,
+              generation: 0,
+              updatedAt: at,
+              status: "active",
+              taskId: "review-active-child",
+              parentTaskId: f.running.taskId,
+              executionKind: "human",
+              deliverableKind: "non-code",
+            }),
+          ]);
+        }
+        if (change === "failed")
+          yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=json_set(terminal_json,'$.outcome','failed') WHERE operation_id=${f.operation.operationId}`;
+        if (change === "missing") {
+          yield* f.sql`DELETE FROM project_team_pi_process WHERE operation_id=${f.operation.operationId}`;
+        }
+        if (change === "input") {
+          yield* f.sql`DROP TRIGGER project_team_mailbox_input_immutable`;
+          yield* f.sql`UPDATE project_team_mailbox_input SET worker_id='foreign' WHERE operation_id=${f.operation.operationId}`;
+        }
+        if (change === "freshness") {
+          // Bypass an immutable trigger only to simulate corruption of disposable retained custody.
+          yield* f.sql`DROP TRIGGER project_team_review_freshness_immutable`;
+          yield* f.sql`UPDATE project_team_review_freshness SET native_jsonl='x' WHERE operation_id='review-initialize'`;
+        }
+        const before = yield* f.state();
+        const proof = yield* f.prepare();
+        expect(proof?.status).toBe("denied");
+        if (change === "dependency" || change === "child")
+          expect(proof).toMatchObject({ reason: "dependency-incomplete" });
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+  );
+}
+it.effect(
+  "completed review consumer captures caller input before yielding and rejects extra fields",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* consumedReviewFixture;
+        const snapshot = structuredClone(f.proposalSnapshot);
+        const joined = structuredClone(f.joined);
+        const effect = f.consumer.prepare(snapshot, joined);
+        Reflect.set(snapshot.fence, "dispatchId", "foreign");
+        Reflect.set(joined.evidence, "bindingId", "foreign");
+        expect((yield* f.sql.withTransaction(effect))?.status).toBe("completed");
+        const injected = { ...f.proposalSnapshot, injected: true };
+        expect(
+          (yield* f.sql.withTransaction(f.consumer.prepare(injected, f.joined)).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+it.effect("completed review consumer preserves SQL failure and rolls back owning writes", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* consumedReviewFixture;
+      const before = yield* f.state();
+      // Establish a valid cached statement before the controlled transactional schema fault.
+      expect((yield* f.prepare())?.status).toBe("completed");
+      const result = yield* f.sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* f.sql`DROP TABLE project_team_mailbox_input`;
+            return yield* f.consumer.prepare(f.proposalSnapshot, f.joined);
+          }),
+        )
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") expect(result.failure._tag).toBe("SqlError");
+      expect(yield* f.state()).toEqual(before);
+      expect((yield* f.prepare())?.status).toBe("completed");
+    }),
+  ),
+);
+it.effect(
+  "integrated completed review settlement completes only the original review child and replays exactly after lease expiry",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({ criticalFinding: true });
+        const before = yield* f.state();
+        const proof = yield* f.prepare();
+        if (proof?.status !== "completed")
+          return yield* Effect.die("Missing original completed proof");
+        let qualifications = 0;
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          // Disposable retained SQL/custody descriptors, not actual Host/native drain verification.
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: (snapshot, receipt) =>
+            f.consumer.prepare(snapshot, receipt).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  qualifications++;
+                }),
+              ),
+            ),
+        });
+        yield* TestClock.setTime(Date.parse("2030-01-01T00:00:00.000Z") + 1);
+        const settled = yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined);
+        expect(settled.fence.stage).toBe("settled");
+        const after = yield* f.state();
+        expect(after.tasks.find((t) => t.taskId === f.running.taskId)?.state).toBe("completed");
+        expect(after.attempts.find((a) => a.attemptId === f.running.attemptId)?.state).toBe(
+          "succeeded",
+        );
+        expect(
+          after.foundationRecords?.find((r) => r.recordId === f.running.recordId),
+        ).toMatchObject({ status: "settled" });
+        expect(after.tasks.find((t) => t.taskId === proof.target.taskId)).toEqual(
+          before.tasks.find((t) => t.taskId === proof.target.taskId),
+        );
+        expect(after.criteria.filter((c) => c.taskId === proof.target.taskId)).toEqual(
+          before.criteria.filter((c) => c.taskId === proof.target.taskId),
+        );
+        expect(
+          after.foundationRecords?.filter(
+            (r) => r.kind === "gate" && r.taskId === proof.target.taskId,
+          ),
+        ).toEqual(
+          before.foundationRecords?.filter(
+            (r) => r.kind === "gate" && r.taskId === proof.target.taskId,
+          ),
+        );
+        expect(after.foundationRecords?.filter((r) => r.kind === "review-finding")).toEqual(
+          before.foundationRecords?.filter((r) => r.kind === "review-finding"),
+        );
+        expect(
+          after.evidence.filter((e) => proof.outputs.some((o) => o.evidenceId === e.evidenceId)),
+        ).toHaveLength(proof.outputs.length);
+        expect(after.evidence.find((e) => e.evidenceId === proof.reportEvidenceId)).toMatchObject({
+          taskId: f.running.taskId,
+          detail: f.completionReport.summary,
+          attribution: f.reportAttribution,
+        });
+        expect(after.comments?.find((c) => c.commentId === proof.reportCommentId)).toMatchObject({
+          taskId: f.running.taskId,
+          body: f.completionReport.summary,
+        });
+        const events = yield* f.sql<{
+          event_type: string;
+        }>`SELECT event_type FROM project_work_events WHERE project_id=${projectId} AND command_id=(SELECT command_id FROM project_work_events WHERE project_id=${projectId} AND event_type='project-work.task.completed' AND json_extract(payload_json,'$.taskId')=${f.running.taskId} LIMIT 1) ORDER BY sequence`;
+        const types = events.map((e) => e.event_type);
+        expect(types.slice(0, proof.outputs.length)).toEqual(
+          proof.outputs.map(() => "project-work.evidence.added"),
+        );
+        expect(types.slice(proof.outputs.length, proof.outputs.length + 3)).toEqual([
+          "project-work.evidence.added",
+          "project-work.comment.added",
+          "project-work.task.completed",
+        ]);
+        expect(types[proof.outputs.length + 3]).toBe("project-work.foundation.recorded");
+        expect(types).not.toContain("project-work.attempt.stopped");
+        const counts =
+          yield* f.sql`SELECT (SELECT COUNT(*) FROM project_work_events WHERE project_id=${projectId}) AS events,(SELECT COUNT(*) FROM project_work_command_receipts WHERE project_id=${projectId}) AS receipts`;
+        expect(
+          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).duplicate,
+        ).toBe(true);
+        expect(qualifications).toBe(1);
+        expect(yield* f.state()).toEqual(after);
+        expect(
+          yield* f.sql`SELECT (SELECT COUNT(*) FROM project_work_events WHERE project_id=${projectId}) AS events,(SELECT COUNT(*) FROM project_work_command_receipts WHERE project_id=${projectId}) AS receipts`,
+        ).toEqual(counts);
+        const query = yield* ProjectWorkQuery;
+        expect(
+          (yield* query.snapshot(projectId)).tasks.find((t) => t.taskId === f.running.taskId)
+            ?.state,
+        ).toBe("completed");
+      }),
+    ),
+);
+it.effect(
+  "integrated completed review settlement denies changed findings then stops and retains child attention without report outputs",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* consumedReviewFixture;
+        yield* f.repository.execute(yield* f.compile(yield* f.report({ severity: "critical" })));
+        const before = yield* f.state();
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+        });
+        yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined);
+        const after = yield* f.state();
+        expect(after.tasks.find((t) => t.taskId === f.running.taskId)?.state).toBe("blocked");
+        expect(after.attempts.find((a) => a.attemptId === f.running.attemptId)?.state).toBe(
+          "canceled",
+        );
+        expect(after.blockers.some((b) => b.taskId === f.running.taskId && b.attention)).toBe(true);
+        expect(
+          after.foundationRecords?.find((r) => r.recordId === f.running.recordId),
+        ).toMatchObject({ status: "settled" });
+        expect(after.evidence).toEqual(before.evidence);
+        expect(after.comments).toEqual(before.comments);
+        expect(after.tasks.find((t) => t.taskId === f.selection.taskId)).toEqual(
+          before.tasks.find((t) => t.taskId === f.selection.taskId),
+        );
+        const blocked = yield* f.sql<{
+          event_type: string;
+        }>`SELECT event_type FROM project_work_events WHERE project_id=${projectId} AND json_extract(payload_json,'$.taskId')=${f.running.taskId} AND event_type IN ('project-work.attempt.stopped','project-work.task.blocked','project-work.task.completed') ORDER BY sequence`;
+        expect(blocked.map((e) => e.event_type)).toEqual([
+          "project-work.attempt.stopped",
+          "project-work.task.blocked",
+        ]);
+      }),
+    ),
+);
+it.effect(
+  "integrated completed review settlement propagates consumer SQL failure and rolls back its stage before exact retry",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* consumedReviewFixture;
+        expect((yield* f.prepare())?.status).toBe("completed");
+        const before = yield* f.state();
+        const priorReceipts = yield* f.journal.readStageReceipts(
+          f.proposalSnapshot.fence.dispatchId,
+        );
+        const inputs =
+          yield* f.sql`SELECT * FROM project_team_mailbox_input WHERE operation_id=${f.operation.operationId}`;
+        const broken = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: (snapshot, receipt) =>
+            Effect.gen(function* () {
+              // Controlled transactional storage fault, followed by the actual consumer.
+              yield* f.sql`DROP TABLE project_team_mailbox_input`;
+              return yield* f.consumer.prepare(snapshot, receipt);
+            }),
+        });
+        const result = yield* broken
+          .settleAfterJoined(f.proposalSnapshot.fence, f.joined)
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure).toMatchObject({
+            _tag: "PersistenceSqlError",
+            cause: { _tag: "SqlError" },
+          });
+        expect(yield* f.state()).toEqual(before);
+        expect(yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId)).toEqual(
+          priorReceipts,
+        );
+        expect(
+          yield* f.sql`SELECT * FROM project_team_mailbox_input WHERE operation_id=${f.operation.operationId}`,
+        ).toEqual(inputs);
+        const retry = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+        });
+        expect(
+          (yield* retry.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).fence.stage,
+        ).toBe("settled");
+        expect((yield* f.state()).tasks.find((t) => t.taskId === f.running.taskId)?.state).toBe(
+          "completed",
+        );
+      }),
+    ),
+);
+it.effect(
+  "integrated completed review settlement failed COMMIT exposes no successful completion or public snapshot before owned cleanup",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* consumedReviewFixture;
+        const before = yield* f.state();
+        const priorReceipts = yield* f.journal.readStageReceipts(
+          f.proposalSnapshot.fence.dispatchId,
+        );
+        const query = yield* ProjectWorkQuery;
+        const gateway = yield* ProjectWorkGateway;
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+        });
+        yield* f.sql`CREATE TABLE completion_commit_parent(id TEXT PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE completion_commit_child(id TEXT REFERENCES completion_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* f.sql`CREATE TRIGGER completion_commit_failure AFTER INSERT ON project_work_events BEGIN INSERT INTO completion_commit_child VALUES ('missing'); END`;
+        let escaped = false;
+        expect(
+          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                escaped = true;
+              }),
+            ),
+            Effect.exit,
+          ))._tag,
+        ).toBe("Failure");
+        expect(escaped).toBe(false);
+        expect(
+          (yield* f.sql<{
+            count: number;
+          }>`SELECT COUNT(*) AS count FROM completion_commit_child`)[0]?.count,
+        ).toBeGreaterThan(0);
+        expect((yield* query.snapshot(projectId).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(
+          (yield* gateway
+            .read({ projectId, operation: "foundation-records", recordKinds: ["review-finding"] })
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        // Only this disposable test owns the connection loan; production never rolls back a foreign loan.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* f.state()).toEqual(before);
+        expect(yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId)).toEqual(
+          priorReceipts,
+        );
+        yield* f.sql`DROP TRIGGER completion_commit_failure`;
+        expect(
+          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).fence.stage,
+        ).toBe("settled");
+        expect(
+          (yield* query.snapshot(projectId)).tasks.find((t) => t.taskId === f.running.taskId)
+            ?.state,
+        ).toBe("completed");
+      }),
+    ),
+);
 it.effect(
   "retains a pending original review completion proposal with explicit empty findings and no work-state changes",
   () =>

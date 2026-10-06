@@ -1,3 +1,5 @@
+import * as NodeCrypto from "node:crypto";
+import * as Schema from "effect/Schema";
 import {
   CommandId,
   ProjectId,
@@ -10,8 +12,9 @@ import {
   ThreadId,
   EnvironmentId,
   canonicalProjectWorkPayload,
+  ProjectTeamReviewCompletionProof,
   type ProjectTeamGuidedIntent,
-  type ProjectTeamRecord,
+  ProjectTeamRecord,
   type ProjectWorkCommand,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -26,7 +29,13 @@ import {
   assertProjectTeamRunAuthority,
   projectTeamScopeHash,
   projectTeamSpecificationHash,
+  projectTeamDerivedRecordId,
 } from "./ProjectTeamPolicy.ts";
+
+const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
+const decodeReviewCompletionProof = Schema.decodeUnknownSync(ProjectTeamReviewCompletionProof, {
+  onExcessProperty: "error",
+});
 
 const projectId = ProjectId.make("guided-project");
 const taskId = ProjectWorkTaskId.make("guided-task");
@@ -2411,4 +2420,334 @@ it("an exact Human exception above the exhausted allowance permits only its debi
     status: "exhausted",
     pendingSemanticRepair: false,
   });
+});
+
+const reviewSettlementFixture = () => {
+  const f = reviewerReport();
+  const binding = { ...f.binding, sessionId: "original-review-session" };
+  const dispatchId = "original-review-dispatch";
+  const state: ProjectWorkReducerState = {
+    ...f.state,
+    foundationRecords: [
+      ...f.state.foundationRecords!.map((record) =>
+        record.recordId === binding.recordId ? binding : record,
+      ),
+      {
+        kind: "effect",
+        projectId,
+        recordId: "original-review-dispatch-effect",
+        revision: 0,
+        generation: binding.generation,
+        updatedAt: at,
+        status: "claimed",
+        effectId: dispatchId,
+        effectKind: "dispatch",
+        taskId: binding.taskId,
+        runId: binding.recordId,
+        targetId: binding.recordId,
+        payload: { recordIds: [binding.recordId], expectedRevision: f.state.revision },
+        claimGeneration: 1,
+        availableAt: at,
+      },
+    ],
+  };
+  const assignment = state.foundationRecords!.find(
+    (record) => record.kind === "task-membership" && record.taskId === binding.taskId,
+  )!;
+  const parent = state.tasks.find((task) => task.taskId === taskId)!;
+  const target = {
+    projectId,
+    taskId,
+    specRevision: parent.specRevision,
+    planRevision: 1,
+    baseSha: "b".repeat(40),
+    headSha: "c".repeat(40),
+  };
+  const provenance = {
+    reviewTaskId: binding.taskId,
+    bindingId: binding.recordId,
+    generation: binding.generation,
+    memberId: binding.memberId,
+    providerInstanceId: binding.providerInstanceId,
+    threadId: binding.threadId,
+    sessionId: binding.sessionId,
+    initializeOperationId: "original-review-initialize",
+    dispatchId,
+    targetSha256: "a".repeat(64),
+  };
+  const finding = decodeTeamRecord({
+    kind: "review-finding",
+    projectId,
+    recordId: "critical-parent-finding",
+    revision: 0,
+    generation: 0,
+    updatedAt: at,
+    findingId: "critical-parent-finding",
+    taskId,
+    target,
+    severity: "critical",
+    criterionIds: state.criteria.filter((c) => c.taskId === taskId).map((c) => c.criterionId),
+    detail: "Parent code still requires repair",
+    status: "open",
+    resolutionArtifactIds: [],
+    originReviewer: provenance,
+    reportedBy: provenance,
+  });
+  state.foundationRecords!.push(finding);
+  const criteria = state.criteria.filter((c) => c.taskId === binding.taskId);
+  const proof = decodeReviewCompletionProof({
+    status: "completed",
+    proposalCommandId: f.intent.commandId,
+    proposalSha256: "a".repeat(64),
+    assignmentOperationId: "original-review-assignment",
+    assignmentRequestHash: "a".repeat(64),
+    assignmentReceiptSha256: "a".repeat(64),
+    joinedReceiptId: "original-review-joined",
+    joinedEvidenceSha256: "a".repeat(64),
+    report: f.intent,
+    reportAttribution: f.command.attribution,
+    assignment,
+    target,
+    provenance,
+    criteria: criteria.map((c) => ({
+      id: c.criterionId,
+      revision: c.revision,
+      sha256: reviewSnapshotHash(c),
+    })),
+    evidence: [],
+    outputs: (f.intent.outputs ?? []).map((output, index) => ({
+      evidenceId: projectTeamDerivedRecordId(f.intent.commandId, `report-output:${index}`),
+      criterionId: output.criterionId,
+      sha256: reviewSnapshotHash({
+        ...output,
+        summary:
+          output.summary ?? criteria.find((c) => c.criterionId === output.criterionId)!.description,
+      }),
+    })),
+    reportEvidenceId: projectTeamDerivedRecordId(f.intent.commandId, "report-evidence"),
+    reportCommentId: projectTeamDerivedRecordId(f.intent.commandId, "report"),
+    findings: [
+      { findingId: "critical-parent-finding", revision: 0, sha256: reviewSnapshotHash(finding) },
+    ],
+  });
+  if (proof.status !== "completed") throw new Error("Completed proof fixture required");
+  const child = state.tasks.find((task) => task.taskId === binding.taskId)!;
+  const attempt = state.attempts.find((a) => a.attemptId === binding.attemptId)!;
+  const command: Extract<ProjectWorkCommand, { type: "project-work.foundation.commit" }> = {
+    type: "project-work.foundation.commit",
+    projectId,
+    commandId: CommandId.make("original-review-joined-command"),
+    expectedRevision: state.revision,
+    attribution: {
+      actor: { kind: "system", id: "project-team-runtime" },
+      source: { kind: "system", id: "project-team-runtime" },
+      recordedAt: at,
+    },
+    records: [],
+    committedAt: at,
+    transition: {
+      kind: "run.settle",
+      reviewCompletion: proof,
+      bindingId: binding.recordId,
+      generation: binding.generation,
+      expectedBindingRevision: binding.revision,
+      taskId: binding.taskId,
+      expectedTaskRevision: child.revision,
+      attemptId: binding.attemptId,
+      expectedAttemptRevision: attempt.revision,
+      dispatchId,
+      receiptId: "original-review-joined",
+      effectIds: ["original-review-dispatch-effect"],
+    },
+  };
+  return { state, command, proof, binding, parent };
+};
+const reviewSnapshotHash = (value: unknown) =>
+  NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+
+it("trusted review settlement completes only the child with critical findings and leaves parent work unchanged", () => {
+  const f = reviewSettlementFixture();
+  const next = applyProjectWorkEvents(f.state, decideProjectWorkCommand(f.state, f.command));
+  expect(next.tasks.find((task) => task.taskId === f.binding.taskId)?.state).toBe("completed");
+  expect(next.attempts.find((attempt) => attempt.attemptId === f.binding.attemptId)?.state).toBe(
+    "succeeded",
+  );
+  expect(next.tasks.find((task) => task.taskId === taskId)).toEqual(f.parent);
+  expect(next.criteria.filter((c) => c.taskId === taskId)).toEqual(
+    f.state.criteria.filter((c) => c.taskId === taskId),
+  );
+  expect(
+    next.criteria
+      .filter((c) => c.taskId === f.binding.taskId)
+      .every((c) => c.status === "satisfied"),
+  ).toBe(true);
+  expect(
+    next.foundationRecords!.find((record) => record.recordId === "critical-parent-finding"),
+  ).toEqual(
+    f.state.foundationRecords!.find((record) => record.recordId === "critical-parent-finding"),
+  );
+  expect(next.evidence.some((e) => e.evidenceId === f.proof.reportEvidenceId)).toBe(true);
+  expect((next.comments ?? []).some((c) => c.commentId === f.proof.reportCommentId)).toBe(true);
+  expect(
+    next.foundationRecords!.find((record) => record.recordId === f.binding.recordId)?.status,
+  ).toBe("settled");
+});
+
+it("trusted review settlement rejects a changed full criterion snapshot before any state mutation", () => {
+  const f = reviewSettlementFixture();
+  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+  const transition = f.command.transition;
+  const before = canonicalProjectWorkPayload(f.state);
+  expect(() =>
+    decideProjectWorkCommand(f.state, {
+      ...f.command,
+      transition: {
+        ...transition,
+        reviewCompletion: {
+          ...f.proof,
+          criteria: f.proof.criteria.map((c) => ({ ...c, sha256: "d".repeat(64) })),
+        },
+      },
+    }),
+  ).toThrow();
+  expect(canonicalProjectWorkPayload(f.state)).toBe(before);
+});
+
+it("trusted review settlement retains denied child attention after stopping without granting completion", () => {
+  const f = reviewSettlementFixture();
+  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+  const transition = f.command.transition;
+  const next = applyProjectWorkEvents(
+    f.state,
+    decideProjectWorkCommand(f.state, {
+      ...f.command,
+      transition: {
+        ...transition,
+        reviewCompletion: {
+          status: "denied",
+          proposalCommandId: f.proof.proposalCommandId,
+          proposalSha256: f.proof.proposalSha256,
+          assignmentOperationId: f.proof.assignmentOperationId,
+          reason: "stale-proof",
+        },
+      },
+    }),
+  );
+  expect(next.tasks.find((task) => task.taskId === f.binding.taskId)).toMatchObject({
+    state: "blocked",
+  });
+  expect(
+    next.tasks.find((task) => task.taskId === f.binding.taskId)?.activeAttemptId,
+  ).toBeUndefined();
+  expect(next.attempts.find((a) => a.attemptId === f.binding.attemptId)?.state).toBe("canceled");
+  expect(next.blockers.some((b) => b.taskId === f.binding.taskId && b.attention)).toBe(true);
+  expect(next.evidence).toEqual(f.state.evidence);
+  expect(next.tasks.find((task) => task.taskId === taskId)).toEqual(f.parent);
+});
+
+it("trusted review settlement rejects an unfinished child deliverable of the review task", () => {
+  const f = reviewSettlementFixture();
+  const nestedId = ProjectWorkTaskId.make("nested-review-deliverable");
+  const state: ProjectWorkReducerState = {
+    ...f.state,
+    tasks: [...f.state.tasks, { ...f.parent, taskId: nestedId, state: "ready" }],
+    foundationRecords: [
+      ...f.state.foundationRecords!,
+      {
+        ...f.proof.assignment,
+        recordId: "nested-review-membership",
+        taskId: nestedId,
+        parentTaskId: f.binding.taskId,
+      },
+    ],
+  };
+  expect(() => decideProjectWorkCommand(state, f.command)).toThrow();
+});
+
+it.each(["canceled", "paused", "successor"] as const)(
+  "trusted review settlement does not revive %s assignments when a proposal is denied",
+  (mode) => {
+    const f = reviewSettlementFixture();
+    if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+    const transition = f.command.transition;
+    const state: ProjectWorkReducerState = {
+      ...f.state,
+      tasks: f.state.tasks.map((task) =>
+        task.taskId === f.binding.taskId && mode === "canceled"
+          ? { ...task, state: "canceled" }
+          : task,
+      ),
+      foundationRecords: f.state.foundationRecords!.map((record) =>
+        record.kind === "task-membership" && record.taskId === f.binding.taskId
+          ? {
+              ...record,
+              ...(mode === "paused" ? { controlState: "paused" as const } : {}),
+              ...(mode === "successor"
+                ? { requestedSuccessorMemberId: "replacement-reviewer" }
+                : {}),
+            }
+          : record,
+      ),
+    };
+    const next = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        ...f.command,
+        transition: {
+          ...transition,
+          reviewCompletion: {
+            status: "denied",
+            proposalCommandId: f.proof.proposalCommandId,
+            proposalSha256: f.proof.proposalSha256,
+            assignmentOperationId: f.proof.assignmentOperationId,
+            reason: "control-changed",
+          },
+        },
+      }),
+    );
+    expect(next.tasks.find((task) => task.taskId === f.binding.taskId)?.state).toBe(
+      mode === "canceled" ? "canceled" : "ready",
+    );
+    expect(next.blockers).toEqual(state.blockers);
+    expect(next.evidence).toEqual(state.evidence);
+    expect(
+      next.foundationRecords!.find(
+        (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
+      ),
+    ).toEqual(
+      state.foundationRecords!.find(
+        (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
+      ),
+    );
+    expect(next.attempts.find((a) => a.attemptId === f.binding.attemptId)?.state).toBe("canceled");
+  },
+);
+
+it("trusted review settlement rejects exhausted task revisions before stopping and adding attention", () => {
+  const f = reviewSettlementFixture();
+  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+  const transition = f.command.transition;
+  const revision = Number.MAX_SAFE_INTEGER - 1;
+  const state: ProjectWorkReducerState = {
+    ...f.state,
+    tasks: f.state.tasks.map((task) =>
+      task.taskId === f.binding.taskId ? { ...task, revision } : task,
+    ),
+  };
+  expect(() =>
+    decideProjectWorkCommand(state, {
+      ...f.command,
+      transition: {
+        ...transition,
+        expectedTaskRevision: revision,
+        reviewCompletion: {
+          status: "denied",
+          proposalCommandId: f.proof.proposalCommandId,
+          proposalSha256: f.proof.proposalSha256,
+          assignmentOperationId: f.proof.assignmentOperationId,
+          reason: "stale-proof",
+        },
+      },
+    }),
+  ).toThrow();
 });

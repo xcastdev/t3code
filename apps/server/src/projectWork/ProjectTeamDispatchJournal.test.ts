@@ -7,7 +7,19 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
+import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
+import { GitWorkflowService } from "../git/GitWorkflowService.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
+import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import { makeProjectTeamExecutionHost } from "./ProjectTeamExecutionHost.ts";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
+import * as SqlError from "effect/unstable/sql/SqlError";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
@@ -22,12 +34,14 @@ import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository
 import { ProjectWorkProjection } from "./ProjectWorkProjection.ts";
 import { ProjectLifecycle, ProjectLifecycleLive } from "../project/ProjectLifecycle.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { PersistenceSqlError } from "../persistence/Errors.ts";
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamDispatchJournalError,
   type ProjectTeamDispatchRequest,
 } from "./ProjectTeamDispatchJournal.ts";
 
+const isPersistenceSqlError = Schema.is(PersistenceSqlError);
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 
 const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
@@ -2377,3 +2391,136 @@ for (const extraStop of [false, true])
           }),
         ),
     );
+
+it.effect(
+  "review preparation shares settlement transaction before advancement and is skipped on exact replay",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        let prepared = 0;
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: (snapshot, receipt) =>
+            Effect.gen(function* () {
+              expect(yield* SqlClient.SqlClient).toBe(f.sql);
+              expect(Option.isSome(yield* Effect.serviceOption(f.sql.transactionService))).toBe(
+                true,
+              );
+              expect(snapshot).toEqual(claimed);
+              expect(receipt).toEqual(joinedReceipt);
+              expect(
+                yield* f.sql`SELECT stage FROM project_team_dispatch WHERE dispatch_id=${f.request.dispatchId}`,
+              ).toEqual([{ stage: "reserved" }]);
+              prepared++;
+              return undefined;
+            }),
+        });
+        const settled = yield* journal.settleAfterJoined(claimed.fence, joinedReceipt);
+        expect(prepared).toBe(1);
+        const before = yield* readCurrentState(f.sql, projectId);
+        expect((yield* journal.settleAfterJoined(claimed.fence, joinedReceipt)).duplicate).toBe(
+          true,
+        );
+        expect(prepared).toBe(1);
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+        expect((yield* journal.readRetained(f.request.dispatchId)).fence).toEqual(settled.fence);
+      }),
+    ),
+);
+
+it.effect(
+  "review preparation SQL failure rolls back original joined settlement and preserves retry",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const before = yield* readCurrentState(f.sql, projectId);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: () =>
+            f.sql`SELECT * FROM missing_review_proof_storage`.pipe(Effect.as(undefined)),
+        });
+        const result = yield* journal
+          .settleAfterJoined(claimed.fence, joinedReceipt)
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") {
+          expect(result.failure).toBeInstanceOf(PersistenceSqlError);
+          if (isPersistenceSqlError(result.failure)) {
+            expect(result.failure.operation).toBe("ProjectWorkRepository.executeAtomic");
+            expect(SqlError.isSqlError(result.failure.cause)).toBe(true);
+          }
+        }
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+        expect(yield* journal.readRetained(f.request.dispatchId)).toEqual(claimed);
+        expect(
+          yield* f.sql`SELECT receipt_id FROM project_team_dispatch_receipt WHERE dispatch_id=${f.request.dispatchId} AND stage='settled'`,
+        ).toEqual([]);
+        const retry = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: () => Effect.succeed(undefined),
+        });
+        expect((yield* retry.settleAfterJoined(claimed.fence, joinedReceipt)).fence.stage).toBe(
+          "settled",
+        );
+      }),
+    ),
+);
+
+it.effect(
+  "execution host constructs its trusted review consumer from full host configuration without execution",
+  () =>
+    scoped(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* seed("reviewer", "running", { issueCredential: false });
+          const sql = yield* SqlClient.SqlClient;
+          const before = yield* readCurrentState(sql, projectId);
+          const counts = sql`SELECT
+      (SELECT COUNT(*) FROM project_work_events) AS events,
+      (SELECT COUNT(*) FROM project_work_command_receipts) AS receipts,
+      (SELECT COUNT(*) FROM project_team_dispatch) AS dispatches,
+      (SELECT COUNT(*) FROM project_team_review_completion_proposal) AS proposals`;
+          const beforeCounts = yield* counts;
+          // Construction captures services; unimplemented mocks trap any execution or native spawn.
+          const result = yield* makeProjectTeamExecutionHost({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 128,
+            protectedRoots: ["/protected"],
+            launchPolicy: { memoryBytes: 536870912, runtimeSeconds: 30 },
+            assertEnabled: Effect.die("Construction must not admit execution"),
+          }).pipe(Effect.result);
+          expect(result._tag).toBe("Success");
+          if (result._tag === "Success") yield* result.success.stop;
+          expect(yield* readCurrentState(sql, projectId)).toEqual(before);
+          expect(yield* counts).toEqual(beforeCounts);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.mock(ProviderService)({}),
+              Layer.mock(ServerSettingsService)({}),
+              Layer.mock(OrchestrationEngineService)({}),
+              Layer.mock(ProjectionSnapshotQuery)({}),
+              Layer.mock(GitWorkflowService)({}),
+              Layer.mock(ProjectTeamPiRuntime)({}),
+              Layer.mock(ChildProcessSpawner)({}),
+              Layer.succeed(HostProcessPlatform, "linux"),
+              Layer.succeed(HostProcessUserId, 1000),
+            ),
+          ),
+        ),
+      ),
+    ),
+);

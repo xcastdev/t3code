@@ -1,7 +1,12 @@
+import * as NodeCrypto from "node:crypto";
+import * as Schema from "effect/Schema";
 import {
   canonicalProjectWorkPayload,
   ProjectWorkBlockerId,
   ProjectWorkTaskId,
+  ProjectWorkEvidenceId,
+  ProjectWorkCommentId,
+  ProjectTeamReviewCompletionProof,
   type ProjectTeamRecord,
   type ProjectWorkCommand,
 } from "@t3tools/contracts";
@@ -22,6 +27,8 @@ import {
   projectTeamDerivedRecordId,
 } from "./ProjectTeamPolicy.ts";
 import { projectTeamRepairHash } from "./ProjectTeamGuidedLifecycle.ts";
+
+const isReviewCompletionProof = Schema.is(ProjectTeamReviewCompletionProof);
 
 type Command = Extract<ProjectWorkCommand, { type: "project-work.foundation.commit" }>;
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
@@ -281,10 +288,208 @@ export const decideProjectTeamGuidedTransition = (
         writers.some((r) => r.recordId !== t.writableReservationId || r.status !== "held")
       )
         reject("Joined run settlement writer ownership changed");
+      const completion = t.reviewCompletion;
+      if (completion !== undefined && !isReviewCompletionProof(completion))
+        reject("Joined review completion proof is malformed");
+      const memberships = records().filter(
+        (r) => r.kind === "task-membership" && r.taskId === task.taskId,
+      );
+      const membership = memberships[0];
+      const member = records().find((r) => r.kind === "member" && r.recordId === run!.memberId);
+      const attention =
+        completion?.status === "denied" &&
+        task.state === "in-progress" &&
+        task.activeAttemptId === attempt!.attemptId &&
+        memberships.length === 1 &&
+        membership?.kind === "task-membership" &&
+        membership.status === "active" &&
+        (membership.controlState === undefined || membership.controlState === "active") &&
+        membership.requestedSuccessorMemberId === undefined &&
+        member?.kind === "member" &&
+        member.status === "active" &&
+        !state.blockers.some((b) => b.taskId === task.taskId && b.resolvedAt === undefined);
+      const hash = (value: unknown) =>
+        NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+      const same = (left: unknown, right: unknown) =>
+        canonicalProjectWorkPayload(left) === canonicalProjectWorkPayload(right);
+      const required = state.criteria.filter(
+        (c) =>
+          c.taskId === task.taskId &&
+          (c.required || task.specification?.criterionIds.includes(c.criterionId)),
+      );
+      if (completion?.status === "completed") {
+        const report = completion.report;
+        const role = records().find(
+          (r) => r.kind === "role-revision" && r.recordId === run!.roleRevisionId,
+        );
+        const plan = records()
+          .filter(
+            (r): r is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+              r.kind === "plan-revision" &&
+              r.taskId === task.taskId &&
+              r.status === "proposed" &&
+              r.specRevision === task.specRevision,
+          )
+          .sort((a, b) => b.planRevision - a.planRevision)[0];
+        if (
+          report.type !== "project-team.assignment.report" ||
+          report.outcome !== "complete" ||
+          task.state !== "in-progress" ||
+          task.activeAttemptId !== attempt!.attemptId ||
+          (attempt!.state !== "running" && attempt!.state !== "leased") ||
+          (run!.status !== "running" && run!.status !== "stopping") ||
+          role?.kind !== "role-revision" ||
+          role.role !== "reviewer" ||
+          role.status !== "available" ||
+          member?.kind !== "member" ||
+          member.status !== "active" ||
+          member.roleRevisionId !== role.recordId ||
+          memberships.length !== 1 ||
+          membership?.kind !== "task-membership" ||
+          !same(membership, completion.assignment) ||
+          (membership.controlState !== undefined && membership.controlState !== "active") ||
+          membership.requestedSuccessorMemberId !== undefined ||
+          report.projectId !== command.projectId ||
+          report.taskId !== task.taskId ||
+          report.commandId !== completion.proposalCommandId ||
+          report.expectedTaskRevision !== task.revision ||
+          report.assignmentId !== membership.recordId ||
+          report.expectedAssignmentRevision !== membership.revision ||
+          report.specRevision !== task.specRevision ||
+          report.planRevision !== (plan?.planRevision ?? 0) ||
+          completion.target.projectId !== command.projectId ||
+          completion.target.taskId !== membership.parentTaskId ||
+          completion.provenance.reviewTaskId !== task.taskId ||
+          completion.provenance.bindingId !== run!.recordId ||
+          completion.provenance.generation !== run!.generation ||
+          completion.provenance.memberId !== run!.memberId ||
+          completion.provenance.providerInstanceId !== run!.providerInstanceId ||
+          completion.provenance.threadId !== run!.threadId ||
+          completion.provenance.sessionId !== run!.sessionId ||
+          completion.provenance.dispatchId !== t.dispatchId ||
+          completion.joinedReceiptId !== t.receiptId ||
+          run!.scopeHash !== projectTeamScopeHash(state, task.taskId, plan) ||
+          records().some(
+            (r) =>
+              r.kind === "run-binding" &&
+              r.taskId === task.taskId &&
+              r.recordId !== run!.recordId &&
+              (r.generation > run!.generation ||
+                r.status === "reserved" ||
+                r.status === "running" ||
+                r.status === "stopping"),
+          )
+        )
+          reject("Joined reviewer report identity or scope changed");
+        const dependencies = new Set(plan?.dependencyTaskIds ?? []);
+        for (const relationship of state.relationships) {
+          if (relationship.kind === "depends-on" && relationship.fromTaskId === task.taskId)
+            dependencies.add(relationship.toTaskId);
+          if (relationship.kind === "blocks" && relationship.toTaskId === task.taskId)
+            dependencies.add(relationship.fromTaskId);
+        }
+        for (const dependency of dependencies) {
+          const result = evaluateProjectTeamDependency({
+            projectId: command.projectId,
+            taskId: dependency,
+            task: state.tasks.find((t) => t.taskId === dependency),
+            memberships: records().filter(
+              (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+                r.kind === "task-membership",
+            ),
+          });
+          if (!result.available) reject("Joined reviewer dependency is incomplete");
+        }
+        for (const child of records().filter(
+          (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+            r.kind === "task-membership" && r.parentTaskId === task.taskId && r.status === "active",
+        )) {
+          const result = evaluateProjectTeamDependency({
+            projectId: command.projectId,
+            taskId: child.taskId,
+            task: state.tasks.find((t) => t.taskId === child.taskId),
+            memberships: [child],
+          });
+          if (!result.available) reject("Joined reviewer child deliverable is incomplete");
+        }
+        const criterionSnapshots = required
+          .map((c) => ({ id: c.criterionId, revision: c.revision, sha256: hash(c) }))
+          .sort((a, b) => a.id.localeCompare(b.id));
+        const evidenceIds = [...new Set([...report.evidenceIds, ...report.outputArtifactIds])];
+        const evidence = evidenceIds.map((id) =>
+          state.evidence.find((e) => e.evidenceId === id && e.taskId === task.taskId),
+        );
+        if (
+          evidence.some(
+            (e) => e === undefined || !e.detail?.trim() || e.scopeHash !== run!.scopeHash,
+          ) ||
+          report.outputArtifactIds.some(
+            (id) => !evidence.some((e) => e?.evidenceId === id && e.kind === "artifact"),
+          )
+        )
+          reject("Joined reviewer evidence is unavailable or stale");
+        const evidenceSnapshots = evidence
+          .flatMap((e) => (e ? [{ id: e.evidenceId, revision: e.revision, sha256: hash(e) }] : []))
+          .sort((a, b) => a.id.localeCompare(b.id));
+        const findings = records()
+          .flatMap((r) =>
+            r.kind === "review-finding" &&
+            r.taskId === completion.target.taskId &&
+            same(r.target, completion.target)
+              ? [{ findingId: r.findingId, revision: r.revision, sha256: hash(r) }]
+              : [],
+          )
+          .sort((a, b) => a.findingId.localeCompare(b.findingId));
+        if (
+          !same(criterionSnapshots, completion.criteria) ||
+          !same(evidenceSnapshots, completion.evidence) ||
+          !same(findings, completion.findings) ||
+          new Set(criterionSnapshots.map((c) => c.id)).size !== criterionSnapshots.length ||
+          new Set(findings.map((f) => f.findingId)).size !== findings.length
+        )
+          reject("Joined reviewer retained snapshots changed");
+        const outputs = report.outputs ?? [];
+        const outputSnapshots = outputs.map((output, index) => {
+          const criterion = state.criteria.find(
+            (c) => c.criterionId === output.criterionId && c.taskId === task.taskId,
+          );
+          if (!criterion || !output.detail.trim())
+            reject("Joined reviewer output criterion changed");
+          return {
+            evidenceId: projectTeamDerivedRecordId(report.commandId, `report-output:${index}`),
+            criterionId: output.criterionId,
+            sha256: hash({ ...output, summary: output.summary ?? criterion!.description }),
+          };
+        });
+        if (
+          new Set(outputs.map((o) => o.criterionId)).size !== outputs.length ||
+          !same(outputSnapshots, completion.outputs) ||
+          completion.reportEvidenceId !==
+            projectTeamDerivedRecordId(report.commandId, "report-evidence") ||
+          completion.reportCommentId !== projectTeamDerivedRecordId(report.commandId, "report") ||
+          required.length === 0 ||
+          required.some(
+            (c) =>
+              c.status !== "waived" &&
+              !outputs.some((o) => o.criterionId === c.criterionId) &&
+              !evidence.some((e) => e?.criterionId === c.criterionId),
+          ) ||
+          state.evidence.some(
+            (e) =>
+              e.evidenceId === completion.reportEvidenceId ||
+              completion.outputs.some((o) => o.evidenceId === e.evidenceId),
+          ) ||
+          (state.comments ?? []).some((c) => c.commentId === completion.reportCommentId)
+        )
+          reject("Joined reviewer outputs or original report identity changed");
+      }
       const revisions = [
         run!.revision,
         ...effects.map((r) => r.revision),
         ...writers.map((r) => r.revision),
+        ...(completion?.status === "completed"
+          ? required.filter((c) => c.status !== "waived").map((c) => c.revision)
+          : []),
       ];
       if (attempt!.state === "leased" || attempt!.state === "running")
         revisions.push(attempt!.revision, task.revision);
@@ -292,17 +497,97 @@ export const decideProjectTeamGuidedTransition = (
         revisions.some((value) => !Number.isSafeInteger(value) || value >= Number.MAX_SAFE_INTEGER)
       )
         reject("Joined run settlement revision is exhausted");
+      if (attention && task.revision > Number.MAX_SAFE_INTEGER - 2)
+        reject("Joined review attention task revision is exhausted");
       const eventCount =
         1 +
         writers.length +
         effects.length +
-        (attempt!.state === "leased" || attempt!.state === "running" ? 1 : 0);
+        (completion?.status === "completed"
+          ? completion.outputs.length + 3
+          : attempt!.state === "leased" || attempt!.state === "running"
+            ? 1
+            : 0) +
+        (attention ? 1 : 0);
       if (
         !Number.isSafeInteger(state.revision) ||
         state.revision < 0 ||
         state.revision > Number.MAX_SAFE_INTEGER - eventCount
       )
         reject("Joined run settlement aggregate revision is exhausted");
+      if (completion?.status === "completed") {
+        const report = completion.report;
+        if (report.type !== "project-team.assignment.report") reject("Joined report kind changed");
+        const scopeHash = run!.scopeHash;
+        if (scopeHash === undefined) reject("Joined reviewer scope is missing");
+        const recordedAt = completion.reportAttribution.recordedAt;
+        for (const [index, output] of (report.outputs ?? []).entries()) {
+          const criterion = state.criteria.find(
+            (c) => c.criterionId === output.criterionId && c.taskId === task.taskId,
+          )!;
+          emit({
+            type: "project-work.evidence.added",
+            addedAt: at,
+            occurredAt: at,
+            evidence: {
+              evidenceId: ProjectWorkEvidenceId.make(completion.outputs[index]!.evidenceId),
+              taskId: task.taskId,
+              criterionId: output.criterionId,
+              kind: output.kind,
+              summary: output.summary ?? criterion.description,
+              detail: output.detail,
+              recordedAt,
+              revision: 0,
+              attribution: completion.reportAttribution,
+              scopeHash,
+            },
+          });
+        }
+        emit({
+          type: "project-work.evidence.added",
+          addedAt: at,
+          occurredAt: at,
+          evidence: {
+            evidenceId: ProjectWorkEvidenceId.make(completion.reportEvidenceId),
+            taskId: task.taskId,
+            kind: "observation",
+            summary: report.summary,
+            detail: report.summary,
+            outputArtifactIds: report.outputArtifactIds.map((value) =>
+              ProjectWorkEvidenceId.make(value),
+            ),
+            scopeHash,
+            recordedAt,
+            revision: 0,
+            attribution: completion.reportAttribution,
+          },
+        });
+        emit({
+          type: "project-work.comment.added",
+          occurredAt: at,
+          addedAt: at,
+          attribution: completion.reportAttribution,
+          comment: {
+            commentId: ProjectWorkCommentId.make(completion.reportCommentId),
+            projectId: command.projectId,
+            taskId: task.taskId,
+            body: report.summary,
+            createdAt: recordedAt,
+            revision: 0,
+            attribution: completion.reportAttribution,
+          },
+        });
+        emit({
+          type: "project-work.task.completed",
+          taskId: task.taskId,
+          attemptId: attempt!.attemptId,
+          satisfiedCriterionIds: required
+            .filter((c) => c.status !== "waived")
+            .map((c) => c.criterionId),
+          completedAt: at,
+          occurredAt: at,
+        });
+      }
       record({ ...run!, status: "settled", revision: run!.revision + 1, updatedAt: at });
       for (const writer of writers)
         record(
@@ -322,7 +607,8 @@ export const decideProjectTeamGuidedTransition = (
           revision: effect.revision + 1,
           updatedAt: at,
         });
-      if (attempt!.state === "leased" || attempt!.state === "running")
+      const currentAttempt = state.attempts.find((a) => a.attemptId === t.attemptId);
+      if (currentAttempt?.state === "leased" || currentAttempt?.state === "running")
         emit({
           type: "project-work.attempt.stopped",
           taskId: task.taskId,
@@ -331,6 +617,24 @@ export const decideProjectTeamGuidedTransition = (
           receiptId: t.receiptId,
           stoppedAt: at,
           occurredAt: at,
+        });
+      if (attention && completion?.status === "denied")
+        emit({
+          type: "project-work.task.blocked",
+          taskId: task.taskId,
+          blockedAt: at,
+          occurredAt: at,
+          blocker: {
+            blockerId: ProjectWorkBlockerId.make(id("review-completion-blocker")),
+            taskId: task.taskId,
+            reason:
+              "The saved review report could not complete this assignment. Check the current review evidence before assigning another review.",
+            resolver: "Review current evidence and decide whether another review is needed",
+            referenceIds: [completion.proposalCommandId],
+            attention: true,
+            revision: 0,
+            attribution: command.attribution,
+          },
         });
       break;
     }

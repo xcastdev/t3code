@@ -36,6 +36,7 @@ import {
   type ProjectTeamDispatchFence,
 } from "./ProjectTeamDispatchJournal.ts";
 import { makeProjectTeamRecovery } from "./ProjectTeamRecovery.ts";
+import { makeProjectTeamReviewCompletion } from "./ProjectTeamReviewCompletion.ts";
 import {
   makeProjectTeamSessionReceipts,
   type ProjectTeamInitializationReceipt,
@@ -48,7 +49,16 @@ import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 
 type Snapshot = ProjectTeamDispatchSnapshot;
-type Journal = Effect.Success<ReturnType<typeof makeProjectTeamDispatchJournal>>;
+type ReviewCompletion = Effect.Success<ReturnType<typeof makeProjectTeamReviewCompletion>>;
+type ReviewCompletionEffect = ReturnType<ReviewCompletion["prepare"]>;
+type Journal = Effect.Success<
+  ReturnType<
+    typeof makeProjectTeamDispatchJournal<
+      Effect.Error<ReviewCompletionEffect>,
+      Effect.Services<ReviewCompletionEffect>
+    >
+  >
+>;
 type Receipt = ProjectTeamDispatchReceipt<
   ProjectManagedSetupReceipt,
   ProjectTeamInitializationReceipt,
@@ -231,8 +241,13 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       if (!same(input.evidence, expected))
         return yield* denied("Stage evidence differs from retained physical receipts");
     });
+    const reviewCompletion = yield* makeProjectTeamReviewCompletion({
+      environmentId: options.environmentId,
+      maximumEnvironmentModelCalls: options.maximumEnvironmentModelCalls,
+    });
     const journal: Journal = yield* makeProjectTeamDispatchJournal({
       ...options,
+      prepareReviewCompletion: reviewCompletion.prepare,
       verifyStage: (receipt, snapshot) =>
         boundary(verifyStage(receipt, snapshot)).pipe(Effect.provideService(Scope.Scope, scope)),
       verifySettlement: (receipt, snapshot) =>

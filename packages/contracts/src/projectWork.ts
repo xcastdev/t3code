@@ -7,6 +7,9 @@ import {
   ProjectTeamDeliverableKind,
   ProjectTeamEffect,
   ProjectTeamReservation,
+  ProjectTeamTaskMembership,
+  ProjectTeamReviewFinding,
+  ProjectTeamReviewFindingProvenance,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1324,6 +1327,79 @@ export type ProjectWorkGuidedTransition = typeof ProjectWorkGuidedTransition.Typ
 
 /** Private scheduler/runtime transitions. Public transports deny foundation commands. */
 const JoinedRunCounter = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+const ReviewProofDigest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u));
+const ReviewProofSnapshot = Schema.Struct({
+  id: GuidedId,
+  revision: JoinedRunCounter,
+  sha256: ReviewProofDigest,
+});
+export const ProjectTeamReviewCompletionDenialReason = Schema.Literals([
+  "stale-proof",
+  "scope-changed",
+  "control-changed",
+  "assignment-failed",
+  "assignment-incomplete",
+  "dependency-incomplete",
+  "invalid-proof",
+]);
+/** Private joined settlement carries retained child proof, never an approval grant. */
+export const ProjectTeamReviewCompletionProof = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("completed"),
+    proposalCommandId: GuidedId,
+    proposalSha256: ReviewProofDigest,
+    assignmentOperationId: GuidedId,
+    assignmentRequestHash: ReviewProofDigest,
+    assignmentReceiptSha256: ReviewProofDigest,
+    joinedReceiptId: GuidedId,
+    joinedEvidenceSha256: ReviewProofDigest,
+    report: ProjectTeamGuidedIntent.check(
+      Schema.makeFilter(
+        (value) => value.type === "project-team.assignment.report" && value.outcome === "complete",
+      ),
+    ),
+    reportAttribution: ProjectWorkAttribution,
+    assignment: ProjectTeamTaskMembership.check(
+      Schema.makeFilter(
+        (value) =>
+          value.status === "active" &&
+          value.executionKind === "managed" &&
+          value.deliverableKind === "review" &&
+          value.parentTaskId !== undefined,
+      ),
+    ),
+    target: ProjectTeamReviewFinding.fields.target,
+    provenance: ProjectTeamReviewFindingProvenance,
+    criteria: Schema.Array(ReviewProofSnapshot).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(64),
+    ),
+    evidence: Schema.Array(ReviewProofSnapshot).check(Schema.isMaxLength(128)),
+    outputs: Schema.Array(
+      Schema.Struct({ evidenceId: GuidedId, criterionId: GuidedId, sha256: ReviewProofDigest }),
+    ).check(Schema.isMaxLength(64)),
+    reportEvidenceId: GuidedId,
+    reportCommentId: GuidedId,
+    findings: Schema.Array(
+      Schema.Struct({ findingId: GuidedId, revision: JoinedRunCounter, sha256: ReviewProofDigest }),
+    ).check(Schema.isMaxLength(256)),
+  }),
+  Schema.Struct({
+    status: Schema.Literal("denied"),
+    proposalCommandId: GuidedId,
+    proposalSha256: ReviewProofDigest,
+    assignmentOperationId: GuidedId,
+    reason: ProjectTeamReviewCompletionDenialReason,
+  }),
+])
+  .check(
+    Schema.makeFilter((value) => utf8Length(canonicalProjectWorkPayload(value)) <= 524288, {
+      message: "Retained review completion proof exceeds its 512 KiB byte limit",
+    }),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamReviewCompletionProof = typeof ProjectTeamReviewCompletionProof.Type;
+
 const PublicationRepository = Schema.Struct({
   host: GuidedId.check(
     Schema.isPattern(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u),
@@ -1441,6 +1517,7 @@ export const ProjectWorkTeamTransition = Schema.Union([
   }),
   Schema.Struct({
     kind: Schema.Literal("run.settle"),
+    reviewCompletion: Schema.optionalKey(ProjectTeamReviewCompletionProof),
     bindingId: GuidedId,
     generation: JoinedRunCounter,
     expectedBindingRevision: JoinedRunCounter,

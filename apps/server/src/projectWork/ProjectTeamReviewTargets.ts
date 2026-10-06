@@ -110,9 +110,13 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
     });
     const resolve = Effect.fn("ProjectTeamReviewTargets.resolve")(function* (
       snapshot: ProjectTeamDispatchSnapshot,
+      historical = false,
     ) {
       yield* transaction;
-      const original = yield* journal.inspect(snapshot.fence.dispatchId, { requireClaim: true });
+      const original = yield* historical
+        ? journal.readRetained(snapshot.fence.dispatchId)
+        : journal.inspect(snapshot.fence.dispatchId, { requireClaim: true });
+      if (historical) yield* journal.readStageReceipts(snapshot.fence.dispatchId);
       if (!same(original, snapshot)) return yield* deny("Original review dispatch changed");
       const claim = original.intent.compiledClaim.transition;
       if (claim?.kind !== "claim" || claim.binding.environmentId !== options.environmentId)
@@ -141,8 +145,9 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
     });
     const read = Effect.fn("ProjectTeamReviewTargets.read")(function* (
       snapshot: ProjectTeamDispatchSnapshot,
+      historical = false,
     ) {
-      const owner = yield* resolve(snapshot);
+      const owner = yield* resolve(snapshot, historical);
       const rows =
         yield* sql`SELECT environment_id,dispatch_id,project_id,binding_id,generation,dispatch_intent_hash,sha256,CASE WHEN length(CAST(manifest_json AS BLOB))<=131072 THEN manifest_json ELSE NULL END AS manifest_json FROM project_team_review_target WHERE environment_id=${options.environmentId} AND (dispatch_id=${snapshot.fence.dispatchId} OR (binding_id=${owner.binding.recordId} AND generation=${owner.binding.generation})) LIMIT 2`;
       if (rows.length === 0) return undefined;
@@ -418,6 +423,20 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
         return target;
       }).pipe(Effect.mapError(mapFailure));
     };
-    return { captureInitial, readForDispatch };
+    /** Retained cleanup proof does not renew forward admission or hide storage failures. */
+    const readRetainedForDispatch = (snapshot: ProjectTeamDispatchSnapshot) => {
+      let owned: ProjectTeamDispatchSnapshot;
+      try {
+        owned = clone(snapshot);
+      } catch {
+        return Effect.fail(deny("Invalid original review snapshot"));
+      }
+      return Effect.gen(function* () {
+        const target = yield* read(owned, true);
+        if (!target) return yield* deny("The original review target is missing");
+        return target;
+      });
+    };
+    return { captureInitial, readForDispatch, readRetainedForDispatch };
   });
 }

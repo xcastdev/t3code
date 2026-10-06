@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 import {
   ClientOrchestrationCommand,
   ProjectWorkTeamTransition,
+  ProjectTeamReviewCompletionProof,
   ProjectWorkExport,
   ProjectWorkMarkdownExport,
   ProjectWorkCriterionRead,
@@ -630,4 +631,141 @@ describe("private verification consumption contract", () => {
     ])
       expect(() => decode(input)).toThrow();
   });
+});
+
+const reviewProofReport = {
+  type: "project-team.assignment.report",
+  commandId: "report-command",
+  projectId: "project",
+  taskId: "review-child",
+  expectedRevision: 1,
+  expectedTaskRevision: 1,
+  specRevision: 1,
+  planRevision: 1,
+  assignmentId: "membership",
+  expectedAssignmentRevision: 0,
+  summary: "Reviewed the original target",
+  evidenceIds: [],
+  outputArtifactIds: [],
+  outputs: [
+    { criterionId: "review-criterion", kind: "observation", detail: "Checked original changes" },
+  ],
+  outcome: "complete",
+};
+const proofHash = "a".repeat(64);
+const reviewCompletionProof = {
+  status: "completed",
+  proposalCommandId: "report-command",
+  proposalSha256: proofHash,
+  assignmentOperationId: "assignment-operation",
+  assignmentRequestHash: proofHash,
+  assignmentReceiptSha256: proofHash,
+  joinedReceiptId: "joined-receipt",
+  joinedEvidenceSha256: proofHash,
+  report: reviewProofReport,
+  reportAttribution: {
+    actor: { kind: "agent", id: "review-agent" },
+    source: { kind: "mcp", id: "worker" },
+    recordedAt: "2026-10-06T00:00:00.000Z",
+  },
+  assignment: {
+    kind: "task-membership",
+    projectId: "project",
+    recordId: "membership",
+    revision: 0,
+    generation: 0,
+    updatedAt: "2026-10-06T00:00:00.000Z",
+    status: "active",
+    taskId: "review-child",
+    executionKind: "managed",
+    deliverableKind: "review",
+    parentTaskId: "parent",
+  },
+  target: {
+    projectId: "project",
+    taskId: "parent",
+    specRevision: 1,
+    planRevision: 1,
+    baseSha: "b".repeat(40),
+    headSha: "c".repeat(40),
+  },
+  provenance: {
+    reviewTaskId: "review-child",
+    bindingId: "binding",
+    generation: 0,
+    memberId: "member",
+    providerInstanceId: "pi",
+    threadId: "thread",
+    sessionId: "session",
+    initializeOperationId: "initialize-operation",
+    dispatchId: "dispatch",
+    targetSha256: proofHash,
+  },
+  criteria: [{ id: "review-criterion", revision: 0, sha256: proofHash }],
+  evidence: [],
+  outputs: [{ evidenceId: "derived-output", criterionId: "review-criterion", sha256: proofHash }],
+  reportEvidenceId: "derived-report-evidence",
+  reportCommentId: "derived-report-comment",
+  findings: [],
+};
+
+it("review completion proof requires a complete typed report and rejects credentials or a bare grant", () => {
+  const decode = Schema.decodeUnknownSync(ProjectTeamReviewCompletionProof);
+  expect(decode(reviewCompletionProof)).toEqual(reviewCompletionProof);
+  for (const changed of [
+    true,
+    { status: "completed", proposalSha256: proofHash },
+    { ...reviewCompletionProof, credential: "must-not-cross-this-boundary" },
+    { ...reviewCompletionProof, report: { ...reviewProofReport, outcome: "findings" } },
+    { ...reviewCompletionProof, assignmentReceiptSha256: "invalid" },
+    {
+      ...reviewCompletionProof,
+      criteria: Array.from({ length: 65 }, (_, index) => ({
+        id: `criterion-${index}`,
+        revision: 0,
+        sha256: proofHash,
+      })),
+    },
+  ])
+    expect(() => decode(changed)).toThrow();
+  const denied = {
+    status: "denied",
+    proposalCommandId: "report-command",
+    proposalSha256: proofHash,
+    assignmentOperationId: "assignment-operation",
+    reason: "stale-proof",
+  };
+  expect(decode(denied)).toEqual(denied);
+  expect(() => decode({ ...denied, reason: "" })).toThrow();
+});
+
+it("review completion proof enforces its total UTF8 byte bound across valid bounded fields", () => {
+  const decode = Schema.decodeUnknownSync(ProjectTeamReviewCompletionProof);
+  const id = (index: number) => "界".repeat(240) + index;
+  const snapshots = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      id: id(index),
+      revision: 0,
+      sha256: proofHash,
+    }));
+  const oversized = {
+    ...reviewCompletionProof,
+    report: { ...reviewProofReport, summary: "界".repeat(32000) },
+    criteria: snapshots(64),
+    evidence: snapshots(128),
+    findings: Array.from({ length: 256 }, (_, index) => ({
+      findingId: id(index),
+      revision: 0,
+      sha256: proofHash,
+    })),
+    outputs: Array.from({ length: 64 }, (_, index) => ({
+      evidenceId: id(index),
+      criterionId: id(index),
+      sha256: proofHash,
+    })),
+  };
+  expect(new TextEncoder().encode(canonicalProjectWorkPayload(oversized)).length).toBeGreaterThan(
+    524288,
+  );
+  expect(() => decode(oversized)).toThrow();
 });

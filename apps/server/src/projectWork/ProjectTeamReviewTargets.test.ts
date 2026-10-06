@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlError from "effect/unstable/sql/SqlError";
 import { scoped } from "./ProjectTeamAuthorization.testFixtures.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import {
@@ -76,6 +77,45 @@ it.effect("malformed private environment options fail before target access", () 
         if (result._tag === "Failure")
           expect(result.failure).toBeInstanceOf(ProjectTeamReviewTargetError);
       }
+    }),
+  ),
+);
+
+it.effect(
+  "historical target reader rejects absent and foreign transactions without storage access",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* verificationFixture;
+        const targets = yield* makeProjectTeamReviewTargets(options);
+        for (const operation of [
+          targets.readRetainedForDispatch(f.snapshot),
+          f.sql.withTransaction(
+            targets
+              .readRetainedForDispatch(f.snapshot)
+              .pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql })),
+          ),
+        ]) {
+          const result = yield* operation.pipe(Effect.result);
+          expect(result._tag).toBe("Failure");
+          if (result._tag === "Failure")
+            expect(result.failure).toBeInstanceOf(ProjectTeamReviewTargetError);
+        }
+      }),
+    ),
+);
+
+it.effect("historical target reader preserves actual SQL failure for settlement rollback", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* verificationFixture;
+      const targets = yield* makeProjectTeamReviewTargets(options);
+      yield* f.sql`ALTER TABLE project_team_dispatch RENAME TO project_team_dispatch_storage_unavailable`;
+      const result = yield* f.sql
+        .withTransaction(targets.readRetainedForDispatch(f.snapshot))
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") expect(SqlError.isSqlError(result.failure)).toBe(true);
     }),
   ),
 );

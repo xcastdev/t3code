@@ -1,5 +1,6 @@
 import {
   canonicalProjectWorkPayload,
+  type ProjectTeamReviewCompletionProof,
   projectWorkPayloadFingerprint,
   CommandId,
   ProjectTeamRecord as ProjectTeamRecordSchema,
@@ -254,16 +255,22 @@ const nextForwardStage: Partial<Record<ProjectTeamDispatchStage, typeof ForwardS
 
 /** Only Root constructs this journal. Every effect admission and receipt checks committed authority. */
 export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatchJournal")(
-  function* (options: {
+  function* <E = never, R = never>(options: {
     readonly environmentId: string;
     readonly maximumEnvironmentModelCalls: number;
     /** Trusted Root checks actual retained Git/setup/native receipts. No client or worker predicate. */
     readonly verifyStage?: ProjectTeamDispatchStageVerifier;
     /** Root checks original worker/setup/model owners joined, including retained transport accounting. */
     readonly verifySettlement?: ProjectTeamDispatchStageVerifier;
+    /** Read original child proof before releasing its attempt in this same transaction. */
+    readonly prepareReviewCompletion?: (
+      snapshot: ProjectTeamDispatchSnapshot,
+      receipt: ProjectTeamDispatchStageReceipt,
+    ) => Effect.Effect<ProjectTeamReviewCompletionProof | undefined, E, R>;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const repository = yield* ProjectWorkRepository;
+    const prepareReviewCompletion = options.prepareReviewCompletion;
     const environmentId = yield* decodeEnvironment(options.environmentId);
     const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
     const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
@@ -1526,8 +1533,10 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           const original = yield* read(expected.dispatchId);
           yield* readStageHistory(original.row, original.intent);
           yield* verify(receipt, { fence: fence(original.row), intent: original.intent });
-          settled = yield* advanceStage(expected, receipt);
-          if (yield* isProjectWorkTombstoned(sql, original.row.project_id)) return [];
+          if (yield* isProjectWorkTombstoned(sql, original.row.project_id)) {
+            settled = yield* advanceStage(expected, receipt);
+            return [];
+          }
           const state = yield* readCurrentState(sql, original.row.project_id);
           const records = state.foundationRecords ?? [];
           const binding = records.find(
@@ -1535,11 +1544,22 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           );
           if (binding?.kind !== "run-binding" || binding.generation !== original.row.generation)
             return yield* deny("Original settlement binding is missing or replaced");
-          if (binding.status === "settled") return [];
+          if (binding.status === "settled") {
+            settled = yield* advanceStage(expected, receipt);
+            return [];
+          }
           const task = state.tasks.find((t) => t.taskId === original.row.task_id);
           const attempt = state.attempts.find((a) => a.attemptId === original.row.attempt_id);
           if (task === undefined || attempt === undefined)
             return yield* deny("Original settlement task or attempt is missing");
+          const reviewCompletion =
+            prepareReviewCompletion === undefined
+              ? undefined
+              : yield* prepareReviewCompletion(
+                  { fence: fence(original.row), intent: original.intent },
+                  receipt,
+                );
+          settled = yield* advanceStage(expected, receipt);
           const at = time(yield* Clock.currentTimeMillis);
           const command: typeof ProjectWorkFoundationCommitCommand.Type = {
             type: "project-work.foundation.commit",
@@ -1557,6 +1577,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
             committedAt: at,
             transition: {
               kind: "run.settle",
+              ...(reviewCompletion === undefined ? {} : { reviewCompletion }),
               bindingId: binding.recordId,
               generation: binding.generation,
               expectedBindingRevision: binding.revision,
