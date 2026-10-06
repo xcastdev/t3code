@@ -44,6 +44,7 @@ import {
 } from "./workActions";
 import { WorkQuestions, WorkTeam } from "./WorkTeam";
 import { WorkEvidence } from "./WorkEvidence";
+import { WorkAttention } from "./WorkAttention";
 import { WorkSupervisionSource } from "./WorkSupervisionSource";
 
 const knownTeamRecord = Schema.is(ProjectTeamRecord);
@@ -271,6 +272,12 @@ function ProjectWorkSession({
       >
         {showSupervision ? "Show project work" : "Show supervision"}
       </WorkButton>
+      <WorkAttention
+        target={target}
+        connected={focused && runtime?.connectionState === "connected"}
+        supported={foundationSupported}
+        writesSupported={config?.environment.capabilities.projectTeamGuidedWrites === true}
+      />
       {showSupervision ? (
         <WorkSupervisionSource
           {...target}
