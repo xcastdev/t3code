@@ -4,6 +4,8 @@ import {
   ProjectWorkAttemptId,
   ProjectWorkCriterionId,
   ProjectWorkTaskId,
+  ProjectTeamEffect,
+  EventId,
 } from "@t3tools/contracts";
 import { assert, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -15,19 +17,92 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runMigrations } from "../persistence/Migrations.ts";
-import { ProjectWorkEventBus } from "./ProjectWorkEventBus.ts";
+import { ProjectWorkEventBus, ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
 import type { ProjectWorkLeaseReactorShape } from "./ProjectWorkLeaseReactor.ts";
 import { ProjectWorkLeaseReactor } from "./ProjectWorkLeaseReactor.ts";
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import { ProjectWorkQueryLive } from "./ProjectWorkQuery.ts";
 import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
-import { runProjectWorkLeaseWorker } from "./ProjectWorkRuntime.ts";
+import {
+  runProjectWorkLeaseWorker,
+  runProjectWorkPublicationRecovery,
+} from "./ProjectWorkRuntime.ts";
 import { coreLayer, leaseLayer } from "./ProjectWorkRuntime.ts";
+
+const decodePublicationEffect = Schema.decodeUnknownSync(ProjectTeamEffect);
+
+it.effect(
+  "publication recovery runs at startup and on claimed receipts without a reflection feedback loop",
+  () =>
+    Effect.gen(function* () {
+      const bus = yield* ProjectWorkEventBus;
+      const called = yield* Queue.unbounded<number>();
+      let count = 0;
+      const service = {
+        recoverAll: () =>
+          Effect.gen(function* () {
+            count += 1;
+            yield* Queue.offer(called, count);
+            return { recovered: 0, confirmed: 0, uncertain: 0, failed: 0 };
+          }),
+      };
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.forkScoped(runProjectWorkPublicationRecovery(service, Effect.void));
+          expect(yield* Queue.take(called)).toBe(1);
+          const at = "2026-10-05T00:00:00.000Z";
+          const projectId = ProjectId.make("publication-worker-project");
+          const effect = decodePublicationEffect({
+            kind: "effect",
+            recordId: "publication",
+            effectId: "publication",
+            projectId,
+            revision: 1,
+            generation: 0,
+            updatedAt: at,
+            effectKind: "publication",
+            status: "uncertain",
+            targetId: "github.com/owner/repo",
+            payload: { recordIds: [], expectedRevision: 0 },
+            claimGeneration: 1,
+            availableAt: at,
+          });
+          yield* bus.publish([
+            {
+              cursor: 1,
+              event: {
+                eventId: EventId.make("uncertain"),
+                projectId,
+                revision: 1,
+                type: "project-work.foundation.recorded",
+                record: effect,
+                occurredAt: at,
+              },
+            },
+            {
+              cursor: 2,
+              event: {
+                eventId: EventId.make("claimed"),
+                projectId,
+                revision: 2,
+                type: "project-work.foundation.recorded",
+                record: { ...effect, status: "claimed" },
+                occurredAt: at,
+              },
+            },
+          ]);
+          expect(yield* Queue.take(called)).toBe(2);
+        }),
+      );
+      expect(count).toBe(2);
+    }).pipe(Effect.provide(ProjectWorkEventBusLive)),
+);
 
 it.effect("starts the lease drain immediately and interrupts it with its scope", () =>
   Effect.gen(function* () {

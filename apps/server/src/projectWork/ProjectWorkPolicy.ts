@@ -306,8 +306,24 @@ function attentionFor(
       revision: task.revision,
     });
   };
-  // Only one reason is persisted per task. Closure stays visible without changing
-  // execution authority; a stable bounded identity avoids notices for body edits.
+  // Only one reason is persisted per task. Uncertain publication takes priority;
+  // a stable operation identity avoids repeated notices for recovery reads.
+  const uncertainPublication = (state.foundationRecords ?? [])
+    .filter(
+      (record) =>
+        record.kind === "effect" &&
+        record.effectKind === "publication" &&
+        record.status === "uncertain" &&
+        record.projectId === state.projectId &&
+        record.taskId === task.taskId,
+    )
+    .map((record) => record.recordId)
+    .sort()[0];
+  if (uncertainPublication !== undefined)
+    add(
+      "blocked",
+      `PR publication '${uncertainPublication}' has an uncertain outcome. Review the remote result before retrying.`,
+    );
   const closedIssue = closedIssueFor(state, task);
   if (closedIssue !== undefined)
     add("external-issue-closed", `Linked issue '${closedIssue}' is closed.`);
