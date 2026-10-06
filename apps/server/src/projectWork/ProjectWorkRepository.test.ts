@@ -37,6 +37,70 @@ const at = "2026-01-01T00:00:00.000Z";
 const layer = it.layer(Layer.fresh(Layer.mergeAll(NodeSqliteClient.layerMemory())));
 
 layer("ProjectWorkRepository", (it) => {
+  it.effect("replays an accepted zero-event receipt only after live authorization", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      yield* runForkMigrations();
+      const repository = yield* ProjectWorkRepository;
+      const sql = yield* SqlClient.SqlClient;
+      const command: ProjectWorkCommand = {
+        type: "project-work.foundation.commit",
+        projectId: ProjectId.make("zero-event-receipt"),
+        commandId: CommandId.make("zero-event-report"),
+        expectedRevision: 0,
+        records: [],
+        committedAt: at,
+        attribution: {
+          actor: { kind: "agent", id: "authorized-reviewer" },
+          source: { kind: "mcp", id: "review-report" },
+          recordedAt: at,
+        },
+      };
+      let authorized = 0;
+      let live = true;
+      const observedDuplicates: boolean[] = [];
+      const execute = () =>
+        repository.executeAuthorized(
+          command,
+          () => {
+            authorized++;
+            return Effect.succeed(command);
+          },
+          ({ duplicate }) => {
+            observedDuplicates.push(duplicate);
+            return live ? Effect.void : Effect.fail("reviewer-revoked");
+          },
+        );
+      const first = yield* execute();
+      expect(first.events).toEqual([]);
+      expect(first.writeResult.receipt.eventCount).toBe(0);
+      const second = yield* execute();
+      expect(second.duplicate).toBe(true);
+      expect(second.writeResult).toEqual(first.writeResult);
+      expect(observedDuplicates).toEqual([false, true]);
+      expect(authorized).toBe(1);
+      live = false;
+      expect((yield* execute().pipe(Effect.result))._tag).toBe("Failure");
+      expect(authorized).toBe(1);
+      expect(
+        (yield* repository
+          .execute({
+            ...command,
+            attribution: {
+              ...command.attribution!,
+              actor: { kind: "agent", id: "other-reviewer" },
+            },
+          })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        yield* sql`SELECT * FROM project_work_events WHERE project_id=${command.projectId}`,
+      ).toHaveLength(0);
+      expect(
+        yield* sql`SELECT * FROM project_work_command_receipts WHERE project_id=${command.projectId}`,
+      ).toHaveLength(1);
+    }).pipe(Effect.provide(ProjectWorkRepositoryLive)),
+  );
   for (const outcome of ["denial", "defect", "interrupt"] as const)
     it.effect(`retains transaction cause and policy certainty for ${outcome}`, () =>
       Effect.gen(function* () {
@@ -1254,6 +1318,13 @@ it.effect(
             [27, "ProjectTeamSetupJournal"],
             [28, "ProjectTeamWorkspaceReceipt"],
             [29, "ProjectTeamMemoryJournal"],
+            [30, "ProjectTeamMemoryOutcome"],
+            [31, "ProjectTeamReviewFreshness"],
+            [32, "ProjectWorkArtifacts"],
+            [33, "ProjectWorkVerificationJobs"],
+            [34, "ProjectWorkVerificationExecution"],
+            [35, "ProjectTeamReviewTargets"],
+            [36, "ProjectTeamReviewFindings"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(

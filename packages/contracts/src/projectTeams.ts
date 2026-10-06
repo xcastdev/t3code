@@ -379,7 +379,74 @@ export const ProjectTeamEffect = Schema.Struct({
   outcome: Schema.optionalKey(Text),
   availableAt: IsoDateTime,
 });
+const FindingId = Schema.String.check(
+  Schema.isTrimmed(),
+  Schema.isMinLength(1),
+  Schema.isMaxLength(256),
+  Schema.makeFilter((value) => !value.includes("\0")),
+);
+const FindingIds = Schema.Array(FindingId).check(
+  Schema.isMaxLength(64),
+  Schema.makeFilter((values) => new Set(values).size === values.length),
+);
+const FindingFields = {
+  findingId: FindingId,
+  severity: Schema.Literals(["low", "medium", "high", "critical"]),
+  criterionIds: Schema.Array(ProjectWorkCriterionId).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(64),
+    Schema.makeFilter((values) => new Set(values).size === values.length),
+  ),
+  detail: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(32_000),
+    Schema.isPattern(/\S/u),
+  ),
+  status: Schema.Literals(["open", "resolved"]),
+  resolutionArtifactIds: FindingIds,
+};
+export const ProjectTeamReviewFindingProvenance = Schema.Struct({
+  reviewTaskId: ProjectWorkTaskId,
+  bindingId: FindingId,
+  generation: NonNegativeInt,
+  memberId: FindingId,
+  providerInstanceId: ProviderInstanceId,
+  threadId: ThreadId,
+  sessionId: FindingId,
+  initializeOperationId: FindingId,
+  dispatchId: FindingId,
+  targetSha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+});
+export type ProjectTeamReviewFindingProvenance = typeof ProjectTeamReviewFindingProvenance.Type;
+export const ProjectTeamReviewFinding = Schema.Struct({
+  ...Fields,
+  ...FindingFields,
+  kind: Schema.Literal("review-finding"),
+  taskId: ProjectWorkTaskId,
+  target: Schema.Struct({
+    projectId: ProjectId,
+    taskId: ProjectWorkTaskId,
+    specRevision: NonNegativeInt,
+    planRevision: NonNegativeInt,
+    baseSha: Text,
+    headSha: Text,
+  }),
+  originReviewer: ProjectTeamReviewFindingProvenance,
+  reportedBy: ProjectTeamReviewFindingProvenance,
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      value.target.projectId === value.projectId &&
+      value.target.taskId === value.taskId &&
+      (value.status === "open"
+        ? value.resolutionArtifactIds.length === 0
+        : value.resolutionArtifactIds.length > 0),
+  ),
+);
+export type ProjectTeamReviewFinding = typeof ProjectTeamReviewFinding.Type;
+
 export const ProjectTeamRecord = Schema.Union([
+  ProjectTeamReviewFinding,
   ProjectTeamMission,
   ProjectTeamTaskMembership,
   ProjectTeamRoleRevision,
@@ -403,6 +470,7 @@ export const ProjectTeamRecord = Schema.Union([
 export type ProjectTeamRecord = typeof ProjectTeamRecord.Type;
 // Read variants deliberately retain unknown future states and role/kind slugs.
 export const ProjectTeamRecordRead = Schema.Union([
+  Schema.Struct({ ...ProjectTeamReviewFinding.fields, status: Text, severity: Text }),
   Schema.Struct({ ...ProjectTeamMission.fields, status: Text }),
   Schema.Struct({
     ...ProjectTeamTaskMembership.fields,
@@ -560,7 +628,28 @@ export const ProjectTeamVerificationProposal = Schema.Struct({
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamVerificationProposal = typeof ProjectTeamVerificationProposal.Type;
 
+export const ProjectTeamReviewFindingIntent = Schema.Struct({
+  ...IntentFields,
+  ...FindingFields,
+  type: Schema.Literal("project-team.review.finding.record"),
+  revision: NonNegativeInt,
+})
+  .check(
+    Schema.makeFilter(
+      (value) =>
+        new TextEncoder().encode(value.detail).length +
+          [...value.criterionIds, ...value.resolutionArtifactIds].reduce(
+            (total, id) => total + new TextEncoder().encode(id).length,
+            0,
+          ) <=
+        131_072,
+    ),
+  )
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamReviewFindingIntent = typeof ProjectTeamReviewFindingIntent.Type;
+
 export const ProjectTeamWriteIntent = Schema.Union([
+  ProjectTeamReviewFindingIntent,
   ProjectTeamVerificationProposal,
   ProjectTeamConfigurationIntent,
   Schema.Struct({

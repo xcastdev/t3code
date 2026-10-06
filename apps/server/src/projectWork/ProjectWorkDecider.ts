@@ -832,6 +832,15 @@ export function decideProjectWorkCommand(
           );
         seen.add(input.recordId);
         const record = validateProjectTeamRecord(working, input, command.attribution);
+        if (
+          record.kind === "review-finding" &&
+          working.foundationRecords?.some(
+            (prior) =>
+              prior.recordId === record.recordId &&
+              canonicalProjectWorkPayload(prior) === canonicalProjectWorkPayload(record),
+          )
+        )
+          continue;
         const recorded = event(
           { type: "project-work.foundation.recorded", record, occurredAt: command.committedAt },
           events.length,

@@ -15,7 +15,7 @@ const decodeTeamRecordReadJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectTeamRecordRead),
 );
 
-export const PROJECT_WORK_CHECKPOINT_VERSION = 2;
+export const PROJECT_WORK_CHECKPOINT_VERSION = 3;
 const projectionKinds = [
   "mission",
   "task-membership",
@@ -27,6 +27,7 @@ const projectionKinds = [
   "message",
   "question",
   "evidence-applicability",
+  "review-finding",
   "repair-episode",
   "limits",
   "issue",

@@ -96,6 +96,7 @@ const isError = Schema.is(ProjectTeamReviewFreshnessError);
 const isCapture = Schema.is(CaptureFields);
 const SessionOwner = Schema.Struct({ ...Ownership.fields, sessionId: Id });
 const isSessionOwner = Schema.is(SessionOwner);
+const decodeSessionOwner = Schema.decodeUnknownSync(SessionOwner, strict);
 const isId = Schema.is(Id);
 const isSafe = Schema.is(Safe);
 const parseJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -527,31 +528,47 @@ export const makeProjectTeamReviewFreshness = Effect.fn("makeProjectTeamReviewFr
       if (!isId(operationId)) return yield* deny("invalid-input");
       return yield* sql.withTransaction(readInside(operationId));
     });
+    const readSessionInside = Effect.fn("ReviewFreshness.readSessionInside")(function* (
+      fields: typeof SessionOwner.Type,
+    ) {
+      const rows = yield* sql<{
+        operationId: string;
+      }>`SELECT operation_id AS operationId FROM project_team_review_freshness
+          WHERE environment_id=${environmentId} AND binding_id=${fields.bindingId} AND generation=${fields.generation}
+            AND provider_instance_id=${fields.providerInstanceId} AND thread_id=${fields.threadId} AND session_id=${fields.sessionId} LIMIT 2`;
+      if (rows.length !== 1) return yield* deny("conflict");
+      const receipt = yield* readInside(rows[0]!.operationId);
+      if (
+        receipt === undefined ||
+        receipt.projectId !== fields.projectId ||
+        receipt.taskId !== fields.taskId ||
+        receipt.specRevision !== fields.specRevision ||
+        receipt.planRevision !== fields.planRevision
+      )
+        return yield* deny("conflict");
+      return receipt;
+    });
     const readSessionOwned = Effect.fn("ReviewFreshness.readForSession")(function* (
       fields: typeof SessionOwner.Type,
     ) {
       yield* independent;
-      return yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const rows = yield* sql<{
-            operationId: string;
-          }>`SELECT operation_id AS operationId FROM project_team_review_freshness
-          WHERE environment_id=${environmentId} AND binding_id=${fields.bindingId} AND generation=${fields.generation}
-            AND provider_instance_id=${fields.providerInstanceId} AND thread_id=${fields.threadId} AND session_id=${fields.sessionId} LIMIT 2`;
-          if (rows.length !== 1) return yield* deny("conflict");
-          const receipt = yield* readInside(rows[0]!.operationId);
-          if (
-            receipt === undefined ||
-            receipt.projectId !== fields.projectId ||
-            receipt.taskId !== fields.taskId ||
-            receipt.specRevision !== fields.specRevision ||
-            receipt.planRevision !== fields.planRevision
-          )
-            return yield* deny("conflict");
-          return receipt;
-        }),
-      );
+      return yield* sql.withTransaction(readSessionInside(fields));
     });
+    const readSessionInTransaction = Effect.fn("ReviewFreshness.readForSessionInTransaction")(
+      function* (fields: typeof SessionOwner.Type) {
+        const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
+        if (
+          Option.isNone(supplied) ||
+          supplied.value !== sql ||
+          Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+        )
+          return yield* deny("inherited-transaction");
+        // Bind only after checking the caller; keep its transaction connection loan.
+        return yield* readSessionInside(fields).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+        );
+      },
+    );
     return {
       capture: <E, R>(input: ProjectTeamReviewFreshnessCaptureInput<E, R>) => {
         const { assertCurrent, ...fields } = input;
@@ -563,6 +580,17 @@ export const makeProjectTeamReviewFreshness = Effect.fn("makeProjectTeamReviewFr
         isSessionOwner(input)
           ? protect(readSessionOwned(structuredClone(input)))
           : Effect.fail(deny("invalid-input")),
+      readForSessionInTransaction: (input: typeof SessionOwner.Type) => {
+        let fields: typeof SessionOwner.Type;
+        try {
+          const copy: unknown = structuredClone(input);
+          fields = decodeSessionOwner(copy);
+          if (encode(copy) !== encode(fields)) return Effect.fail(deny("invalid-input"));
+        } catch {
+          return Effect.fail(deny("invalid-input"));
+        }
+        return protect(readSessionInTransaction(fields));
+      },
     };
   },
 );

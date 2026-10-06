@@ -377,9 +377,9 @@ const makeProjectWorkRepository = Effect.gen(function* () {
             WHERE project_id = ${projectId} AND command_id = ${command.commandId}
             ORDER BY sequence ASC
           `;
-          if (liveValidate !== undefined)
-            yield* liveValidate({ duplicate: priorCommandRows.length > 0 });
-          if (priorCommandRows.length > 0) {
+          const duplicate = priorReceipt !== undefined || priorCommandRows.length > 0;
+          if (liveValidate !== undefined) yield* liveValidate({ duplicate });
+          if (duplicate) {
             const priorEvents = priorCommandRows.map((row) =>
               decodeProjectWorkEvent(JSON.parse(String(row.payloadJson))),
             );

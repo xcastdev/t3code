@@ -2,6 +2,9 @@ import {
   CommandId,
   ProjectId,
   ProjectWorkTaskId,
+  ProjectWorkCriterionId,
+  ProviderInstanceId,
+  ThreadId,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -48,6 +51,113 @@ const gate: Extract<ProjectTeamRecord, { kind: "gate" }> = {
   evidenceIds: [],
   attribution: human,
 };
+describe("review finding foundation invariants", () => {
+  const criterionId = ProjectWorkCriterionId.make("review-criterion");
+  const provenance = {
+    reviewTaskId: ProjectWorkTaskId.make("review-child"),
+    bindingId: "review-binding",
+    generation: 2,
+    memberId: "reviewer",
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    threadId: ThreadId.make("review-thread"),
+    sessionId: "fresh-session",
+    initializeOperationId: "review-initialize",
+    dispatchId: "review-dispatch",
+    targetSha256: "a".repeat(64),
+  };
+  const finding: Extract<ProjectTeamRecord, { kind: "review-finding" }> = {
+    ...fields,
+    recordId: "finding-ledger",
+    kind: "review-finding",
+    taskId,
+    findingId: "retry-loses-report",
+    severity: "high",
+    criterionIds: [criterionId],
+    detail: "A repeated report loses its original result.",
+    status: "open",
+    resolutionArtifactIds: [],
+    target: {
+      projectId,
+      taskId,
+      specRevision: 1,
+      planRevision: 1,
+      baseSha: "base",
+      headSha: "head",
+    },
+    originReviewer: provenance,
+    reportedBy: provenance,
+  };
+  const state = () => {
+    const current = initial();
+    return applyProjectWorkEvents(
+      current,
+      decideProjectWorkCommand(current, {
+        type: "project-work.criterion.upsert",
+        projectId,
+        taskId,
+        commandId: CommandId.make("review-criterion"),
+        criterion: {
+          criterionId,
+          taskId,
+          description: "Report survives retry",
+          required: true,
+          status: "unsatisfied",
+          satisfiedByEvidenceIds: [],
+          revision: 0,
+          updatedAt: at,
+        },
+        updatedAt: at,
+      }),
+    );
+  };
+  it("retains exact duplicate findings without advancing the event log", () => {
+    const current = { ...state(), foundationRecords: [finding] };
+    expect(
+      decideProjectWorkCommand(current, {
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: CommandId.make("repeat-finding"),
+        expectedRevision: current.revision,
+        records: [finding],
+        attribution: human,
+        committedAt: at,
+      }),
+    ).toEqual([]);
+    expect(() =>
+      validateProjectTeamRecord(current, { ...finding, detail: "Changed at same revision" }, human),
+    ).toThrow();
+  });
+  it("preserves the original target and reviewer while allowing exact next-revision detail", () => {
+    const current = { ...state(), foundationRecords: [finding] };
+    expect(
+      validateProjectTeamRecord(current, { ...finding, revision: 1, detail: "More detail" }, human)
+        .revision,
+    ).toBe(1);
+    for (const changed of [
+      { ...finding, revision: 1, target: { ...finding.target, headSha: "replacement" } },
+      { ...finding, revision: 1, originReviewer: { ...provenance, memberId: "replacement" } },
+      { ...finding, revision: 1, generation: 1 },
+    ])
+      expect(() => validateProjectTeamRecord(current, changed, human)).toThrow();
+  });
+  it("rejects foreign criteria, duplicate finding identities and unproved resolution", () => {
+    const current = state();
+    expect(validateProjectTeamRecord(current, finding, human)).toEqual(finding);
+    for (const changed of [
+      { ...finding, criterionIds: [ProjectWorkCriterionId.make("foreign")] },
+      { ...finding, status: "resolved" as const, resolutionArtifactIds: ["bare-artifact"] },
+      { ...finding, generation: 1 },
+    ])
+      expect(() => validateProjectTeamRecord(current, changed, human)).toThrow();
+    expect(() =>
+      validateProjectTeamRecord(
+        { ...current, foundationRecords: [finding] },
+        { ...finding, recordId: "other-ledger" },
+        human,
+      ),
+    ).toThrow();
+  });
+});
 describe("guided foundation invariants", () => {
   it("consumed and invalidated grants cannot become fresh approval", () => {
     for (const status of ["consumed", "invalidated"] as const) {

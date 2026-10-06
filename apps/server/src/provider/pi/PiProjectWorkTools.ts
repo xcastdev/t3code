@@ -137,7 +137,8 @@ export const executePiProjectWorkBridgeTool = Effect.fn("executePiProjectWorkBri
     );
     if (
       (input.toolName === "project_work_report" &&
-        intent.type !== "project-team.assignment.report") ||
+        intent.type !== "project-team.assignment.report" &&
+        intent.type !== "project-team.review.finding.record") ||
       (input.toolName === "project_work_plan" && intent.type !== "project-team.plan.propose")
     )
       return yield* new PiProjectWorkToolValidationError({ reason: "intent-kind" });

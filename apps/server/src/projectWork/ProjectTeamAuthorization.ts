@@ -25,7 +25,8 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
-import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
+import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { decodeProjectWorkEvent } from "./ProjectWorkEventStore.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import {
@@ -357,6 +358,11 @@ export const layer = Layer.effect(
       principal: ProjectTeamPrincipal,
       command: ProjectWorkCommand,
     ) {
+      if (
+        command.type === "project-work.foundation.commit" &&
+        command.records.some((record) => record.kind === "review-finding")
+      )
+        return yield* deny("Review findings require the authenticated typed report route");
       const authority = yield* resolve(principal);
       if (!authority) return;
       const targetTaskId =
@@ -429,6 +435,26 @@ export const layer = Layer.effect(
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) {
+      if (input.type === "project-team.review.finding.record") {
+        const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+        const transaction = yield* Effect.serviceOption(sql.transactionService);
+        const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+        if (
+          Option.isNone(currentSql) ||
+          currentSql.value !== sql ||
+          Option.isNone(transaction) ||
+          Option.isNone(repository)
+        )
+          return yield* deny("Review finding report requires its original transaction");
+        const findings = yield* makeProjectTeamReviewFindings(resolve).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.provideService(ProjectWorkRepository, repository.value),
+        );
+        return yield* findings.compile(principal, input, attribution, duplicate).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.mapError(() => deny("Review finding authority or retained proof is invalid")),
+        );
+      }
       const authority = yield* resolve(principal);
       const state = authority?.state ?? (yield* stateFor(input.projectId));
       if (input.type === "project-team.configure") {

@@ -571,3 +571,103 @@ it("preserves unknown gate kinds and statuses without accepting them as current 
   expect(decodeTeamRecordRead(future)).toEqual(future);
   expect(() => decodeTeamRecord(future)).toThrow();
 });
+
+describe("authenticated review finding wire contracts", () => {
+  const provenance = {
+    reviewTaskId: "review-child",
+    bindingId: "review-binding",
+    generation: 2,
+    memberId: "review-member",
+    providerInstanceId: "pi-review",
+    threadId: "review-thread",
+    sessionId: "review-session",
+    initializeOperationId: "review-initialize",
+    dispatchId: "review-dispatch",
+    targetSha256: "a".repeat(64),
+  };
+  const finding = {
+    kind: "review-finding",
+    recordId: "finding-record",
+    projectId: "project",
+    taskId: "parent",
+    revision: 0,
+    generation: 0,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    findingId: "finding-one",
+    status: "open",
+    severity: "high",
+    criterionIds: ["criterion-one"],
+    detail: "The original target omits the required retry boundary.",
+    resolutionArtifactIds: [],
+    target: {
+      projectId: "project",
+      taskId: "parent",
+      specRevision: 3,
+      planRevision: 4,
+      baseSha: "b".repeat(40),
+      headSha: "c".repeat(40),
+    },
+    originReviewer: provenance,
+    reportedBy: provenance,
+  };
+  const findingIntent = {
+    type: "project-team.review.finding.record",
+    commandId: "report-finding",
+    projectId: "project",
+    taskId: "review-child",
+    expectedRevision: 8,
+    expectedTaskRevision: 2,
+    specRevision: 1,
+    planRevision: 0,
+    findingId: "finding-one",
+    revision: 0,
+    severity: "high",
+    criterionIds: ["criterion-one"],
+    detail: finding.detail,
+    status: "open",
+    resolutionArtifactIds: [],
+  };
+  it("accepts a child-scoped report and retains the distinct host-derived parent target", () => {
+    expect(decodeIntent(findingIntent)).toEqual(findingIntent);
+    expect(decodePublicWrite(findingIntent)).toEqual(findingIntent);
+    expect(decodeTeamRecord(finding)).toEqual(finding);
+  });
+  it.each(["target", "originReviewer", "reportedBy", "bindingId", "sessionId", "freshness"])(
+    "rejects caller-authored %s authority in a report",
+    (field) => {
+      expect(() => decodeIntent({ ...findingIntent, [field]: finding.target })).toThrow();
+    },
+  );
+  it("bounds stable finding identity, revisions, criteria and retained report content", () => {
+    for (const extra of [
+      { findingId: " " },
+      { findingId: "x".repeat(257) },
+      { findingId: "finding\0one" },
+      { revision: -1 },
+      { revision: Number.MAX_SAFE_INTEGER + 1 },
+      { criterionIds: [] },
+      { criterionIds: ["criterion-one", "criterion-one"] },
+      { criterionIds: Array.from({ length: 65 }, (_, i) => `criterion-${i}`) },
+      { detail: " " },
+      { detail: "x".repeat(32_001) },
+      { severity: "unknown" },
+      { resolutionArtifactIds: ["artifact", "artifact"] },
+    ])
+      expect(() => decodeIntent({ ...findingIntent, ...extra })).toThrow();
+  });
+  it("retains future read severity and status without accepting them in writes", () => {
+    const future = { ...finding, severity: "blocking", status: "reopened" };
+    expect(decodeTeamRecordRead(future)).toEqual(future);
+    expect(() => decodeTeamRecord(future)).toThrow();
+  });
+  it("rejects mismatched parent ownership, malformed provenance and conflicting open resolution", () => {
+    for (const value of [
+      { ...finding, taskId: "foreign-parent" },
+      { ...finding, target: { ...finding.target, projectId: "foreign-project" } },
+      { ...finding, originReviewer: { ...provenance, targetSha256: "not-a-digest" } },
+      { ...finding, reportedBy: { ...provenance, generation: -1 } },
+      { ...finding, resolutionArtifactIds: ["unqualified-artifact"] },
+    ])
+      expect(() => decodeTeamRecord(value)).toThrow();
+  });
+});

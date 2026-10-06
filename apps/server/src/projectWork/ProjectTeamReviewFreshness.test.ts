@@ -14,6 +14,8 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Layer from "effect/Layer";
+import * as Context from "effect/Context";
+import * as Cause from "effect/Cause";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
@@ -215,6 +217,167 @@ const addSuccessor = Effect.fn("freshnessTest.addSuccessor")(function* (
       operation_ordinal+1,'prompt',request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,
       'settled',intent_json,native_json,terminal_json FROM project_team_pi_operation WHERE operation_id=${f.input.operationId}`;
 });
+
+it.effect(
+  "private session lookup requires its exact caller transaction and captures ownership synchronously",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const receipt = yield* f.service.capture(f.input);
+        expect(
+          (yield* f.service.readForSessionInTransaction(sessionOwner(f)).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const input = sessionOwner(f);
+        const captured = f.service.readForSessionInTransaction(input);
+        input.sessionId = "changed-after-construction";
+        input.specRevision = 999;
+        expect(yield* f.sql.withTransaction(captured)).toEqual(receipt);
+        expect(
+          (yield* f.sql.withTransaction(
+            f.service
+              .readForSessionInTransaction(sessionOwner(f))
+              .pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql }), Effect.result),
+          ))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql.withTransaction(
+            f.service.readForSessionInTransaction(sessionOwner(f)).pipe(
+              Effect.updateContext((context: Context.Context<never>) =>
+                Context.omit(SqlClient.SqlClient)(context),
+              ),
+              Effect.result,
+            ),
+          ))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(f.service.readForSession(sessionOwner(f)))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect("private session ownership guards reject before the captured SQL boundary", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const receipt = yield* f.service.capture(f.input);
+      let queries = 0;
+      const capturedSql = new Proxy(f.sql, {
+        apply(target, receiver, args) {
+          queries++;
+          return Reflect.apply(target, receiver, args);
+        },
+      });
+      const service = yield* makeProjectTeamReviewFreshness({
+        environmentId: "review-environment",
+      }).pipe(Effect.provideService(SqlClient.SqlClient, capturedSql));
+      expect(
+        (yield* service.readForSessionInTransaction(sessionOwner(f)).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* f.sql
+          .withTransaction(service.readForSessionInTransaction(sessionOwner(f)))
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(queries).toBe(0);
+      expect(
+        yield* f.sql.withTransaction(
+          service
+            .readForSessionInTransaction(sessionOwner(f))
+            .pipe(Effect.provideService(SqlClient.SqlClient, capturedSql)),
+        ),
+      ).toEqual(receipt);
+      expect(queries).toBeGreaterThan(0);
+    }),
+  ),
+);
+
+for (const kind of [
+  "unknown-key",
+  "stale-owner",
+  "canonical-manifest",
+  "raw-bytes",
+  "native-operation",
+] as const)
+  it.effect(`private session lookup denies ${kind} without relaxing retained qualification`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* f.service.capture(f.input);
+        const owner = sessionOwner(f);
+        const selected =
+          kind === "unknown-key"
+            ? { ...owner, injected: "authority" }
+            : kind === "stale-owner"
+              ? { ...owner, planRevision: owner.planRevision + 1 }
+              : owner;
+        if (kind === "canonical-manifest" || kind === "raw-bytes")
+          yield* f.sql`DROP TRIGGER project_team_review_freshness_immutable`;
+        if (kind === "canonical-manifest")
+          yield* f.sql`UPDATE project_team_review_freshness SET manifest_json=' ' || manifest_json WHERE operation_id=${f.input.operationId}`;
+        if (kind === "raw-bytes")
+          yield* f.sql`UPDATE project_team_review_freshness SET native_jsonl=native_jsonl || ' ' WHERE operation_id=${f.input.operationId}`;
+        if (kind === "native-operation")
+          yield* f.sql`UPDATE project_team_pi_operation SET native_json=${encode({ ...f.input.native, sessionId: "foreign-native" })} WHERE operation_id=${f.input.operationId}`;
+        expect(
+          (yield* f.sql
+            .withTransaction(f.service.readForSessionInTransaction(selected))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+  );
+
+it.effect(
+  "failed caller COMMIT cannot publish a private receipt or bypass public read fences",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const receipt = yield* f.service.capture(f.input);
+        yield* f.sql`CREATE TABLE controlled_parent(id INTEGER PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE controlled_child(parent_id INTEGER REFERENCES controlled_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        let committedReceipts = 0;
+        const owning = yield* f.sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const value = yield* f.service.readForSessionInTransaction(sessionOwner(f));
+              yield* f.sql`INSERT INTO controlled_child(parent_id) VALUES(1)`;
+              return value;
+            }),
+          )
+          .pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                committedReceipts++;
+              }),
+            ),
+            Effect.exit,
+          );
+        expect(owning._tag).toBe("Failure");
+        if (owning._tag === "Failure")
+          expect(Cause.pretty(owning.cause)).toContain("FOREIGN KEY constraint failed");
+        expect(committedReceipts).toBe(0);
+        expect(yield* f.sql`SELECT parent_id FROM controlled_child`).toEqual([{ parent_id: 1 }]);
+        for (const read of [
+          f.service.readForSession(sessionOwner(f)),
+          f.service.readRetained(f.input.operationId),
+          f.service.readForSessionInTransaction(sessionOwner(f)),
+        ])
+          expect((yield* read.pipe(Effect.result))._tag).toBe("Failure");
+        // Cleanup only this disposable connection's failed physical transaction.
+        yield* f.sql`ROLLBACK`;
+        expect(yield* f.sql`SELECT parent_id FROM controlled_child`).toEqual([]);
+        expect(yield* f.service.readForSession(sessionOwner(f))).toEqual(receipt);
+        expect(
+          yield* f.sql.withTransaction(f.service.readForSessionInTransaction(sessionOwner(f))),
+        ).toEqual(receipt);
+      }),
+    ),
+);
 
 it.effect("retains the actual fresh initialized SDK journal and immutable ownership", () =>
   scoped(

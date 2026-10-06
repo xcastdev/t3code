@@ -21,6 +21,16 @@ const reject = (message: string): never => {
 const stable = (record: TeamRecord) => {
   const mutable = new Set(["status", "revision", "generation", "updatedAt"]);
   if (record.kind === "run-binding") mutable.add("sessionId");
+  if (record.kind === "review-finding") {
+    for (const field of [
+      "severity",
+      "criterionIds",
+      "detail",
+      "resolutionArtifactIds",
+      "reportedBy",
+    ])
+      mutable.add(field);
+  }
   if (record.kind === "gate") {
     mutable.add("attribution");
     mutable.add("consumedByRunId");
@@ -74,6 +84,30 @@ export const validateProjectTeamRecord = (
   const records = state.foundationRecords ?? [];
   if (r.projectId !== state.projectId) reject("Foundation record project does not match command");
   const old = records.find((entry) => entry.recordId === r.recordId);
+  if (r.kind === "review-finding") {
+    if (r.generation !== 0) reject("Review finding ledger generation cannot change");
+    if (r.status !== "open") reject("Finding resolution requires trusted repair evidence");
+    if (
+      r.criterionIds.some(
+        (id) => !state.criteria.some((c) => c.criterionId === id && c.taskId === r.taskId),
+      )
+    )
+      reject("Review finding requires criteria from its parent task");
+    if (
+      records.some(
+        (entry) =>
+          entry.kind === "review-finding" &&
+          entry.taskId === r.taskId &&
+          entry.findingId === r.findingId &&
+          entry.recordId !== r.recordId,
+      )
+    )
+      reject("Review finding identity already has a ledger");
+    if (old?.kind === "review-finding") {
+      if (stable(old) !== stable(r)) reject("Original review target and reviewer cannot change");
+      if (canonicalProjectWorkPayload(old) === canonicalProjectWorkPayload(r)) return old;
+    }
+  }
   // Only the dedicated private transition can reconcile an original memory effect.
   const reflectedMemory =
     memoryReflection !== undefined &&

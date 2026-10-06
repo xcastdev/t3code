@@ -103,6 +103,7 @@ import ForkMigration0032 from "./Migrations/fork/032_ProjectWorkArtifacts.ts";
 import ForkMigration0033 from "./Migrations/fork/033_ProjectWorkVerificationJobs.ts";
 import ForkMigration0034 from "./Migrations/fork/034_ProjectWorkVerificationExecution.ts";
 import ForkMigration0035 from "./Migrations/fork/035_ProjectTeamReviewTargets.ts";
+import ForkMigration0036 from "./Migrations/fork/036_ProjectTeamReviewFindings.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -206,6 +207,7 @@ export const forkMigrationEntries = [
   [33, "ProjectWorkVerificationJobs", ForkMigration0033],
   [34, "ProjectWorkVerificationExecution", ForkMigration0034],
   [35, "ProjectTeamReviewTargets", ForkMigration0035],
+  [36, "ProjectTeamReviewFindings", ForkMigration0036],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
