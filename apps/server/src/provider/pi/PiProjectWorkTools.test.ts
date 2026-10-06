@@ -614,7 +614,7 @@ it.effect("planner proposes the inherited parent plan without broad write author
       }).pipe(Effect.result);
       expect(denied).toMatchObject({
         _tag: "Failure",
-        failure: { _tag: "PersistenceSqlError", cause: { _tag: "ProjectTeamAuthorizationError" } },
+        failure: { _tag: "ProjectTeamAuthorizationError" },
       });
       expect((yield* f.state()).revision).toBe(before);
     }),
@@ -641,8 +641,7 @@ for (const kind of ["investigation", "planning"] as const)
         expect(denied).toMatchObject({
           _tag: "Failure",
           failure: {
-            _tag: "PersistenceSqlError",
-            cause: { _tag: "ProjectTeamAuthorizationError" },
+            _tag: "ProjectTeamAuthorizationError",
           },
         });
         expect(yield* f.state()).toEqual(before);
@@ -713,8 +712,7 @@ it.effect(
         expect(denied).toMatchObject({
           _tag: "Failure",
           failure: {
-            _tag: "PersistenceSqlError",
-            cause: { _tag: "ProjectTeamAuthorizationError" },
+            _tag: "ProjectTeamAuthorizationError",
           },
         });
         expect(yield* f.state()).toEqual(before);

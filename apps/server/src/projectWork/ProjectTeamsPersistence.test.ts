@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -18,9 +19,12 @@ import {
   ProjectWorkAttemptId,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamRecord,
+  canonicalProjectWorkPayload,
   type ProjectTeamRecord as TeamRecord,
   type ProjectTeamGuidedIntent,
   type ProjectWorkCommand,
+  type ProjectWorkPublicationRequest,
+  type ProjectWorkPublicationOutcome,
 } from "@t3tools/contracts";
 import { runMigrations, runForkMigrations } from "../persistence/Migrations.ts";
 import {
@@ -916,17 +920,56 @@ layer("teams foundation persistence", (it) => {
         const repo = yield* ProjectWorkRepository;
         const projection = yield* ProjectWorkProjection;
         const query = yield* ProjectWorkQuery;
+        const sql = yield* SqlClient.SqlClient;
         const project = "immutable-effects";
+        const taskId = ProjectWorkTaskId.make("immutable-effects-task");
+        yield* repo.execute({
+          type: "project-work.task.create",
+          projectId: ProjectId.make(project),
+          taskId,
+          commandId: CommandId.make("immutable-effects-create-task"),
+          title: "Publication target",
+          createdAt: at,
+        });
+        const request: ProjectWorkPublicationRequest = {
+          version: 1,
+          kind: "create-pr",
+          operationId: "immutable-effect",
+          marker: "immutable_effect_marker",
+          repository: { host: "github.com", nodeId: "repo-node", nameWithOwner: "owner/repo" },
+          target: {
+            projectId: ProjectId.make(project),
+            taskId,
+            specRevision: 0,
+            planRevision: 0,
+            scopeHash: "original-scope",
+            baseSha: "original-base",
+            headSha: "original-head",
+            baseRef: "main",
+            headRef: "task",
+            headRepositoryNodeId: "repo-node",
+            headSelector: "owner:task",
+          },
+          expectedTaskRevision: 0,
+          authorizationRecordIds: ["original-review"],
+          title: "Once",
+          body: "Original publication request",
+        };
         const effect = record(project, "effect", "immutable-effect", {
+          taskId,
           status: "pending",
-          effectId: "external-once",
+          effectId: request.operationId,
           effectKind: "publication",
-          targetId: "issue",
-          payload: { recordIds: [], expectedRevision: 0, summary: "Once" },
+          targetId: "github.com/owner/repo",
+          payload: {
+            recordIds: request.authorizationRecordIds,
+            expectedRevision: request.expectedTaskRevision,
+            summary: canonicalProjectWorkPayload(request),
+          },
           claimGeneration: 0,
           availableAt: at,
         });
-        yield* repo.execute(commit(project, "effect-create", 0, [effect]));
+        yield* repo.execute(commit(project, "effect-create", 1, [effect]));
         for (const [i, change] of [
           { effectId: "renamed" },
           { targetId: "other" },
@@ -936,22 +979,89 @@ layer("teams foundation persistence", (it) => {
           expect(
             (yield* repo
               .execute(
-                commit(project, "effect-mutate-" + i, 1, [
+                commit(project, "effect-mutate-" + i, 2, [
                   yield* decodeTeamRecordEffect({ ...effect, revision: 1, ...change }),
                 ]),
               )
               .pipe(Effect.result))._tag,
           ).toBe("Failure");
         }
-        const uncertain = { ...effect, revision: 1, status: "uncertain" as const };
-        yield* repo.execute(commit(project, "effect-uncertain", 1, [uncertain]));
+        const rawStatus = yield* repo
+          .execute(
+            commit(project, "effect-raw-uncertain", 2, [
+              { ...effect, revision: 1, status: "uncertain" },
+            ]),
+          )
+          .pipe(Effect.result);
+        expect(rawStatus).toMatchObject({
+          _tag: "Failure",
+          failure: { message: "Publication status requires a typed private transition" },
+        });
+        const publicationAttribution = {
+          actor: { kind: "system", id: "project-work-github-outbox" },
+          source: { kind: "system", id: "project-work-github-outbox" },
+          recordedAt: at,
+        } as const;
+        yield* repo.execute({
+          type: "project-work.foundation.commit",
+          projectId: ProjectId.make(project),
+          commandId: CommandId.make("effect-claim"),
+          expectedRevision: 2,
+          records: [],
+          committedAt: at,
+          attribution: publicationAttribution,
+          transition: {
+            kind: "publication.claim",
+            effectId: effect.effectId,
+            expectedEffectRevision: 0,
+            expectedClaimGeneration: 0,
+          },
+        });
+        const receipt: ProjectWorkPublicationOutcome = {
+          version: 1,
+          kind: "uncertain",
+          operationId: effect.effectId,
+          requestHash: NodeCrypto.createHash("sha256")
+            .update(effect.payload.summary!)
+            .digest("hex"),
+          claimGeneration: 1,
+          observedAt: at,
+          reason: "missing-match",
+        };
+        yield* repo.execute({
+          type: "project-work.foundation.commit",
+          projectId: ProjectId.make(project),
+          commandId: CommandId.make("effect-uncertain"),
+          expectedRevision: 3,
+          records: [],
+          committedAt: at,
+          attribution: publicationAttribution,
+          transition: {
+            kind: "publication.reflect",
+            effectId: effect.effectId,
+            expectedEffectRevision: 1,
+            claimGeneration: 1,
+            receipt,
+          },
+        });
+        const uncertain = {
+          ...effect,
+          revision: 2,
+          status: "uncertain" as const,
+          claimGeneration: 1,
+          outcome: canonicalProjectWorkPayload(receipt),
+        };
+        const historicalEvents = yield* repo.replay(project);
+        const retainedReceipts =
+          yield* sql`SELECT * FROM project_work_command_receipts WHERE project_id=${project}`;
         yield* projection.rebuild(project);
+        expect(yield* repo.replay(project)).toEqual(historicalEvents);
         for (const status of ["failed", "pending", "claimed", "succeeded"] as const) {
           expect(
             (yield* repo
               .execute(
-                commit(project, "escape-uncertain-" + status, 2, [
-                  { ...uncertain, revision: 2, status, outcome: "untyped claim of reconciliation" },
+                commit(project, "escape-uncertain-" + status, 4, [
+                  { ...uncertain, revision: 3, status, outcome: "untyped claim of reconciliation" },
                 ]),
               )
               .pipe(Effect.result))._tag,
@@ -960,7 +1070,7 @@ layer("teams foundation persistence", (it) => {
         expect(
           (yield* repo
             .execute(
-              commit(project, "duplicate-original-effect", 2, [
+              commit(project, "duplicate-original-effect", 4, [
                 { ...effect, recordId: "another-effect" },
               ]),
             )
@@ -969,6 +1079,10 @@ layer("teams foundation persistence", (it) => {
         expect((yield* query.listFoundationRecords({ projectId: project })).items).toEqual([
           uncertain,
         ]);
+        expect(yield* repo.replay(project)).toEqual(historicalEvents);
+        expect(
+          yield* sql`SELECT * FROM project_work_command_receipts WHERE project_id=${project}`,
+        ).toEqual(retainedReceipts);
       }).pipe(Effect.provide(services)),
   );
 
