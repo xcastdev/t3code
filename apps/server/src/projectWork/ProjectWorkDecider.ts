@@ -1,6 +1,7 @@
 import type { ProjectTeamRecord } from "@t3tools/contracts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
 import { decideProjectTeamGuidedLifecycle } from "./ProjectTeamGuidedLifecycle.ts";
+import { decideProjectTeamVerificationClaim } from "./ProjectTeamVerificationTransitions.ts";
 import { decideProjectTeamMemoryReflection } from "./ProjectTeamMemoryTransitions.ts";
 import { decideProjectTeamPublicationTransition } from "./ProjectTeamPublicationTransitions.ts";
 import { decideProjectTeamGuidedTransition } from "./ProjectTeamGuidedTransitions.ts";
@@ -757,6 +758,8 @@ export function decideProjectWorkCommand(
         command.transition?.kind === "publication.reflect"
       )
         return decideProjectTeamPublicationTransition(mutableState(state), command, event);
+      if (command.transition?.kind === "verification.claim")
+        return decideProjectTeamVerificationClaim(mutableState(state), command, event);
       if (command.transition?.kind === "memory.reflect")
         return decideProjectTeamMemoryReflection(
           mutableState(state),

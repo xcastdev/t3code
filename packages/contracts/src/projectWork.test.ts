@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 
 import {
   ClientOrchestrationCommand,
+  ProjectWorkTeamTransition,
   ProjectWorkExport,
   ProjectWorkMarkdownExport,
   ProjectWorkCriterionRead,
@@ -601,4 +602,32 @@ it("retains a bounded typed verification preview through the shared read record 
       },
     }),
   ).toThrow();
+});
+
+describe("private verification consumption contract", () => {
+  const decode = Schema.decodeUnknownSync(ProjectWorkTeamTransition, { onExcessProperty: "error" });
+  const transition = {
+    kind: "verification.claim",
+    taskId: "task",
+    expectedTaskRevision: 1,
+    gateId: "gate",
+    expectedGateRevision: 0,
+    jobId: "job",
+    manifestHash: "a".repeat(64),
+    attemptId: "attempt",
+  };
+  it("accepts an exact consumption target without executable or result authority", () => {
+    expect(decode(transition)).toEqual(transition);
+  });
+  it("rejects malformed digests, counters and extra authority", () => {
+    for (const input of [
+      { ...transition, manifestHash: "A".repeat(64) },
+      { ...transition, manifestHash: "a".repeat(63) },
+      { ...transition, expectedTaskRevision: -1 },
+      { ...transition, expectedGateRevision: Number.MAX_SAFE_INTEGER + 1 },
+      { ...transition, executable: "/bin/bash" },
+      { ...transition, success: true },
+    ])
+      expect(() => decode(input)).toThrow();
+  });
 });

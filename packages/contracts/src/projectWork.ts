@@ -1402,6 +1402,16 @@ export const ProjectWorkPublicationOutcome = Schema.Union([
 export type ProjectWorkPublicationOutcome = typeof ProjectWorkPublicationOutcome.Type;
 export const ProjectWorkTeamTransition = Schema.Union([
   Schema.Struct({
+    kind: Schema.Literal("verification.claim"),
+    taskId: ProjectWorkTaskId,
+    expectedTaskRevision: JoinedRunCounter,
+    gateId: GuidedId,
+    expectedGateRevision: JoinedRunCounter,
+    jobId: GuidedId,
+    manifestHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+    attemptId: GuidedId,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
     kind: Schema.Literal("publication.claim"),
     effectId: GuidedId,
     expectedEffectRevision: JoinedRunCounter,

@@ -1,3 +1,4 @@
+import { canReleasePiVerificationRuntime } from "./PiVerificationRuntimeRetention.ts";
 import { HostProcessUserId } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as Context from "effect/Context";
@@ -532,6 +533,8 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
             ino,
           });
         }
+        if (!(yield* canReleasePiVerificationRuntime({ directory: stage.directory, files })))
+          return false;
         return yield* setupAssets.canRelease({ directory: stage.directory, files });
       }).pipe(
         Effect.timeoutOption(options.cleanupDeadlineMs),

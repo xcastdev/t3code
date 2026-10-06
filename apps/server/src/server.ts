@@ -1,3 +1,7 @@
+import { makeProjectWorkVerificationExecutionHost } from "./projectWork/ProjectWorkVerificationExecutionHost.ts";
+import { makeProjectWorkVerificationExecution } from "./projectWork/ProjectWorkVerificationExecution.ts";
+import { makeProjectWorkVerificationExecutionWorker } from "./projectWork/ProjectWorkVerificationExecutionRuntime.ts";
+import { ProjectWorkVerificationExecutionError } from "./projectWork/ProjectWorkVerificationExecutionJournal.ts";
 import * as ProjectWorkVerification from "./projectWork/ProjectWorkVerification.ts";
 import * as AuthSessions from "./persistence/AuthSessions.ts";
 // @effect-diagnostics nodeBuiltinImport:off
@@ -880,7 +884,45 @@ const ProjectTeamExecutionLayerLive = Layer.effectDiscard(
   Layer.provide(ServerSettingsLayerLive),
 );
 
+const ProjectWorkVerificationExecutionLayerLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const environment = yield* ServerEnvironment.ServerEnvironment;
+    const environmentId = yield* environment.getEnvironmentId;
+    const start = makeProjectWorkVerificationExecutionHost({
+      environmentId,
+      maximumEnvironmentModelCalls: 2,
+      protectedRoots: [config.stateDir, config.secretsDir],
+      nativeAdmission: Effect.fail(
+        new ProjectWorkVerificationExecutionError({
+          reason: "Managed verification awaits the retained engineering verdicts",
+        }),
+      ),
+    }).pipe(
+      Effect.flatMap((host) => makeProjectWorkVerificationExecution({ environmentId, ...host })),
+      Effect.mapError(
+        () =>
+          new ProjectWorkVerificationExecutionError({
+            reason: "Managed verification service is unavailable",
+          }),
+      ),
+    );
+    yield* makeProjectWorkVerificationExecutionWorker(
+      start,
+      (yield* ServerActivation) ?? Effect.void,
+    );
+  }),
+).pipe(
+  Layer.provide(ProjectTeamPiRuntimeLayerLive),
+  Layer.provide(ProjectWorkCoreLive),
+  Layer.provide(GitWorkflowLayerLive),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(ServerSettingsLayerLive),
+  Layer.provide(PersistenceLayerLive),
+);
+
 const ProviderRuntimeLayerLive = Layer.mergeAll(
+  ProjectWorkVerificationExecutionLayerLive,
   ProviderSessionReaperLive,
   ProjectTeamExecutionLayerLive,
 ).pipe(
