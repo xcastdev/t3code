@@ -165,6 +165,33 @@ describe("WorkPage project-scoped sections", () => {
     expect(testState.environment.page).not.toHaveBeenCalled();
   });
 
+  it.each(["inbox", "overview"] as const)(
+    "mounts the Inbox when URL selection starts at %s",
+    async (initialTab) => {
+      const environmentId = EnvironmentId.make("environment-1");
+      const projectId = ProjectId.make("project-1");
+      const renderTab = async (tab: "inbox" | "overview") => {
+        await act(async () =>
+          root.render(
+            <StrictMode>
+              <WorkPage environmentId={environmentId} projectId={projectId} selection={{ tab }} />
+            </StrictMode>,
+          ),
+        );
+      };
+      await renderTab(initialTab);
+      await renderTab("inbox");
+      expect(host.textContent).toContain("does not support the question inbox");
+      await renderTab("overview");
+      const retainedInbox = [...host.querySelectorAll<HTMLDivElement>("div[hidden]")].find((node) =>
+        node.textContent?.includes("does not support the question inbox"),
+      );
+      expect(retainedInbox).toBeDefined();
+      await renderTab("inbox");
+      expect(host.textContent).toContain("does not support the question inbox");
+    },
+  );
+
   it("resets a loaded task page when switching projects", async () => {
     const environmentId = EnvironmentId.make("environment-1");
     const firstProjectId = ProjectId.make("project-1");

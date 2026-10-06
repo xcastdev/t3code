@@ -90,10 +90,11 @@ function ProjectWorkPage({
   const project = useProject(scopeProjectRef(environmentId, projectId));
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const [localTab, setTab] = useState<WorkTab>("overview");
-  const [inboxVisited, setInboxVisited] = useState(false);
+  const [inboxVisited, setInboxVisited] = useState(selection?.tab === "inbox");
   const [localTargetTask, setTargetTask] = useState<ProjectWorkTaskId | undefined>();
   const tab = selection?.tab ?? localTab;
   const targetTask = selection ? selection.taskId : localTargetTask;
+  if (tab === "inbox" && !inboxVisited) setInboxVisited(true);
   const selectTab = (nextTab: WorkTab) => {
     if (onSelectionChange) {
       onSelectionChange({
@@ -287,7 +288,7 @@ function ProjectWorkPage({
                 streamAvailable={!poll}
               />
             )}
-            {inboxVisited ? (
+            {tab === "inbox" || inboxVisited ? (
               <div hidden={tab !== "inbox"}>
                 <Inbox
                   environmentId={environmentId}
