@@ -283,6 +283,12 @@ const fixture = Effect.gen(function* () {
     },
   };
 });
+const reviewerFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const role = { ...f.role, revision: f.role.revision + 1, role: "reviewer" as const };
+  yield* restoreHistoricalBinding(role);
+  return { ...f, role };
+});
 const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -4367,9 +4373,9 @@ it.effect("joins a held durable preparation receipt before canceling its never-s
 
 // Durable metadata below is synthetic; these cases exercise real SQL and the real
 // nonmutating file reader without starting a Pi process or model transport.
-const stableReplayFixtureFor = (prompt = false) =>
+const stableReplayFixtureFor = (prompt = false, reviewer = false) =>
   Effect.gen(function* () {
-    const f = yield* fixture;
+    const f = yield* reviewer ? reviewerFixture : fixture;
     const request: PiManagedOperationRequest = prompt
       ? {
           threadId,
@@ -4977,6 +4983,233 @@ for (const api of ["requestStop", "stopAll"] as const) {
         expect(
           yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`,
         ).toEqual(original);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+}
+
+for (const prompt of [false, true]) {
+  it.effect(
+    `reviewer freshness refuses unqualified ${prompt ? "prompt" : "initialize"} replay`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* stableReplayFixtureFor(prompt, true);
+          const restarted = yield* makePiManagedRuntimeLive(f.options);
+          const instance = yield* restarted.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          const result = yield* instance
+            .prepareOperation(f.request, () => Effect.void)
+            .pipe(Effect.result);
+          expect(result).toMatchObject({ _tag: "Failure" });
+          expect(f.launches).toBe(0);
+          expect(f.transports).toBe(0);
+          expect(
+            yield* f.sql`SELECT operation_id FROM project_team_pi_operation ORDER BY operation_ordinal`,
+          ).toEqual(
+            prompt
+              ? [
+                  { operation_id: "root-stable-initialize" },
+                  { operation_id: "root-stable-assignment" },
+                ]
+              : [{ operation_id: "root-stable-initialize" }],
+          );
+        }),
+      ),
+  );
+}
+
+for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as const) {
+  it.effect(`reviewer freshness qualifies only the host briefing before publication: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* reviewerFixture;
+        const original = SessionRuntime.makePiSessionRuntime;
+        let nativeFile = "";
+        const capture = vi
+          .spyOn(SessionRuntime, "makePiSessionRuntime")
+          .mockImplementation((input) =>
+            original(input).pipe(
+              Effect.map((session) => ({
+                ...session,
+                run: () =>
+                  Effect.gen(function* () {
+                    // Synthetic child and kernel receipts exercise the real parent/SQL/file boundary.
+                    // This fixture never acquires a managed process or calls a model.
+                    const allocation = input.persistence.allocation;
+                    const owner = {
+                      type: "owner" as const,
+                      unit: allocation.unit,
+                      nonce: allocation.nonce,
+                      invocation: "a".repeat(32),
+                      cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+                      pid: 99999999,
+                      memoryBytes: allocation.policy.memoryBytes,
+                      swapBytes: 0,
+                      oomGroup: 1,
+                    };
+                    yield* input.persistence.claimActivation(allocation);
+                    yield* input.persistence.beforeStart(owner);
+                    const briefing = input.transferTexts.find(
+                      (entry) => entry.transferId === "context",
+                    )?.text;
+                    if (!briefing) return yield* Effect.die("No original host briefing");
+                    const native = {
+                      sessionId: "fresh-review-session",
+                      sessionReference: "sessions/fresh-review.jsonl",
+                      leafId: mode === "inherited" ? "inherited-leaf" : "briefing-leaf",
+                      persisted: true,
+                    };
+                    const entries = [
+                      {
+                        type: "session",
+                        version: 3,
+                        id: native.sessionId,
+                        timestamp: at,
+                        cwd: "/workspace",
+                      },
+                      {
+                        type: "message",
+                        id: "briefing-leaf",
+                        parentId: null,
+                        timestamp: at,
+                        message: {
+                          role: "user",
+                          content: [
+                            {
+                              type: "text",
+                              text: mode === "wrong-briefing" ? "Inherited instructions" : briefing,
+                            },
+                          ],
+                          timestamp: Date.parse(at),
+                        },
+                      },
+                      ...(mode === "inherited"
+                        ? [
+                            {
+                              type: "message",
+                              id: "inherited-leaf",
+                              parentId: "briefing-leaf",
+                              timestamp: at,
+                              message: {
+                                role: "assistant",
+                                content: [{ type: "text", text: "Prior implementer conversation" }],
+                                timestamp: Date.parse(at),
+                              },
+                            },
+                          ]
+                        : []),
+                    ];
+                    const state = allocation.launch.nativeStateRoot;
+                    yield* f.fs.makeDirectory(state + "/sessions", { recursive: true });
+                    nativeFile = state + "/sessions/fresh-review.jsonl";
+                    yield* f.fs.writeFileString(
+                      nativeFile,
+                      entries.map((entry) => json(entry)).join("\n") + "\n",
+                    );
+                    const signal = new AbortController().signal;
+                    yield* Effect.tryPromise(() =>
+                      input.persistNative(
+                        {
+                          version: 1,
+                          ...input.identity,
+                          ...input.operation,
+                          sequence: 0,
+                          message: { type: "initialized", native },
+                        },
+                        signal,
+                      ),
+                    );
+                    const terminal: SessionRuntime.PiSessionTerminal = {
+                      identity: input.identity,
+                      operation: input.operation,
+                      outcome: "success",
+                      ownerCaptured: true,
+                      native,
+                      accountingReceipts: [],
+                      drain: {
+                        unit: owner.unit,
+                        invocation: owner.invocation,
+                        cgroup: owner.cgroup,
+                        ownerPid: owner.pid,
+                        memoryBytes: owner.memoryBytes,
+                        swapBytes: 0,
+                        oomGroup: 1,
+                        launcherPid: 99999998,
+                        childPid: 99999997,
+                        childExitCode: 0,
+                        kernel: "removed",
+                      },
+                    };
+                    yield* Effect.tryPromise(() => input.persistTerminal(terminal, signal));
+                    return terminal;
+                  }).pipe(
+                    Effect.mapError(
+                      () =>
+                        new SessionRuntime.PiSessionRuntimeError({
+                          code: "SYNTHETIC_SESSION_FAILURE",
+                        }),
+                    ),
+                  ),
+              })),
+            ),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => capture.mockRestore()));
+        const prepared = yield* f.instance.prepareOperation(
+          { threadId, kind: "initialize", operationId: "fresh-review-initialize" },
+          () => Effect.void,
+        );
+        const result = yield* prepared.run.pipe(Effect.result);
+        const rows = yield* f.sql<{
+          native_jsonl: string;
+        }>`SELECT native_jsonl FROM project_team_review_freshness`;
+        if (mode === "fresh" || mode === "fresh-prompt") {
+          expect(result._tag).toBe("Success");
+          expect(rows).toEqual([{ native_jsonl: yield* f.fs.readFileString(nativeFile) }]);
+          const restart = yield* makePiManagedRuntimeLive(f.options);
+          const instance = yield* restart.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          const replay = yield* instance.prepareOperation(
+            { threadId, kind: "initialize", operationId: "fresh-review-initialize" },
+            () => Effect.void,
+          );
+          expect((yield* replay.run).terminal.outcome).toBe("success");
+          if (mode === "fresh-prompt") {
+            const assignment = yield* instance.prepareOperation(
+              {
+                threadId,
+                kind: "prompt",
+                operationId: "fresh-review-assignment",
+                prompt: "Review the assigned revision",
+              },
+              () => Effect.void,
+            );
+            expect(assignment.kind).toBe("prompt");
+            expect(
+              yield* f.sql`SELECT operation_kind FROM project_team_pi_operation ORDER BY operation_ordinal`,
+            ).toEqual([{ operation_kind: "initialize" }, { operation_kind: "prompt" }]);
+            return;
+          }
+          yield* f.sql`DELETE FROM project_team_review_freshness`;
+          expect(
+            (yield* instance
+              .prepareOperation(
+                { threadId, kind: "initialize", operationId: "fresh-review-initialize" },
+                () => Effect.void,
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        } else {
+          expect(result._tag).toBe("Failure");
+          expect(rows).toEqual([]);
+        }
         expect(f.transports).toBe(0);
       }),
     ),
