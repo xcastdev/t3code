@@ -118,6 +118,7 @@ import {
   useThreadSelectionStore,
 } from "../threadSelectionStore";
 import { useThreadActions } from "../hooks/useThreadActions";
+import { useProjectWorkTarget } from "../hooks/useProjectWorkTarget";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { isCommandPaletteOpen, openCommandPalette } from "../commandPaletteBus";
 import { startNewThreadFromContext } from "../lib/chatThreadActions";
@@ -130,7 +131,6 @@ import {
   readThreadShell,
   useAllEnvironmentProjectSnapshotsReady,
   useProjects,
-  useThreadShell,
   useThreadShells,
 } from "../state/entities";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
@@ -2242,7 +2242,6 @@ export default function Sidebar() {
     () => resolveActiveThreadRouteRef(routeTarget, routeDraftThread),
     [routeDraftThread, routeTarget],
   );
-  const routeThread = useThreadShell(routeThreadRef);
   const routeThreadKey = routeThreadRef ? scopedThreadKey(routeThreadRef) : null;
   const routeTargetRef = useRef(routeTarget);
   routeTargetRef.current = routeTarget;
@@ -2344,18 +2343,7 @@ export default function Sidebar() {
       ),
     [projectGroups],
   );
-  const workTarget = useMemo(() => {
-    if (routeDraftThread) {
-      return {
-        environmentId: routeDraftThread.environmentId,
-        projectId: routeDraftThread.projectId,
-      };
-    }
-    if (!routeThreadRef) return null;
-    return routeThread
-      ? { environmentId: routeThread.environmentId, projectId: routeThread.projectId }
-      : null;
-  }, [routeDraftThread, routeThread, routeThreadRef]);
+  const workTarget = useProjectWorkTarget();
 
   const nowMinute = useNowMinute();
   // Snooze wake times are second-precise, so classifying with the quantized
