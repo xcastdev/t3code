@@ -4,6 +4,7 @@ import {
   ProjectTeamReviewCompletionProof,
   ProjectTeamReviewCompletionDenialReason,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -20,7 +21,10 @@ import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts"
 import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
 import { makeProjectWorkVerificationResultReader } from "./ProjectWorkVerificationExecutionJournal.ts";
 import { snapshotReviewCriterionAssessments } from "./ProjectTeamReviewCriterionAssessments.ts";
-import { ProjectTeamReviewCurrentTarget } from "./ProjectTeamReviewCurrentTarget.ts";
+import {
+  ProjectTeamReviewCurrentTarget,
+  ProjectTeamReviewCurrentTargetError,
+} from "./ProjectTeamReviewCurrentTarget.ts";
 import {
   evaluateProjectTeamDependency,
   projectTeamDerivedRecordId,
@@ -32,6 +36,7 @@ const canonical = canonicalProjectWorkPayload;
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 const hash = (value: unknown) => digest(canonical(value));
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
+const isCurrentTargetError = Schema.is(ProjectTeamReviewCurrentTargetError);
 const Id = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256), Schema.isTrimmed());
 const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
 const Digest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u));
@@ -486,12 +491,17 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
           })
           .pipe(
             Effect.as(true),
-            Effect.catchTag("ProjectTeamReviewCurrentTargetError", (error) =>
-              error.reason === "changed" &&
-              error.detail === "Current committed review target changed"
+            Effect.catchCause((cause) => {
+              const reason = cause.reasons[0];
+              return cause.reasons.length === 1 &&
+                reason !== undefined &&
+                Cause.isFailReason(reason) &&
+                isCurrentTargetError(reason.error) &&
+                reason.error.reason === "changed" &&
+                reason.error.detail === "Current committed review target changed"
                 ? Effect.succeed(false)
-                : Effect.fail(error),
-            ),
+                : Effect.failCause(cause);
+            }),
           );
         if (!targetCurrent) return yield* deny("stale-proof");
       }

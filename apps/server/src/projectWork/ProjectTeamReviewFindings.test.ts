@@ -4,6 +4,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
@@ -2184,19 +2185,24 @@ const makeConsumedReviewFixture = (
               expect(targetControl.insidePermit).toBe(true);
               expect((yield* Effect.serviceOption(f.sql.transactionService))._tag).toBe("Some");
               const call = ++targetControl.calls;
-              const result = yield* use(
+              return yield* use(
                 call === targetControl.driftAt
                   ? { ...targetObservation, headSha: "f".repeat(40) }
                   : targetObservation,
+              ).pipe(
+                Effect.onExit(() =>
+                  call === targetControl.postFailureAt
+                    ? Effect.fail(
+                        new GitCommandError({
+                          operation: "ControlledReviewTarget",
+                          command: "/usr/bin/git",
+                          cwd: job.target.worktree,
+                          detail: "Controlled post-callback target drift",
+                        }),
+                      )
+                    : Effect.void,
+                ),
               );
-              if (call === targetControl.postFailureAt)
-                return yield* new GitCommandError({
-                  operation: "ControlledReviewTarget",
-                  command: "/usr/bin/git",
-                  cwd: job.target.worktree,
-                  detail: "Controlled post-callback target drift",
-                });
-              return result;
             });
           const read = vi
             .spyOn(ManagedGit, "withManagedVerificationTarget")
@@ -2392,6 +2398,92 @@ it.effect(
         expect(
           (yield* f.state()).tasks.find((task) => task.taskId === f.running.taskId)?.state,
         ).toBe("completed");
+      }),
+    ),
+);
+it.effect(
+  "current review target preserves combined callback and native postcheck failures before settlement",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const before = yield* f.state();
+        const history = yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId);
+        const receipts =
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} ORDER BY command_id`;
+        const events =
+          yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`;
+        let completionFailures: ReadonlyArray<unknown> = [];
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: (snapshot, receipt) =>
+            f.consumer.prepare(snapshot, receipt).pipe(
+              Effect.tapCause((cause) =>
+                Effect.sync(() => {
+                  completionFailures = cause.reasons
+                    .filter(Cause.isFailReason)
+                    .map((reason) => reason.error);
+                }),
+              ),
+            ),
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        f.targetControl.driftAt = 1;
+        f.targetControl.postFailureAt = 1;
+        let escaped = false;
+        const exit = yield* f
+          .withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined))
+          .pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                escaped = true;
+              }),
+            ),
+            Effect.exit,
+          );
+        expect(exit._tag).toBe("Failure");
+        // Observe both errors before the repository's existing outer error normalization.
+        expect(completionFailures).toMatchObject([
+          {
+            _tag: "ProjectTeamReviewCurrentTargetError",
+            reason: "changed",
+            detail: "Current committed review target changed",
+          },
+          { _tag: "GitCommandError", detail: "Controlled post-callback target drift" },
+        ]);
+        expect(escaped).toBe(false);
+        expect(yield* f.state()).toEqual(before);
+        expect(yield* f.journal.readRetained(f.proposalSnapshot.fence.dispatchId)).toEqual(
+          f.proposalSnapshot,
+        );
+        expect(yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId)).toEqual(
+          history,
+        );
+        expect(
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} ORDER BY command_id`,
+        ).toEqual(receipts);
+        expect(
+          yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`,
+        ).toEqual(events);
+        f.targetControl.driftAt = 0;
+        f.targetControl.postFailureAt = 0;
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        const after = yield* f.state();
+        expect(after.tasks.find((task) => task.taskId === f.running.taskId)?.state).toBe(
+          "completed",
+        );
+        expect(after.tasks.find((task) => task.taskId === f.selection.taskId)).toEqual(
+          before.tasks.find((task) => task.taskId === f.selection.taskId),
+        );
+        expect(
+          after.criteria.filter((criterion) => criterion.taskId === f.selection.taskId),
+        ).toEqual(before.criteria.filter((criterion) => criterion.taskId === f.selection.taskId));
       }),
     ),
 );
