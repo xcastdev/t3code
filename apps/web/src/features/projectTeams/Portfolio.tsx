@@ -154,15 +154,16 @@ function usableQuestion(question: Summary["questions"]["items"][number]) {
 /** Render bounded recorded metadata supplied by the owning environment; this view performs no reads. */
 export function Portfolio(props: PortfolioProps) {
   const entries = props.entries.slice(0, PAGE_SIZE);
+  const canPage = !props.loading;
   const canRead =
-    !props.loading &&
+    canPage &&
     (entries.length === 0 ||
       entries.some((entry) => entry.connected && entry.enabled && entry.supported));
   const previous = useEffectEvent(() => {
-    if (canRead && props.hasPrevious) props.onPrevious();
+    if (canPage && props.hasPrevious) props.onPrevious();
   });
   const next = useEffectEvent(() => {
-    if (canRead && props.hasNext) props.onNext();
+    if (canPage && props.hasNext) props.onNext();
   });
   const refresh = useEffectEvent(() => {
     if (canRead) props.onRefresh();
@@ -203,7 +204,7 @@ export function Portfolio(props: PortfolioProps) {
         <Button
           size="sm"
           variant="outline"
-          disabled={!canRead || !props.hasPrevious}
+          disabled={!canPage || !props.hasPrevious}
           onClick={() => previous()}
         >
           Previous portfolio page
@@ -211,7 +212,7 @@ export function Portfolio(props: PortfolioProps) {
         <Button
           size="sm"
           variant="outline"
-          disabled={!canRead || !props.hasNext}
+          disabled={!canPage || !props.hasNext}
           onClick={() => next()}
         >
           Next portfolio page

@@ -13,6 +13,7 @@ type Project = Pick<
 >;
 export type PortfolioSourceProps = Omit<PortfolioProps, "entries" | "now" | "loading"> & {
   readonly projects: ReadonlyArray<Project>;
+  readonly canRefreshProject?: (target: Pick<Project, "environmentId" | "projectId">) => boolean;
 };
 type Saved = {
   readonly token: string;
@@ -152,26 +153,28 @@ function PortfolioRead(props: PortfolioSourceProps) {
       registry.get(query) === results[index]
     );
   };
-  const canRead = () =>
+  const canPage = () =>
     !loading &&
-    (props.projects.length === 0 || props.projects.some(eligible)) &&
     props.projects.every((project, index) => {
       const query = queries[index];
       return !eligible(project) || (query !== undefined && registry.get(query) === results[index]);
     });
+  const canRead = () => canPage() && (props.projects.length === 0 || props.projects.some(eligible));
   const refresh = useEffectEvent(() => {
     if (!mounted.current || !canRead()) return;
     for (const [index, project] of props.projects.entries()) {
       const query = queries[index];
-      if (eligible(project) && query) registry.refresh(query);
+      if (eligible(project) && query && (props.canRefreshProject?.(project) ?? true)) {
+        registry.refresh(query);
+      }
     }
     props.onRefresh();
   });
   const previous = useEffectEvent(() => {
-    if (mounted.current && canRead() && props.hasPrevious) props.onPrevious();
+    if (mounted.current && canPage() && props.hasPrevious) props.onPrevious();
   });
   const next = useEffectEvent(() => {
-    if (mounted.current && canRead() && props.hasNext) props.onNext();
+    if (mounted.current && canPage() && props.hasNext) props.onNext();
   });
   // Changed public records retire held entry controls. Receive-time updates keep the widget mounted.
   const metadataKey = JSON.stringify(retained.map((entry) => entry?.token ?? null));

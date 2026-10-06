@@ -531,7 +531,7 @@ describe("Portfolio mounted read-only presentation", () => {
     });
   });
 
-  it("supports previous/next/refresh and revokes held paging controls while unavailable", async () => {
+  it("supports previous/next/refresh and revokes held paging controls while loading", async () => {
     await render({ hasPrevious: true, hasNext: true });
     await click("Previous portfolio page");
     await click("Next portfolio page");
@@ -540,11 +540,11 @@ describe("Portfolio mounted read-only presentation", () => {
     expect(props.onNext).toHaveBeenCalledOnce();
     expect(props.onRefresh).toHaveBeenCalledOnce();
     const held = button("Next portfolio page");
-    await render({ entries: changeEntry({ supported: false }), hasPrevious: false });
+    await render({ loading: true, hasPrevious: false });
     await act(async () => held.click());
     expect(props.onNext).toHaveBeenCalledOnce();
     expect(button("Refresh portfolio").disabled).toBe(true);
-    await render({ entries: [entry], hasPrevious: true });
+    await render({ entries: [entry], hasPrevious: true, loading: false });
     await click("Previous portfolio page");
     expect(props.onPrevious).toHaveBeenCalledTimes(2);
     await render({ hasNext: false });
