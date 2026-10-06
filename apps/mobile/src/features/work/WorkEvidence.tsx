@@ -4,6 +4,7 @@ import type { ProjectWorkFoundationSnapshot } from "@t3tools/client-runtime/proj
 import {
   ProjectTeamRecord,
   type ProjectTeamEffect,
+  type ProjectTeamReviewFindingProvenance,
   type EnvironmentId,
   type ProjectId,
   type ProjectWorkTaskId,
@@ -83,6 +84,7 @@ function EvidenceSession(props: WorkEvidenceProps) {
       if (taskId !== undefined && (!("taskId" in record) || record.taskId !== taskId)) return false;
       return (
         !knownRecord(record) ||
+        record.kind === "review-finding" ||
         record.kind === "evidence-applicability" ||
         (record.kind === "effect" && record.effectKind === "publication")
       );
@@ -175,7 +177,7 @@ function EvidenceSession(props: WorkEvidenceProps) {
           </>
         ) : null}
         {view.items.length === 0 ? (
-          <Notice>No evidence or publication records in this snapshot.</Notice>
+          <Notice>No evidence, findings or publication records in this snapshot.</Notice>
         ) : null}
       </WorkCard>
       {view.items.slice(visible * PAGE_SIZE, (visible + 1) * PAGE_SIZE).map((item) => {
@@ -186,6 +188,53 @@ function EvidenceSession(props: WorkEvidenceProps) {
                 {item.kind} · {item.status} · {item.recordId}
               </Notice>
               <Notice>Applicability is unknown. Update this client to inspect this record.</Notice>
+            </WorkCard>
+          );
+        if (item.kind === "review-finding")
+          return (
+            <WorkCard key={item.recordId} title={`Review finding ${item.findingId}`}>
+              <Notice>
+                Severity: {item.severity} · Recorded finding status: {item.status}
+              </Notice>
+              <Text selectable className="text-sm text-foreground">
+                {item.detail}
+              </Text>
+              <Metadata label="Parent task" value={item.taskId} />
+              <Metadata label="Parent criteria" value={item.criterionIds.join(" · ")} />
+              <Metadata
+                label="Resolution artifact references"
+                value={item.resolutionArtifactIds.join(" · ") || "No resolution artifacts recorded"}
+              />
+              <Notice>
+                Recorded resolution does not establish current approval or verify the referenced
+                artifacts.
+              </Notice>
+              <View className="gap-2 border-t border-border pt-2">
+                <Notice>
+                  Record {item.recordId} · Revision {item.revision}
+                </Notice>
+                <Notice>
+                  Frozen target: Spec revision {item.target.specRevision} · Plan revision{" "}
+                  {item.target.planRevision}
+                </Notice>
+                <Metadata label="Frozen base" value={item.target.baseSha} />
+                <Metadata label="Frozen head" value={item.target.headSha} />
+                <FindingReviewer label="Original reviewer" reviewer={item.originReviewer} />
+                <FindingReviewer label="Latest reporter" reviewer={item.reportedBy} />
+                <Notice>Last recorded update {item.updatedAt}</Notice>
+              </View>
+              <WorkButton
+                onPress={() =>
+                  navigation.navigate("WorkTask", { ...props.target, taskId: item.taskId })
+                }
+              >
+                Open task {item.taskId}
+              </WorkButton>
+              {taskId === undefined ? (
+                <WorkButton onPress={() => changeTask(item.taskId)}>
+                  Inspect evidence for task {item.taskId}
+                </WorkButton>
+              ) : null}
             </WorkCard>
           );
         if (
@@ -371,6 +420,23 @@ function EvidenceSession(props: WorkEvidenceProps) {
         ) : null}
       </View>
     </>
+  );
+}
+
+function FindingReviewer({
+  label,
+  reviewer,
+}: {
+  readonly label: string;
+  readonly reviewer: ProjectTeamReviewFindingProvenance;
+}) {
+  return (
+    <View className="gap-1">
+      <Notice>{label}</Notice>
+      <Text selectable className="text-xs text-muted-foreground">
+        {`${reviewer.memberId} · Review task ${reviewer.reviewTaskId}\nBinding ${reviewer.bindingId} · Generation ${reviewer.generation}\n${reviewer.providerInstanceId} · Thread ${reviewer.threadId} · Session ${reviewer.sessionId}\nInitialization ${reviewer.initializeOperationId} · Dispatch ${reviewer.dispatchId}\nReview target hash ${reviewer.targetSha256}`}
+      </Text>
+    </View>
   );
 }
 

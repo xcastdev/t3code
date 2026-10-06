@@ -2,6 +2,7 @@ import { readProjectWorkPublicationHistory } from "@t3tools/shared/projectWorkPu
 import {
   ProjectTeamRecord,
   type ProjectTeamEffect,
+  type ProjectTeamReviewFindingProvenance,
   type EnvironmentId,
   type ProjectId,
   type ProjectWorkTaskId,
@@ -65,7 +66,8 @@ function EvidenceSession(props: EvidenceViewProps) {
           .filter((effect) => effect.effectKind === "publication");
         const gates = records.filter((record) => record.kind === "gate");
         const plans = records.filter((record) => record.kind === "plan-revision");
-        const items = [...evidence, ...publications];
+        const findings = selected.filter((record) => record.kind === "review-finding");
+        const items = [...evidence, ...publications, ...findings];
         const start = offset < items.length ? offset : 0;
         const complete = props.connected && props.enabled && current;
         const updatedAt = selected.reduce(
@@ -120,6 +122,59 @@ function EvidenceSession(props: EvidenceViewProps) {
               </p>
             ) : null}
             {items.slice(start, start + PAGE_SIZE).map((item) => {
+              if (item.kind === "review-finding")
+                return (
+                  <WorkCard key={item.recordId}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h3 className="break-all font-medium">Review finding {item.findingId}</h3>
+                      <Badge variant="outline">Severity: {item.severity}</Badge>
+                      <Badge variant="outline">Recorded finding status: {item.status}</Badge>
+                    </div>
+                    <p className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-all text-sm">
+                      {item.detail}
+                    </p>
+                    <dl className="mt-3 grid gap-2 text-sm">
+                      <Metadata label="Parent task" value={item.taskId} />
+                      <Metadata label="Parent criteria" value={item.criterionIds.join(" · ")} />
+                      <Metadata
+                        label="Resolution artifact references"
+                        value={
+                          item.resolutionArtifactIds.join(" · ") ||
+                          "No resolution artifacts recorded"
+                        }
+                      />
+                    </dl>
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      Recorded resolution does not establish current approval or verify the
+                      referenced artifacts.
+                    </p>
+                    <dl className="mt-3 grid gap-2 text-xs text-muted-foreground">
+                      <Metadata
+                        label="Finding record"
+                        value={`${item.recordId} · Revision ${item.revision}`}
+                      />
+                      <Metadata
+                        label="Frozen target revisions"
+                        value={`Spec revision ${item.target.specRevision} · Plan revision ${item.target.planRevision}`}
+                      />
+                      <Metadata label="Frozen base" value={item.target.baseSha} />
+                      <Metadata label="Frozen head" value={item.target.headSha} />
+                    </dl>
+                    <FindingReviewer label="Original reviewer" reviewer={item.originReviewer} />
+                    <FindingReviewer label="Latest reporter" reviewer={item.reportedBy} />
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Last recorded update {item.updatedAt}
+                    </p>
+                    <Button
+                      className="mt-3"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => props.onOpenTask(item.taskId)}
+                    >
+                      Open task {item.taskId}
+                    </Button>
+                  </WorkCard>
+                );
               const itemTaskId = item.taskId;
               const linkedGates = gates.filter(
                 (gate) =>
@@ -266,6 +321,39 @@ function EvidenceSession(props: EvidenceViewProps) {
         );
       }}
     </WorkTeamFoundation>
+  );
+}
+
+function FindingReviewer({
+  label,
+  reviewer,
+}: {
+  readonly label: string;
+  readonly reviewer: ProjectTeamReviewFindingProvenance;
+}) {
+  return (
+    <div className="mt-3 text-xs text-muted-foreground">
+      <p className="font-medium">{label}</p>
+      <dl className="mt-1 grid gap-1">
+        <Metadata
+          label="Member and review task"
+          value={`${reviewer.memberId} · Review task ${reviewer.reviewTaskId}`}
+        />
+        <Metadata
+          label="Binding"
+          value={`${reviewer.bindingId} · Generation ${reviewer.generation}`}
+        />
+        <Metadata
+          label="Provider and session"
+          value={`${reviewer.providerInstanceId} · Thread ${reviewer.threadId} · Session ${reviewer.sessionId}`}
+        />
+        <Metadata
+          label="Initialization and dispatch"
+          value={`${reviewer.initializeOperationId} · Dispatch ${reviewer.dispatchId}`}
+        />
+        <Metadata label="Review target hash" value={reviewer.targetSha256} />
+      </dl>
+    </div>
   );
 }
 

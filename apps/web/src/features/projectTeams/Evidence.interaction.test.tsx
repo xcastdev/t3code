@@ -20,6 +20,7 @@ import {
   EnvironmentId,
   ProjectId,
   ProjectTeamEvidenceApplicability,
+  ProjectTeamReviewFinding,
   ProjectTeamGate,
   ProjectTeamPlanRevision,
   ProjectTeamEffect,
@@ -133,6 +134,63 @@ const historyEffect: typeof ProjectTeamEffect.Type = {
 };
 
 const base = { projectId, revision: 2, generation: 0, updatedAt: at };
+const finding = Schema.decodeSync(ProjectTeamReviewFinding)({
+  ...base,
+  kind: "review-finding",
+  recordId: "finding-record",
+  findingId: "missing-reconnect-check",
+  taskId,
+  severity: "high",
+  status: "open",
+  criterionIds: ["parent-criterion-1", "parent-criterion-2"],
+  detail: "Reconnect loses the selected task.\nPreserve the parent task selection.",
+  resolutionArtifactIds: [],
+  target: {
+    projectId,
+    taskId,
+    specRevision: 3,
+    planRevision: 4,
+    baseSha: "review-base",
+    headSha: "review-head",
+  },
+  originReviewer: {
+    reviewTaskId: "review-child",
+    bindingId: "review-binding",
+    generation: 7,
+    memberId: "original-reviewer",
+    providerInstanceId: "pi-reviewer",
+    threadId: "review-thread",
+    sessionId: "review-session",
+    initializeOperationId: "review-initialize",
+    dispatchId: "review-dispatch",
+    targetSha256: "a".repeat(64),
+  },
+  reportedBy: {
+    reviewTaskId: "review-child",
+    bindingId: "review-binding",
+    generation: 7,
+    memberId: "original-reviewer",
+    providerInstanceId: "pi-reviewer",
+    threadId: "review-thread",
+    sessionId: "review-session",
+    initializeOperationId: "review-initialize",
+    dispatchId: "review-dispatch",
+    targetSha256: "a".repeat(64),
+  },
+});
+// This is a retained read fixture; the current producer does not authorize resolution.
+const resolvedFinding = Schema.decodeSync(ProjectTeamReviewFinding)({
+  ...finding,
+  status: "resolved",
+  revision: 5,
+  resolutionArtifactIds: ["resolution-artifact-1", "resolution-artifact-2"],
+  reportedBy: {
+    ...finding.reportedBy,
+    memberId: "later-reporter",
+    sessionId: "later-session",
+    targetSha256: "b".repeat(64),
+  },
+});
 const evidence = Schema.decodeSync(ProjectTeamEvidenceApplicability)({
   ...base,
   kind: "evidence-applicability",
@@ -404,6 +462,168 @@ describe("Evidence through mounted environment foundation atoms", () => {
   async function click(label: string) {
     await act(async () => button(label)!.click());
   }
+
+  interaction(
+    "inspects an open review finding and opens its exact parent task without writing",
+    async () => {
+      records = [finding];
+      const openTask = vi.fn();
+      await render({ onOpenTask: openTask });
+      for (const value of [
+        "Review finding missing-reconnect-check",
+        "Severity: high",
+        "Recorded finding status: open",
+        "Reconnect loses the selected task.",
+        "Preserve the parent task selection.",
+        "parent-criterion-1",
+        "parent-criterion-2",
+        "Spec revision 3",
+        "Plan revision 4",
+        "review-base",
+        "review-head",
+        "Original reviewer",
+        "original-reviewer",
+        "review-child",
+        "review-binding",
+        "review-session",
+        "review-initialize",
+        "review-dispatch",
+        "a".repeat(64),
+        "No resolution artifacts recorded",
+        "Complete recorded snapshot",
+      ])
+        expect(host.textContent).toContain(value);
+      await click("Open task task-1");
+      expect(openTask).toHaveBeenCalledExactlyOnceWith(taskId);
+      expect(otherRequests).toEqual([]);
+      expect(
+        reads.every(({ input }) => input.operation === "foundation-records" && input.limit === 128),
+      ).toBe(true);
+    },
+  );
+
+  interaction(
+    "keeps recorded review resolution distinct from approval and the original reviewer",
+    async () => {
+      records = [resolvedFinding];
+      await render();
+      for (const text of [
+        "Recorded finding status: resolved",
+        "resolution-artifact-1",
+        "resolution-artifact-2",
+        "Revision 5",
+        "Recorded resolution does not establish current approval or verify the referenced artifacts.",
+      ])
+        expect(host.textContent).toContain(text);
+      const original = [...host.querySelectorAll("p")].find(
+        (node) => node.textContent === "Original reviewer",
+      )?.parentElement;
+      const latest = [...host.querySelectorAll("p")].find(
+        (node) => node.textContent === "Latest reporter",
+      )?.parentElement;
+      expect(original?.textContent).toContain("original-reviewer");
+      expect(original?.textContent).toContain("a".repeat(64));
+      expect(original?.textContent).not.toContain("later-reporter");
+      expect(latest?.textContent).toContain("later-reporter");
+      expect(latest?.textContent).toContain("later-session");
+      expect(latest?.textContent).toContain("b".repeat(64));
+      expect(
+        [...host.querySelectorAll("button")].some((node) =>
+          /resolve|approve|merge|publish/i.test(node.textContent ?? ""),
+        ),
+      ).toBe(false);
+      expect(otherRequests).toEqual([]);
+    },
+  );
+  for (const invalid of [
+    { ...finding, status: "future-finding-state" },
+    { ...finding, severity: "future-severity" },
+    { ...finding, resolutionArtifactIds: ["unverified-artifact"] },
+    { ...resolvedFinding, resolutionArtifactIds: [] },
+    { ...finding, target: { ...finding.target, projectId: otherProjectId } },
+    { ...finding, target: { ...finding.target, taskId: otherTaskId } },
+  ])
+    interaction(
+      "withholds invalid review finding interpretation " +
+        JSON.stringify([
+          invalid.status,
+          invalid.severity,
+          invalid.target,
+          invalid.resolutionArtifactIds,
+        ]),
+      async () => {
+        records = [invalid];
+        await render();
+        expect(host.textContent).toContain("Unsupported or malformed records");
+        expect(host.textContent).toContain("Cached or incomplete evidence");
+        expect(host.textContent).not.toContain("Reconnect loses the selected task.");
+        expect(button("Open task task-1")).toBeUndefined();
+        expect(otherRequests).toEqual([]);
+      },
+    );
+  interaction("preserves cached review findings offline without offering resolution", async () => {
+    records = [resolvedFinding];
+    await render();
+    await render({ connected: false, enabled: false });
+    expect(host.textContent).toContain("Cached or incomplete evidence");
+    expect(host.textContent).toContain("Recorded finding status: resolved");
+    expect(host.textContent).toContain("resolution-artifact-1");
+    expect(host.textContent).toContain("Last recorded update " + at);
+    expect(button("Refresh evidence")?.disabled).toBe(true);
+    expect(otherRequests).toEqual([]);
+  });
+  interaction(
+    "pages review findings and resets parent selection when ownership changes",
+    async () => {
+      const all = Array.from({ length: 129 }, (_, index) => ({
+        ...finding,
+        recordId: "finding-record-" + index,
+        findingId: "finding-" + index,
+        detail: "finding detail[" + index + "]",
+        taskId: index === 128 ? otherTaskId : taskId,
+        target: { ...finding.target, taskId: index === 128 ? otherTaskId : taskId },
+      }));
+      pages.set("", { projectId, revision: 10, items: all.slice(0, 128), nextCursor: "next" });
+      pages.set("next", { projectId, revision: 10, items: all.slice(128) });
+      await render();
+      await act(async () =>
+        settle(atoms.foundationPage({ environmentId, projectId, cursor: "next" })),
+      );
+      expect(host.querySelectorAll("section")).toHaveLength(128);
+      expect(host.textContent).not.toContain("finding detail[128]");
+      await click("Next evidence page");
+      expect(host.textContent).toContain("finding detail[128]");
+      expect(host.textContent).not.toContain("finding detail[0]");
+      await render({ taskId: otherTaskId });
+      expect(host.textContent).toContain("finding detail[128]");
+      expect(button("Next evidence page")).toBeUndefined();
+      expect(button("Open task task-2")).toBeDefined();
+      pages = new Map();
+      records = [];
+      await render({
+        environmentId: otherEnvironmentId,
+        projectId: otherProjectId,
+      });
+      expect(host.textContent).not.toContain("finding detail[128]");
+      expect(button("Open task task-2")).toBeUndefined();
+      expect(reads.at(-1)?.environmentId).toBe(otherEnvironmentId);
+      expect(otherRequests).toEqual([]);
+    },
+  );
+  interaction("excludes a foreign project's finding before displaying parent links", async () => {
+    records = [
+      {
+        ...finding,
+        projectId: otherProjectId,
+        target: { ...finding.target, projectId: otherProjectId },
+      },
+    ];
+    await render();
+    expect(host.textContent).toContain("Project work changed while loading");
+    expect(host.textContent).not.toContain("Reconnect loses the selected task.");
+    expect(button("Open task task-1")).toBeUndefined();
+    expect(otherRequests).toEqual([]);
+  });
 
   interaction(
     "withholds a PR link when its receipt no longer matches the recorded head",
