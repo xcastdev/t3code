@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1157,5 +1158,110 @@ it("accepts an existing finish followed by the route's zero-usage marker and act
     outcome: "reported",
     chargedInputTokens: 50,
     chargedOutputTokens: 10,
+  });
+});
+
+describe("sealed assignment input", () => {
+  it("binds the exact encoded outbound body after reservation and before transport", async () => {
+    let binding: { reservationId: string; encodedRequestSha256: string } | undefined;
+    const f = fixture({
+      requiredSystemText: "Trusted assignment",
+      bindRequestInput: async (input) => {
+        binding = input;
+      },
+      transport: async (_url, init) => {
+        expect(binding).toEqual({
+          reservationId: "reserved-1",
+          encodedRequestSha256: NodeCrypto.createHash("sha256").update(init.body).digest("hex"),
+        });
+        expect(init.body).not.toContain(secret);
+        return response(success());
+      },
+    });
+    await f.invoke();
+    expect(f.reservations).toHaveLength(1);
+  });
+
+  it.each(
+    [
+      [{ role: "user", content: "Trusted assignment" }],
+      [{ role: "system", content: "Trusted assignment suffix" }],
+      [
+        { role: "system", content: "Trusted assignment" },
+        { role: "system", content: "extra" },
+      ],
+      [
+        {
+          role: "system",
+          content: [
+            { type: "text", text: "Trusted assignment" },
+            { type: "text", text: "" },
+          ],
+        },
+      ],
+    ].map((messages) => ({ messages })),
+  )("rejects substituted or fragmented system input before reservation", async ({ messages }) => {
+    const f = fixture({
+      requiredSystemText: "Trusted assignment",
+      bindRequestInput: async () => {},
+    });
+    await expect(f.invoke(requestBody({ messages }))).rejects.toMatchObject({
+      code: "REQUEST_SYSTEM_INPUT_INVALID",
+    });
+    expect(f.reservations).toHaveLength(0);
+    expect(f.transports).toHaveLength(0);
+  });
+
+  it("accepts one exact text part and captures the host binding configuration", async () => {
+    const bound: string[] = [];
+    const f = fixture({
+      requiredSystemText: "Trusted assignment",
+      bindRequestInput: async ({ reservationId }) => {
+        bound.push(reservationId);
+      },
+    });
+    Object.assign(f.cfg, {
+      requiredSystemText: "changed after construction",
+      bindRequestInput: async () => {
+        throw new Error("mutated callback");
+      },
+    });
+    await f.invoke(
+      requestBody({
+        messages: [
+          { role: "system", content: [{ type: "text", text: "Trusted assignment" }] },
+          { role: "user", content: "Investigate" },
+        ],
+      }),
+    );
+    expect(bound).toEqual(["reserved-1"]);
+    expect(f.transports).toHaveLength(1);
+  });
+
+  it("requires paired private input configuration", () => {
+    const f = fixture();
+    expect(() => makePiModelBroker({ ...f.cfg, requiredSystemText: "Trusted assignment" })).toThrow(
+      PiModelBrokerError,
+    );
+    expect(() => makePiModelBroker({ ...f.cfg, bindRequestInput: async () => {} })).toThrow(
+      PiModelBrokerError,
+    );
+  });
+
+  it("joins failed binding settlement without transport or successful receipt", async () => {
+    const f = fixture({
+      requiredSystemText: "Trusted assignment",
+      bindRequestInput: async () => {
+        throw new Error("binding commit failed");
+      },
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "REQUEST_INPUT_BINDING_FAILED" });
+    expect(f.transports).toHaveLength(0);
+    expect(f.settlements).toHaveLength(1);
+    expect(f.settlements[0]).toMatchObject({
+      outcome: "unknown",
+      failureCode: "REQUEST_INPUT_BINDING_FAILED",
+      transportDrained: true,
+    });
   });
 });

@@ -42,6 +42,7 @@ import {
   type ProjectTeamAssignmentReceipt,
 } from "./ProjectTeamSessionReceipts.ts";
 import { makeProjectTeamWorkspace } from "./ProjectTeamWorkspace.ts";
+import { makeProjectTeamMailboxConsumption } from "./ProjectTeamMailboxConsumption.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
@@ -150,6 +151,9 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
         Effect.fail(new ProjectManagedSetupError({ reason: "Cleanup cannot authorize setup" })),
     });
     const receipts = yield* makeProjectTeamSessionReceipts(options);
+    const mailbox = yield* makeProjectTeamMailboxConsumption({
+      environmentId: options.environmentId,
+    });
     const retainedSetup = Effect.fn("ProjectTeamExecutionHost.retainedSetup")(function* (
       snapshot: Snapshot,
     ) {
@@ -527,6 +531,17 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
     const readAssignmentObservation = Effect.fn(
       "ProjectTeamExecutionHost.readAssignmentObservation",
     )(function* (snapshot: Snapshot) {
+      const batches = yield* sql<{
+        operation_id: string;
+      }>`SELECT operation_id FROM project_team_mailbox_batch WHERE operation_id=${snapshot.intent.request.assignmentOperationId} LIMIT 2`;
+      if (batches.length > 1) return yield* denied("Assignment mailbox identity is ambiguous");
+      if (batches.length === 1) {
+        const reflection = yield* mailbox.reflectAssignment(snapshot);
+        if (reflection.status === "delivered" || reflection.status === "unchanged")
+          return reflection.receipt;
+        return undefined;
+      }
+      // Legacy assignments have no sealed batch and cannot qualify mailbox delivery.
       const rows = yield* sql<{
         status: string;
       }>`SELECT status FROM project_team_pi_operation WHERE operation_id=${snapshot.intent.request.assignmentOperationId} LIMIT 2`;

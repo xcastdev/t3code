@@ -548,7 +548,7 @@ describe("applyMessageReceipt", () => {
     ).toMatchObject({ accepted: false });
   });
 
-  it("preserves uncertain delivery identity and requires reconciliation before consumption", () => {
+  it("preserves uncertain delivery identity and requires delivery reconciliation before acknowledgment", () => {
     const uncertain = apply(message(), "uncertain");
     expect(uncertain).toEqual({
       ...message(),
@@ -558,7 +558,7 @@ describe("applyMessageReceipt", () => {
       deliveryCursor: 1,
       deliveryGeneration: 7,
     });
-    for (const status of ["delivered", "acknowledged", "resolved"] as const) {
+    for (const status of ["acknowledged", "resolved"] as const) {
       expect(
         applyMessageReceipt({
           message: uncertain,
@@ -617,4 +617,28 @@ describe("applyMessageReceipt", () => {
       ).toMatchObject({ accepted: false });
     }
   });
+});
+
+it("reconciles uncertain delivery only for the same current original target", () => {
+  const uncertain = apply(message(), "uncertain");
+  const input = {
+    message: uncertain,
+    current: current(),
+    recordedTarget: target,
+    receipt: { ...receipt(), expectedMessageRevision: uncertain.revision },
+  };
+  expect(applyMessageReceipt(input)).toMatchObject({
+    accepted: true,
+    changed: true,
+    message: { status: "delivered", revision: 2, deliveryCursor: 1 },
+  });
+  expect(
+    applyMessageReceipt({
+      ...input,
+      current: { ...current(), runBinding: run({ generation: 8 }) },
+    }),
+  ).toMatchObject({ accepted: false });
+  expect(
+    applyMessageReceipt({ ...input, receipt: { ...input.receipt, deliveryCursor: 2 } }),
+  ).toMatchObject({ accepted: false });
 });

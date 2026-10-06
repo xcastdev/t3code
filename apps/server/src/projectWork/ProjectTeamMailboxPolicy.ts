@@ -219,6 +219,7 @@ export const applyMessageReceipt = (input: typeof ReceiptInput.Type) => {
       (receipt.status === "delivered" || receipt.status === "uncertain")) ||
     (message.status === "delivered" &&
       (receipt.status === "acknowledged" || receipt.status === "uncertain")) ||
+    (message.status === "uncertain" && receipt.status === "delivered") ||
     (message.status === "acknowledged" && receipt.status === "resolved");
   if (!validTransition) return rejected("invalid-receipt-transition");
   const next: Message = {

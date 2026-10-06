@@ -59,6 +59,7 @@ import {
 import { readPiNativeSession } from "./PiNativeSessionReader.ts";
 import { makeProjectTeamReviewFreshness } from "../../projectWork/ProjectTeamReviewFreshness.ts";
 import { makeProjectTeamContext } from "../../projectWork/ProjectTeamContext.ts";
+import { makeProjectTeamMailboxConsumption } from "../../projectWork/ProjectTeamMailboxConsumption.ts";
 import { makePiRuntimeEventTranslator } from "./PiRuntimeEvents.ts";
 import { makePiSessionRuntime } from "./PiSessionRuntime.ts";
 import { piLocalToolDefinitions } from "./PiLocalTools.ts";
@@ -622,6 +623,9 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     protectedRoots: [...supplied.protectedRoots],
   };
   const operations = yield* makeProjectTeamPiOperations({ environmentId: options.environmentId });
+  const mailbox = yield* makeProjectTeamMailboxConsumption({
+    environmentId: options.environmentId,
+  });
   const reviewFreshness = yield* makeProjectTeamReviewFreshness({
     environmentId: options.environmentId,
   });
@@ -1613,6 +1617,13 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 );
                 if (contextFor(durable.authority) !== context)
                   return yield* deny("Pi assignment changed before durable handoff", "conflict");
+                const sealedMailbox =
+                  request.kind === "prompt"
+                    ? yield* mailbox.sealAssignmentContext({
+                        operationId: operation.operationId,
+                        baseSystemText: requiredText,
+                      })
+                    : undefined;
                 const turnId = TurnId.make(operation.operationId);
                 const translator =
                   request.kind === "prompt"
@@ -1661,7 +1672,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   });
                 }
                 const texts = [
-                  { transferId: "context", text: requiredText },
+                  { transferId: "context", text: sealedMailbox?.systemText ?? requiredText },
                   ...(request.kind === "prompt"
                     ? [{ transferId: "prompt", text: request.prompt }]
                     : []),
@@ -1915,6 +1926,29 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           ),
                         ),
                       ),
+                    ...(sealedMailbox === undefined
+                      ? {}
+                      : {
+                          requiredSystemText: sealedMailbox.systemText,
+                          bindRequestInput: (
+                            input: {
+                              readonly reservationId: string;
+                              readonly encodedRequestSha256: string;
+                            },
+                            signal: AbortSignal,
+                          ) =>
+                            perform(
+                              check(signal).pipe(
+                                Effect.andThen(
+                                  mailbox.bindRequestInput({
+                                    operationId: operation.operationId,
+                                    ...input,
+                                  }),
+                                ),
+                                Effect.asVoid,
+                              ),
+                            ),
+                        }),
                     settleRequest: (settlement) => perform(accounting.settle(settlement)),
                     transport: options.transport,
                   },

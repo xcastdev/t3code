@@ -15,9 +15,9 @@ it.effect(
       yield* sql`INSERT INTO project_team_member (record_id,project_id,status,revision,generation,updated_at,payload_json)
       VALUES ('retained-member','project','active',0,0,'2026-10-06T00:00:00.000Z','{}')`;
       const before = yield* sql`SELECT * FROM project_team_member`;
-      expect(yield* runForkMigrations()).toEqual([[36, "ProjectTeamReviewFindings"]]);
+      expect(yield* runForkMigrations(36)).toEqual([[36, "ProjectTeamReviewFindings"]]);
       expect(yield* sql`SELECT * FROM project_team_review_finding`).toEqual([]);
       expect(yield* sql`SELECT * FROM project_team_member`).toEqual(before);
-      expect(yield* runForkMigrations()).toEqual([]);
+      expect(yield* runForkMigrations(36)).toEqual([]);
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
 );

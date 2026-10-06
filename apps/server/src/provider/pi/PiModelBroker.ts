@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
@@ -152,6 +153,8 @@ export type PiModelBrokerErrorCode =
   | "REQUEST_COUNT_LIMIT"
   | "REQUEST_FAILED"
   | "REQUEST_INPUT_LIMIT"
+  | "REQUEST_SYSTEM_INPUT_INVALID"
+  | "REQUEST_INPUT_BINDING_FAILED"
   | "REQUEST_INVALID"
   | "REQUEST_MODEL_OR_OUTPUT_INVALID"
   | "REQUEST_REPLAY"
@@ -239,6 +242,12 @@ export interface PiModelBrokerConfig {
   readonly maxInputTokens: number;
   readonly maxOutputTokens: number;
   readonly deadlineMs: number;
+  /** Private assignment custody; the broker binds only the exact outbound system input. */
+  readonly requiredSystemText?: string;
+  readonly bindRequestInput?: (
+    input: { readonly reservationId: string; readonly encodedRequestSha256: string },
+    signal: AbortSignal,
+  ) => Promise<void>;
   readonly getCredential: (signal: AbortSignal) => Promise<string>;
   readonly authorizeCurrent: (
     phase: "beforeReserve" | "beforeTransport" | "beforeForward" | "beforeReturn",
@@ -325,6 +334,14 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
     ].some((f) => typeof f !== "function")
   )
     fail("CONFIG_CALLBACK_REQUIRED");
+  if (
+    (cfg.requiredSystemText === undefined) !== (cfg.bindRequestInput === undefined) ||
+    (cfg.requiredSystemText !== undefined &&
+      (typeof cfg.requiredSystemText !== "string" ||
+        Buffer.byteLength(cfg.requiredSystemText) > 65_536 ||
+        typeof cfg.bindRequestInput !== "function"))
+  )
+    fail("CONFIG_CALLBACK_REQUIRED");
   const allowedTools = new Map(tools.map((tool) => [tool.function.name, canonical(tool)]));
   if (
     tools.length > 32 ||
@@ -346,6 +363,19 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       if (error instanceof PiModelBrokerError) throw error;
       return fail("REQUEST_INVALID");
     }
+    if (cfg.requiredSystemText !== undefined) {
+      const systems = parsed.messages.filter((message) => message.role === "system");
+      const content = systems[0]?.content;
+      const systemText =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content) && content.length === 1
+            ? content[0]?.text
+            : undefined;
+      if (systems.length !== 1 || systemText !== cfg.requiredSystemText)
+        fail("REQUEST_SYSTEM_INPUT_INVALID");
+    }
+    const encodedBody = encodeRequest({ ...parsed, model: cfg.model });
     if (usedRequestIds.has(operation.requestId)) fail("REQUEST_REPLAY");
     if (active) fail("REQUEST_CONCURRENT");
     if (usedRequestIds.size >= 1_024) fail("REQUEST_COUNT_LIMIT");
@@ -444,6 +474,22 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       }
       if (!reservationId || reservationId.length > 256) fail("RESERVATION_RECEIPT_INVALID");
       check();
+      if (cfg.bindRequestInput !== undefined) {
+        try {
+          await cfg.bindRequestInput(
+            {
+              reservationId,
+              encodedRequestSha256: NodeCrypto.createHash("sha256")
+                .update(encodedBody)
+                .digest("hex"),
+            },
+            controller.signal,
+          );
+        } catch {
+          fail("REQUEST_INPUT_BINDING_FAILED");
+        }
+        check();
+      }
       let credential: string;
       try {
         credential = await cfg.getCredential(controller.signal);
@@ -459,7 +505,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
           method: "POST",
           redirect: "error",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
-          body: encodeRequest({ ...parsed, model: cfg.model }),
+          body: encodedBody,
           signal: controller.signal,
         });
       } catch {
