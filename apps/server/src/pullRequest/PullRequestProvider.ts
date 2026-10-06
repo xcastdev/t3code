@@ -466,6 +466,15 @@ export interface PullRequestProviderApi {
     },
   ) => Effect.Effect<void, PullRequestProviderError>;
 
+  /** Host-authorized immediate merge only; absence means this provider cannot enforce an exact head. */
+  readonly mergeExactHead?: (
+    input: ProviderRepositoryRef & {
+      readonly number: number;
+      readonly expectedHeadSha: string;
+      readonly mergeMethod?: PullRequestMergeMethod;
+    },
+  ) => Effect.Effect<void, PullRequestProviderError>;
+
   /**
    * Rewrites the change request's own words. Only called when `capabilities.edit.changeRequest`
    * is true, and never with both fields absent — the caller refuses that before it gets here,

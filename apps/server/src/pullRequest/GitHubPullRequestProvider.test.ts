@@ -2,12 +2,109 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as Schema from "effect/Schema";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import type { PullRequestReaction } from "@t3tools/contracts";
 
 import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import * as GitHubPullRequestCli from "./GitHubPullRequestCli.ts";
+import * as GitHubGraphQlBudget from "../sourceControl/githubGraphQlBudget.ts";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { gitHubViewerPermissions, loginAvatarUrl, make } from "./GitHubPullRequestProvider.ts";
 import type { GitHubReviewThreadComments } from "./gitHubPullRequestJson.ts";
+
+const encodeMergeFixture = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const exactMergeInput = {
+  cwd: "/w",
+  repository: "acme/web",
+  host: "github.enterprise.test",
+  number: 7,
+  expectedHeadSha: "a".repeat(40),
+};
+const mergeDetail = (overrides: Readonly<Record<string, unknown>> = {}) =>
+  encodeMergeFixture({
+    number: 7,
+    state: "OPEN",
+    headRefOid: exactMergeInput.expectedHeadSha,
+    autoMergeRequest: null,
+    mergedAt: null,
+    ...overrides,
+  });
+
+const makeMergeTransport = Effect.fn("makeMergeTransport")(function* (
+  responses: ReadonlyArray<string>,
+) {
+  const calls: VcsProcess.VcsProcessInput[] = [];
+  const transport = Layer.succeed(
+    VcsProcess.VcsProcess,
+    VcsProcess.VcsProcess.of({
+      run: (input) =>
+        Effect.sync(() => {
+          const stdout = responses[calls.length];
+          calls.push(input);
+          if (stdout === undefined) throw new Error("Unexpected GitHub transport call");
+          return {
+            exitCode: ChildProcessSpawner.ExitCode(0),
+            stdout,
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          };
+        }),
+    }),
+  );
+  const provider = yield* make.pipe(
+    Effect.provide(
+      GitHubPullRequestCli.layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.effect(GitHubCli.GitHubCli, GitHubCli.make).pipe(Layer.provide(transport)),
+            GitHubGraphQlBudget.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+  return { provider, calls };
+});
+
+it.effect("merges only the exact head through a conditioned write and confirmed result", () =>
+  Effect.gen(function* () {
+    const { provider, calls } = yield* makeMergeTransport([
+      mergeDetail(),
+      encodeMergeFixture({ merged: true, sha: "b".repeat(40), message: "Merged" }),
+      mergeDetail({ state: "MERGED", mergedAt: "2026-10-05T12:00:00Z" }),
+    ]);
+    const merge = provider.mergeExactHead;
+    if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
+    yield* merge({ ...exactMergeInput, mergeMethod: "squash" }).pipe(
+      Effect.provideService(GitHubCli.PinnedGitHubCredential, {
+        host: exactMergeInput.host,
+        token: Redacted.make("test-pinned-token"),
+        credentialFingerprint: "test-fingerprint",
+      }),
+    );
+    expect(calls).toHaveLength(3);
+    expect(calls[1]?.args).toEqual([
+      "api",
+      "--method",
+      "PUT",
+      "--hostname",
+      exactMergeInput.host,
+      "repos/acme/web/pulls/7/merge",
+      "--input",
+      "-",
+    ]);
+    expect(calls[1]?.stdin).toBe(
+      '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","merge_method":"squash"}',
+    );
+    for (const call of calls) {
+      expect(call.cwd).toBe("/w");
+      expect(call.env?.GH_TOKEN).toBe("test-pinned-token");
+      expect(call.env?.GH_HOST).toBe(exactMergeInput.host);
+    }
+  }),
+);
 
 it.effect("maps credential verification failures without relabeling operation failures", () =>
   Effect.gen(function* () {
@@ -44,6 +141,144 @@ it.effect("maps credential verification failures without relabeling operation fa
     verificationFails = false;
     expect(yield* verify(input, operation).pipe(Effect.flip)).toBe("operation-failed");
     expect(operations).toBe(1);
+  }),
+);
+
+it.effect("refuses an exact-head merge without a SHA instead of taking the ordinary path", () =>
+  Effect.gen(function* () {
+    const { provider, calls } = yield* makeMergeTransport([""]);
+    const merge = provider.mergeExactHead;
+    if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
+    // @ts-expect-error - Exercise a runtime caller violating the mandatory private precondition.
+    const result = yield* merge({
+      cwd: "/w",
+      repository: "acme/web",
+      host: "github.com",
+      number: 7,
+    }).pipe(Effect.result);
+    expect(result).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "PullRequestProviderError", operation: "mergeExactHead", reason: "failed" },
+    });
+    expect(calls).toHaveLength(0);
+  }),
+);
+
+describe("exact-head adapter refusals", () => {
+  for (const fixture of [
+    { name: "stale head", detail: { headRefOid: "c".repeat(40) }, reason: "head" },
+    { name: "standing auto-merge", detail: { autoMergeRequest: {} }, reason: "auto-merge" },
+  ]) {
+    it.effect(`refuses ${fixture.name} before writing`, () =>
+      Effect.gen(function* () {
+        const { provider, calls } = yield* makeMergeTransport([mergeDetail(fixture.detail)]);
+        const merge = provider.mergeExactHead;
+        if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
+        expect(yield* merge(exactMergeInput).pipe(Effect.flip)).toMatchObject({
+          _tag: "PullRequestProviderError",
+          operation: "mergeExactHead",
+          reason: "failed",
+          cause: { _tag: "GitHubExactHeadMergeRefusedError", reason: fixture.reason },
+        });
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.args.slice(0, 2)).toEqual(["pr", "view"]);
+      }),
+    );
+  }
+
+  it.effect("refuses an invalid supplied SHA before transport", () =>
+    Effect.gen(function* () {
+      const { provider, calls } = yield* makeMergeTransport([]);
+      const merge = provider.mergeExactHead;
+      if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
+      expect(
+        yield* merge({ ...exactMergeInput, expectedHeadSha: "" }).pipe(Effect.flip),
+      ).toMatchObject({
+        operation: "mergeExactHead",
+        cause: { _tag: "GitHubExactHeadMergeRefusedError", reason: "input" },
+      });
+      expect(calls).toHaveLength(0);
+    }),
+  );
+
+  it.effect("preserves an uncertain confirmation instead of reporting successful merge", () =>
+    Effect.gen(function* () {
+      const { provider, calls } = yield* makeMergeTransport([
+        mergeDetail(),
+        encodeMergeFixture({ merged: true, sha: "b".repeat(40), message: "Merged" }),
+        mergeDetail(),
+      ]);
+      const merge = provider.mergeExactHead;
+      if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
+      expect(yield* merge(exactMergeInput).pipe(Effect.flip)).toMatchObject({
+        operation: "mergeExactHead",
+        reason: "failed",
+        cause: { _tag: "GitHubExactHeadMergeUncertainError", phase: "confirmation" },
+      });
+      expect(calls).toHaveLength(3);
+      expect(calls[1]?.stdin).toBe(
+        '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","merge_method":"merge"}',
+      );
+    }),
+  );
+
+  it.effect("preserves a rejected conditional write without trying an ordinary merge", () =>
+    Effect.gen(function* () {
+      const { provider, calls } = yield* makeMergeTransport([
+        mergeDetail(),
+        encodeMergeFixture({ merged: false, message: "Head changed" }),
+      ]);
+      const merge = provider.mergeExactHead;
+      if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
+      expect(yield* merge(exactMergeInput).pipe(Effect.flip)).toMatchObject({
+        operation: "mergeExactHead",
+        cause: { _tag: "GitHubExactHeadMergeRejectedError", detail: "Head changed" },
+      });
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.args).toContain("PUT");
+    }),
+  );
+
+  it.effect("keeps the pinned credential on its own host before transport", () =>
+    Effect.gen(function* () {
+      const { provider, calls } = yield* makeMergeTransport([]);
+      const merge = provider.mergeExactHead;
+      if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
+      const error = yield* merge(exactMergeInput).pipe(
+        Effect.provideService(GitHubCli.PinnedGitHubCredential, {
+          host: "github.com",
+          token: Redacted.make("wrong-host-test-token"),
+          credentialFingerprint: "wrong-host-fingerprint",
+        }),
+        Effect.flip,
+      );
+      expect(error).toMatchObject({ operation: "mergeExactHead", reason: "failed" });
+      expect(calls).toHaveLength(0);
+    }),
+  );
+});
+
+it.effect("keeps ordinary merges on the existing CLI action path", () =>
+  Effect.gen(function* () {
+    const { provider, calls } = yield* makeMergeTransport([""]);
+    yield* provider.runAction({
+      cwd: "/w",
+      repository: "acme/web",
+      host: "github.com",
+      number: 7,
+      action: "merge",
+      mergeMethod: "squash",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args).toEqual([
+      "pr",
+      "merge",
+      "7",
+      "--repo",
+      "github.com/acme/web",
+      "--squash",
+    ]);
+    expect(calls[0]?.stdin).toBeUndefined();
   }),
 );
 
