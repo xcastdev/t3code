@@ -1,8 +1,11 @@
+import * as NodeCrypto from "node:crypto";
 /* @vitest-environment happy-dom */
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
+  canonicalProjectWorkPayload,
+  type ProjectWorkPublicationRequest,
   EnvironmentId,
   ProjectId,
   ProjectWorkTaskId,
@@ -17,6 +20,8 @@ import {
 import * as Schema from "effect/Schema";
 import type { ProjectWorkFoundationSnapshot } from "@t3tools/client-runtime/project-work";
 
+const link = vi.hoisted(() => ({ open: vi.fn().mockResolvedValue(true) }));
+vi.mock("../../lib/openExternalUrl", () => ({ tryOpenExternalUrl: link.open }));
 const navigation = vi.hoisted(() => ({ navigate: vi.fn() }));
 vi.mock("@react-navigation/native", () => ({ useNavigation: () => navigation }));
 vi.mock("react-native", async () => {
@@ -59,6 +64,75 @@ const otherProjectId = ProjectId.make("project-2");
 const taskId = ProjectWorkTaskId.make("task-1");
 const otherTaskId = ProjectWorkTaskId.make("task-2");
 const at = "2026-10-01T10:00:00.000Z";
+const historyRequest: ProjectWorkPublicationRequest = {
+  version: 1,
+  kind: "create-pr",
+  operationId: "publication-one",
+  marker: "publication_marker_one",
+  repository: { host: "github.com", nodeId: "R_base", nameWithOwner: "owner/repo" },
+  target: {
+    projectId,
+    taskId,
+    specRevision: 2,
+    planRevision: 3,
+    scopeHash: "scope-one",
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    baseRef: "main",
+    headRef: "feature",
+    headRepositoryNodeId: "R_base",
+    headSelector: "feature",
+  },
+  expectedTaskRevision: 2,
+  authorizationRecordIds: ["proof-one"],
+  title: "Repair task",
+  body: "Verified change.",
+};
+const historyReceipt = {
+  version: 1,
+  kind: "confirmed",
+  operationId: historyRequest.operationId,
+  requestHash: NodeCrypto.createHash("sha256")
+    .update(canonicalProjectWorkPayload(historyRequest))
+    .digest("hex"),
+  claimGeneration: 1,
+  observedAt: at,
+  marker: historyRequest.marker,
+  repository: historyRequest.repository,
+  pullRequest: {
+    nodeId: "PR_one",
+    number: 42,
+    url: "https://github.com/owner/repo/pull/42",
+    state: "MERGED",
+    baseSha: historyRequest.target.baseSha,
+    headSha: historyRequest.target.headSha,
+    baseRef: "main",
+    headRef: "feature",
+    headRepositoryNodeId: "R_base",
+  },
+};
+const historyEffect: typeof ProjectTeamEffect.Type = {
+  kind: "effect",
+  recordId: historyRequest.operationId,
+  effectId: historyRequest.operationId,
+  projectId,
+  revision: 2,
+  generation: 0,
+  updatedAt: at,
+  status: "succeeded",
+  effectKind: "publication",
+  taskId,
+  targetId: "github.com/owner/repo",
+  payload: {
+    recordIds: historyRequest.authorizationRecordIds,
+    expectedRevision: 2,
+    summary: canonicalProjectWorkPayload(historyRequest),
+  },
+  claimGeneration: 1,
+  availableAt: at,
+  outcome: canonicalProjectWorkPayload(historyReceipt),
+};
+
 const base = { projectId, revision: 2, generation: 0, updatedAt: at };
 const decodeEvidence = Schema.decodeSync(ProjectTeamEvidenceApplicability);
 const decodeGate = Schema.decodeSync(ProjectTeamGate);
@@ -190,6 +264,7 @@ let props: WorkEvidenceProps;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   navigation.navigate.mockReset();
+  link.open.mockReset().mockResolvedValue(true);
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
@@ -224,6 +299,29 @@ async function click(label: string) {
 
 // Removing owner fencing, record validation, page bounds, or the recorded/live wording breaks these observed views.
 describe("mounted mobile evidence inspection", () => {
+  it("withholds inconsistent and foreign-owner PR links", async () => {
+    await render({ foundation: snapshot([{ ...historyEffect, claimGeneration: 2 }]) });
+    expect(host.textContent).toContain("PR publication is unconfirmed in this record.");
+    expect(
+      [...host.querySelectorAll("button")].some((item) => item.textContent === "Open PR #42"),
+    ).toBe(false);
+    await render({
+      foundation: snapshot([historyEffect]),
+      foundationOwner: { environmentId: otherEnvironmentId, projectId },
+    });
+    expect(host.textContent).toContain("Waiting for this environment's snapshot");
+    expect(host.textContent).not.toContain("owner/repo #42");
+  });
+
+  it("opens a recorded merged PR and handles a failed external link", async () => {
+    await render({ foundation: snapshot([historyEffect]) });
+    expect(host.textContent).toContain("Recorded PR state: MERGED");
+    expect(host.textContent).toContain("owner/repo #42");
+    link.open.mockResolvedValueOnce(false);
+    await click("Open PR #42");
+    expect(link.open).toHaveBeenCalledWith("https://github.com/owner/repo/pull/42", "pull-request");
+    expect(host.textContent).toContain("Could not open the pull request. Try again.");
+  });
   it("orders offset timestamps by their recorded instants", async () => {
     vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-01T15:00:00Z"));
     await render({

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 /* @vitest-environment happy-dom */
 
 import { RegistryContext } from "@effect/atom-react";
@@ -14,6 +15,8 @@ import {
 } from "@t3tools/client-runtime/connection";
 import type { RpcSession } from "@t3tools/client-runtime/rpc";
 import {
+  canonicalProjectWorkPayload,
+  type ProjectWorkPublicationRequest,
   EnvironmentId,
   ProjectId,
   ProjectTeamEvidenceApplicability,
@@ -41,6 +44,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 
+const link = vi.hoisted(() => ({ open: vi.fn().mockResolvedValue(undefined) }));
+vi.mock("../../browser/useOpenLink", () => ({ useOpenLink: () => link.open }));
 const bridge = vi.hoisted((): { atoms: unknown } => ({ atoms: undefined }));
 vi.mock("~/state/projectWork", () => ({
   get projectWorkEnvironment() {
@@ -58,6 +63,75 @@ const taskId = ProjectWorkTaskId.make("task-1");
 const otherTaskId = ProjectWorkTaskId.make("task-2");
 const decodeRead = Schema.decodeUnknownEffect(ProjectWorkReadIntent);
 const at = "2026-10-01T10:00:00.000Z";
+const historyRequest: ProjectWorkPublicationRequest = {
+  version: 1,
+  kind: "create-pr",
+  operationId: "publication-one",
+  marker: "publication_marker_one",
+  repository: { host: "github.com", nodeId: "R_base", nameWithOwner: "owner/repo" },
+  target: {
+    projectId,
+    taskId,
+    specRevision: 2,
+    planRevision: 3,
+    scopeHash: "scope-one",
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    baseRef: "main",
+    headRef: "feature",
+    headRepositoryNodeId: "R_base",
+    headSelector: "feature",
+  },
+  expectedTaskRevision: 2,
+  authorizationRecordIds: ["proof-one"],
+  title: "Repair task",
+  body: "Verified change.",
+};
+const historyReceipt = {
+  version: 1,
+  kind: "confirmed",
+  operationId: historyRequest.operationId,
+  requestHash: NodeCrypto.createHash("sha256")
+    .update(canonicalProjectWorkPayload(historyRequest))
+    .digest("hex"),
+  claimGeneration: 1,
+  observedAt: at,
+  marker: historyRequest.marker,
+  repository: historyRequest.repository,
+  pullRequest: {
+    nodeId: "PR_one",
+    number: 42,
+    url: "https://github.com/owner/repo/pull/42",
+    state: "MERGED",
+    baseSha: historyRequest.target.baseSha,
+    headSha: historyRequest.target.headSha,
+    baseRef: "main",
+    headRef: "feature",
+    headRepositoryNodeId: "R_base",
+  },
+};
+const historyEffect: typeof ProjectTeamEffect.Type = {
+  kind: "effect",
+  recordId: historyRequest.operationId,
+  effectId: historyRequest.operationId,
+  projectId,
+  revision: 2,
+  generation: 0,
+  updatedAt: at,
+  status: "succeeded",
+  effectKind: "publication",
+  taskId,
+  targetId: "github.com/owner/repo",
+  payload: {
+    recordIds: historyRequest.authorizationRecordIds,
+    expectedRevision: 2,
+    summary: canonicalProjectWorkPayload(historyRequest),
+  },
+  claimGeneration: 1,
+  availableAt: at,
+  outcome: canonicalProjectWorkPayload(historyReceipt),
+};
+
 const base = { projectId, revision: 2, generation: 0, updatedAt: at };
 const evidence = Schema.decodeSync(ProjectTeamEvidenceApplicability)({
   ...base,
@@ -330,6 +404,45 @@ describe("Evidence through mounted environment foundation atoms", () => {
   async function click(label: string) {
     await act(async () => button(label)!.click());
   }
+
+  interaction(
+    "withholds a PR link when its receipt no longer matches the recorded head",
+    async () => {
+      records = [
+        {
+          ...historyEffect,
+          outcome: canonicalProjectWorkPayload({
+            ...historyReceipt,
+            pullRequest: { ...historyReceipt.pullRequest, headSha: "later-head" },
+          }),
+        },
+      ];
+      await render();
+      expect(host.textContent).toContain("PR publication is unconfirmed in this record.");
+      expect(button("Open PR #42")).toBeUndefined();
+    },
+  );
+
+  interaction("preserves cached history and lets a failed PR link be retried", async () => {
+    records = [historyEffect];
+    await render();
+    await render({ connected: false });
+    expect(host.textContent).toContain("Cached or incomplete");
+    link.open.mockRejectedValueOnce(new Error("open failed"));
+    await click("Open PR #42");
+    expect(host.textContent).toContain("Could not open the pull request. Try again.");
+    await click("Open PR #42");
+    expect(host.textContent).not.toContain("Could not open the pull request. Try again.");
+  });
+
+  interaction("opens a recorded merged PR through the client link opener", async () => {
+    records = [historyEffect];
+    await render();
+    expect(host.textContent).toContain("Recorded PR state: MERGED");
+    expect(host.textContent).toContain("owner/repo #42");
+    await click("Open PR #42");
+    expect(link.open).toHaveBeenCalledWith("https://github.com/owner/repo/pull/42");
+  });
 
   interaction(
     "inspects exact evidence and original publication/gate identities without approval or delivery claims",

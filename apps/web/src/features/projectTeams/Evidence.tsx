@@ -1,11 +1,14 @@
+import { readProjectWorkPublicationHistory } from "@t3tools/shared/projectWorkPublicationHistory";
 import {
   ProjectTeamRecord,
+  type ProjectTeamEffect,
   type EnvironmentId,
   type ProjectId,
   type ProjectWorkTaskId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useState } from "react";
+import { useOpenLink } from "../../browser/useOpenLink";
+import { useMemo, useState } from "react";
 
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
@@ -194,6 +197,7 @@ function EvidenceSession(props: EvidenceViewProps) {
                     <>
                       <h3 className="break-all font-medium">Publication effect {item.effectId}</h3>
                       <Badge variant="outline">Recorded publication status: {item.status}</Badge>
+                      <PublicationHistory key={`${item.recordId}:${item.revision}`} effect={item} />
                       <dl className="mt-3 grid gap-2 text-sm">
                         <Metadata
                           label="Effect record"
@@ -214,14 +218,7 @@ function EvidenceSession(props: EvidenceViewProps) {
                         />
                         <Metadata label="Claim generation" value={String(item.claimGeneration)} />
                         <Metadata label="Available at" value={item.availableAt} />
-                        <Metadata
-                          label="Recorded outcome"
-                          value={item.outcome ?? "Outcome not recorded"}
-                        />
                         {item.runId ? <Metadata label="Recorded run" value={item.runId} /> : null}
-                        {item.payload.summary ? (
-                          <Metadata label="Recorded summary" value={item.payload.summary} />
-                        ) : null}
                       </dl>
                     </>
                   )}
@@ -297,6 +294,51 @@ function RecordedGate({ gate }: { readonly gate: Gate }) {
       {gate.pullRequestNumber !== undefined ? <p>PR number {gate.pullRequestNumber}</p> : null}
       {gate.targetBranch ? <p className="break-all">Target branch {gate.targetBranch}</p> : null}
       {gate.mergeMethod ? <p>Merge method {gate.mergeMethod}</p> : null}
+    </div>
+  );
+}
+
+function PublicationHistory({ effect }: { readonly effect: typeof ProjectTeamEffect.Type }) {
+  const history = useMemo(() => readProjectWorkPublicationHistory(effect), [effect]);
+  const openLink = useOpenLink(null);
+  const [failed, setFailed] = useState(false);
+  if (!history)
+    return (
+      <>
+        <p className="mt-2 text-sm">PR publication is unconfirmed in this record.</p>
+        <dl className="mt-2 grid gap-2 text-sm">
+          <Metadata label="Recorded outcome" value={effect.outcome ?? "Outcome not recorded"} />
+          {effect.payload.summary ? (
+            <Metadata label="Recorded summary" value={effect.payload.summary} />
+          ) : null}
+        </dl>
+      </>
+    );
+  const pr = history.pullRequest;
+  return (
+    <div className="mt-3 space-y-2 text-sm">
+      <p className="break-all font-medium">
+        {history.repository.nameWithOwner} #{pr.number}
+      </p>
+      <p>Recorded PR state: {pr.state}</p>
+      <dl className="grid gap-2">
+        <Metadata label="Recorded at" value={history.observedAt} />
+        <Metadata label="Recorded base" value={`${pr.baseRef} · ${pr.baseSha}`} />
+        <Metadata label="Recorded head" value={`${pr.headRef} · ${pr.headSha}`} />
+      </dl>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => {
+          void openLink(pr.url).then(
+            () => setFailed(false),
+            () => setFailed(true),
+          );
+        }}
+      >
+        Open PR #{pr.number}
+      </Button>
+      {failed ? <p role="alert">Could not open the pull request. Try again.</p> : null}
     </div>
   );
 }

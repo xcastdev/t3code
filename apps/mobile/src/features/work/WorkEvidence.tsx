@@ -1,13 +1,16 @@
+import { readProjectWorkPublicationHistory } from "@t3tools/shared/projectWorkPublicationHistory";
 import { useNavigation } from "@react-navigation/native";
 import type { ProjectWorkFoundationSnapshot } from "@t3tools/client-runtime/project-work";
 import {
   ProjectTeamRecord,
+  type ProjectTeamEffect,
   type EnvironmentId,
   type ProjectId,
   type ProjectWorkTaskId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useMemo, useState } from "react";
+import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { Notice, WorkButton, WorkCard } from "./WorkScreens";
@@ -267,6 +270,7 @@ function EvidenceSession(props: WorkEvidenceProps) {
             ) : (
               <>
                 <Notice>Recorded publication status: {item.status}</Notice>
+                <PublicationHistory key={`${item.recordId}:${item.revision}`} effect={item} />
                 <Metadata label="Publication target" value={`Target ${item.targetId}`} />
                 <Notice>
                   Expected project revision {item.payload.expectedRevision} · Claim generation{" "}
@@ -277,7 +281,6 @@ function EvidenceSession(props: WorkEvidenceProps) {
                   value={item.payload.recordIds.join(" · ") || "None recorded"}
                 />
                 <Metadata label="Available at" value={item.availableAt} />
-                <Metadata label="Recorded outcome" value={item.outcome ?? "Outcome not recorded"} />
                 {item.sourceId ? (
                   <Metadata
                     label="Recorded source"
@@ -400,6 +403,38 @@ function RecordedGate({ gate }: { readonly gate: Gate }) {
       ) : null}
       {gate.targetBranch ? <Metadata label="Target branch" value={gate.targetBranch} /> : null}
       {gate.mergeMethod ? <Notice>Merge method {gate.mergeMethod}</Notice> : null}
+    </View>
+  );
+}
+
+function PublicationHistory({ effect }: { readonly effect: typeof ProjectTeamEffect.Type }) {
+  const history = useMemo(() => readProjectWorkPublicationHistory(effect), [effect]);
+  const [failed, setFailed] = useState(false);
+  if (!history)
+    return (
+      <>
+        <Notice>PR publication is unconfirmed in this record.</Notice>
+        <Metadata label="Recorded outcome" value={effect.outcome ?? "Outcome not recorded"} />
+      </>
+    );
+  const pr = history.pullRequest;
+  return (
+    <View className="gap-2">
+      <Text className="font-t3-medium text-foreground">
+        {history.repository.nameWithOwner} #{pr.number}
+      </Text>
+      <Notice>Recorded PR state: {pr.state}</Notice>
+      <Metadata label="Recorded at" value={history.observedAt} />
+      <Metadata label="Recorded base" value={`${pr.baseRef} · ${pr.baseSha}`} />
+      <Metadata label="Recorded head" value={`${pr.headRef} · ${pr.headSha}`} />
+      <WorkButton
+        onPress={() => {
+          void tryOpenExternalUrl(pr.url, "pull-request").then((opened) => setFailed(!opened));
+        }}
+      >
+        Open PR #{pr.number}
+      </WorkButton>
+      {failed ? <Notice>Could not open the pull request. Try again.</Notice> : null}
     </View>
   );
 }
