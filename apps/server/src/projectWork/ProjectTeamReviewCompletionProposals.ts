@@ -22,6 +22,11 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectTeamAuthority, ProjectTeamPrincipal } from "./ProjectTeamAuthorization.ts";
 import { makeProjectTeamReviewQualification } from "./ProjectTeamReviewQualification.ts";
+import {
+  ProjectTeamReviewCriterionAssessmentSnapshot,
+  snapshotReviewCriterionAssessments,
+  reviewCriterionAssessmentBindingsMatch,
+} from "./ProjectTeamReviewCriterionAssessments.ts";
 import { projectTeamDerivedRecordId, projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import {
   ProjectWorkContentGuard,
@@ -120,6 +125,9 @@ const Manifest = Schema.Struct({
   reportCommentId: Id,
   findings: Schema.Array(Schema.Struct({ findingId: Id, revision: Safe, sha256: Digest })).check(
     Schema.isMaxLength(256),
+  ),
+  criterionAssessments: Schema.optionalKey(
+    Schema.Array(ProjectTeamReviewCriterionAssessmentSnapshot).check(Schema.isMaxLength(64)),
   ),
 });
 export type ProjectTeamReviewCompletionProposalManifest = typeof Manifest.Type;
@@ -268,6 +276,14 @@ export const makeProjectTeamReviewCompletionProposals = <E, R>(
         row.command_id !== input.commandId
       )
         return yield* deny("Review proposal immutable identity or hash changed");
+      if (
+        !reviewCriterionAssessmentBindingsMatch(
+          manifest.report.criterionAssessments,
+          manifest.criterionAssessments,
+          manifest.target,
+        )
+      )
+        return yield* deny("Review proposal assessment bindings changed");
       return { manifest, sha256: digest(row.manifest_json) };
     });
     const scope = Effect.fn("ProjectTeamReviewCompletionProposals.scope")(function* (
@@ -544,7 +560,14 @@ export const makeProjectTeamReviewCompletionProposals = <E, R>(
         .sort((a, b) => a.findingId.localeCompare(b.findingId));
       if (new Set(findingSnapshots.map((f) => f.findingId)).size !== findingSnapshots.length)
         return yield* deny("Original target findings are ambiguous");
+      const criterionAssessments = yield* snapshotReviewCriterionAssessments({
+        assessments: report.criterionAssessments,
+        state,
+        target,
+        prepared: retained.prepared.manifest,
+      });
       return {
+        ...(criterionAssessments === undefined ? {} : { criterionAssessments }),
         operation,
         assignmentRequestHash: String(row.request_hash),
         provenance,

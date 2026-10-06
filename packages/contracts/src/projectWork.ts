@@ -1159,6 +1159,25 @@ const GuidedFields = {
   expectedTaskRevision: NonNegativeInt,
 };
 
+export const ProjectTeamReviewCriterionAssessment = Schema.Struct({
+  criterionId: ProjectWorkCriterionId,
+  expectedRevision: NonNegativeInt,
+  verdict: Schema.Literals(["met", "not-met"]),
+  detail: GuidedBody,
+  evidenceIds: Schema.Array(GuidedId).check(
+    Schema.isMaxLength(64),
+    Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+  ),
+}).check(
+  Schema.makeFilter(
+    (assessment) => assessment.verdict !== "met" || assessment.evidenceIds.length > 0,
+    {
+      message: "A positive criterion assessment requires retained evidence",
+    },
+  ),
+);
+export type ProjectTeamReviewCriterionAssessment = typeof ProjectTeamReviewCriterionAssessment.Type;
+
 /** Guided intent inputs describe a requested change, never caller-created authority. */
 export const ProjectTeamGuidedIntent = Schema.Union([
   Schema.Struct({
@@ -1286,15 +1305,34 @@ export const ProjectTeamGuidedIntent = Schema.Union([
         }),
       ).check(Schema.isMaxLength(64)),
     ),
+    criterionAssessments: Schema.optionalKey(
+      Schema.Array(ProjectTeamReviewCriterionAssessment).check(
+        Schema.isMaxLength(64),
+        Schema.makeFilter(
+          (assessments) =>
+            new Set(assessments.map((assessment) => assessment.criterionId)).size ===
+            assessments.length,
+        ),
+      ),
+    ),
     outcome: Schema.Literals(["findings", "review-ready", "complete"]),
   }).check(
+    Schema.makeFilter(
+      (input) => input.criterionAssessments === undefined || input.outcome === "complete",
+      {
+        message: "Criterion assessments require a complete review report",
+      },
+    ),
     Schema.makeFilter(
       (input) =>
         utf8Length(input.summary) +
           (input.outputs ?? []).reduce(
             (total, output) => total + utf8Length(output.detail) + utf8Length(output.summary ?? ""),
             0,
-          ) <=
+          ) +
+          (input.criterionAssessments === undefined
+            ? 0
+            : utf8Length(canonicalProjectWorkPayload(input.criterionAssessments))) <=
         131_072,
       { message: "Retained report content exceeds its 128 KiB byte limit" },
     ),

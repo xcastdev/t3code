@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 
 import {
   ClientOrchestrationCommand,
+  ProjectTeamGuidedIntent,
   ProjectWorkTeamTransition,
   ProjectTeamReviewCompletionProof,
   ProjectWorkExport,
@@ -652,6 +653,57 @@ const reviewProofReport = {
   ],
   outcome: "complete",
 };
+const decodeAssessmentReport = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, {
+  onExcessProperty: "error",
+});
+const criterionAssessment = {
+  criterionId: "parent-criterion",
+  expectedRevision: 1,
+  verdict: "met",
+  detail: "Checked the current criterion",
+  evidenceIds: ["parent-evidence"],
+};
+it("criterion assessments retain explicit judgments only in complete reports", () => {
+  const report = { ...reviewProofReport, criterionAssessments: [criterionAssessment] };
+  expect(decodeAssessmentReport(report)).toEqual(report);
+  expect(decodeAssessmentReport(reviewProofReport)).toEqual(reviewProofReport);
+  expect(() => decodeAssessmentReport({ ...report, outcome: "findings" })).toThrow();
+  expect(() => decodeAssessmentReport({ ...report, outcome: "review-ready" })).toThrow();
+  expect(() =>
+    decodeAssessmentReport({
+      ...report,
+      criterionAssessments: [{ ...criterionAssessment, evidenceIds: [] }],
+    }),
+  ).toThrow();
+  expect(
+    decodeAssessmentReport({
+      ...report,
+      criterionAssessments: [{ ...criterionAssessment, verdict: "not-met", evidenceIds: [] }],
+    }),
+  ).toEqual({
+    ...report,
+    criterionAssessments: [{ ...criterionAssessment, verdict: "not-met", evidenceIds: [] }],
+  });
+});
+it("criterion assessments reject ambiguous identities, unsafe revisions, excess authority and byte overflow", () => {
+  for (const criterionAssessments of [
+    [criterionAssessment, criterionAssessment],
+    [{ ...criterionAssessment, expectedRevision: -1 }],
+    [{ ...criterionAssessment, expectedRevision: Number.MAX_SAFE_INTEGER + 1 }],
+    [{ ...criterionAssessment, evidenceIds: ["parent-evidence", "parent-evidence"] }],
+    [{ ...criterionAssessment, parentTaskId: "caller-selected-parent" }],
+    Array.from({ length: 65 }, (_, i) => ({
+      ...criterionAssessment,
+      criterionId: `criterion-${i}`,
+    })),
+    Array.from({ length: 2 }, (_, i) => ({
+      ...criterionAssessment,
+      criterionId: `criterion-${i}`,
+      detail: "界".repeat(32000),
+    })),
+  ])
+    expect(() => decodeAssessmentReport({ ...reviewProofReport, criterionAssessments })).toThrow();
+});
 const proofHash = "a".repeat(64);
 const reviewCompletionProof = {
   status: "completed",

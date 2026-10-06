@@ -1036,6 +1036,8 @@ export const decideProjectTeamGuidedLifecycle = (
       break;
     }
     case "project-team.assignment.report": {
+      if (intent.criterionAssessments !== undefined)
+        reject("Criterion assessments require a trusted reviewer report");
       const m = membership(task.taskId);
       if (
         m === undefined ||
@@ -1372,6 +1374,8 @@ export const assertProjectTeamGuidedReplayCurrent = (
       reject("Replay descendant control target changed");
   }
   if (input.type === "project-team.assignment.report") {
+    if (input.criterionAssessments !== undefined)
+      reject("Criterion assessments require a trusted reviewer report");
     const plan = state.foundationRecords
       ?.filter(
         (r): r is Plan =>

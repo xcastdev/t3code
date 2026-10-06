@@ -2392,6 +2392,509 @@ const readProposal = (f: Effect.Success<typeof proposalFixture>) =>
     }),
   );
 
+const parentAssessmentFixture = Effect.gen(function* () {
+  const f = yield* proposalFixture;
+  const current = yield* f.state();
+  const criterion = current.criteria.find((c) => c.criterionId === f.selection.criterionIds[0]);
+  if (!criterion || criterion.taskId !== f.selection.taskId)
+    return yield* Effect.die("Missing selected parent criterion");
+  const plan = current.foundationRecords?.find(
+    (r) =>
+      r.kind === "plan-revision" &&
+      r.taskId === criterion.taskId &&
+      r.planRevision === f.target.prepared.manifest.planRevision,
+  );
+  const evidence = {
+    evidenceId: ProjectWorkEvidenceId.make("parent-assessment-note"),
+    taskId: criterion.taskId,
+    criterionId: criterion.criterionId,
+    kind: "observation" as const,
+    summary: "Retained original parent review observation",
+    detail: "The selected criterion was inspected against the original target",
+    recordedAt: at,
+    revision: 0,
+    attribution: f.reportAttribution,
+    scopeHash: projectTeamScopeHash(
+      current,
+      criterion.taskId,
+      plan?.kind === "plan-revision" ? plan : undefined,
+    ),
+  };
+  yield* f.repository.execute({
+    type: "project-work.evidence.add",
+    projectId,
+    commandId: ProjectTeamReviewFindingIntent.fields.commandId.make("parent-assessment-evidence"),
+    evidence,
+    addedAt: at,
+  });
+  const assessment = {
+    criterionId: criterion.criterionId,
+    expectedRevision: criterion.revision,
+    verdict: "met" as const,
+    detail: "Explicit pending assessment of the original criterion",
+    evidenceIds: [evidence.evidenceId],
+  };
+  return { ...f, criterion, parentEvidence: evidence, assessment };
+});
+
+it.effect(
+  "pending criterion assessment retains exact parent snapshots without accepting work",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* parentAssessmentFixture;
+        const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments: [f.assessment],
+        };
+        yield* completionTool(f, report);
+        const retained = yield* readProposal(f);
+        expect(retained?.manifest).toMatchObject({
+          report,
+          criterionAssessments: [
+            {
+              assessmentSha256: digest(canonical(f.assessment)),
+              projectId,
+              taskId: f.selection.taskId,
+              criterion: {
+                id: f.criterion.criterionId,
+                revision: f.criterion.revision,
+                sha256: digest(canonical(f.criterion)),
+              },
+              evidence: [
+                {
+                  id: f.parentEvidence.evidenceId,
+                  taskId: f.selection.taskId,
+                  revision: 0,
+                  sha256: digest(canonical(f.parentEvidence)),
+                },
+              ],
+            },
+          ],
+        });
+        expect(yield* f.state()).toEqual(before);
+        yield* completionTool(f, report);
+        expect(yield* readProposal(f)).toEqual(retained);
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect(
+  "pending criterion assessment denies met with an open critical target finding but retains not-met",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* parentAssessmentFixture;
+        yield* f.repository.execute(yield* f.compile(yield* f.report({ severity: "critical" })));
+        const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments: [f.assessment],
+        };
+        expect((yield* completionTool(f, report).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+        const negative = {
+          ...report,
+          criterionAssessments: [{ ...f.assessment, verdict: "not-met" as const, evidenceIds: [] }],
+        };
+        yield* completionTool(f, negative);
+        expect((yield* readProposal(f))?.manifest.report).toEqual(negative);
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+for (const invalid of [
+  "child-criterion",
+  "revision",
+  "missing-evidence",
+  "duplicate-criterion",
+  "duplicate-evidence",
+  "empty-met",
+  "overflow",
+  "secret",
+] as const) {
+  it.effect(`pending criterion assessment denies ${invalid} without retaining a proposal`, () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* parentAssessmentFixture;
+        const before = yield* f.state();
+        const childCriterion = before.criteria.find((c) => c.taskId === f.running.taskId);
+        if (!childCriterion) return yield* Effect.die("Missing child criterion");
+        const assessment =
+          invalid === "child-criterion"
+            ? { ...f.assessment, criterionId: childCriterion.criterionId }
+            : invalid === "revision"
+              ? { ...f.assessment, expectedRevision: f.assessment.expectedRevision + 1 }
+              : invalid === "missing-evidence"
+                ? { ...f.assessment, evidenceIds: ["missing"] }
+                : invalid === "duplicate-evidence"
+                  ? {
+                      ...f.assessment,
+                      evidenceIds: [...f.assessment.evidenceIds, ...f.assessment.evidenceIds],
+                    }
+                  : invalid === "empty-met"
+                    ? { ...f.assessment, evidenceIds: [] }
+                    : invalid === "overflow"
+                      ? { ...f.assessment, detail: "界".repeat(45000) }
+                      : invalid === "secret"
+                        ? {
+                            ...f.assessment,
+                            detail: "Authorization: Bearer sk-proj-" + "a".repeat(80),
+                          }
+                        : f.assessment;
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments:
+            invalid === "duplicate-criterion" ? [assessment, assessment] : [assessment],
+        };
+        expect((yield* completionTool(f, report).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${report.commandId}`,
+        ).toEqual([{ count: 0 }]);
+      }),
+    ),
+  );
+}
+
+for (const drift of ["task", "criterion", "scope", "detail", "revision"] as const) {
+  it.effect(
+    `pending criterion assessment denies ${drift} evidence drift without refreshing its first snapshot`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const f = yield* parentAssessmentFixture;
+          const before = yield* f.state();
+          const report = {
+            ...f.completionReport,
+            expectedRevision: before.revision,
+            criterionAssessments: [f.assessment],
+          };
+          yield* completionTool(f, report);
+          const retained = yield* readProposal(f);
+          const index = before.evidence.findIndex(
+            (e) => e.evidenceId === f.parentEvidence.evidenceId,
+          );
+          const field =
+            drift === "task"
+              ? "taskId"
+              : drift === "criterion"
+                ? "criterionId"
+                : drift === "scope"
+                  ? "scopeHash"
+                  : drift;
+          const value = drift === "revision" ? 1 : "changed";
+          // Disposable checkpoint corruption tests changed persisted metadata; it grants no production mutation authority.
+          yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${"$.evidence[" + index + "]." + field},${value}) WHERE project_id=${projectId}`;
+          expect((yield* completionTool(f, report).pipe(Effect.result))._tag).toBe("Failure");
+          expect(yield* readProposal(f)).toEqual(retained);
+          expect(
+            yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${report.commandId}`,
+          ).toEqual([{ count: 1 }]);
+        }),
+      ),
+  );
+}
+
+it.effect("pending criterion assessment preserves unassigned parent evidence compatibility", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const f = yield* parentAssessmentFixture;
+      const before = yield* f.state();
+      const index = before.evidence.findIndex((e) => e.evidenceId === f.parentEvidence.evidenceId);
+      // The disposable checkpoint supplies a real scoped parent observation without a criterion-specific assignment.
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_remove(state_json,${"$.evidence[" + index + "].criterionId"}) WHERE project_id=${projectId}`;
+      const report = {
+        ...f.completionReport,
+        expectedRevision: before.revision,
+        criterionAssessments: [f.assessment],
+      };
+      yield* completionTool(f, report);
+      const retained = yield* readProposal(f);
+      expect(retained?.manifest.criterionAssessments?.[0]?.evidence[0]).not.toHaveProperty(
+        "criterionId",
+      );
+      expect(yield* f.state()).toEqual({
+        ...before,
+        evidence: before.evidence.map((entry, position) => {
+          if (position !== index) return entry;
+          const { criterionId: _criterion, ...unassigned } = entry;
+          return unassigned;
+        }),
+      });
+    }),
+  ),
+);
+
+it.effect(
+  "pending criterion assessment preserves an explicit empty list without inferring acceptance",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* proposalFixture;
+        const before = yield* f.state();
+        const report = { ...f.completionReport, criterionAssessments: [] };
+        yield* completionTool(f, report);
+        expect((yield* readProposal(f))?.manifest).toMatchObject({
+          report,
+          criterionAssessments: [],
+        });
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect(
+  "pending criterion assessment requires the captured SQL transaction and original host context",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* parentAssessmentFixture;
+        const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments: [f.assessment],
+        };
+        const compile = () => f.proposals.compile(f.principal, report, f.reportAttribution);
+        expect(
+          (yield* compile().pipe(
+            Effect.provideService(ProjectTeamReviewReportOperation, f.operation),
+            Effect.result,
+          ))._tag,
+        ).toBe("Failure");
+        expect((yield* f.sql.withTransaction(compile()).pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              compile().pipe(
+                Effect.provideService(ProjectTeamReviewReportOperation, f.operation),
+                Effect.updateContext((context: Context.Context<never>) =>
+                  Context.omit(SqlClient.SqlClient)(context),
+                ),
+              ),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              compile().pipe(
+                Effect.provideService(ProjectTeamReviewReportOperation, {
+                  ...f.operation,
+                  workerId: "foreign-worker",
+                }),
+              ),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect(
+  "pending criterion assessment duplicate validation rejects sensitive retained detail even with coherent hashes",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* parentAssessmentFixture;
+        const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments: [f.assessment],
+        };
+        yield* completionTool(f, report);
+        const retained = yield* readProposal(f);
+        const snapshot = retained?.manifest.criterionAssessments?.[0];
+        if (!retained || !snapshot) return yield* Effect.die("Missing assessment snapshot");
+        const assessment = {
+          ...f.assessment,
+          detail: "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+        };
+        const sensitive = { ...report, criterionAssessments: [assessment] };
+        const manifest = {
+          ...retained.manifest,
+          report: sensitive,
+          criterionAssessments: [{ ...snapshot, assessmentSha256: digest(canonical(assessment)) }],
+        };
+        const json = canonical(manifest);
+        // Only disposable corruption bypasses immutability; coherent hashes are not a content-safety grant.
+        yield* f.sql`DROP TRIGGER project_team_review_completion_proposal_immutable`;
+        yield* f.sql`UPDATE project_team_review_completion_proposal SET manifest_json=${json},sha256=${digest(json)}`;
+        expect((yield* readProposal(f))?.manifest).toEqual(manifest);
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              f.proposals
+                .validate(f.principal, sensitive, f.reportAttribution, { duplicate: true })
+                .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${report.commandId}`,
+        ).toEqual([{ count: 1 }]);
+      }),
+    ),
+);
+
+it.effect(
+  "pending criterion assessment captures caller input before awaiting original authority and exact retry survives unrelated revision",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* parentAssessmentFixture;
+        const auth = yield* ProjectTeamAuthorization;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const proposals = yield* makeProjectTeamReviewCompletionProposals((principal) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return yield* auth.resolve(principal);
+          }),
+        );
+        const before = yield* f.state();
+        const assessment = { ...f.assessment, evidenceIds: [...f.assessment.evidenceIds] };
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments: [assessment],
+        };
+        const original = structuredClone(report);
+        const pending = proposals.compile(f.principal, report, f.reportAttribution);
+        const fiber = yield* f.sql
+          .withTransaction(
+            pending.pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        assessment.detail = "Changed after the first await";
+        assessment.evidenceIds[0] = ProjectWorkEvidenceId.make("foreign-after-await");
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(fiber);
+        const retained = yield* readProposal(f);
+        expect(retained?.manifest.report).toEqual(original);
+        expect(yield* f.state()).toEqual(before);
+        yield* f.repository.execute({
+          type: "project-work.task.create",
+          projectId,
+          taskId: ProjectTeamReviewFindingIntent.fields.taskId.make("assessment-unrelated"),
+          commandId: ProjectTeamReviewFindingIntent.fields.commandId.make(
+            "assessment-unrelated-create",
+          ),
+          title: "Unrelated work",
+          createdAt: at,
+        });
+        yield* f.sql.withTransaction(
+          f.proposals
+            .compile(f.principal, original, f.reportAttribution)
+            .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+        );
+        expect(yield* readProposal(f)).toEqual(retained);
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              f.proposals
+                .compile(f.principal, report, f.reportAttribution)
+                .pipe(Effect.provideService(ProjectTeamReviewReportOperation, f.operation)),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+
+for (const contradiction of [
+  "missing",
+  "report-detail",
+  "parent",
+  "target",
+  "criterion",
+  "revision",
+  "evidence",
+  "evidence-owner",
+  "evidence-criterion",
+  "evidence-scope",
+] as const) {
+  it.effect(
+    `pending criterion assessment retained reader denies ${contradiction} intrinsic contradiction`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const f = yield* parentAssessmentFixture;
+          const before = yield* f.state();
+          const report = {
+            ...f.completionReport,
+            expectedRevision: before.revision,
+            criterionAssessments: [f.assessment],
+          };
+          yield* completionTool(f, report);
+          const retained = yield* readProposal(f);
+          const snapshot = retained?.manifest.criterionAssessments?.[0];
+          const evidence = snapshot?.evidence[0];
+          if (!retained || !snapshot || !evidence)
+            return yield* Effect.die("Missing retained assessment");
+          const changed =
+            contradiction === "parent"
+              ? { ...snapshot, taskId: "foreign" }
+              : contradiction === "target"
+                ? { ...snapshot, target: { ...snapshot.target, headSha: "foreign" } }
+                : contradiction === "criterion"
+                  ? { ...snapshot, criterion: { ...snapshot.criterion, id: "foreign" } }
+                  : contradiction === "revision"
+                    ? {
+                        ...snapshot,
+                        criterion: {
+                          ...snapshot.criterion,
+                          revision: snapshot.criterion.revision + 1,
+                        },
+                      }
+                    : contradiction === "evidence"
+                      ? { ...snapshot, evidence: [{ ...evidence, id: "foreign" }] }
+                      : contradiction === "evidence-owner"
+                        ? { ...snapshot, evidence: [{ ...evidence, taskId: "foreign" }] }
+                        : contradiction === "evidence-criterion"
+                          ? { ...snapshot, evidence: [{ ...evidence, criterionId: "foreign" }] }
+                          : contradiction === "evidence-scope"
+                            ? { ...snapshot, evidence: [{ ...evidence, scopeHash: "foreign" }] }
+                            : snapshot;
+          const manifest = {
+            ...retained.manifest,
+            ...(contradiction === "report-detail"
+              ? {
+                  report: {
+                    ...report,
+                    criterionAssessments: [
+                      { ...f.assessment, detail: "Different persisted judgment" },
+                    ],
+                  },
+                }
+              : {}),
+            criterionAssessments: contradiction === "missing" ? [] : [changed],
+          };
+          const json = canonical(manifest);
+          // Deliberately bypass only immutability in disposable SQL; recomputed whole-manifest hash must not hide contradictory linkage.
+          yield* f.sql`DROP TRIGGER project_team_review_completion_proposal_immutable`;
+          yield* f.sql`UPDATE project_team_review_completion_proposal SET manifest_json=${json},sha256=${digest(json)}`;
+          expect((yield* readProposal(f).pipe(Effect.result))._tag).toBe("Failure");
+          expect(yield* f.state()).toEqual(before);
+        }),
+      ),
+  );
+}
+
 it.effect(
   "actual report tool commits only a pending proposal and zero-event receipt; exact retry survives unrelated project revision",
   () =>
@@ -2815,21 +3318,26 @@ it.effect(
 );
 
 it.effect(
-  "proposal insertion failure rolls back the public receipt and leaves an exact original retry available",
+  "pending criterion assessment insertion failure rolls back the public receipt and leaves exact retry available",
   () =>
     scopedGateway(
       Effect.gen(function* () {
-        const f = yield* proposalFixture;
+        const f = yield* parentAssessmentFixture;
         const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments: [f.assessment],
+        };
         yield* f.sql`CREATE TRIGGER reject_pending_proposal BEFORE INSERT ON project_team_review_completion_proposal BEGIN SELECT RAISE(ABORT,'controlled proposal storage failure'); END`;
-        expect((yield* completionTool(f).pipe(Effect.exit))._tag).toBe("Failure");
+        expect((yield* completionTool(f, report).pipe(Effect.exit))._tag).toBe("Failure");
         expect(yield* readProposal(f)).toBeUndefined();
         expect(yield* f.state()).toEqual(before);
         expect(
           yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
         ).toEqual([{ count: 0 }]);
         yield* f.sql`DROP TRIGGER reject_pending_proposal`;
-        yield* completionTool(f);
+        yield* completionTool(f, report);
         expect(yield* readProposal(f)).toBeDefined();
         expect(yield* f.state()).toEqual(before);
       }),
@@ -2837,20 +3345,25 @@ it.effect(
 );
 
 it.effect(
-  "failed owning COMMIT exposes no successful proposal receipt or public state before owned test cleanup",
+  "pending criterion assessment failed owning COMMIT exposes no successful receipt or public state before cleanup",
   () =>
     scopedGateway(
       Effect.gen(function* () {
-        const f = yield* proposalFixture;
+        const f = yield* parentAssessmentFixture;
         const gateway = yield* ProjectWorkGateway;
         const query = yield* ProjectWorkQuery;
         const before = yield* f.state();
+        const report = {
+          ...f.completionReport,
+          expectedRevision: before.revision,
+          criterionAssessments: [f.assessment],
+        };
         yield* f.sql`CREATE TABLE proposal_commit_parent(id TEXT PRIMARY KEY)`;
         yield* f.sql`CREATE TABLE proposal_commit_child(id TEXT REFERENCES proposal_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER proposal_commit_failure AFTER INSERT ON project_team_review_completion_proposal BEGIN INSERT INTO proposal_commit_child VALUES ('missing'); END`;
         let escaped = false;
         expect(
-          (yield* completionTool(f).pipe(
+          (yield* completionTool(f, report).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
                 escaped = true;
@@ -2883,7 +3396,7 @@ it.effect(
           yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
         ).toEqual([{ count: 0 }]);
         yield* f.sql`DROP TRIGGER proposal_commit_failure`;
-        yield* completionTool(f);
+        yield* completionTool(f, report);
         expect(yield* readProposal(f)).toBeDefined();
       }),
     ),

@@ -504,6 +504,57 @@ describe("guided lifecycle", () => {
       }),
     ).toThrow(/Dependency is ineligible/);
   });
+  it("ordinary reports cannot silently consume criterion assessments", () => {
+    const state = investigate();
+    const child = state.tasks.find((task) => task.taskId !== taskId)!;
+    const assignment = state.foundationRecords!.find(
+      (record) => record.kind === "task-membership" && record.taskId === child.taskId,
+    )!;
+    const criterion = state.criteria.find((entry) => entry.taskId === child.taskId)!;
+    const intent: Extract<ProjectTeamGuidedIntent, { type: "project-team.assignment.report" }> = {
+      ...envelope(state, "ordinary-assessment-report", child.taskId),
+      type: "project-team.assignment.report",
+      specRevision: child.specRevision,
+      planRevision: 0,
+      assignmentId: assignment.recordId,
+      expectedAssignmentRevision: assignment.revision,
+      summary: "Retained investigation output",
+      evidenceIds: [],
+      outputArtifactIds: [],
+      outputs: [
+        {
+          criterionId: criterion.criterionId,
+          kind: "observation",
+          detail: "Retained causal observations",
+        },
+      ],
+      outcome: "complete",
+    };
+    expect(run(state, intent).tasks.find((task) => task.taskId === child.taskId)?.state).toBe(
+      "completed",
+    );
+    const before = canonicalProjectWorkPayload(state);
+    for (const criterionAssessments of [
+      [],
+      [
+        {
+          criterionId: criterion.criterionId,
+          expectedRevision: criterion.revision,
+          verdict: "met" as const,
+          detail: "A caller-provided judgment",
+          evidenceIds: ["claimed-parent-evidence"],
+        },
+      ],
+    ]) {
+      expect(() => run(state, { ...intent, criterionAssessments })).toThrow(
+        "Criterion assessments require a trusted reviewer report",
+      );
+      expect(() =>
+        assertProjectTeamGuidedReplayCurrent(state, { ...intent, criterionAssessments }, []),
+      ).toThrow("Criterion assessments require a trusted reviewer report");
+      expect(canonicalProjectWorkPayload(state)).toBe(before);
+    }
+  });
   it("requires actual retained current outputs for non-code completion without fabricated Git proof", () => {
     let state = investigate();
     const child = state.tasks.find((t) => t.taskId !== taskId)!;
