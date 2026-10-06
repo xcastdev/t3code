@@ -91,6 +91,14 @@ const decodeControlledJson = Schema.decodeUnknownEffect(
   strict,
 );
 const decodeControlledRelationship = Schema.decodeUnknownEffect(ProjectWorkRelationship, strict);
+const decodeVerificationIntent = Schema.decodeUnknownEffect(
+  ProjectWorkVerificationExecutionIntent,
+  strict,
+);
+const decodeStoredVerificationIntent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectWorkVerificationExecutionIntent),
+  strict,
+);
 const input = () =>
   decodeIntent({
     type: "project-team.review.finding.record",
@@ -2185,14 +2193,8 @@ it.effect("completed assessment qualification binds the original human verificat
       const rows = yield* f.sql<{
         intent_json: string;
       }>`SELECT intent_json FROM project_work_verification_execution WHERE job_id=${f.selection.jobId}`;
-      const original = yield* Schema.decodeUnknownEffect(
-        Schema.fromJsonString(ProjectWorkVerificationExecutionIntent),
-        strict,
-      )(rows[0]?.intent_json);
-      const changed = yield* Schema.decodeUnknownEffect(
-        ProjectWorkVerificationExecutionIntent,
-        strict,
-      )({
+      const original = yield* decodeStoredVerificationIntent(rows[0]?.intent_json);
+      const changed = yield* decodeVerificationIntent({
         ...original,
         gate: { ...original.gate, recordId: "different-human-approval" },
       });
