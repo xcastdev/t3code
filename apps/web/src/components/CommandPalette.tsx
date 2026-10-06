@@ -1,5 +1,8 @@
 "use client";
 
+import { ProjectWorkShortcut } from "./ProjectWorkShortcut";
+import { useProjectWorkTarget } from "../hooks/useProjectWorkTarget";
+
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 
@@ -543,6 +546,11 @@ export function CommandPalette({ children }: { children: ReactNode }) {
 
   return (
     <ComposerHandleContext value={composerHandleRef}>
+      <ProjectWorkShortcut
+        paletteOpen={state.open}
+        terminalOpen={terminalOpen}
+        previewOpen={previewOpen}
+      />
       <CommandDialog
         open={state.open}
         onOpenChange={(open, eventDetails) => {
@@ -623,6 +631,7 @@ function OpenCommandPaletteDialog(props: {
   readonly clearOpenIntent: () => void;
 }) {
   const navigate = useNavigate();
+  const workTarget = useProjectWorkTarget();
   const pathname = useLocation({ select: (location) => location.pathname });
   const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
   const [query, setQuery] = useState(openIntent?.kind === "search" ? openIntent.query : "");
@@ -1865,6 +1874,24 @@ function OpenCommandPaletteDialog(props: {
     },
   });
 
+  if (workTarget) {
+    const group = projectGroupByTargetKey.get(
+      `${workTarget.environmentId}:${workTarget.projectId}`,
+    );
+    actionItems.push({
+      kind: "action",
+      value: "action:project-work",
+      searchTerms: ["work", "tasks", "knowledge", "durable", "project"],
+      title: "Open Work",
+      description: group?.displayName,
+      icon: <ListTodoIcon className={ITEM_ICON_CLASS} />,
+      shortcutCommand: "projectWork.open",
+      run: async () => {
+        await navigate({ to: "/work/$environmentId/$projectId", params: workTarget });
+      },
+    });
+  }
+
   // Target the active thread or draft's project, falling back to the first sidebar group.
   const contextualProjectGroup =
     (contextualProjectRef
@@ -1875,34 +1902,6 @@ function OpenCommandPaletteDialog(props: {
     projectGroups[0] ??
     null;
   if (contextualProjectGroup) {
-    const workProject =
-      (contextualProjectRef &&
-        contextualProjectGroup.memberProjects.find(
-          (member) =>
-            member.environmentId === contextualProjectRef.environmentId &&
-            member.id === contextualProjectRef.projectId,
-        )) ??
-      contextualProjectGroup.memberProjects[0];
-    if (workProject) {
-      actionItems.push({
-        kind: "action",
-        value: "action:project-work",
-        searchTerms: ["work", "tasks", "knowledge", "durable", "project"],
-        title: "Open Work",
-        description: contextualProjectGroup.displayName,
-        icon: <ListTodoIcon className={ITEM_ICON_CLASS} />,
-        shortcutCommand: "projectWork.open",
-        run: async () => {
-          await navigate({
-            to: "/work/$environmentId/$projectId",
-            params: {
-              environmentId: workProject.environmentId,
-              projectId: workProject.id,
-            },
-          });
-        },
-      });
-    }
     actionItems.push({
       kind: "action",
       value: "action:project-settings",
