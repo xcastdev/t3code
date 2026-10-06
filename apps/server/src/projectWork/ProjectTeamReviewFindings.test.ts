@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Disposable SDK JSONL is the retained observation under test.
-import { expect, it } from "@effect/vitest";
+import { expect, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -16,6 +16,7 @@ import * as DateTime from "effect/DateTime";
 import * as Clock from "effect/Clock";
 import {
   canonicalProjectWorkPayload,
+  GitCommandError,
   ProjectTeamReviewFindingIntent,
   ProjectTeamReviewFindingProvenance,
   ProjectTeamRecord,
@@ -48,6 +49,13 @@ import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamReviewCompletion } from "./ProjectTeamReviewCompletion.ts";
+import {
+  makeProjectTeamReviewCurrentTarget,
+  ProjectTeamReviewCurrentTarget,
+} from "./ProjectTeamReviewCurrentTarget.ts";
+import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import * as ManagedGit from "../git/ManagedGitExecution.ts";
+import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import { snapshotReviewCriterionAssessments } from "./ProjectTeamReviewCriterionAssessments.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import {
@@ -57,7 +65,10 @@ import {
 } from "./ProjectWorkVerificationGate.ts";
 import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
 import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
-import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
+import {
+  makeProjectTeamDispatchJournal,
+  ProjectTeamWorkspaceReceipt,
+} from "./ProjectTeamDispatchJournal.ts";
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
@@ -91,6 +102,10 @@ const decodeControlledJson = Schema.decodeUnknownEffect(
   strict,
 );
 const decodeControlledRelationship = Schema.decodeUnknownEffect(ProjectWorkRelationship, strict);
+const decodeControlledWorkspace = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectTeamWorkspaceReceipt),
+  strict,
+);
 const decodeVerificationIntent = Schema.decodeUnknownEffect(
   ProjectWorkVerificationExecutionIntent,
   strict,
@@ -1841,6 +1856,7 @@ const makeConsumedReviewFixture = (
     readonly criticalFinding?: boolean;
     readonly referencedEvidence?: boolean;
     readonly parentAssessment?: boolean | "empty";
+    readonly withoutCurrentTarget?: boolean;
     readonly assessmentVerdict?: "met" | "not-met";
     readonly verificationOutcome?: "success" | "failed";
   } = {},
@@ -2045,10 +2061,87 @@ const makeConsumedReviewFixture = (
     });
     const originalReceipt = yield* sessions.readAssignment(f.proposalSnapshot);
     if (!originalReceipt) return yield* Effect.die("Missing full original assignment receipt");
-    const consumer = yield* makeProjectTeamReviewCompletion({
+    const job = f.target.prepared.manifest;
+    const implementationBinding = (yield* f.state()).foundationRecords?.find(
+      (record) => record.kind === "run-binding" && record.recordId === job.bindingId,
+    );
+    if (implementationBinding?.kind !== "run-binding")
+      return yield* Effect.die("Missing original target binding");
+    const workspaceRows = yield* f.sql<{
+      receipt_json: string;
+    }>`SELECT receipt_json FROM project_team_workspace_receipt WHERE dispatch_id=${job.dispatchId} LIMIT 2`;
+    if (workspaceRows.length !== 1) return yield* Effect.die("Missing original target workspace");
+    const workspace = yield* decodeControlledWorkspace(workspaceRows[0]!.receipt_json);
+    const registry = yield* makeProjectTeamPiRuntime();
+    yield* registry.publishAssets(
+      implementationBinding.providerInstanceId,
+      {
+        runtimeFiles: [],
+        revalidate: Effect.void,
+        borrow: (effect) => effect,
+      },
+      {
+        inspect: Effect.die("Unexpected runtime inspection"),
+        prepareOperation: () => Effect.die("Unexpected native preparation"),
+        readSession: () => Effect.die("Unexpected native session read"),
+        readThread: () => Effect.die("Unexpected native thread read"),
+        requestStop: () => Effect.die("Unexpected native stop"),
+        stopAll: Effect.die("Unexpected native stop"),
+        authorizeSkills: () => Effect.die("Unexpected native skill authorization"),
+        discoverNativeSkills: () => Effect.die("Unexpected native skill discovery"),
+      },
+    );
+    const targetObservation: ManagedGit.ManagedVerificationTarget = {
+      receipt: workspace,
+      cwd: job.target.worktree,
+      baseSha: job.target.baseSha,
+      headSha: job.target.headSha,
+      testedCommit: job.target.testedCommit,
+      testedTree: job.target.testedTree,
+    };
+    const targetControl = {
+      calls: 0,
+      driftAt: 0,
+      postFailureAt: 0,
+      permits: 0,
+      insidePermit: false,
+    };
+    const makeTarget = makeProjectTeamReviewCurrentTarget({
+      environmentId: "environment",
+    });
+    const targetService = yield* Effect.gen(function* () {
+      return yield* makeTarget;
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(ProjectTeamPiRuntime, registry),
+          Layer.mock(GitWorkflowService, {
+            withRepositoryPermit: (_operation, cwd, effect) =>
+              Effect.gen(function* () {
+                expect((yield* Effect.serviceOption(f.sql.transactionService))._tag).toBe("None");
+                expect(cwd).toBe(workspace.assignment.primaryRoot);
+                expect(targetControl.insidePermit).toBe(false);
+                targetControl.permits++;
+                targetControl.insidePermit = true;
+                return yield* effect.pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      targetControl.insidePermit = false;
+                    }),
+                  ),
+                );
+              }),
+          }),
+        ),
+      ),
+    );
+    const makeConsumer = makeProjectTeamReviewCompletion({
       environmentId: "environment",
       maximumEnvironmentModelCalls: 128,
     });
+    const consumer = yield* Effect.gen(function* () {
+      return yield* makeConsumer;
+    }).pipe(Effect.provideService(ProjectTeamReviewCurrentTarget, targetService));
     const joined = {
       receiptId: "review-original-joined",
       stage: "settled" as const,
@@ -2077,11 +2170,57 @@ const makeConsumedReviewFixture = (
         }),
       ),
     };
-    const prepare = () => f.sql.withTransaction(consumer.prepare(f.proposalSnapshot, joined));
+    const withTarget = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // Both native entry points are intercepted: this token intentionally has no private branding or filesystem authority.
+          const controlledContext = {} as ManagedGit.ManagedGitExecution;
+          const make = vi.spyOn(ManagedGit, "make").mockImplementation(() => {
+            expect(targetControl.insidePermit).toBe(true);
+            return Effect.succeed(controlledContext);
+          });
+          const controlledRead: typeof ManagedGit.withManagedVerificationTarget = (_context, use) =>
+            Effect.gen(function* () {
+              expect(targetControl.insidePermit).toBe(true);
+              expect((yield* Effect.serviceOption(f.sql.transactionService))._tag).toBe("Some");
+              const call = ++targetControl.calls;
+              const result = yield* use(
+                call === targetControl.driftAt
+                  ? { ...targetObservation, headSha: "f".repeat(40) }
+                  : targetObservation,
+              );
+              if (call === targetControl.postFailureAt)
+                return yield* new GitCommandError({
+                  operation: "ControlledReviewTarget",
+                  command: "/usr/bin/git",
+                  cwd: job.target.worktree,
+                  detail: "Controlled post-callback target drift",
+                });
+              return result;
+            });
+          const read = vi
+            .spyOn(ManagedGit, "withManagedVerificationTarget")
+            .mockImplementation(controlledRead);
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              read.mockRestore();
+              make.mockRestore();
+            }),
+          );
+          return yield* targetService.withOriginalTarget(f.proposalSnapshot, joined, effect);
+        }),
+      );
+    const prepare = () =>
+      options.withoutCurrentTarget
+        ? f.sql.withTransaction(consumer.prepare(f.proposalSnapshot, joined))
+        : withTarget(f.sql.withTransaction(consumer.prepare(f.proposalSnapshot, joined)));
     return {
       ...f,
       completionReport,
       consumer,
+      targetService,
+      targetControl,
+      withTarget,
       prepare,
       joined,
       originalReceipt,
@@ -2092,6 +2231,170 @@ const makeConsumedReviewFixture = (
     };
   });
 const consumedReviewFixture = makeConsumedReviewFixture();
+it.effect("current review target denies assessment completion without a concrete target loan", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({
+        parentAssessment: true,
+        verificationOutcome: "success",
+        withoutCurrentTarget: true,
+      });
+      const before = yield* f.state();
+      const retained = yield* readProposal(f);
+      expect(retained?.manifest.criterionAssessments).toHaveLength(1);
+      expect((yield* f.prepare().pipe(Effect.result))._tag).toBe("Failure");
+      expect(yield* readProposal(f)).toEqual(retained);
+      expect(yield* f.state()).toEqual(before);
+    }),
+  ),
+);
+it.effect(
+  "current review target qualifies the actual joined settlement and replays without a new host loan",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const before = yield* f.state();
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          // Retained SQL/custody fixtures control stage verification; no Host/native drain proof is claimed.
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        const settled = yield* f.state();
+        expect(settled.tasks.find((task) => task.taskId === f.running.taskId)?.state).toBe(
+          "completed",
+        );
+        expect(settled.tasks.find((task) => task.taskId === f.selection.taskId)).toEqual(
+          before.tasks.find((task) => task.taskId === f.selection.taskId),
+        );
+        expect(
+          settled.criteria.filter((criterion) => criterion.taskId === f.selection.taskId),
+        ).toEqual(before.criteria.filter((criterion) => criterion.taskId === f.selection.taskId));
+        expect(f.targetControl.calls).toBe(2);
+        expect(f.targetControl.permits).toBe(1);
+        yield* TestClock.setTime(Date.parse("2030-01-01T00:00:00.000Z") + 1);
+        expect(
+          (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)))
+            .duplicate,
+        ).toBe(true);
+        expect(f.targetControl.calls).toBe(2);
+        expect(f.targetControl.permits).toBe(1);
+        expect(yield* f.state()).toEqual(settled);
+      }),
+    ),
+);
+
+it.effect("current review target requires its final hook before advancing the original stage", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({
+        parentAssessment: true,
+        verificationOutcome: "success",
+      });
+      const before = yield* f.state();
+      const history = yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId);
+      const journal = yield* makeProjectTeamDispatchJournal({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 128,
+        verifyStage: () => Effect.void,
+        verifySettlement: () => Effect.void,
+        prepareReviewCompletion: f.consumer.prepare,
+      });
+      expect(
+        (yield* f
+          .withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined))
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.journal.readRetained(f.proposalSnapshot.fence.dispatchId)).toEqual(
+        f.proposalSnapshot,
+      );
+      expect(yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId)).toEqual(
+        history,
+      );
+      expect(yield* f.state()).toEqual(before);
+    }),
+  ),
+);
+
+it.effect(
+  "current review target observed commit mismatch denies qualification without accepting the parent",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const before = yield* f.state();
+        f.targetControl.driftAt = 1;
+        expect(yield* f.prepare()).toMatchObject({ status: "denied", reason: "stale-proof" });
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect(
+  "current review target postprojection native failure rolls back the joined settlement and exact retry remains",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const before = yield* f.state();
+        const history = yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: (snapshot, receipt) =>
+            Effect.gen(function* () {
+              expect(
+                (yield* f.state()).tasks.find((task) => task.taskId === f.running.taskId)?.state,
+              ).toBe("completed");
+              yield* f.targetService.assertOriginalInTransaction(snapshot, receipt);
+            }),
+        });
+        f.targetControl.postFailureAt = 2;
+        let escaped = false;
+        expect(
+          (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                escaped = true;
+              }),
+            ),
+            Effect.result,
+          ))._tag,
+        ).toBe("Failure");
+        expect(escaped).toBe(false);
+        expect(f.targetControl.calls).toBe(2);
+        expect(yield* f.state()).toEqual(before);
+        expect(yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId)).toEqual(
+          history,
+        );
+        expect(yield* f.journal.readRetained(f.proposalSnapshot.fence.dispatchId)).toEqual(
+          f.proposalSnapshot,
+        );
+        f.targetControl.postFailureAt = 0;
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        expect(
+          (yield* f.state()).tasks.find((task) => task.taskId === f.running.taskId)?.state,
+        ).toBe("completed");
+      }),
+    ),
+);
 it.effect(
   "completed assessment qualification denies a missing verification result without changing work",
   () =>
@@ -2261,9 +2564,11 @@ it.effect(
           verifyStage: () => Effect.void,
           verifySettlement: () => Effect.void,
           prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
         });
         expect(
-          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).fence.stage,
+          (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined))).fence
+            .stage,
         ).toBe("settled");
         const after = yield* f.state();
         expect(after.tasks.find((t) => t.taskId === f.running.taskId)?.state).toBe("completed");
@@ -2274,7 +2579,8 @@ it.effect(
           before.criteria.filter((c) => c.taskId === f.selection.taskId),
         );
         expect(
-          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).duplicate,
+          (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)))
+            .duplicate,
         ).toBe(true);
         expect(yield* f.state()).toEqual(after);
       }),
@@ -2689,9 +2995,10 @@ it.effect(
               yield* f.sql`DROP TABLE project_team_mailbox_input`;
               return yield* f.consumer.prepare(snapshot, receipt);
             }),
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
         });
-        const result = yield* broken
-          .settleAfterJoined(f.proposalSnapshot.fence, f.joined)
+        const result = yield* f
+          .withTarget(broken.settleAfterJoined(f.proposalSnapshot.fence, f.joined))
           .pipe(Effect.result);
         expect(result._tag).toBe("Failure");
         if (result._tag === "Failure")
@@ -2712,9 +3019,11 @@ it.effect(
           verifyStage: () => Effect.void,
           verifySettlement: () => Effect.void,
           prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
         });
         expect(
-          (yield* retry.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).fence.stage,
+          (yield* f.withTarget(retry.settleAfterJoined(f.proposalSnapshot.fence, f.joined))).fence
+            .stage,
         ).toBe("settled");
         expect((yield* f.state()).tasks.find((t) => t.taskId === f.running.taskId)?.state).toBe(
           "completed",
@@ -2743,13 +3052,14 @@ it.effect(
           verifyStage: () => Effect.void,
           verifySettlement: () => Effect.void,
           prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
         });
         yield* f.sql`CREATE TABLE completion_commit_parent(id TEXT PRIMARY KEY)`;
         yield* f.sql`CREATE TABLE completion_commit_child(id TEXT REFERENCES completion_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER completion_commit_failure AFTER INSERT ON project_work_events BEGIN INSERT INTO completion_commit_child VALUES ('missing'); END`;
         let escaped = false;
         expect(
-          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined).pipe(
+          (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
                 escaped = true;
@@ -2783,7 +3093,8 @@ it.effect(
         );
         yield* f.sql`DROP TRIGGER completion_commit_failure`;
         expect(
-          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).fence.stage,
+          (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined))).fence
+            .stage,
         ).toBe("settled");
         expect(
           (yield* query.snapshot(projectId)).tasks.find((t) => t.taskId === f.running.taskId)

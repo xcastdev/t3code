@@ -267,10 +267,16 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       snapshot: ProjectTeamDispatchSnapshot,
       receipt: ProjectTeamDispatchStageReceipt,
     ) => Effect.Effect<ProjectTeamReviewCompletionProof | undefined, E, R>;
+    /** Recheck the original assessment target after domain projection, before COMMIT. */
+    readonly verifyReviewTarget?: (
+      snapshot: ProjectTeamDispatchSnapshot,
+      receipt: ProjectTeamDispatchStageReceipt,
+    ) => Effect.Effect<void, E, R>;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const repository = yield* ProjectWorkRepository;
     const prepareReviewCompletion = options.prepareReviewCompletion;
+    const verifyReviewTarget = options.verifyReviewTarget;
     const environmentId = yield* decodeEnvironment(options.environmentId);
     const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
     const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
@@ -1528,6 +1534,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
             "Joined settlement physical task or attempt disagrees with domain state",
           );
       });
+      let reviewTargetSnapshot: ProjectTeamDispatchSnapshot | undefined;
       yield* repository.executeAtomic(
         Effect.gen(function* () {
           const original = yield* read(expected.dispatchId);
@@ -1559,6 +1566,15 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
                   { fence: fence(original.row), intent: original.intent },
                   receipt,
                 );
+          if (
+            reviewCompletion?.status === "completed" &&
+            reviewCompletion.report.type === "project-team.assignment.report" &&
+            reviewCompletion.report.criterionAssessments !== undefined
+          ) {
+            if (verifyReviewTarget === undefined)
+              return yield* deny("Assessment settlement requires current target verification");
+            reviewTargetSnapshot = { fence: fence(original.row), intent: original.intent };
+          }
           settled = yield* advanceStage(expected, receipt);
           const at = time(yield* Clock.currentTimeMillis);
           const command: typeof ProjectWorkFoundationCommitCommand.Type = {
@@ -1604,7 +1620,13 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           };
           return [command];
         }),
-        assertDomainSettled,
+        assertDomainSettled.pipe(
+          Effect.andThen(() =>
+            reviewTargetSnapshot === undefined || verifyReviewTarget === undefined
+              ? Effect.void
+              : verifyReviewTarget(reviewTargetSnapshot, receipt),
+          ),
+        ),
       );
       if (settled === undefined)
         return yield* deny("Joined settlement returned no durable receipt");

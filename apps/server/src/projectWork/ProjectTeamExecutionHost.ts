@@ -38,6 +38,10 @@ import {
 import { makeProjectTeamRecovery } from "./ProjectTeamRecovery.ts";
 import { makeProjectTeamReviewCompletion } from "./ProjectTeamReviewCompletion.ts";
 import {
+  makeProjectTeamReviewCurrentTarget,
+  ProjectTeamReviewCurrentTarget,
+} from "./ProjectTeamReviewCurrentTarget.ts";
+import {
   makeProjectTeamSessionReceipts,
   type ProjectTeamInitializationReceipt,
   type ProjectTeamAssignmentReceipt,
@@ -331,13 +335,20 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       if (!same(input.evidence, expected))
         return yield* denied("Stage evidence differs from retained physical receipts");
     });
-    const reviewCompletion = yield* makeProjectTeamReviewCompletion({
+    const currentTarget = yield* makeProjectTeamReviewCurrentTarget({
+      environmentId: options.environmentId,
+    });
+    const reviewCompletionFactory = makeProjectTeamReviewCompletion({
       environmentId: options.environmentId,
       maximumEnvironmentModelCalls: options.maximumEnvironmentModelCalls,
     });
+    const reviewCompletion = yield* Effect.gen(function* () {
+      return yield* reviewCompletionFactory;
+    }).pipe(Effect.provideService(ProjectTeamReviewCurrentTarget, currentTarget));
     const journal: Journal = yield* makeProjectTeamDispatchJournal({
       ...options,
       prepareReviewCompletion: reviewCompletion.prepare,
+      verifyReviewTarget: currentTarget.assertOriginalInTransaction,
       verifyStage: (receipt, snapshot) =>
         boundary(verifyStage(receipt, snapshot)).pipe(Effect.provideService(Scope.Scope, scope)),
       verifySettlement: (receipt, snapshot) =>
@@ -572,14 +583,19 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       yield* owned(owner);
       const snapshot = yield* journal.readRetained(owner.snapshot.fence.dispatchId);
       owner.snapshot = snapshot;
-      owner.snapshot = yield* journal.settleAfterJoined(snapshot.fence, {
+      const joined = {
         receiptId: projectTeamDerivedRecordId(
           snapshot.fence.dispatchId,
           `joined:${snapshot.fence.claimGeneration}`,
         ),
-        stage: "settled",
+        stage: "settled" as const,
         evidence,
-      });
+      };
+      owner.snapshot = yield* currentTarget.withOriginalTarget(
+        snapshot,
+        joined,
+        journal.settleAfterJoined(snapshot.fence, joined),
+      );
     });
     const stopAndJoin = Effect.fn("ProjectTeamExecutionHost.stopAndJoin")(function* (owner: Owner) {
       const outcome = yield* joinCleanup(owner);

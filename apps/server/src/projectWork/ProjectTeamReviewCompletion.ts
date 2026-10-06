@@ -20,6 +20,7 @@ import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts"
 import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
 import { makeProjectWorkVerificationResultReader } from "./ProjectWorkVerificationExecutionJournal.ts";
 import { snapshotReviewCriterionAssessments } from "./ProjectTeamReviewCriterionAssessments.ts";
+import { ProjectTeamReviewCurrentTarget } from "./ProjectTeamReviewCurrentTarget.ts";
 import {
   evaluateProjectTeamDependency,
   projectTeamDerivedRecordId,
@@ -161,6 +162,7 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
       environmentId: options.environmentId,
     });
     const sessions = yield* makeProjectTeamSessionReceipts(options);
+    const currentTarget = yield* Effect.serviceOption(ProjectTeamReviewCurrentTarget);
     const verificationResults = yield* makeProjectWorkVerificationResultReader({
       environmentId: options.environmentId,
     });
@@ -474,6 +476,24 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
         );
         if (assessments === undefined || !same(assessments, manifest.criterionAssessments))
           return yield* deny("stale-proof");
+        if (Option.isNone(currentTarget))
+          return yield* fail("Current review target service is unavailable");
+        const targetCurrent = yield* currentTarget.value
+          .assertInTransaction({
+            snapshot: original,
+            jobId: manifest.prepared.jobId,
+            manifestHash: target.prepared.sha256,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catchTag("ProjectTeamReviewCurrentTargetError", (error) =>
+              error.reason === "changed" &&
+              error.detail === "Current committed review target changed"
+                ? Effect.succeed(false)
+                : Effect.fail(error),
+            ),
+          );
+        if (!targetCurrent) return yield* deny("stale-proof");
       }
       for (const prior of records.filter(
         (r) => r.kind === "run-binding" && r.taskId === manifest.target.taskId,
