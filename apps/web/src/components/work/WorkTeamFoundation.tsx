@@ -43,6 +43,7 @@ export function WorkTeamFoundation(props: {
   readonly connected: boolean;
   readonly enabled: boolean;
   readonly supported: boolean;
+  readonly poll?: boolean;
   readonly children: (view: WorkTeamFoundationView) => ReactNode;
 }) {
   return (
@@ -77,9 +78,10 @@ function FoundationSession(props: Parameters<typeof WorkTeamFoundation>[0]) {
       cursors.map((cursor) => ({
         environmentId: props.environmentId,
         projectId: props.projectId,
+        ...(props.poll === undefined ? {} : { poll: props.poll }),
         ...(cursor === undefined ? {} : { cursor }),
       })),
-    [cursors, props.environmentId, props.projectId],
+    [cursors, props.environmentId, props.projectId, props.poll],
   );
   const values = targets.map((target) =>
     registry.get(projectWorkEnvironment.foundationPage(target)),
@@ -111,6 +113,13 @@ function FoundationSession(props: Parameters<typeof WorkTeamFoundation>[0]) {
   const current =
     settled && snapshot.complete && snapshot.error === null && snapshot.records.every(knownRecord);
   const refresh = () => {
+    if (
+      !owner.current ||
+      !access.current.connected ||
+      !access.current.enabled ||
+      !access.current.supported
+    )
+      return;
     for (const target of targets) void run(target);
   };
   const firstPage = asProjectWorkFoundationPage(pages[0]?.value, props.projectId);

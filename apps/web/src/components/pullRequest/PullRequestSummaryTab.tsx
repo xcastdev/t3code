@@ -52,6 +52,7 @@ import {
   canEditPullRequestChangeRequest,
   canEditPullRequestComment,
 } from "./pullRequestEditing.logic";
+import { PullRequestProjectWork } from "./PullRequestProjectWork";
 import { PullRequestMarkdown } from "./PullRequestMarkdown";
 import { PullRequestMarkdownEditor } from "./PullRequestMarkdownEditor";
 import { PullRequestReactionBar } from "./PullRequestReactions";
@@ -675,6 +676,26 @@ export function PullRequestSummaryTab({
             </div>
           )}
         </div>
+      </Section>
+
+      <Section
+        key={JSON.stringify([
+          "project-work",
+          environmentId,
+          reference.projectId,
+          reference.host,
+          reference.repository,
+          reference.number,
+          detail.url,
+        ])}
+        title="Project Work"
+        defaultOpen={false}
+      >
+        <PullRequestProjectWork
+          environmentId={environmentId}
+          reference={reference}
+          detail={detail}
+        />
       </Section>
 
       <Section key={`checks:${detail.url}`} title="Checks" defaultOpen={false}>

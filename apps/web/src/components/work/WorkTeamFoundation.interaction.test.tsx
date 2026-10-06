@@ -50,6 +50,7 @@ vi.mock("./WorkOverview", () => ({ WorkOverview: () => <div>Current overview</di
 
 import { WorkPage } from "./WorkPage";
 import { WorkTasks } from "./WorkTasks";
+import { WorkTeamFoundation } from "./WorkTeamFoundation";
 
 class TestConnectionError extends Data.TaggedError("TestConnectionError") {
   override readonly message = "connection lost";
@@ -121,6 +122,7 @@ describe("Work task entrypoint through mounted environment atoms", () => {
   let writeRelease: Promise<void>;
   let releaseWrite: () => void;
   let foundationFailure: boolean;
+  let foundationAttempts: number;
   let foundations: Map<string, unknown>;
   let taskPages: Map<number, unknown>;
   let holdContext: boolean;
@@ -146,6 +148,7 @@ describe("Work task entrypoint through mounted environment atoms", () => {
       releaseWrite = resolve;
     });
     foundationFailure = false;
+    foundationAttempts = 0;
     foundations = new Map();
     taskPages = new Map();
     holdContext = false;
@@ -160,6 +163,7 @@ describe("Work task entrypoint through mounted environment atoms", () => {
     const client = {
       [WS_METHODS.projectWorkRead]: (input: ProjectWorkReadIntent) =>
         Effect.gen(function* () {
+          if (input.operation === "foundation-records") foundationAttempts += 1;
           if (input.operation === "foundation-records" && foundationFailure)
             return yield* new TestConnectionError();
           if (input.operation === "task-context" && holdContext) {
@@ -1255,4 +1259,132 @@ describe("Work task entrypoint through mounted environment atoms", () => {
       expect(writes).toHaveLength(1);
     });
   }
+  interaction(
+    "nonpolling foundation still pages and explicitly refreshes without interval reads",
+    async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        nextCursor = "second";
+        let refresh = () => {};
+        await act(async () => {
+          root.render(
+            <RegistryContext.Provider value={registry}>
+              <WorkTeamFoundation
+                environmentId={environmentId}
+                projectId={projectId}
+                connected
+                enabled
+                supported
+                poll={false}
+              >
+                {(view) => {
+                  refresh = view.refresh;
+                  return (
+                    <div>
+                      {view.snapshot.complete ? "Complete retained foundation" : "Incomplete"}
+                    </div>
+                  );
+                }}
+              </WorkTeamFoundation>
+            </RegistryContext.Provider>,
+          );
+          await settle(atoms.foundationPage({ environmentId, projectId, poll: false }));
+        });
+        await act(async () =>
+          settle(atoms.foundationPage({ environmentId, projectId, cursor: "second", poll: false })),
+        );
+        expect(host.textContent).toContain("Complete retained foundation");
+        expect(foundationAttempts).toBe(2);
+        await act(async () => vi.advanceTimersByTimeAsync(46_000));
+        expect(foundationAttempts).toBe(2);
+        await act(async () => {
+          refresh();
+          await settle(atoms.foundationPage({ environmentId, projectId, poll: false }));
+          await settle(
+            atoms.foundationPage({ environmentId, projectId, cursor: "second", poll: false }),
+          );
+        });
+        expect(foundationAttempts).toBe(4);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+  for (const revoked of ["connected", "enabled", "supported", "owner"] as const) {
+    interaction("fences a held foundation refresh after " + revoked + " revocation", async () => {
+      let heldRefresh = () => {};
+      const mount = async (eligible: boolean) =>
+        act(async () =>
+          root.render(
+            <RegistryContext.Provider value={registry}>
+              {revoked === "owner" && !eligible ? (
+                <div>Other owner</div>
+              ) : (
+                <WorkTeamFoundation
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  connected={revoked !== "connected" || eligible}
+                  enabled={revoked !== "enabled" || eligible}
+                  supported={revoked !== "supported" || eligible}
+                  poll={false}
+                >
+                  {(view) => {
+                    if (eligible) heldRefresh = view.refresh;
+                    return <div>Foundation inspection</div>;
+                  }}
+                </WorkTeamFoundation>
+              )}
+            </RegistryContext.Provider>,
+          ),
+        );
+      await mount(true);
+      await act(async () =>
+        settle(atoms.foundationPage({ environmentId, projectId, poll: false })),
+      );
+      const before = foundationAttempts;
+      await mount(false);
+      await act(async () => heldRefresh());
+      expect(foundationAttempts).toBe(before);
+      if (revoked !== "owner") {
+        await mount(true);
+        await act(async () => {
+          heldRefresh();
+          await settle(atoms.foundationPage({ environmentId, projectId, poll: false }));
+        });
+        expect(foundationAttempts).toBe(before + 1);
+      }
+    });
+  }
+  interaction("built-in foundation Retry cannot refresh after disconnect", async () => {
+    foundationFailure = true;
+    const mount = async (connected: boolean) =>
+      act(async () =>
+        root.render(
+          <RegistryContext.Provider value={registry}>
+            <WorkTeamFoundation
+              environmentId={environmentId}
+              projectId={projectId}
+              connected={connected}
+              enabled
+              supported
+              poll={false}
+            >
+              {() => <div>Inspection</div>}
+            </WorkTeamFoundation>
+          </RegistryContext.Provider>,
+        ),
+      );
+    await mount(true);
+    await act(async () => settle(atoms.foundationPage({ environmentId, projectId, poll: false })));
+    expect(button("Retry")).toBeDefined();
+    const before = foundationAttempts;
+    await mount(false);
+    foundationFailure = false;
+    await click("Retry");
+    expect(foundationAttempts).toBe(before);
+    await mount(true);
+    await click("Retry");
+    await act(async () => settle(atoms.foundationPage({ environmentId, projectId, poll: false })));
+    expect(foundationAttempts).toBe(before + 1);
+  });
 });
