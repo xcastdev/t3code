@@ -21,6 +21,8 @@ import {
   ProjectWorkWriteIntent,
   ProjectWorkTaskId,
   ProjectTeamRecord,
+  ProjectWorkTask,
+  type ProjectWorkAttention,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as Data from "effect/Data";
@@ -51,6 +53,13 @@ vi.mock("../../components/work/WorkOverview", () => ({
   WorkOverview: () => <div>Current overview</div>,
 }));
 
+import {
+  applyProjectWorkEvents,
+  decideProjectWorkCommand,
+  emptyProjectWorkReducerState,
+  type ProjectWorkReducerState,
+} from "../../../../server/src/projectWork/ProjectWorkDecider";
+
 import { WorkPage } from "../../components/work/WorkPage";
 import { Inbox } from "./Inbox";
 import { Team } from "./Team";
@@ -67,6 +76,7 @@ class TestConnectionError extends Data.TaggedError("TestConnectionError") {
 const environmentId = EnvironmentId.make("environment-1");
 const projectId = ProjectId.make("project-1");
 const decodeWrite = Schema.decodeUnknownSync(ProjectWorkWriteIntent);
+const decodeTask = Schema.decodeUnknownSync(ProjectWorkTask);
 const at = "2026-10-01T10:00:00.000Z";
 const task = {
   taskId: ProjectWorkTaskId.make("task-1"),
@@ -193,6 +203,11 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
   let foundationFailure: boolean;
   let foundations: Map<string, unknown>;
   let taskPages: Map<number, unknown>;
+  let attentionPages: Map<number, unknown>;
+  let attention: ProjectWorkAttention[];
+  let attentionFailure: boolean;
+  let workState: ProjectWorkReducerState | undefined;
+  let openedTasks: string[];
   let holdContext: boolean;
   let contextStarted: Promise<void>;
   let startContext: () => void;
@@ -220,6 +235,11 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
     foundationFailure = false;
     foundations = new Map();
     taskPages = new Map();
+    attentionPages = new Map();
+    attention = [];
+    attentionFailure = false;
+    workState = undefined;
+    openedTasks = [];
     holdContext = false;
     contextStarted = new Promise<void>((resolve) => {
       startContext = resolve;
@@ -232,6 +252,8 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
     const client = {
       [WS_METHODS.projectWorkRead]: (input: ProjectWorkReadIntent) =>
         Effect.gen(function* () {
+          if (input.operation === "attention" && attentionFailure)
+            return yield* new TestConnectionError();
           if (input.operation === "foundation-records" && foundationFailure)
             return yield* new TestConnectionError();
           if (input.operation === "task-context" && holdContext) {
@@ -249,6 +271,17 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
                 items: input.cursor ? [] : records,
                 ...(input.cursor || nextCursor === undefined ? {} : { nextCursor }),
               };
+            if (input.operation === "attention")
+              return (
+                attentionPages.get(input.offset ?? 0) ?? {
+                  projectId: input.projectId,
+                  revision: workState?.revision ?? revision,
+                  offset: input.offset ?? 0,
+                  limit: input.limit,
+                  hasMore: false,
+                  items: workState?.attention ?? attention,
+                }
+              );
             if (input.operation === "tasks" && taskPages.has(input.offset ?? 0))
               return taskPages.get(input.offset ?? 0);
             if (input.operation === "task-context" && contextOverride !== undefined)
@@ -290,6 +323,13 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
             yield* Effect.promise(() => writeRelease);
           }
           if (denyWrite) return yield* new TestDeniedError();
+          if (workState && input.type === "project-work.attention.seen") {
+            workState = applyProjectWorkEvents(
+              workState,
+              decideProjectWorkCommand(workState, input),
+            );
+            revision = taskRevision = workState.revision;
+          }
           return yield* failWrite
             ? Effect.fail(new TestConnectionError())
             : Effect.succeed({
@@ -427,11 +467,14 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
             enabled
             supported={supported}
             writesSupported={supported}
-            onOpenTask={() => {}}
+            onOpenTask={(taskId) => openedTasks.push(taskId)}
           />
         </RegistryContext.Provider>,
       );
       await settle(atoms.foundationPage({ environmentId: env, projectId: target }));
+      await settle(
+        atoms.page({ environmentId: env, projectId: target, collection: "attention", offset: 0 }),
+      );
     });
   }
   const button = (label: string) =>
@@ -457,6 +500,330 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
       await settle(atoms.taskContext({ environmentId, projectId, taskId: task.taskId }));
     });
   }
+  interaction(
+    "uncertain publication is visible with no questions and opening its task does not acknowledge it",
+    async () => {
+      records = [member, role, binding, membership, gate];
+      attention = [
+        {
+          taskId: task.taskId,
+          reason: "needs-review",
+          detail: "PR publication response is uncertain. Review the retained operation.",
+          revision: 4,
+        },
+      ];
+      await render();
+      expect(host.textContent).toContain("Task attention");
+      expect(host.textContent).toContain("PR publication response is uncertain");
+      expect(host.textContent).toContain("No pending questions recorded");
+      await click("Open task " + task.taskId);
+      expect(openedTasks).toEqual([task.taskId]);
+      expect(writes).toEqual([]);
+    },
+  );
+
+  interaction(
+    "marking task attention seen retains its unresolved occurrence and cannot advance managed work",
+    async () => {
+      const publication = decodeRecord({
+        ...baseRecord,
+        kind: "effect",
+        recordId: "publication-1",
+        status: "uncertain",
+        effectId: "effect-1",
+        effectKind: "publication",
+        targetId: "publication-1",
+        taskId: task.taskId,
+        payload: { recordIds: [], expectedRevision: 10 },
+        claimGeneration: 1,
+        availableAt: at,
+        outcome: "Publication uncertain",
+      });
+      records.push(publication);
+      workState = {
+        ...emptyProjectWorkReducerState(projectId),
+        revision: 10,
+        tasks: [decodeTask(task)],
+        foundationRecords: records.map((record) => decodeRecord(record)),
+        attention: [
+          {
+            taskId: task.taskId,
+            reason: "blocked",
+            detail:
+              "PR publication 'publication-1' has an uncertain outcome. Review the remote result before retrying.",
+            revision: 4,
+          },
+        ],
+      };
+      const before = {
+        tasks: workState.tasks,
+        attempts: workState.attempts,
+        foundationRecords: workState.foundationRecords,
+      };
+      await render();
+      await click("Review task attention");
+      await click("Mark task attention seen");
+      await act(async () =>
+        settle(atoms.page({ environmentId, projectId, collection: "attention", offset: 0 })),
+      );
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).toMatchObject({
+        type: "project-work.attention.seen",
+        taskId: task.taskId,
+        expectedRevision: 10,
+      });
+      expect(workState.attention).toEqual([
+        {
+          taskId: task.taskId,
+          reason: "blocked",
+          detail:
+            "PR publication 'publication-1' has an uncertain outcome. Review the remote result before retrying.",
+          revision: 5,
+          seenAt: expect.any(String),
+        },
+      ]);
+      expect({
+        tasks: workState.tasks,
+        attempts: workState.attempts,
+        foundationRecords: workState.foundationRecords,
+      }).toEqual(before);
+      expect(
+        workState.foundationRecords?.find((item) => item.recordId === question.recordId),
+      ).not.toHaveProperty("seenAt");
+      expect(host.textContent).toContain("Unresolved");
+      expect(host.textContent).toContain("has an uncertain outcome");
+      expect(host.textContent).toContain("Seen ");
+    },
+  );
+
+  const notice: ProjectWorkAttention = {
+    taskId: task.taskId,
+    reason: "blocked",
+    detail: "Review retained publication",
+    revision: 4,
+  };
+  async function refreshAttention(offset = 0) {
+    await act(async () => {
+      const atom = atoms.page({ environmentId, projectId, collection: "attention", offset });
+      registry.refresh(atom);
+      await settle(atom);
+    });
+  }
+  interaction(
+    "a new attention revision and detail require another review before acknowledgment",
+    async () => {
+      attention = [notice];
+      await render();
+      await click("Review task attention");
+      attention = [{ ...notice, detail: "Different retained operation", revision: 5 }];
+      revision = 11;
+      await refreshAttention();
+      expect(button("Mark task attention seen")?.disabled).toBe(true);
+      expect(host.textContent).toContain("Task attention changed");
+      await click("Mark task attention seen");
+      expect(writes).toEqual([]);
+      await click("Review task attention");
+      await click("Mark task attention seen");
+      expect(writes[0]).toMatchObject({ expectedRevision: 11 });
+    },
+  );
+  interaction(
+    "the registry fences a changed occurrence before React commits the new page",
+    async () => {
+      attention = [notice];
+      await render();
+      await click("Review task attention");
+      const control = button("Mark task attention seen")!;
+      const atom = atoms.page({ environmentId, projectId, collection: "attention", offset: 0 });
+      attention = [{ ...notice, detail: "Another occurrence", revision: 5 }];
+      revision = 11;
+      const dispose = registry.subscribe(atom, (value) => {
+        if (
+          AsyncResult.isSuccess(value) &&
+          !value.waiting &&
+          typeof value.value === "object" &&
+          value.value !== null &&
+          "revision" in value.value &&
+          value.value.revision === 11
+        )
+          control.click();
+      });
+      await refreshAttention();
+      dispose();
+      expect(writes).toEqual([]);
+      expect(host.textContent).toContain("Task attention changed");
+    },
+  );
+  for (const denial of [
+    "disconnected",
+    "stale-read",
+    "foreign-project",
+    "foreign-row",
+    "wrong-offset",
+    "overflow",
+    "unsafe-revision",
+    "future-row-revision",
+    "malformed-row",
+    "duplicate-task",
+  ]) {
+    interaction("task attention acknowledgment denies " + denial, async () => {
+      attention = [notice];
+      await render();
+      await click("Review task attention");
+      if (denial === "disconnected") await render(false);
+      else if (denial === "stale-read") {
+        attentionFailure = true;
+        await refreshAttention();
+      } else {
+        const envelope = {
+          projectId,
+          revision: 10,
+          offset: 0,
+          limit: 51,
+          hasMore: false,
+          items: [notice],
+        };
+        attentionPages.set(
+          0,
+          denial === "foreign-project"
+            ? { ...envelope, projectId: "foreign" }
+            : denial === "foreign-row"
+              ? { ...envelope, items: [{ ...notice, projectId: "foreign" }] }
+              : denial === "wrong-offset"
+                ? { ...envelope, offset: 50 }
+                : denial === "overflow"
+                  ? { ...envelope, items: Array.from({ length: 52 }, () => notice) }
+                  : denial === "unsafe-revision"
+                    ? { ...envelope, revision: Number.MAX_SAFE_INTEGER + 1 }
+                    : denial === "future-row-revision"
+                      ? { ...envelope, items: [{ ...notice, revision: 11 }] }
+                      : denial === "duplicate-task"
+                        ? { ...envelope, items: [notice, { ...notice, revision: 5 }] }
+                        : { ...envelope, items: [{ ...notice, seenAt: "invalid" }] },
+        );
+        await refreshAttention();
+      }
+      expect(button("Mark task attention seen")?.disabled).toBe(true);
+      await click("Mark task attention seen");
+      expect(writes).toEqual([]);
+      expect(host.textContent).not.toContain("No unresolved task attention on this page");
+    });
+  }
+  interaction(
+    "resolved rows and unsupported reasons cannot hide a later unresolved attention page",
+    async () => {
+      records = [];
+      const resolved = Array.from({ length: 51 }, (_, index) => ({
+        ...notice,
+        taskId: "resolved-" + index,
+        resolvedAt: at,
+      }));
+      attentionPages.set(0, {
+        projectId,
+        revision: 10,
+        offset: 0,
+        limit: 51,
+        hasMore: false,
+        items: resolved,
+      });
+      attentionPages.set(50, {
+        projectId,
+        revision: 10,
+        offset: 50,
+        limit: 51,
+        hasMore: false,
+        items: [
+          resolved[50],
+          { ...notice, reason: "future-reason", taskId: "unsupported-task" },
+          notice,
+        ],
+      });
+      await render();
+      expect(host.textContent).toContain("No unresolved task attention on this page");
+      expect(button("Next attention page")?.disabled).toBe(false);
+      await click("Next attention page");
+      await act(async () =>
+        settle(atoms.page({ environmentId, projectId, collection: "attention", offset: 50 })),
+      );
+      expect(host.textContent).toContain("Review retained publication");
+      expect(host.textContent).toContain("Unsupported attention reason: future-reason");
+      expect(host.textContent).not.toContain("Resolved " + at);
+      await click("Include resolved attention");
+      expect(host.textContent).toContain("Resolved " + at);
+      expect(
+        [...host.querySelectorAll("button")].filter(
+          (item) => item.textContent === "Review task attention",
+        ),
+      ).toHaveLength(1);
+      expect(reads.filter((input) => input.operation === "attention")).toMatchObject([
+        { projectId, operation: "attention", limit: 51, offset: 0, envelope: true },
+        { projectId, operation: "attention", limit: 51, offset: 50, envelope: true },
+      ]);
+      expect(writes).toEqual([]);
+    },
+  );
+  interaction(
+    "uncertain task attention acknowledgment retries its exact original envelope",
+    async () => {
+      attention = [notice];
+      await render();
+      await click("Review task attention");
+      failWrite = true;
+      await click("Mark task attention seen");
+      const original = writes[0];
+      expect(button("Retry exact task attention seen")?.disabled).toBe(false);
+      attention = [{ ...notice, detail: "New occurrence after uncertainty", revision: 5 }];
+      revision = 11;
+      await refreshAttention();
+      failWrite = false;
+      await click("Retry exact task attention seen");
+      expect(writes).toHaveLength(2);
+      expect(writes[1]).toBe(original);
+      expect(host.textContent).toContain("Resolution is unchanged");
+    },
+  );
+  interaction(
+    "another project's late task attention receipt cannot change the new Inbox owner",
+    async () => {
+      attention = [notice];
+      await render();
+      await click("Review task attention");
+      holdWrite = true;
+      await act(async () => {
+        button("Mark task attention seen")!.click();
+        await writeStarted;
+      });
+      attention = [];
+      await render(true, true, ProjectId.make("other-project"));
+      await act(async () => releaseWrite());
+      expect(host.textContent).not.toContain("Task attention marked seen");
+      expect(host.textContent).not.toContain("Review retained publication");
+      expect(writes).toHaveLength(1);
+    },
+  );
+  interaction(
+    "an uncertain attention receipt survives a same-owner capability interlude",
+    async () => {
+      attention = [notice];
+      await render();
+      await click("Review task attention");
+      holdWrite = true;
+      await act(async () => {
+        button("Mark task attention seen")!.click();
+        await writeStarted;
+      });
+      await render(true, false);
+      failWrite = true;
+      await act(async () => releaseWrite());
+      await render();
+      expect(button("Retry exact task attention seen")?.disabled).toBe(false);
+      const original = writes[0];
+      failWrite = false;
+      await click("Retry exact task attention seen");
+      expect(writes[1]).toBe(original);
+    },
+  );
+
   interaction(
     "answers the exact recorded question and gate through the real command atom",
     async () => {

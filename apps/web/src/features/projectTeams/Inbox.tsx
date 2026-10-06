@@ -5,6 +5,10 @@ import {
   CommandId,
   ProjectTeamRecord,
   ProjectWorkTask,
+  ProjectWorkAttentionRead,
+  ProjectWorkAttention,
+  type ProjectWorkWriteIntent,
+  ProjectWorkBoundedReadEnvelope,
   type ProjectTeamWriteIntent,
   type EnvironmentId,
   type ProjectId,
@@ -77,6 +81,7 @@ export interface InboxProps {
   readonly enabled: boolean;
   readonly supported: boolean;
   readonly writesSupported: boolean;
+  readonly poll?: boolean;
   readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
 }
 
@@ -134,8 +139,7 @@ function InboxSession(props: InboxProps) {
   const unsettledQuestion = [...drafts].find(
     ([, draft]) => draft.status === "sending" || draft.status === "uncertain",
   )?.[0];
-  if (!props.supported) return <p>This environment does not support the question inbox.</p>;
-  return (
+  const questionsInbox = (
     <WorkTeamFoundation {...props}>
       {(foundation) => {
         const questions = foundation.snapshot.records
@@ -147,7 +151,7 @@ function InboxSession(props: InboxProps) {
         return (
           <div className="flex min-w-0 flex-col gap-4">
             <div>
-              <h2 className="text-lg font-semibold">Inbox</h2>
+              <h2 className="text-lg font-semibold">Questions</h2>
               <p className="text-sm text-muted-foreground">
                 Human decisions linked to recorded tasks and gates.
               </p>
@@ -163,8 +167,8 @@ function InboxSession(props: InboxProps) {
                 <p>Unsupported team records are present. Answers are unavailable.</p>
               ) : null}
               <p className="text-xs text-muted-foreground">
-                Mark seen is unavailable on this environment. Opening a question does not answer or
-                resolve it.
+                Mark seen is unavailable for questions on this environment. Opening a question does
+                not answer or resolve it.
               </p>
             </div>
             <div className="flex gap-2" role="group" aria-label="Question status">
@@ -273,6 +277,395 @@ function InboxSession(props: InboxProps) {
         );
       }}
     </WorkTeamFoundation>
+  );
+  return (
+    <>
+      <h2 className="text-lg font-semibold">Inbox</h2>
+      <TaskAttention {...props} />
+      {props.supported ? (
+        questionsInbox
+      ) : (
+        <p>This environment does not support the question inbox.</p>
+      )}
+    </>
+  );
+}
+
+const knownAttentionPage = Schema.is(ProjectWorkBoundedReadEnvelope);
+const knownAttention = Schema.is(ProjectWorkAttentionRead);
+
+function attentionPage(
+  value: unknown,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  offset: number,
+) {
+  if (
+    offset > 1_000_000 ||
+    !knownAttentionPage(value) ||
+    value.projectId !== projectId ||
+    !Number.isSafeInteger(value.offset) ||
+    !Number.isSafeInteger(value.limit) ||
+    value.offset !== offset ||
+    value.limit !== projectWorkEnvironment.pageRequestSize ||
+    !Number.isSafeInteger(value.revision) ||
+    value.items.length > value.limit ||
+    new Set(value.items.filter(knownAttention).map((item) => item.taskId)).size !==
+      value.items.length ||
+    value.items.some(
+      (item) =>
+        !knownAttention(item) ||
+        !Number.isSafeInteger(item.revision) ||
+        item.revision > value.revision ||
+        item.taskId.length > 256 ||
+        item.taskId.trim() !== item.taskId ||
+        item.reason.length > 4_000 ||
+        item.reason.trim() !== item.reason ||
+        item.reason.length === 0 ||
+        ("projectId" in item && item.projectId !== projectId) ||
+        ("environmentId" in item && item.environmentId !== environmentId),
+    )
+  )
+    return null;
+  return {
+    revision: value.revision,
+    records: value.items.filter(knownAttention).slice(0, projectWorkEnvironment.pageSize),
+    hasNext: value.items.length > projectWorkEnvironment.pageSize || value.hasMore,
+  };
+}
+
+type Seen = Extract<ProjectWorkWriteIntent, { type: "project-work.attention.seen" }>;
+type AttentionReview = {
+  readonly occurrence: ProjectWorkAttentionRead;
+  readonly revision: number;
+  readonly command?: Seen;
+  readonly status?: "sending" | "uncertain" | "rejected" | "accepted";
+  readonly notice?: string;
+};
+const supportedAttention = Schema.is(ProjectWorkAttention);
+const sameAttention = (a: ProjectWorkAttentionRead, b: ProjectWorkAttentionRead) =>
+  a.taskId === b.taskId &&
+  a.revision === b.revision &&
+  a.reason === b.reason &&
+  a.detail === b.detail &&
+  a.seenAt === b.seenAt &&
+  a.resolvedAt === b.resolvedAt;
+
+/** The owner retains an uncertain seen command even when its page or capability disappears. */
+function TaskAttention(props: InboxProps) {
+  const write = useAtomCommand(projectWorkEnvironment.write, {
+    reportFailure: false,
+    reportDefect: false,
+  });
+  const [offset, setOffset] = useState(0);
+  const [showResolved, setShowResolved] = useState(false);
+  const [review, setReview] = useState<AttentionReview>();
+  const reviewRef = useRef(review);
+  const owner = useRef(false);
+  const access = useRef(props);
+  useLayoutEffect(() => {
+    access.current = props;
+  });
+  useLayoutEffect(() => {
+    owner.current = true;
+    return () => {
+      owner.current = false;
+    };
+  }, []);
+  const store = (next: AttentionReview) => {
+    reviewRef.current = next;
+    setReview(next);
+  };
+  async function send(command: Seen) {
+    const previous = reviewRef.current;
+    if (
+      !owner.current ||
+      !access.current.connected ||
+      !access.current.enabled ||
+      !access.current.supported ||
+      !access.current.writesSupported ||
+      !previous ||
+      previous.status === "sending" ||
+      command.taskId !== previous.occurrence.taskId ||
+      command.expectedRevision !== previous.revision ||
+      (previous.command !== undefined && previous.command !== command)
+    )
+      return;
+    store({ ...previous, command, status: "sending", notice: "Recording task attention as seen…" });
+    let completed: AttentionReview;
+    try {
+      const outcome = await write({ environmentId: props.environmentId, input: command });
+      if (outcome._tag === "Failure") throw squashAtomCommandFailure(outcome);
+      completed = {
+        ...previous,
+        command,
+        status: "accepted",
+        notice: "Task attention marked seen. Resolution is unchanged.",
+      };
+    } catch (error) {
+      const explicit =
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        [
+          "stale-revision",
+          "invalid-state",
+          "permission-denied",
+          "forbidden",
+          "unauthorized",
+          "not-found",
+          "invalid-request",
+        ].includes(String(error.code));
+      completed = {
+        ...previous,
+        command,
+        status: previous.status === "uncertain" || !explicit ? "uncertain" : "rejected",
+        notice: projectWorkCommandFailure(error).message,
+      };
+    }
+    if (!owner.current || reviewRef.current?.command !== command) return;
+    store(completed);
+  }
+  return (
+    <div className="flex flex-col gap-3" aria-label="Task attention">
+      <h2 className="text-lg font-semibold">Task attention</h2>
+      <p className="text-sm text-muted-foreground">
+        Retained task notices. Marking seen records acknowledgment; the task stays unresolved.
+      </p>
+      {!props.supported ? (
+        <p>This environment does not support task attention.</p>
+      ) : (
+        <AttentionPage
+          {...props}
+          offset={offset}
+          showResolved={showResolved}
+          onOffset={setOffset}
+          onShowResolved={setShowResolved}
+          review={review}
+          onReview={store}
+          onSend={send}
+        />
+      )}
+    </div>
+  );
+}
+
+function AttentionPage(
+  props: InboxProps & {
+    readonly offset: number;
+    readonly showResolved: boolean;
+    readonly onOffset: (offset: number) => void;
+    readonly onShowResolved: (value: boolean) => void;
+    readonly review: AttentionReview | undefined;
+    readonly onReview: (review: AttentionReview) => void;
+    readonly onSend: (command: Seen) => Promise<void>;
+  },
+) {
+  const registry = useContext(RegistryContext);
+  const atom = projectWorkEnvironment.page({
+    ...props,
+    collection: "attention",
+    offset: props.offset,
+  });
+  const result = useAtomValue(atom);
+  const page = attentionPage(
+    Option.getOrNull(AsyncResult.value(result)),
+    props.environmentId,
+    props.projectId,
+    props.offset,
+  );
+  const current = page !== null && AsyncResult.isSuccess(result) && !result.waiting;
+  const access = useRef(props);
+  useLayoutEffect(() => {
+    access.current = props;
+  });
+  const writable = props.connected && props.enabled && props.writesSupported && current;
+  const rows = page?.records.filter((item) => props.showResolved || !item.resolvedAt) ?? [];
+  const unsettled = props.review?.status === "sending" || props.review?.status === "uncertain";
+  const latest = page?.records.find((item) => item.taskId === props.review?.occurrence.taskId);
+  const changed =
+    !latest ||
+    !props.review ||
+    !sameAttention(latest, props.review.occurrence) ||
+    page?.revision !== props.review.revision;
+  const canMark =
+    writable &&
+    props.review !== undefined &&
+    !changed &&
+    latest !== undefined &&
+    supportedAttention(latest) &&
+    !latest.resolvedAt &&
+    !latest.seenAt &&
+    !props.review.command &&
+    page?.records.filter((item) => item.taskId === latest.taskId).length === 1;
+  async function submit(retry: boolean) {
+    const active = access.current;
+    const review = active.review;
+    if (
+      !active.connected ||
+      !active.enabled ||
+      !active.supported ||
+      !active.writesSupported ||
+      !review ||
+      review.status === "sending"
+    )
+      return;
+    const freshResult = registry.get(atom);
+    const fresh = attentionPage(
+      Option.getOrNull(AsyncResult.value(freshResult)),
+      active.environmentId,
+      active.projectId,
+      active.offset,
+    );
+    if (!fresh || !AsyncResult.isSuccess(freshResult) || freshResult.waiting) {
+      active.onReview({
+        ...review,
+        notice: "Task attention is unavailable. Refresh and review before marking seen.",
+      });
+      return;
+    }
+    if (retry) {
+      if (review.status === "uncertain" && review.command) await active.onSend(review.command);
+      return;
+    }
+    const occurrences = fresh.records.filter((item) => item.taskId === review.occurrence.taskId);
+    const occurrence = occurrences[0];
+    if (
+      review.command ||
+      occurrences.length !== 1 ||
+      !occurrence ||
+      !supportedAttention(occurrence) ||
+      occurrence.resolvedAt ||
+      occurrence.seenAt ||
+      fresh.revision !== review.revision ||
+      !sameAttention(occurrence, review.occurrence)
+    ) {
+      active.onReview({
+        ...review,
+        notice: "Task attention changed. Review the current occurrence before marking seen.",
+      });
+      return;
+    }
+    await active.onSend({
+      type: "project-work.attention.seen",
+      projectId: active.projectId,
+      taskId: occurrence.taskId,
+      commandId: CommandId.make(randomUUID()),
+      expectedRevision: review.revision,
+      seenAt: new Date().toISOString(),
+    });
+  }
+  return (
+    <>
+      {!props.connected || !current ? (
+        <p>Cached or unavailable task attention. Reconnect and refresh before marking seen.</p>
+      ) : null}
+      {!props.writesSupported ? (
+        <p>This environment does not support task attention acknowledgment.</p>
+      ) : null}
+      <Button
+        size="sm"
+        variant="outline"
+        aria-pressed={props.showResolved}
+        onClick={() => props.onShowResolved(!props.showResolved)}
+      >
+        Include resolved attention
+      </Button>
+      {current && rows.length === 0 ? (
+        <p>No {props.showResolved ? "" : "unresolved "}task attention on this page.</p>
+      ) : null}
+      {rows.map((item) => (
+        <WorkCard key={JSON.stringify([item.taskId, item.revision, item.resolvedAt])}>
+          <h3 className="font-medium">
+            {supportedAttention(item)
+              ? item.reason
+              : `Unsupported attention reason: ${item.reason}`}
+          </h3>
+          {item.detail ? <p className="whitespace-pre-wrap text-sm">{item.detail}</p> : null}
+          <p className="text-xs text-muted-foreground">
+            Task {item.taskId} · Revision {item.revision}
+          </p>
+          <p className="text-sm">
+            {item.resolvedAt ? `Resolved ${item.resolvedAt}` : "Unresolved"} ·{" "}
+            {item.seenAt ? `Seen ${item.seenAt}` : "Not marked seen"}
+          </p>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => props.onOpenTask(item.taskId)}>
+              Open task {item.taskId}
+            </Button>
+            {supportedAttention(item) && !item.resolvedAt && !item.seenAt ? (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!writable || unsettled}
+                onClick={() => props.onReview({ occurrence: item, revision: page!.revision })}
+              >
+                Review task attention
+              </Button>
+            ) : null}
+          </div>
+        </WorkCard>
+      ))}
+      {props.review ? (
+        <div className="flex flex-col gap-2" aria-label="Review task attention">
+          <p className="whitespace-pre-wrap">
+            Reviewing task {props.review.occurrence.taskId}: {props.review.occurrence.reason}
+            {props.review.occurrence.detail ? ` · ${props.review.occurrence.detail}` : ""}
+          </p>
+          {changed && !unsettled ? (
+            <p>Task attention changed. Review the current occurrence before marking seen.</p>
+          ) : null}
+          {props.review.notice ? <p>{props.review.notice}</p> : null}
+          {props.review.command ? (
+            <p className="text-xs">Original command {props.review.command.commandId}</p>
+          ) : null}
+          {props.review.status === "uncertain" ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!writable}
+              onClick={() => void submit(true)}
+            >
+              Retry exact task attention seen
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!canMark}
+              onClick={() => void submit(false)}
+            >
+              Mark task attention seen
+            </Button>
+          )}
+        </div>
+      ) : null}
+      <div className="flex gap-2">
+        {props.offset > 0 ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              props.onOffset(Math.max(0, props.offset - projectWorkEnvironment.pageSize))
+            }
+          >
+            Previous attention page
+          </Button>
+        ) : null}
+        {page?.hasNext ? (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => props.onOffset(props.offset + projectWorkEnvironment.pageSize)}
+          >
+            Next attention page
+          </Button>
+        ) : null}
+        <Button size="sm" variant="outline" onClick={() => registry.refresh(atom)}>
+          Refresh task attention
+        </Button>
+      </div>
+    </>
   );
 }
 

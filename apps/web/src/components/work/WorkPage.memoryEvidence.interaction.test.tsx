@@ -282,22 +282,31 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
                         }
                       : input.operation === "tasks"
                         ? { projectId: input.projectId, revision, items: [], hasMore: false }
-                        : input.operation === "knowledge"
-                          ? {
+                        : input.operation === "attention"
+                          ? (pages.get(`attention:${input.offset ?? 0}`) ?? {
                               projectId: input.projectId,
                               revision,
-                              items: [
-                                {
-                                  projectId: input.projectId,
-                                  knowledgeId: "knowledge-1",
-                                  title: "Existing project knowledge",
-                                  body: "Retained manual knowledge",
-                                  sourceKind: "manual",
-                                  updatedAt: at,
-                                },
-                              ],
-                            }
-                          : [];
+                              offset: input.offset ?? 0,
+                              limit: input.limit,
+                              hasMore: false,
+                              items: [],
+                            })
+                          : input.operation === "knowledge"
+                            ? {
+                                projectId: input.projectId,
+                                revision,
+                                items: [
+                                  {
+                                    projectId: input.projectId,
+                                    knowledgeId: "knowledge-1",
+                                    title: "Existing project knowledge",
+                                    body: "Retained manual knowledge",
+                                    sourceKind: "manual",
+                                    updatedAt: at,
+                                  },
+                                ],
+                              }
+                            : [];
               const gate = held;
               if (
                 input.operation === "foundation-records" &&
@@ -478,6 +487,7 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
           "tasks",
           "knowledge",
           "decisions",
+          "attention",
         ].includes(input.operation),
       ),
     ).toBe(true);
@@ -715,7 +725,7 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
     },
   );
   interaction(
-    "Inbox draft survives Memory and Evidence visits without an answer dispatch",
+    "Inbox draft survives task attention navigation and Memory and Evidence visits without a dispatch",
     async () => {
       records.push(
         {
@@ -744,10 +754,35 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
           choices: ["Keep history", "Start fresh"],
         },
       );
+      pages.set("attention:0", {
+        projectId,
+        revision: 10,
+        offset: 0,
+        limit: 51,
+        hasMore: false,
+        items: [
+          { taskId, reason: "blocked", detail: "Retained uncertain publication", revision: 1 },
+        ],
+      });
       await render();
       await navigate("Inbox");
+      await act(async () =>
+        settleAtom(atoms.page({ environmentId, projectId, collection: "attention", offset: 0 })),
+      );
+      expect(host.textContent).toContain("Retained uncertain publication");
       await click("Answer question");
       await click("Keep history");
+      expect(button("Keep history")?.getAttribute("aria-pressed")).toBe("true");
+      const attentionCard = [...host.querySelectorAll("section")].find((item) =>
+        item.textContent?.includes("Retained uncertain publication"),
+      );
+      await act(async () => attentionCard?.querySelector<HTMLButtonElement>("button")?.click());
+      await act(async () => settleAtom(atoms.taskContext({ environmentId, projectId, taskId })));
+      expect(host.textContent).toContain(task.title);
+      expect(host.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain(
+        "Tasks",
+      );
+      await navigate("Inbox");
       expect(button("Keep history")?.getAttribute("aria-pressed")).toBe("true");
       await navigate("Memory");
       await inspect(source.recordId);

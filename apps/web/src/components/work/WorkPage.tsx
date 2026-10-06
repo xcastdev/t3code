@@ -291,6 +291,7 @@ function ProjectWorkPage({
             {tab === "inbox" || inboxVisited ? (
               <div hidden={tab !== "inbox"}>
                 <Inbox
+                  poll={poll}
                   environmentId={environmentId}
                   projectId={projectId}
                   connected={connected}
