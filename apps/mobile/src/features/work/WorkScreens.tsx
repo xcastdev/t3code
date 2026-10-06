@@ -14,7 +14,7 @@ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime"
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { useLayoutEffect, useState, type ReactNode } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Platform, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/AppText";
@@ -44,6 +44,11 @@ import {
 } from "./workActions";
 import { WorkQuestions, WorkTeam } from "./WorkTeam";
 import { WorkEvidence } from "./WorkEvidence";
+import {
+  WorkVerification,
+  type MobileVerificationRequest,
+  type MobileVerificationStore,
+} from "./WorkVerification";
 import { WorkAttention } from "./WorkAttention";
 import { WorkSupervisionSource } from "./WorkSupervisionSource";
 
@@ -428,10 +433,30 @@ function ProjectWorkSession({
 export function WorkTaskScreen({
   route,
 }: StaticScreenProps<ProjectParams & { readonly taskId: string }>) {
+  const [verificationSnapshot, saveVerification] = useState<
+    ReadonlyArray<MobileVerificationRequest>
+  >([]);
+  const verificationState = useRef(verificationSnapshot);
+  const verificationStore = useMemo<MobileVerificationStore>(
+    () => ({
+      snapshot: verificationSnapshot,
+      read: () => verificationState.current,
+      write: (entries) => {
+        verificationState.current = entries;
+        saveVerification(entries);
+      },
+    }),
+    [verificationSnapshot],
+  );
   const target = decodeWorkRoute(route.params);
   const taskId = Option.getOrNull(decodeTaskId(route.params.taskId));
   return target && taskId ? (
-    <WorkTaskSession key={JSON.stringify([target, taskId])} target={target} taskId={taskId} />
+    <WorkTaskSession
+      key={JSON.stringify([target, taskId])}
+      target={target}
+      taskId={taskId}
+      verificationStore={verificationStore}
+    />
   ) : (
     <WorkSurface title="Task">
       <Notice>This link is missing an environment, project or task.</Notice>
@@ -441,9 +466,11 @@ export function WorkTaskScreen({
 function WorkTaskSession({
   target,
   taskId,
+  verificationStore,
 }: {
   readonly target: { readonly environmentId: EnvironmentId; readonly projectId: ProjectId };
   readonly taskId: ProjectWorkTaskId;
+  readonly verificationStore: MobileVerificationStore;
 }) {
   const navigation = useNavigation();
   const focused = useIsFocused();
@@ -683,6 +710,16 @@ function WorkTaskSession({
           <WorkQuestions
             current={current}
             readCurrent={readCurrent}
+            send={async (input) => {
+              const result = await write({ environmentId: target.environmentId, input });
+              if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+            }}
+          />
+          <WorkVerification
+            current={current}
+            readCurrent={readCurrent}
+            store={verificationStore}
+            onRefresh={refresh}
             send={async (input) => {
               const result = await write({ environmentId: target.environmentId, input });
               if (result._tag === "Failure") throw squashAtomCommandFailure(result);
