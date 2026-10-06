@@ -1,3 +1,59 @@
+import {
+  ExternalNotificationPayload,
+  ProjectWorkAttentionReason,
+  ProjectWorkTaskState,
+} from "@t3tools/contracts";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+
+const decodeWorkNotification = Schema.decodeUnknownOption(
+  Schema.Struct({
+    schemaVersion: ExternalNotificationPayload.fields.schemaVersion,
+    environmentId: ExternalNotificationPayload.fields.environmentId,
+    projectWork: ExternalNotificationPayload.fields.projectWork,
+  }),
+);
+const isKnownTaskState = Schema.is(ProjectWorkTaskState);
+const isKnownAttentionReason = Schema.is(ProjectWorkAttentionReason);
+
+function isExactNotificationIdentity(value: unknown): value is string {
+  return (
+    typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+  );
+}
+
+function projectWorkDeepLink(data: Record<string, unknown>): string | null {
+  const context = data.projectWork;
+  if (typeof context !== "object" || context === null || Array.isArray(context)) {
+    return null;
+  }
+  const work = context as Record<string, unknown>;
+  if (
+    !isExactNotificationIdentity(data.environmentId) ||
+    !isExactNotificationIdentity(work.projectId) ||
+    !isExactNotificationIdentity(work.taskId)
+  ) {
+    return null;
+  }
+  const notification = Option.getOrNull(decodeWorkNotification(data));
+  if (
+    !notification?.projectWork ||
+    !isKnownTaskState(notification.projectWork.state) ||
+    (notification.projectWork.reason !== undefined &&
+      !isKnownAttentionReason(notification.projectWork.reason)) ||
+    !Number.isSafeInteger(notification.projectWork.revision) ||
+    notification.projectWork.revision < 0
+  ) {
+    return null;
+  }
+  try {
+    // A notification only opens the task; current state and authority come from its screen.
+    return `/work/${encodeURIComponent(notification.environmentId)}/${encodeURIComponent(notification.projectWork.projectId)}/tasks/${encodeURIComponent(notification.projectWork.taskId)}`;
+  } catch {
+    return null;
+  }
+}
+
 function dataFromNotificationResponse(response: unknown): Record<string, unknown> | null {
   if (typeof response !== "object" || response === null) {
     return null;
@@ -71,6 +127,10 @@ function normalizeThreadDeepLink(value: string): string | null {
 
 export function extractAgentNotificationDeepLink(response: unknown): string | null {
   const data = dataFromNotificationResponse(response);
+  // A malformed work hint must not redirect to an obsolete or unrelated provider thread.
+  if (data && "projectWork" in data) {
+    return projectWorkDeepLink(data);
+  }
   const deepLink = data?.deepLink;
   if (typeof deepLink === "string") {
     const normalizedDeepLink = normalizeThreadDeepLink(deepLink);
