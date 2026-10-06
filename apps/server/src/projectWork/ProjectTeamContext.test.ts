@@ -30,6 +30,7 @@ import {
   type ProjectTeamDispatchRequest,
 } from "./ProjectTeamDispatchJournal.ts";
 import { makeProjectTeamContext, ProjectTeamContextError } from "./ProjectTeamContext.ts";
+import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 import * as Accounting from "./ProjectTeamModelAccounting.ts";
 import { managedActorId } from "./ProjectTeamAuthorization.ts";
@@ -43,20 +44,33 @@ const decodeCommand = Schema.decodeUnknownEffect(ProjectWorkCommand);
 const decodeRecord = Schema.decodeUnknownEffect(TeamRecordSchema);
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 
-const makeFixture = (role: "implementer" | "integrator" = "implementer", writableWorkers = 1) =>
+const makeFixture = (
+  role: "implementer" | "integrator" | "planner" | "reviewer" | "investigator" = "implementer",
+  writableWorkers = 1,
+  readonlyKind?: "planning" | "review" | "investigation",
+) =>
   Effect.gen(function* () {
     const repository = yield* ProjectWorkRepository;
     const sql = yield* SqlClient.SqlClient;
     let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
     // The real fixture commits approvals and the execution grant; intercept only its final claim.
     const result = yield* seed(role, "reserved", {
-      roleTools: role === "integrator" ? ["pi.read"] : ["pi.read", "pi.write"],
-      toolIds: role === "integrator" ? ["pi.read"] : ["pi.read", "pi.write"],
+      roleTools: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
+      toolIds: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
       issueCredential: false,
     }).pipe(
       Effect.provideService(ProjectWorkRepository, {
         ...repository,
         execute: (command) => {
+          if (
+            readonlyKind !== undefined &&
+            readonlyKind !== "review" &&
+            command.type === "project-work.foundation.commit" &&
+            command.guided?.intent.type === "project-team.plan.propose"
+          )
+            return Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Stop before first parent plan"),
+            );
           if (
             command.type === "project-work.foundation.commit" &&
             command.transition?.kind === "claim"
@@ -72,6 +86,159 @@ const makeFixture = (role: "implementer" | "integrator" = "implementer", writabl
       Effect.result,
     );
     expect(result._tag).toBe("Failure");
+    if (readonlyKind !== undefined) {
+      let state = yield* readCurrentState(sql, projectId);
+      const parent = state.tasks.find((task) => task.taskId === "authorization-task");
+      const specGate = state.foundationRecords?.find(
+        (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "specification",
+      );
+      const plan = state.foundationRecords?.find(
+        (r) => r.kind === "plan-revision" && r.taskId === parent?.taskId,
+      );
+      const planGate = state.foundationRecords?.find(
+        (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "plan",
+      );
+      if (!parent || specGate?.kind !== "gate")
+        return yield* Effect.die("Missing real parent specification");
+      const human = {
+        actor: { kind: "human", id: "readonly-context-human" },
+        source: { kind: "web", id: "readonly-context-browser" },
+        recordedAt: at,
+      } as const;
+      const envelope = {
+        projectId,
+        taskId: parent.taskId,
+        commandId: "readonly-context-grant",
+        expectedRevision: state.revision,
+        expectedTaskRevision: parent.revision,
+      };
+      yield* repository.execute(
+        yield* decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: envelope.commandId,
+          expectedRevision: state.revision,
+          attribution: human,
+          committedAt: at,
+          records: [],
+          guided: {
+            intent:
+              readonlyKind === "investigation"
+                ? {
+                    ...envelope,
+                    type: "project-team.investigation.start",
+                    objective: "Investigate original bounded scope",
+                    outputDescriptions: ["Sourced investigation findings"],
+                  }
+                : {
+                    ...envelope,
+                    type: "project-team.assignment.start",
+                    assignmentKind: readonlyKind,
+                    objective:
+                      readonlyKind === "planning"
+                        ? "Draft the first approved plan"
+                        : "Review original approved scope",
+                    outputDescriptions: [
+                      readonlyKind === "planning"
+                        ? "Proposed first plan"
+                        : "Independent review findings",
+                    ],
+                    specRevision: parent.specRevision,
+                    specificationGateId: specGate.recordId,
+                    expectedSpecificationGateRevision: specGate.revision,
+                    ...(readonlyKind === "review" &&
+                    plan?.kind === "plan-revision" &&
+                    planGate?.kind === "gate"
+                      ? {
+                          parentPlan: {
+                            recordId: plan.recordId,
+                            expectedRecordRevision: plan.revision,
+                            planRevision: plan.planRevision,
+                            gateId: planGate.recordId,
+                            expectedGateRevision: planGate.revision,
+                          },
+                        }
+                      : {}),
+                  },
+          },
+        }),
+      );
+      state = yield* readCurrentState(sql, projectId);
+      const grant = state.foundationRecords?.find(
+        (r) =>
+          r.kind === "gate" &&
+          r.taskId !== parent.taskId &&
+          (r.gate === "assignment" || r.gate === "investigation"),
+      );
+      const task = state.tasks.find(
+        (task) => task.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
+      );
+      const roleRecord = state.foundationRecords?.find(
+        (r) => r.kind === "role-revision" && r.recordId === "role",
+      );
+      if (!task || grant?.kind !== "gate" || roleRecord?.kind !== "role-revision")
+        return yield* Effect.die("Missing real readonly child grant");
+      const binding = {
+        kind: "run-binding",
+        projectId,
+        recordId: "binding",
+        revision: 0,
+        generation: 0,
+        updatedAt: at,
+        status: "reserved",
+        taskId: task.taskId,
+        attemptId: "attempt",
+        memberId: "member",
+        roleRevisionId: roleRecord.recordId,
+        providerInstanceId: ProviderInstanceId.make("pi"),
+        threadId: ThreadId.make("authorization-thread"),
+        environmentId: "environment",
+        model: roleRecord.model,
+        configuration: {
+          instructionsHash: "hash",
+          toolIds: ["pi.read"],
+          skillIds: [],
+          runtimeVersion: "test",
+          maxTokens: 1000,
+          maxDurationMs: 1000,
+          paidFallback: false,
+        },
+        worktree: "/workspace",
+        branch: "task",
+        leaseGeneration: 0,
+        specRevision: task.specRevision,
+        planRevision: 0,
+        authorizationGateId: grant.recordId,
+        scopeHash: projectTeamScopeHash(state, task.taskId),
+      };
+      pending = yield* decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "readonly-context-claim",
+        expectedRevision: state.revision,
+        attribution,
+        committedAt: at,
+        records: [],
+        transition: {
+          kind: "claim",
+          taskId: task.taskId,
+          expectedTaskRevision: task.revision,
+          authorizationGateId: grant.recordId,
+          expectedGateRevision: grant.revision,
+          binding,
+          claim: {
+            type: "project-work.task.claim",
+            projectId,
+            taskId: task.taskId,
+            commandId: "readonly-context-claim",
+            attemptId: "attempt",
+            leaseToken: "readonly-context-lease",
+            leasedUntil: "2030-01-01T00:00:00.000Z",
+            claimedAt: at,
+          },
+        },
+      });
+    }
     if (!pending || pending.transition?.kind !== "claim")
       return yield* Effect.die("Fixture did not capture its claim");
     yield* repository.execute(
@@ -241,6 +408,180 @@ const makeBudgetFixture = (writableWorkers = 1) =>
   });
 
 const budgetFixture = makeBudgetFixture();
+
+for (const kind of ["planning", "review", "investigation"] as const)
+  it.effect(`required context reconstructs legal planless ${kind} original authority`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture(
+          kind === "planning" ? "planner" : kind === "review" ? "reviewer" : "investigator",
+          1,
+          kind,
+        );
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Missing readonly original claim");
+        expect(claim.binding.planRevision).toBe(0);
+        const state = yield* readCurrentState(f.sql, projectId);
+        expect(
+          state.foundationRecords?.filter(
+            (record) => record.kind === "plan-revision" && record.taskId === claim.binding.taskId,
+          ),
+        ).toEqual([]);
+        const grant = state.foundationRecords?.find(
+          (record) => record.recordId === claim.binding.authorizationGateId,
+        );
+        expect(grant).toMatchObject({
+          kind: "gate",
+          gate: kind === "investigation" ? "investigation" : "assignment",
+          status: "consumed",
+          attribution: { actor: { kind: "human" } },
+        });
+        const required = yield* f.reader.readForOperation({
+          projectId,
+          bindingId: claim.binding.recordId,
+          generation: claim.binding.generation,
+          providerInstanceId: claim.binding.providerInstanceId,
+          threadId: claim.binding.threadId,
+          operationId: f.request.initializeOperationId,
+          operationKind: "initialize",
+        });
+        expect(required.required.tasks[0]?.plan).toBeUndefined();
+        expect(required.required.tasks[0]?.criteria[0]?.description).toBe(
+          kind === "planning"
+            ? "Proposed first plan"
+            : kind === "review"
+              ? "Independent review findings"
+              : "Sourced investigation findings",
+        );
+        expect(required.required.tasks[1]?.task.taskId).toBe("authorization-task");
+        expect(required.required.approvals).toContainEqual(
+          expect.objectContaining({ recordId: claim.binding.authorizationGateId }),
+        );
+      }),
+    ),
+  );
+
+it.effect("required context denies actual duplicate equal plan revisions", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture();
+      const plan = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+        (record) => record.kind === "plan-revision",
+      );
+      if (plan?.kind !== "plan-revision") return yield* Effect.die("Missing original plan");
+      yield* f.change({ ...plan, recordId: "duplicate-equal-plan" });
+      expect(
+        (yield* readCurrentState(f.sql, projectId)).foundationRecords?.filter(
+          (record) => record.kind === "plan-revision" && record.planRevision === plan.planRevision,
+        ),
+      ).toHaveLength(2);
+      yield* denied(f.reader.readRequired(f.snapshot));
+    }),
+  ),
+);
+
+for (const operationKind of ["initialize", "prompt"] as const)
+  it.effect(`required operation lookup resolves exact original ${operationKind} context`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Missing claim");
+        const resolved = yield* f.reader.readForOperation({
+          projectId,
+          bindingId: claim.binding.recordId,
+          generation: claim.binding.generation,
+          providerInstanceId: claim.binding.providerInstanceId,
+          threadId: claim.binding.threadId,
+          operationId:
+            operationKind === "initialize"
+              ? f.request.initializeOperationId
+              : f.request.assignmentOperationId,
+          operationKind,
+        });
+        expect(resolved).toEqual(yield* f.reader.readRequired(f.snapshot));
+      }),
+    ),
+  );
+
+for (const mismatch of [
+  "project",
+  "binding",
+  "generation",
+  "provider",
+  "thread",
+  "operation",
+  "kind",
+  "missing",
+  "corrupt",
+  "transaction",
+] as const)
+  it.effect(`required operation lookup denies ${mismatch} before delivering context`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Missing claim");
+        const input = {
+          projectId: mismatch === "project" ? "foreign-project" : projectId,
+          bindingId: mismatch === "binding" ? "foreign-binding" : claim.binding.recordId,
+          generation:
+            mismatch === "generation" ? claim.binding.generation + 1 : claim.binding.generation,
+          providerInstanceId:
+            mismatch === "provider"
+              ? ProviderInstanceId.make("foreign-provider")
+              : claim.binding.providerInstanceId,
+          threadId:
+            mismatch === "thread" ? ThreadId.make("foreign-thread") : claim.binding.threadId,
+          operationId:
+            mismatch === "operation" ? "foreign-operation" : f.request.initializeOperationId,
+          operationKind: mismatch === "kind" ? ("prompt" as const) : ("initialize" as const),
+        };
+        if (mismatch === "missing") yield* f.sql`DELETE FROM project_team_dispatch`;
+        if (mismatch === "corrupt") {
+          yield* f.sql`DROP TRIGGER project_team_dispatch_immutable`;
+          yield* f.sql`UPDATE project_team_dispatch SET intent_json='{}'`;
+        }
+        if (mismatch === "transaction") {
+          yield* f.sql`DROP TABLE project_team_dispatch`;
+          const result = yield* f.sql
+            .withTransaction(f.reader.readForOperation(input))
+            .pipe(Effect.result);
+          expect(result).toMatchObject({
+            _tag: "Failure",
+            failure: { reason: "Required context must own its read transaction" },
+          });
+        } else yield* denied(f.reader.readForOperation(input));
+      }),
+    ),
+  );
+
+for (const count of [2, 129])
+  it.effect(`required operation lookup denies ${count} ambiguous retained dispatches`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Missing original claim");
+        // Corrupt duplicate rows cannot occur through journal writes; exercise denial against retained SQL corruption.
+        yield* f.sql`ALTER TABLE project_team_dispatch RENAME TO original_context_dispatch`;
+        yield* f.sql`CREATE TABLE project_team_dispatch AS SELECT * FROM original_context_dispatch WHERE 0`;
+        for (let i = 0; i < count; i++)
+          yield* f.sql`INSERT INTO project_team_dispatch SELECT * FROM original_context_dispatch`;
+        yield* denied(
+          f.reader.readForOperation({
+            projectId,
+            bindingId: claim.binding.recordId,
+            generation: claim.binding.generation,
+            providerInstanceId: claim.binding.providerInstanceId,
+            threadId: claim.binding.threadId,
+            operationId: f.request.initializeOperationId,
+            operationKind: "initialize",
+          }),
+        );
+      }),
+    ),
+  );
 
 it.effect(
   "reconstructs exact original scope, outputs, role, approvals and caps after checkpoint loss",

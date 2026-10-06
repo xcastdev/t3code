@@ -1,5 +1,6 @@
 import { vi } from "vite-plus/test";
 import * as SessionRuntime from "./PiSessionRuntime.ts";
+import * as ManagedProcess from "./PiManagedProcess.ts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import {
@@ -17,6 +18,10 @@ import {
   ProjectWorkComment,
   ManagedSkillKey,
   SkillCatalogRevision,
+  ProjectWorkFoundationCommitCommand,
+  ProjectWorkTaskId,
+  ThreadId,
+  type ProjectWorkCommand,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
@@ -40,6 +45,9 @@ import {
   providerInstanceId,
   threadId,
   at,
+  attribution,
+  projectId,
+  createManagedAssignment,
 } from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
 import * as ManagedSkills from "../../skills/ManagedSkillRepository.ts";
 import * as ServerConfig from "../../config.ts";
@@ -54,7 +62,18 @@ import { EnvironmentAuth } from "../../auth/EnvironmentAuth.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { makeSqlitePersistenceLive } from "../../persistence/Layers/Sqlite.ts";
 import * as Authorization from "../../projectWork/ProjectTeamAuthorization.ts";
-import { ProjectWorkRepositoryLive } from "../../projectWork/ProjectWorkRepository.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+} from "../../projectWork/ProjectWorkRepository.ts";
+import { ProjectWorkPolicyError } from "../../projectWork/ProjectWorkPolicy.ts";
+import {
+  makeProjectTeamDispatchJournal,
+  type ProjectTeamDispatchRequest,
+} from "../../projectWork/ProjectTeamDispatchJournal.ts";
+import { makeProjectTeamContext } from "../../projectWork/ProjectTeamContext.ts";
+import { projectTeamScopeHash } from "../../projectWork/ProjectTeamPolicy.ts";
+import * as RequiredContext from "../../projectWork/ProjectTeamContext.ts";
 import { readCurrentState } from "../../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkQueryLive } from "../../projectWork/ProjectWorkQuery.ts";
 import { ProjectWorkSearchLive } from "../../projectWork/ProjectWorkSearch.ts";
@@ -5215,3 +5234,1059 @@ for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as c
     ),
   );
 }
+
+const decodeRequiredFoundation = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const decodeRequiredJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+// Required-context cases intercept only session execution; no managed worker or model is run.
+const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
+  reviewer = false,
+  child = !reviewer,
+  readonlyKind?: "planning" | "review" | "investigation",
+) {
+  yield* TestClock.setTime(Date.parse(at) + 1);
+  const sql = yield* SqlClient.SqlClient;
+  const repository = yield* ProjectWorkRepository;
+  const fs = yield* FileSystem.FileSystem;
+  const scratch = yield* fs.makeTempDirectoryScoped();
+  const main = scratch + "/main";
+  const assigned = scratch + "/assigned";
+  const agentDirectory = scratch + "/agent";
+  const nativeStateRoot = scratch + "/state";
+  yield* fs.makeDirectory(agentDirectory);
+  yield* fs.makeDirectory(nativeStateRoot);
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const git = (args: ReadonlyArray<string>) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const process = yield* spawner.spawn(ChildProcess.make("/usr/bin/git", args));
+        const [stdout, code] = yield* Effect.all(
+          [collectUint8StreamText({ stream: process.stdout, maxBytes: 8192 }), process.exitCode],
+          { concurrency: "unbounded" },
+        );
+        expect(Number(code)).toBe(0);
+        return stdout.text.trim();
+      }),
+    );
+  yield* git(["init", "-q", main]);
+  yield* git([
+    "-C",
+    main,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "--allow-empty",
+    "-qm",
+    "initial",
+  ]);
+  const baseOid = yield* git(["-C", main, "rev-parse", "HEAD"]);
+  yield* git(["-C", main, "worktree", "add", "-qb", "required-root", assigned]);
+  let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+  const captureClaim = {
+    ...repository,
+    execute: (command: ProjectWorkCommand) => {
+      if (
+        command.type === "project-work.foundation.commit" &&
+        command.transition?.kind === "claim"
+      ) {
+        pending = command;
+        return Effect.fail(new ProjectWorkPolicyError("invalid-state", "Retain new context claim"));
+      }
+      if (command.type === "project-work.foundation.commit")
+        return repository.execute({
+          ...command,
+          records: command.records.map((r) => (r.kind === "role-revision" ? { ...r, model } : r)),
+        });
+      return repository.execute(command);
+    },
+  };
+  yield* seed(reviewer && readonlyKind === undefined ? "reviewer" : "implementer", "reserved", {
+    nativeSessionId: null,
+    roleTools: [],
+    toolIds: [],
+    issueCredential: false,
+  }).pipe(Effect.provideService(ProjectWorkRepository, captureClaim), Effect.result);
+  if (!pending || pending.transition?.kind !== "claim")
+    return yield* Effect.die("Missing original context claim");
+  yield* repository.execute(
+    yield* decodeRequiredFoundation({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "required-limits",
+      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+      attribution,
+      committedAt: at,
+      records: [
+        {
+          kind: "limits",
+          projectId,
+          recordId: "required-limits",
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          status: "configured",
+          environmentModelCalls: 4,
+          projectWritableWorkers: 2,
+          modelCalls: 2,
+          delegationDepth: 2,
+          repairAllowance: 2,
+          model,
+          tokenLimit: 2000,
+          durationLimitMs: 2000,
+        },
+      ],
+    }),
+  );
+  const role = (yield* readCurrentState(sql, projectId)).foundationRecords?.find(
+    (r) => r.kind === "role-revision",
+  );
+  if (role?.kind !== "role-revision") return yield* Effect.die("Missing required role");
+  const configuration = {
+    ...pending.transition.binding.configuration,
+    runtimeVersion: "0.99.1",
+    instructionsHash: NodeCrypto.createHash("sha256").update(role.instructions).digest("hex"),
+  };
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+  });
+  const reserve = Effect.fn("requiredTransferFixture.reserve")(function* (
+    claim: typeof ProjectWorkFoundationCommitCommand.Type,
+    path: string,
+    branch: string,
+    id: string,
+  ) {
+    if (claim.transition?.kind !== "claim") return yield* Effect.die("Missing context transition");
+    const binding = {
+      ...claim.transition.binding,
+      worktree: path,
+      branch,
+      model,
+      configuration: {
+        ...claim.transition.binding.configuration,
+        runtimeVersion: "0.99.1",
+        ...(readonlyKind === undefined || id === "required-root"
+          ? { instructionsHash: configuration.instructionsHash }
+          : {}),
+      },
+      ...(id === "required-root" && child
+        ? { threadId: ThreadId.make("required-parent-thread") }
+        : {}),
+    };
+    const request: ProjectTeamDispatchRequest = {
+      dispatchId: id,
+      claim: {
+        ...claim,
+        expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+        transition: { ...claim.transition, binding },
+      },
+      git: {
+        effectId: id,
+        runId: binding.recordId,
+        generation: binding.generation,
+        primaryRoot: main,
+        commonGitDirectory: main + "/.git",
+        worktreePath: path,
+        branchRef: branch,
+        baseRef: "refs/heads/main",
+        baseOid,
+        ownershipToken: id + "-owner",
+        policyHash: "b".repeat(64),
+      },
+      setupId: id + "-setup",
+      initializeOperationId: id + "-initialize",
+      assignmentOperationId: id + "-assignment",
+      assignment: "Implement the approved retained context",
+    };
+    const snapshot = yield* journal.claimEffect((yield* journal.reserve(request)).fence);
+    yield* journal.readStageReceipts(snapshot.fence.dispatchId);
+    return { request, snapshot, binding };
+  });
+  let retained = yield* reserve(pending, assigned, "refs/heads/required-root", "required-root");
+  if (child) {
+    const parentOperations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+    const parentRequest = {
+      threadId: retained.binding.threadId,
+      kind: "initialize" as const,
+      operationId: retained.request.initializeOperationId,
+    };
+    const parentAllocation = yield* preallocatePiManagedProcess({
+      workspaceRoot: retained.binding.worktree,
+      workspaceAccess: "readonly",
+      nativeStateRoot,
+      protectedRoots: [main],
+      runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+      argv: ["/bin/true"],
+      memoryBytes: 33554432,
+      runtimeSeconds: 10,
+    });
+    const parent = yield* parentOperations.prepare(
+      { providerInstanceId, threadId: retained.binding.threadId },
+      parentRequest,
+      NodeCrypto.createHash("sha256")
+        .update(canonicalProjectWorkPayload(parentRequest))
+        .digest("hex"),
+      {
+        allocation: parentAllocation,
+        workerId: "required-parent",
+        operationId: retained.request.initializeOperationId,
+        resourceHash: piManagedSkillResourceIdentity([]),
+      },
+    );
+    yield* parentOperations.persistNative(parent, {
+      sessionId: "required-parent-session",
+      sessionReference: "sessions/parent.jsonl",
+      leafId: null,
+      persisted: false,
+    });
+    yield* sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${parent.operation.operationId}`;
+    if (readonlyKind !== undefined) {
+      let state = yield* readCurrentState(sql, projectId);
+      const parentTask = state.tasks.find((task) => task.taskId === retained.binding.taskId);
+      const specification = state.foundationRecords?.find(
+        (record) =>
+          record.kind === "gate" &&
+          record.taskId === parentTask?.taskId &&
+          record.gate === "specification",
+      );
+      const plan = state.foundationRecords?.find(
+        (record) => record.kind === "plan-revision" && record.taskId === parentTask?.taskId,
+      );
+      const planGate = state.foundationRecords?.find(
+        (record) =>
+          record.kind === "gate" && record.taskId === parentTask?.taskId && record.gate === "plan",
+      );
+      if (
+        !parentTask ||
+        specification?.kind !== "gate" ||
+        plan?.kind !== "plan-revision" ||
+        planGate?.kind !== "gate"
+      )
+        return yield* Effect.die("Missing real retained parent scope");
+      const human = {
+        actor: { kind: "human", id: "readonly-runtime-human" },
+        source: { kind: "web", id: "readonly-runtime-browser" },
+        recordedAt: at,
+      } as const;
+      const envelope = {
+        projectId,
+        taskId: parentTask.taskId,
+        commandId: "readonly-runtime-grant",
+        expectedRevision: state.revision,
+        expectedTaskRevision: parentTask.revision,
+      };
+      yield* repository.execute(
+        yield* decodeRequiredFoundation({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: envelope.commandId,
+          expectedRevision: state.revision,
+          attribution: human,
+          committedAt: at,
+          records: [],
+          guided: {
+            intent:
+              readonlyKind === "investigation"
+                ? {
+                    ...envelope,
+                    type: "project-team.investigation.start",
+                    objective: "Investigate original bounded scope",
+                    outputDescriptions: ["Sourced investigation findings"],
+                  }
+                : {
+                    ...envelope,
+                    type: "project-team.assignment.start",
+                    assignmentKind: readonlyKind,
+                    objective:
+                      readonlyKind === "planning"
+                        ? "Draft the first child plan"
+                        : "Review original approved scope",
+                    outputDescriptions: [
+                      readonlyKind === "planning"
+                        ? "Proposed first plan"
+                        : "Independent review findings",
+                    ],
+                    specRevision: parentTask.specRevision,
+                    specificationGateId: specification.recordId,
+                    expectedSpecificationGateRevision: specification.revision,
+                    parentPlan: {
+                      recordId: plan.recordId,
+                      expectedRecordRevision: plan.revision,
+                      planRevision: plan.planRevision,
+                      gateId: planGate.recordId,
+                      expectedGateRevision: planGate.revision,
+                    },
+                  },
+          },
+        }),
+      );
+      state = yield* readCurrentState(sql, projectId);
+      const grant = state.foundationRecords?.find(
+        (record) =>
+          record.kind === "gate" &&
+          record.taskId !== parentTask.taskId &&
+          (record.gate === "assignment" || record.gate === "investigation"),
+      );
+      const task = state.tasks.find(
+        (task) => task.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
+      );
+      const generatedRole = state.foundationRecords?.find(
+        (record) => record.kind === "role-revision" && record.recordId !== "role",
+      );
+      if (!task || grant?.kind !== "gate" || generatedRole?.kind !== "role-revision")
+        return yield* Effect.die("Missing real readonly child scope");
+      const roleRecord = {
+        ...generatedRole,
+        recordId: "readonly-runtime-role",
+        roleId: "readonly-runtime-role",
+        revision: 0,
+        model,
+        delegationDepth: role.delegationDepth,
+      };
+      yield* repository.execute(
+        yield* decodeRequiredFoundation({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "readonly-runtime-configure",
+          expectedRevision: state.revision,
+          attribution: human,
+          committedAt: at,
+          records: [
+            roleRecord,
+            {
+              kind: "member",
+              projectId,
+              recordId: "readonly-runtime-member",
+              revision: 0,
+              generation: 0,
+              updatedAt: at,
+              status: "active",
+              name: "Readonly context worker",
+              coordinator: false,
+              roleRevisionId: roleRecord.recordId,
+            },
+          ],
+        }),
+      );
+      state = yield* readCurrentState(sql, projectId);
+      const binding = {
+        kind: "run-binding",
+        projectId,
+        recordId: "required-child-binding",
+        revision: 0,
+        generation: 0,
+        updatedAt: at,
+        status: "reserved",
+        taskId: task.taskId,
+        attemptId: "required-child-attempt",
+        memberId: "readonly-runtime-member",
+        roleRevisionId: roleRecord.recordId,
+        parentRunId: retained.binding.recordId,
+        providerInstanceId,
+        threadId,
+        environmentId: "environment",
+        model,
+        configuration: {
+          ...configuration,
+          instructionsHash: NodeCrypto.createHash("sha256")
+            .update(roleRecord.instructions)
+            .digest("hex"),
+        },
+        worktree: "/workspace",
+        branch: "task",
+        leaseGeneration: 0,
+        specRevision: task.specRevision,
+        planRevision: 0,
+        authorizationGateId: grant.recordId,
+        scopeHash: projectTeamScopeHash(state, task.taskId),
+      };
+      pending = yield* decodeRequiredFoundation({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "readonly-runtime-claim",
+        expectedRevision: state.revision,
+        attribution,
+        committedAt: at,
+        records: [],
+        transition: {
+          kind: "claim",
+          taskId: task.taskId,
+          expectedTaskRevision: task.revision,
+          authorizationGateId: grant.recordId,
+          expectedGateRevision: grant.revision,
+          binding,
+          claim: {
+            type: "project-work.task.claim",
+            projectId,
+            taskId: task.taskId,
+            commandId: "readonly-runtime-claim",
+            attemptId: binding.attemptId,
+            leaseToken: "readonly-runtime-lease",
+            leasedUntil: "2030-01-01T00:00:00.000Z",
+            claimedAt: at,
+          },
+        },
+      });
+    } else {
+      yield* repository.execute({
+        type: "project-work.task.create",
+        projectId,
+        taskId: ProjectWorkTaskId.make("required-child"),
+        commandId: CommandId.make("required-child-create"),
+        title: "Child task",
+        createdAt: at,
+      });
+      yield* repository.execute(
+        yield* decodeRequiredFoundation({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "required-child-membership",
+          expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+          attribution,
+          committedAt: at,
+          records: [
+            {
+              kind: "task-membership",
+              projectId,
+              recordId: "required-child-membership",
+              revision: 0,
+              generation: 0,
+              updatedAt: at,
+              status: "active",
+              taskId: "required-child",
+              parentTaskId: retained.binding.taskId,
+              executionKind: "managed",
+              deliverableKind: "code",
+              controlState: "active",
+            },
+          ],
+        }),
+      );
+      pending = undefined;
+      yield* createManagedAssignment({
+        taskId: ProjectWorkTaskId.make("required-child"),
+        recordId: "required-child-binding",
+        attemptId: "required-child-attempt",
+        commandId: "required-child-claim",
+        providerInstanceId,
+        threadId,
+        role,
+        status: "reserved",
+        configuration,
+        parentRunId: retained.binding.recordId,
+      }).pipe(Effect.provideService(ProjectWorkRepository, captureClaim), Effect.result);
+      if (!pending) return yield* Effect.die("Missing child claim");
+    }
+    const childPath = scratch + "/child";
+    yield* git(["-C", main, "worktree", "add", "-qb", "required-child", childPath]);
+    retained = yield* reserve(pending, childPath, "refs/heads/required-child", "required-child");
+  }
+  let allocations = 0;
+  let transports = 0;
+  const options: PiManagedRuntimeLiveOptions = {
+    environmentId: "environment",
+    agentDirectory,
+    nativeStateRoot,
+    protectedRoots: [main],
+    runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+    workerArgv: () => {
+      allocations++;
+      return ["/bin/true"];
+    },
+    memoryBytes: 33554432,
+    cleanupDeadlineMs: 1000,
+    maxInputTokens: 100,
+    maxOutputTokens: 100,
+    readCatalogue: Effect.succeed({
+      source: "https://api.commandcode.ai/provider/v1/models",
+      fetchedAt: at,
+      selectedEntry: {
+        id: model,
+        owned_by: "command-code",
+        context_length: 20000,
+        supported_endpoints: ["/chat/completions"],
+      },
+    }),
+    transport: async () => {
+      transports++;
+      throw Error("Required context transport forbidden");
+    },
+  };
+  const runtime = yield* makePiManagedRuntimeLive(options);
+  const instance = yield* runtime.forInstance({
+    instanceId: providerInstanceId,
+    enabled: true,
+    configuration: {},
+  });
+  const reader = yield* makeProjectTeamContext({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 128,
+  });
+  return {
+    sql,
+    repository,
+    fs,
+    options,
+    instance,
+    reader,
+    ...retained,
+    get allocations() {
+      return allocations;
+    },
+    get transports() {
+      return transports;
+    },
+  };
+});
+
+for (const readonlyKind of [undefined, "planning", "investigation", "review"] as const)
+  for (const kind of readonlyKind === "review"
+    ? (["initialize"] as const)
+    : (["initialize", "prompt"] as const))
+    it.effect(
+      `required context transfer includes ${readonlyKind ?? "approved child"} criteria and ancestor caps for ${kind}`,
+      () =>
+        scoped(
+          Effect.gen(function* () {
+            const f = yield* requiredTransferFixture(false, true, readonlyKind);
+            expect(f.binding.planRevision).toBe(readonlyKind === undefined ? 1 : 0);
+            if (readonlyKind !== undefined)
+              expect(
+                (yield* readCurrentState(f.sql, projectId)).foundationRecords?.filter(
+                  (r) => r.kind === "plan-revision" && r.taskId === f.binding.taskId,
+                ),
+              ).toEqual([]);
+            if (kind === "prompt") {
+              const operations = yield* makeProjectTeamPiOperations({
+                environmentId: "environment",
+              });
+              const allocation = yield* preallocatePiManagedProcess({
+                workspaceRoot: f.binding.worktree,
+                workspaceAccess: "readonly",
+                nativeStateRoot: f.options.nativeStateRoot,
+                protectedRoots: f.options.protectedRoots,
+                runtimeFiles: f.options.runtimeFiles,
+                argv: ["/bin/true"],
+                memoryBytes: f.options.memoryBytes,
+                runtimeSeconds: 10,
+              });
+              const previous = yield* operations.prepare(
+                { providerInstanceId, threadId },
+                { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
+                NodeCrypto.createHash("sha256")
+                  .update(
+                    canonicalProjectWorkPayload({
+                      threadId,
+                      kind: "initialize",
+                      operationId: f.request.initializeOperationId,
+                    }),
+                  )
+                  .digest("hex"),
+                {
+                  allocation,
+                  workerId: "required-previous",
+                  operationId: f.request.initializeOperationId,
+                  resourceHash: piManagedSkillResourceIdentity([]),
+                },
+              );
+              yield* operations.persistNative(previous, {
+                sessionId: "required-session",
+                sessionReference: "sessions/required.jsonl",
+                leafId: null,
+                persisted: false,
+              });
+              yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${previous.operation.operationId}`;
+            }
+            const current = yield* f.reader.readRequired(f.snapshot);
+            let transferred: SessionRuntime.PiSessionRuntimeOptions | undefined;
+            const original = SessionRuntime.makePiSessionRuntime;
+            const spy = vi
+              .spyOn(SessionRuntime, "makePiSessionRuntime")
+              .mockImplementation((input) =>
+                original(input).pipe(
+                  Effect.map((runtime) => ({
+                    ...runtime,
+                    run: () =>
+                      Effect.sync(() => {
+                        transferred = input;
+                      }).pipe(
+                        Effect.andThen(
+                          Effect.fail(
+                            new SessionRuntime.PiSessionRuntimeError({
+                              code: "CONTEXT_INTERCEPTED",
+                            }),
+                          ),
+                        ),
+                      ),
+                  })),
+                ),
+              );
+            yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+            const prepared = yield* f.instance.prepareOperation(
+              kind === "initialize"
+                ? { threadId, kind, operationId: f.request.initializeOperationId }
+                : {
+                    threadId,
+                    kind,
+                    operationId: f.request.assignmentOperationId,
+                    prompt: f.request.assignment,
+                  },
+              () => Effect.void,
+            );
+            yield* prepared.run.pipe(Effect.result);
+            expect(transferred).toBeDefined();
+            const text = transferred?.transferTexts.find(
+              (entry) => entry.transferId === "context",
+            )?.text;
+            expect(text).toContain(current.text);
+            expect(text).toContain(
+              readonlyKind === undefined
+                ? '"description":"Requirement"'
+                : readonlyKind === "planning"
+                  ? '"description":"Proposed first plan"'
+                  : readonlyKind === "investigation"
+                    ? '"description":"Sourced investigation findings"'
+                    : '"description":"Independent review findings"',
+            );
+            expect(text).toContain('"parentTaskId":"authorization-task"');
+            expect(text).toContain('"gate":"specification"');
+            expect(text).toContain('"rootRemainingTokens":1000');
+            expect(current.required.tasks).toHaveLength(2);
+            expect(current.required.approvals).toHaveLength(readonlyKind === undefined ? 5 : 3);
+            if (readonlyKind !== undefined) expect(current.required.tasks[0]?.plan).toBeUndefined();
+            expect(transferred?.bootstrap.context.totalBytes).toBe(Buffer.byteLength(text ?? ""));
+            expect(f.transports).toBe(0);
+            expect(
+              yield* f.sql`SELECT owner_json FROM project_team_pi_process WHERE owner_json IS NOT NULL`,
+            ).toEqual([]);
+          }),
+        ),
+    );
+
+for (const mode of [
+  "missing",
+  "corrupt",
+  "wrong-operation",
+  "oversize",
+  "prompt-budget",
+  "changed-provenance",
+] as const)
+  it.effect(`required context transfer rejects ${mode} before managed allocation`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredTransferFixture(false, false);
+        const addQuestions = Effect.fn("requiredTransferFixture.addQuestions")(function* (
+          count: number,
+        ) {
+          const state = yield* readCurrentState(f.sql, projectId);
+          const gate = state.foundationRecords?.find((r) => r.kind === "gate" && r.gate === "plan");
+          if (gate?.kind !== "gate") return yield* Effect.die("Missing current question target");
+          yield* f.repository.execute(
+            yield* decodeRequiredFoundation({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: "required-questions",
+              expectedRevision: state.revision,
+              attribution,
+              committedAt: at,
+              records: Array.from({ length: count }, (_, i) => ({
+                kind: "question",
+                projectId,
+                recordId: "required-question-" + i,
+                revision: 0,
+                generation: 0,
+                updatedAt: at,
+                status: "pending",
+                taskId: f.binding.taskId,
+                senderId: f.binding.memberId,
+                targetGateId: gate.recordId,
+                targetRevision: gate.revision,
+                body: "é".repeat(2000),
+                choices: [],
+              })),
+            }),
+          );
+        });
+        if (mode === "missing") yield* f.sql`DELETE FROM project_team_dispatch`;
+        if (mode === "corrupt") {
+          yield* f.sql`DROP TRIGGER project_team_dispatch_immutable`;
+          yield* f.sql`UPDATE project_team_dispatch SET intent_json='{}'`;
+        }
+        if (mode === "oversize") {
+          yield* addQuestions(16);
+          const context = yield* f.reader.readForOperation({
+            projectId,
+            bindingId: f.binding.recordId,
+            generation: 0,
+            providerInstanceId,
+            threadId,
+            operationId: f.request.initializeOperationId,
+            operationKind: "initialize",
+          });
+          expect(Buffer.byteLength(context.text)).toBeGreaterThan(65536);
+          expect(Buffer.byteLength(context.text)).toBeLessThan(262144);
+        }
+        if (mode === "prompt-budget") {
+          const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+          const request = {
+            threadId,
+            kind: "initialize" as const,
+            operationId: f.request.initializeOperationId,
+          };
+          const allocation = yield* preallocatePiManagedProcess({
+            workspaceRoot: f.binding.worktree,
+            workspaceAccess: "readonly",
+            nativeStateRoot: f.options.nativeStateRoot,
+            protectedRoots: f.options.protectedRoots,
+            runtimeFiles: f.options.runtimeFiles,
+            argv: ["/bin/true"],
+            memoryBytes: f.options.memoryBytes,
+            runtimeSeconds: 10,
+          });
+          const previous = yield* operations.prepare(
+            { providerInstanceId, threadId },
+            request,
+            NodeCrypto.createHash("sha256")
+              .update(canonicalProjectWorkPayload(request))
+              .digest("hex"),
+            {
+              allocation,
+              workerId: "required-budget-previous",
+              operationId: request.operationId,
+              resourceHash: piManagedSkillResourceIdentity([]),
+            },
+          );
+          yield* operations.persistNative(previous, {
+            sessionId: "required-budget-session",
+            sessionReference: "sessions/budget.jsonl",
+            leafId: null,
+            persisted: false,
+          });
+          yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${previous.operation.operationId}`;
+        }
+        let allocations = 0;
+        let sessions = 0;
+        const originalAllocate = ManagedProcess.preallocatePiManagedProcess;
+        const allocationSpy = vi
+          .spyOn(ManagedProcess, "preallocatePiManagedProcess")
+          .mockImplementation((launch) => {
+            allocations++;
+            return originalAllocate(launch);
+          });
+        const sessionSpy = vi
+          .spyOn(SessionRuntime, "makePiSessionRuntime")
+          .mockImplementation(() => {
+            sessions++;
+            return Effect.die("Unexpected session after rejected required context");
+          });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            allocationSpy.mockRestore();
+            sessionSpy.mockRestore();
+          }),
+        );
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          ...(mode === "changed-provenance"
+            ? { revalidateRuntime: addQuestions(1).pipe(Effect.mapError(controlledCallbackError)) }
+            : {}),
+        });
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const request: PiManagedOperationRequest =
+          mode === "prompt-budget"
+            ? {
+                threadId,
+                kind: "prompt",
+                operationId: f.request.assignmentOperationId,
+                prompt: "é".repeat(32769),
+              }
+            : {
+                threadId,
+                kind: "initialize",
+                operationId:
+                  mode === "wrong-operation"
+                    ? "unrelated-initialize"
+                    : f.request.initializeOperationId,
+              };
+        const result = yield* instance
+          .prepareOperation(request, () => Effect.void)
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (mode === "oversize" || mode === "prompt-budget")
+          expect(result).toMatchObject({
+            failure: { detail: "Pi required context exceeds transfer bounds" },
+          });
+        if (mode === "changed-provenance")
+          expect(result).toMatchObject({
+            failure: { detail: "Required context provenance changed before allocation" },
+          });
+        expect(allocations).toBe(0);
+        expect(sessions).toBe(0);
+        expect(f.transports).toBe(0);
+        expect(
+          yield* f.sql`SELECT operation_id FROM project_team_pi_operation WHERE operation_id=${mode === "prompt-budget" ? f.request.assignmentOperationId : f.request.initializeOperationId}`,
+        ).toEqual([]);
+      }),
+    ),
+  );
+
+for (const readonlyKind of [undefined, "review"] as const)
+  it.effect(
+    `required context transfer qualifies the exact ${readonlyKind === undefined ? "planned" : "planless"} reviewer text and preserves terminal replay`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* requiredTransferFixture(true, readonlyKind !== undefined, readonlyKind);
+          const required = yield* f.reader.readRequired(f.snapshot);
+          let briefing = "";
+          let runs = 0;
+          let promptText: string | undefined;
+          const original = SessionRuntime.makePiSessionRuntime;
+          const sessionSpy = vi
+            .spyOn(SessionRuntime, "makePiSessionRuntime")
+            .mockImplementation((input) =>
+              original(input).pipe(
+                Effect.map((session) => ({
+                  ...session,
+                  run: () =>
+                    Effect.gen(function* () {
+                      if (input.operation.operationKind === "prompt") {
+                        promptText = input.transferTexts.find(
+                          (entry) => entry.transferId === "context",
+                        )?.text;
+                        return yield* new SessionRuntime.PiSessionRuntimeError({
+                          code: "CONTROLLED_PROMPT_CONTEXT",
+                        });
+                      }
+                      // Synthetic native metadata and terminal receipts exercise context qualification only.
+                      // No OS owner, managed worker or model is acquired by this controlled session.
+                      runs++;
+                      const allocation = input.persistence.allocation;
+                      const owner = {
+                        type: "owner" as const,
+                        unit: allocation.unit,
+                        nonce: allocation.nonce,
+                        invocation: "a".repeat(32),
+                        cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+                        pid: 99999999,
+                        memoryBytes: allocation.policy.memoryBytes,
+                        swapBytes: 0,
+                        oomGroup: 1,
+                      };
+                      yield* input.persistence.claimActivation(allocation);
+                      yield* input.persistence.beforeStart(owner);
+                      briefing =
+                        input.transferTexts.find((entry) => entry.transferId === "context")?.text ??
+                        "";
+                      expect(briefing).toContain(required.text);
+                      const native = {
+                        sessionId: "required-review-session",
+                        sessionReference: "sessions/required-review.jsonl",
+                        leafId: "required-briefing",
+                        persisted: true,
+                      };
+                      const state = allocation.launch.nativeStateRoot;
+                      yield* f.fs.makeDirectory(state + "/sessions", { recursive: true });
+                      yield* f.fs.writeFileString(
+                        state + "/" + native.sessionReference,
+                        [
+                          {
+                            type: "session",
+                            version: 3,
+                            id: native.sessionId,
+                            timestamp: at,
+                            cwd: "/workspace",
+                          },
+                          {
+                            type: "message",
+                            id: native.leafId,
+                            parentId: null,
+                            timestamp: at,
+                            message: {
+                              role: "user",
+                              content: [{ type: "text", text: briefing }],
+                              timestamp: Date.parse(at),
+                            },
+                          },
+                        ]
+                          .map((entry) => json(entry))
+                          .join("\n") + "\n",
+                      );
+                      const signal = yield* Effect.abortSignal;
+                      yield* Effect.tryPromise(() =>
+                        input.persistNative(
+                          {
+                            version: 1,
+                            ...input.identity,
+                            ...input.operation,
+                            sequence: 0,
+                            message: { type: "initialized", native },
+                          },
+                          signal,
+                        ),
+                      );
+                      const terminal: SessionRuntime.PiSessionTerminal = {
+                        identity: input.identity,
+                        operation: input.operation,
+                        outcome: "success",
+                        ownerCaptured: true,
+                        native,
+                        accountingReceipts: [],
+                        drain: {
+                          unit: owner.unit,
+                          invocation: owner.invocation,
+                          cgroup: owner.cgroup,
+                          ownerPid: owner.pid,
+                          memoryBytes: owner.memoryBytes,
+                          swapBytes: 0,
+                          oomGroup: 1,
+                          launcherPid: 99999998,
+                          childPid: 99999997,
+                          childExitCode: 0,
+                          kernel: "removed",
+                        },
+                      };
+                      yield* Effect.tryPromise(() => input.persistTerminal(terminal, signal));
+                      return terminal;
+                    }).pipe(
+                      Effect.mapError(
+                        () =>
+                          new SessionRuntime.PiSessionRuntimeError({
+                            code: "CONTROLLED_CONTEXT_FAILURE",
+                          }),
+                      ),
+                    ),
+                })),
+              ),
+            );
+          yield* Effect.addFinalizer(() => Effect.sync(() => sessionSpy.mockRestore()));
+          const request = {
+            threadId,
+            kind: "initialize" as const,
+            operationId: f.request.initializeOperationId,
+          };
+          const prepared = yield* f.instance.prepareOperation(request, () => Effect.void);
+          expect((yield* prepared.run).terminal.outcome).toBe("success");
+          const freshness = yield* f.sql<{
+            manifest_json: string;
+            native_jsonl: string;
+          }>`SELECT manifest_json,native_jsonl FROM project_team_review_freshness`;
+          expect(freshness).toHaveLength(1);
+          const manifest = decodeRequiredJson(freshness[0]?.manifest_json);
+          expect(manifest).toMatchObject({
+            briefingSHA256: NodeCrypto.createHash("sha256").update(briefing).digest("hex"),
+          });
+          expect(freshness[0]?.native_jsonl).toContain(json(briefing));
+          const state = yield* readCurrentState(f.sql, projectId);
+          const gate = state.foundationRecords?.find(
+            (record) =>
+              record.kind === "gate" &&
+              (readonlyKind === undefined
+                ? record.gate === "plan"
+                : record.recordId === f.binding.authorizationGateId),
+          );
+          if (gate?.kind !== "gate") return yield* Effect.die("Missing review question target");
+          yield* f.repository.execute(
+            yield* decodeRequiredFoundation({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: "required-review-question",
+              expectedRevision: state.revision,
+              attribution,
+              committedAt: at,
+              records: [
+                {
+                  kind: "question",
+                  projectId,
+                  recordId: "required-review-question",
+                  revision: 0,
+                  generation: 0,
+                  updatedAt: at,
+                  status: "pending",
+                  taskId: f.binding.taskId,
+                  senderId: f.binding.memberId,
+                  targetGateId: gate.recordId,
+                  targetRevision: gate.revision,
+                  body: "New question after the completed review",
+                  choices: [],
+                },
+              ],
+            }),
+          );
+          expect(
+            (yield* f.reader.readForOperation({
+              projectId,
+              bindingId: f.binding.recordId,
+              generation: 0,
+              providerInstanceId,
+              threadId,
+              operationId: request.operationId,
+              operationKind: "initialize",
+            })).text,
+          ).toContain("New question after the completed review");
+          let recaptures = 0;
+          const originalReader = RequiredContext.makeProjectTeamContext;
+          const readerSpy = vi
+            .spyOn(RequiredContext, "makeProjectTeamContext")
+            .mockImplementation((options) =>
+              originalReader(options).pipe(
+                Effect.map((reader) => ({
+                  ...reader,
+                  readForOperation: (input) =>
+                    Effect.sync(() => {
+                      recaptures++;
+                    }).pipe(Effect.andThen(reader.readForOperation(input))),
+                })),
+              ),
+            );
+          yield* Effect.addFinalizer(() => Effect.sync(() => readerSpy.mockRestore()));
+          const restarted = yield* makePiManagedRuntimeLive(f.options);
+          const instance = yield* restarted.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          const replay = yield* instance.prepareOperation(request, () =>
+            Effect.die("Unexpected replay emission"),
+          );
+          expect((yield* replay.run).terminal.outcome).toBe("success");
+          expect(recaptures).toBe(0);
+          expect(runs).toBe(1);
+          expect(
+            yield* f.sql`SELECT manifest_json,native_jsonl FROM project_team_review_freshness`,
+          ).toEqual(freshness);
+          expect(f.transports).toBe(0);
+          if (readonlyKind === "review") {
+            const current = yield* f.reader.readForOperation({
+              projectId,
+              bindingId: f.binding.recordId,
+              generation: 0,
+              providerInstanceId,
+              threadId,
+              operationId: f.request.assignmentOperationId,
+              operationKind: "prompt",
+            });
+            expect(current.required.tasks[0]?.plan).toBeUndefined();
+            const prompt = yield* instance.prepareOperation(
+              {
+                threadId,
+                kind: "prompt",
+                operationId: f.request.assignmentOperationId,
+                prompt: f.request.assignment,
+              },
+              () => Effect.void,
+            );
+            yield* prompt.run.pipe(Effect.result);
+            expect(promptText).toContain(current.text);
+            expect(promptText).toContain('"description":"Independent review findings"');
+            expect(f.transports).toBe(0);
+          }
+        }),
+      ),
+  );

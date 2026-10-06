@@ -58,6 +58,7 @@ import {
 } from "./PiNativeConfiguration.ts";
 import { readPiNativeSession } from "./PiNativeSessionReader.ts";
 import { makeProjectTeamReviewFreshness } from "../../projectWork/ProjectTeamReviewFreshness.ts";
+import { makeProjectTeamContext } from "../../projectWork/ProjectTeamContext.ts";
 import { makePiRuntimeEventTranslator } from "./PiRuntimeEvents.ts";
 import { makePiSessionRuntime } from "./PiSessionRuntime.ts";
 import { piLocalToolDefinitions } from "./PiLocalTools.ts";
@@ -623,6 +624,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const operations = yield* makeProjectTeamPiOperations({ environmentId: options.environmentId });
   const reviewFreshness = yield* makeProjectTeamReviewFreshness({
     environmentId: options.environmentId,
+  });
+  const requiredContext = yield* makeProjectTeamContext({
+    environmentId: options.environmentId,
+    maximumEnvironmentModelCalls: 128,
   });
   const authorization = yield* ProjectTeamAuthorization;
   const gateway = yield* ProjectWorkGateway;
@@ -1379,6 +1384,41 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   return yield* deny("Pi resume hint differs from durable native identity");
                 const context = contextFor(authority);
                 let authorityContext = context;
+                if (request.kind !== "initialize" && request.kind !== "prompt")
+                  return yield* deny("Required context is unavailable for this operation");
+                const contextOperation = {
+                  projectId: binding.projectId,
+                  bindingId: binding.recordId,
+                  generation: binding.generation,
+                  providerInstanceId: binding.providerInstanceId,
+                  threadId: binding.threadId,
+                  operationId: request.operationId ?? "",
+                  operationKind: request.kind,
+                };
+                const required = yield* requiredContext.readForOperation(contextOperation);
+                if (
+                  required.required.projectId !== binding.projectId ||
+                  required.required.runId !== binding.recordId ||
+                  required.required.taskId !== binding.taskId ||
+                  required.required.attemptId !== binding.attemptId ||
+                  required.required.generation !== binding.generation ||
+                  encode(required.required.role) !== encode(authority.role) ||
+                  required.required.tasks[0]?.task.specRevision !== binding.specRevision ||
+                  (required.required.tasks[0]?.plan?.planRevision ?? 0) !== binding.planRevision
+                )
+                  return yield* deny(
+                    "Required context differs from current assignment",
+                    "conflict",
+                  );
+                const requiredText = context + "\n\n" + required.text;
+                const promptBytes =
+                  request.kind === "prompt" ? Buffer.byteLength(request.prompt) : 0;
+                if (
+                  Buffer.byteLength(requiredText) > 65536 ||
+                  promptBytes > 65536 ||
+                  Buffer.byteLength(requiredText) + promptBytes > 131072
+                )
+                  return yield* deny("Pi required context exceeds transfer bounds", "unavailable");
                 const authorizeResources = guard(
                   Effect.gen(function* () {
                     yield* preparationCurrent;
@@ -1535,6 +1575,12 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   identity(request.threadId),
                   request.kind === "initialize",
                 );
+                const qualified = yield* requiredContext.readForOperation(contextOperation);
+                if (encode(qualified.provenance) !== encode(required.provenance))
+                  return yield* deny(
+                    "Required context provenance changed before allocation",
+                    "conflict",
+                  );
                 if (contextFor(allocationAuthority) !== context)
                   return yield* deny("Pi assignment changed before managed allocation", "conflict");
                 yield* verifyWorkspace(allocationAuthority, agentDirectory, workspace);
@@ -1615,7 +1661,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   });
                 }
                 const texts = [
-                  { transferId: "context", text: context },
+                  { transferId: "context", text: requiredText },
                   ...(request.kind === "prompt"
                     ? [{ transferId: "prompt", text: request.prompt }]
                     : []),
@@ -1948,7 +1994,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           specRevision: binding.specRevision,
                           planRevision: binding.planRevision,
                           native: terminal.native,
-                          expectedBriefing: context,
+                          expectedBriefing: requiredText,
                           expectedCwd: "/workspace",
                           sessionDirectoryRoot: nativeStateDirectory + "/sessions",
                           assertCurrent: assertFreshnessOwner,

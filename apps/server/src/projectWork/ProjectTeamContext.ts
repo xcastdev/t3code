@@ -145,6 +145,16 @@ const decodeCriterionEvent = Schema.decodeUnknownEffect(
 );
 const decodeReservation = Schema.decodeUnknownEffect(Schema.fromJsonString(Reservation), strict);
 const decodeSettlement = Schema.decodeUnknownEffect(Schema.fromJsonString(Settlement), strict);
+const OperationInput = Schema.Struct({
+  projectId: Schema.String,
+  bindingId: Id,
+  generation: Safe,
+  providerInstanceId: Id,
+  threadId: Id,
+  operationId: Id,
+  operationKind: Schema.Literals(["initialize", "prompt"]),
+});
+const decodeOperationInput = Schema.decodeUnknownEffect(OperationInput, strict);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const same = (a: unknown, b: unknown) =>
   canonicalProjectWorkPayload(a) === canonicalProjectWorkPayload(b);
@@ -775,7 +785,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
               )
               .sort((a, b) => b.planRevision - a.planRevision);
             const plan = plans[0];
-            if (plans[1]?.planRevision === plan?.planRevision)
+            if (plan !== undefined && plans[1]?.planRevision === plan.planRevision)
               return yield* deny("Required plan revision is ambiguous");
             if (plan !== undefined) requiredRecords.set(plan.recordId, plan);
             if (taskId !== binding.taskId) {
@@ -957,5 +967,49 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         : Effect.fail(deny("Required context denied by retained or current authority")),
     ),
   );
-  return { readRequired };
+  const readForOperation = Effect.fn("ProjectTeamContext.readForOperation")(function* (
+    input: typeof OperationInput.Type,
+  ) {
+    const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
+    if (Option.isSome(currentClient) && currentClient.value !== sql)
+      return yield* deny("Required context must use its captured SQL client");
+    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+      return yield* deny("Required context must own its read transaction");
+    const operation = yield* decodeOperationInput(input).pipe(
+      Effect.mapError(() => deny("Required operation identity is invalid")),
+    );
+    const snapshot = yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const rows = yield* sql<{ dispatch_id: string }>`SELECT dispatch_id
+            FROM project_team_dispatch WHERE environment_id=${options.environmentId}
+            AND project_id=${operation.projectId} AND binding_id=${operation.bindingId}
+            AND generation=${operation.generation} ORDER BY dispatch_id LIMIT 129`;
+          if (rows.length !== 1 || rows[0] === undefined)
+            return yield* deny("Required original dispatch is missing or ambiguous");
+          const retained = yield* journal.readRetained(rows[0].dispatch_id);
+          const claim = retained.intent.compiledClaim.transition;
+          const request = retained.intent.request;
+          if (
+            claim?.kind !== "claim" ||
+            claim.binding.environmentId !== options.environmentId ||
+            claim.binding.projectId !== operation.projectId ||
+            claim.binding.recordId !== operation.bindingId ||
+            claim.binding.generation !== operation.generation ||
+            claim.binding.providerInstanceId !== operation.providerInstanceId ||
+            claim.binding.threadId !== operation.threadId ||
+            operation.operationId !==
+              (operation.operationKind === "initialize"
+                ? request.initializeOperationId
+                : request.assignmentOperationId)
+          )
+            return yield* deny("Required operation differs from its original dispatch");
+          return retained;
+        }),
+      )
+      .pipe(Effect.mapError(() => deny("Required original dispatch is unavailable")));
+    // The owned reader revalidates this snapshot in its own transaction before returning content.
+    return yield* readRequired(snapshot);
+  });
+  return { readRequired, readForOperation };
 });
