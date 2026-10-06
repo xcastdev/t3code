@@ -644,8 +644,19 @@ const ProjectWorkPublicationServicesLive = ProjectWorkRuntime.publicationService
   Layer.provideMerge(ProjectWorkCoreLive),
   Layer.provide(GitHubCli.layer),
 );
+const ProjectWorkPublicationLinksServicesLive =
+  ProjectWorkRuntime.publicationLinksServicesLayer.pipe(
+    Layer.provideMerge(ProjectIssueServicesLive),
+    Layer.provideMerge(ProjectWorkCoreLive),
+    Layer.provide(OrchestrationLayerLive),
+  );
 
 const ProjectWorkServicesLive = Layer.mergeAll(
+  ProjectWorkPublicationLinksServicesLive,
+  ProjectWorkRuntime.publicationLinksRecoveryLayer.pipe(
+    Layer.provide(ProjectWorkPublicationLinksServicesLive),
+    Layer.provide(ServerSettingsLayerLive),
+  ),
   ProjectWorkPublicationServicesLive,
   ProjectWorkRuntime.publicationRecoveryLayer.pipe(
     Layer.provide(ProjectWorkPublicationServicesLive),

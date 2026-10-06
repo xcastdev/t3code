@@ -7,6 +7,7 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -17,8 +18,9 @@ import * as IssueComments from "./ProjectIssueComments.ts";
 import * as IssueHumanBinding from "./ProjectIssueHumanBinding.ts";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
-import type { ProjectWorkPublicationRequest } from "@t3tools/contracts";
+import type { ProjectWorkPublicationRequest, ServerSettingsError } from "@t3tools/contracts";
 import * as Publication from "./ProjectWorkPullRequests.ts";
+import * as PublicationLinks from "./ProjectWorkPublicationLinks.ts";
 import { readIssueRepositoryState } from "./ProjectIssueRepositoryState.ts";
 
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
@@ -408,5 +410,80 @@ export const publicationRecoveryLayer = Layer.effectDiscard(
     const service = yield* Publication.ProjectWorkPullRequests;
     const issues = yield* ProjectIssueRuntime;
     yield* Effect.forkScoped(runProjectWorkPublicationRecovery(service, issues.ready));
+  }),
+);
+
+/** Confirmed observations can restore thread links; uncertain results grant no link authority. */
+export const runProjectWorkPublicationLinkRecovery = Effect.fn(
+  "runProjectWorkPublicationLinkRecovery",
+)(function* (
+  service: Pick<PublicationLinks.ProjectWorkPublicationLinks["Service"], "recoverAll" | "link">,
+  ready: Effect.Effect<void>,
+  isEnabled: Effect.Effect<boolean, ServerSettingsError> = Effect.succeed(true),
+  enabledChanges: Stream.Stream<unknown> = Stream.empty,
+) {
+  const bus = yield* ProjectWorkEventBus.ProjectWorkEventBus;
+  const changes = yield* bus.subscribe;
+  const guarded = <A>(operation: Effect.Effect<A, PublicationLinks.PublicationLinkError>) =>
+    isEnabled.pipe(
+      Effect.flatMap((enabled) => (enabled ? operation : Effect.succeed(undefined))),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : Effect.logWarning("project-work PR link recovery failed", cause),
+      ),
+      Effect.asVoid,
+    );
+  const recover = guarded(
+    service
+      .recoverAll()
+      .pipe(
+        Effect.tap((result) =>
+          result.failed === 0
+            ? Effect.void
+            : Effect.logWarning("project-work PR links remain unavailable", {
+                failed: result.failed,
+              }),
+        ),
+      ),
+  );
+  yield* ready;
+  yield* recover;
+  const confirmed = changes.pipe(
+    Stream.filterMap(({ event }) =>
+      event.type === "project-work.foundation.recorded" &&
+      event.record.kind === "effect" &&
+      event.record.effectKind === "publication" &&
+      event.record.status === "succeeded"
+        ? Result.succeed({ kind: "confirmed" as const, operationId: event.record.effectId })
+        : Result.fail(undefined),
+    ),
+  );
+  const enabled = enabledChanges.pipe(Stream.map(() => ({ kind: "enabled" as const })));
+  yield* Stream.merge(confirmed, enabled).pipe(
+    Stream.runForEach((event) =>
+      event.kind === "confirmed" ? guarded(service.link(event.operationId)) : recover,
+    ),
+  );
+});
+
+export const publicationLinksServicesLayer = Layer.effect(
+  PublicationLinks.ProjectWorkPublicationLinks,
+  PublicationLinks.make,
+);
+export const publicationLinksRecoveryLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const links = yield* PublicationLinks.ProjectWorkPublicationLinks;
+    const issues = yield* ProjectIssueRuntime;
+    const settings = yield* ServerSettingsService;
+    const changes = yield* settings.subscribeChanges;
+    yield* Effect.forkScoped(
+      runProjectWorkPublicationLinkRecovery(
+        links,
+        issues.ready,
+        settings.getSettings.pipe(Effect.map((value) => value.projectWorkEnabled)),
+        changes.pipe(Stream.filter((value) => value.projectWorkEnabled)),
+      ),
+    );
   }),
 );
