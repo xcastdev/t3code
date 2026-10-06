@@ -7,6 +7,7 @@ import {
   ProjectWorkTaskContext,
   ProjectIssueIntakeRead,
   ProjectIssueRepositoryCursorRead,
+  ProjectTeamRecord,
   type ProjectTeamRecordRead,
 } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -30,6 +31,7 @@ import { environmentPresentations } from "../../state/presentation";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { uuidv4 } from "../../lib/uuid";
+import { createHomeThreadNavigationAction } from "../home/home-thread-navigation";
 import { mobileWorkEnvironment } from "./workEnvironment";
 import { decodeWorkRoute } from "./workNavigation";
 import { mobileTaskPage } from "./workData";
@@ -39,6 +41,7 @@ import { WorkQuestions, WorkTeam } from "./WorkTeam";
 import { WorkEvidence } from "./WorkEvidence";
 import { WorkSupervisionSource } from "./WorkSupervisionSource";
 
+const knownTeamRecord = Schema.is(ProjectTeamRecord);
 const decodeContext = Schema.decodeUnknownOption(ProjectWorkTaskContext);
 const isIssue = Schema.is(ProjectIssueIntakeRead);
 const isCursor = Schema.is(ProjectIssueRepositoryCursorRead);
@@ -459,6 +462,7 @@ function WorkTaskSession({
     reportFailure: false,
     reportDefect: false,
   });
+  const [workerPage, setWorkerPage] = useState(0);
   const [session] = useState(() =>
     createWorkActionSession(
       { ...target, taskId },
@@ -518,6 +522,23 @@ function WorkTaskSession({
     context.task.taskId === taskId
       ? context
       : null;
+  const recordCounts = new Map<string, number>();
+  for (const record of foundation.snapshot.records)
+    recordCounts.set(record.recordId, (recordCounts.get(record.recordId) ?? 0) + 1);
+  const records = foundation.snapshot.records.filter(knownTeamRecord);
+  const workers =
+    ownContext === null
+      ? []
+      : records.filter(
+          (record) =>
+            record.kind === "run-binding" &&
+            record.projectId === target.projectId &&
+            record.taskId === taskId &&
+            record.environmentId === target.environmentId &&
+            recordCounts.get(record.recordId) === 1,
+        );
+  const workerPages = Math.max(1, Math.ceil(workers.length / 10));
+  const visibleWorkerPage = Math.min(workerPage, workerPages - 1);
   return (
     <WorkSurface title="Work task">
       <ProjectIdentity target={target} />
@@ -558,6 +579,76 @@ function WorkTaskSession({
             {ownContext.blockers.map((blocker) => (
               <Notice key={blocker.blockerId}>{blocker.reason}</Notice>
             ))}
+          </WorkCard>
+          <WorkCard title="Recorded workers">
+            <Notice>
+              {runtime?.connectionState === "connected" && foundation.current
+                ? "Recorded worker history"
+                : "Cached or incomplete worker history"}
+            </Notice>
+            {workers.slice(visibleWorkerPage * 10, (visibleWorkerPage + 1) * 10).map((run) => {
+              if (run.kind !== "run-binding") return null;
+              const roles = records.filter(
+                (record) =>
+                  record.kind === "role-revision" &&
+                  record.projectId === target.projectId &&
+                  record.recordId === run.roleRevisionId &&
+                  recordCounts.get(record.recordId) === 1,
+              );
+              const role = roles.length === 1 ? roles[0] : undefined;
+              return (
+                <View key={run.recordId} className="gap-2 border-t border-border pt-3">
+                  <Notice>
+                    {role?.kind === "role-revision" ? role.role : "Role unavailable"} · {run.model}{" "}
+                    · {run.status}
+                  </Notice>
+                  <Notice>
+                    Run {run.recordId} · attempt {run.attemptId}
+                  </Notice>
+                  <Notice>
+                    Specification {run.specRevision} · plan {run.planRevision}
+                  </Notice>
+                  <Text selectable className="text-sm text-foreground-muted">
+                    {run.worktree} · {run.branch}
+                  </Text>
+                  <WorkButton
+                    onPress={() =>
+                      navigation.dispatch((state) =>
+                        createHomeThreadNavigationAction({
+                          state,
+                          dismissingRouteKey: null,
+                          thread: { environmentId: target.environmentId, id: run.threadId },
+                        }),
+                      )
+                    }
+                  >
+                    Open worker thread {run.threadId}
+                  </WorkButton>
+                </View>
+              );
+            })}
+            {workers.length === 0 ? <Notice>No workers recorded for this task.</Notice> : null}
+            {workerPages > 1 ? (
+              <>
+                <View className="flex-row flex-wrap gap-2">
+                  <WorkButton
+                    disabled={visibleWorkerPage === 0}
+                    onPress={() => setWorkerPage(visibleWorkerPage - 1)}
+                  >
+                    Previous workers
+                  </WorkButton>
+                  <WorkButton
+                    disabled={visibleWorkerPage + 1 === workerPages}
+                    onPress={() => setWorkerPage(visibleWorkerPage + 1)}
+                  >
+                    Next workers
+                  </WorkButton>
+                </View>
+                <Notice>
+                  Page {visibleWorkerPage + 1} of {workerPages}
+                </Notice>
+              </>
+            ) : null}
           </WorkCard>
           <WorkQuestions
             current={current}

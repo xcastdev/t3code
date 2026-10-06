@@ -174,6 +174,56 @@ function records(current: ProjectWorkTaskContext, gateStatus = "pending") {
   ].map((record) => decodeRecord(record));
 }
 
+function workerRecords(overrides: Record<string, unknown> = {}) {
+  const fields = { projectId, revision: 1, generation: 0, updatedAt: at };
+  return [
+    decodeRecord({
+      ...fields,
+      kind: "role-revision",
+      recordId: "worker-role",
+      status: "retired",
+      roleId: "implementation",
+      roleRevision: 1,
+      role: "implementer",
+      model: "profile-model",
+      instructions: "Implement the task",
+      skills: [],
+      tools: [],
+      memoryAccess: "project",
+      delegationDepth: 0,
+    }),
+    decodeRecord({
+      ...fields,
+      kind: "run-binding",
+      recordId: "worker-run",
+      status: "running",
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      memberId: "worker-member",
+      roleRevisionId: "worker-role",
+      providerInstanceId: "pi-local",
+      threadId: "worker/thread",
+      environmentId,
+      model: "frozen-model",
+      configuration: {
+        instructionsHash: "hash",
+        toolIds: [],
+        skillIds: [],
+        runtimeVersion: "pi",
+        maxTokens: 100,
+        maxDurationMs: 1000,
+        paidFallback: false,
+      },
+      worktree: "/fixture",
+      branch: "worker",
+      leaseGeneration: 0,
+      specRevision: 1,
+      planRevision: 1,
+      ...overrides,
+    }),
+  ];
+}
+
 function deferred() {
   let resolve: () => void = () => {};
   let reject: (error: unknown) => void = () => {};
@@ -260,6 +310,107 @@ describe("GuidedTaskDetail human interactions", () => {
     select.value = value;
     await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
   }
+
+  it("shows recorded running and settled workers with frozen configuration and thread links", async () => {
+    foundation = [
+      ...foundation,
+      ...workerRecords(),
+      workerRecords({ recordId: "old-run", status: "settled", threadId: "old-thread" })[1]!,
+    ];
+    await render();
+    expect(host.textContent).toContain("Recorded workers");
+    expect(host.textContent).toContain("implementer · frozen-model · running");
+    expect(host.textContent).toContain("implementer · frozen-model · settled");
+    expect(host.textContent).not.toContain("profile-model");
+    expect(host.textContent).toContain("Specification 1 · plan 1");
+    expect(host.textContent).toContain("/fixture · worker");
+    expect([...host.querySelectorAll("a")].map((link) => link.getAttribute("href"))).toEqual([
+      "/environment-1/worker%2Fthread",
+      "/environment-1/old-thread",
+    ]);
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("pages through settled history and resets the worker page on a task change", async () => {
+    const role = workerRecords()[0]!;
+    foundation = [
+      ...foundation,
+      role,
+      ...Array.from(
+        { length: 11 },
+        (_, index) =>
+          workerRecords({
+            recordId: `run-${index}`,
+            threadId: `thread-${index}`,
+            status: "settled",
+          })[1]!,
+      ),
+    ];
+    await render();
+    expect(host.querySelectorAll("a")).toHaveLength(10);
+    expect(host.textContent).not.toContain("Worker thread thread-10");
+    await click("Next workers");
+    expect(host.querySelectorAll("a")).toHaveLength(1);
+    expect(host.textContent).toContain("Worker thread thread-10");
+    await click("Previous workers");
+    expect(host.querySelectorAll("a")).toHaveLength(10);
+    await click("Next workers");
+    current = context(10, "task-2");
+    foundation = [
+      role,
+      ...Array.from(
+        { length: 11 },
+        (_, index) =>
+          workerRecords({
+            recordId: `next-run-${index}`,
+            taskId: "task-2",
+            threadId: `next-thread-${index}`,
+            status: "settled",
+          })[1]!,
+      ),
+    ];
+    await render();
+    expect(host.querySelectorAll("a")).toHaveLength(10);
+    expect(host.textContent).toContain("Worker thread next-thread-0");
+    expect(host.textContent).not.toContain("Worker thread thread-");
+  });
+
+  it.each(["environment", "project", "task", "duplicate", "future", "malformed"])(
+    "withholds %s worker navigation",
+    async (variant) => {
+      const overrides =
+        variant === "environment"
+          ? { environmentId: "foreign" }
+          : variant === "project"
+            ? { projectId: "foreign" }
+            : variant === "task"
+              ? { taskId: "other-task" }
+              : variant === "future"
+                ? { status: "future-running" }
+                : variant === "malformed"
+                  ? { threadId: undefined }
+                  : {};
+      const workers = workerRecords(overrides);
+      foundation = [...foundation, ...workers, ...(variant === "duplicate" ? [workers[1]!] : [])];
+      await render();
+      expect(host.querySelector("a")).toBeNull();
+      expect(write).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps settled worker links in saved work while offline and removes them on owner changes", async () => {
+    foundation = [...foundation, ...workerRecords({ status: "settled" })];
+    await render({ connected: false, foundationComplete: false });
+    expect(host.textContent).toContain("Showing saved work while disconnected");
+    expect(host.querySelector("a")?.getAttribute("href")).toBe("/environment-1/worker%2Fthread");
+    await render({ environmentId: EnvironmentId.make("environment-2") });
+    expect(host.querySelector("a")).toBeNull();
+    await render({ projectId: ProjectId.make("project-2") });
+    expect(host.querySelector("a")).toBeNull();
+    current = context(10, "task-2");
+    await render();
+    expect(host.querySelector("a")).toBeNull();
+  });
 
   it("starts only explicit linked investigation with exact task, project, and issue revisions", async () => {
     foundation = [

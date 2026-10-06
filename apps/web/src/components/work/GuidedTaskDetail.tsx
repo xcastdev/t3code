@@ -96,6 +96,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   const [drafts, setDrafts] = useState(createGuidedTaskDraftState);
   const state = useRef(drafts);
   const lifetime = useRef(0);
+  const [workerPage, setWorkerPage] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [acceptedRevision, setAcceptedRevision] = useState<number | null>(null);
   const [controlAction, setControlAction] = useState<(typeof controls)[number]>("defer");
@@ -114,6 +115,20 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   const taskRecords = records.filter(
     (record) => "taskId" in record && record.taskId === task?.taskId,
   );
+  const recordCounts = new Map<string, number>();
+  for (const record of props.foundationRecords)
+    recordCounts.set(record.recordId, (recordCounts.get(record.recordId) ?? 0) + 1);
+  const workers = owned
+    ? taskRecords.filter(
+        (record) =>
+          record.kind === "run-binding" &&
+          record.projectId === projectId &&
+          record.environmentId === environmentId &&
+          recordCounts.get(record.recordId) === 1,
+      )
+    : [];
+  const workerPages = Math.max(1, Math.ceil(workers.length / 10));
+  const visibleWorkerPage = Math.min(workerPage, workerPages - 1);
   const membership = one(taskRecords.filter((record) => record.kind === "task-membership"));
   const plans = taskRecords.filter(
     (record): record is Plan => record.kind === "plan-revision" && record.status === "proposed",
@@ -683,6 +698,75 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
           {notice}
         </p>
       ) : null}
+      <WorkCard>
+        <h3 className="mb-3 font-medium">Recorded workers</h3>
+        <p className="mb-3 text-xs text-muted-foreground">
+          {props.connected && complete
+            ? "Recorded worker history"
+            : "Cached or incomplete worker history"}
+        </p>
+        {workers.slice(visibleWorkerPage * 10, (visibleWorkerPage + 1) * 10).map((run) => {
+          if (run.kind !== "run-binding") return null;
+          const role = one(
+            records.filter(
+              (record) =>
+                record.kind === "role-revision" &&
+                record.projectId === projectId &&
+                record.recordId === run.roleRevisionId &&
+                recordCounts.get(record.recordId) === 1,
+            ),
+          );
+          return (
+            <div key={run.recordId} className="mb-3 space-y-1 text-sm">
+              <p>
+                {role?.kind === "role-revision" ? role.role : "Role unavailable"} · {run.model} ·{" "}
+                {run.status}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Run {run.recordId} · Attempt {run.attemptId}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Specification {run.specRevision} · plan {run.planRevision}
+              </p>
+              <p className="break-all text-xs text-muted-foreground">
+                {run.worktree} · {run.branch}
+              </p>
+              <a
+                className="text-primary underline"
+                href={`/${encodeURIComponent(environmentId)}/${encodeURIComponent(run.threadId)}`}
+              >
+                Worker thread {run.threadId}
+              </a>
+            </div>
+          );
+        })}
+        {workers.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No workers recorded for this task.</p>
+        ) : null}
+        {workerPages > 1 ? (
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={visibleWorkerPage === 0}
+              onClick={() => setWorkerPage(visibleWorkerPage - 1)}
+            >
+              Previous workers
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={visibleWorkerPage + 1 === workerPages}
+              onClick={() => setWorkerPage(visibleWorkerPage + 1)}
+            >
+              Next workers
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Page {visibleWorkerPage + 1} of {workerPages}
+            </span>
+          </div>
+        ) : null}
+      </WorkCard>
       <WorkCard>
         <h3 className="mb-3 font-medium">Internal findings</h3>
         {context?.comments.map((comment) => (
