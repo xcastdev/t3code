@@ -32,10 +32,144 @@ import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import {
   runProjectWorkLeaseWorker,
   runProjectWorkPublicationRecovery,
+  runProjectWorkPublicationLinkRecovery,
 } from "./ProjectWorkRuntime.ts";
 import { coreLayer, leaseLayer } from "./ProjectWorkRuntime.ts";
 
 const decodePublicationEffect = Schema.decodeUnknownSync(ProjectTeamEffect);
+
+it.effect("publication links stay inactive while disabled and catch up when enabled", () =>
+  Effect.gen(function* () {
+    const checked = yield* Queue.unbounded<boolean>();
+    const called = yield* Queue.unbounded<number>();
+    const enabledChanges = yield* Queue.unbounded<void>();
+    let enabled = false;
+    let count = 0;
+    const isEnabled = Effect.suspend(() => Queue.offer(checked, enabled).pipe(Effect.as(enabled)));
+    const service = {
+      link: () => Effect.die("unexpected publication receipt"),
+      recoverAll: () =>
+        Effect.gen(function* () {
+          count += 1;
+          yield* Queue.offer(called, count);
+          return { observed: 0, attempted: 0, skipped: 0, failed: 0 };
+        }),
+    };
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* Effect.forkScoped(
+          runProjectWorkPublicationLinkRecovery(
+            service,
+            Effect.void,
+            isEnabled,
+            Stream.fromQueue(enabledChanges),
+          ),
+        );
+        const first = yield* Effect.raceFirst(
+          Queue.take(checked).pipe(Effect.as("checked")),
+          Queue.take(called).pipe(Effect.as("called")),
+        );
+        expect(first).toBe("checked");
+        expect(count).toBe(0);
+        enabled = true;
+        yield* Queue.offer(enabledChanges, undefined);
+        expect(yield* Queue.take(checked)).toBe(true);
+        expect(yield* Queue.take(called)).toBe(1);
+        enabled = false;
+        yield* Queue.offer(enabledChanges, undefined);
+        expect(yield* Queue.take(checked)).toBe(false);
+      }),
+    );
+    expect(count).toBe(1);
+  }).pipe(Effect.provide(ProjectWorkEventBusLive)),
+);
+
+it.effect(
+  "publication links retain confirmed receipts queued before startup readiness and stop with their scope",
+  () =>
+    Effect.gen(function* () {
+      const bus = yield* ProjectWorkEventBus;
+      const subscribed = yield* Deferred.make<void>();
+      const ready = yield* Deferred.make<void>();
+      const called = yield* Queue.unbounded<number>();
+      let count = 0;
+      let scans = 0;
+      const linkedIds: string[] = [];
+      const service = {
+        recoverAll: () =>
+          Effect.gen(function* () {
+            scans += 1;
+            count += 1;
+            yield* Queue.offer(called, count);
+            return { observed: 0, attempted: 0, skipped: 0, failed: 0 };
+          }),
+        link: (operationId: string) =>
+          Effect.gen(function* () {
+            linkedIds.push(operationId);
+            count += 1;
+            yield* Queue.offer(called, count);
+            return { status: "attempted" as const };
+          }),
+      };
+      const at = "2026-10-05T00:00:00.000Z";
+      const projectId = ProjectId.make("publication-link-worker-project");
+      const effect = decodePublicationEffect({
+        kind: "effect",
+        recordId: "publication-link",
+        effectId: "publication-link",
+        projectId,
+        revision: 1,
+        generation: 0,
+        updatedAt: at,
+        effectKind: "publication",
+        status: "succeeded",
+        targetId: "github.com/owner/repo",
+        payload: { recordIds: [], expectedRevision: 0 },
+        claimGeneration: 1,
+        availableAt: at,
+      });
+      const receipts = [
+        { ...effect, status: "claimed" as const },
+        { ...effect, status: "uncertain" as const },
+        { ...effect, effectKind: "dispatch" as const },
+        effect,
+      ].map((record, index) => ({
+        cursor: index + 1,
+        event: {
+          eventId: EventId.make(`link-receipt-${index}`),
+          projectId,
+          revision: index + 1,
+          type: "project-work.foundation.recorded" as const,
+          record,
+          occurredAt: at,
+        },
+      }));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.forkScoped(
+            runProjectWorkPublicationLinkRecovery(service, Deferred.await(ready)).pipe(
+              Effect.provideService(ProjectWorkEventBus, {
+                ...bus,
+                subscribe: bus.subscribe.pipe(
+                  Effect.tap(() => Deferred.succeed(subscribed, undefined)),
+                ),
+              }),
+            ),
+          );
+          yield* Deferred.await(subscribed);
+          yield* bus.publish(receipts);
+          expect(count).toBe(0);
+          yield* Deferred.succeed(ready, undefined);
+          expect(yield* Queue.take(called)).toBe(1);
+          expect(yield* Queue.take(called)).toBe(2);
+          expect(scans).toBe(1);
+          expect(linkedIds).toEqual([effect.effectId]);
+        }),
+      );
+      yield* bus.publish(receipts);
+      expect(count).toBe(2);
+    }).pipe(Effect.provide(ProjectWorkEventBusLive)),
+);
 
 it.effect(
   "publication recovery runs at startup and on claimed receipts without a reflection feedback loop",
