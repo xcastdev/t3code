@@ -3,6 +3,7 @@ import {
   ChartNoAxesColumnIcon,
   GitPullRequestIcon,
   ListTodoIcon,
+  LayoutDashboardIcon,
   SettingsIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -153,11 +154,13 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu({
           ? "project-settings"
           : /^\/work\/[^/]+\/[^/]+\/?$/.test(location.pathname)
             ? "work"
-            : location.pathname === "/usage"
-              ? "usage"
-              : location.pathname === "/pull-requests"
-                ? "pull-requests"
-                : null,
+            : location.pathname === "/portfolio"
+              ? "portfolio"
+              : location.pathname === "/usage"
+                ? "usage"
+                : location.pathname === "/pull-requests"
+                  ? "pull-requests"
+                  : null,
   });
   const { environments } = useEnvironments();
   // The page reads every connected server, so one of them offering pull requests is enough for
@@ -198,6 +201,11 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu({
     });
   }, [closeMobileSidebar, navigate, workTarget]);
 
+  const handlePortfolioClick = useCallback(() => {
+    closeMobileSidebar();
+    void navigate({ to: "/portfolio" });
+  }, [closeMobileSidebar, navigate]);
+
   const handleBackClick = useCallback(() => {
     closeMobileSidebar();
     if (canGoBack) {
@@ -218,6 +226,11 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu({
         </SidebarMenuItem>
       ) : (
         <>
+          <SidebarUtilityItem
+            icon={<LayoutDashboardIcon />}
+            label="Portfolio"
+            onClick={handlePortfolioClick}
+          />
           {workTarget ? (
             <SidebarUtilityItem icon={<ListTodoIcon />} label="Work" onClick={handleWorkClick} />
           ) : null}

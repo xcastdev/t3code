@@ -215,6 +215,50 @@ describe("WorkPage project-scoped sections", () => {
     });
   });
 
+  it("opens a linked task immediately and keeps the new-task draft across same-owner URL changes", async () => {
+    const environmentId = EnvironmentId.make("environment-1");
+    const projectId = ProjectId.make("project-1");
+    testState.pages.set(`${projectId}:tasks:0`, makeTaskPage(projectId, 1));
+    const render = async (taskId: string) =>
+      act(async () =>
+        root.render(
+          <WorkPage
+            environmentId={environmentId}
+            projectId={projectId}
+            selection={{ tab: "tasks", taskId: ProjectWorkTaskId.make(taskId) }}
+          />,
+        ),
+      );
+    await render("first");
+    expect(host.textContent).toContain("The linked task requires current team records");
+    expect(host.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain(
+      "Tasks",
+    );
+    await act(async () =>
+      [...host.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("New task"))
+        ?.click(),
+    );
+    const input = host.querySelector<HTMLInputElement>(
+      'input[placeholder="e.g. Document the release checklist"]',
+    );
+    expect(input).not.toBeNull();
+    if (!input) throw new Error("Missing real new-task title field");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+        input,
+        "Keep this draft",
+      );
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await render("second");
+    expect(
+      host.querySelector<HTMLInputElement>(
+        'input[placeholder="e.g. Document the release checklist"]',
+      )?.value,
+    ).toBe("Keep this draft");
+  });
+
   it("resets a loaded knowledge page when switching projects", async () => {
     const environmentId = EnvironmentId.make("environment-1");
     const firstProjectId = ProjectId.make("project-1");

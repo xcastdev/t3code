@@ -51,18 +51,31 @@ const TAB_ITEMS: ReadonlyArray<{
   { id: "evidence", label: "Evidence", icon: FileCheckIcon },
 ];
 
+export interface WorkPageSelection {
+  readonly tab: WorkTab;
+  readonly taskId?: ProjectWorkTaskId;
+}
+
+interface WorkPageProps {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly selection?: WorkPageSelection;
+  readonly onSelectionChange?: (selection: WorkPageSelection) => void;
+}
+
 export function WorkPage({
   environmentId,
   projectId,
-}: {
-  readonly environmentId: EnvironmentId;
-  readonly projectId: ProjectId;
-}) {
+  selection,
+  onSelectionChange,
+}: WorkPageProps) {
   return (
     <ProjectWorkPage
       key={JSON.stringify([environmentId, projectId])}
       environmentId={environmentId}
       projectId={projectId}
+      {...(selection ? { selection } : {})}
+      {...(onSelectionChange ? { onSelectionChange } : {})}
     />
   );
 }
@@ -70,17 +83,30 @@ export function WorkPage({
 function ProjectWorkPage({
   environmentId,
   projectId,
-}: {
-  readonly environmentId: EnvironmentId;
-  readonly projectId: ProjectId;
-}) {
+  selection,
+  onSelectionChange,
+}: WorkPageProps) {
   const environment = useEnvironment(environmentId);
   const project = useProject(scopeProjectRef(environmentId, projectId));
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
-  const [tab, setTab] = useState<WorkTab>("overview");
+  const [localTab, setTab] = useState<WorkTab>("overview");
   const [inboxVisited, setInboxVisited] = useState(false);
-  const [targetTask, setTargetTask] = useState<ProjectWorkTaskId | undefined>();
+  const [localTargetTask, setTargetTask] = useState<ProjectWorkTaskId | undefined>();
+  const tab = selection?.tab ?? localTab;
+  const targetTask = selection ? selection.taskId : localTargetTask;
+  const selectTab = (nextTab: WorkTab) => {
+    if (onSelectionChange) {
+      onSelectionChange({
+        tab: nextTab,
+        ...(nextTab === "tasks" && targetTask ? { taskId: targetTask } : {}),
+      });
+    } else setTab(nextTab);
+  };
   const openTask = (taskId: ProjectWorkTaskId) => {
+    if (onSelectionChange) {
+      onSelectionChange({ tab: "tasks", taskId });
+      return;
+    }
     setTargetTask(taskId);
     setTab("tasks");
   };
@@ -175,7 +201,7 @@ function ProjectWorkPage({
                   }`}
                   onClick={() => {
                     if (id === "inbox") setInboxVisited(true);
-                    setTab(id);
+                    selectTab(id);
                   }}
                 >
                   <Icon className="size-4" />
@@ -201,7 +227,7 @@ function ProjectWorkPage({
                   serverConfig?.environment?.capabilities?.projectTeamSupervisionReads === true
                 }
                 onOpenTask={openTask}
-                onInspectProject={() => setTab("team")}
+                onInspectProject={() => selectTab("team")}
               />
             ) : tab === "tasks" ? (
               <WorkTasks

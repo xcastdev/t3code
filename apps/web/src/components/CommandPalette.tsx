@@ -50,6 +50,7 @@ import {
   GitPullRequestArrowIcon,
   LinkIcon,
   ListTodoIcon,
+  LayoutDashboardIcon,
   MessageSquareIcon,
   PaletteIcon,
   SettingsIcon,
@@ -1850,6 +1851,17 @@ function OpenCommandPaletteDialog(props: {
     icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
     run: async () => {
       await navigate({ to: "/settings" });
+    },
+  });
+
+  actionItems.push({
+    kind: "action",
+    value: "action:portfolio",
+    searchTerms: ["portfolio", "projects", "teams", "supervision", "work", "progress"],
+    title: "Open Portfolio",
+    icon: <LayoutDashboardIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({ to: "/portfolio" });
     },
   });
 
