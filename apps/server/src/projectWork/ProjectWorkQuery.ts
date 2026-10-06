@@ -782,6 +782,12 @@ const makeProjectWorkQuery = Effect.gen(function* () {
           blockers: listBlockers({ projectId, trusted: true }),
           attention: listAttention({ projectId, trusted: true }),
           knowledge: listKnowledge({ projectId, limit: maxKnowledge, trusted: true }),
+          decisions: listDecisions({
+            projectId,
+            state: "accepted",
+            limit: maxKnowledge,
+            trusted: true,
+          }),
         }).pipe(
           Effect.map((value) => ({
             projectId,
@@ -790,7 +796,6 @@ const makeProjectWorkQuery = Effect.gen(function* () {
             relationships: [],
             activities: [],
             checkpoints: [],
-            decisions: [],
             comments: [],
           })),
         ),

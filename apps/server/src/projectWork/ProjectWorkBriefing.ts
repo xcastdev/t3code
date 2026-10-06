@@ -4,6 +4,7 @@ import {
   type ProjectWorkBriefing as ProjectWorkBriefingRecord,
   type ProjectWorkBriefingKind,
   type ProjectWorkKnowledge,
+  type ProjectWorkDecision,
   type ProjectWorkTask,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -138,6 +139,17 @@ const knowledgeLine = (knowledge: ProjectWorkKnowledge, kind: ProjectWorkBriefin
   return `- ${oneLine(knowledge.title)} — ${body}`;
 };
 
+const decisionLine = (decision: ProjectWorkDecision): string => {
+  let line = `- [${oneLine(String(decision.decisionId))}; revision ${decision.revision}] ${oneLine(decision.title)} — ${oneLine(decision.body)}`;
+  const transition = decision.stateTransitionAttribution;
+  if (transition) {
+    const actor = `${transition.actor.kind}${transition.actor.id ? `/${oneLine(transition.actor.id)}` : ""}${transition.actor.displayName ? ` (${oneLine(transition.actor.displayName)})` : ""}`;
+    const source = `${transition.source.kind}${transition.source.id ? `/${oneLine(transition.source.id)}` : ""}${transition.source.uri ? ` (${oneLine(transition.source.uri)})` : ""}`;
+    line += ` (recorded acceptance: ${actor}; source: ${source}; ${transition.recordedAt})`;
+  }
+  return line;
+};
+
 const appendWithinLimit = (lines: Array<string>, value: string, maxCharacters: number): boolean => {
   const candidate = [...lines, value].join("\n");
   if (candidate.length > maxCharacters) return false;
@@ -164,6 +176,16 @@ export const buildProjectWorkBriefing = (
   const limits = limitsFor(input);
   const tasks = sortTasks(snapshot);
   const knowledge = sortKnowledge(snapshot);
+  const decisions = snapshot.decisions
+    .filter(
+      (decision) => decision.state === "accepted" && String(decision.projectId) === input.projectId,
+    )
+    .toSorted((left, right) => {
+      const timeDelta = compareDescendingTime(left.updatedAt, right.updatedAt);
+      return timeDelta !== 0
+        ? timeDelta
+        : String(left.decisionId).localeCompare(String(right.decisionId));
+    });
   const omittedReasons: Array<string> = [];
   const includedTaskIds: Array<ProjectWorkTaskId> = [];
   const includedKnowledgeIds: Array<ProjectWorkKnowledgeId> = [];
@@ -194,6 +216,18 @@ export const buildProjectWorkBriefing = (
       includedKnowledgeIds.push(entry.knowledgeId);
     }
     if (knowledge.length > limits.maxKnowledge) omittedReasons.push("knowledge-bound");
+  }
+  if (decisions.length > 0) {
+    if (!appendWithinLimit(lines, "Recorded decisions", limits.maxCharacters))
+      omittedReasons.push("character-bound");
+    // Decisions use the existing per-kind context count and the shared text budget.
+    for (const decision of decisions.slice(0, limits.maxKnowledge)) {
+      if (!appendWithinLimit(lines, decisionLine(decision), limits.maxCharacters)) {
+        omittedReasons.push("character-bound");
+        break;
+      }
+    }
+    if (decisions.length > limits.maxKnowledge) omittedReasons.push("decision-bound");
   }
   const text = clipTo(lines.join("\n"), limits.maxCharacters);
   // The service boundary supplies current time; pure callers should pass a
@@ -234,7 +268,8 @@ const makeProjectWorkBriefing = Effect.gen(function* () {
   const generate: ProjectWorkBriefingShape["generate"] = (input) =>
     query
       // Keep one trusted sentinel through rendering so an exact boundary and
-      // a truncated result remain distinguishable, including maxKnowledge=0.
+      // a truncated result remain distinguishable for knowledge and decisions,
+      // including maxKnowledge=0.
       .briefingSnapshot(input.projectId, limitsFor(input).maxKnowledge + 1)
       .pipe(Effect.map((snapshot) => buildProjectWorkBriefing(snapshot, input)));
   return {

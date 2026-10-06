@@ -21,6 +21,7 @@ import {
   MessageId,
   OrchestrationThreadShell,
   ProjectId,
+  ProjectWorkDecisionId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -93,6 +94,12 @@ import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectWorkBriefing from "../../projectWork/ProjectWorkBriefing.ts";
+import { ProjectWorkQueryLive } from "../../projectWork/ProjectWorkQuery.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+} from "../../projectWork/ProjectWorkRepository.ts";
+import { runForkMigrations } from "../../persistence/Migrations.ts";
 import * as ProjectWorkNarrative from "../../projectWork/ProjectWorkNarrative.ts";
 import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import { OrchestrationEngineLive } from "../../orchestration/Layers/OrchestrationEngine.ts";
@@ -5940,6 +5947,157 @@ describe("agent browser access", () => {
 });
 
 describe("durable project-work provider envelope", () => {
+  it.effect(
+    "reconstructs recorded decisions from SQL for startup and replacement without narrative services",
+    () =>
+      Effect.gen(function* () {
+        yield* runForkMigrations(9);
+        const at = "2026-01-01T00:00:00.000Z";
+        const threadId = asThreadId("thread-recorded-decision-context");
+        const projectId = ProjectId.make("project-recorded-decision-context");
+        const originalId = ProjectWorkDecisionId.make("provider-original-decision");
+        const replacementId = ProjectWorkDecisionId.make("provider-replacement-decision");
+        const attribution = {
+          actor: { kind: "human" as const, id: "context-maintainer" },
+          source: { kind: "web" as const, id: "context-client" },
+          recordedAt: at,
+        };
+        const repository = yield* ProjectWorkRepository;
+        const original = {
+          decisionId: originalId,
+          projectId,
+          title: "Use the shared parser",
+          body: "The web and desktop clients share one parser.",
+          state: "proposed" as const,
+          revision: 0,
+          createdAt: at,
+          updatedAt: at,
+        };
+        yield* repository.execute({
+          type: "project-work.decision.propose",
+          commandId: CommandId.make("provider-decision-propose"),
+          projectId,
+          decision: original,
+          proposedAt: at,
+          attribution,
+        });
+        yield* repository.execute({
+          type: "project-work.decision.accept",
+          commandId: CommandId.make("provider-decision-accept"),
+          projectId,
+          decisionId: originalId,
+          acceptedAt: at,
+          attribution,
+        });
+        const shell = yield* decodeBrowserAccessThreadShell({
+          id: threadId,
+          projectId,
+          title: "Recorded decision context",
+          modelSelection: createModelSelection(codexInstanceId, "context-model"),
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          latestTurn: null,
+          createdAt: at,
+          updatedAt: at,
+          session: null,
+          latestUserMessageAt: null,
+          hasPendingApprovals: false,
+          hasPendingUserInput: false,
+          hasActionableProposedPlan: false,
+        });
+        const projection = {
+          getThreadShellById: () => Effect.succeed(Option.some(shell)),
+        } as unknown as ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"];
+        const codex = makeFakeCodexAdapter();
+        const providerLayer = makeProviderServiceLive().pipe(
+          Layer.provide(
+            Layer.succeed(
+              ProviderAdapterRegistry.ProviderAdapterRegistry,
+              makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
+            ),
+          ),
+          Layer.provide(
+            ProviderSessionDirectoryLive.pipe(Layer.provide(ProviderSessionRuntime.layer)),
+          ),
+          Layer.provide(Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, projection)),
+          Layer.provide(
+            ProjectWorkBriefing.ProjectWorkBriefingLive.pipe(Layer.provide(ProjectWorkQueryLive)),
+          ),
+          Layer.provide(
+            ServerSettings.ServerSettingsService.layerTest({ projectWorkEnabled: true }),
+          ),
+          Layer.provide(serverConfigTestLayer),
+          Layer.provide(AnalyticsService.layerTest),
+          Layer.provide(
+            Layer.succeed(
+              ProviderEventLoggers.ProviderEventLoggers,
+              ProviderEventLoggers.NoOpProviderEventLoggers,
+            ),
+          ),
+          Layer.provide(NodeServices.layer),
+        );
+        const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(providerLayer));
+        const input = {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          modelSelection: createModelSelection(codexInstanceId, "context-model"),
+          cwd: fixtureCwd("recorded-decision-context"),
+          runtimeMode: "full-access" as const,
+        };
+        yield* provider.startSession(threadId, input);
+        const initialContext = codex.startSession.mock.calls[0]?.[0].projectWork;
+        assert(initialContext);
+        assert.equal(initialContext.projectId, projectId);
+        assert.equal(initialContext.sourceRevision, 2);
+        assert(initialContext.briefing.includes("Recorded decisions"));
+        assert(initialContext.briefing.includes("provider-original-decision; revision 1"));
+        assert(initialContext.briefing.includes(original.body));
+        assert(initialContext.briefing.includes("human/context-maintainer"));
+        assert.equal(initialContext.narrative, undefined);
+
+        yield* repository.execute({
+          type: "project-work.decision.supersede",
+          commandId: CommandId.make("provider-decision-supersede"),
+          projectId,
+          decisionId: originalId,
+          replacement: {
+            ...original,
+            decisionId: replacementId,
+            title: "Replace the shared parser",
+            body: "Move both clients to the replacement parser.",
+          },
+          supersededAt: at,
+          attribution,
+        });
+        yield* repository.execute({
+          type: "project-work.decision.accept",
+          commandId: CommandId.make("provider-replacement-accept"),
+          projectId,
+          decisionId: replacementId,
+          acceptedAt: at,
+          attribution,
+        });
+        yield* provider.startSession(threadId, input);
+        assert.equal(codex.startSession.mock.calls.length, 2);
+        const replacementContext = codex.startSession.mock.calls[1]?.[0].projectWork;
+        assert(replacementContext);
+        assert.equal(replacementContext.sourceRevision, 4);
+        assert(replacementContext.briefing.includes("source revision 4"));
+        assert(replacementContext.briefing.includes("provider-replacement-decision; revision 1"));
+        assert(
+          replacementContext.briefing.includes("Move both clients to the replacement parser."),
+        );
+        assert(!replacementContext.briefing.includes(original.title));
+        assert(!replacementContext.briefing.includes(original.body));
+        assert.equal(replacementContext.narrative, undefined);
+        yield* provider.stopSession({ threadId });
+      }).pipe(
+        Effect.provide(ProjectWorkRepositoryLive.pipe(Layer.provideMerge(SqlitePersistenceMemory))),
+      ),
+  );
+
   const makeFixture = (input: {
     readonly name: string;
     readonly environmentModel: string;
