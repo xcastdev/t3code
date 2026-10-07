@@ -41,6 +41,14 @@ on each selected environment, and reset returns to the environment's shared list
 For workspace mode, a project's `t3.json` preference applies when the project has no override.
 Browser access changes apply when an agent session next starts.
 
+## Project teams
+
+Enable **Project Work** in General settings, then select a project and open its **Project team**
+section. Choose one checkout when the project is available on several environments. Each checkout
+keeps its own team configuration and limits.
+
+See [Manage project work](project-work.md) to configure a team, capture work and respond to approvals.
+
 ## Project icons
 
 Select the project and open Project to choose an icon, emoji, or image. The choice applies to

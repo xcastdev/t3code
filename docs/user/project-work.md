@@ -1,0 +1,82 @@
+# Project Work
+
+Use Work to keep tasks, approved scope, worker history, questions, and evidence together for a
+project. Select the environment and checkout you intend to supervise; another checkout keeps its
+own team and limits.
+
+## Open Work and configure a team
+
+1. In **Settings → General**, enable **Project Work** for the selected environment.
+2. Open **Work** from the sidebar or choose **Open Work** in the command palette. Settings also
+   offers **Open Work** when a project is selected.
+3. To configure a team, select the project in Settings and open **Project → Project team**. If
+   several checkouts are listed, choose **Team checkout** explicitly.
+4. Choose **Set up team** or **Edit configuration**. Select an available Pi provider and models,
+   review the role instructions and work limits, then save. Use **Enable team** to control whether
+   that team is enabled.
+
+If the provider or model catalogue is unavailable, configure the provider before saving. Existing
+team work must stop and drain before its configuration can change. Enabling Project Work or a
+team does not itself start a worker. See [project settings](project-settings.md) for environment
+selection and project overrides.
+
+## Turn an issue into an approved task
+
+Open **Tasks**. For a recorded GitHub issue, choose **Refine issue** to create a task or mission,
+or link an existing task. Review the title and description before saving. A linked task offers
+**Start investigation**. You can also choose **New task** without an issue.
+
+Open the task to inspect its internal findings. Use **Propose a revised specification** to set
+the objective, included and excluded scope, and acceptance criteria. Then use **Propose a plan**
+to describe the implementation and validation work.
+
+In **Approvals and execution**, review and approve the current specification and plan, or reject
+them. Approval applies to the displayed revision. Proposing a revised specification resets
+criterion satisfaction and invalidates the previous scope's approvals and execution permission.
+
+Choose **Start execution** only after reviewing those approvals. The server can still reject the
+request because ownership, prior workers, dependencies, or execution availability prevent it.
+An accepted request records permission; check recorded worker activity to see what actually ran.
+
+## Follow work and handle questions
+
+Use **Team** or **Supervision** to inspect activity. A task's **Recorded workers** lists role,
+model, status, worktree, branch, and the specification and plan revisions used. Open a recorded
+worker's thread to inspect its conversation. Settled workers remain in the history.
+
+On mobile, open the project's Work screen and select a task to inspect its workers and controls.
+Use **Show evidence** or **Show supervision** to inspect the corresponding project records.
+
+Open **Inbox** for questions and task attention. Answer a question after reviewing its linked
+task and current request. **Mark task attention seen** records acknowledgment; it does not resolve
+the task or answer a question. Seen notices remain visible until resolved.
+
+Use **Task controls** with a reason to pause, defer, cancel, or resume eligible work. For
+reassignment, select a current active recipient and review the choice. Reassignment requests a
+successor and pauses owned work. **Resume** is separate and rechecks ownership, stopped workers,
+and approvals; a requested successor is not a launched worker.
+
+## Review verification and findings
+
+For an eligible completed assignment, the task's **Verification** section lets you select the
+assignment, enter an absolute executable and literal argument array, and choose criterion
+coverage and limits. Propose verification, then **Load verification preview**. Review its target,
+revisions, command, limits, and verification type before approving or rejecting it. Approval
+alone does not confirm execution or passing tests.
+
+Open **Evidence** to inspect recorded verification applicability and review findings. Findings
+show severity, open or resolved status, affected parent criteria, original reviewer, latest
+reporter, frozen target, and resolution artifact references. A recorded resolution does not by
+itself establish current approval. **Integration verification** describes the integrator's tested
+assignment; it does not establish that all implementation branches were combined.
+
+Managed team PR creation and merge are currently unavailable. Satisfied criteria or a completed
+reviewer task do not mean the parent code task was delivered.
+
+## When an action is unavailable
+
+Reconnect and refresh before changing cached work. Disconnected views can retain history, but
+their freshness labels matter. If a draft's revisions changed, compare the current content and
+deliberately review the draft again. If an outcome is uncertain, use the offered exact retry
+before submitting a replacement. Older environments may support inspection without the action
+you need; follow the displayed explanation.
