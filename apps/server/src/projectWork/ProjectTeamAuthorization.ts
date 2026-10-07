@@ -7,8 +7,10 @@ import {
   ProjectTeamGuidedIntent,
   ProjectTeamIntegrationSources,
   ProjectWorkKnowledgeId,
+  ProjectWorkAttribution,
+  ProjectWorkWriteResult,
+  EventId,
   type ProjectWorkActor,
-  type ProjectWorkAttribution,
   type ProjectWorkCommand,
   type ProjectWorkReadIntent,
   type ProjectTeamWriteIntent,
@@ -28,7 +30,12 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
-import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
+import {
+  applyProjectWorkEvents,
+  decideProjectWorkCommand,
+  emptyProjectWorkReducerState,
+  type ProjectWorkReducerState,
+} from "./ProjectWorkDecider.ts";
 import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { makeProjectTeamReviewCompletionProposals } from "./ProjectTeamReviewCompletionProposals.ts";
@@ -64,6 +71,9 @@ export interface ProjectTeamAuthority {
 const isAuthorizationError = Schema.is(ProjectTeamAuthorizationError);
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
+const decodeAttribution = Schema.decodeUnknownSync(ProjectWorkAttribution);
+const decodeWriteResult = Schema.decodeUnknownSync(Schema.fromJsonString(ProjectWorkWriteResult));
+const decodeEventIds = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(EventId)));
 const decodeGuidedIntent = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, {
   onExcessProperty: "error",
 });
@@ -994,6 +1004,11 @@ export const layer = Layer.effect(
         principal.actor.id !== attribution.actor.id
       )
         return yield* deny("Guided attribution does not match authenticated principal");
+      if (
+        intent.type === "project-team.criterion.waiver" &&
+        (principal.actor.kind !== "human" || principal.managed !== undefined)
+      )
+        return yield* deny("Criterion waiver requires authenticated human authority");
       const requireProposalTransaction = Effect.gen(function* () {
         const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
         const transaction = yield* Effect.serviceOption(sql.transactionService);
@@ -1104,11 +1119,153 @@ export const layer = Layer.effect(
         } satisfies ProjectWorkCommand;
       }
       if (duplicate) {
-        const rows = yield* sql<{ payload: string }>`
-          SELECT payload_json AS payload FROM project_work_events
+        if (intent.type === "project-team.criterion.waiver") yield* requireProposalTransaction;
+        const rows = yield* sql<{
+          payload: string;
+          eventId: string;
+          eventType: string;
+          occurredAt: string;
+        }>`
+          SELECT payload_json AS payload, event_id AS eventId,
+            event_type AS eventType, occurred_at AS occurredAt FROM project_work_events
           WHERE project_id=${intent.projectId} AND command_id=${intent.commandId}
           ORDER BY sequence ASC
         `;
+        if (intent.type === "project-team.criterion.waiver") {
+          const receipts = yield* sql<{
+            actorKind: string | null;
+            actorId: string | null;
+            sourceKind: string | null;
+            sourceId: string | null;
+            createdAt: string;
+            fingerprint: string;
+            eventIds: string | null;
+            result: string | null;
+          }>`SELECT actor_kind AS actorKind, actor_id AS actorId,
+            source_kind AS sourceKind, source_id AS sourceId,
+            created_at AS createdAt, payload_fingerprint AS fingerprint,
+            CASE WHEN length(CAST(event_ids_json AS BLOB)) <= 1048576 THEN event_ids_json END AS eventIds,
+            CASE WHEN length(CAST(result_json AS BLOB)) <= 262144 THEN result_json END AS result
+            FROM project_work_command_receipts
+            WHERE project_id=${intent.projectId} AND command_id=${intent.commandId} LIMIT 2`;
+          const preceding = yield* sql<{ payload: string }>`
+            SELECT payload_json AS payload FROM project_work_events
+            WHERE project_id=${intent.projectId} AND sequence < (
+              SELECT MIN(sequence) FROM project_work_events
+              WHERE project_id=${intent.projectId} AND command_id=${intent.commandId}
+            ) ORDER BY sequence ASC
+          `;
+          yield* Effect.try({
+            try: () => {
+              const receipt = receipts[0];
+              if (receipts.length !== 1 || receipt === undefined || rows.length === 0)
+                throw deny("Retained waiver receipt is missing");
+              const original = rows.map((row) =>
+                decodeProjectWorkEvent(decodeUnknownJson(row.payload)),
+              );
+              const primary = original[0];
+              const pending = original.find(
+                (event) =>
+                  event.type === "project-work.foundation.recorded" &&
+                  event.record.kind === "gate" &&
+                  event.record.status === "pending",
+              );
+              // Decorations are not retained in receipt metadata or its fingerprint.
+              // Authority identities and time always come from the owning receipt.
+              const pendingRecord =
+                pending?.type === "project-work.foundation.recorded"
+                  ? decodeRecord(pending.record)
+                  : undefined;
+              const decorated = decodeAttribution(
+                primary?.type === "project-work.criterion.waived"
+                  ? primary.waiver.attribution
+                  : pendingRecord?.kind === "gate"
+                    ? pendingRecord.attribution
+                    : undefined,
+              );
+              const originalAttribution = decodeAttribution({
+                actor: {
+                  ...decorated.actor,
+                  kind: receipt.actorKind,
+                  ...(receipt.actorId === null ? { id: undefined } : { id: receipt.actorId }),
+                },
+                source: {
+                  ...decorated.source,
+                  kind: receipt.sourceKind,
+                  ...(receipt.sourceId === null ? { id: undefined } : { id: receipt.sourceId }),
+                },
+                recordedAt: receipt.createdAt,
+              });
+              const fingerprint =
+                "project-team-intent:" +
+                NodeCrypto.createHash("sha256")
+                  .update(
+                    canonicalProjectWorkPayload({
+                      intent,
+                      actor: { kind: principal.actor.kind, id: principal.actor.id },
+                      source: { kind: attribution.source.kind, id: attribution.source.id },
+                      managed: null,
+                    }),
+                  )
+                  .digest("hex");
+              if (
+                receipt.actorKind !== "human" ||
+                receipt.actorKind !== principal.actor.kind ||
+                receipt.actorId !== (principal.actor.id ?? null) ||
+                receipt.sourceKind !== attribution.source.kind ||
+                receipt.sourceId !== (attribution.source.id ?? null) ||
+                receipt.fingerprint !== fingerprint
+              )
+                throw deny("Retained waiver authority changed");
+              const before = applyProjectWorkEvents(
+                emptyProjectWorkReducerState(intent.projectId),
+                preceding.map((row) => decodeProjectWorkEvent(decodeUnknownJson(row.payload))),
+              );
+              const expected = decideProjectWorkCommand(before, {
+                type: "project-work.foundation.commit",
+                commandId: intent.commandId,
+                projectId: intent.projectId,
+                expectedRevision: intent.expectedRevision,
+                attribution: originalAttribution,
+                committedAt: receipt.createdAt,
+                records: [],
+                guided: { intent },
+              });
+              if (
+                canonicalProjectWorkPayload(expected) !== canonicalProjectWorkPayload(original) ||
+                rows.some(
+                  (row, index) =>
+                    row.eventId !== expected[index]?.eventId ||
+                    row.eventType !== expected[index]?.type ||
+                    row.occurredAt !== receipt.createdAt,
+                )
+              )
+                throw deny("Retained waiver events changed");
+              const eventIds = decodeEventIds(receipt.eventIds);
+              const result = decodeWriteResult(receipt.result);
+              const revision = expected.at(-1)?.revision;
+              if (
+                canonicalProjectWorkPayload(eventIds) !==
+                  canonicalProjectWorkPayload(expected.map((event) => event.eventId)) ||
+                result.projectId !== intent.projectId ||
+                result.revision !== revision ||
+                result.receipt.commandId !== intent.commandId ||
+                result.receipt.projectId !== intent.projectId ||
+                result.receipt.status !== "accepted" ||
+                result.receipt.revision !== revision ||
+                result.receipt.eventCount !== expected.length ||
+                result.delta.projectId !== intent.projectId ||
+                result.delta.revision !== revision ||
+                canonicalProjectWorkPayload(result.delta.eventIds) !==
+                  canonicalProjectWorkPayload(eventIds.slice(0, 64)) ||
+                canonicalProjectWorkPayload(result.delta.changedFields) !==
+                  canonicalProjectWorkPayload(["criteria", "tasks", "foundationRecords"])
+              )
+                throw deny("Retained waiver result changed");
+            },
+            catch: () => deny("Guided receipt target changed"),
+          });
+        }
         yield* Effect.try({
           try: () =>
             assertProjectTeamGuidedReplayCurrent(

@@ -1239,6 +1239,25 @@ export const ProjectTeamGuidedIntent = Schema.Union([
   }),
   Schema.Struct({
     ...GuidedFields,
+    type: Schema.Literal("project-team.criterion.waiver"),
+    criterionId: ProjectWorkCriterionId,
+    expectedCriterionRevision: NonNegativeInt,
+    expectedSpecRevision: NonNegativeInt,
+    expectedSpecificationHash: GuidedId.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+    action: Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("waive"),
+        reason: GuidedText,
+        evidenceIds: Schema.Array(ProjectWorkEvidenceId).check(
+          Schema.isMaxLength(64),
+          Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+        ),
+      }),
+      Schema.Struct({ kind: Schema.Literal("revoke") }),
+    ]),
+  }),
+  Schema.Struct({
+    ...GuidedFields,
     type: Schema.Literal("project-team.plan.propose"),
     specRevision: NonNegativeInt,
     content: GuidedBody,

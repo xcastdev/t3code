@@ -2,6 +2,7 @@ import * as NodeCrypto from "node:crypto";
 import * as Schema from "effect/Schema";
 import {
   CommandId,
+  EventId,
   ProjectId,
   ProjectWorkTaskId,
   ProjectWorkRelationshipId,
@@ -27,6 +28,7 @@ import {
 } from "./ProjectWorkDecider.ts";
 import { staleIntegrationTaskIds } from "./ProjectTeamIntegrationSourceState.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
+import { prepareReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
 import {
   assertProjectTeamRunAuthority,
   projectTeamScopeHash,
@@ -147,6 +149,69 @@ const planned = () => {
   });
   return approveGates(state);
 };
+const waiverIntent = (state: ProjectWorkReducerState, commandId = "waive") => ({
+  ...envelope(state, commandId),
+  type: "project-team.criterion.waiver" as const,
+  criterionId: state.criteria[0]!.criterionId,
+  expectedCriterionRevision: state.criteria[0]!.revision,
+  expectedSpecRevision: state.tasks[0]!.specRevision,
+  expectedSpecificationHash: projectTeamSpecificationHash(state, taskId),
+  action: { kind: "waive" as const, reason: "Human exception", evidenceIds: [] },
+});
+
+it("revokes only the selected guided waiver and audits historical retry without restoring it", () => {
+  const before = planned();
+  const intent = waiverIntent(before);
+  const originalEvents = decideProjectWorkCommand(before, compile(intent));
+  const waived = applyProjectWorkEvents(before, originalEvents);
+  expect(waived.tasks[0]!.revision).toBe(before.tasks[0]!.revision);
+  expect(waived.criteria[0]).toMatchObject({ status: "waived", waiver: { attribution } });
+  const another = {
+    ...waived.criteria[0]!,
+    criterionId: ProjectWorkCriterionId.make("independent-waiver"),
+    description: "Independent exception",
+    satisfiedByEvidenceIds: [ProjectWorkEvidenceId.make("preserved-evidence")],
+  };
+  const withOther = { ...waived, criteria: [...waived.criteria, another] };
+  const revoke = { ...waiverIntent(withOther, "revoke"), action: { kind: "revoke" as const } };
+  const reversed = run(withOther, revoke);
+  expect(reversed.criteria[0]).toMatchObject({
+    status: "unsatisfied",
+    revision: waived.criteria[0]!.revision + 1,
+  });
+  expect(reversed.criteria[0]!.waiver).toBeUndefined();
+  expect(reversed.criteria[1]).toEqual(another);
+  expect(() =>
+    assertProjectTeamGuidedReplayCurrent(reversed, intent, originalEvents),
+  ).not.toThrow();
+  expect(reversed.criteria[0]!.waiver).toBeUndefined();
+  expect(() =>
+    assertProjectTeamGuidedReplayCurrent(reversed, intent, originalEvents.slice(1)),
+  ).toThrow(/waiver/);
+});
+
+it("denies stale, foreign and protected guided waiver targets", () => {
+  const state = planned();
+  const intent = waiverIntent(state);
+  for (const change of [
+    { expectedCriterionRevision: intent.expectedCriterionRevision + 1 },
+    { expectedSpecRevision: intent.expectedSpecRevision + 1 },
+    { expectedSpecificationHash: "b".repeat(64) },
+    { criterionId: ProjectWorkCriterionId.make("foreign-criterion") },
+  ])
+    expect(() => run(state, { ...intent, ...change })).toThrow();
+  const protectedState = {
+    ...state,
+    tasks: state.tasks.map((task) => ({
+      ...task,
+      specification: { ...task.specification!, protected: true },
+    })),
+  };
+  expect(() => run(protectedState, waiverIntent(protectedState))).toThrow(
+    /protected specification/,
+  );
+  expect(() => run(state, { ...intent, action: { kind: "revoke" } })).toThrow(/no current waiver/);
+});
 const startIntent = (
   state: ProjectWorkReducerState,
 ): Extract<ProjectTeamGuidedIntent, { type: "project-team.execution.start" }> => {
@@ -2620,6 +2685,169 @@ const reviewSettlementFixture = () => {
 };
 const reviewSnapshotHash = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+
+it("revoking a guided waiver keeps the selected criterion unsatisfied while clearing stale review support", () => {
+  // Pure qualification fixture: the existing joined-review fixture supplies original review identity.
+  const f = reviewSettlementFixture();
+  const selected = f.state.criteria.find((criterion) => criterion.taskId === taskId)!;
+  const independentId = ProjectWorkEvidenceId.make("independent-selected-support");
+  const state: ProjectWorkReducerState = {
+    ...f.state,
+    criteria: f.state.criteria.map((criterion) =>
+      criterion.criterionId === selected.criterionId
+        ? { ...criterion, satisfiedByEvidenceIds: [independentId] }
+        : criterion,
+    ),
+    foundationRecords: f.state.foundationRecords!.filter(
+      (record) => record.kind !== "review-finding",
+    ),
+    evidence: [...f.state.evidence],
+  };
+  const plan = state.foundationRecords!.find(
+    (record): record is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+      record.kind === "plan-revision" && record.taskId === taskId,
+  );
+  const scopeHash = projectTeamScopeHash(state, taskId, plan);
+  const evidenceId = ProjectWorkEvidenceId.make("mixed-verification");
+  const verification = {
+    environmentId: "environment",
+    jobId: "mixed-job",
+    manifestHash: "a".repeat(64),
+    attemptId: "mixed-attempt",
+    resultHash: "b".repeat(64),
+    outcome: "success",
+    exitCode: 0,
+    evidenceId,
+    applicabilityId: "mixed-applicability",
+  };
+  state.evidence.push({
+    evidenceId,
+    taskId,
+    criterionId: selected.criterionId,
+    kind: "test",
+    summary: "Qualified pure verification",
+    detail: canonicalProjectWorkPayload({
+      jobId: verification.jobId,
+      manifestHash: verification.manifestHash,
+      attemptId: verification.attemptId,
+      resultHash: verification.resultHash,
+      criteriaHash: "c".repeat(64),
+      criterionCount: 1,
+    }),
+    scopeHash,
+    recordedAt: at,
+    revision: 0,
+    attribution,
+  });
+  state.foundationRecords!.push(
+    decodeTeamRecord({
+      kind: "evidence-applicability",
+      projectId,
+      recordId: verification.applicabilityId,
+      revision: 0,
+      generation: 0,
+      updatedAt: at,
+      status: "current",
+      taskId,
+      evidenceId,
+      specRevision: f.proof.target.specRevision,
+      planRevision: f.proof.target.planRevision,
+      repository: "/repository",
+      worktree: "/workspace",
+      testedTree: "d".repeat(40),
+      baseSha: f.proof.target.baseSha,
+      headSha: f.proof.target.headSha,
+      command: "controlled verification",
+      exitCode: 0,
+      artifactId: "mixed-raw",
+      environmentSummary: "Pure fixture only",
+      integration: false,
+      scopeHash,
+    }),
+  );
+  const criterion = state.criteria.find((entry) => entry.criterionId === selected.criterionId)!;
+  const evidence = state.evidence.find((entry) => entry.evidenceId === evidenceId)!;
+  const assessment = {
+    criterionId: criterion.criterionId,
+    expectedRevision: criterion.revision,
+    verdict: "met",
+    detail: "Qualified selected behavior",
+    evidenceIds: [evidenceId],
+  };
+  if (f.proof.report.type !== "project-team.assignment.report")
+    throw new Error("Expected reviewer report");
+  const proof = decodeReviewCompletionProof({
+    ...f.proof,
+    findings: [],
+    report: { ...f.proof.report, criterionAssessments: [assessment] },
+    parentAssessments: {
+      snapshots: [
+        {
+          projectId,
+          taskId,
+          criterion: {
+            id: criterion.criterionId,
+            revision: criterion.revision,
+            sha256: reviewSnapshotHash(criterion),
+          },
+          assessmentSha256: reviewSnapshotHash(assessment),
+          target: f.proof.target,
+          parentScopeHash: scopeHash,
+          evidence: [
+            {
+              id: evidenceId,
+              revision: evidence.revision,
+              sha256: reviewSnapshotHash(evidence),
+              taskId,
+              criterionId: criterion.criterionId,
+              scopeHash,
+            },
+          ],
+        },
+      ],
+      verification,
+    },
+  });
+  if (proof.status !== "completed") throw new Error("Expected completed review proof");
+  const drafts = prepareReviewCriterionProgress({
+    state,
+    completion: proof,
+    settlementCommandId: "mixed-settlement",
+    settlementCommandFingerprint: "0123abcd",
+    at,
+  });
+  const supported = applyProjectWorkEvents(
+    state,
+    drafts.map((draft, index) => ({
+      ...draft,
+      projectId,
+      eventId: EventId.make(`mixed-progress:${index}`),
+      revision: state.revision + index + 1,
+    })),
+  );
+  expect(
+    supported.criteria.find((entry) => entry.criterionId === selected.criterionId)?.status,
+  ).toBe("satisfied");
+  const waived = run(supported, {
+    ...waiverIntent(supported, "mixed-waive"),
+    criterionId: selected.criterionId,
+    expectedCriterionRevision: supported.criteria.find(
+      (entry) => entry.criterionId === selected.criterionId,
+    )!.revision,
+  });
+  const revoked = run(waived, {
+    ...waiverIntent(waived, "mixed-revoke"),
+    criterionId: selected.criterionId,
+    expectedCriterionRevision: waived.criteria.find(
+      (entry) => entry.criterionId === selected.criterionId,
+    )!.revision,
+    action: { kind: "revoke" },
+  });
+  expect(
+    revoked.criteria.find((entry) => entry.criterionId === selected.criterionId),
+  ).toMatchObject({ status: "unsatisfied", satisfiedByEvidenceIds: [independentId] });
+  expect(revoked.evidence).toEqual(waived.evidence);
+});
 
 it("trusted review settlement completes only the child with critical findings and leaves parent work unchanged", () => {
   const f = reviewSettlementFixture();

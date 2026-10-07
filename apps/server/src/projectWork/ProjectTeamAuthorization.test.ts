@@ -3,7 +3,14 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpServer } from "effect/unstable/http";
-import { ProjectId, ProjectWorkTaskId, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  ProjectId,
+  ProjectWorkTaskId,
+  EnvironmentId,
+  ThreadId,
+  CommandId,
+  ProjectWorkEvidenceId,
+} from "@t3tools/contracts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as Authorization from "./ProjectTeamAuthorization.ts";
 import * as Registry from "../mcp/McpSessionRegistry.ts";
@@ -11,6 +18,9 @@ import * as Invocation from "../mcp/McpInvocationContext.ts";
 import * as Environment from "../environment/ServerEnvironment.ts";
 
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
+import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
+import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { projectTeamSpecificationHash, projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import {
   seed,
   createManagedAssignment,
@@ -21,7 +31,292 @@ import {
   taskId,
   threadId,
   providerInstanceId,
+  gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+
+it.effect(
+  "records an authenticated guided human criterion waiver and invalidates the old scope",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer", "running", { issueCredential: false });
+      const gateway = yield* ProjectWorkGateway;
+      const before = yield* readCurrentState(f.sql, projectId);
+      const criterion = before.criteria[0]!;
+      const task = before.tasks.find((entry) => entry.taskId === taskId)!;
+      const input = {
+        type: "project-team.criterion.waiver" as const,
+        commandId: CommandId.make("human-guided-waiver"),
+        projectId,
+        taskId,
+        expectedRevision: before.revision,
+        expectedTaskRevision: task.revision,
+        criterionId: criterion.criterionId,
+        expectedCriterionRevision: criterion.revision,
+        expectedSpecRevision: task.specRevision,
+        expectedSpecificationHash: projectTeamSpecificationHash(before, taskId),
+        action: { kind: "waive" as const, reason: "Human accepts this exception", evidenceIds: [] },
+      };
+      const actor = { kind: "human" as const, id: "waiver-human" };
+      const source = { kind: "web" as const, id: "waiver-browser" };
+      const agent = yield* gateway
+        .write(input, f.principal.actor, source, f.principal)
+        .pipe(Effect.result);
+      expect(agent._tag).toBe("Failure");
+      if (agent._tag === "Failure")
+        expect(agent.failure).toMatchObject({
+          _tag: "ProjectTeamAuthorizationError",
+          reason: "Criterion waiver requires authenticated human authority",
+        });
+      const spoofed = yield* gateway
+        .write(input, actor, source, { actor: { kind: "human", id: "another-human" } })
+        .pipe(Effect.result);
+      expect(spoofed._tag).toBe("Failure");
+      if (spoofed._tag === "Failure")
+        expect(spoofed.failure).toMatchObject({ reason: "spoofed-attribution" });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+      const receipt = yield* gateway.write(input, actor, source);
+      const after = yield* readCurrentState(f.sql, projectId);
+      expect(
+        after.criteria.find((entry) => entry.criterionId === criterion.criterionId),
+      ).toMatchObject({
+        status: "waived",
+        revision: criterion.revision + 1,
+        waiver: {
+          reason: input.action.reason,
+          specRevision: task.specRevision,
+          attribution: { actor, source },
+        },
+      });
+      expect(
+        after.foundationRecords?.find((entry) => entry.recordId === f.binding.recordId),
+      ).toMatchObject({ status: "stopping" });
+      expect(
+        after.foundationRecords?.filter(
+          (entry) => entry.kind === "gate" && entry.status === "approved",
+        ),
+      ).toEqual([]);
+      expect(
+        after.foundationRecords?.filter(
+          (entry) =>
+            entry.kind === "gate" && entry.gate === "specification" && entry.status === "pending",
+        ),
+      ).toHaveLength(1);
+      const pending = after.foundationRecords?.find(
+        (entry) =>
+          entry.kind === "gate" && entry.gate === "specification" && entry.status === "pending",
+      );
+      expect(pending).toMatchObject({ contentHash: projectTeamSpecificationHash(after, taskId) });
+      for (const old of before.foundationRecords ?? []) {
+        if (old.kind === "gate" && old.status === "approved")
+          expect(
+            after.foundationRecords?.find((entry) => entry.recordId === old.recordId),
+          ).toMatchObject({ status: "invalidated", contentHash: old.contentHash });
+      }
+      expect(yield* gateway.write(input, actor, source)).toEqual(receipt);
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(after);
+      const revoke = {
+        ...input,
+        commandId: CommandId.make("human-revoke-waiver"),
+        expectedRevision: after.revision,
+        expectedCriterionRevision: criterion.revision + 1,
+        expectedSpecificationHash: projectTeamSpecificationHash(after, taskId),
+        action: { kind: "revoke" as const },
+      };
+      const revokedReceipt = yield* gateway.write(revoke, actor, source);
+      const reversed = yield* readCurrentState(f.sql, projectId);
+      expect(
+        reversed.criteria.find((entry) => entry.criterionId === criterion.criterionId),
+      ).toMatchObject({ status: "unsatisfied", revision: criterion.revision + 2 });
+      expect(
+        reversed.criteria.find((entry) => entry.criterionId === criterion.criterionId)?.waiver,
+      ).toBeUndefined();
+      expect(yield* gateway.write(input, actor, source)).toEqual(receipt);
+      expect(yield* gateway.write(revoke, actor, source)).toEqual(revokedReceipt);
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(reversed);
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.record.contentHash',${"f".repeat(64)}) WHERE project_id=${projectId} AND command_id=${input.commandId} AND event_type='project-work.foundation.recorded' AND json_extract(payload_json,'$.record.recordId')=${pending!.recordId}`;
+      const alteredGate = yield* gateway.write(input, actor, source).pipe(Effect.result);
+      expect(alteredGate._tag).toBe("Failure");
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.record.contentHash',${projectTeamSpecificationHash(after, taskId)}) WHERE project_id=${projectId} AND command_id=${input.commandId} AND event_type='project-work.foundation.recorded' AND json_extract(payload_json,'$.record.recordId')=${pending!.recordId}`;
+      const retainedRows = yield* f.sql<{
+        eventId: string;
+        payload: string;
+        type: string;
+        recordId: string | null;
+      }>`
+      SELECT event_id AS eventId, payload_json AS payload, event_type AS type,
+        json_extract(payload_json,'$.record.recordId') AS recordId FROM project_work_events
+      WHERE project_id=${projectId} AND command_id=${input.commandId} ORDER BY sequence ASC`;
+      const originalGate = before.foundationRecords?.find(
+        (entry) => entry.kind === "gate" && entry.status === "approved",
+      );
+      expect(originalGate).toBeDefined();
+      for (const alteration of [
+        {
+          recordId: pending!.recordId,
+          path: "$.record.attribution.actor.id",
+          value: "different-human",
+        },
+        {
+          recordId: originalGate!.recordId,
+          path: "$.record.attribution.actor.id",
+          value: "different-human",
+        },
+        {
+          recordId: originalGate!.recordId,
+          path: "$.record.recordId",
+          value: "different-invalidated-gate",
+        },
+        { recordId: null, path: "$.waiver.attribution.actor.id", value: "different-human" },
+        { recordId: null, path: "$.occurredAt", value: "2026-01-02T00:00:00.000Z" },
+      ]) {
+        const row = retainedRows.find((entry) =>
+          alteration.recordId === null
+            ? entry.type === "project-work.criterion.waived"
+            : entry.recordId === alteration.recordId,
+        );
+        expect(row).toBeDefined();
+        yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,${alteration.path},${alteration.value}) WHERE event_id=${row!.eventId}`;
+        const altered = yield* gateway.write(input, actor, source).pipe(Effect.result);
+        expect(altered._tag).toBe("Failure");
+        if (altered._tag === "Failure")
+          expect(altered.failure).toMatchObject({ reason: "Guided receipt target changed" });
+        yield* f.sql`UPDATE project_work_events SET payload_json=${row!.payload} WHERE event_id=${row!.eventId}`;
+      }
+      expect(yield* gateway.write(input, actor, source)).toEqual(receipt);
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(reversed);
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.waiver.reason','corrupted reason') WHERE project_id=${projectId} AND command_id=${input.commandId} AND event_type='project-work.criterion.waived'`;
+      const corrupt = yield* gateway.write(input, actor, source).pipe(Effect.result);
+      expect(corrupt._tag).toBe("Failure");
+      if (corrupt._tag === "Failure")
+        expect(corrupt.failure).toMatchObject({ reason: "Guided receipt target changed" });
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
+  "accepts retained summary-only waiver evidence and rejects stale or foreign guided targets",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer", "running", { issueCredential: false });
+      const gateway = yield* ProjectWorkGateway;
+      const before = yield* readCurrentState(f.sql, projectId);
+      const criterion = before.criteria[0]!;
+      const task = before.tasks.find((entry) => entry.taskId === taskId)!;
+      const evidenceId = ProjectWorkEvidenceId.make("waiver-reference");
+      yield* f.repo.execute({
+        type: "project-work.evidence.add",
+        projectId,
+        commandId: CommandId.make("waiver-reference"),
+        addedAt: "2026-01-01T00:00:00.000Z",
+        evidence: {
+          evidenceId,
+          taskId,
+          criterionId: criterion.criterionId,
+          kind: "observation",
+          summary: "Retained explanation",
+          uri: "https://example.invalid/exception",
+          scopeHash: projectTeamScopeHash(
+            before,
+            taskId,
+            before.foundationRecords?.find((entry) => entry.kind === "plan-revision"),
+          ),
+          recordedAt: "2026-01-01T00:00:00.000Z",
+          revision: 0,
+          attribution: {
+            actor: { kind: "human", id: "waiver-human" },
+            source: { kind: "web", id: "waiver-browser" },
+            recordedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      });
+      const current = yield* readCurrentState(f.sql, projectId);
+      const input = {
+        type: "project-team.criterion.waiver" as const,
+        commandId: CommandId.make("reference-waiver"),
+        projectId,
+        taskId,
+        expectedRevision: current.revision,
+        expectedTaskRevision: task.revision,
+        criterionId: criterion.criterionId,
+        expectedCriterionRevision: criterion.revision,
+        expectedSpecRevision: task.specRevision,
+        expectedSpecificationHash: projectTeamSpecificationHash(current, taskId),
+        action: { kind: "waive" as const, reason: "Recorded exception", evidenceIds: [evidenceId] },
+      };
+      const actor = { kind: "human" as const, id: "waiver-human" };
+      const source = { kind: "web" as const, id: "waiver-browser" };
+      for (const changed of [
+        { expectedCriterionRevision: criterion.revision + 1 },
+        { expectedSpecRevision: task.specRevision + 1 },
+        { expectedSpecificationHash: "b".repeat(64) },
+        { taskId: ProjectWorkTaskId.make("another-task") },
+        {
+          action: {
+            ...input.action,
+            evidenceIds: [ProjectWorkEvidenceId.make("missing-evidence")],
+          },
+        },
+      ]) {
+        expect(
+          (yield* gateway.write({ ...input, ...changed }, actor, source).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(current);
+      }
+      yield* gateway.write(input, actor, source);
+      const waived = yield* readCurrentState(f.sql, projectId);
+      expect(waived.criteria[0]?.waiver?.evidenceIds).toEqual([evidenceId]);
+      expect(waived.evidence).toEqual(current.evidence);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
+  "rolls back a guided waiver when its owning SQL commit fails before accepting retry",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer", "running", { issueCredential: false });
+      const gateway = yield* ProjectWorkGateway;
+      const before = yield* readCurrentState(f.sql, projectId);
+      const criterion = before.criteria[0]!;
+      const task = before.tasks.find((entry) => entry.taskId === taskId)!;
+      const input = {
+        type: "project-team.criterion.waiver" as const,
+        commandId: CommandId.make("commit-waiver"),
+        projectId,
+        taskId,
+        expectedRevision: before.revision,
+        expectedTaskRevision: task.revision,
+        criterionId: criterion.criterionId,
+        expectedCriterionRevision: criterion.revision,
+        expectedSpecRevision: task.specRevision,
+        expectedSpecificationHash: projectTeamSpecificationHash(before, taskId),
+        action: { kind: "waive" as const, reason: "Commit-bound exception", evidenceIds: [] },
+      };
+      const actor = { kind: "human" as const, id: "waiver-human" };
+      const source = { kind: "web" as const, id: "waiver-browser" };
+      yield* f.sql`CREATE TEMP TABLE waiver_commit_parent (id INTEGER PRIMARY KEY)`;
+      yield* f.sql`CREATE TEMP TABLE waiver_commit_child (id INTEGER REFERENCES waiver_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      const outcome = yield* f.repo
+        .executeAtomic(
+          Effect.gen(function* () {
+            yield* gateway.write(input, actor, source);
+            yield* f.sql`INSERT INTO waiver_commit_child (id) VALUES (1)`;
+            return [];
+          }),
+        )
+        .pipe(Effect.exit);
+      expect(outcome._tag).toBe("Failure");
+      expect(
+        (yield* gateway.read({ projectId, taskId, operation: "task-context" }).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      yield* f.sql`ROLLBACK`;
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${input.commandId}`,
+      ).toEqual([]);
+      yield* gateway.write(input, actor, source);
+      expect((yield* readCurrentState(f.sql, projectId)).criteria[0]?.status).toBe("waived");
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
 
 it.effect(
   "checks actual durable authority beyond public page bounds and rejects frozen-role operational grants",

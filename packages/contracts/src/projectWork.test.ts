@@ -38,6 +38,38 @@ const decodeTaskRead = Schema.decodeUnknownSync(ProjectWorkTaskRead);
 const decodeClientCommand = Schema.decodeUnknownSync(ClientOrchestrationCommand);
 
 describe("project work contracts", () => {
+  it("bounds guided criterion waiver requests without caller-created authority", () => {
+    const decode = Schema.decodeUnknownSync(ProjectTeamGuidedIntent);
+    const input = {
+      type: "project-team.criterion.waiver",
+      commandId: "waive",
+      projectId: "project",
+      taskId: "task",
+      expectedRevision: 1,
+      expectedTaskRevision: 0,
+      criterionId: "criterion",
+      expectedCriterionRevision: 0,
+      expectedSpecRevision: 1,
+      expectedSpecificationHash: "a".repeat(64),
+      action: { kind: "waive", reason: "Explicit human exception", evidenceIds: [] },
+    };
+    expect(decode(input).type).toBe(input.type);
+    expect(decode({ ...input, action: { kind: "revoke" } }).type).toBe(input.type);
+    for (const action of [
+      { kind: "waive", reason: "", evidenceIds: [] },
+      { kind: "waive", reason: "Exception", evidenceIds: ["same", "same"] },
+      {
+        kind: "waive",
+        reason: "Exception",
+        evidenceIds: Array.from({ length: 65 }, (_, i) => `e-${i}`),
+      },
+      { kind: "revoke", waiver: { attribution: { actor: { kind: "human" } } } },
+    ])
+      expect(() => decode({ ...input, action })).toThrow();
+    expect(() => decode({ ...input, expectedSpecificationHash: "approved" })).toThrow();
+    expect(() => decode({ ...input, expectedCriterionRevision: -1 })).toThrow();
+    expect(() => decode({ ...input, attribution: { actor: { kind: "human" } } })).toThrow();
+  });
   it("bounds private repair proof to exact selected raw output identities", () => {
     const decode = Schema.decodeUnknownSync(ProjectTeamReviewResolutionProof, {
       onExcessProperty: "error",

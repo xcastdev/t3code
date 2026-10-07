@@ -1,12 +1,15 @@
 import { invalidateReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
+import * as Schema from "effect/Schema";
 import {
+  ProjectWorkCriterion,
+  ProjectWorkCriterionWaiver,
+  ProjectTeamRecord,
   ProjectWorkTaskId,
   ProjectWorkCriterionId,
   ProjectWorkCommentId,
   ProjectWorkEvidenceId,
   canonicalProjectWorkPayload,
   type ProjectTeamGuidedIntent,
-  type ProjectTeamRecord,
   type ProjectWorkCommand,
   type ProjectWorkTask,
 } from "@t3tools/contracts";
@@ -46,6 +49,9 @@ const unique = (values: ReadonlyArray<string>) => {
 };
 const unresolvedWriter = (r: ProjectTeamRecord) =>
   r.kind === "run-binding" && r.status !== "settled";
+const knownCriterion = Schema.is(ProjectWorkCriterion);
+const knownWaiver = Schema.is(ProjectWorkCriterionWaiver);
+const knownRecord = Schema.is(ProjectTeamRecord);
 
 /** All generated records share the command transaction and its authenticated envelope. */
 export const decideProjectTeamGuidedLifecycle = (
@@ -631,6 +637,105 @@ export const decideProjectTeamGuidedLifecycle = (
       gate(
         "specification",
         assertKnownTask(state, task.taskId),
+        "specification",
+        projectTeamSpecificationHash(state, task.taskId),
+      );
+      break;
+    }
+    case "project-team.criterion.waiver": {
+      const assignment = membership(task.taskId);
+      if (
+        command.attribution.actor.kind !== "human" ||
+        guided.bindingId !== undefined ||
+        guided.generation !== undefined ||
+        assignment === undefined ||
+        assignment.status !== "active" ||
+        assignment.executionKind === "legacy"
+      )
+        reject("Criterion waiver requires authenticated human guided work");
+      if (task.state === "completed" || task.state === "canceled")
+        reject("Terminal task requires an explicit reopen");
+      if (task.specification?.protected)
+        throw new ProjectWorkPolicyError(
+          "protected-specification",
+          "Use the approved protected specification revision process",
+        );
+      const matches = state.criteria.filter((entry) => entry.criterionId === intent.criterionId);
+      const criterion = matches[0];
+      if (
+        matches.length !== 1 ||
+        criterion === undefined ||
+        criterion.taskId !== task.taskId ||
+        task.specification === undefined
+      )
+        reject("Criterion waiver requires an exact current specification criterion");
+      if (
+        criterion.revision !== intent.expectedCriterionRevision ||
+        task.specRevision !== intent.expectedSpecRevision ||
+        projectTeamSpecificationHash(state, task.taskId) !== intent.expectedSpecificationHash
+      )
+        throw new ProjectWorkPolicyError("stale-revision", "Criterion waiver target changed");
+      if (criterion.revision >= Number.MAX_SAFE_INTEGER) reject("Criterion revision is exhausted");
+      if (intent.action.kind === "waive") {
+        const scopeHash = projectTeamScopeHash(state, task.taskId, currentPlan(task.taskId));
+        for (const evidenceId of intent.action.evidenceIds) {
+          const evidence = state.evidence.filter((entry) => entry.evidenceId === evidenceId);
+          const applicability = records().filter(
+            (entry): entry is Extract<ProjectTeamRecord, { kind: "evidence-applicability" }> =>
+              entry.kind === "evidence-applicability" && entry.evidenceId === evidenceId,
+          );
+          if (
+            evidence.length !== 1 ||
+            evidence[0]?.taskId !== task.taskId ||
+            (evidence[0]?.criterionId !== undefined &&
+              evidence[0].criterionId !== criterion.criterionId) ||
+            evidence[0]?.scopeHash !== scopeHash ||
+            applicability.length > 1 ||
+            applicability.some(
+              (entry) =>
+                entry.status !== "current" ||
+                entry.taskId !== task.taskId ||
+                entry.scopeHash !== scopeHash,
+            )
+          )
+            reject("Waiver evidence is not retained for the current criterion scope");
+        }
+        emit({
+          type: "project-work.criterion.waived",
+          taskId: task.taskId,
+          criterionId: criterion.criterionId,
+          waiver: {
+            reason: intent.action.reason,
+            evidenceIds: [...intent.action.evidenceIds],
+            specRevision: task.specRevision,
+            waivedAt: at,
+            attribution: command.attribution,
+          },
+          waivedAt: at,
+          occurredAt: at,
+        });
+      } else {
+        if (criterion.status !== "waived" || criterion.waiver === undefined)
+          reject("There is no current waiver to revoke");
+        const retained = { ...criterion };
+        delete retained.waiver;
+        emit({
+          type: "project-work.criterion.upserted",
+          taskId: task.taskId,
+          criterion: {
+            ...retained,
+            status: "unsatisfied",
+            revision: criterion.revision + 1,
+            updatedAt: at,
+          },
+          updatedAt: at,
+          occurredAt: at,
+        });
+      }
+      invalidate(task.taskId, "Criterion waiver changed");
+      gate(
+        "waiver-specification",
+        task,
         "specification",
         projectTeamSpecificationHash(state, task.taskId),
       );
@@ -1332,7 +1437,13 @@ export const decideProjectTeamGuidedLifecycle = (
   for (const draft of invalidateReviewCriterionProgress({ state, at })) {
     if (!Number.isSafeInteger(initial.revision + events.length + 1))
       reject("Review criterion invalidation revision is exhausted");
-    emit(draft);
+    emit(
+      intent.type === "project-team.criterion.waiver" &&
+        intent.action.kind === "revoke" &&
+        draft.criterion.criterionId === intent.criterionId
+        ? { ...draft, criterion: { ...draft.criterion, status: "unsatisfied" } }
+        : draft,
+    );
   }
   return events;
 };
@@ -1351,12 +1462,108 @@ export const assertProjectTeamGuidedReplayCurrent = (
   input: ProjectTeamGuidedIntent,
   events: ReadonlyArray<ProjectWorkEvent>,
 ): void => {
+  if (input.type === "project-team.criterion.waiver") {
+    // The owning receipt binds the original intent and authenticated actor/source.
+    // Later revocation or scope changes cannot turn this historical retry into a write.
+    const first = events[0];
+    const pendingId = projectTeamDerivedRecordId(input.commandId, "waiver-specification");
+    if (first === undefined || events.length < 2) reject("Retained waiver result is missing");
+    if (input.action.kind === "waive") {
+      if (
+        first.type !== "project-work.criterion.waived" ||
+        first.taskId !== input.taskId ||
+        first.criterionId !== input.criterionId ||
+        !knownWaiver(first.waiver) ||
+        first.waiver.reason !== input.action.reason ||
+        canonicalProjectWorkPayload(first.waiver.evidenceIds) !==
+          canonicalProjectWorkPayload(input.action.evidenceIds) ||
+        first.waiver.specRevision !== input.expectedSpecRevision ||
+        first.waiver.attribution.actor.kind !== "human" ||
+        first.waiver.waivedAt !== first.waivedAt ||
+        first.waivedAt !== first.occurredAt
+      )
+        reject("Retained waiver differs from its human request");
+    } else if (
+      first.type !== "project-work.criterion.upserted" ||
+      first.taskId !== input.taskId ||
+      !knownCriterion(first.criterion) ||
+      first.criterion.taskId !== input.taskId ||
+      first.criterion.criterionId !== input.criterionId ||
+      first.criterion.revision !== input.expectedCriterionRevision + 1 ||
+      first.criterion.status !== "unsatisfied" ||
+      first.criterion.waiver !== undefined ||
+      first.criterion.updatedAt !== first.occurredAt ||
+      first.updatedAt !== first.occurredAt
+    )
+      reject("Retained waiver revocation differs from its human request");
+    let pending = 0;
+    for (const [index, event] of events.entries()) {
+      if (
+        event.projectId !== input.projectId ||
+        event.eventId !== `${input.commandId}:project-work:${index}` ||
+        event.revision !== input.expectedRevision + index + 1 ||
+        event.occurredAt !== first.occurredAt
+      )
+        reject("Retained waiver event identity changed");
+      if (index === 0) continue;
+      if (event.type === "project-work.foundation.recorded" && knownRecord(event.record)) {
+        const record = event.record;
+        if (record.projectId !== input.projectId || record.updatedAt !== event.occurredAt)
+          reject("Retained waiver invalidation identity changed");
+        if (
+          record.recordId === pendingId &&
+          record.kind === "gate" &&
+          record.taskId === input.taskId &&
+          record.gate === "specification" &&
+          record.status === "pending" &&
+          record.revision === 0 &&
+          record.specRevision === input.expectedSpecRevision &&
+          record.planRevision === 0 &&
+          record.attribution.actor.kind === "human" &&
+          record.evidenceIds.length === 0
+        ) {
+          if (
+            first.type === "project-work.criterion.waived" &&
+            canonicalProjectWorkPayload(record.attribution) !==
+              canonicalProjectWorkPayload(first.waiver.attribution)
+          )
+            reject("Retained waiver approval request changed actor");
+          pending++;
+          continue;
+        }
+        if (
+          (record.kind === "gate" && record.status === "invalidated") ||
+          (record.kind === "evidence-applicability" && record.status === "stale") ||
+          (record.kind === "run-binding" &&
+            (record.status === "stopping" || record.status === "quarantined")) ||
+          (record.kind === "effect" &&
+            ((record.effectKind === "stop" && record.status === "pending") ||
+              ((record.effectKind === "dispatch" || record.effectKind === "setup") &&
+                record.status === "canceled")))
+        )
+          continue;
+      } else if (
+        event.type === "project-work.criterion.upserted" &&
+        knownCriterion(event.criterion) &&
+        event.criterion.taskId === event.taskId &&
+        event.criterion.waiver === undefined &&
+        (event.criterion.status === "satisfied" || event.criterion.status === "unsatisfied") &&
+        event.criterion.updatedAt === event.occurredAt &&
+        event.updatedAt === event.occurredAt
+      )
+        continue;
+      reject("Retained waiver result contains an unrelated event");
+    }
+    if (pending !== 1) reject("Retained waiver approval request is missing or ambiguous");
+    return;
+  }
   const finalRecords = new Map<string, ProjectTeamRecord>();
   const createdTasks = new Map<string, ProjectWorkTask>();
   const taskChanges = new Map<string, number>();
   const unchangedTaskEvents = new Set([
     "project-work.comment.added",
     "project-work.criterion.upserted",
+    "project-work.criterion.waived",
     "project-work.evidence.added",
     "project-work.foundation.recorded",
   ]);
