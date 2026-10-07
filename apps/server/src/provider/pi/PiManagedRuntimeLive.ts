@@ -1430,9 +1430,15 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       "Retained mailbox context changed before allocation",
                       "conflict",
                     );
+                  const textOptions = {
+                    optionalTextBudgetBytes: Math.max(
+                      0,
+                      65536 - Buffer.byteLength(context + "\n\n", "utf8"),
+                    ),
+                  };
                   return yield* currentTurn._tag === "LaterTurn"
-                    ? requiredContext.readRequired(currentTurn.original)
-                    : requiredContext.readForOperation(contextOperation);
+                    ? requiredContext.readRequired(currentTurn.original, textOptions)
+                    : requiredContext.readForOperation(contextOperation, textOptions);
                 });
                 const required = yield* readOperationContext;
                 if (

@@ -11,6 +11,11 @@ import {
   EventId,
   IsoDateTime,
   ProjectWorkWriteResult,
+  ProjectWorkDecision,
+  ProjectWorkDecisionId,
+  ProjectWorkKnowledge,
+  ProjectWorkAttribution,
+  ProjectId,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -25,6 +30,8 @@ import {
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { applyProjectWorkEvents, emptyProjectWorkReducerState } from "./ProjectWorkDecider.ts";
+import * as NodeCrypto from "node:crypto";
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import {
   evaluateProjectTeamGate,
@@ -156,6 +163,81 @@ const decodeAnswerResult = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectWorkWriteResult),
   strict,
 );
+const retainedEventFields = {
+  ...eventFields,
+  projectId: ProjectId,
+  attribution: Schema.optionalKey(ProjectWorkAttribution),
+};
+const DecisionEvent = Schema.Union([
+  Schema.Struct({
+    ...retainedEventFields,
+    type: Schema.Literal("project-work.decision.proposed"),
+    decision: ProjectWorkDecision,
+    proposedAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...retainedEventFields,
+    type: Schema.Literal("project-work.decision.accepted"),
+    decisionId: ProjectWorkDecisionId,
+    acceptedAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...retainedEventFields,
+    type: Schema.Literal("project-work.decision.rejected"),
+    decisionId: ProjectWorkDecisionId,
+    reason: Schema.String,
+    rejectedAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    ...retainedEventFields,
+    attribution: ProjectWorkAttribution,
+    type: Schema.Literal("project-work.decision.superseded"),
+    decisionId: ProjectWorkDecisionId,
+    replacement: ProjectWorkDecision,
+    supersededAt: IsoDateTime,
+  }),
+]);
+const KnowledgeEvent = Schema.Struct({
+  ...retainedEventFields,
+  type: Schema.Literal("project-work.knowledge.promoted"),
+  knowledge: ProjectWorkKnowledge,
+  promotedAt: IsoDateTime,
+});
+const decodeDecisionEvent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(DecisionEvent),
+  strict,
+);
+const decodeKnowledgeEvent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(KnowledgeEvent),
+  strict,
+);
+const decodeDecision = Schema.decodeUnknownEffect(ProjectWorkDecision, strict);
+const decodeKnowledge = Schema.decodeUnknownEffect(ProjectWorkKnowledge, strict);
+const decodeAttributionJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectWorkAttribution),
+  strict,
+);
+type RetainedKnowledge = {
+  readonly status: "available" | "disabled" | "degraded";
+  readonly records: readonly ProjectWorkKnowledge[];
+  readonly omitted: readonly string[];
+};
+type ContextTextOptions = { readonly optionalTextBudgetBytes: number };
+const hash = (value: unknown) =>
+  NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+const receiptFields = (type: string): readonly string[] => {
+  if (type.includes("foundation")) return ["foundationRecords"];
+  if (type.includes("criterion")) return ["criteria", "tasks"];
+  if (type.includes("evidence")) return ["evidence", "criteria", "tasks"];
+  if (type.includes("relationship")) return ["relationships", "tasks"];
+  if (type.includes("attempt") || type.includes("checkpoint"))
+    return ["attempts", "tasks", "checkpoints"];
+  if (type.includes("knowledge")) return ["knowledge"];
+  if (type.includes("decision")) return ["decisions"];
+  if (type.includes("comment")) return ["comments"];
+  if (type.includes("attention")) return ["attention", "tasks"];
+  return ["tasks"];
+};
 const OperationInput = Schema.Struct({
   projectId: Schema.String,
   bindingId: Id,
@@ -225,6 +307,423 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
   });
   const journal = yield* makeProjectTeamDispatchJournal(options);
   const reviewTargets = yield* makeProjectTeamReviewTargets(options);
+  const readRetained = Effect.fn("ProjectTeamContext.readRetained")(function* (
+    projectId: string,
+    kind: "decision" | "knowledge",
+  ) {
+    // Bound metadata before loading bodies, including complete replacement history.
+    const metadata = yield* sql<{
+      sequence: number;
+      bytes: number;
+      scalarBytes: number;
+    }>`
+      SELECT sequence,length(CAST(payload_json AS BLOB)) AS bytes,
+      length(CAST(event_id AS BLOB))+length(CAST(project_id AS BLOB))+length(CAST(occurred_at AS BLOB))+length(CAST(command_id AS BLOB))+length(CAST(event_type AS BLOB)) AS scalarBytes
+      FROM project_work_events WHERE project_id=${projectId} AND event_type LIKE ${"project-work." + kind + ".%"}
+      ORDER BY sequence LIMIT 4097`;
+    if (metadata.length > Bounds.ledgerRows)
+      return yield* deny("Retained context history exceeds row bounds");
+    let bytes = 0;
+    for (const row of metadata) {
+      if (
+        !Number.isSafeInteger(row.sequence) ||
+        row.sequence <= 0 ||
+        !Number.isSafeInteger(row.bytes) ||
+        row.bytes <= 0 ||
+        row.bytes > Bounds.contextBytes ||
+        !Number.isSafeInteger(row.scalarBytes) ||
+        row.scalarBytes <= 0 ||
+        row.scalarBytes > Bounds.contextBytes
+      )
+        return yield* deny("Retained context event exceeds bounds");
+      bytes = add(bytes, add(row.bytes, row.scalarBytes));
+    }
+    if (bytes > Bounds.ledgerBytes)
+      return yield* deny("Retained context history exceeds byte bounds");
+    const rows = yield* sql<{
+      sequence: number;
+      event_id: string;
+      project_id: string;
+      revision: number;
+      occurred_at: string;
+      command_id: string;
+      event_type: string;
+      payload: string | null;
+    }>`SELECT sequence,event_id,project_id,json_extract(payload_json,'$.revision') AS revision,occurred_at,command_id,event_type,
+      CASE WHEN length(CAST(payload_json AS BLOB))<=${Bounds.contextBytes} THEN payload_json END AS payload
+      FROM project_work_events WHERE project_id=${projectId} AND event_type LIKE ${"project-work." + kind + ".%"} ORDER BY sequence LIMIT 4097`;
+    if (rows.length !== metadata.length)
+      return yield* deny("Retained context history changed during read");
+    const decoded = yield* Effect.forEach(
+      rows,
+      Effect.fn("ProjectTeamContext.decodeRetained")(function* (row, index) {
+        if (row.sequence !== metadata[index]?.sequence || row.payload === null)
+          return yield* deny("Retained context event is missing");
+        return kind === "decision"
+          ? yield* decodeDecisionEvent(row.payload)
+          : yield* decodeKnowledgeEvent(row.payload);
+      }),
+    );
+    const commands = new Map<string, typeof decoded>();
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index];
+      const event = decoded[index];
+      if (!row || !event) return yield* deny("Retained context event is missing");
+      const command = commands.get(row.command_id);
+      if (command) command.push(event);
+      else commands.set(row.command_id, [event]);
+    }
+    let reconstructed = emptyProjectWorkReducerState(projectId);
+    const audited = new Set<string>();
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index];
+      const event = decoded[index];
+      if (!row || !event) return yield* deny("Retained context event is missing");
+      if (
+        event.eventId !== row.event_id ||
+        event.projectId !== projectId ||
+        event.revision !== row.revision ||
+        event.occurredAt !== row.occurred_at ||
+        event.type !== row.event_type
+      )
+        return yield* deny("Retained context event disagrees with physical metadata");
+      if (!audited.has(row.command_id)) {
+        const receiptMetadata = yield* sql<{ scalarBytes: number; bytes: number }>`SELECT
+          COALESCE(length(CAST(actor_kind AS BLOB)),0)+COALESCE(length(CAST(actor_id AS BLOB)),0)+COALESCE(length(CAST(source_kind AS BLOB)),0)+COALESCE(length(CAST(source_id AS BLOB)),0)+length(CAST(created_at AS BLOB)) AS scalarBytes,
+          COALESCE(length(CAST(event_ids_json AS BLOB)),0)+COALESCE(length(CAST(result_json AS BLOB)),0) AS bytes
+          FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${row.command_id} LIMIT 2`;
+        const receiptSize = receiptMetadata[0];
+        if (
+          receiptMetadata.length !== 1 ||
+          !receiptSize ||
+          !Number.isSafeInteger(receiptSize.scalarBytes) ||
+          receiptSize.scalarBytes <= 0 ||
+          receiptSize.scalarBytes > Bounds.contextBytes ||
+          !Number.isSafeInteger(receiptSize.bytes) ||
+          receiptSize.bytes <= 0 ||
+          receiptSize.bytes > 1310720
+        )
+          return yield* deny("Retained context receipt metadata exceeds bounds");
+        bytes = add(bytes, add(receiptSize.bytes, receiptSize.scalarBytes));
+        if (bytes > Bounds.ledgerBytes)
+          return yield* deny("Retained context receipt history exceeds byte bounds");
+        const receipts = yield* sql<{
+          actorKind: string | null;
+          actorId: string | null;
+          sourceKind: string | null;
+          sourceId: string | null;
+          createdAt: string;
+          ids: string | null;
+          result: string | null;
+        }>`
+          SELECT actor_kind AS actorKind,actor_id AS actorId,source_kind AS sourceKind,source_id AS sourceId,created_at AS createdAt,
+          CASE WHEN length(CAST(event_ids_json AS BLOB))<=1048576 THEN event_ids_json END AS ids,
+          CASE WHEN length(CAST(result_json AS BLOB))<=262144 THEN result_json END AS result
+          FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${row.command_id} LIMIT 2`;
+        const receipt = receipts[0];
+        if (receipts.length !== 1 || !receipt || receipt.ids === null || receipt.result === null)
+          return yield* deny("Retained context original receipt is missing or oversized");
+        const ids = yield* decodeAnswerEventIds(receipt.ids);
+        const result = yield* decodeAnswerResult(receipt.result);
+        const commandMetadata = yield* sql<{
+          count: number;
+          bytes: number | null;
+          payloadBytes: number | null;
+        }>`SELECT COUNT(*) AS count,
+          SUM(length(CAST(event_id AS BLOB))+length(CAST(occurred_at AS BLOB))+length(CAST(event_type AS BLOB))) AS bytes,
+          MAX(length(CAST(payload_json AS BLOB))) AS payloadBytes FROM project_work_events WHERE project_id=${projectId} AND command_id=${row.command_id}`;
+        const commandSize = commandMetadata[0];
+        if (
+          !commandSize ||
+          !Number.isSafeInteger(commandSize.count) ||
+          commandSize.count <= 0 ||
+          commandSize.count > Bounds.ledgerRows ||
+          commandSize.bytes === null ||
+          !Number.isSafeInteger(commandSize.bytes) ||
+          commandSize.bytes <= 0 ||
+          commandSize.bytes > Bounds.ledgerBytes ||
+          commandSize.payloadBytes === null ||
+          commandSize.payloadBytes > Bounds.contextBytes
+        )
+          return yield* deny("Retained context command metadata exceeds bounds");
+        bytes = add(bytes, commandSize.bytes);
+        if (bytes > Bounds.ledgerBytes)
+          return yield* deny("Retained context command history exceeds byte bounds");
+        const commandEvents = yield* sql<{
+          event_id: string;
+          revision: number;
+          occurred_at: string;
+          event_type: string;
+        }>`
+          SELECT event_id,json_extract(payload_json,'$.revision') AS revision,occurred_at,event_type FROM project_work_events WHERE project_id=${projectId} AND command_id=${row.command_id} ORDER BY sequence LIMIT 4097`;
+        if (
+          ids.length > Bounds.ledgerRows ||
+          new Set(ids).size !== ids.length ||
+          !same(
+            ids,
+            commandEvents.map((entry) => entry.event_id),
+          ) ||
+          result.projectId !== projectId ||
+          result.receipt.projectId !== projectId ||
+          result.receipt.commandId !== row.command_id ||
+          result.receipt.status !== "accepted" ||
+          result.receipt.eventCount !== ids.length ||
+          result.receipt.revision !== result.revision ||
+          result.delta.projectId !== projectId ||
+          result.delta.revision !== result.revision ||
+          !same(result.delta.eventIds, ids.slice(0, 64)) ||
+          !same(
+            result.delta.changedFields,
+            [...new Set(commandEvents.flatMap((entry) => receiptFields(entry.event_type)))].slice(
+              0,
+              64,
+            ),
+          ) ||
+          commandEvents.some(
+            (entry, index) => entry.revision !== result.revision - ids.length + index + 1,
+          ) ||
+          commandEvents.at(-1)?.occurred_at !== receipt.createdAt
+        )
+          return yield* deny("Retained context original receipt disagrees with its exact events");
+        // The receipt retains actor/source IDs and event time. Gateway recordedAt is a
+        // separate server-clock value; the receipt does not independently retain it.
+        for (const produced of commands.get(row.command_id) ?? []) {
+          const actor = produced.attribution;
+          if (
+            !actor ||
+            actor.actor.kind !== receipt.actorKind ||
+            (actor.actor.id ?? null) !== receipt.actorId ||
+            actor.source.kind !== receipt.sourceKind ||
+            (actor.source.id ?? null) !== receipt.sourceId ||
+            produced.occurredAt !== receipt.createdAt
+          )
+            return yield* deny(
+              "Retained context producer attribution disagrees with its original receipt",
+            );
+        }
+        audited.add(row.command_id);
+      }
+      if (event.type === "project-work.knowledge.promoted") {
+        if (
+          event.knowledge.projectId !== projectId ||
+          reconstructed.knowledge?.some(
+            (record) => record.knowledgeId === event.knowledge.knowledgeId,
+          ) ||
+          event.promotedAt !== event.occurredAt
+        )
+          return yield* deny("Retained knowledge producer is inconsistent");
+      } else if (event.type === "project-work.decision.proposed") {
+        if (
+          event.decision.projectId !== projectId ||
+          event.decision.state !== "proposed" ||
+          reconstructed.decisions?.some(
+            (record) => record.decisionId === event.decision.decisionId,
+          ) ||
+          event.proposedAt !== event.occurredAt
+        )
+          return yield* deny("Retained decision proposal is inconsistent");
+      } else {
+        const prior = reconstructed.decisions?.find(
+          (record) => record.decisionId === event.decisionId,
+        );
+        if (
+          !prior ||
+          (event.type === "project-work.decision.superseded"
+            ? prior.state !== "accepted"
+            : prior.state !== "proposed")
+        )
+          return yield* deny("Retained decision transition lacks its original proposal");
+        const transitionAt =
+          event.type === "project-work.decision.accepted"
+            ? event.acceptedAt
+            : event.type === "project-work.decision.rejected"
+              ? event.rejectedAt
+              : event.supersededAt;
+        if (transitionAt !== event.occurredAt)
+          return yield* deny("Retained decision transition time is inconsistent");
+        if (
+          event.type === "project-work.decision.superseded" &&
+          (event.replacement.projectId !== projectId ||
+            event.replacement.state !== "proposed" ||
+            event.replacement.supersedesDecisionId !== event.decisionId ||
+            reconstructed.decisions?.some(
+              (record) => record.decisionId === event.replacement.decisionId,
+            ))
+        )
+          return yield* deny("Retained decision replacement is inconsistent");
+      }
+      reconstructed = applyProjectWorkEvents(reconstructed, [event]);
+    }
+    return reconstructed;
+  });
+  const readDecisions = Effect.fn("ProjectTeamContext.readDecisions")(function* (
+    state: Awaited<ReturnType<typeof emptyProjectWorkReducerState>>,
+  ) {
+    const retained = (yield* readRetained(state.projectId, "decision")).decisions ?? [];
+    if (!same(retained, state.decisions ?? []))
+      return yield* deny("Required decisions disagree with current retained state");
+    const metadata = yield* sql<{
+      bytes: number;
+    }>`SELECT length(CAST(decision_id AS BLOB))+length(CAST(title AS BLOB))+length(CAST(body AS BLOB))+
+      COALESCE(length(CAST(attribution_json AS BLOB)),0)+COALESCE(length(CAST(state_transition_attribution_json AS BLOB)),0)+
+      COALESCE(length(CAST(rejection_reason AS BLOB)),0)+COALESCE(length(CAST(supersedes_decision_id AS BLOB)),0)+length(CAST(created_at AS BLOB))+length(CAST(updated_at AS BLOB))+
+      COALESCE(length(CAST(rejected_at AS BLOB)),0)+length(CAST(state AS BLOB)) AS bytes FROM project_work_decisions WHERE project_id=${state.projectId} LIMIT 4097`;
+    if (
+      metadata.length !== retained.length ||
+      metadata.length > Bounds.ledgerRows ||
+      metadata.some(
+        (row) =>
+          !Number.isSafeInteger(row.bytes) || row.bytes <= 0 || row.bytes > Bounds.contextBytes,
+      ) ||
+      metadata.reduce((sum, row) => sum + row.bytes, 0) > Bounds.ledgerBytes
+    )
+      return yield* deny("Required decision projections exceed retained bounds");
+    const rows = yield* sql<{
+      decisionId: string;
+      projectId: string;
+      title: string | null;
+      body: string | null;
+      state: string;
+      supersedesDecisionId: string | null;
+      rejectionReason: string | null;
+      rejectedAt: string | null;
+      revision: number;
+      createdAt: string;
+      updatedAt: string;
+      attribution: string | null;
+      transition: string | null;
+    }>`
+      SELECT decision_id AS decisionId,project_id AS projectId,state,supersedes_decision_id AS supersedesDecisionId,rejected_at AS rejectedAt,revision,created_at AS createdAt,updated_at AS updatedAt,
+      CASE WHEN length(CAST(title AS BLOB))<=${Bounds.contextBytes} THEN title END AS title,
+      CASE WHEN length(CAST(body AS BLOB))<=${Bounds.contextBytes} THEN body END AS body,
+      CASE WHEN length(CAST(rejection_reason AS BLOB))<=${Bounds.contextBytes} THEN rejection_reason END AS rejectionReason,
+      CASE WHEN length(CAST(attribution_json AS BLOB))<=${Bounds.contextBytes} THEN attribution_json END AS attribution,
+      CASE WHEN length(CAST(state_transition_attribution_json AS BLOB))<=${Bounds.contextBytes} THEN state_transition_attribution_json END AS transition
+      FROM project_work_decisions WHERE project_id=${state.projectId} ORDER BY decision_id LIMIT 4097`;
+    if (rows.length !== retained.length || rows.length > Bounds.ledgerRows)
+      return yield* deny("Required decisions have incomplete physical records");
+    for (const row of rows) {
+      const physical = yield* decodeDecision({
+        decisionId: row.decisionId,
+        projectId: row.projectId,
+        title: row.title,
+        body: row.body,
+        state: row.state,
+        revision: row.revision,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        ...(row.supersedesDecisionId === null
+          ? {}
+          : { supersedesDecisionId: row.supersedesDecisionId }),
+        ...(row.rejectionReason === null ? {} : { rejectionReason: row.rejectionReason }),
+        ...(row.rejectedAt === null ? {} : { rejectedAt: row.rejectedAt }),
+        ...(row.attribution === null
+          ? {}
+          : { attribution: yield* decodeAttributionJson(row.attribution) }),
+        ...(row.transition === null
+          ? {}
+          : { stateTransitionAttribution: yield* decodeAttributionJson(row.transition) }),
+      });
+      if (
+        !same(
+          physical,
+          retained.find((record) => record.decisionId === physical.decisionId),
+        )
+      )
+        return yield* deny("Required decision projection disagrees with its original events");
+    }
+    const accepted = retained
+      .filter((record) => record.state === "accepted")
+      .sort((a, b) => a.decisionId.localeCompare(b.decisionId));
+    if (accepted.length > 64) return yield* deny("Required accepted decisions exceed bounds");
+    return accepted;
+  });
+  const readKnowledge = Effect.fn("ProjectTeamContext.readKnowledge")(function* (
+    state: Awaited<ReturnType<typeof emptyProjectWorkReducerState>>,
+  ) {
+    const metadata = yield* sql<{ bytes: number }>`SELECT
+      length(CAST(knowledge_id AS BLOB))+length(CAST(title AS BLOB))+length(CAST(body AS BLOB))+COALESCE(length(CAST(attribution_json AS BLOB)),0)+
+      length(CAST(source_kind AS BLOB))+length(CAST(source_id AS BLOB))+COALESCE(length(CAST(supersedes_knowledge_id AS BLOB)),0)+length(CAST(created_at AS BLOB))+length(CAST(updated_at AS BLOB)) AS bytes
+      FROM project_work_knowledge WHERE project_id=${state.projectId} ORDER BY knowledge_id LIMIT 257`;
+    if (
+      metadata.length > 256 ||
+      metadata.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > Bounds.contextBytes) ||
+      metadata.reduce((sum, row) => sum + row.bytes, 0) > Bounds.ledgerBytes
+    )
+      return yield* deny("Knowledge closure exceeds bounds");
+    const retained = (yield* readRetained(state.projectId, "knowledge")).knowledge ?? [];
+    if (retained.length !== metadata.length || !same(retained, state.knowledge ?? []))
+      return yield* deny("Knowledge closure disagrees with retained state");
+    const rows = yield* sql<{
+      knowledgeId: string;
+      projectId: string;
+      title: string | null;
+      body: string | null;
+      sourceKind: string;
+      sourceId: string;
+      revision: number;
+      supersedesKnowledgeId: string | null;
+      createdAt: string;
+      updatedAt: string;
+      attribution: string | null;
+    }>`
+      SELECT knowledge_id AS knowledgeId,project_id AS projectId,source_kind AS sourceKind,source_id AS sourceId,revision,supersedes_knowledge_id AS supersedesKnowledgeId,created_at AS createdAt,updated_at AS updatedAt,
+      CASE WHEN length(CAST(title AS BLOB))<=${Bounds.contextBytes} THEN title END AS title,
+      CASE WHEN length(CAST(body AS BLOB))<=${Bounds.contextBytes} THEN body END AS body,
+      CASE WHEN length(CAST(attribution_json AS BLOB))<=${Bounds.contextBytes} THEN attribution_json END AS attribution
+      FROM project_work_knowledge WHERE project_id=${state.projectId} ORDER BY knowledge_id LIMIT 257`;
+    for (const row of rows) {
+      const physical = yield* decodeKnowledge({
+        knowledgeId: row.knowledgeId,
+        projectId: row.projectId,
+        title: row.title,
+        body: row.body,
+        sourceKind: row.sourceKind,
+        sourceId: row.sourceId,
+        revision: row.revision,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        ...(row.supersedesKnowledgeId === null
+          ? {}
+          : { supersedesKnowledgeId: row.supersedesKnowledgeId }),
+        ...(row.attribution === null
+          ? {}
+          : { attribution: yield* decodeAttributionJson(row.attribution) }),
+      });
+      if (
+        !same(
+          physical,
+          retained.find((record) => record.knowledgeId === physical.knowledgeId),
+        )
+      )
+        return yield* deny("Knowledge projection disagrees with its original events");
+    }
+    const records = new Map(retained.map((record) => [record.knowledgeId, record]));
+    const replacements = new Map<string, string>();
+    for (const record of retained) {
+      const previous = record.supersedesKnowledgeId;
+      if (previous === undefined) continue;
+      if (previous === record.knowledgeId || !records.has(previous) || replacements.has(previous))
+        return yield* deny("Knowledge replacement closure is missing or ambiguous");
+      replacements.set(previous, record.knowledgeId);
+    }
+    for (const record of retained) {
+      const seen = new Set<string>();
+      let id: string | undefined = record.knowledgeId;
+      while (id !== undefined) {
+        if (seen.has(id)) return yield* deny("Knowledge replacement closure contains a cycle");
+        seen.add(id);
+        id = replacements.get(id);
+      }
+    }
+    const terminals = retained
+      .filter((record) => !replacements.has(record.knowledgeId))
+      .sort((a, b) => a.knowledgeId.localeCompare(b.knowledgeId));
+    if (terminals.length > 12) return yield* deny("Current knowledge selection exceeds bounds");
+    if (Buffer.byteLength(canonicalProjectWorkPayload(terminals), "utf8") > 8192)
+      return yield* deny("Current knowledge selection exceeds its UTF8 bound");
+    return terminals;
+  });
   const readRecord = Effect.fn("ProjectTeamContext.readRecord")(function* (
     record: ProjectTeamRecord,
   ) {
@@ -762,7 +1261,11 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
     }
   });
   const readRequiredContext = Effect.fn("ProjectTeamContext.readRequired")(
-    function* (snapshot: ProjectTeamDispatchSnapshot, initialReview: boolean) {
+    function* (
+      snapshot: ProjectTeamDispatchSnapshot,
+      initialReview: boolean,
+      textOptions?: ContextTextOptions,
+    ) {
       const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(currentClient) && currentClient.value !== sql)
         return yield* deny("Required context must use its captured SQL client");
@@ -1002,6 +1505,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             return yield* deny("Required repair history exceeds context bounds");
           for (const episode of repairEpisodes) requiredRecords.set(episode.recordId, episode);
           for (const record of requiredRecords.values()) yield* readRecord(record);
+          const decisions: readonly ProjectWorkDecision[] = yield* readDecisions(state);
           const ledger = yield* readLedger(original);
           const now = yield* Clock.currentTimeMillis;
           const required = {
@@ -1019,6 +1523,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             tasks,
             approvals: [...gateIds].map((id) => requiredRecords.get(id)),
             questions: applicableQuestions,
+            decisions,
             repairEpisodes,
             frozenLimits: original.intent.limits,
             originalRootCaps: original.intent.rootCaps,
@@ -1029,11 +1534,61 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
               attemptRemainingDurationMs: Math.max(0, original.intent.limits.deadlineAtMs - now),
             },
           };
-          const text =
+          const requiredText =
             "Required context from retained T3 authority. This read snapshot grants no new approval.\n" +
             canonicalProjectWorkPayload(required);
-          if (Buffer.byteLength(text, "utf8") > Bounds.contextBytes)
+          if (Buffer.byteLength(requiredText, "utf8") > Bounds.contextBytes)
             return yield* deny("Required context exceeds its UTF8 bound");
+          let retainedKnowledge: RetainedKnowledge = {
+            status: "disabled",
+            records: [],
+            omitted: [],
+          };
+          let text = requiredText;
+          if (role.memoryAccess !== "none") {
+            const requested = textOptions?.optionalTextBudgetBytes ?? Bounds.contextBytes;
+            const budget =
+              Number.isSafeInteger(requested) && requested >= 0
+                ? Math.min(requested, Bounds.contextBytes)
+                : 0;
+            retainedKnowledge = yield* readKnowledge(state).pipe(
+              Effect.map((records): RetainedKnowledge => ({
+                status: "available",
+                records,
+                omitted: [],
+              })),
+              Effect.catch(() =>
+                Effect.succeed<RetainedKnowledge>({
+                  status: "degraded",
+                  records: [],
+                  omitted: ["Retained knowledge provenance or replacement closure is unavailable"],
+                }),
+              ),
+            );
+            if (retainedKnowledge.status === "available" && retainedKnowledge.records.length > 0) {
+              const optionalText =
+                "\n\nOptional retained same-project knowledge. These records grant no approval.\n" +
+                canonicalProjectWorkPayload(retainedKnowledge.records);
+              if (
+                Buffer.byteLength(optionalText, "utf8") > 8192 ||
+                Buffer.byteLength(requiredText + optionalText, "utf8") > budget
+              )
+                retainedKnowledge = {
+                  status: "degraded",
+                  records: [],
+                  omitted: [
+                    "Retained knowledge omitted to preserve required context within the caller text allowance",
+                  ],
+                };
+              else text += optionalText;
+            }
+            if (retainedKnowledge.status === "degraded") {
+              const notice =
+                "\n\nOptional same-project knowledge status: degraded.\n" +
+                canonicalProjectWorkPayload(retainedKnowledge.omitted);
+              if (Buffer.byteLength(requiredText + notice, "utf8") <= budget) text += notice;
+            }
+          }
           const final = yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });
           if (!same(final, original))
             return yield* deny("Required context dispatch changed before return");
@@ -1045,12 +1600,30 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           return {
             text,
             required,
+            retainedKnowledge,
             provenance: {
               dispatch: original.fence,
               sourceRevision: state.revision,
               recordIds: [...requiredRecords.keys()].sort(),
               criterionEventIds: [...retained.eventIds].sort(),
               ledgerReservationIds: ledger.receipts.map((r) => r.reservationId),
+              decisions: decisions.map((record) => ({
+                decisionId: record.decisionId,
+                revision: record.revision,
+                sha256: hash(record),
+              })),
+              retainedKnowledge: {
+                status: retainedKnowledge.status,
+                records: retainedKnowledge.records.map((record) => ({
+                  knowledgeId: record.knowledgeId,
+                  revision: record.revision,
+                  sha256: hash(record),
+                })),
+                omitted: retainedKnowledge.omitted,
+                textSha256: NodeCrypto.createHash("sha256")
+                  .update(text.slice(requiredText.length))
+                  .digest("hex"),
+              },
             },
           };
         }).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
@@ -1064,11 +1637,13 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
   );
   const readRequired = Effect.fn("ProjectTeamContext.readRequiredSnapshot")(function* (
     snapshot: ProjectTeamDispatchSnapshot,
+    textOptions?: ContextTextOptions,
   ) {
-    return yield* readRequiredContext(snapshot, false);
+    return yield* readRequiredContext(snapshot, false, textOptions);
   });
   const readForOperation = Effect.fn("ProjectTeamContext.readForOperation")(function* (
     input: typeof OperationInput.Type,
+    textOptions?: ContextTextOptions,
   ) {
     const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
     if (Option.isSome(currentClient) && currentClient.value !== sql)
@@ -1109,7 +1684,11 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       )
       .pipe(Effect.mapError(() => deny("Required original dispatch is unavailable")));
     // The owned reader revalidates this snapshot in its own transaction before returning content.
-    return yield* readRequiredContext(snapshot, operation.operationKind === "initialize");
+    return yield* readRequiredContext(
+      snapshot,
+      operation.operationKind === "initialize",
+      textOptions,
+    );
   });
   return { readRequired, readForOperation };
 });

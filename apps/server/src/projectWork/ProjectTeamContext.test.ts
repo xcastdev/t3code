@@ -5,10 +5,12 @@ import {
   ProjectTeamWriteIntent,
   canonicalProjectWorkPayload,
   EventId,
+  ProjectId,
   ProjectWorkTaskId,
   ProviderInstanceId,
   ThreadId,
   ProjectWorkCommand,
+  ProjectWorkWriteIntent,
   ProjectTeamRecord as TeamRecordSchema,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
@@ -25,6 +27,7 @@ import {
   scoped,
   createManagedAssignment,
   restoreHistoricalBinding,
+  gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { ProjectWorkProjection } from "./ProjectWorkProjection.ts";
@@ -40,6 +43,8 @@ import * as Accounting from "./ProjectTeamModelAccounting.ts";
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import { ProjectTeamAuthorization } from "./ProjectTeamAuthorization.ts";
+import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
+import * as Layer from "effect/Layer";
 import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
 import {
   makeProjectWorkVerificationGate,
@@ -57,12 +62,14 @@ const decodeVerificationIntent = Schema.decodeUnknownEffect(ProjectTeamWriteInte
 const decodeCommand = Schema.decodeUnknownEffect(ProjectWorkCommand);
 const decodeRecord = Schema.decodeUnknownEffect(TeamRecordSchema);
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const decodeRetainedIntent = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
 
 const makeFixture = (
   role: "implementer" | "integrator" | "planner" | "reviewer" | "investigator" = "implementer",
   writableWorkers = 1,
   readonlyKind?: "planning" | "review" | "investigation",
   verified = false,
+  memoryAccess: "none" | "project" | "shared" = "none",
 ) =>
   Effect.gen(function* () {
     const repository = yield* ProjectWorkRepository;
@@ -177,6 +184,16 @@ const makeFixture = (
           Effect.provideService(ProjectWorkRepository, {
             ...repository,
             execute: (command) => {
+              if (
+                command.type === "project-work.foundation.commit" &&
+                command.commandId === "setup"
+              )
+                return repository.execute({
+                  ...command,
+                  records: command.records.map((record) =>
+                    record.kind === "role-revision" ? { ...record, memoryAccess } : record,
+                  ),
+                });
               if (
                 readonlyKind !== undefined &&
                 readonlyKind !== "review" &&
@@ -448,6 +465,96 @@ const makeFixture = (
     return { sql, repository, request, journal, snapshot, reader, change, parentVerification };
   });
 
+it.effect(
+  "provides accepted decisions and current retained knowledge on a later prepared context read",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+      const gateway = yield* ProjectWorkGateway;
+      const actor = { kind: "human" as const, id: "context-human" };
+      const source = { kind: "web" as const, id: "context-browser" };
+      const write = (input: unknown) =>
+        decodeRetainedIntent(input).pipe(
+          Effect.flatMap((intent) => gateway.write(intent, actor, source)),
+        );
+      const before = yield* f.reader.readRequired(f.snapshot);
+      yield* write({
+        type: "project-work.decision.propose",
+        projectId,
+        commandId: "context-propose",
+        decision: {
+          decisionId: "context-decision",
+          projectId,
+          title: "Compatibility",
+          body: "Keep the existing format",
+          state: "proposed",
+          revision: 0,
+          createdAt: at,
+          updatedAt: at,
+        },
+        proposedAt: at,
+      });
+      yield* write({
+        type: "project-work.decision.accept",
+        projectId,
+        commandId: "context-accept",
+        decisionId: "context-decision",
+        acceptedAt: at,
+      });
+      yield* write({
+        type: "project-work.knowledge.promote",
+        projectId,
+        commandId: "context-promote",
+        knowledge: {
+          knowledgeId: "context-knowledge",
+          projectId,
+          title: "Build",
+          body: "Use the retained build recipe",
+          sourceKind: "manual",
+          sourceId: "context-human",
+          revision: 0,
+          createdAt: at,
+          updatedAt: at,
+        },
+        promotedAt: at,
+      });
+      const original = yield* f.sql<{
+        actor: string;
+        source: string;
+        recordedAt: string;
+        occurredAt: string;
+        receiptAt: string;
+      }>`SELECT
+      json_extract(e.payload_json,'$.attribution.actor.id') AS actor,json_extract(e.payload_json,'$.attribution.source.id') AS source,
+      json_extract(e.payload_json,'$.attribution.recordedAt') AS recordedAt,e.occurred_at AS occurredAt,r.created_at AS receiptAt
+      FROM project_work_events e JOIN project_work_command_receipts r ON r.project_id=e.project_id AND r.command_id=e.command_id
+      WHERE e.project_id=${projectId} AND e.command_id='context-accept'`;
+      expect(original).toHaveLength(1);
+      expect(original[0]).toMatchObject({
+        actor: actor.id,
+        source: source.id,
+        occurredAt: at,
+        receiptAt: at,
+      });
+      expect(original[0]?.recordedAt).not.toBe(original[0]?.receiptAt);
+      const after = yield* f.reader.readRequired(f.snapshot);
+      expect(before.required).toMatchObject({ decisions: [] });
+      expect(after.required).toMatchObject({
+        decisions: [{ decisionId: "context-decision", state: "accepted" }],
+      });
+      expect(after).toMatchObject({
+        retainedKnowledge: {
+          status: "available",
+          records: [{ knowledgeId: "context-knowledge", sourceKind: "manual" }],
+          omitted: [],
+        },
+      });
+      expect(after.text).toContain("Keep the existing format");
+      expect(after.text).toContain("Use the retained build recipe");
+      expect(after.provenance).not.toEqual(before.provenance);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
 const denied = Effect.fn("contextFixture.denied")(function* <A, E, R>(
   effect: Effect.Effect<A, E, R>,
 ) {
@@ -455,6 +562,379 @@ const denied = Effect.fn("contextFixture.denied")(function* <A, E, R>(
   expect(result._tag).toBe("Failure");
   if (result._tag === "Failure") expect(result.failure).toBeInstanceOf(ProjectTeamContextError);
 });
+const retainedWriter = Effect.fn("contextFixture.retainedWriter")(function* () {
+  const gateway = yield* ProjectWorkGateway;
+  const actor = { kind: "human" as const, id: "retained-human" };
+  const source = { kind: "web" as const, id: "retained-browser" };
+  const write = (input: unknown) =>
+    decodeRetainedIntent(input).pipe(
+      Effect.flatMap((intent) => gateway.write(intent, actor, source)),
+    );
+  const decision = (decisionId: string, body = "Retained constraint", owner = projectId) => ({
+    decisionId,
+    projectId: owner,
+    title: decisionId,
+    body,
+    state: "proposed",
+    revision: 0,
+    createdAt: at,
+    updatedAt: at,
+  });
+  return {
+    propose: (id: string, body?: string, owner = projectId) =>
+      write({
+        type: "project-work.decision.propose",
+        projectId: owner,
+        commandId: "propose-" + id,
+        decision: decision(id, body, owner),
+        proposedAt: at,
+      }),
+    accept: (id: string, owner = projectId) =>
+      write({
+        type: "project-work.decision.accept",
+        projectId: owner,
+        commandId: "accept-" + id,
+        decisionId: id,
+        acceptedAt: at,
+      }),
+    reject: (id: string) =>
+      write({
+        type: "project-work.decision.reject",
+        projectId,
+        commandId: "reject-" + id,
+        decisionId: id,
+        reason: "Rejected constraint",
+        rejectedAt: at,
+      }),
+    replace: (id: string, replacement: string) =>
+      write({
+        type: "project-work.decision.supersede",
+        projectId,
+        commandId: "replace-" + id,
+        decisionId: id,
+        replacement: decision(replacement),
+        supersededAt: at,
+        attribution: { actor, source, recordedAt: at },
+      }),
+    promote: (id: string, previous?: string, body = "Retained knowledge", owner = projectId) =>
+      write({
+        type: "project-work.knowledge.promote",
+        projectId: owner,
+        commandId: "promote-" + id,
+        knowledge: {
+          knowledgeId: id,
+          projectId: owner,
+          title: id,
+          body,
+          sourceKind: "manual",
+          sourceId: actor.id,
+          revision: 0,
+          createdAt: at,
+          updatedAt: at,
+          ...(previous === undefined ? {} : { supersedesKnowledgeId: previous }),
+        },
+        promotedAt: at,
+      }),
+  };
+});
+const withRetainedGateway = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
+
+it.effect(
+  "retained context includes only accepted decisions and observes an accepted replacement",
+  () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const w = yield* retainedWriter();
+        yield* w.propose("pending");
+        yield* w.propose("rejected");
+        yield* w.reject("rejected");
+        yield* w.propose("original");
+        yield* w.accept("original");
+        const original = yield* f.reader.readRequired(f.snapshot);
+        expect(original.required.decisions.map((record) => record.decisionId)).toEqual([
+          "original",
+        ]);
+        yield* w.replace("original", "replacement");
+        expect((yield* f.reader.readRequired(f.snapshot)).required.decisions).toEqual([]);
+        yield* w.accept("replacement");
+        const current = yield* f.reader.readRequired(f.snapshot);
+        expect(current.required.decisions.map((record) => record.decisionId)).toEqual([
+          "replacement",
+        ]);
+        expect(current.required.decisions[0]?.attribution).toMatchObject({
+          actor: { kind: "human", id: "retained-human" },
+          source: { kind: "web", id: "retained-browser" },
+        });
+        expect(current.text).not.toContain('"state":"superseded"');
+        expect(current.provenance.decisions).not.toEqual(original.provenance.decisions);
+      }),
+    ),
+);
+
+for (const memoryAccess of ["none", "project", "shared"] as const)
+  it.effect(`retained context honors frozen ${memoryAccess} knowledge access`, () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture("implementer", 1, undefined, false, memoryAccess);
+        const w = yield* retainedWriter();
+        yield* w.promote("local", undefined, "Same-project manual recipe");
+        if (memoryAccess === "none")
+          yield* f.sql`DELETE FROM project_work_command_receipts WHERE command_id='promote-local'`;
+        const result = yield* f.reader.readRequired(f.snapshot);
+        expect(result.retainedKnowledge.status).toBe(
+          memoryAccess === "none" ? "disabled" : "available",
+        );
+        expect(result.retainedKnowledge.records.map((record) => record.knowledgeId)).toEqual(
+          memoryAccess === "none" ? [] : ["local"],
+        );
+        expect(result.text.includes("Same-project manual recipe")).toBe(memoryAccess !== "none");
+      }),
+    ),
+  );
+
+it.effect(
+  "retained context selects a complete knowledge replacement chain without crossing projects",
+  () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture("implementer", 1, undefined, false, "shared");
+        const w = yield* retainedWriter();
+        const foreign = ProjectId.make("foreign-context-project");
+        yield* f.sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${foreign},'Foreign','/foreign','[]',${at},${at})`;
+        yield* w.promote("foreign", undefined, "Foreign secret", foreign);
+        yield* w.propose("foreign-decision", "Foreign constraint", foreign);
+        yield* w.accept("foreign-decision", foreign);
+        yield* w.promote("a", undefined, "Old knowledge");
+        yield* w.promote("b", "a", "Intermediate knowledge");
+        const before = yield* f.reader.readRequired(f.snapshot);
+        expect(before.retainedKnowledge.records.map((record) => record.knowledgeId)).toEqual(["b"]);
+        yield* w.promote("c", "b", "Current knowledge");
+        const after = yield* f.reader.readRequired(f.snapshot);
+        expect(after.retainedKnowledge.records.map((record) => record.knowledgeId)).toEqual(["c"]);
+        expect(after.required.decisions).toEqual([]);
+        expect(after.text).toContain("Current knowledge");
+        for (const hidden of [
+          "Old knowledge",
+          "Intermediate knowledge",
+          "Foreign secret",
+          "Foreign constraint",
+        ])
+          expect(after.text).not.toContain(hidden);
+        expect(after.provenance.retainedKnowledge).not.toEqual(before.provenance.retainedKnowledge);
+      }),
+    ),
+);
+
+for (const closure of ["missing", "foreign", "self", "fork", "cycle"] as const)
+  it.effect(
+    `retained knowledge degrades for ${closure} replacement closure while preserving required decisions`,
+    () =>
+      withRetainedGateway(
+        Effect.gen(function* () {
+          const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+          const w = yield* retainedWriter();
+          yield* w.propose("required");
+          yield* w.accept("required");
+          if (closure === "missing") yield* w.promote("a", "missing");
+          if (closure === "foreign") {
+            const foreign = ProjectId.make("foreign-context-project");
+            yield* f.sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${foreign},'Foreign','/foreign','[]',${at},${at})`;
+            yield* w.promote("foreign", undefined, "Foreign secret", foreign);
+            yield* w.promote("a", "foreign");
+          }
+          if (closure === "self") yield* w.promote("a", "a");
+          if (closure === "fork") {
+            yield* w.promote("a");
+            yield* w.promote("b", "a");
+            yield* w.promote("c", "a");
+          }
+          if (closure === "cycle") {
+            yield* w.promote("a", "b");
+            yield* w.promote("b", "a");
+          }
+          const result = yield* f.reader.readRequired(f.snapshot);
+          expect(result.retainedKnowledge).toMatchObject({ status: "degraded", records: [] });
+          expect(result.retainedKnowledge.omitted.length).toBeGreaterThan(0);
+          expect(result.required.decisions.map((record) => record.decisionId)).toEqual([
+            "required",
+          ]);
+          expect(result.text).not.toContain('"body":"Retained knowledge"');
+          expect(result.text).toContain("Optional same-project knowledge status: degraded.");
+        }),
+      ),
+  );
+
+for (const corruption of [
+  "receipt-actor",
+  "receipt-membership",
+  "receipt-delta",
+  "projection",
+  "missing-proposal",
+] as const)
+  it.effect(`required retained decisions deny ${corruption} corruption`, () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const w = yield* retainedWriter();
+        yield* w.propose("required");
+        yield* w.accept("required");
+        expect((yield* f.reader.readRequired(f.snapshot)).required.decisions).toHaveLength(1);
+        if (corruption === "receipt-actor")
+          yield* f.sql`UPDATE project_work_command_receipts SET actor_id='substituted-human' WHERE command_id='accept-required'`;
+        if (corruption === "receipt-membership")
+          yield* f.sql`UPDATE project_work_command_receipts SET event_ids_json='[]' WHERE command_id='accept-required'`;
+        if (corruption === "receipt-delta")
+          yield* f.sql`UPDATE project_work_command_receipts SET result_json=json_set(result_json,'$.delta.changedFields',json('[]')) WHERE command_id='accept-required'`;
+        if (corruption === "projection")
+          yield* f.sql`UPDATE project_work_decisions SET body='Substituted constraint' WHERE decision_id='required'`;
+        if (corruption === "missing-proposal")
+          yield* f.sql`DELETE FROM project_work_events WHERE command_id='propose-required'`;
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }),
+    ),
+  );
+
+for (const corruption of [
+  "receipt",
+  "projection",
+  "missing-event",
+  "duplicate",
+  "storage",
+] as const)
+  it.effect(`optional retained knowledge degrades for ${corruption} corruption`, () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+        const w = yield* retainedWriter();
+        yield* w.promote("optional");
+        const before = yield* f.reader.readRequired(f.snapshot);
+        expect(before.retainedKnowledge.status).toBe("available");
+        if (corruption === "receipt")
+          yield* f.sql`UPDATE project_work_command_receipts SET actor_id='substituted-human' WHERE command_id='promote-optional'`;
+        if (corruption === "projection")
+          yield* f.sql`UPDATE project_work_knowledge SET body='Substituted body' WHERE knowledge_id='optional'`;
+        if (corruption === "missing-event")
+          yield* f.sql`DELETE FROM project_work_events WHERE command_id='promote-optional'`;
+        if (corruption === "duplicate") {
+          yield* w.promote("other");
+          yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.knowledge.knowledgeId','optional') WHERE command_id='promote-other'`;
+        }
+        if (corruption === "storage") yield* f.sql`DROP TABLE project_work_knowledge`;
+        const after = yield* f.reader.readRequired(f.snapshot);
+        if (corruption === "duplicate")
+          expect(after.required.decisions).toEqual(before.required.decisions);
+        else expect(after.required).toEqual(before.required);
+        expect(after.retainedKnowledge).toMatchObject({ status: "degraded", records: [] });
+        expect(after.text).toContain("Optional same-project knowledge status: degraded.");
+        expect(after.provenance.retainedKnowledge).not.toEqual(before.provenance.retainedKnowledge);
+      }),
+    ),
+  );
+
+it.effect(
+  "retained knowledge respects the real caller text allowance without dropping required decisions",
+  () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+        const w = yield* retainedWriter();
+        yield* w.propose("required");
+        yield* w.accept("required");
+        yield* w.promote("optional");
+        const available = yield* f.reader.readRequired(f.snapshot);
+        const requiredBytes = Buffer.byteLength(
+          "Required context from retained T3 authority. This read snapshot grants no new approval.\n" +
+            canonicalProjectWorkPayload(available.required),
+          "utf8",
+        );
+        const limited = yield* f.reader.readRequired(f.snapshot, {
+          optionalTextBudgetBytes: requiredBytes,
+        });
+        expect(limited.required).toEqual(available.required);
+        expect(limited.retainedKnowledge).toMatchObject({ status: "degraded", records: [] });
+        expect(Buffer.byteLength(limited.text, "utf8")).toBe(requiredBytes);
+        expect(limited.text).not.toContain("Retained knowledge");
+        expect(
+          (yield* f.reader.readRequired(f.snapshot, {
+            optionalTextBudgetBytes: Buffer.byteLength(available.text, "utf8"),
+          })).text,
+        ).toBe(available.text);
+        for (const invalid of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+          const read = yield* f.reader.readRequired(f.snapshot, {
+            optionalTextBudgetBytes: invalid,
+          });
+          expect(read.required).toEqual(available.required);
+          expect(read.retainedKnowledge.status).toBe("degraded");
+        }
+      }),
+    ),
+);
+
+for (const bound of ["selection", "UTF8", "closure"] as const)
+  it.effect(`retained knowledge ${bound} overflow falls back to required context`, () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+        const w = yield* retainedWriter();
+        if (bound === "selection")
+          for (let index = 0; index < 13; index++) yield* w.promote("optional-" + index);
+        if (bound === "UTF8") yield* w.promote("optional", undefined, "界".repeat(3000));
+        if (bound === "closure") {
+          // Invalid physical rows exercise the bounded fallback, without manufacturing trusted knowledge.
+          for (let index = 0; index < 257; index++)
+            yield* f.sql`INSERT INTO project_work_knowledge (knowledge_id,project_id,title,body,source_kind,source_id,revision,created_at,updated_at) VALUES (${"untrusted-" + index},${projectId},'Untrusted','Untrusted','manual','untrusted',0,${at},${at})`;
+        }
+        const read = yield* f.reader.readRequired(f.snapshot);
+        expect(read.retainedKnowledge).toMatchObject({ status: "degraded", records: [] });
+        expect(read.required.runId).toBe("binding");
+        expect(read.text).not.toContain("Untrusted");
+      }),
+    ),
+  );
+
+it.effect("required retained decision UTF8 overflow denies instead of omitting constraints", () =>
+  withRetainedGateway(
+    Effect.gen(function* () {
+      const f = yield* makeFixture();
+      const w = yield* retainedWriter();
+      for (let index = 0; index < 3; index++) {
+        const id = "large-" + index;
+        yield* w.propose(id, "界".repeat(32000));
+        yield* w.accept(id);
+      }
+      yield* denied(f.reader.readRequired(f.snapshot));
+    }),
+  ),
+);
+for (const kind of ["decision", "knowledge"] as const)
+  for (const metadata of ["event", "receipt"] as const)
+    it.effect(`retained context bounds oversized ${kind} ${metadata} metadata`, () =>
+      withRetainedGateway(
+        Effect.gen(function* () {
+          const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+          const w = yield* retainedWriter();
+          yield* w.propose("required");
+          yield* w.accept("required");
+          yield* w.promote("optional");
+          const before = yield* f.reader.readRequired(f.snapshot);
+          const command = kind === "decision" ? "accept-required" : "promote-optional";
+          const oversized = "x".repeat(262145);
+          if (metadata === "event")
+            yield* f.sql`UPDATE project_work_events SET command_id=${oversized} WHERE command_id=${command}`;
+          else
+            yield* f.sql`UPDATE project_work_command_receipts SET actor_id=${oversized} WHERE command_id=${command}`;
+          if (kind === "decision") yield* denied(f.reader.readRequired(f.snapshot));
+          else {
+            const after = yield* f.reader.readRequired(f.snapshot);
+            expect(after.required).toEqual(before.required);
+            expect(after.retainedKnowledge).toMatchObject({ status: "degraded", records: [] });
+            expect(after.text).toContain("Optional same-project knowledge status: degraded.");
+          }
+        }),
+      ),
+    );
 const makeBudgetFixture = (writableWorkers = 1) =>
   Effect.gen(function* () {
     const f = yield* makeFixture("implementer", writableWorkers);
