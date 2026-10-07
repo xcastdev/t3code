@@ -751,6 +751,15 @@ export const ProjectTeamWriteIntent = Schema.Union([
   }),
   Schema.Struct({
     ...IntentFields,
+    type: Schema.Literal("project-team.question.request"),
+    questionId: Text,
+    targetGateId: Text,
+    expectedGateRevision: NonNegativeInt,
+    body: Body,
+    choices: Ids,
+  }),
+  Schema.Struct({
+    ...IntentFields,
     type: Schema.Literal("project-team.question.answer"),
     questionId: Text,
     expectedQuestionRevision: NonNegativeInt,

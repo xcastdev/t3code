@@ -39,6 +39,35 @@ const member = {
   roleRevisionId: "role",
 };
 describe("team contracts", () => {
+  it("accepts bounded human-question requests without caller identity or approval fields", () => {
+    const request = {
+      type: "project-team.question.request",
+      commandId: "ask-human",
+      projectId: "project",
+      taskId: "task",
+      expectedRevision: 3,
+      expectedTaskRevision: 1,
+      specRevision: 1,
+      planRevision: 1,
+      questionId: "question",
+      targetGateId: "gate",
+      expectedGateRevision: 2,
+      body: "Which bounded option should the worker use?",
+      choices: ["Keep history", "Revise plan"],
+    };
+    expect(decodeIntent(request)).toEqual(request);
+    for (const change of [
+      { senderId: "caller" },
+      { generation: 9 },
+      { attribution: { actor: { kind: "human", id: "caller" } } },
+      { response: "approved" },
+      { expectedGateRevision: -1 },
+      { body: "x".repeat(32001) },
+      { choices: Array.from({ length: 65 }, (_, i) => `choice-${i}`) },
+      { choices: ["x".repeat(257)] },
+    ])
+      expect(() => decodeIntent({ ...request, ...change })).toThrow();
+  });
   it("preserves future read statuses while rejecting them for writes", () => {
     expect(decodeTeamRecordRead({ ...member, status: "sleeping" }).status).toBe("sleeping");
     expect(() => decodeTeamRecord({ ...member, status: "sleeping" })).toThrow();

@@ -924,6 +924,205 @@ for (const corruption of [
     ),
   );
 
+it.effect(
+  "retains an original human answer in required question context without granting its gate",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const current = yield* readCurrentState(f.sql, projectId);
+        const target = current.foundationRecords!.find(
+          (r) => r.kind === "gate" && r.gate === "plan",
+        );
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (target?.kind !== "gate" || claim?.kind !== "claim")
+          return yield* Effect.die("Missing original question target");
+        const human = {
+          actor: { kind: "human" as const, id: "answer-human" },
+          source: { kind: "web" as const, id: "answer-device" },
+          recordedAt: at,
+        };
+        const pending = yield* decodeRecord({
+          kind: "question",
+          recordId: "answered-context-question",
+          projectId,
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          status: "pending",
+          taskId: claim.taskId,
+          senderId: claim.binding.memberId,
+          targetGateId: target.recordId,
+          targetRevision: target.revision,
+          body: "Which history should be preserved?",
+          choices: ["Recorded history"],
+        });
+        yield* f.change(pending);
+        yield* f.change(
+          yield* decodeRecord({
+            kind: "member",
+            recordId: "answer-private-member",
+            projectId,
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "active",
+            name: "Private member",
+            coordinator: false,
+            roleRevisionId: "role",
+          }),
+        );
+        const excluded = [
+          yield* decodeRecord({
+            ...pending,
+            recordId: "answer-private-question",
+            senderId: "answer-private-member",
+            body: "Private teammate answer",
+          }),
+          yield* decodeRecord({
+            ...pending,
+            recordId: "answer-stale-question",
+            targetRevision: target.revision + 1,
+            body: "Stale target answer",
+          }),
+        ];
+        for (const entry of excluded) yield* f.change(entry);
+        yield* f.change(
+          yield* decodeRecord({
+            ...pending,
+            recordId: "answer-canceled-question",
+            status: "canceled",
+            body: "Canceled answer context",
+          }),
+        );
+        const beforeAnswer = yield* f.reader.readRequired(f.snapshot);
+        expect(beforeAnswer.required.questions).toContainEqual(pending);
+        const repo = yield* ProjectWorkRepository;
+        yield* repo.execute(
+          yield* decodeCommit({
+            type: "project-work.foundation.commit",
+            commandId: "context-human-answer",
+            projectId,
+            expectedRevision: (yield* readCurrentState(f.sql, projectId)).revision,
+            attribution: human,
+            committedAt: at,
+            records: [pending, ...excluded].map((entry) => ({
+              ...entry,
+              revision: 1,
+              status: "answered",
+              answer: "Recorded history",
+              answeredBy: human,
+            })),
+          }),
+        );
+        const result = yield* f.reader.readRequired(f.snapshot);
+        expect(result.required.questions).toHaveLength(1);
+        expect(result.required.questions[0]).toMatchObject({
+          status: "answered",
+          revision: 1,
+          answer: "Recorded history",
+          answeredBy: human,
+        });
+        expect(result.text).toContain("Recorded history");
+        expect(result.text).toContain("answer-human");
+        expect(result.text).not.toContain("Private teammate answer");
+        expect(result.text).not.toContain("Stale target answer");
+        expect(result.text).not.toContain("Canceled answer context");
+        expect(
+          (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+            (r) => r.recordId === target.recordId,
+          ),
+        ).toEqual(target);
+      }),
+    ),
+);
+
+it.effect(
+  "denies substituted human answer attribution despite matching question projection and event",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture();
+        const state = yield* readCurrentState(f.sql, projectId);
+        const target = state.foundationRecords?.find((r) => r.kind === "gate" && r.gate === "plan");
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (target?.kind !== "gate" || claim?.kind !== "claim")
+          return yield* Effect.die("Missing original answer target");
+        const pending = yield* decodeRecord({
+          kind: "question",
+          recordId: "answer-attribution-question",
+          projectId,
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          status: "pending",
+          taskId: claim.taskId,
+          senderId: claim.binding.memberId,
+          targetGateId: target.recordId,
+          targetRevision: target.revision,
+          body: "Which answer belongs to the original human?",
+          choices: ["Original answer"],
+        });
+        yield* f.change(pending);
+        const human = {
+          actor: { kind: "human" as const, id: "original-answer-human" },
+          source: { kind: "web" as const, id: "original-answer-device" },
+          recordedAt: at,
+        };
+        const repo = yield* ProjectWorkRepository;
+        const commandId = "original-context-answer";
+        yield* repo.execute(
+          yield* decodeCommit({
+            type: "project-work.foundation.commit",
+            commandId,
+            projectId,
+            expectedRevision: (yield* readCurrentState(f.sql, projectId)).revision,
+            attribution: human,
+            committedAt: at,
+            records: [
+              {
+                ...pending,
+                revision: 1,
+                status: "answered",
+                answer: "Original answer",
+                answeredBy: human,
+              },
+            ],
+          }),
+        );
+        expect((yield* f.reader.readRequired(f.snapshot)).required.questions[0]).toMatchObject({
+          answeredBy: human,
+        });
+        const receipt =
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${commandId}`;
+        yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.record.answeredBy.actor.id','substituted-human') WHERE project_id=${projectId} AND command_id=${commandId}`;
+        yield* f.sql`UPDATE project_team_question SET payload_json=json_set(payload_json,'$.answeredBy.actor.id','substituted-human') WHERE project_id=${projectId} AND record_id='answer-attribution-question'`;
+        yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${projectId}`;
+        expect(
+          (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+            (r) => r.recordId === "answer-attribution-question",
+          ),
+        ).toMatchObject({ answeredBy: { actor: { id: "substituted-human" } } });
+        expect(
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${commandId}`,
+        ).toEqual(receipt);
+        yield* denied(f.reader.readRequired(f.snapshot));
+        yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.record.answeredBy.actor.id',${human.actor.id}) WHERE project_id=${projectId} AND command_id=${commandId}`;
+        yield* f.sql`UPDATE project_team_question SET payload_json=json_set(payload_json,'$.answeredBy.actor.id',${human.actor.id}) WHERE project_id=${projectId} AND record_id='answer-attribution-question'`;
+        yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${projectId}`;
+        expect((yield* f.reader.readRequired(f.snapshot)).required.questions[0]).toMatchObject({
+          answeredBy: human,
+        });
+        yield* f.sql`UPDATE project_work_command_receipts SET source_id='substituted-device' WHERE project_id=${projectId} AND command_id=${commandId}`;
+        yield* denied(f.reader.readRequired(f.snapshot));
+        yield* f.sql`UPDATE project_work_command_receipts SET source_id=${human.source.id},created_at='2026-01-02T00:00:00.000Z' WHERE project_id=${projectId} AND command_id=${commandId}`;
+        yield* denied(f.reader.readRequired(f.snapshot));
+        yield* f.sql`UPDATE project_work_command_receipts SET created_at=${at},event_ids_json='[]' WHERE project_id=${projectId} AND command_id=${commandId}`;
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }),
+    ),
+);
+
 it.effect("never leaks other members or stale-target questions", () =>
   scoped(
     Effect.gen(function* () {

@@ -2,6 +2,8 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
+import * as Context from "effect/Context";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { HttpServer } from "effect/unstable/http";
 import {
   ProjectId,
@@ -19,7 +21,7 @@ import * as Environment from "../environment/ServerEnvironment.ts";
 
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
-import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { projectTeamSpecificationHash, projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import {
   seed,
@@ -33,6 +35,481 @@ import {
   providerInstanceId,
   gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+
+it.effect(
+  "records an authenticated agent human question and retains its exact request after answer",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seed("investigator");
+      const gateway = yield* ProjectWorkGateway;
+      const before = yield* readCurrentState(f.sql, projectId);
+      const task = before.tasks.find((entry) => entry.taskId === taskId)!;
+      const gate = before.foundationRecords?.find(
+        (entry) => entry.kind === "gate" && entry.recordId === f.binding.planGateId,
+      );
+      expect(gate?.kind).toBe("gate");
+      if (gate?.kind !== "gate") return yield* Effect.die("Missing original plan gate");
+      const request = {
+        type: "project-team.question.request" as const,
+        commandId: CommandId.make("agent-human-question"),
+        projectId,
+        taskId,
+        expectedRevision: before.revision,
+        expectedTaskRevision: task.revision,
+        specRevision: task.specRevision,
+        planRevision: f.binding.planRevision,
+        questionId: "agent-decision-question",
+        targetGateId: gate.recordId,
+        expectedGateRevision: gate.revision,
+        body: "Which implementation should preserve reconnect history?",
+        choices: ["Preserve recorded history", "Request a revised plan"],
+      };
+      const source = { kind: "mcp" as const, id: "question-tool", uri: "mcp://original-question" };
+      const principal = {
+        ...f.principal,
+        actor: { ...f.principal.actor, displayName: "Original worker" },
+      };
+      const receipt = yield* gateway.write(request, principal.actor, source, principal);
+      const pending = yield* readCurrentState(f.sql, projectId);
+      expect(
+        pending.foundationRecords?.find((entry) => entry.recordId === request.questionId),
+      ).toMatchObject({
+        kind: "question",
+        status: "pending",
+        revision: 0,
+        senderId: f.binding.memberId,
+        generation: f.binding.generation,
+        targetGateId: gate.recordId,
+        targetRevision: gate.revision,
+        body: request.body,
+        choices: request.choices,
+      });
+      expect(pending.foundationRecords?.find((entry) => entry.recordId === gate.recordId)).toEqual(
+        gate,
+      );
+      const answered = yield* gateway.write(
+        {
+          type: "project-team.question.answer",
+          commandId: CommandId.make("human-question-answer"),
+          projectId,
+          taskId,
+          expectedRevision: pending.revision,
+          expectedTaskRevision: task.revision,
+          specRevision: task.specRevision,
+          planRevision: f.binding.planRevision,
+          questionId: request.questionId,
+          expectedQuestionRevision: 0,
+          expectedGateRevision: gate.revision,
+          answer: request.choices[0]!,
+        },
+        { kind: "human", id: "question-human" },
+        { kind: "web", id: "second-device" },
+      );
+      expect(answered.receipt.eventCount).toBe(1);
+      const after = yield* readCurrentState(f.sql, projectId);
+      expect(
+        after.foundationRecords?.find((entry) => entry.recordId === request.questionId),
+      ).toMatchObject({
+        status: "answered",
+        revision: 1,
+        answer: request.choices[0],
+        answeredBy: {
+          actor: { kind: "human", id: "question-human" },
+          source: { kind: "web", id: "second-device" },
+        },
+      });
+      expect(after.foundationRecords?.find((entry) => entry.recordId === gate.recordId)).toEqual(
+        gate,
+      );
+      expect(yield* gateway.write(request, f.principal.actor, source, f.principal)).toEqual(
+        receipt,
+      );
+      expect(
+        yield* gateway.write(
+          request,
+          { ...principal.actor, displayName: "Renamed worker" },
+          { ...source, uri: "mcp://reconnected-question" },
+          { ...principal, actor: { ...principal.actor, displayName: "Renamed worker" } },
+        ),
+      ).toEqual(receipt);
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(after);
+    }).pipe(Effect.provide(gatewayRuntime)),
+);
+
+const encodeQuestionFixtureJSON = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const questionFixture = Effect.fn("questionTest.fixture")(function* (
+  options: {
+    readonly roleTools?: readonly string[];
+    readonly toolIds?: readonly string[];
+  } = {},
+) {
+  const f = yield* seed("investigator", "running", options);
+  const gateway = yield* ProjectWorkGateway;
+  const before = yield* readCurrentState(f.sql, projectId);
+  const task = before.tasks.find((entry) => entry.taskId === taskId)!;
+  const gate = before.foundationRecords?.find(
+    (entry) => entry.kind === "gate" && entry.recordId === f.binding.planGateId,
+  );
+  if (gate?.kind !== "gate") return yield* Effect.die("Missing original question gate");
+  return {
+    ...f,
+    gateway,
+    before,
+    gate,
+    request: {
+      type: "project-team.question.request" as const,
+      commandId: CommandId.make("bounded-question-request"),
+      projectId,
+      taskId,
+      expectedRevision: before.revision,
+      expectedTaskRevision: task.revision,
+      specRevision: task.specRevision,
+      planRevision: f.binding.planRevision,
+      questionId: "bounded-question",
+      targetGateId: gate.recordId,
+      expectedGateRevision: gate.revision,
+      body: "Which retained option should be used?",
+      choices: ["Keep original", "Replace original"],
+    },
+    source: { kind: "mcp" as const, id: "question-test-tool" },
+  };
+});
+
+it.effect("denies foreign or stale human-question requests without recording authority", () =>
+  Effect.gen(function* () {
+    const f = yield* questionFixture();
+    for (const changed of [
+      { taskId: ProjectWorkTaskId.make("foreign-task") },
+      { targetGateId: "foreign-gate" },
+      { expectedGateRevision: f.gate.revision + 1 },
+      { expectedTaskRevision: f.request.expectedTaskRevision + 1 },
+      { expectedRevision: f.before.revision + 1 },
+      { specRevision: f.request.specRevision + 1 },
+      { planRevision: f.request.planRevision + 1 },
+      { body: "   " },
+      { questionId: f.gate.recordId },
+    ]) {
+      expect(
+        (yield* f.gateway
+          .write({ ...f.request, ...changed }, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
+    }
+    for (const principal of [
+      { actor: { kind: "human" as const, id: "human" } },
+      { actor: f.principal.actor },
+      { ...f.principal, actor: { kind: "agent" as const, id: "forged-agent" } },
+      { ...f.principal, managed: { ...f.principal.managed, generation: f.binding.generation + 1 } },
+    ]) {
+      expect(
+        (yield* f.gateway
+          .write(f.request, principal.actor, f.source, principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }
+    expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+for (const missing of ["role", "binding"] as const)
+  it.effect(`denies human-question request without frozen ${missing} write grant`, () =>
+    Effect.gen(function* () {
+      const f = yield* questionFixture();
+      const record = missing === "role" ? f.role : f.binding;
+      const path = missing === "role" ? "$.tools" : "$.configuration.toolIds";
+      const tools = (missing === "role" ? f.role.tools : f.binding.configuration.toolIds).filter(
+        (tool) => tool !== "project-work.write",
+      );
+      const encodedTools = yield* encodeQuestionFixtureJSON(tools);
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,${"$.record" + path.slice(1)},json(${encodedTools}))
+        WHERE project_id=${projectId} AND json_extract(payload_json,'$.record.recordId')=${record.recordId}
+          AND json_extract(payload_json,'$.record.revision')=${record.revision}`;
+      if (missing === "role")
+        yield* f.sql`UPDATE project_team_role_revision SET payload_json=json_set(payload_json,${path},json(${encodedTools})) WHERE project_id=${projectId} AND record_id=${record.recordId}`;
+      else
+        yield* f.sql`UPDATE project_team_run_binding SET payload_json=json_set(payload_json,${path},json(${encodedTools})) WHERE project_id=${projectId} AND record_id=${record.recordId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${projectId}`;
+      const withdrawn = yield* readCurrentState(f.sql, projectId);
+      const retained = withdrawn.foundationRecords?.find(
+        (entry) => entry.recordId === record.recordId,
+      );
+      expect(retained).toMatchObject(
+        missing === "role" ? { tools } : { configuration: { toolIds: tools } },
+      );
+      const outcome = yield* f.gateway
+        .write(f.request, f.principal.actor, f.source, f.principal)
+        .pipe(Effect.result);
+      expect(outcome).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "ProjectTeamAuthorizationError" },
+      });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(withdrawn);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+it.effect(
+  "audits original human-question events and receipt after scope drift without recreating pending",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* questionFixture();
+      const original = yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+      yield* f.change(
+        decodeRecord({ ...f.binding, revision: f.binding.revision + 1, status: "revoked" }),
+      );
+      const changed = yield* readCurrentState(f.sql, projectId);
+      expect(yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal)).toEqual(
+        original,
+      );
+      const rebuilt = yield* Authorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(Layer.fresh(Authorization.layer)),
+      );
+      expect(
+        yield* f.sql.withTransaction(
+          rebuilt.intent(
+            f.principal,
+            f.request,
+            {
+              actor: f.principal.actor,
+              source: f.source,
+              recordedAt: "2026-01-03T00:00:00.000Z",
+            },
+            true,
+          ),
+        ),
+      ).toMatchObject({
+        type: "project-work.foundation.commit",
+        records: [{ kind: "question", status: "pending" }],
+      });
+      expect(
+        (yield* f.gateway
+          .write(
+            {
+              ...f.request,
+              commandId: CommandId.make("new-question-after-revoke"),
+              questionId: "new-question",
+            },
+            f.principal.actor,
+            f.source,
+            f.principal,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      for (const principal of [
+        {
+          ...f.principal,
+          managed: { ...f.principal.managed, generation: f.binding.generation + 1 },
+        },
+        {
+          ...f.principal,
+          managed: { ...f.principal.managed, threadId: ThreadId.make("foreign-thread") },
+        },
+      ])
+        expect(
+          (yield* f.gateway
+            .write(f.request, principal.actor, f.source, principal)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      const events = yield* f.sql<{
+        payload: string;
+      }>`SELECT payload_json AS payload FROM project_work_events WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+      expect(events).toHaveLength(1);
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.record.body','Corrupt retained request') WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+      expect(
+        (yield* f.gateway
+          .write(f.request, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.sql`UPDATE project_work_events SET payload_json=${events[0]!.payload} WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+      yield* f.sql`UPDATE project_work_command_receipts SET created_at='2026-01-02T00:00:00.000Z' WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+      expect(
+        (yield* f.gateway
+          .write(f.request, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(changed);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
+  "retains one human question and one answer across competing devices without approving its gate",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* questionFixture();
+      yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+      const pending = yield* readCurrentState(f.sql, projectId);
+      expect(
+        (yield* f.gateway
+          .write(
+            {
+              ...f.request,
+              commandId: CommandId.make("duplicate-question-identity"),
+              expectedRevision: pending.revision,
+            },
+            f.principal.actor,
+            f.source,
+            f.principal,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      const question = pending.foundationRecords?.find((r) => r.recordId === f.request.questionId);
+      if (question?.kind !== "question")
+        return yield* Effect.die("Missing original pending question");
+      expect(
+        (yield* f.gateway
+          .write(
+            {
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: CommandId.make("raw-question-forgery"),
+              expectedRevision: pending.revision,
+              committedAt: "2026-01-01T00:00:00.000Z",
+              attribution: {
+                actor: f.principal.actor,
+                source: f.source,
+                recordedAt: "2026-01-01T00:00:00.000Z",
+              },
+              records: [decodeRecord({ ...question, recordId: "raw-question" })],
+            },
+            f.principal.actor,
+            f.source,
+            f.principal,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      const answer = {
+        type: "project-team.question.answer" as const,
+        commandId: CommandId.make("answer-device-one"),
+        projectId,
+        taskId,
+        expectedRevision: pending.revision,
+        expectedTaskRevision: f.request.expectedTaskRevision,
+        specRevision: f.request.specRevision,
+        planRevision: f.request.planRevision,
+        questionId: question.recordId,
+        expectedQuestionRevision: question.revision,
+        expectedGateRevision: f.gate.revision,
+        answer: "Keep original",
+      };
+      const first = yield* f.gateway.write(
+        answer,
+        { kind: "human", id: "answer-human" },
+        { kind: "web", id: "device-one" },
+      );
+      const answered = yield* readCurrentState(f.sql, projectId);
+      expect(
+        yield* f.gateway
+          .write(
+            {
+              ...answer,
+              commandId: CommandId.make("answer-device-two"),
+              expectedRevision: answered.revision,
+              answer: "Replace original",
+            },
+            { kind: "human", id: "other-human" },
+            { kind: "mobile", id: "device-two" },
+          )
+          .pipe(Effect.result),
+      ).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "ProjectTeamAuthorizationError", reason: "Question target changed" },
+      });
+      expect(
+        yield* f.gateway.write(
+          answer,
+          { kind: "human", id: "answer-human" },
+          { kind: "web", id: "device-one" },
+        ),
+      ).toEqual(first);
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(answered);
+      expect(answered.foundationRecords?.find((r) => r.recordId === f.gate.recordId)).toEqual(
+        f.gate,
+      );
+      expect(answered.tasks).toEqual(f.before.tasks);
+      expect(
+        answered.foundationRecords?.find((r) => r.recordId === question.recordId),
+      ).toMatchObject({
+        status: "answered",
+        answer: "Keep original",
+        answeredBy: { actor: { id: "answer-human" }, source: { id: "device-one" } },
+      });
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
+  "requires original SQL transaction and repository context for human-question compilation",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* questionFixture();
+      const attribution = {
+        actor: f.principal.actor,
+        source: f.source,
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      };
+      const compile = f.auth.intent(f.principal, f.request, attribution, false);
+      expect((yield* compile.pipe(Effect.result))._tag).toBe("Failure");
+      yield* Effect.gen(function* () {
+        const foreign = yield* SqlClient.SqlClient;
+        expect(
+          (yield* f.sql
+            .withTransaction(compile.pipe(Effect.provideService(SqlClient.SqlClient, foreign)))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory({})));
+      expect(
+        (yield* f.sql
+          .withTransaction(
+            compile.pipe(
+              Effect.updateContext((context: Context.Context<never>) =>
+                Context.omit(ProjectWorkRepository)(context),
+              ),
+            ),
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.sql.withTransaction(compile)).toMatchObject({
+        type: "project-work.foundation.commit",
+        records: [{ kind: "question", senderId: f.binding.memberId }],
+      });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
+  "keeps a failed human-question COMMIT private and accepts its exact retry after rollback",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* questionFixture();
+      yield* f.sql`CREATE TEMP TABLE question_commit_parent (id INTEGER PRIMARY KEY)`;
+      yield* f.sql`CREATE TEMP TABLE question_commit_child (id INTEGER REFERENCES question_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      const outcome = yield* f.repo
+        .executeAtomic(
+          Effect.gen(function* () {
+            yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+            yield* f.sql`INSERT INTO question_commit_child (id) VALUES (1)`;
+            return [];
+          }),
+        )
+        .pipe(Effect.exit);
+      expect(outcome._tag).toBe("Failure");
+      expect(
+        (yield* f.gateway
+          .read({ projectId, taskId, operation: "task-context" })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.sql`ROLLBACK`;
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+      ).toEqual([]);
+      yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+      expect(
+        (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+          (r) => r.recordId === f.request.questionId,
+        ),
+      ).toMatchObject({ kind: "question", status: "pending", revision: 0 });
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
 
 it.effect(
   "records an authenticated guided human criterion waiver and invalidates the old scope",

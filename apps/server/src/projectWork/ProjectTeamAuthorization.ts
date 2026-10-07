@@ -84,6 +84,86 @@ export const managedActorId = (
   credential: Pick<ProjectTeamCredential, "providerInstanceId" | "threadId">,
 ) => `agent:mcp:${credential.providerInstanceId}:${credential.threadId}`;
 const deny = (reason: string) => new ProjectTeamAuthorizationError({ reason });
+type QuestionRequest = Extract<ProjectTeamWriteIntent, { type: "project-team.question.request" }>;
+
+const compileQuestionRequest = (
+  state: ProjectWorkReducerState,
+  input: QuestionRequest,
+  attribution: ProjectWorkAttribution,
+  credential: ProjectTeamCredential,
+): ProjectWorkCommand => {
+  const records = state.foundationRecords ?? [];
+  const binding = records.find(
+    (r) => r.kind === "run-binding" && r.recordId === credential.bindingId,
+  );
+  const role =
+    binding?.kind === "run-binding"
+      ? records.find((r) => r.kind === "role-revision" && r.recordId === binding.roleRevisionId)
+      : undefined;
+  const task = state.tasks.find((r) => r.taskId === input.taskId);
+  const gates = records.filter((r) => r.kind === "gate" && r.recordId === input.targetGateId);
+  const gate = gates[0];
+  if (
+    attribution.actor.kind !== "agent" ||
+    attribution.actor.id !== managedActorId(credential) ||
+    credential.projectId !== input.projectId ||
+    binding?.kind !== "run-binding" ||
+    binding.projectId !== input.projectId ||
+    binding.taskId !== input.taskId ||
+    binding.generation !== credential.generation ||
+    binding.providerInstanceId !== credential.providerInstanceId ||
+    binding.threadId !== credential.threadId ||
+    role?.kind !== "role-revision" ||
+    !role.tools.includes("project-work.write") ||
+    !binding.configuration.toolIds.includes("project-work.write")
+  )
+    throw deny("Human question requires its original managed write authority");
+  assertProjectTeamRunAuthority(state, binding, role, false);
+  if (
+    state.revision !== input.expectedRevision ||
+    task === undefined ||
+    task.revision !== input.expectedTaskRevision ||
+    task.specRevision !== input.specRevision ||
+    binding.specRevision !== input.specRevision ||
+    binding.planRevision !== input.planRevision ||
+    gates.length !== 1 ||
+    gate?.kind !== "gate" ||
+    gate.taskId !== input.taskId ||
+    gate.revision !== input.expectedGateRevision ||
+    gate.specRevision !== input.specRevision ||
+    gate.planRevision !== input.planRevision ||
+    !["proposed", "pending", "approved", "consumed"].includes(gate.status)
+  )
+    throw deny("Human question task, plan or gate target changed");
+  if (records.some((r) => r.recordId === input.questionId))
+    throw deny("Human question identity is already retained");
+  if (input.body.trim().length === 0) throw deny("Human question body is empty");
+  return {
+    type: "project-work.foundation.commit",
+    projectId: input.projectId,
+    commandId: input.commandId,
+    expectedRevision: input.expectedRevision,
+    attribution,
+    committedAt: attribution.recordedAt,
+    records: [
+      decodeRecord({
+        kind: "question",
+        recordId: input.questionId,
+        projectId: input.projectId,
+        revision: 0,
+        generation: binding.generation,
+        updatedAt: attribution.recordedAt,
+        status: "pending",
+        taskId: input.taskId,
+        senderId: binding.memberId,
+        targetGateId: gate.recordId,
+        targetRevision: gate.revision,
+        body: input.body,
+        choices: [...input.choices],
+      }),
+    ],
+  };
+};
 
 export class ProjectTeamAuthorization extends Context.Service<
   ProjectTeamAuthorization,
@@ -554,6 +634,151 @@ export const layer = Layer.effect(
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) {
+      if (input.type === "project-team.question.request") {
+        const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+        const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+        const transaction = yield* Effect.serviceOption(sql.transactionService);
+        if (
+          Option.isNone(currentSql) ||
+          currentSql.value !== sql ||
+          Option.isNone(repository) ||
+          Option.isNone(transaction)
+        )
+          return yield* deny("Human question requires its original transaction");
+      }
+      if (input.type === "project-team.question.request" && duplicate) {
+        if (
+          principal.managed === undefined ||
+          principal.actor.kind !== "agent" ||
+          principal.actor.id !== managedActorId(principal.managed) ||
+          principal.managed.projectId !== input.projectId
+        )
+          return yield* deny("Human question replay requires its original managed identity");
+        const credential = principal.managed;
+        const receipts = yield* sql<{
+          actorKind: string | null;
+          actorId: string | null;
+          sourceKind: string | null;
+          sourceId: string | null;
+          createdAt: string;
+          fingerprint: string;
+          eventIds: string | null;
+          result: string | null;
+        }>`SELECT actor_kind AS actorKind,actor_id AS actorId,
+          source_kind AS sourceKind,source_id AS sourceId,created_at AS createdAt,
+          payload_fingerprint AS fingerprint,
+          CASE WHEN length(CAST(event_ids_json AS BLOB)) <= 1048576 THEN event_ids_json END AS eventIds,
+          CASE WHEN length(CAST(result_json AS BLOB)) <= 262144 THEN result_json END AS result
+          FROM project_work_command_receipts
+          WHERE project_id=${input.projectId} AND command_id=${input.commandId} LIMIT 2`;
+        const rows = yield* sql<{
+          payload: string | null;
+          eventId: string;
+          eventType: string;
+          occurredAt: string;
+        }>`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1048576 THEN payload_json END AS payload,
+          event_id AS eventId,event_type AS eventType,occurred_at AS occurredAt
+          FROM project_work_events WHERE project_id=${input.projectId} AND command_id=${input.commandId}
+          ORDER BY sequence ASC`;
+        const preceding = yield* sql<{ payload: string | null }>`
+          SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1048576 THEN payload_json END AS payload
+          FROM project_work_events WHERE project_id=${input.projectId} AND sequence < (
+            SELECT MIN(sequence) FROM project_work_events
+            WHERE project_id=${input.projectId} AND command_id=${input.commandId}
+          ) ORDER BY sequence ASC`;
+        return yield* Effect.try({
+          try: () => {
+            const receipt = receipts[0];
+            if (receipts.length !== 1 || receipt === undefined || rows.length === 0)
+              throw deny("Original human question receipt is missing");
+            const fingerprint =
+              "project-team-intent:" +
+              NodeCrypto.createHash("sha256")
+                .update(
+                  canonicalProjectWorkPayload({
+                    intent: input,
+                    actor: { kind: principal.actor.kind, id: principal.actor.id },
+                    source: { kind: attribution.source.kind, id: attribution.source.id },
+                    managed: principal.managed,
+                  }),
+                )
+                .digest("hex");
+            if (
+              receipt.actorKind !== principal.actor.kind ||
+              receipt.actorId !== principal.actor.id ||
+              receipt.sourceKind !== attribution.source.kind ||
+              receipt.sourceId !== (attribution.source.id ?? null) ||
+              receipt.fingerprint !== fingerprint
+            )
+              throw deny("Original human question authority changed");
+            const original = rows.map((r) => decodeProjectWorkEvent(decodeUnknownJson(r.payload)));
+            const originalAttribution = decodeAttribution({
+              actor: { kind: receipt.actorKind, id: receipt.actorId },
+              source: {
+                kind: receipt.sourceKind,
+                ...(receipt.sourceId === null ? {} : { id: receipt.sourceId }),
+              },
+              recordedAt: receipt.createdAt,
+            });
+            const before = applyProjectWorkEvents(
+              emptyProjectWorkReducerState(input.projectId),
+              preceding.map((r) => decodeProjectWorkEvent(decodeUnknownJson(r.payload))),
+            );
+            const command = compileQuestionRequest(before, input, originalAttribution, credential);
+            const expected = decideProjectWorkCommand(before, command);
+            if (
+              canonicalProjectWorkPayload(expected) !== canonicalProjectWorkPayload(original) ||
+              rows.some(
+                (r, i) =>
+                  r.eventId !== expected[i]?.eventId ||
+                  r.eventType !== expected[i]?.type ||
+                  r.occurredAt !== receipt.createdAt,
+              )
+            )
+              throw deny("Original human question events changed");
+            const eventIds = decodeEventIds(receipt.eventIds);
+            const result = decodeWriteResult(receipt.result);
+            const revision = expected.at(-1)?.revision;
+            const fields = [
+              ...new Set(
+                expected.flatMap((event) => {
+                  if (event.type.includes("foundation")) return ["foundationRecords"];
+                  if (event.type.includes("criterion")) return ["criteria", "tasks"];
+                  if (event.type.includes("evidence")) return ["evidence", "criteria", "tasks"];
+                  if (event.type.includes("relationship")) return ["relationships", "tasks"];
+                  if (event.type.includes("attempt") || event.type.includes("checkpoint"))
+                    return ["attempts", "tasks", "checkpoints"];
+                  if (event.type.includes("knowledge")) return ["knowledge"];
+                  if (event.type.includes("decision")) return ["decisions"];
+                  if (event.type.includes("comment")) return ["comments"];
+                  if (event.type.includes("attention")) return ["attention", "tasks"];
+                  return ["tasks"];
+                }),
+              ),
+            ].slice(0, 64);
+            if (
+              canonicalProjectWorkPayload(eventIds) !==
+                canonicalProjectWorkPayload(expected.map((e) => e.eventId)) ||
+              result.projectId !== input.projectId ||
+              result.revision !== revision ||
+              result.receipt.commandId !== input.commandId ||
+              result.receipt.projectId !== input.projectId ||
+              result.receipt.status !== "accepted" ||
+              result.receipt.revision !== revision ||
+              result.receipt.eventCount !== expected.length ||
+              result.delta.projectId !== input.projectId ||
+              result.delta.revision !== revision ||
+              canonicalProjectWorkPayload(result.delta.eventIds) !==
+                canonicalProjectWorkPayload(eventIds.slice(0, 64)) ||
+              canonicalProjectWorkPayload(result.delta.changedFields) !==
+                canonicalProjectWorkPayload(fields)
+            )
+              throw deny("Original human question result changed");
+            return command;
+          },
+          catch: () => deny("Human question receipt target changed"),
+        });
+      }
       if (input.type === "project-team.review.finding.record") {
         const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
         const transaction = yield* Effect.serviceOption(sql.transactionService);
@@ -576,6 +801,22 @@ export const layer = Layer.effect(
       }
       const authority = yield* resolve(principal);
       const state = authority?.state ?? (yield* stateFor(input.projectId));
+      if (input.type === "project-team.question.request") {
+        if (
+          authority === undefined ||
+          principal.managed === undefined ||
+          attribution.actor.kind !== principal.actor.kind ||
+          attribution.actor.id !== principal.actor.id
+        )
+          return yield* deny("Human question requires current managed authority");
+        return yield* Effect.try({
+          try: () => compileQuestionRequest(state, input, attribution, authority.credential),
+          catch: (error) =>
+            isAuthorizationError(error)
+              ? error
+              : deny("Human question authority or target changed"),
+        });
+      }
       if (input.type === "project-team.gate.respond" && input.response === "approved")
         yield* assertSelectedSources(state, input.taskId);
 

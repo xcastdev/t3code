@@ -60,7 +60,7 @@ const ProjectWorkReadTool = Tool.make("project_work_read", {
 
 const ProjectWorkWriteTool = Tool.make("project_work_write", {
   description:
-    "Append one project-work intent to the authoritative event log. The server attributes it to this MCP agent; protected revisions require a matching single-use human approval token.",
+    "Append one authorized intent. To ask a human, use project-team.question.request with commandId, projectId, taskId, expectedRevision, expectedTaskRevision, specRevision, planRevision, questionId, targetGateId, expectedGateRevision, body and choices. Read current task-context revisions first. Sender identity is server-derived and the human answer is retained; it does not approve a gate. Protected revisions require a matching single-use human approval token.",
   parameters: ProjectWorkWriteParameters,
   success: ProjectWorkWriteResult,
   failure: ProjectWorkToolkitError,

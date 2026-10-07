@@ -20,7 +20,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as Authorization from "../../projectWork/ProjectTeamAuthorization.ts";
-import { gatewayRuntime } from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import { gatewayRuntime, seed } from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
 import { projectTeamScopeHash } from "../../projectWork/ProjectTeamPolicy.ts";
 import { ProjectWorkGateway } from "../../projectWork/ProjectWorkGateway.ts";
 import {
@@ -46,6 +46,70 @@ const encodeJSON = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const parameters = (intent: unknown) => ({ intentJSON: encodeJSON(intent) });
 const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
+
+it.effect("advertises and persists a human question through the actual Pi write bridge", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* seed("investigator");
+      const tools = preparePiProjectWorkTools({
+        roleTools: f.role.tools,
+        bindingTools: f.binding.configuration.toolIds,
+      });
+      expect(
+        tools.find((entry) => entry.tool.function.name === "project_work_write")?.tool.function
+          .description,
+      ).toContain("project-team.question.request");
+      const state = yield* readCurrentState(f.sql, f.binding.projectId);
+      const task = state.tasks.find((entry) => entry.taskId === f.binding.taskId)!;
+      const gate = state.foundationRecords?.find(
+        (entry) => entry.kind === "gate" && entry.recordId === f.binding.planGateId,
+      );
+      if (gate?.kind !== "gate") return yield* Effect.die("Missing retained bridge gate");
+      const request = {
+        type: "project-team.question.request",
+        commandId: "pi-human-question",
+        projectId: f.binding.projectId,
+        taskId: f.binding.taskId,
+        expectedRevision: state.revision,
+        expectedTaskRevision: task.revision,
+        specRevision: task.specRevision,
+        planRevision: f.binding.planRevision,
+        questionId: "pi-question",
+        targetGateId: gate.recordId,
+        expectedGateRevision: gate.revision,
+        body: "Should the original history remain visible?",
+        choices: ["Keep history"],
+      };
+      const receipt = yield* executePiProjectWorkBridgeTool({
+        toolName: "project_work_write",
+        arguments: parameters(request),
+        principal: f.principal,
+        source,
+      });
+      expect(receipt).toMatchObject({ receipt: { status: "accepted", eventCount: 1 } });
+      const after = yield* readCurrentState(f.sql, f.binding.projectId);
+      expect(
+        after.foundationRecords?.find((entry) => entry.recordId === request.questionId),
+      ).toMatchObject({
+        kind: "question",
+        status: "pending",
+        senderId: f.binding.memberId,
+        body: request.body,
+      });
+      expect(after.foundationRecords?.find((entry) => entry.recordId === gate.recordId)).toEqual(
+        gate,
+      );
+      expect(
+        yield* executePiProjectWorkBridgeTool({
+          toolName: "project_work_write",
+          arguments: parameters(request),
+          principal: f.principal,
+          source,
+        }),
+      ).toEqual(receipt);
+    }),
+  ),
+);
 
 it("denies absent capability in either configuration and never infers it from a role name", () => {
   for (const capability of piProjectWorkToolCapabilities) {

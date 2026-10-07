@@ -129,6 +129,70 @@ import {
   decodeRecord,
   at,
 } from "../../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import { readCurrentState } from "../../../projectWork/ProjectWorkRepository.ts";
+it.effect("persists a human question through the actual managed MCP write toolkit", () =>
+  Effect.gen(function* () {
+    const f = yield* seedTeam("investigator");
+    const service = yield* ProjectWorkGateway.ProjectWorkGateway;
+    const toolkit = yield* ProjectWorkToolkit.pipe(
+      Effect.provide(
+        ProjectWorkToolkitHandlersLive.pipe(
+          Layer.provide(Layer.succeed(ProjectWorkGateway.ProjectWorkGateway, service)),
+        ),
+      ),
+    );
+    const state = yield* readCurrentState(f.sql, f.binding.projectId);
+    const task = state.tasks.find((entry) => entry.taskId === f.binding.taskId)!;
+    const gate = state.foundationRecords?.find(
+      (entry) => entry.kind === "gate" && entry.recordId === f.binding.planGateId,
+    );
+    if (gate?.kind !== "gate") return yield* Effect.die("Missing original MCP gate");
+    const request = {
+      type: "project-team.question.request" as const,
+      commandId: CommandId.make("mcp-human-question"),
+      projectId: f.binding.projectId,
+      taskId: f.binding.taskId,
+      expectedRevision: state.revision,
+      expectedTaskRevision: task.revision,
+      specRevision: task.specRevision,
+      planRevision: f.binding.planRevision,
+      questionId: "mcp-question",
+      targetGateId: gate.recordId,
+      expectedGateRevision: gate.revision,
+      body: "Which original result should remain visible?",
+      choices: ["Keep original result"],
+    };
+    const scope = {
+      environmentId: EnvironmentId.make("environment"),
+      providerInstanceId: f.principal.managed.providerInstanceId,
+      threadId: f.principal.managed.threadId,
+      providerSessionId: "issued",
+      managed: f.principal.managed,
+      capabilities: new Set(["project" as const]),
+      issuedAt: 0,
+    };
+    yield* toolkit
+      .handle("project_work_write", request)
+      .pipe(
+        Stream.unwrap,
+        Stream.runCollect,
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+      );
+    const after = yield* readCurrentState(f.sql, f.binding.projectId);
+    expect(
+      after.foundationRecords?.find((entry) => entry.recordId === request.questionId),
+    ).toMatchObject({
+      kind: "question",
+      status: "pending",
+      senderId: f.binding.memberId,
+      body: request.body,
+    });
+    expect(after.foundationRecords?.find((entry) => entry.recordId === gate.recordId)).toEqual(
+      gate,
+    );
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
 it.effect(
   "uses actual gateway task authority for managed toolkit reads, nested writes and revoked duplicate receipts",
   () =>

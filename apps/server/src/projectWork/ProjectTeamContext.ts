@@ -10,6 +10,7 @@ import {
   ProjectWorkAttemptId,
   EventId,
   IsoDateTime,
+  ProjectWorkWriteResult,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -147,6 +148,14 @@ const decodeCriterionEvent = Schema.decodeUnknownEffect(
 );
 const decodeReservation = Schema.decodeUnknownEffect(Schema.fromJsonString(Reservation), strict);
 const decodeSettlement = Schema.decodeUnknownEffect(Schema.fromJsonString(Settlement), strict);
+const decodeAnswerEventIds = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Array(EventId)),
+  strict,
+);
+const decodeAnswerResult = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectWorkWriteResult),
+  strict,
+);
 const OperationInput = Schema.Struct({
   projectId: Schema.String,
   bindingId: Id,
@@ -249,7 +258,8 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       event_id: string;
       project_id: string;
       occurred_at: string;
-    }>`SELECT event_id,project_id,occurred_at,
+      command_id: string;
+    }>`SELECT event_id,project_id,occurred_at,command_id,
       CASE WHEN length(CAST(payload_json AS BLOB))<=${Bounds.contextBytes} THEN payload_json ELSE NULL END AS payload_json
       FROM project_work_events WHERE project_id=${record.projectId} AND event_type='project-work.foundation.recorded'
       AND json_extract(payload_json,'$.record.recordId')=${record.recordId} ORDER BY sequence DESC LIMIT 1`;
@@ -264,6 +274,55 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       !same(event.record, validated)
     )
       return yield* deny("Required record disagrees with retained event provenance");
+    if (validated.kind === "question" && validated.status === "answered") {
+      const answer = validated.answeredBy;
+      const receipts = yield* sql<{
+        actorKind: string | null;
+        actorId: string | null;
+        sourceKind: string | null;
+        sourceId: string | null;
+        createdAt: string;
+        eventIds: string | null;
+        result: string | null;
+      }>`SELECT actor_kind AS actorKind,actor_id AS actorId,source_kind AS sourceKind,source_id AS sourceId,created_at AS createdAt,
+        CASE WHEN length(CAST(event_ids_json AS BLOB))<=1048576 THEN event_ids_json END AS eventIds,
+        CASE WHEN length(CAST(result_json AS BLOB))<=262144 THEN result_json END AS result
+        FROM project_work_command_receipts WHERE project_id=${validated.projectId} AND command_id=${storedEvent.command_id} LIMIT 2`;
+      const receipt = receipts[0];
+      if (
+        receipts.length !== 1 ||
+        receipt === undefined ||
+        answer?.actor.kind !== "human" ||
+        receipt.actorKind !== answer.actor.kind ||
+        receipt.actorId !== (answer.actor.id ?? null) ||
+        receipt.sourceKind !== answer.source.kind ||
+        receipt.sourceId !== (answer.source.id ?? null) ||
+        receipt.createdAt !== answer.recordedAt ||
+        receipt.createdAt !== event.occurredAt ||
+        receipt.eventIds === null ||
+        receipt.result === null
+      )
+        return yield* deny("Required human answer disagrees with its original receipt");
+      const eventIds = yield* decodeAnswerEventIds(receipt.eventIds);
+      const result = yield* decodeAnswerResult(receipt.result);
+      const index = eventIds.findIndex((id) => id === event.eventId);
+      if (
+        index < 0 ||
+        eventIds.findLastIndex((id) => id === event.eventId) !== index ||
+        new Set(eventIds).size !== eventIds.length ||
+        result.projectId !== validated.projectId ||
+        result.receipt.commandId !== storedEvent.command_id ||
+        result.receipt.projectId !== validated.projectId ||
+        result.receipt.status !== "accepted" ||
+        result.receipt.eventCount !== eventIds.length ||
+        result.receipt.revision !== result.revision ||
+        result.revision - event.revision !== eventIds.length - index - 1 ||
+        result.delta.projectId !== validated.projectId ||
+        result.delta.revision !== result.revision ||
+        !same(result.delta.eventIds, eventIds.slice(0, 64))
+      )
+        return yield* deny("Required human answer is not in its exact accepted receipt");
+    }
     return validated;
   });
   const readLedger = Effect.fn("ProjectTeamContext.readLedger")(function* (
@@ -910,13 +969,18 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           const questions = records.filter(
             (r): r is RecordOf<"question"> =>
               r.kind === "question" &&
-              r.status === "pending" &&
+              (r.status === "pending" || r.status === "answered") &&
               r.taskId === binding.taskId &&
               r.senderId === binding.memberId,
           );
           if (questions.length > 64) return yield* deny("Required questions exceed context bounds");
           const applicableQuestions: Array<RecordOf<"question">> = [];
           for (const question of questions) {
+            if (
+              question.status === "answered" &&
+              (question.answer === undefined || question.answeredBy?.actor.kind !== "human")
+            )
+              return yield* deny("Required question has no retained human answer");
             const targets = records.filter(
               (r) =>
                 r.kind === "gate" &&

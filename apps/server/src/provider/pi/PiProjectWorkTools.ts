@@ -85,7 +85,11 @@ export const preparePiProjectWorkTools = (input: {
     : "project-work.read-task";
   const definitions = [
     ["project_work_read", readCapability, "Read current assigned project work"],
-    ["project_work_write", "project-work.write", "Write an authorized project work intent"],
+    [
+      "project_work_write",
+      "project-work.write",
+      "Write an authorized intentJSON. To ask a human, use project-team.question.request with commandId, projectId, taskId, expectedRevision, expectedTaskRevision, specRevision, planRevision, questionId, targetGateId, expectedGateRevision, body and choices. Read current task-context revisions first. The server derives sender identity and retains the human answer; an answer does not approve a gate.",
+    ],
     ["project_work_report", "project-work.report", "Report findings for the authorized assignment"],
     ["project_work_plan", "project-work.plan", "Propose a plan for the authorized task"],
   ] as const;
