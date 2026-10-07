@@ -490,7 +490,7 @@ async function fill(label: string, value: string) {
   await act(async () => field.dispatchEvent(new Event("input", { bubbles: true })));
 }
 async function prepare() {
-  await click("Select settled implementation binding");
+  await click("Select completed assignment binding");
   await fill("Verification executable", "/opt/test runner");
   await fill("Verification arguments", '["", "  preserved  ", "$(literal); *", "line\\nbreak"]');
   await click("Cover Retain the conversation");
@@ -503,6 +503,70 @@ async function pendingGate() {
   await render();
 }
 describe("mounted mobile verification", () => {
+  it("proposes verification for an original completed integrator assignment", async () => {
+    registry.set(
+      team,
+      AsyncResult.success({
+        projectId,
+        revision: 10,
+        items: foundation().map((record) =>
+          record.kind === "role-revision"
+            ? decodeRecord({ ...record, role: "integrator" })
+            : record,
+        ),
+      }),
+    );
+    await render();
+    await prepare();
+    await click("Propose verification");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.verification.propose",
+      bindingId: "binding",
+    });
+    expect(Object.hasOwn(emitted[0]!, "integration")).toBe(false);
+  });
+
+  it.each([
+    ["integrator", true, true],
+    ["implementer", true, false],
+    ["integrator", false, false],
+  ] as const)(
+    "checks %s role against integration=%s before approval",
+    async (role, integration, allowed) => {
+      const manifest = integration ? { ...previewManifest, integration: true } : previewManifest;
+      const prepared = {
+        ...preview,
+        manifest,
+        sha256: NodeCrypto.createHash("sha256")
+          .update(canonicalProjectWorkPayload(manifest))
+          .digest("hex"),
+      };
+      previewAtom = Atom.make<AsyncResult.AsyncResult<unknown>>(AsyncResult.success(prepared));
+      registry.set(
+        team,
+        AsyncResult.success({
+          projectId,
+          revision: 10,
+          items: [
+            ...foundation().map((record) =>
+              record.kind === "role-revision" ? decodeRecord({ ...record, role }) : record,
+            ),
+            decodeRecord({ ...gate(), contentHash: prepared.sha256 }),
+          ],
+        }),
+      );
+      await render();
+      await click("Review prepared verification");
+      expect(button("Approve prepared verification").disabled, host.textContent ?? "").toBe(
+        !allowed,
+      );
+      if (allowed) expect(host.textContent).toContain("Integration verification");
+      await click("Approve prepared verification");
+      expect(emitted).toHaveLength(allowed ? 1 : 0);
+    },
+  );
+
   it("loads the exact retained preview and approves its current gate through the typed API", async () => {
     await pendingGate();
     expect(button("Approve prepared verification").disabled).toBe(true);

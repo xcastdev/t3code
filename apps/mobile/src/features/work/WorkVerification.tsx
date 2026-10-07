@@ -110,7 +110,7 @@ function view(current: MobileWorkCurrent, owner: MobileWorkScope) {
         (role) =>
           role.kind === "role-revision" &&
           role.recordId === r.roleRevisionId &&
-          role.role === "implementer",
+          (role.role === "implementer" || role.role === "integrator"),
       ).length === 1,
   );
   return {
@@ -159,8 +159,17 @@ function reviewTarget(
       b.worktree === manifest.target.worktree &&
       b.branch === manifest.target.branchRef,
   );
+  const role = binding
+    ? current.foundation.records
+        .filter(knownRecord)
+        .find(
+          (record) => record.kind === "role-revision" && record.recordId === binding.roleRevisionId,
+        )
+    : undefined;
   if (
     !binding ||
+    role?.kind !== "role-revision" ||
+    (manifest.integration === true) !== (role.role === "integrator") ||
     !manifest.criteria.every(
       (item) =>
         found.context.task.specification?.criterionIds.includes(item.criterionId) &&
@@ -175,6 +184,7 @@ function reviewTarget(
     task: found.context.task,
     gate,
     binding,
+    role,
     plan: found.plan,
     criteria: found.context.criteria.filter((c) =>
       manifest.criteria.some((item) => item.criterionId === c.criterionId),
@@ -517,7 +527,7 @@ function VerificationSession(props: WorkVerificationProps) {
         successful result.
       </Notice>
       <Notice>
-        The Linux host must provide the selected implementer's published executable and a clean
+        The Linux host must provide the selected assignment's published executable and a clean
         committed original worktree. An arbitrary absolute host path is not available automatically.
       </Notice>
       {notice || request?.notice ? <Notice>{notice ?? request?.notice}</Notice> : null}
@@ -526,22 +536,20 @@ function VerificationSession(props: WorkVerificationProps) {
           Reconnect and load complete current task and project access before verification.
         </Notice>
       ) : null}
-      <Text className="text-sm font-t3-medium text-foreground">
-        Original settled implementation
-      </Text>
+      <Text className="text-sm font-t3-medium text-foreground">Original completed assignment</Text>
       {found?.bindings.map((entry) => (
         <View key={entry.recordId} className="gap-1">
           <Notice>
             {entry.worktree} · {entry.branch} · generation {entry.generation}
           </Notice>
           <WorkButton disabled={pending} onPress={() => setBinding(entry)}>
-            Select settled implementation {entry.recordId}
+            Select completed assignment {entry.recordId}
           </WorkButton>
-          {selected?.recordId === entry.recordId ? <Notice>Selected implementation</Notice> : null}
+          {selected?.recordId === entry.recordId ? <Notice>Selected assignment</Notice> : null}
         </View>
       ))}
       {binding && !selected ? (
-        <Notice>The selected implementation changed. Review and select it again.</Notice>
+        <Notice>The selected assignment changed. Review and select it again.</Notice>
       ) : null}
       <TextInput
         accessibilityLabel="Verification executable"
@@ -613,7 +621,7 @@ function VerificationSession(props: WorkVerificationProps) {
           .join(" · ") || "No criteria selected"}
       </Notice>
       <Notice>
-        {criteria.length} criteria selected · {selected?.recordId ?? "No implementation selected"}
+        {criteria.length} criteria selected · {selected?.recordId ?? "No assignment selected"}
       </Notice>
       <WorkButton
         disabled={
@@ -645,6 +653,11 @@ function VerificationSession(props: WorkVerificationProps) {
               </WorkButton>
               {usable?.gateId === gate.recordId ? (
                 <View className="gap-1">
+                  <Notice>
+                    {usable.preview.manifest.integration === true
+                      ? "Integration verification"
+                      : "Implementation verification"}
+                  </Notice>
                   <Notice>Prepared manifest {usable.preview.sha256}</Notice>
                   <Notice>
                     Command {JSON.stringify(usable.preview.manifest.command.executable)} · arguments{" "}

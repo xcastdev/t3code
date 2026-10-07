@@ -124,10 +124,10 @@ const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
     });
     return { sql, repository, request, journal };
   });
-const fixture = makeFixture();
-
-export const verificationFixture = Effect.gen(function* () {
-  const f = yield* fixture;
+export const makeVerificationFixture = Effect.fn("makeVerificationFixture")(function* (
+  role: "implementer" | "integrator" = "implementer",
+) {
+  const f = yield* makeFixture(role);
   const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
   const settling = yield* makeProjectTeamDispatchJournal({
     environmentId: "environment",
@@ -212,3 +212,5 @@ export const verificationFixture = Effect.gen(function* () {
   const prepared = yield* preparation.prepare(selection, principal);
   return { ...f, state, snapshot, receipt, selection, jobs, preparation, principal, prepared };
 });
+
+export const verificationFixture = makeVerificationFixture();

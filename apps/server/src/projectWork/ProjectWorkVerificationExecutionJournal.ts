@@ -236,7 +236,7 @@ const applicability = (intent: VerificationExecutionIntent, result: RetainedVeri
     }),
     exitCode: result.exitCode ?? -1,
     environmentSummary: result.environmentSummary,
-    integration: false,
+    integration: job.integration === true,
   };
 };
 const validateResult = (

@@ -9,7 +9,7 @@ import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { scoped, at } from "./ProjectTeamAuthorization.testFixtures.ts";
-import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
+import { makeVerificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { makeProjectWorkVerificationGate } from "./ProjectWorkVerificationGate.ts";
 import { makeProjectWorkArtifacts } from "./ProjectWorkArtifacts.ts";
@@ -43,8 +43,10 @@ const attribution = {
   source: { kind: "web", id: "verification-control" },
   recordedAt: at,
 } as const;
-const fixture = Effect.gen(function* () {
-  const f = yield* verificationFixture;
+const makeFixture = Effect.fn("makeExecutionFixture")(function* (
+  role: "implementer" | "integrator" = "implementer",
+) {
+  const f = yield* makeVerificationFixture(role);
   const repository = yield* ProjectWorkRepository;
   const gate = decodeGate({
     kind: "gate",
@@ -210,6 +212,7 @@ const fixture = Effect.gen(function* () {
 
 const controlled = (
   config: {
+    readonly role?: "implementer" | "integrator";
     readonly held?: boolean;
     readonly code?: number;
     readonly stdout?: readonly Uint8Array[];
@@ -217,7 +220,7 @@ const controlled = (
   } = {},
 ) =>
   Effect.gen(function* () {
-    const f = yield* fixture;
+    const f = yield* makeFixture(config.role);
     const started = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
     const commands: ChildProcess.Command[] = [];
@@ -392,65 +395,83 @@ const controlled = (
     };
   });
 
-it.effect("the existing native admission hold prevents any approved-job capture or spawn", () =>
-  scoped(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const f = yield* controlled();
-        const execution = yield* makeProjectWorkVerificationExecution({
-          ...f.options,
-          assertEnabled: Effect.fail(
-            new ProjectWorkVerificationExecutionError({
-              reason: "Managed execution awaits retained engineering verdicts",
-            }),
-          ),
-        });
-        yield* execution.ready;
-        expect(yield* execution.sweep.pipe(Effect.result)).toMatchObject({
-          _tag: "Failure",
-          failure: { _tag: "ProjectWorkVerificationExecutionError" },
-        });
-        expect(f.commands).toEqual([]);
-        expect(f.counters().discoveries).toBe(0);
-      }),
-    ),
-  ),
-);
-
-it.effect(
-  "an approved job produces one drained binary result and repeat wakes never launch it again",
-  () =>
-    scoped(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const f = yield* controlled();
-          const execution = yield* makeProjectWorkVerificationExecution(f.options);
-          yield* execution.ready;
-          yield* execution.sweep;
-          const result = yield* f.journal.readResult(f.selection.jobId);
-          expect(result).toMatchObject({
-            outcome: "success",
-            exitCode: 0,
-            outputComplete: true,
-            stdout: { byteCount: 3 },
-            stderr: { byteCount: 2 },
-            drain: { childPid: 300, childExitCode: 0 },
-          });
-          const artifacts = yield* makeProjectWorkArtifacts({
-            environmentId: "environment",
-            maximumArtifactBytes: 4096,
-          });
-          expect((yield* artifacts.readRetained(result!.stdout.artifactId))?.bytes).toEqual(
-            new Uint8Array([0, 255, 10]),
-          );
-          yield* execution.sweep;
-          expect(f.counters().starts).toBe(1);
-          expect(f.counters().inputClosed).toBe(1);
-          expect(f.commands).toHaveLength(1);
-        }),
+for (const role of ["implementer", "integrator"] as const)
+  it.effect(
+    `the existing native admission hold prevents any approved ${role} job capture or spawn`,
+    () =>
+      scoped(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* controlled({ role });
+            const execution = yield* makeProjectWorkVerificationExecution({
+              ...f.options,
+              assertEnabled: Effect.fail(
+                new ProjectWorkVerificationExecutionError({
+                  reason: "Managed execution awaits retained engineering verdicts",
+                }),
+              ),
+            });
+            yield* execution.ready;
+            expect(yield* execution.sweep.pipe(Effect.result)).toMatchObject({
+              _tag: "Failure",
+              failure: { _tag: "ProjectWorkVerificationExecutionError" },
+            });
+            expect(f.commands).toEqual([]);
+            expect(f.counters().discoveries).toBe(0);
+          }),
+        ),
       ),
-    ),
-);
+  );
+
+for (const role of ["implementer", "integrator"] as const)
+  it.effect(
+    `an approved ${role} job produces one drained binary result and repeat wakes never launch it again`,
+    () =>
+      scoped(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* controlled({ role });
+            const execution = yield* makeProjectWorkVerificationExecution(f.options);
+            yield* execution.ready;
+            yield* execution.sweep;
+            const result = yield* f.journal.readResult(f.selection.jobId);
+            expect(result).toMatchObject({
+              outcome: "success",
+              exitCode: 0,
+              outputComplete: true,
+              stdout: { byteCount: 3 },
+              stderr: { byteCount: 2 },
+              drain: { childPid: 300, childExitCode: 0 },
+            });
+            const artifacts = yield* makeProjectWorkArtifacts({
+              environmentId: "environment",
+              maximumArtifactBytes: 4096,
+            });
+            expect((yield* artifacts.readRetained(result!.stdout.artifactId))?.bytes).toEqual(
+              new Uint8Array([0, 255, 10]),
+            );
+            for (const output of [result!.stdout, result!.stderr]) {
+              const retained = yield* artifacts.readRetained(output.artifactId);
+              expect(retained?.applicability.integration).toBe(role === "integrator");
+            }
+            expect((yield* artifacts.readRetained(result!.stderr.artifactId))?.bytes).toEqual(
+              new Uint8Array([27, 0]),
+            );
+            const state = yield* readCurrentState(f.sql, f.selection.projectId);
+            expect(
+              state.foundationRecords?.find((row) => row.kind === "evidence-applicability"),
+            ).toMatchObject({ integration: role === "integrator", status: "current" });
+            expect(state.tasks.find((row) => row.taskId === f.selection.taskId)?.state).not.toBe(
+              "completed",
+            );
+            yield* execution.sweep;
+            expect(f.counters().starts).toBe(1);
+            expect(f.counters().inputClosed).toBe(1);
+            expect(f.commands).toHaveLength(1);
+          }),
+        ),
+      ),
+  );
 
 it.effect("an invalidated grant stops its exact running process before the held child exit", () =>
   scoped(

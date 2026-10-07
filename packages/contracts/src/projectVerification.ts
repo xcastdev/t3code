@@ -40,6 +40,7 @@ const GitOid = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u));
  * approval; only the server's retained capture and human response can do that. */
 export const ProjectVerificationJobManifest = Schema.Struct({
   version: Schema.Literal(1),
+  integration: Schema.optionalKey(Schema.Literal(true)),
   jobId: Id,
   environmentId: EnvironmentId.check(Schema.isMaxLength(256)),
   projectId: ProjectId.check(Schema.isMaxLength(256)),

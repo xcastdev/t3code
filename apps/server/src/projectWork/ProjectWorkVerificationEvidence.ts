@@ -125,7 +125,7 @@ export function prepareVerificationEvidence(
         exitCode: 0,
         artifactId: result.stdout.artifactId,
         environmentSummary: result.environmentSummary,
-        integration: false,
+        integration: job.integration === true,
         scopeHash,
       },
     ],

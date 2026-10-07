@@ -99,6 +99,19 @@ describe("frozen verification preview", () => {
     expect(decodeManifest(manifest)).toEqual(manifest);
   });
 
+  it("retains host-captured integration classification without changing legacy manifests", () => {
+    const integration = { ...manifest, integration: true };
+    expect(decodeManifest(integration)).toEqual(integration);
+    expect(decodeManifest(manifest)).toEqual(manifest);
+    expect(Object.hasOwn(decodeManifest(manifest), "integration")).toBe(false);
+  });
+
+  it("rejects unrecognized integration classification", () => {
+    for (const integration of [false, undefined, null, "true"]) {
+      expect(() => decodeManifest({ ...manifest, integration })).toThrow();
+    }
+  });
+
   it("rejects a dirty target or a tested commit different from the displayed head", () => {
     for (const target of [
       { ...manifest.target, workspaceState: "dirty" },

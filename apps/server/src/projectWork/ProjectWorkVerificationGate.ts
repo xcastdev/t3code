@@ -149,7 +149,8 @@ export function makeProjectWorkVerificationGate(input: typeof Options.Type) {
         if (
           roles.length !== 1 ||
           roles[0]?.kind !== "role-revision" ||
-          roles[0].role !== "implementer"
+          (roles[0].role !== "implementer" && roles[0].role !== "integrator") ||
+          (job.integration === true) !== (roles[0].role === "integrator")
         )
           return yield* deny("Original verification role changed");
         const plans = records.filter(

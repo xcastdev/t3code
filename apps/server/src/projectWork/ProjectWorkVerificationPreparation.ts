@@ -219,9 +219,9 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
           if (
             roles.length !== 1 ||
             roles[0]?.kind !== "role-revision" ||
-            roles[0].role !== "implementer"
+            (roles[0].role !== "implementer" && roles[0].role !== "integrator")
           )
-            return yield* deny("Original implementation role is missing or ambiguous");
+            return yield* deny("Original verification role is missing or ambiguous");
           const plans = records.filter(
             (row) =>
               row.kind === "plan-revision" &&
@@ -333,6 +333,7 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
             return yield* deny("Original workspace receipt contradicts the retained assignment");
           return freeze({
             binding: structuredClone(binding),
+            integration: roles[0].role === "integrator",
             snapshot,
             receipt,
             specificationHash,
@@ -385,6 +386,7 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
                       try: () =>
                         capture(decodeManifest, {
                           version: 1,
+                          ...(original.integration ? { integration: true } : {}),
                           jobId: selection.jobId,
                           environmentId: options.environmentId,
                           projectId: selection.projectId,

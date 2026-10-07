@@ -15,7 +15,7 @@ import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { at, scoped } from "./ProjectTeamAuthorization.testFixtures.ts";
-import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
+import { makeVerificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import { ProjectWorkGateway, ProjectWorkGatewayLive } from "./ProjectWorkGateway.ts";
 import { ProjectWorkSearchLive } from "./ProjectWorkSearch.ts";
 import { ProjectWorkBriefingLive } from "./ProjectWorkBriefing.ts";
@@ -29,8 +29,10 @@ import { readCurrentState } from "./ProjectWorkRepository.ts";
 
 const decodeWrite = Schema.decodeUnknownEffect(ProjectTeamWriteIntent);
 const decodeRead = Schema.decodeUnknownEffect(ProjectWorkReadIntent);
-const fixture = Effect.gen(function* () {
-  const f = yield* verificationFixture;
+const makeFixture = Effect.fn("makeGatewayFixture")(function* (
+  role: "implementer" | "integrator" = "implementer",
+) {
+  const f = yield* makeVerificationFixture(role);
   const principal = { actor: { kind: "human" as const, id: "user:maintainer" } };
   const source = { kind: "web" as const, id: "browser" };
   const sessions = yield* AuthSessions.make;
@@ -116,6 +118,8 @@ const fixture = Effect.gen(function* () {
     },
   };
 });
+
+const fixture = makeFixture();
 
 for (const permission of ["missing", "revoked", "expired", "read-only", "current"] as const) {
   it.effect(`verification rejection checks ${permission} human permission without its host`, () =>
@@ -269,49 +273,76 @@ it.effect("late revocation after preparation cannot commit a pending approval", 
   ),
 );
 
-it.effect("approval binds the exact pending job and its retry emits no second decision", () =>
-  scoped(
-    Effect.gen(function* () {
-      const f = yield* fixture;
-      const request = yield* f.request("write");
-      yield* f.gateway
-        .write(f.input, f.principal.actor, f.source, f.principal)
-        .pipe(Effect.provideService(ProjectWorkVerificationRequest, request));
-      const state = yield* readCurrentState(f.sql, f.selection.projectId);
-      const gate = state.foundationRecords?.find(
-        (row) => row.kind === "gate" && row.verificationJobId === f.selection.jobId,
-      );
-      if (gate?.kind !== "gate") return yield* Effect.die("Missing verification approval gate");
-      const input = yield* decodeWrite({
-        type: "project-team.gate.respond",
-        commandId: "gateway-approve",
-        projectId: f.selection.projectId,
-        taskId: f.selection.taskId,
-        expectedRevision: state.revision,
-        expectedTaskRevision: f.selection.expectedTaskRevision,
-        specRevision: f.selection.specRevision,
-        planRevision: f.selection.planRevision,
-        gateId: gate.recordId,
-        expectedGateRevision: gate.revision,
-        response: "approved",
-      });
-      const approve = f.gateway
-        .write(input, f.principal.actor, f.source, f.principal)
-        .pipe(Effect.provideService(ProjectWorkVerificationRequest, request));
-      yield* approve;
-      const first = yield* readCurrentState(f.sql, f.selection.projectId);
-      yield* approve;
-      const second = yield* readCurrentState(f.sql, f.selection.projectId);
-      expect(second.revision).toBe(first.revision);
-      expect(second.foundationRecords?.find((row) => row.recordId === gate.recordId)).toMatchObject(
-        {
+for (const role of ["implementer", "integrator"] as const)
+  it.effect(`approval binds the exact ${role} job and its retry emits no second decision`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture(role);
+        const request = yield* f.request("write");
+        yield* f.gateway
+          .write(f.input, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.provideService(ProjectWorkVerificationRequest, request));
+        const readRequest = yield* f.request("read");
+        const preview = yield* f.gateway
+          .read(f.preview, f.principal)
+          .pipe(Effect.provideService(ProjectWorkVerificationRequest, readRequest));
+        expect(preview).toEqual({ kind: "verification-job", ...f.prepared });
+        expect(f.prepared.manifest.integration === true).toBe(role === "integrator");
+        expect(Object.hasOwn(f.prepared.manifest, "integration")).toBe(role === "integrator");
+        const state = yield* readCurrentState(f.sql, f.selection.projectId);
+        const gate = state.foundationRecords?.find(
+          (row) => row.kind === "gate" && row.verificationJobId === f.selection.jobId,
+        );
+        if (gate?.kind !== "gate") return yield* Effect.die("Missing verification approval gate");
+        const input = yield* decodeWrite({
+          type: "project-team.gate.respond",
+          commandId: "gateway-approve",
+          projectId: f.selection.projectId,
+          taskId: f.selection.taskId,
+          expectedRevision: state.revision,
+          expectedTaskRevision: f.selection.expectedTaskRevision,
+          specRevision: f.selection.specRevision,
+          planRevision: f.selection.planRevision,
+          gateId: gate.recordId,
+          expectedGateRevision: gate.revision,
+          response: "approved",
+        });
+        const approve = f.gateway
+          .write(input, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.provideService(ProjectWorkVerificationRequest, request));
+        yield* approve;
+        const first = yield* readCurrentState(f.sql, f.selection.projectId);
+        yield* approve;
+        const second = yield* readCurrentState(f.sql, f.selection.projectId);
+        expect(second.revision).toBe(first.revision);
+        expect(
+          second.foundationRecords?.find((row) => row.recordId === gate.recordId),
+        ).toMatchObject({
           kind: "gate",
           status: "approved",
           verificationJobId: f.selection.jobId,
           contentHash: f.prepared.sha256,
-        },
-      );
-      expect(f.captures()).toBe(1);
+        });
+        expect(f.captures()).toBe(1);
+      }),
+    ),
+  );
+
+it.effect("public verification proposal cannot select integration classification", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const request = yield* f.request("write");
+      const before = yield* readCurrentState(f.sql, f.selection.projectId);
+      const spoofed = { ...f.input, integration: true };
+      expect(
+        (yield* f.gateway
+          .write(spoofed, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.provideService(ProjectWorkVerificationRequest, request), Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(f.captures()).toBe(0);
+      expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(before);
     }),
   ),
 );

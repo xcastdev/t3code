@@ -133,10 +133,10 @@ const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
     });
     return { sql, repository, request, journal };
   });
-const fixture = makeFixture();
-
-const preparedFixture = Effect.gen(function* () {
-  const f = yield* fixture;
+const makePreparedFixture = Effect.fn("makePreparedFixture")(function* (
+  role: "implementer" | "integrator" = "implementer",
+) {
+  const f = yield* makeFixture(role);
   const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
   const settling = yield* makeProjectTeamDispatchJournal({
     environmentId: "environment",
@@ -278,6 +278,7 @@ const preparedFixture = Effect.gen(function* () {
     counts: () => ({ hostCaptures, retained, activeTarget, activeExecutable }),
   };
 });
+const preparedFixture = makePreparedFixture();
 const human = { actor: { kind: "human" as const, id: "maintainer" } };
 
 it.effect(
@@ -289,6 +290,7 @@ it.effect(
         expect(f.selectedTask.approval).toBeUndefined();
         const prepared = yield* f.preparation.prepare(f.selection, human);
         expect(yield* f.jobs.readPrepared(f.selection.jobId)).toEqual(prepared);
+        expect(Object.hasOwn(prepared.manifest, "integration")).toBe(false);
         expect(prepared.manifest).toMatchObject({
           jobId: "verification-1",
           environmentId: "environment",
@@ -487,6 +489,46 @@ it.effect("malformed host capture fails through the typed channel and releases l
         activeExecutable: false,
       });
       expect(yield* f.jobs.readPrepared(f.selection.jobId)).toBeUndefined();
+    }),
+  ),
+);
+
+it.effect("prepares the original settled integrator as integration verification", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makePreparedFixture("integrator");
+      const prepared = yield* f.preparation.prepare(f.selection, human);
+      expect(prepared.manifest.integration).toBe(true);
+      expect(prepared.manifest.dispatchId).toBe(f.request.dispatchId);
+      expect(prepared.manifest.bindingId).toBe("binding");
+      expect(prepared.manifest.target).toMatchObject({
+        worktree: "/workspace-assigned",
+        branchRef: "refs/heads/assigned",
+        testedCommit: "c".repeat(40),
+        workspaceState: "clean-committed",
+      });
+      expect(yield* f.jobs.readPrepared(f.selection.jobId)).toEqual(prepared);
+      expect(f.counts()).toEqual({
+        hostCaptures: 1,
+        retained: 1,
+        activeTarget: false,
+        activeExecutable: false,
+      });
+    }),
+  ),
+);
+
+it.effect("caller selection cannot spoof integration classification", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* preparedFixture;
+      const before = yield* readCurrentState(f.sql, projectId);
+      const spoofed = { ...f.selection, integration: true };
+      const result = yield* f.preparation.prepare(spoofed, human).pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(f.counts().hostCaptures).toBe(0);
+      expect(yield* f.jobs.readPrepared(f.selection.jobId)).toBeUndefined();
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
     }),
   ),
 );

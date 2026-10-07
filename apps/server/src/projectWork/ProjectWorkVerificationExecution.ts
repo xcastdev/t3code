@@ -125,7 +125,7 @@ export const makeProjectWorkVerificationExecution = Effect.fn(
       }),
       exitCode: input.exitCode ?? -1,
       environmentSummary,
-      integration: false,
+      integration: job.integration === true,
     };
     const stdout = yield* artifacts.retain({
       artifactId: claim.attemptId + ":stdout",

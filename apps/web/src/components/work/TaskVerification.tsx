@@ -137,7 +137,7 @@ function selection(
         (role) =>
           role.kind === "role-revision" &&
           role.recordId === r.roleRevisionId &&
-          role.role === "implementer",
+          (role.role === "implementer" || role.role === "integrator"),
       ).length === 1,
   );
   const gates = taskRecords.filter(
@@ -199,8 +199,17 @@ function reviewTarget(
       b.worktree === manifest.target.worktree &&
       b.branch === manifest.target.branchRef,
   );
+  const role = binding
+    ? snapshot.records
+        .filter(knownRecord)
+        .find(
+          (record) => record.kind === "role-revision" && record.recordId === binding.roleRevisionId,
+        )
+    : undefined;
   if (
     !binding ||
+    role?.kind !== "role-revision" ||
+    (manifest.integration === true) !== (role.role === "integrator") ||
     !manifest.criteria.every(
       (item) =>
         found.task.specification?.criterionIds.includes(item.criterionId) &&
@@ -215,6 +224,7 @@ function reviewTarget(
     task: found.task,
     gate,
     binding,
+    role,
     plan: found.plan,
     criteria: found.context.criteria.filter((c) =>
       manifest.criteria.some((item) => item.criterionId === c.criterionId),
@@ -652,26 +662,26 @@ function VerificationSession(props: TaskVerificationProps) {
       {access && target && !target.eligible && (
         <p className="mt-2 text-sm">
           Preparing verification requires an active managed code task, current specification and
-          plan, and an original settled implementer.
+          plan, and an original settled implementation or integration assignment.
         </p>
       )}
       {selected && !currentSelected && (
         <p role="status">
-          The selected implementation changed. Select it again after reviewing the current work.
+          The selected assignment changed. Select it again after reviewing the current work.
         </p>
       )}
       <fieldset disabled={!access || busy || pending !== null} className="mt-3 space-y-3">
         <label className="block text-sm">
-          Settled implementation
+          Completed assignment
           <select
-            aria-label="Settled implementation"
+            aria-label="Completed assignment"
             value={currentSelected?.recordId ?? ""}
             onChange={(e) =>
               setSelected(target?.bindings.find((b) => b.recordId === e.target.value) ?? null)
             }
             className="mt-1 block w-full rounded-md border bg-background p-2"
           >
-            <option value="">Select the original settled implementer</option>
+            <option value="">Select the original completed assignment</option>
             {target?.bindings.map((b) => (
               <option key={b.recordId} value={b.recordId}>
                 {b.recordId} · {b.worktree} · {b.branch}
@@ -788,6 +798,12 @@ function VerificationSession(props: TaskVerificationProps) {
             {manifest && (
               <div className="space-y-2 text-sm">
                 <dl className="grid gap-1">
+                  <dt>Verification type</dt>
+                  <dd>
+                    {manifest.integration === true
+                      ? "Integration verification"
+                      : "Implementation verification"}
+                  </dd>
                   <dt>Executable</dt>
                   <dd className="break-all font-mono">{manifest.command.executable}</dd>
                   <dt>Arguments in order</dt>

@@ -2,12 +2,14 @@
 import { RegistryContext } from "@effect/atom-react";
 import { Atom, AsyncResult, AtomRegistry } from "effect/unstable/reactivity";
 import {
+  canonicalProjectWorkPayload,
   EnvironmentId,
   ProjectId,
   ProjectTeamRecordRead,
   ProjectWorkTaskContext,
   ProjectWorkWriteIntent,
 } from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
 import * as Schema from "effect/Schema";
 import { act, StrictMode, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -371,7 +373,7 @@ describe("human task verification", () => {
   async function prepare() {
     await fill("Verification executable", "/opt/test runner");
     await fill("Verification arguments", '["", "  literal  ", "$(literal); *"]');
-    const select = host.querySelector<HTMLSelectElement>('[aria-label="Settled implementation"]')!;
+    const select = host.querySelector<HTMLSelectElement>('[aria-label="Completed assignment"]')!;
     await act(async () => {
       select.value = "binding";
       select.dispatchEvent(new Event("change", { bubbles: true }));
@@ -380,12 +382,58 @@ describe("human task verification", () => {
       host.querySelector<HTMLInputElement>('[aria-label="Cover Retain the conversation"]')!.click(),
     );
   }
+  it("proposes verification for an original completed integrator assignment", async () => {
+    records = records.map((record) =>
+      record.kind === "role-revision" ? decodeRecord({ ...record, role: "integrator" }) : record,
+    );
+    await render({ records });
+    await prepare();
+    await click("Propose verification");
+    expect(write).toHaveBeenCalledOnce();
+    expect(write.mock.calls[0]?.[0]).toMatchObject({
+      type: "project-team.verification.propose",
+      bindingId: "binding",
+    });
+    expect(Object.hasOwn(write.mock.calls[0]![0], "integration")).toBe(false);
+  });
+
+  it.each([
+    ["integrator", true, true],
+    ["implementer", true, false],
+    ["integrator", false, false],
+  ] as const)(
+    "checks %s role against integration=%s before approval",
+    async (role, integration, allowed) => {
+      const manifest = integration ? { ...previewManifest, integration: true } : previewManifest;
+      const prepared = {
+        ...preview,
+        manifest,
+        sha256: NodeCrypto.createHash("sha256")
+          .update(canonicalProjectWorkPayload(manifest))
+          .digest("hex"),
+      };
+      records = records.map((record) =>
+        record.kind === "role-revision" ? decodeRecord({ ...record, role }) : record,
+      );
+      records.push(decodeRecord({ ...gate(), contentHash: prepared.sha256 }));
+      transport.read.mockResolvedValue({ _tag: "Success", value: prepared });
+      await render({ records });
+      await click("Load verification preview");
+      expect(
+        host.querySelector<HTMLButtonElement>('[aria-label="Approve verification"]')?.disabled,
+      ).toBe(!allowed);
+      if (allowed) expect(host.textContent).toContain("Integration verification");
+      await click("Approve verification");
+      expect(write).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    },
+  );
+
   it("proposes current settled implementation and criterion coverage with literal process arguments", async () => {
     await render();
     expect(host.textContent).toContain("Propose verification");
     await fill("Verification executable", "/opt/test runner");
     await fill("Verification arguments", '["", "  literal  ", "$(literal); *", "line\\nbreak"]');
-    const binding = host.querySelector<HTMLSelectElement>('[aria-label="Settled implementation"]')!;
+    const binding = host.querySelector<HTMLSelectElement>('[aria-label="Completed assignment"]')!;
     await act(async () => {
       binding.value = "binding";
       binding.dispatchEvent(new Event("change", { bubbles: true }));

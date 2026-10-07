@@ -1,5 +1,6 @@
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as NodeCrypto from "node:crypto";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   AuthSessionId,
@@ -23,7 +24,10 @@ import {
 } from "./ProjectWorkVerificationGate.ts";
 import { at } from "./ProjectTeamAuthorization.testFixtures.ts";
 import { scoped } from "./ProjectTeamAuthorization.testFixtures.ts";
-import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
+import {
+  makeVerificationFixture,
+  verificationFixture,
+} from "./ProjectWorkVerification.testFixtures.ts";
 import { makeProjectWorkVerificationGate } from "./ProjectWorkVerificationGate.ts";
 
 const options = { environmentId: "environment", maximumEnvironmentModelCalls: 4 };
@@ -286,6 +290,75 @@ for (const response of ["approved", "rejected"] as const) {
           if (updated?.kind === "gate") {
             expect(updated.verificationJobId).toBe(f.selection.jobId);
             expect(updated.contentHash).toBe(f.prepared.sha256);
+          }
+        }),
+      ),
+  );
+}
+
+for (const role of ["implementer", "integrator"] as const) {
+  it.effect(
+    `current ${role} gate rejects mismatched original role and classification on every validation`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* makeVerificationFixture(role);
+          const gates = yield* makeProjectWorkVerificationGate(options);
+          const { integration: classification, ...legacy } = f.prepared.manifest;
+          expect(classification === true).toBe(role === "integrator");
+          const manifest =
+            role === "integrator" ? legacy : { ...legacy, integration: true as const };
+          const changed = {
+            manifest,
+            sha256: NodeCrypto.createHash("sha256")
+              .update(canonicalProjectWorkPayload(manifest))
+              .digest("hex"),
+          };
+          const missingRole = {
+            ...f.state,
+            foundationRecords: (f.state.foundationRecords ?? []).filter(
+              (row) => row.kind !== "role-revision",
+            ),
+          };
+          const replacedRole = {
+            ...f.state,
+            foundationRecords: (f.state.foundationRecords ?? []).map((row) =>
+              row.kind === "role-revision"
+                ? {
+                    ...row,
+                    role:
+                      role === "integrator" ? ("implementer" as const) : ("integrator" as const),
+                  }
+                : row,
+            ),
+          };
+          const roleRecord = f.state.foundationRecords?.find((row) => row.kind === "role-revision");
+          if (!roleRecord) return yield* Effect.die("Missing original role");
+          const duplicateRole = {
+            ...f.state,
+            foundationRecords: [...(f.state.foundationRecords ?? []), roleRecord],
+          };
+          for (const duplicate of [false, true]) {
+            yield* f.sql.withTransaction(
+              gates.assertCurrent(f.state, f.prepared, f.selection, duplicate),
+            );
+            for (const [state, receipt] of [
+              [f.state, changed],
+              [missingRole, f.prepared],
+              [replacedRole, f.prepared],
+              [duplicateRole, f.prepared],
+            ] as const) {
+              const result = yield* gates
+                .assertCurrent(state, receipt, f.selection, duplicate)
+                .pipe(Effect.result);
+              expect(result).toMatchObject({
+                _tag: "Failure",
+                failure: {
+                  _tag: "ProjectWorkVerificationGateError",
+                  reason: "Original verification role changed",
+                },
+              });
+            }
           }
         }),
       ),
