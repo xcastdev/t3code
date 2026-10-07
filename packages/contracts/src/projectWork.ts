@@ -12,6 +12,8 @@ import {
   ProjectTeamReviewFindingProvenance,
   ProjectTeamIntegrationSourceRefs,
   ProjectTeamIntegrationSources,
+  ProjectTeamIntegrationSource,
+  ProjectTeamIntegrationSourceRef,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1601,7 +1603,40 @@ export const ProjectTeamReviewResolutionProof = Schema.Struct({
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamReviewResolutionProof = typeof ProjectTeamReviewResolutionProof.Type;
 
+/** Private acceptance derives this association from audited delivery, never from a public request. */
+export const ProjectTeamDeliveryAcceptanceProof = Schema.Struct({
+  version: Schema.Literal(1),
+  environmentId: EnvironmentId,
+  operationId: GuidedId,
+  receiptSha256: ReviewProofDigest,
+  decisionSha256: ReviewProofDigest,
+  gateId: GuidedId,
+  gateSha256: ReviewProofDigest,
+  source: ProjectTeamIntegrationSource,
+  sourceRef: ProjectTeamIntegrationSourceRef,
+  criteria: Schema.Array(
+    Schema.Struct({ criterionId: ProjectWorkCriterionId, sha256: ReviewProofDigest }),
+  ).check(
+    Schema.isMaxLength(64),
+    Schema.makeFilter((values) => new Set(values.map((v) => v.criterionId)).size === values.length),
+  ),
+  support: Schema.Array(
+    Schema.Struct({ evidenceId: ProjectWorkEvidenceId, sha256: ReviewProofDigest }),
+  ).check(
+    Schema.isMaxLength(128),
+    Schema.makeFilter((values) => new Set(values.map((v) => v.evidenceId)).size === values.length),
+  ),
+})
+  .check(Schema.makeFilter((v) => utf8Length(canonicalProjectWorkPayload(v)) <= 28000))
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamDeliveryAcceptanceProof = typeof ProjectTeamDeliveryAcceptanceProof.Type;
+
 export const ProjectWorkTeamTransition = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("delivery.accept"),
+    expectedTaskRevision: JoinedRunCounter,
+    proof: ProjectTeamDeliveryAcceptanceProof,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
   Schema.Struct({
     kind: Schema.Literal("review.resolve"),
     finding: ProjectTeamReviewFinding,

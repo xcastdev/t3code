@@ -92,9 +92,13 @@ reviewed commit and target branch. Current verification, review and work approva
 a changed remote head or base must be reviewed before merging. Automatic and stacked merges
 are unavailable for managed work. A confirmed immediate merge retains delivery evidence. An
 uncertain write is checked without sending another merge; an external merge does not establish
-that T3 completed it. Inspect an uncertain outcome before taking further action. Satisfied
-criteria, a completed reviewer task, an open PR, or merge evidence do not automatically complete
-the parent code task.
+that T3 completed it. Inspect an uncertain outcome before taking further action.
+
+A confirmed managed merge completes its matching code task only when its required criteria already
+have current supporting evidence or an explicit human waiver, and no worker still owns the work.
+Delivery does not satisfy criteria or complete a parent task. If acceptance is pending, resolve the
+remaining task requirements; the original delivery stays recorded. Downstream work can use an
+accepted delivery while its approvals, scope, and supporting evidence remain current.
 
 ## When an action is unavailable
 

@@ -204,6 +204,7 @@ export const decideProjectTeamGuidedLifecycle = (
     }
     for (const taskId of ids) {
       const result = evaluateProjectTeamDependency({
+        state,
         projectId: target.projectId,
         taskId,
         task: state.tasks.find((t) => t.taskId === taskId),
@@ -1212,6 +1213,7 @@ export const decideProjectTeamGuidedLifecycle = (
             r.kind === "task-membership" && r.parentTaskId === task.taskId && r.status === "active",
         )) {
           const result = evaluateProjectTeamDependency({
+            state,
             projectId: task.projectId,
             taskId: child.taskId,
             task: state.tasks.find((t) => t.taskId === child.taskId),

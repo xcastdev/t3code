@@ -6,6 +6,7 @@ import {
   CommandId,
   ProjectTeamRecord as ProjectTeamRecordSchema,
   EnvironmentId,
+  ProjectId,
   ProjectWorkTaskId,
   ProjectWorkFoundationCommitCommand,
   ProjectWorkWriteResult,
@@ -34,6 +35,8 @@ import {
   prepareReviewCriterionProgress,
   assertRetainedReviewCriterionProgress,
 } from "./ProjectTeamReviewCriterionProgress.ts";
+import { deliveryDependencyIds } from "./ProjectTeamDeliveryAcceptanceState.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import { makeProjectWorkVerificationResultReader } from "./ProjectWorkVerificationExecutionJournal.ts";
 
 const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
@@ -318,6 +321,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
   }) {
     const sql = yield* SqlClient.SqlClient;
     const repository = yield* ProjectWorkRepository;
+    const settings = yield* Effect.serviceOption(ServerSettingsService);
     const prepareReviewCompletion = options.prepareReviewCompletion;
     const verifyReviewTarget = options.verifyReviewTarget;
     const environmentId = yield* decodeEnvironment(options.environmentId);
@@ -776,6 +780,39 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         try: () => assertProjectTeamRunAuthority(state, binding, role, true),
         catch: () => deny("Dispatch grant or assignment is stale"),
       });
+      const dependencies = yield* Effect.try({
+        try: () => deliveryDependencyIds(state, binding.taskId),
+        catch: () => deny("Dependency lineage changed"),
+      });
+      if (dependencies.length > 0) {
+        if (Option.isNone(settings)) return yield* deny("Delivery settings unavailable");
+        const { makeProjectTeamDeliveryAcceptance } = yield* Effect.promise(
+          () => import("./ProjectTeamDeliveryAcceptance.ts"),
+        );
+        const client = yield* Effect.serviceOption(SqlClient.SqlClient),
+          owner = yield* Effect.serviceOption(ProjectWorkRepository);
+        if (
+          (Option.isSome(client) && client.value !== sql) ||
+          (Option.isSome(owner) && owner.value !== repository)
+        )
+          return yield* deny("Delivery requires original dispatch services");
+        const acceptance = yield* makeProjectTeamDeliveryAcceptance({ environmentId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.provideService(ProjectWorkRepository, repository),
+          Effect.provideService(ServerSettingsService, settings.value),
+          Effect.mapError(() => deny("Delivery history unavailable")),
+        );
+        yield* acceptance
+          .assertTaskDependenciesInTransaction({
+            projectId: ProjectId.make(state.projectId),
+            taskId: binding.taskId,
+          })
+          .pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository),
+            Effect.mapError(() => deny("Delivered dependency history changed")),
+          );
+      }
       const attempt = state.attempts.find(
         (a) => a.attemptId === binding.attemptId && a.taskId === binding.taskId,
       );

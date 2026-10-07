@@ -407,8 +407,14 @@ const ProjectMcpServiceLayerLive = ProjectMcpService.layer.pipe(
   Layer.provideMerge(ProjectMcpOAuthLayerLive),
 );
 
+const ServerEnvironmentLayerLive = ServerEnvironment.layer.pipe(
+  Layer.provide(ServerSecretStore.layer),
+);
+
 const ProjectTeamAuthorizationLive = ProjectTeamAuthorization.layer.pipe(
   Layer.provideMerge(SqlitePersistenceLayerLive),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(ServerSettingsLayerLive),
 );
 
 const ProjectMcpProxyRegistryLayerLive = ProjectMcpProxyRegistry.layer.pipe(
@@ -614,10 +620,6 @@ const ProjectFaviconResolverLayerLive = ProjectFaviconResolver.layer.pipe(
   Layer.provide(T3ProjectFileLoader.layer),
 );
 
-const ServerEnvironmentLayerLive = ServerEnvironment.layer.pipe(
-  Layer.provide(ServerSecretStore.layer),
-);
-
 const AuthLayerLive = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(ProjectTeamAuthorizationLive),
   Layer.provideMerge(PersistenceLayerLive),
@@ -684,7 +686,20 @@ const ProjectWorkPublicationLinksServicesLive =
     Layer.provide(OrchestrationLayerLive),
   );
 
+const ProjectTeamDeliveryAcceptanceServicesLive =
+  ProjectWorkRuntime.deliveryAcceptanceServicesLayer.pipe(
+    Layer.provideMerge(ProjectWorkPublicationServicesLive),
+    Layer.provide(ServerEnvironmentLayerLive),
+    Layer.provide(ServerSettingsLayerLive),
+  );
+
 const ProjectWorkServicesLive = Layer.mergeAll(
+  ProjectTeamDeliveryAcceptanceServicesLive,
+  ProjectWorkRuntime.deliveryAcceptanceRecoveryLayer.pipe(
+    Layer.provide(ProjectTeamDeliveryAcceptanceServicesLive),
+    Layer.provide(ProjectIssueServicesLive),
+    Layer.provide(ServerSettingsLayerLive),
+  ),
   ProjectWorkManagedMergeServicesLive,
   ProjectWorkRuntime.managedMergeRecoveryLayer.pipe(
     Layer.provide(ProjectWorkManagedMergeServicesLive),

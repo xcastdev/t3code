@@ -185,6 +185,16 @@ export class ProjectWorkPublicationAuthorization extends Context.Service<
       request: ProjectWorkPublicationRequest,
       phase: "enqueue" | "dispatch",
     ) => Effect.Effect<void, PublicationError>;
+    readonly readCurrentReviewedInTransaction: (
+      request: ProjectWorkPublicationRequest,
+    ) => Effect.Effect<
+      {
+        readonly detail: typeof Detail.Type;
+        readonly source: ProjectTeamIntegrationSource;
+        readonly state: Effect.Success<ReturnType<typeof readCurrentState>>;
+      },
+      PublicationError
+    >;
   }
 >()("t3/projectWork/ProjectWorkPublicationAuthorization") {}
 
@@ -554,7 +564,7 @@ export const makeProjectWorkPublicationAuthorization = (input: {
         return yield* deny();
       return { evidence: proof, detail, state };
     });
-    const assertInside = Effect.fn("PublicationAuthorization.assertInside")(function* (
+    const readReviewed = Effect.fn("PublicationAuthorization.readReviewed")(function* (
       request: ProjectWorkPublicationRequest,
     ) {
       const { detail, state } = yield* audit(request);
@@ -570,7 +580,16 @@ export const makeProjectWorkPublicationAuthorization = (input: {
         request.target.specRevision !== facts.source.specRevision ||
         request.target.planRevision !== facts.source.planRevision ||
         request.target.baseSha !== facts.source.baseSha ||
-        request.target.headSha !== facts.source.headSha ||
+        request.target.headSha !== facts.source.headSha
+      )
+        return yield* deny();
+      return { detail, source: facts.source, state };
+    });
+    const assertInside = Effect.fn("PublicationAuthorization.assertInside")(function* (
+      request: ProjectWorkPublicationRequest,
+    ) {
+      const { state } = yield* readReviewed(request);
+      if (
         state.tasks.filter(
           (t) => t.taskId === request.target.taskId && t.revision === request.expectedTaskRevision,
         ).length !== 1
@@ -746,6 +765,18 @@ export const makeProjectWorkPublicationAuthorization = (input: {
       return { request, authorizationEvidence };
     });
     return ProjectWorkPublicationAuthorization.of({
+      readCurrentReviewedInTransaction(input) {
+        const request = capture(decodeRequest, input);
+        return boundary(
+          Effect.gen(function* () {
+            if (!request) return yield* deny();
+            yield* originalLoan;
+            return yield* readReviewed(request).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
+          }),
+        );
+      },
       prepareInTransaction(input) {
         const captured = capture(decodeLocal, { input: input.input, target: input.target });
         return boundary(

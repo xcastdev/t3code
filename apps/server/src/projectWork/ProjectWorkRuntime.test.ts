@@ -1,3 +1,4 @@
+import { ProjectTeamDeliveryAcceptanceError } from "./ProjectTeamDeliveryAcceptance.ts";
 import {
   CommandId,
   ProjectId,
@@ -37,6 +38,7 @@ import {
   runProjectWorkPublicationRecovery,
   runProjectWorkPublicationLinkRecovery,
   runProjectWorkManagedMergeRecovery,
+  runProjectTeamDeliveryAcceptanceRecovery,
 } from "./ProjectWorkRuntime.ts";
 import { coreLayer, leaseLayer } from "./ProjectWorkRuntime.ts";
 
@@ -594,5 +596,97 @@ it.effect(
       );
       yield* bus.publish([event("managed-merge-permission:after-drain", 4)]);
       expect(scans).toBe(3);
+    }).pipe(Effect.provide(ProjectWorkEventBusLive)),
+);
+
+it.effect(
+  "delivery acceptance recovery subscribes before readiness and advances past corrupt and unqualified rows over bounded pages",
+  () =>
+    Effect.gen(function* () {
+      const bus = yield* ProjectWorkEventBus;
+      const subscribed = yield* Deferred.make<void>();
+      const ready = yield* Deferred.make<void>();
+      const called = yield* Queue.unbounded<string>();
+      const enabledChecks = yield* Queue.unbounded<boolean>();
+      const pages = yield* Queue.unbounded<string | undefined>();
+      let enabled = false;
+      let scans = 0;
+      const rows = Array.from({ length: 65 }, (_, index) => ({
+        operationId: `retained-${String(index).padStart(3, "0")}`,
+      }));
+      const service = {
+        pending: (after?: string) =>
+          Effect.gen(function* () {
+            scans++;
+            yield* Queue.offer(pages, after);
+            return rows.filter((r) => after === undefined || r.operationId > after).slice(0, 64);
+          }),
+        recover: (operationId: string) =>
+          Effect.gen(function* () {
+            yield* Queue.offer(called, operationId);
+            if (operationId === rows[0]?.operationId)
+              return yield* new ProjectTeamDeliveryAcceptanceError({
+                code: "unavailable",
+                reason: "Corrupt retained receipt",
+              });
+            return { _tag: "NotReady" as const, reason: "Criteria remain unsatisfied" };
+          }),
+      };
+      const at = "2026-10-07T00:00:00.000Z";
+      const evidence = decodeMergeWakeEvidence({
+        evidenceId: "managed-merge-delivery:wake",
+        kind: "observation",
+        summary: "Retained confirmed delivery",
+        recordedAt: at,
+        revision: 0,
+      });
+      const wake = (revision: number) => ({
+        cursor: revision,
+        event: {
+          eventId: EventId.make(`delivery-wake-${revision}`),
+          projectId: ProjectId.make("delivery-recovery"),
+          revision,
+          type: "project-work.evidence.added" as const,
+          evidence,
+          addedAt: at,
+          occurredAt: at,
+        },
+      });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.forkScoped(
+            runProjectTeamDeliveryAcceptanceRecovery(
+              service,
+              Deferred.await(ready),
+              Effect.gen(function* () {
+                const current = enabled;
+                yield* Queue.offer(enabledChecks, current);
+                return current;
+              }),
+            ).pipe(
+              Effect.provideService(ProjectWorkEventBus, {
+                ...bus,
+                subscribe: bus.subscribe.pipe(
+                  Effect.tap(() => Deferred.succeed(subscribed, undefined)),
+                ),
+              }),
+            ),
+          );
+          yield* Deferred.await(subscribed);
+          yield* bus.publish([wake(1)]);
+          expect(scans).toBe(0);
+          yield* Deferred.succeed(ready, undefined);
+          expect(yield* Queue.take(enabledChecks)).toBe(false);
+          expect(yield* Queue.take(enabledChecks)).toBe(false);
+          enabled = true;
+          yield* bus.publish([wake(2)]);
+          expect(yield* Queue.take(pages)).toBeUndefined();
+          expect(yield* Queue.take(pages)).toBe("retained-063");
+          for (const row of rows) expect(yield* Queue.take(called)).toBe(row.operationId);
+          expect(scans).toBe(2);
+        }),
+      );
+      yield* bus.publish([wake(3)]);
+      expect(scans).toBe(2);
     }).pipe(Effect.provide(ProjectWorkEventBusLive)),
 );

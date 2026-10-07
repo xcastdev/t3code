@@ -5,6 +5,7 @@ import {
   type ProjectWorkTask,
 } from "@t3tools/contracts";
 import type { ProjectWorkState } from "./ProjectWorkPolicy.ts";
+import { isDeliveryAcceptedCurrent } from "./ProjectTeamDeliveryAcceptanceState.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
@@ -188,6 +189,7 @@ export const assertProjectTeamAssignmentAuthorization = (state: ProjectWorkState
   }
   for (const taskId of dependencies) {
     const dependency = evaluateProjectTeamDependency({
+      state,
       projectId: parent.projectId,
       taskId,
       task: state.tasks.find((task) => task.taskId === taskId),
@@ -305,6 +307,7 @@ export const assertProjectTeamRunAuthority = (
   }
   for (const taskId of dependencies) {
     const result = evaluateProjectTeamDependency({
+      state,
       projectId: binding.projectId,
       taskId,
       task: state.tasks.find((t) => t.taskId === taskId),
@@ -589,12 +592,13 @@ export const evaluateProjectTeamGate = (
   return { available: true };
 };
 
-/** Managed code needs a future authoritative delivery receipt; completion or approval cannot prove merge. */
+/** Managed code additionally needs current accepted delivery; SQL consumers authenticate its retained history. */
 export const evaluateProjectTeamDependency = (input: {
   readonly projectId: ProjectWorkTask["projectId"];
   readonly taskId: ProjectWorkTask["taskId"];
   readonly task: ProjectWorkTask | undefined;
   readonly memberships: ReadonlyArray<Membership>;
+  readonly state?: ProjectWorkState;
 }): ProjectTeamPolicyResult => {
   const { task, taskId, projectId } = input;
   if (task === undefined) return unavailable("missing-dependency");
@@ -609,7 +613,12 @@ export const evaluateProjectTeamDependency = (input: {
   if (membership?.status === "removed") return unavailable("dependency-membership-removed");
   if (task.state !== "completed") return unavailable("dependency-not-completed");
   if (membership?.executionKind === "managed" && membership.deliverableKind === "code") {
-    return unavailable("delivery-proof-required");
+    if (
+      input.state === undefined ||
+      input.state.projectId !== projectId ||
+      !isDeliveryAcceptedCurrent(input.state, taskId)
+    )
+      return unavailable("delivery-proof-required");
   }
   return { available: true };
 };

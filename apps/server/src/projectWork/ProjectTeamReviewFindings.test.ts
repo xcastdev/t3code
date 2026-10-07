@@ -1,4 +1,12 @@
 // @effect-diagnostics nodeBuiltinImport:off - Disposable SDK JSONL is the retained observation under test.
+import { makeProjectTeamDeliveryAcceptance } from "./ProjectTeamDeliveryAcceptance.ts";
+import {
+  readDeliveryAcceptance,
+  deliveryAcceptanceHash,
+  deliveryCriterionSnapshots,
+  assertDeliveryAcceptanceCurrent,
+} from "./ProjectTeamDeliveryAcceptanceState.ts";
+import { evaluateProjectTeamDependency } from "./ProjectTeamPolicy.ts";
 import { runProjectWorkManagedMergeRecovery } from "./ProjectWorkRuntime.ts";
 import { ProjectWorkEventBus, ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
 import * as Queue from "effect/Queue";
@@ -53,6 +61,7 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import {
   canonicalProjectWorkPayload,
   ProjectId,
+  EventId,
   EnvironmentId,
   AuthOrchestrationOperateScope,
   AuthSessionId,
@@ -72,6 +81,8 @@ import {
   ProjectTeamGuidedIntent,
   ThreadId,
   ProjectWorkEvidenceId,
+  ProjectWorkEvidence,
+  ProjectWorkCriterion,
   ProjectWorkCommand,
   ProjectWorkPublicationRequest,
   ProjectWorkRelationship,
@@ -2503,6 +2514,8 @@ const makeHumanPublicationFixture = Effect.fn("publicationTest.authenticFixture"
   options: {
     readonly accepted?: boolean;
     readonly verificationOutcome?: "success" | "failed";
+    readonly parentAssessment?: boolean;
+    readonly settleReviewRoot?: boolean;
   } = {},
   shared?: Effect.Success<ReturnType<typeof makeConsumedReviewFixture>>,
 ) {
@@ -2510,8 +2523,30 @@ const makeHumanPublicationFixture = Effect.fn("publicationTest.authenticFixture"
     shared ??
     (yield* makeConsumedReviewFixture({
       verificationOutcome: options.verificationOutcome ?? "success",
+      ...(options.parentAssessment === undefined
+        ? {}
+        : { parentAssessment: options.parentAssessment }),
     }));
   if (options.accepted !== false) yield* completeIntegrationSourceReview(f);
+  if (options.settleReviewRoot) {
+    const rows =
+      yield* f.sql`SELECT dispatch_id FROM project_team_dispatch WHERE environment_id='environment' AND binding_id=${f.reviewRootBindingId} LIMIT 2`;
+    if (rows.length !== 1 || typeof rows[0]?.dispatch_id !== "string")
+      return yield* Effect.die("Missing controlled coordinator dispatch");
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+      verifyStage: () => Effect.void,
+      verifySettlement: () => Effect.void,
+    });
+    const original = yield* journal.readRetained(rows[0].dispatch_id);
+    // Actual SQL settlement with a controlled joined receipt; no host process was activated or joined.
+    yield* journal.settleAfterJoined(original.fence, {
+      receiptId: "delivery-review-root-joined",
+      stage: "settled",
+      evidence: { worker: "joined", setup: "joined", transport: "drained" },
+    });
+  }
   yield* ensureIssueRepositoryTables(f.sql);
   yield* bindIssueRepositoryProject(f.sql, {
     key: { host: "github.com", repositoryNodeId: "R_publication" },
@@ -7257,8 +7292,10 @@ it.effect(
     ),
 );
 
-const makeHumanManagedMergeFixture = Effect.fn("mergeTest.authenticFixture")(function* () {
-  const p = yield* makeHumanPublicationFixture();
+const makeHumanManagedMergeFixture = Effect.fn("mergeTest.authenticFixture")(function* (
+  options: { readonly parentAssessment?: boolean; readonly settleReviewRoot?: boolean } = {},
+) {
+  const p = yield* makeHumanPublicationFixture(options);
   const { f, input, target, permission, authorization } = p;
   const pending = yield* p.publication.enqueuePrepared(
     authorization.prepareInTransaction({ input, target, permission }),
@@ -8025,6 +8062,675 @@ it.effect(
             entry.evidenceId.startsWith("managed-merge-delivery:"),
           ),
         ).toBe(false);
+      }),
+    ),
+);
+
+it.effect(
+  "confirmed reviewed delivery accepts only its qualified code task without rewriting criteria",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture({
+          parentAssessment: true,
+          settleReviewRoot: true,
+        });
+        const before = yield* m.f.state();
+        const taskId = m.request.target.taskId;
+        const required = before.criteria.filter((c) => c.taskId === taskId && c.required);
+        expect(required.length).toBeGreaterThan(0);
+        expect(required.every((c) => c.status === "satisfied" || c.status === "waived")).toBe(true);
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        const after = yield* m.f.state();
+        expect(after.tasks.find((t) => t.taskId === taskId)?.state).toBe("completed");
+        expect(after.criteria).toEqual(before.criteria);
+        expect(after.tasks.filter((t) => t.taskId !== taskId)).toEqual(
+          before.tasks.filter((t) => t.taskId !== taskId),
+        );
+        expect(yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports)).toEqual(receipt);
+        expect(yield* m.f.state()).toEqual(after);
+        expect(m.counts()).toEqual({ writes: 1, reads: 0 });
+      }),
+    ),
+);
+it.effect(
+  "confirmed delivery preserves criteria while an active coordinator prevents acceptance",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture({ parentAssessment: true });
+        const before = yield* m.f.state();
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        const after = yield* m.f.state();
+        expect(after.tasks).toEqual(before.tasks);
+        expect(after.criteria).toEqual(before.criteria);
+        expect(after.evidence.some((e) => e.evidenceId.startsWith("delivery-acceptance:"))).toBe(
+          false,
+        );
+        expect(
+          (yield* m.f.sql.withTransaction(m.journal.readInTransaction(receipt.operationId)))
+            ?.receipt,
+        ).toEqual(receipt);
+        expect(m.counts()).toEqual({ writes: 1, reads: 0 });
+      }),
+    ),
+);
+const decodeDeliveryTestCommand = Schema.decodeUnknownSync(ProjectWorkCommand, strict);
+const decodeDeliveryGuidedIntent = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, strict);
+const decodeDeliveryCriterion = Schema.decodeUnknownSync(ProjectWorkCriterion, strict);
+const decodeDeliveryEvidence = Schema.decodeUnknownSync(ProjectWorkEvidence, strict);
+const deliveredDependencyFixture = Effect.fn("deliveryTest.dependency")(function* () {
+  const m = yield* makeHumanManagedMergeFixture({ parentAssessment: true, settleReviewRoot: true });
+  const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+  const downstream = yield* makeVerificationAssignmentFixture(
+    "implementer",
+    "-delivered-dependent",
+  ).pipe(
+    Effect.provideService(ProjectWorkRepository, {
+      ...m.f.repository,
+      execute: (command) =>
+        m.f.repository.execute(
+          command.type === "project-work.foundation.commit" &&
+            command.guided?.intent.type === "project-team.plan.propose"
+            ? {
+                ...command,
+                guided: {
+                  ...command.guided,
+                  intent: {
+                    ...command.guided.intent,
+                    dependencyTaskIds: [m.request.target.taskId],
+                  },
+                },
+              }
+            : command,
+        ),
+    }),
+  );
+  const transition = downstream.request.claim.transition;
+  if (transition?.kind !== "claim") return yield* Effect.die("Missing original downstream claim");
+  const dependencyId = transition.binding.taskId;
+  const command = decodeDeliveryTestCommand;
+  const auth = yield* ProjectTeamAuthorization;
+  const state = yield* m.f.state();
+  const plan = state.foundationRecords?.find(
+    (r) => r.kind === "plan-revision" && r.taskId === dependencyId,
+  );
+  const specGate = state.foundationRecords?.find(
+    (r) => r.kind === "gate" && r.taskId === dependencyId && r.gate === "specification",
+  );
+  const planGate = state.foundationRecords?.find(
+    (r) => r.kind === "gate" && r.taskId === dependencyId && r.gate === "plan",
+  );
+  if (plan?.kind !== "plan-revision" || specGate?.kind !== "gate" || planGate?.kind !== "gate")
+    return yield* Effect.die("Missing exact downstream approvals");
+  const human = {
+    actor: { kind: "human" as const, id: "fixture-human" },
+    source: { kind: "web" as const, id: "fixture-browser" },
+    recordedAt: at,
+  };
+  const executionIntent = (current: typeof state) =>
+    decodeDeliveryGuidedIntent({
+      type: "project-team.execution.start",
+      commandId: "downstream-authority",
+      projectId,
+      expectedRevision: current.revision,
+      taskId: dependencyId,
+      expectedTaskRevision: current.tasks.find((t) => t.taskId === dependencyId)?.revision,
+      specRevision: specGate.specRevision,
+      planRevision: plan.planRevision,
+      specGateId: specGate.recordId,
+      expectedSpecGateRevision: specGate.revision,
+      planId: plan.recordId,
+      expectedPlanRecordRevision: plan.revision,
+      planGateId: planGate.recordId,
+      expectedPlanGateRevision: planGate.revision,
+    });
+  const compile = (current: typeof state) =>
+    m.f.sql.withTransaction(
+      auth.guided({ actor: human.actor }, executionIntent(current), human, false),
+    );
+  const authorized = yield* compile(state);
+  expect(authorized.type).toBe("project-work.foundation.commit");
+  if (authorized.type !== "project-work.foundation.commit")
+    return yield* Effect.die("Missing actual guided foundation command");
+  expect(authorized.guided?.intent.type).toBe("project-team.execution.start");
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+  });
+  const request = {
+    ...downstream.request,
+    claim: { ...downstream.request.claim, expectedRevision: state.revision },
+  };
+  const reserved = yield* journal.reserve(request);
+  yield* journal.inspect(reserved.fence.dispatchId);
+  const acceptance = yield* makeProjectTeamDeliveryAcceptance({
+    environmentId: "environment",
+  }).pipe(Effect.provideService(ProjectWorkPublicationAuthorization, m.authorization));
+  const assertDependencies = m.f.sql.withTransaction(
+    acceptance.assertTaskDependenciesInTransaction({ projectId, taskId: dependencyId }),
+  );
+  return {
+    m,
+    receipt,
+    dependencyId,
+    acceptance,
+    assertDependencies,
+    command,
+    journal,
+    reserved,
+    compile,
+  };
+});
+it.effect(
+  "accepted delivery qualifies real SQL dependencies while watch metadata preserves the original scope",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* deliveredDependencyFixture();
+        yield* f.assertDependencies;
+        let state = yield* f.m.f.state();
+        const task = state.tasks.find((t) => t.taskId === f.m.request.target.taskId);
+        const membership = state.foundationRecords?.find(
+          (r) => r.kind === "task-membership" && r.taskId === task?.taskId,
+        );
+        expect(
+          evaluateProjectTeamDependency({
+            projectId,
+            taskId: f.m.request.target.taskId,
+            task,
+            memberships: membership?.kind === "task-membership" ? [membership] : [],
+            state,
+          }).available,
+        ).toBe(true);
+        const evidence = state.evidence.find((e) =>
+          e.evidenceId.startsWith("delivery-acceptance:"),
+        );
+        for (const action of ["watch", "unwatch"] as const) {
+          state = yield* f.m.f.state();
+          yield* f.m.f.repository.execute(
+            f.command({
+              type: `project-work.task.${action}`,
+              commandId: `delivery-${action}`,
+              projectId,
+              expectedRevision: state.revision,
+              taskId: f.m.request.target.taskId,
+              watcher: { kind: "human", id: "observer" },
+              ...(action === "watch" ? { watchedAt: at } : { unwatchedAt: at }),
+              attribution,
+            }),
+          );
+          yield* f.assertDependencies;
+          yield* f.journal.inspect(f.reserved.fence.dispatchId);
+        }
+        expect(
+          (yield* f.m.f.state()).evidence.find((e) => e.evidenceId === evidence?.evidenceId),
+        ).toEqual(evidence);
+        expect(f.m.counts().writes).toBe(1);
+      }),
+    ),
+);
+for (const corruption of ["merge-receipt", "acceptance-command"] as const)
+  it.effect(
+    `accepted delivery denies new dependency authority after original ${corruption} corruption with unchanged projections`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const f = yield* deliveredDependencyFixture();
+          yield* f.assertDependencies;
+          const before = yield* f.m.f.state();
+          const retained = readDeliveryAcceptance(before, f.m.request.target.taskId);
+          if (!retained) return yield* Effect.die("Missing original acceptance association");
+          if (corruption === "merge-receipt") {
+            // Deliberately corrupt only the disposable store; production immutability remains unchanged.
+            yield* f.m.f.sql`DROP TRIGGER project_work_managed_merge_immutable`;
+            yield* f.m.f.sql`DROP TRIGGER project_work_managed_merge_status`;
+            yield* f.m.f
+              .sql`UPDATE project_work_managed_merge SET receipt_json=json_set(receipt_json,'$.confirmation.mergeCommitSha',${"e".repeat(40)}) WHERE operation_id=${f.receipt.operationId}`;
+          } else
+            yield* f.m.f
+              .sql`UPDATE project_work_command_receipts SET payload_fingerprint='corrupt' WHERE command_id=${retained.detail.commandId}`;
+          expect(yield* f.m.f.state()).toEqual(before);
+          expect((yield* f.assertDependencies.pipe(Effect.result))._tag).toBe("Failure");
+          const deniedCompile = yield* f.compile(before).pipe(Effect.result);
+          expect(deniedCompile._tag).toBe("Failure");
+          if (deniedCompile._tag === "Failure")
+            expect(deniedCompile.failure.reason).toBe(
+              "Delivered dependency history is no longer qualified",
+            );
+          const deniedDispatch = yield* f.journal
+            .inspect(f.reserved.fence.dispatchId)
+            .pipe(Effect.result);
+          expect(deniedDispatch._tag).toBe("Failure");
+          if (deniedDispatch._tag === "Failure")
+            expect(deniedDispatch.failure.reason).toBe("Delivered dependency history changed");
+          expect(yield* f.m.f.state()).toEqual(before);
+          expect(f.m.counts().writes).toBe(1);
+        }),
+      ),
+  );
+
+it.effect(
+  "reopened delivered work loses dependency authority while historical acceptance replay never regrants completion",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* deliveredDependencyFixture();
+        const state = yield* f.m.f.state();
+        const auth = yield* ProjectTeamAuthorization;
+        const human = {
+          actor: { kind: "human" as const, id: "fixture-human" },
+          source: { kind: "web" as const, id: "fixture-browser" },
+          recordedAt: at,
+        };
+        yield* f.m.f.repository.executeAtomic(
+          auth
+            .guided(
+              { actor: human.actor },
+              decodeDeliveryGuidedIntent({
+                type: "project-team.task.control",
+                commandId: "delivery-reopen",
+                projectId,
+                expectedRevision: state.revision,
+                taskId: f.m.request.target.taskId,
+                expectedTaskRevision: state.tasks.find(
+                  (t) => t.taskId === f.m.request.target.taskId,
+                )?.revision,
+                control: {
+                  action: "reopen",
+                  reason: "Human requests another review of delivered work",
+                },
+              }),
+              human,
+              false,
+            )
+            .pipe(Effect.map((command) => [command])),
+        );
+        const reopened = yield* f.m.f.state();
+        expect((yield* f.assertDependencies.pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          yield* f.acceptance.accept({
+            operationId: f.receipt.operationId,
+            expectedReceiptSha256: deliveryAcceptanceHash(f.receipt),
+          }),
+        ).toMatchObject({ _tag: "Accepted" });
+        expect(yield* f.m.f.state()).toEqual(reopened);
+        expect(f.m.counts().writes).toBe(1);
+      }),
+    ),
+);
+it.effect(
+  "confirmed delivery without satisfied required criteria remains recoverable without completing its task",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture({ settleReviewRoot: true });
+        const before = yield* m.f.state();
+        expect(
+          before.criteria.some(
+            (c) => c.taskId === m.request.target.taskId && c.required && c.status === "unsatisfied",
+          ),
+        ).toBe(true);
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        const acceptance = yield* makeProjectTeamDeliveryAcceptance({
+          environmentId: "environment",
+        }).pipe(Effect.provideService(ProjectWorkPublicationAuthorization, m.authorization));
+        expect(yield* acceptance.recover(receipt.operationId)).toMatchObject({ _tag: "NotReady" });
+        expect(
+          (yield* acceptance.pending()).some((r) => r.operationId === receipt.operationId),
+        ).toBe(true);
+        expect((yield* m.f.state()).tasks).toEqual(before.tasks);
+        expect((yield* m.f.state()).criteria).toEqual(before.criteria);
+        expect(m.counts().writes).toBe(1);
+      }),
+    ),
+);
+it.effect(
+  "pure delivery qualification preserves existing human waiver and URI-only evidence bytes",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture({
+          parentAssessment: true,
+          settleReviewRoot: true,
+        });
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        const actual = yield* m.f.state();
+        const accepted = readDeliveryAcceptance(
+          actual,
+          m.request.target.taskId,
+          receipt.operationId,
+        );
+        if (!accepted) return yield* Effect.die("Missing original accepted source");
+        const taskId = m.request.target.taskId;
+        const waiverAttribution = {
+          actor: { kind: "human" as const, id: "existing-waiver-human" },
+          source: { kind: "web" as const, id: "existing-waiver-browser" },
+          recordedAt: at,
+        };
+        const support = actual.criteria
+          .filter((c) => c.taskId === taskId && c.required)
+          .map((c) =>
+            decodeDeliveryEvidence({
+              evidenceId: `human-waiver:${c.criterionId}`,
+              taskId,
+              kind: "observation",
+              summary: "Human accepted this limitation",
+              uri: "https://example.test/decision",
+              recordedAt: at,
+              revision: 0,
+              attribution: waiverAttribution,
+            }),
+          );
+        // Pure retained-state observation only: the current guided API cannot produce a new waiver.
+        const state = {
+          ...actual,
+          evidence: [...actual.evidence, ...support],
+          criteria: actual.criteria.map((c) =>
+            c.taskId === taskId && c.required
+              ? decodeDeliveryCriterion({
+                  ...c,
+                  status: "waived",
+                  satisfiedByEvidenceIds: [],
+                  waiver: {
+                    reason: "Existing explicitly accepted limitation",
+                    evidenceIds: [`human-waiver:${c.criterionId}`],
+                    specRevision: accepted.detail.proof.source.specRevision,
+                    waivedAt: at,
+                    attribution: waiverAttribution,
+                  },
+                })
+              : c,
+          ),
+        };
+        const before = structuredClone(state);
+        const snapshots = deliveryCriterionSnapshots(state, accepted.detail.proof.source);
+        expect(() =>
+          assertDeliveryAcceptanceCurrent(state, { ...accepted.detail.proof, ...snapshots }),
+        ).toThrow("Delivered source is no longer current");
+        expect(state).toEqual(before);
+        expect(snapshots.support).toEqual(
+          support
+            .map((e) => ({
+              evidenceId: e.evidenceId,
+              sha256: deliveryAcceptanceHash(e),
+            }))
+            .sort((a, b) => a.evidenceId.localeCompare(b.evidenceId)),
+        );
+        for (const invalid of ["actor", "spec"] as const) {
+          const changed = {
+            ...state,
+            criteria: state.criteria.map((c) =>
+              c.waiver
+                ? decodeDeliveryCriterion({
+                    ...c,
+                    waiver: {
+                      ...c.waiver,
+                      ...(invalid === "spec"
+                        ? { specRevision: c.waiver.specRevision + 1 }
+                        : {
+                            attribution: {
+                              ...c.waiver.attribution,
+                              actor: { kind: "agent", id: "agent-waiver" },
+                            },
+                          }),
+                    },
+                  })
+                : c,
+            ),
+          };
+          expect(() => deliveryCriterionSnapshots(changed, accepted.detail.proof.source)).toThrow(
+            "Required criterion has no current human waiver",
+          );
+        }
+        expect(yield* m.f.state()).toEqual(actual);
+      }),
+    ),
+);
+
+it.effect(
+  "failed acceptance COMMIT preserves delivered receipt and permits one atomic acceptance retry",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture({
+          parentAssessment: true,
+          settleReviewRoot: true,
+        });
+        const before = yield* m.f.state();
+        const query = yield* ProjectWorkQuery,
+          gateway = yield* ProjectWorkGateway,
+          bus = yield* ProjectWorkEventBus;
+        const published: string[] = [];
+        const drained = yield* Deferred.make<void>();
+        const changes = yield* bus.subscribe;
+        const markerId = ProjectWorkEvidenceId.make("acceptance-test-drain");
+        yield* Effect.forkScoped(
+          changes.pipe(
+            Stream.runForEach(({ event }) =>
+              Effect.gen(function* () {
+                if (event.type !== "project-work.evidence.added") return;
+                published.push(event.evidence.evidenceId);
+                if (event.evidence.evidenceId === markerId)
+                  yield* Deferred.succeed(drained, undefined);
+              }),
+            ),
+          ),
+        );
+        yield* m.f.sql`CREATE TABLE controlled_acceptance_parent(id TEXT PRIMARY KEY)`;
+        yield* m.f
+          .sql`CREATE TABLE controlled_acceptance_child(id TEXT REFERENCES controlled_acceptance_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* m.f
+          .sql`CREATE TRIGGER controlled_acceptance_commit AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'delivery-acceptance:%' BEGIN INSERT INTO controlled_acceptance_child VALUES ('missing'); END`;
+        // SqlClient's owning COMMIT finalizer preserves this deferred SQL failure as a defect.
+        expect(
+          (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect((yield* query.snapshot(projectId).pipe(Effect.exit))._tag).toBe("Failure");
+        expect(
+          (yield* gateway
+            .read({ projectId, operation: "foundation-records", recordKinds: ["gate"] })
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        // This unpersisted bus marker drains only the controlled observer, granting no domain authority.
+        yield* bus.publish([
+          {
+            cursor: before.revision,
+            event: {
+              eventId: EventId.make("acceptance-observer-drain"),
+              projectId,
+              revision: before.revision,
+              type: "project-work.evidence.added",
+              evidence: {
+                evidenceId: markerId,
+                kind: "observation",
+                summary: "Controlled observer drain",
+                recordedAt: at,
+                revision: 0,
+              },
+              addedAt: at,
+              occurredAt: at,
+            },
+          },
+        ]);
+        yield* Deferred.await(drained);
+        expect(published.some((id) => id.startsWith("delivery-acceptance:"))).toBe(false);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* m.f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect((yield* m.f.state()).tasks).toEqual(before.tasks);
+        expect((yield* m.f.state()).criteria).toEqual(before.criteria);
+        const deliveries = yield* m.f
+          .sql`SELECT operation_id FROM project_work_managed_merge WHERE project_id=${projectId} AND status='confirmed' LIMIT 2`;
+        expect(deliveries.length).toBe(1);
+        const operationId = deliveries[0]?.operation_id;
+        if (typeof operationId !== "string")
+          return yield* Effect.die("Missing original confirmed delivery");
+        const original = yield* m.f.sql.withTransaction(m.journal.readInTransaction(operationId));
+        if (!original?.receipt) return yield* Effect.die("Confirmed delivery receipt was lost");
+        const receipt = original.receipt;
+        yield* m.f.sql`DROP TRIGGER controlled_acceptance_commit`;
+        const acceptance = yield* makeProjectTeamDeliveryAcceptance({
+          environmentId: "environment",
+        }).pipe(Effect.provideService(ProjectWorkPublicationAuthorization, m.authorization));
+        expect(yield* acceptance.recover(receipt.operationId)).toMatchObject({ _tag: "Accepted" });
+        const after = yield* m.f.state();
+        expect(after.tasks.find((t) => t.taskId === m.request.target.taskId)?.state).toBe(
+          "completed",
+        );
+        expect(yield* acceptance.recover(receipt.operationId)).toMatchObject({ _tag: "Accepted" });
+        expect(yield* m.f.state()).toEqual(after);
+        expect(m.counts().writes).toBe(1);
+      }),
+    ),
+);
+
+it.effect(
+  "ordinary evidence and caller-shaped delivery transitions cannot forge task acceptance",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture({
+          parentAssessment: true,
+          settleReviewRoot: true,
+        });
+        const before = yield* m.f.state();
+        const evidence = {
+          evidenceId: "delivery-acceptance:" + "a".repeat(64),
+          taskId: m.request.target.taskId,
+          kind: "observation",
+          summary: "System-looking caller evidence",
+          recordedAt: at,
+          revision: 0,
+          attribution: {
+            actor: { kind: "system", id: "project-team-delivery-acceptance" },
+            source: { kind: "system", id: "project-team-delivery-acceptance" },
+            recordedAt: at,
+          },
+        };
+        expect(
+          (yield* m.f.repository
+            .execute(
+              decodeDeliveryTestCommand({
+                type: "project-work.evidence.add",
+                commandId: "forge-delivery",
+                projectId,
+                expectedRevision: before.revision,
+                evidence,
+                addedAt: at,
+                attribution,
+              }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* m.f.state()).toEqual(before);
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        const after = yield* m.f.state();
+        const retained = readDeliveryAcceptance(
+          after,
+          m.request.target.taskId,
+          receipt.operationId,
+        );
+        if (!retained) return yield* Effect.die("Missing real retained association");
+        expect(
+          (yield* m.f.repository
+            .execute(
+              decodeCommit({
+                type: "project-work.foundation.commit",
+                commandId: "human-raw-delivery",
+                projectId,
+                expectedRevision: after.revision,
+                records: [],
+                committedAt: at,
+                attribution: {
+                  actor: { kind: "human", id: "caller" },
+                  source: { kind: "web", id: "caller" },
+                  recordedAt: at,
+                },
+                transition: {
+                  kind: "delivery.accept",
+                  expectedTaskRevision: after.tasks.find(
+                    (t) => t.taskId === m.request.target.taskId,
+                  )?.revision,
+                  proof: retained.detail.proof,
+                },
+              }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* m.f.state()).toEqual(after);
+        expect(m.counts().writes).toBe(1);
+      }),
+    ),
+);
+it.effect(
+  "later source grant revocation preserves accepted delivery history while denying dependency use",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* deliveredDependencyFixture();
+        yield* f.assertDependencies;
+        const before = yield* f.m.f.state();
+        const retained = readDeliveryAcceptance(
+          before,
+          f.m.request.target.taskId,
+          f.receipt.operationId,
+        );
+        const grant = before.foundationRecords?.find(
+          (r) => r.kind === "gate" && r.verificationJobId === f.m.f.prepared.manifest.jobId,
+        );
+        if (grant?.kind !== "gate" || !retained)
+          return yield* Effect.die("Missing original delivery grant");
+        yield* f.m.f.repository.execute(
+          decodeCommit({
+            type: "project-work.foundation.commit",
+            commandId: "accepted-source-revoked",
+            projectId,
+            expectedRevision: before.revision,
+            attribution: grant.attribution,
+            committedAt: at,
+            records: [
+              { ...grant, status: "invalidated", revision: grant.revision + 1, updatedAt: at },
+            ],
+          }),
+        );
+        expect((yield* f.assertDependencies.pipe(Effect.result))._tag).toBe("Failure");
+        const after = yield* f.m.f.state();
+        expect(after.evidence.find((e) => e.evidenceId === retained.evidence.evidenceId)).toEqual(
+          retained.evidence,
+        );
+        expect(yield* f.acceptance.recover(f.receipt.operationId)).toMatchObject({
+          _tag: "Accepted",
+        });
+        expect(yield* f.m.f.state()).toEqual(after);
+        expect(f.m.counts().writes).toBe(1);
+      }),
+    ),
+);
+it.effect(
+  "corrupt unaccepted receipt remains a bounded recovery identity and never grants completion",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture({ settleReviewRoot: true });
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        const before = yield* m.f.state();
+        yield* m.f.sql`DROP TRIGGER project_work_managed_merge_immutable`;
+        yield* m.f.sql`DROP TRIGGER project_work_managed_merge_status`;
+        yield* m.f
+          .sql`UPDATE project_work_managed_merge SET receipt_json=json_set(receipt_json,'$.confirmation.mergeCommitSha',${"e".repeat(40)}) WHERE operation_id=${receipt.operationId}`;
+        const acceptance = yield* makeProjectTeamDeliveryAcceptance({
+          environmentId: "environment",
+        }).pipe(Effect.provideService(ProjectWorkPublicationAuthorization, m.authorization));
+        expect(yield* acceptance.pending()).toEqual([{ operationId: receipt.operationId }]);
+        expect((yield* acceptance.recover(receipt.operationId).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* m.f.state()).toEqual(before);
+        expect(m.counts().writes).toBe(1);
       }),
     ),
 );

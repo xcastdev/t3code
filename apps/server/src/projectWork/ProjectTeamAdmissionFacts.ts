@@ -2,6 +2,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
   EnvironmentId,
+  ProjectId,
   ProjectTeamRecord,
   ProjectWorkTaskId,
   ProviderInstanceId,
@@ -34,7 +35,8 @@ import type { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJourna
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { projectTeamDerivedRecordId, projectTeamAssignmentRole } from "./ProjectTeamPolicy.ts";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
-import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { deliveryDependencyIds } from "./ProjectTeamDeliveryAcceptanceState.ts";
+import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 
 const nativeFs = process.getBuiltinModule("fs");
 const safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
@@ -533,6 +535,33 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
         }
       });
     };
+    const assertDelivered = Effect.fn("ProjectTeamAdmissionFacts.assertDelivered")(function* (
+      actual: ProjectWorkReducerState,
+      taskId: ProjectWorkTaskId,
+    ) {
+      const dependencies = yield* Effect.try({
+        try: () => deliveryDependencyIds(actual, taskId),
+        catch: () => denied("Dependency lineage changed"),
+      });
+      if (dependencies.length > 0) {
+        const owner = yield* Effect.serviceOption(ProjectWorkRepository),
+          client = yield* Effect.serviceOption(SqlClient.SqlClient);
+        if (Option.isNone(owner) || (Option.isSome(client) && client.value !== sql))
+          return yield* denied("Delivery repository or SQL changed");
+        const { makeProjectTeamDeliveryAcceptance } = yield* Effect.promise(
+          () => import("./ProjectTeamDeliveryAcceptance.ts"),
+        );
+        const acceptance = yield* makeProjectTeamDeliveryAcceptance({ environmentId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.provideService(ProjectWorkRepository, owner.value),
+          Effect.provideService(ServerSettingsService, settings),
+          Effect.mapError(() => denied("Delivery history unavailable")),
+        );
+        yield* acceptance
+          .assertTaskDependencies({ projectId: ProjectId.make(actual.projectId), taskId: taskId })
+          .pipe(Effect.mapError(() => denied("Delivered dependency history changed")));
+      }
+    });
     /** Root invokes revalidation in the captured SQL transaction before admission writes.
      * The handle belongs to this callback only and expires with the actual runtime loan. */
     const withCurrent = <A, E, R>(
@@ -555,6 +584,10 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
             catch: (error) =>
               isFactsError(error) ? error : denied("Current configuration is invalid"),
           });
+          const beforeCapture = yield* readCurrentState(sql, input.state.projectId);
+          if (!equal(beforeCapture, input.state))
+            return yield* denied("Current reducer snapshot changed");
+          yield* assertDelivered(beforeCapture, input.taskId);
           const fresh = yield* catalogue.readFresh;
           if (fresh === undefined)
             return yield* denied("Fresh owned catalogue metadata is unavailable");
@@ -571,6 +604,7 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                 const actual = yield* readCurrentState(sql, input.state.projectId);
                 if (!equal(actual, input.state))
                   return yield* denied("Current reducer snapshot changed");
+                yield* assertDelivered(actual, input.taskId);
                 const configured = (yield* settings.getSettings).providerInstances[
                   selected.instanceId
                 ];
