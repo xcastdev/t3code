@@ -321,10 +321,209 @@ describe("GuidedTaskDetail human interactions", () => {
     await act(async () => field.dispatchEvent(new Event("input", { bubbles: true })));
   }
   async function action(value: string) {
-    const select = host.querySelector<HTMLSelectElement>("select")!;
+    const select = host.querySelector<HTMLSelectElement>(
+      'select[aria-label="Task control action"]',
+    )!;
     select.value = value;
     await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
   }
+
+  it("waives the selected criterion through the mounted guided task with exact definition revisions", async () => {
+    await render();
+    await fill("Waiver reason", "Accept the documented reconnect exception");
+    await click("Waive selected criterion");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.criterion.waiver",
+      projectId,
+      taskId: current.task.taskId,
+      expectedRevision: current.revision,
+      expectedTaskRevision: current.task.revision,
+      criterionId: current.criteria[0]!.criterionId,
+      expectedCriterionRevision: current.criteria[0]!.revision,
+      expectedSpecRevision: current.task.specRevision,
+      expectedSpecificationHash: hash({
+        specification: current.task.specification,
+        criteria: current.criteria.map(({ criterionId, description, required, waiver }) => ({
+          criterionId,
+          description,
+          required,
+          waiver,
+        })),
+      }),
+      action: {
+        kind: "waive",
+        reason: "Accept the documented reconnect exception",
+        evidenceIds: [],
+      },
+    });
+    expect(host.textContent).toContain("Approvals must be renewed");
+  });
+
+  it("revokes a recorded selected waiver without submitting a replacement reason", async () => {
+    current = decodeContext({
+      ...current,
+      criteria: current.criteria.map((criterion) => ({
+        ...criterion,
+        status: "waived",
+        waiver: {
+          reason: "Original human exception",
+          evidenceIds: [],
+          specRevision: 2,
+          waivedAt: at,
+          attribution,
+        },
+      })),
+    });
+    foundation = records(current);
+    await render();
+    await click("Revoke selected waiver");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.criterion.waiver",
+      criterionId: "criterion-1",
+      action: { kind: "revoke" },
+    });
+    expect(emitted[0]?.type === "project-team.criterion.waiver" && emitted[0].action).toEqual({
+      kind: "revoke",
+    });
+  });
+
+  it("retries the exact uncertain waiver after refreshed criterion history changes", async () => {
+    write.mockImplementationOnce(async (intent) => {
+      emitted.push(decodeWrite(intent));
+      throw Error("Lost waiver response");
+    });
+    await render();
+    await fill("Waiver reason", "Keep this original human decision");
+    await click("Waive selected criterion");
+    const original = emitted[0];
+    current = decodeContext({
+      ...current,
+      revision: 11,
+      criteria: current.criteria.map((criterion) => ({
+        ...criterion,
+        revision: criterion.revision + 1,
+      })),
+    });
+    foundation = records(current, "invalidated");
+    await render();
+    await click("Retry exact request");
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toEqual(original);
+    expect(button("Waive selected criterion").disabled).toBe(true);
+  });
+
+  it.each(["criterion", "hash", "owner", "disconnect"] as const)(
+    "denies a drafted waiver after %s changes",
+    async (change) => {
+      await render();
+      await fill("Waiver reason", "Review this captured definition");
+      const held = callbacks.get("Waive selected criterion");
+      if (change === "criterion")
+        current = decodeContext({
+          ...current,
+          criteria: current.criteria.map((criterion) => ({
+            ...criterion,
+            revision: criterion.revision + 1,
+          })),
+        });
+      if (change === "hash")
+        current = decodeContext({
+          ...current,
+          criteria: current.criteria.map((criterion) => ({
+            ...criterion,
+            description: "Changed acceptance definition",
+          })),
+        });
+      await render(
+        change === "owner"
+          ? { environmentId: EnvironmentId.make("environment-2") }
+          : change === "disconnect"
+            ? { connected: false }
+            : {},
+      );
+      await act(async () => held?.());
+      expect(emitted).toEqual([]);
+      if (change === "criterion" || change === "hash")
+        expect(button("Waive selected criterion").disabled).toBe(true);
+    },
+  );
+
+  it("cancels a local waiver and directs protected criteria to specification revision", async () => {
+    await render();
+    await fill("Waiver reason", "Do not send this canceled draft");
+    await click("Cancel waiver change");
+    expect(emitted).toEqual([]);
+    expect(button("Waive selected criterion").disabled).toBe(true);
+    current = decodeContext({
+      ...current,
+      task: { ...current.task, specification: { ...current.task.specification, protected: true } },
+    });
+    foundation = records(current);
+    await render();
+    expect(host.textContent).toContain("approved specification revision process");
+    expect(
+      [...host.querySelectorAll("button")].some(
+        (button) => button.textContent === "Waive selected criterion",
+      ),
+    ).toBe(false);
+    expect(emitted).toEqual([]);
+  });
+
+  it("offers only retained evidence matching the selected current scope for waiver references", async () => {
+    const specificationHash = hash({
+      specification: current.task.specification,
+      criteria: current.criteria.map(({ criterionId, description, required, waiver }) => ({
+        criterionId,
+        description,
+        required,
+        waiver,
+      })),
+    });
+    const contentHash = hash({
+      content: "Implement reconnect, then exercise a remote disconnect",
+      dependencyTaskIds: [],
+    });
+    const scopeHash = hash({
+      specificationHash,
+      plan: { planRevision: 3, contentHash, dependencyTaskIds: [] },
+    });
+    current = decodeContext({
+      ...current,
+      evidence: [
+        {
+          evidenceId: "current-reference",
+          taskId: current.task.taskId,
+          criterionId: "criterion-1",
+          kind: "observation",
+          summary: "Current retained explanation",
+          scopeHash,
+          recordedAt: at,
+          revision: 0,
+        },
+        {
+          evidenceId: "old-reference",
+          taskId: current.task.taskId,
+          kind: "observation",
+          summary: "Old scope explanation",
+          scopeHash: "f".repeat(64),
+          recordedAt: at,
+          revision: 0,
+        },
+      ],
+    });
+    await render();
+    const reference = host.querySelector<HTMLInputElement>(
+      'input[aria-label="Reference Current retained explanation"]',
+    );
+    expect(reference).not.toBeNull();
+    expect(host.querySelector('input[aria-label="Reference Old scope explanation"]')).toBeNull();
+    await fill("Waiver reason", "Use the retained explanation");
+    await act(async () => reference!.click());
+    await click("Waive selected criterion");
+    expect(emitted[0]).toMatchObject({ action: { evidenceIds: ["current-reference"] } });
+  });
 
   it("requests reassignment with the explicitly selected member revision and human reason", async () => {
     foundation = [

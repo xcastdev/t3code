@@ -1,4 +1,5 @@
 /* @vitest-environment happy-dom */
+import * as NodeCrypto from "node:crypto";
 import { RegistryContext } from "@effect/atom-react";
 import {
   EnvironmentId,
@@ -12,6 +13,11 @@ import { Atom, AtomRegistry, AsyncResult } from "effect/unstable/reactivity";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+vi.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digestStringAsync: async (_algorithm: string, input: string) =>
+    NodeCrypto.createHash("sha256").update(input).digest("hex"),
+}));
 
 const fixture = vi.hoisted(() => ({
   registry: undefined as unknown,
@@ -402,6 +408,13 @@ async function fill(label: string, text: string) {
   Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(field, text);
   await act(async () => field.dispatchEvent(new Event("input", { bubbles: true })));
 }
+async function selectWaiverCriterion() {
+  const label = "Select criterion: Retain the conversation";
+  expect(button(label).disabled).toBe(false);
+  const press = fixture.callbacks.get(label);
+  expect(press).toBeDefined();
+  await act(async () => await press?.());
+}
 async function snapshot(items = records, revision = current.revision) {
   records = items;
   if (host.childElementCount === 0)
@@ -415,6 +428,141 @@ async function snapshot(items = records, revision = current.revision) {
 }
 
 describe("mounted task lifecycle", () => {
+  it("waives a selected criterion through the actual mobile task action session", async () => {
+    await render();
+    await selectWaiverCriterion();
+    await fill("Waiver reason", "Accept this documented mobile exception");
+    await click("Waive selected criterion");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.criterion.waiver",
+      projectId,
+      taskId: "task-1",
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      criterionId: "criterion-1",
+      expectedCriterionRevision: 3,
+      expectedSpecRevision: 2,
+      action: { kind: "waive", reason: "Accept this documented mobile exception", evidenceIds: [] },
+    });
+    expect(host.textContent).toContain("Approvals must be renewed");
+    expect(button("Waive selected criterion").disabled).toBe(true);
+  });
+
+  it("revokes only the selected recorded waiver through the mobile screen", async () => {
+    current = decodeContext({
+      ...current,
+      criteria: current.criteria.map((criterion) => ({
+        ...criterion,
+        status: "waived",
+        waiver: {
+          reason: "Original exception",
+          evidenceIds: [],
+          specRevision: 2,
+          waivedAt: at,
+          attribution: { actor: { kind: "human" }, source: { kind: "mobile" }, recordedAt: at },
+        },
+      })),
+    });
+    fixture.query.data = current;
+    registry.set(task, AsyncResult.success(current));
+    await render();
+    await selectWaiverCriterion();
+    await click("Revoke selected waiver");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.criterion.waiver",
+      criterionId: "criterion-1",
+      action: { kind: "revoke" },
+    });
+  });
+
+  it("retries the original mobile waiver after lost response and changed criterion history", async () => {
+    fixture.command.mockImplementationOnce(async ({ input }: { input: ProjectWorkWriteIntent }) => {
+      emitted.push(decodeWrite(input));
+      throw Error("Lost waiver response");
+    });
+    await render();
+    await selectWaiverCriterion();
+    await fill("Waiver reason", "Keep the original exception");
+    await click("Waive selected criterion");
+    const original = emitted[0];
+    expect(original).toBeDefined();
+    current = decodeContext({
+      ...current,
+      revision: 11,
+      criteria: current.criteria.map((criterion) => ({
+        ...criterion,
+        revision: criterion.revision + 1,
+      })),
+    });
+    fixture.query.data = current;
+    registry.set(task, AsyncResult.success(current));
+    await snapshot([membership("paused"), member()], 11);
+    await render();
+    await click("Retry exact command");
+    expect(emitted).toHaveLength(2);
+    expect(emitted[1]).toEqual(original);
+    expect(fixture.sequence).toBe(1);
+  });
+
+  it.each(["owner", "disconnect", "criterion", "cancel"] as const)(
+    "withholds a mobile waiver after %s changes",
+    async (change) => {
+      await render();
+      await selectWaiverCriterion();
+      await fill("Waiver reason", "Review this definition first");
+      const held = fixture.callbacks.get("Waive selected criterion");
+      if (change === "owner") await render("environment-2");
+      if (change === "disconnect") {
+        fixture.connected = false;
+        registry.mount(presentation);
+        await act(async () =>
+          registry.set(presentation, {
+            entry: { enabled: true },
+            connection: { phase: "disconnected" },
+            serverConfig: config(),
+          }),
+        );
+        await render();
+      }
+      if (change === "criterion") {
+        current = decodeContext({
+          ...current,
+          criteria: current.criteria.map((criterion) => ({
+            ...criterion,
+            revision: criterion.revision + 1,
+          })),
+        });
+        fixture.query.data = current;
+        registry.set(task, AsyncResult.success(current));
+        await render();
+      }
+      if (change === "cancel") await click("Cancel waiver change");
+      if (change === "disconnect")
+        expect(registry.get(presentation)).toMatchObject({ connection: { phase: "disconnected" } });
+      await act(async () => held?.());
+      expect(emitted).toEqual([]);
+    },
+  );
+
+  it("directs a protected mobile specification to the approved revision process", async () => {
+    current = decodeContext({
+      ...current,
+      task: { ...current.task, specification: { ...current.task.specification, protected: true } },
+    });
+    fixture.query.data = current;
+    registry.set(task, AsyncResult.success(current));
+    await render();
+    expect(host.textContent).toContain("approved specification revision process");
+    expect(
+      [...host.querySelectorAll("button")].some(
+        (button) => button.textContent === "Select criterion: Retain the conversation",
+      ),
+    ).toBe(false);
+    expect(emitted).toEqual([]);
+  });
+
   it("requests the selected successor revision through the actual task screen", async () => {
     await render();
     await click("Select recipient Next worker · successor · revision 7");

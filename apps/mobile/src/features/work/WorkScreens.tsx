@@ -607,10 +607,12 @@ function WorkTaskSession({
       {review.reason ? <Notice>{review.reason}</Notice> : null}
       {state.notice ? <Notice>{state.notice}</Notice> : null}
       {state.status === "sending" ? <Notice>Sending…</Notice> : null}
+      {state.status === "preparing" ? <Notice>Preparing the selected criterion…</Notice> : null}
       {state.status === "uncertain" ? (
         <WorkButton
           disabled={
-            (state.pending?.type === "project-team.task.control"
+            (state.pending?.type === "project-team.task.control" ||
+            state.pending?.type === "project-team.criterion.waiver"
               ? control.reason
               : review.reason) !== null
           }
@@ -619,7 +621,10 @@ function WorkTaskSession({
           Retry exact command
         </WorkButton>
       ) : null}
-      {state.status !== "idle" && state.status !== "sending" && state.status !== "uncertain" ? (
+      {state.status !== "idle" &&
+      state.status !== "preparing" &&
+      state.status !== "sending" &&
+      state.status !== "uncertain" ? (
         <WorkButton onPress={() => session.reset()}>Review refreshed work</WorkButton>
       ) : null}
       {ownContext === null ? (
@@ -738,8 +743,118 @@ function WorkTaskSession({
             {ownContext.criteria.map((criterion) => (
               <Notice key={criterion.criterionId}>
                 {criterion.description} · {criterion.status}
+                {criterion.waiver ? ` · Waiver: ${criterion.waiver.reason}` : ""}
               </Notice>
             ))}
+            {ownContext.task.specification?.protected ? (
+              <Notice>
+                This specification is protected. Use the approved specification revision process to
+                change a criterion exception.
+              </Notice>
+            ) : ownContext.task.state === "completed" || ownContext.task.state === "canceled" ? (
+              <Notice>Reopen this task before changing a criterion waiver.</Notice>
+            ) : ownContext.task.specification && ownContext.criteria.length > 0 ? (
+              <View className="gap-3">
+                <Notice>
+                  Approvals must be renewed after waiving or revoking a criterion. Current work is
+                  stopped and the changed specification needs approval.
+                </Notice>
+                {ownContext.criteria.map((criterion) => (
+                  <WorkButton
+                    key={criterion.criterionId}
+                    disabled={controlLocked}
+                    onPress={() => session.selectWaiverCriterion(criterion.criterionId)}
+                  >
+                    {`Select criterion: ${criterion.description}`}
+                  </WorkButton>
+                ))}
+                {state.waiver ? (
+                  (() => {
+                    const selected = ownContext.criteria.find(
+                      (criterion) => criterion.criterionId === state.waiver?.criterionId,
+                    );
+                    const changed =
+                      state.waiver.revision !== ownContext.revision ||
+                      state.waiver.criterionRevision !== selected?.revision ||
+                      state.waiver.taskRevision !== ownContext.task.revision;
+                    return (
+                      <View className="gap-3">
+                        <Text selectable>
+                          Selected criterion: {selected?.description ?? "Unavailable"}
+                        </Text>
+                        {changed ? (
+                          <Notice>
+                            This criterion changed. Cancel the draft and review its current
+                            definition.
+                          </Notice>
+                        ) : null}
+                        <TextInput
+                          accessibilityLabel="Waiver reason"
+                          multiline
+                          maxLength={4000}
+                          editable={state.status === "idle"}
+                          value={state.waiverReason}
+                          onChangeText={(reason) => session.editWaiver(reason)}
+                        />
+                        {ownContext.evidence
+                          .filter(
+                            (evidence) =>
+                              evidence.taskId === taskId &&
+                              evidence.scopeHash === state.waiver?.scopeHash &&
+                              (evidence.criterionId === undefined ||
+                                evidence.criterionId === state.waiver?.criterionId) &&
+                              !records.some(
+                                (record) =>
+                                  record.kind === "evidence-applicability" &&
+                                  record.evidenceId === evidence.evidenceId &&
+                                  record.status !== "current",
+                              ),
+                          )
+                          .slice(0, 64)
+                          .map((evidence) => (
+                            <WorkButton
+                              key={evidence.evidenceId}
+                              disabled={controlLocked || changed}
+                              onPress={() => session.toggleWaiverEvidence(evidence.evidenceId)}
+                            >
+                              {`${state.waiverEvidenceIds.includes(evidence.evidenceId) ? "Remove reference" : "Reference"}: ${evidence.summary}`}
+                            </WorkButton>
+                          ))}
+                        <Notice>
+                          Evidence references are optional. The server checks their current
+                          applicability.
+                        </Notice>
+                        <WorkButton
+                          disabled={controlLocked || changed || !state.waiverReason.trim()}
+                          onPress={() => void session.submit({ kind: "waiver", action: "waive" })}
+                        >
+                          Waive selected criterion
+                        </WorkButton>
+                        <WorkButton
+                          disabled={
+                            controlLocked ||
+                            changed ||
+                            selected?.status !== "waived" ||
+                            selected.waiver === undefined
+                          }
+                          onPress={() => void session.submit({ kind: "waiver", action: "revoke" })}
+                        >
+                          Revoke selected waiver
+                        </WorkButton>
+                        <WorkButton
+                          disabled={state.status !== "idle"}
+                          onPress={() => session.cancelWaiver()}
+                        >
+                          Cancel waiver change
+                        </WorkButton>
+                      </View>
+                    );
+                  })()
+                ) : (
+                  <Notice>Select the criterion whose exception you want to review.</Notice>
+                )}
+              </View>
+            ) : null}
             {review.specificationGate ? (
               <GateButtons gate={review.specificationGate} locked={locked} session={session} />
             ) : null}

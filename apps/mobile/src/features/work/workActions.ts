@@ -3,6 +3,7 @@ import {
   ProjectTeamRecord,
   ProjectWorkTask,
   ProjectWorkCriterion,
+  canonicalProjectWorkPayload,
   ProjectWorkAttempt,
   ProjectWorkWriteIntent,
   type CommandId,
@@ -10,6 +11,8 @@ import {
   type ProjectId,
   type ProjectWorkTaskId,
   type ProjectWorkTaskContext,
+  type ProjectWorkCriterionId,
+  type ProjectWorkEvidenceId,
 } from "@t3tools/contracts";
 import type { ProjectWorkFoundationSnapshot } from "@t3tools/client-runtime/project-work";
 import * as Schema from "effect/Schema";
@@ -36,6 +39,18 @@ const knownCriterion = Schema.is(ProjectWorkCriterion);
 const knownAttempt = Schema.is(ProjectWorkAttempt);
 const decodeWrite = Schema.decodeUnknownSync(ProjectWorkWriteIntent);
 const only = <T>(items: ReadonlyArray<T>): T | null => (items.length === 1 ? items[0]! : null);
+const waiverDefinition = (context: ProjectWorkTaskContext) =>
+  canonicalProjectWorkPayload({
+    specification: context.task.specification,
+    criteria: context.criteria
+      .map(({ criterionId, description, required, waiver }) => ({
+        criterionId,
+        description,
+        required,
+        waiver,
+      }))
+      .sort((a, b) => (a.criterionId < b.criterionId ? -1 : a.criterionId > b.criterionId ? 1 : 0)),
+  });
 
 /** Capability flags describe UI support. The server still authorizes every command. */
 function reviewWork(current: MobileWorkCurrent, controls = false) {
@@ -210,14 +225,28 @@ export function reviewMobileTaskControl(current: MobileWorkCurrent) {
 
 export type MobileWorkAction =
   | { readonly kind: "investigate" }
+  | { readonly kind: "waiver"; readonly action: "waive" | "revoke" }
   | { readonly kind: "control"; readonly action: "reassign" | "resume" }
   | { readonly kind: "gate"; readonly gateId: string; readonly response: "approved" | "rejected" };
 export interface MobileWorkActionState {
+  readonly waiver: {
+    readonly criterionId: ProjectWorkCriterionId;
+    readonly criterionRevision: number;
+    readonly specRevision: number;
+    readonly revision: number;
+    readonly taskRevision: number;
+    readonly specification: string;
+    readonly plan: string;
+    readonly specificationHash: string | null;
+    readonly scopeHash: string | null;
+  } | null;
+  readonly waiverReason: string;
+  readonly waiverEvidenceIds: ReadonlyArray<ProjectWorkEvidenceId>;
   readonly reason: string;
   readonly recipient: { readonly id: string; readonly revision: number } | null;
   readonly objective: string;
   readonly outputs: string;
-  readonly status: "idle" | "sending" | "uncertain" | "stale" | "denied" | "accepted";
+  readonly status: "idle" | "preparing" | "sending" | "uncertain" | "stale" | "denied" | "accepted";
   readonly notice: string | null;
   readonly pending: ProjectWorkWriteIntent | null;
 }
@@ -311,6 +340,9 @@ export function createWorkActionSession(
   let alive = true;
   let blockedRevision: number | null = null;
   let state: MobileWorkActionState = {
+    waiver: null,
+    waiverReason: "",
+    waiverEvidenceIds: [],
     reason: "",
     recipient: null,
     objective: "",
@@ -378,6 +410,137 @@ export function createWorkActionSession(
     editControl(reason: string) {
       if (state.status !== "sending" && state.status !== "uncertain") update({ reason });
     },
+    async selectWaiverCriterion(criterionId: ProjectWorkCriterionId) {
+      const value = available(true);
+      const context = value?.context;
+      const criterion = context?.criteria.find((entry) => entry.criterionId === criterionId);
+      if (
+        state.status !== "idle" ||
+        value === null ||
+        !context ||
+        !criterion ||
+        context.task.specification === undefined ||
+        context.task.specification.protected
+      )
+        return;
+      const plan = reviewMobileTaskControl(value).plan;
+      const planSignature = canonicalProjectWorkPayload(plan);
+      const planPayload =
+        plan === null
+          ? null
+          : canonicalProjectWorkPayload({
+              content: plan.content,
+              dependencyTaskIds: [...plan.dependencyTaskIds].sort(),
+              ...(plan.integrationSources === undefined
+                ? {}
+                : { integrationSources: plan.integrationSources }),
+            });
+      const planTarget =
+        plan === null
+          ? undefined
+          : {
+              planRevision: plan.planRevision,
+              dependencyTaskIds: [...plan.dependencyTaskIds].sort(),
+            };
+      const selection = {
+        criterionId,
+        criterionRevision: criterion.revision,
+        specRevision: context.task.specRevision,
+        revision: context.revision,
+        taskRevision: context.task.revision,
+        specification: waiverDefinition(context),
+        plan: planSignature,
+        specificationHash: null,
+        scopeHash: null,
+      };
+      update({
+        status: "preparing",
+        waiver: selection,
+        waiverReason: "",
+        waiverEvidenceIds: [],
+        notice: null,
+      });
+      try {
+        const { CryptoDigestAlgorithm, digestStringAsync } = await import("expo-crypto");
+        const specificationHash = await digestStringAsync(
+          CryptoDigestAlgorithm.SHA256,
+          selection.specification,
+        );
+        const contentHash =
+          planPayload === null
+            ? undefined
+            : await digestStringAsync(CryptoDigestAlgorithm.SHA256, planPayload);
+        const scopeHash = await digestStringAsync(
+          CryptoDigestAlgorithm.SHA256,
+          canonicalProjectWorkPayload({
+            specificationHash,
+            plan: planTarget === undefined ? undefined : { ...planTarget, contentHash },
+          }),
+        );
+        const after = available(true);
+        if (
+          !after?.context ||
+          after.context.revision !== selection.revision ||
+          after.context.task.revision !== selection.taskRevision ||
+          waiverDefinition(after.context) !== selection.specification ||
+          after.context.criteria.find((entry) => entry.criterionId === criterionId)?.revision !==
+            selection.criterionRevision ||
+          canonicalProjectWorkPayload(reviewMobileTaskControl(after).plan) !== planSignature
+        ) {
+          if (alive)
+            update({
+              status: "stale",
+              notice: "The selected criterion or connection changed. Refresh and review it again.",
+            });
+          return;
+        }
+        update({ status: "idle", waiver: { ...selection, specificationHash, scopeHash } });
+      } catch {
+        if (alive)
+          update({
+            status: "denied",
+            notice: "The current criterion definition could not be prepared. Refresh work.",
+          });
+      }
+    },
+    editWaiver(reason: string) {
+      if (state.status === "idle") update({ waiverReason: reason });
+    },
+    toggleWaiverEvidence(evidenceId: ProjectWorkEvidenceId) {
+      const value = available(true);
+      if (
+        state.status !== "idle" ||
+        !state.waiver ||
+        !value?.context?.evidence.some(
+          (evidence) =>
+            evidence.evidenceId === evidenceId &&
+            evidence.taskId === scope.taskId &&
+            evidence.scopeHash === state.waiver?.scopeHash &&
+            (evidence.criterionId === undefined ||
+              evidence.criterionId === state.waiver?.criterionId),
+        ) ||
+        value.foundation.records
+          .filter(knownRecord)
+          .some(
+            (record) =>
+              record.kind === "evidence-applicability" &&
+              record.evidenceId === evidenceId &&
+              record.status !== "current",
+          )
+      )
+        return;
+      const selected = state.waiverEvidenceIds.includes(evidenceId);
+      if (!selected && state.waiverEvidenceIds.length >= 64) return;
+      update({
+        waiverEvidenceIds: selected
+          ? state.waiverEvidenceIds.filter((id) => id !== evidenceId)
+          : [...state.waiverEvidenceIds, evidenceId],
+      });
+    },
+    cancelWaiver() {
+      if (state.status === "idle")
+        update({ waiver: null, waiverReason: "", waiverEvidenceIds: [], notice: null });
+    },
     selectRecipient(memberId: string, revision: number) {
       const value = available(true);
       if (
@@ -392,7 +555,7 @@ export function createWorkActionSession(
     },
     async submit(action: MobileWorkAction) {
       if (state.status !== "idle") return;
-      const value = available(action.kind === "control");
+      const value = available(action.kind === "control" || action.kind === "waiver");
       if (value === null || value.context === null || value.context.revision === blockedRevision) {
         update({ notice: "Load current work in this environment and project before sending." });
         return;
@@ -407,7 +570,50 @@ export function createWorkActionSession(
       };
       let intent: ProjectWorkWriteIntent;
       try {
-        if (action.kind === "control") {
+        if (action.kind === "waiver") {
+          const captured = state.waiver;
+          const criterion = value.context.criteria.find(
+            (entry) => entry.criterionId === captured?.criterionId,
+          );
+          if (
+            !captured ||
+            captured.specificationHash === null ||
+            captured.scopeHash === null ||
+            !criterion ||
+            value.context.task.specification?.protected ||
+            captured.revision !== value.context.revision ||
+            captured.taskRevision !== value.context.task.revision ||
+            captured.criterionRevision !== criterion.revision ||
+            captured.specRevision !== value.context.task.specRevision ||
+            captured.specification !== waiverDefinition(value.context) ||
+            captured.plan !== canonicalProjectWorkPayload(reviewMobileTaskControl(value).plan) ||
+            (action.action === "waive" && !state.waiverReason.trim()) ||
+            (action.action === "revoke" &&
+              (criterion.status !== "waived" || criterion.waiver === undefined))
+          ) {
+            update({
+              notice: "Select and review the current criterion before changing its waiver.",
+            });
+            return;
+          }
+          const waiverAction =
+            action.action === "revoke"
+              ? { kind: "revoke" as const }
+              : {
+                  kind: "waive" as const,
+                  reason: state.waiverReason,
+                  evidenceIds: [...state.waiverEvidenceIds],
+                };
+          intent = decodeWrite({
+            ...base,
+            type: "project-team.criterion.waiver",
+            criterionId: captured.criterionId,
+            expectedCriterionRevision: captured.criterionRevision,
+            expectedSpecRevision: captured.specRevision,
+            expectedSpecificationHash: captured.specificationHash,
+            action: waiverAction,
+          });
+        } else if (action.kind === "control") {
           const control = reviewMobileTaskControl(value);
           const recipient = state.recipient;
           if (
@@ -474,8 +680,11 @@ export function createWorkActionSession(
         }
       } catch {
         update({
+          ...(action.kind === "waiver" ? { status: "denied" as const } : {}),
           notice:
-            "Enter an investigation objective and one to sixteen outputs within the server's text limits.",
+            action.kind === "waiver"
+              ? "The criterion waiver could not be prepared. Review its reason and current definition."
+              : "Enter an investigation objective and one to sixteen outputs within the server's text limits.",
         });
         return;
       }
@@ -483,7 +692,12 @@ export function createWorkActionSession(
     },
     async retry() {
       if (state.status !== "uncertain" || state.pending === null) return;
-      if (available(state.pending.type === "project-team.task.control") === null) {
+      if (
+        available(
+          state.pending.type === "project-team.task.control" ||
+            state.pending.type === "project-team.criterion.waiver",
+        ) === null
+      ) {
         update({
           notice:
             "Reconnect and refresh this task in its original environment and project to retry.",
@@ -493,8 +707,19 @@ export function createWorkActionSession(
       await execute(state.pending);
     },
     reset() {
-      if (state.status !== "sending" && state.status !== "uncertain")
-        update({ status: "idle", pending: null, notice: null });
+      if (
+        state.status !== "preparing" &&
+        state.status !== "sending" &&
+        state.status !== "uncertain"
+      )
+        update({
+          status: "idle",
+          pending: null,
+          notice: null,
+          waiver: null,
+          waiverReason: "",
+          waiverEvidenceIds: [],
+        });
     },
     activate() {
       alive = true;

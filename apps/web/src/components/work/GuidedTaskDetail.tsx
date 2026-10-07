@@ -4,6 +4,7 @@ import {
   ProjectTeamRecord,
   ProjectTeamIntegrationSourceRefs,
   ProjectWorkCriterionId,
+  ProjectWorkEvidenceId,
   ProjectWorkCriterion,
   ProjectWorkTask,
   ProjectWorkAttemptState,
@@ -67,6 +68,9 @@ const decodeIntent = Schema.decodeUnknownSync(Schema.fromJsonString(ProjectWorkW
 const descriptionJson = Schema.fromJsonString(Schema.Record(Schema.String, Schema.String));
 const encodeDescriptions = Schema.encodeSync(descriptionJson);
 const decodeDescriptions = Schema.decodeUnknownSync(descriptionJson);
+const evidenceIdsJson = Schema.fromJsonString(Schema.Array(ProjectWorkEvidenceId));
+const decodeEvidenceIds = Schema.decodeUnknownSync(evidenceIdsJson);
+const encodeEvidenceIds = Schema.encodeSync(evidenceIdsJson);
 const criterionFields = (fields: Readonly<Record<string, string>>) =>
   decodeDescriptions(fields.criteria ?? "{}");
 const knownRecord = Schema.is(ProjectTeamRecord);
@@ -121,6 +125,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     readonly id: string;
     readonly revision: number;
   } | null>(null);
+  const [waiverCriterionId, setWaiverCriterionId] = useState<string | null>(null);
   const [newCriterionId] = useState(() => ProjectWorkCriterionId.make(randomUUID()));
   useEffect(
     () => () => {
@@ -296,6 +301,35 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     const source = original(draft);
     const descriptions = criterionFields(fields);
     switch (kind) {
+      case "project-team.criterion.waiver": {
+        const criterion =
+          waiverCriterionId === null
+            ? criteria[0]
+            : criteria.find((entry) => entry.criterionId === waiverCriterionId);
+        if (
+          !criterion ||
+          task.specification === undefined ||
+          task.specification.protected ||
+          terminal
+        )
+          return null;
+        return {
+          ...base,
+          type: kind,
+          criterionId: criterion.criterionId,
+          expectedCriterionRevision: criterion.revision,
+          expectedSpecRevision: task.specRevision,
+          expectedSpecificationHash: specificationHash,
+          action:
+            fields.action === "revoke"
+              ? { kind: "revoke" }
+              : {
+                  kind: "waive",
+                  reason: fields.reason ?? "Explain this criterion exception",
+                  evidenceIds: decodeEvidenceIds(fields.evidenceIds ?? "[]"),
+                },
+        };
+      }
       case "project-team.investigation.start":
         return {
           ...base,
@@ -507,6 +541,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
         integrationSourceRefs: JSON.stringify(retainedSources()),
       };
     if (kind === "project-team.task.control") return { reason: "" };
+    if (kind === "project-team.criterion.waiver") return { reason: "", evidenceIds: "[]" };
     return {};
   }
 
@@ -602,6 +637,14 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     }
     if (kind === "project-team.plan.propose" && !fields.content?.trim()) {
       setNotice("Describe the implementation and validation plan.");
+      return;
+    }
+    if (
+      kind === "project-team.criterion.waiver" &&
+      fields.action !== "revoke" &&
+      !fields.reason?.trim()
+    ) {
+      setNotice("Explain why this criterion can be waived.");
       return;
     }
     const intent = build(kind, fields, existing);
@@ -742,6 +785,26 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
       </WorkCard>
     );
   const specKind = "project-team.specification.propose";
+  const waiverKind = "project-team.criterion.waiver";
+  const waiverDraft = draftFor(waiverKind);
+  const selectedWaiverCriterion =
+    waiverCriterionId === null
+      ? criteria[0]
+      : criteria.find((entry) => entry.criterionId === waiverCriterionId);
+  const selectedEvidenceIds = decodeEvidenceIds(waiverDraft?.fields.evidenceIds ?? "[]");
+  const waiverEvidence = (context?.evidence ?? []).filter(
+    (evidence) =>
+      evidence.taskId === task.taskId &&
+      evidence.scopeHash === scopeHash &&
+      (evidence.criterionId === undefined ||
+        evidence.criterionId === selectedWaiverCriterion?.criterionId) &&
+      !taskRecords.some(
+        (record) =>
+          record.kind === "evidence-applicability" &&
+          record.evidenceId === evidence.evidenceId &&
+          record.status !== "current",
+      ),
+  );
   const specDraft = draftFor(specKind);
   const specSource = original(specDraft);
   const draftCriteria = specSource?.type === specKind ? specSource.criterionSnapshots : criteria;
@@ -934,10 +997,125 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
                 </li>
               ))}
             </ul>
+            {criteria.some((criterion) => criterion.waiver !== undefined) ? (
+              <p>Recorded waivers retain the human reason and evidence references.</p>
+            ) : null}
           </div>
         ) : (
           <p className="mb-3 text-sm text-muted-foreground">No specification proposed yet.</p>
         )}
+        {task.specification?.protected ? (
+          <p className="mb-4 text-sm text-muted-foreground">
+            This specification is protected. Use the approved specification revision process to
+            change a criterion exception.
+          </p>
+        ) : terminal ? (
+          <p className="mb-4 text-sm text-muted-foreground">
+            Reopen this task before changing a criterion waiver.
+          </p>
+        ) : task.specification && criteria.length > 0 ? (
+          <details className="mb-4">
+            <summary className="cursor-pointer text-sm font-medium">
+              Change a criterion waiver
+            </summary>
+            <div className="mt-3 space-y-3 text-sm">
+              <p className="text-muted-foreground">
+                Approvals must be renewed after waiving or revoking a criterion. Current work is
+                stopped and the changed specification needs approval.
+              </p>
+              <label className="block space-y-1">
+                <span>Criterion to waive or revoke</span>
+                <select
+                  aria-label="Criterion to waive or revoke"
+                  className="w-full rounded-md border bg-background p-2"
+                  value={selectedWaiverCriterion?.criterionId ?? ""}
+                  disabled={Boolean(waiverDraft)}
+                  onChange={(event) => setWaiverCriterionId(event.target.value)}
+                >
+                  {criteria.map((criterion) => (
+                    <option key={criterion.criterionId} value={criterion.criterionId}>
+                      {criterion.description} · {criterion.status}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedWaiverCriterion?.waiver ? (
+                <p>Current waiver: {selectedWaiverCriterion.waiver.reason}</p>
+              ) : null}
+              {field(waiverKind, "reason", "Waiver reason", "")}
+              {waiverEvidence.length > 0 ? (
+                <fieldset className="space-y-2">
+                  <legend>Optional retained evidence</legend>
+                  {waiverEvidence.slice(0, 64).map((evidence) => (
+                    <label key={evidence.evidenceId} className="flex items-start gap-2">
+                      <input
+                        type="checkbox"
+                        aria-label={`Reference ${evidence.summary}`}
+                        disabled={Boolean(waiverDraft?.pending)}
+                        checked={selectedEvidenceIds.includes(evidence.evidenceId)}
+                        onChange={(event) =>
+                          edit(waiverKind, {
+                            evidenceIds: encodeEvidenceIds(
+                              event.target.checked
+                                ? [...selectedEvidenceIds, evidence.evidenceId]
+                                : selectedEvidenceIds.filter((id) => id !== evidence.evidenceId),
+                            ),
+                          })
+                        }
+                      />
+                      <span>{evidence.summary}</span>
+                    </label>
+                  ))}
+                </fieldset>
+              ) : (
+                <p className="text-muted-foreground">
+                  No current scoped evidence references are available. A human reason is required.
+                </p>
+              )}
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  disabled={
+                    !canWrite ||
+                    !selectedWaiverCriterion ||
+                    !waiverDraft?.fields.reason?.trim() ||
+                    blockedDraft(waiverKind)
+                  }
+                  onClick={() => submit(waiverKind, { action: "waive" })}
+                >
+                  Waive selected criterion
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={
+                    !canWrite || !selectedWaiverCriterion?.waiver || blockedDraft(waiverKind)
+                  }
+                  onClick={() => submit(waiverKind, { action: "revoke" })}
+                >
+                  Revoke selected waiver
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={Boolean(waiverDraft?.pending)}
+                  onClick={() => {
+                    const key = keyFor(waiverKind);
+                    if (key) {
+                      const next = discardGuidedTaskDraft(state.current, key);
+                      if (next.ok) update(next.state);
+                    }
+                    setWaiverCriterionId(null);
+                    setNotice(null);
+                  }}
+                >
+                  Cancel waiver change
+                </Button>
+              </div>
+              {status(waiverKind)}
+            </div>
+          </details>
+        ) : null}
         <details>
           <summary className="cursor-pointer text-sm font-medium">
             Propose a revised specification

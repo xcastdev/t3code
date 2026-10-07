@@ -39,6 +39,13 @@ In **Approvals and execution**, review and approve the current specification and
 them. Approval applies to the displayed revision. Proposing a revised specification resets
 criterion satisfaction and invalidates the previous scope's approvals and execution permission.
 
+For an explicit human exception, open the task's specification, select a criterion, and give a
+waiver reason. You can reference retained evidence from its current scope. A waiver changes the
+approved specification: current work stops and approvals must be renewed. Use **Revoke selected
+waiver** to return that criterion to unsatisfied; other waivers remain recorded. Canceling the
+draft sends nothing. Protected specifications require the approved revision process, and terminal
+tasks must be reopened first. These controls are available on web, desktop and mobile.
+
 Choose **Start execution** only after reviewing those approvals. The server can still reject the
 request because ownership, prior workers, dependencies, or execution availability prevent it.
 An accepted request records permission; check recorded worker activity to see what actually ran.

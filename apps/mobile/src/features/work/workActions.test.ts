@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import * as NodeCrypto from "node:crypto";
 import {
   CommandId,
   EnvironmentId,
@@ -7,10 +8,16 @@ import {
   ProjectWorkAction,
   ProjectWorkTaskContext,
   ProjectWorkWriteIntent,
+  canonicalProjectWorkPayload,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { combineProjectWorkFoundationPages } from "@t3tools/client-runtime/project-work";
 import { createWorkActionSession, reviewMobileWork } from "./workActions";
+vi.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digestStringAsync: async (_algorithm: string, input: string) =>
+    NodeCrypto.createHash("sha256").update(input).digest("hex"),
+}));
 
 const projectId = ProjectId.make("project-a");
 const environmentId = EnvironmentId.make("environment-a");
@@ -137,6 +144,141 @@ const current = () => ({
 });
 
 describe("mobile human work", () => {
+  it("captures a selected waiver definition before sending its exact mobile request", async () => {
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      current,
+      async (input) => {
+        sent.push(decodeWrite(input));
+      },
+      () => CommandId.make("mobile-waiver"),
+    );
+    await session.selectWaiverCriterion(context.criteria[0]!.criterionId);
+    session.editWaiver("Accept a documented exception");
+    await session.submit({ kind: "waiver", action: "waive" });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      type: "project-team.criterion.waiver",
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      criterionId: context.criteria[0]!.criterionId,
+      expectedCriterionRevision: 1,
+      expectedSpecRevision: 2,
+      expectedSpecificationHash: NodeCrypto.createHash("sha256")
+        .update(
+          canonicalProjectWorkPayload({
+            specification: context.task.specification,
+            criteria: context.criteria.map(({ criterionId, description, required, waiver }) => ({
+              criterionId,
+              description,
+              required,
+              waiver,
+            })),
+          }),
+        )
+        .digest("hex"),
+      action: { kind: "waive", reason: "Accept a documented exception", evidenceIds: [] },
+    });
+  });
+
+  it("keeps the exact uncertain waiver request after later criterion revision changes", async () => {
+    let latest = current();
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      () => latest,
+      async (input) => {
+        sent.push(input);
+        throw Error("Lost response");
+      },
+      () => CommandId.make("uncertain-waiver"),
+    );
+    await session.selectWaiverCriterion(context.criteria[0]!.criterionId);
+    session.editWaiver("Keep the original exception");
+    await session.submit({ kind: "waiver", action: "waive" });
+    expect(session.state.status).toBe("uncertain");
+    latest = {
+      ...latest,
+      context: decodeContext({
+        ...context,
+        criteria: context.criteria.map((criterion) => ({
+          ...criterion,
+          revision: criterion.revision + 1,
+        })),
+      }),
+    };
+    session.editWaiver("Replace the original reason");
+    await session.retry();
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual(sent[0]);
+  });
+
+  it("denies waiver sends after selected targets, owner or connection change and cancel sends nothing", async () => {
+    for (const change of ["criterion", "specification", "owner", "disconnect", "cancel"] as const) {
+      let latest = current();
+      const sent: ProjectWorkWriteIntent[] = [];
+      const session = createWorkActionSession(
+        { environmentId, projectId, taskId: context.task.taskId },
+        () => latest,
+        async (input) => {
+          sent.push(input);
+        },
+        () => CommandId.make("denied-waiver"),
+      );
+      await session.selectWaiverCriterion(context.criteria[0]!.criterionId);
+      session.editWaiver("Accept this exception");
+      if (change === "criterion")
+        latest = {
+          ...latest,
+          context: decodeContext({
+            ...context,
+            criteria: context.criteria.map((criterion) => ({
+              ...criterion,
+              revision: criterion.revision + 1,
+            })),
+          }),
+        };
+      if (change === "specification")
+        latest = {
+          ...latest,
+          context: decodeContext({
+            ...context,
+            criteria: context.criteria.map((criterion) => ({
+              ...criterion,
+              description: "Changed definition",
+            })),
+          }),
+        };
+      if (change === "owner")
+        latest = { ...latest, environmentId: EnvironmentId.make("other-environment") };
+      if (change === "disconnect") latest = { ...latest, connected: false };
+      if (change === "cancel") session.cancelWaiver();
+      await session.submit({ kind: "waiver", action: "waive" });
+      expect(sent).toEqual([]);
+    }
+  });
+
+  it("denies a changed owner while criterion hashing yields without rebasing the selection", async () => {
+    let latest = current();
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      () => latest,
+      async (input) => {
+        sent.push(input);
+      },
+      () => CommandId.make("hash-owner"),
+    );
+    const preparing = session.selectWaiverCriterion(context.criteria[0]!.criterionId);
+    expect(session.state.status).toBe("preparing");
+    latest = { ...latest, environmentId: EnvironmentId.make("other-environment") };
+    await preparing;
+    expect(session.state.status).toBe("stale");
+    await session.submit({ kind: "waiver", action: "waive" });
+    expect(sent).toEqual([]);
+  });
+
   it("sends reassignment with the reviewed member revision and reason", async () => {
     const member = decodeRecord({
       ...fields,

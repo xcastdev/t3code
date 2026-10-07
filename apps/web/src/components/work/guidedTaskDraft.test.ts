@@ -94,6 +94,40 @@ const gate = (
 });
 
 describe("guided task drafts and exact submissions", () => {
+  it("retains waiver criterion and specification targets when the task revision is unchanged", () => {
+    const input: Extract<ProjectTeamGuidedIntent, { type: "project-team.criterion.waiver" }> = {
+      type: "project-team.criterion.waiver",
+      commandId: CommandId.make("waiver-source"),
+      projectId,
+      taskId,
+      expectedRevision: 10,
+      expectedTaskRevision: 7,
+      expectedSpecRevision: 2,
+      criterionId: ProjectWorkCriterionId.make("criterion-one"),
+      expectedCriterionRevision: 3,
+      expectedSpecificationHash: "a".repeat(64),
+      action: { kind: "waive", reason: "A deliberate human exception", evidenceIds: [] },
+    };
+    const draftKey = key({ kind: input.type });
+    const state = edited(createGuidedTaskDraftState(), draftKey, input);
+    for (const change of [
+      { criterionId: ProjectWorkCriterionId.make("criterion-two") },
+      { expectedCriterionRevision: 4 },
+      { expectedSpecificationHash: "b".repeat(64) },
+    ]) {
+      const next = { ...input, ...change, commandId: CommandId.make("waiver-attempt") };
+      expect(compareGuidedTaskDraft(state, draftKey, next)?.targetsChanged).toBe(true);
+      expectRefusal(beginGuidedTaskSubmission(state, draftKey, next), state, "target-changed");
+    }
+    const sent = submit(state, draftKey, { ...input, commandId: CommandId.make("waiver-command") });
+    const uncertain = changed(
+      recordGuidedTaskDraftOutcome(sent.state, sent.submission, "uncertain"),
+    );
+    const retry = retryGuidedTaskSubmission(uncertain, draftKey);
+    expect(retry.ok).toBe(true);
+    if (retry.ok) expect(retry.submission.intentJson).toBe(sent.submission.intentJson);
+  });
+
   it("retains an exact verification proposal and refuses changed binding or criterion targets", () => {
     const input = {
       type: "project-team.verification.propose" as const,
