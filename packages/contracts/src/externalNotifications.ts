@@ -81,17 +81,43 @@ export class ExternalNotificationError extends Schema.TaggedError<ExternalNotifi
   }
 }
 
-export function buildExternalNotificationRelativeRoute(input: {
+interface NotificationLinkTarget {
   readonly environmentId: EnvironmentId | string;
   readonly threadId: ThreadId | string;
-}): string {
+  readonly projectWork?: {
+    readonly projectId: ProjectId | string;
+    readonly taskId: ProjectWorkTaskId | string;
+  };
+}
+
+const exactWorkIdentity = (value: string) =>
+  typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value;
+
+function workLinkSegments(input: NotificationLinkTarget) {
+  if (input.projectWork === undefined) return undefined;
+  if (
+    !exactWorkIdentity(input.environmentId) ||
+    !exactWorkIdentity(input.projectWork.projectId) ||
+    !exactWorkIdentity(input.projectWork.taskId)
+  )
+    throw new TypeError("Invalid durable Work notification target");
+  return [input.environmentId, input.projectWork.projectId, input.projectWork.taskId].map(
+    encodeURIComponent,
+  );
+}
+
+export function buildExternalNotificationRelativeRoute(input: NotificationLinkTarget): string {
+  const work = workLinkSegments(input);
+  if (work) return `/work/${work[0]}/${work[1]}?taskId=${work[2]}`;
   return `/threads/${encodeURIComponent(input.environmentId)}/${encodeURIComponent(input.threadId)}`;
 }
 
-export function buildExternalNotificationDeepLink(input: {
-  readonly appScheme: ExternalNotificationAppScheme;
-  readonly environmentId: EnvironmentId | string;
-  readonly threadId: ThreadId | string;
-}): string {
+export function buildExternalNotificationDeepLink(
+  input: NotificationLinkTarget & {
+    readonly appScheme: ExternalNotificationAppScheme;
+  },
+): string {
+  const work = workLinkSegments(input);
+  if (work) return `${input.appScheme}://work/${work[0]}/${work[1]}/tasks/${work[2]}`;
   return `${input.appScheme}://threads/${encodeURIComponent(input.environmentId)}/${encodeURIComponent(input.threadId)}`;
 }

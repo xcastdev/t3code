@@ -6,6 +6,7 @@ import {
   ProjectWorkAttemptId,
   ProjectWorkTaskId,
   type ProjectIssueIntake,
+  type ExternalNotificationPayload,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { describe, expect, it } from "vite-plus/test";
@@ -18,12 +19,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type * as Statement from "effect/unstable/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ExternalNotificationDispatcher from "../notifications/ExternalNotificationDispatcher.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as HomeAssistantWebhookAdapter from "../notifications/HomeAssistantWebhookAdapter.ts";
 import { runForkMigrations, runMigrations } from "../persistence/Migrations.ts";
 import * as ProjectWorkAttentionReactor from "./ProjectWorkAttentionReactor.ts";
 
@@ -39,6 +43,7 @@ import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 
 const projectId = ProjectId.make("attention-project");
 const at = "2026-01-01T00:00:00.000Z";
+const decodeNotificationOutcome = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
 const closureTaskId = ProjectWorkTaskId.make("closure-task");
 const closedIssue = {
@@ -649,6 +654,129 @@ describe("ProjectWorkAttentionReactor", () => {
         }
       }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
   );
+
+  for (const invalid of [false, true]) {
+    effectIt.effect(
+      invalid
+        ? "keeps invalid durable Work notification targets pending without sending"
+        : "drains durable Work attention through the real dispatcher with task links",
+      () => {
+        const sent: ExternalNotificationPayload[] = [];
+        const owner = EnvironmentId.make("remote server");
+        const notificationLayer = ExternalNotificationDispatcher.layer.pipe(
+          Layer.provide(
+            Layer.succeed(HomeAssistantWebhookAdapter.HomeAssistantWebhookAdapter, {
+              send: ({ payload }) => Effect.sync(() => sent.push(payload)),
+            }),
+          ),
+          Layer.provide(
+            ServerSettings.layerTest({
+              externalNotifications: {
+                appScheme: "t3code",
+                destinations: [
+                  {
+                    _tag: "home-assistant-webhook",
+                    id: "home",
+                    label: "Home",
+                    enabled: true,
+                    configured: true,
+                    webhookUrl: "https://home.example.test/api/webhook/token",
+                  },
+                ],
+              },
+            }),
+          ),
+        );
+        return TestClock.setTime(Date.parse(at)).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              yield* runMigrations();
+              const sql = yield* SqlClient.SqlClient;
+              const reactor = yield* ProjectWorkAttentionReactor.ProjectWorkAttentionReactor;
+              // Keep the durable fixture private until this explicit drain completes.
+              yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  const before = closureState();
+                  const next = applyProjectWorkProjectionEvent(before, issueEvent(10, closedIssue));
+                  yield* persistProjectWorkState(sql, next, projectId);
+                  yield* ProjectWorkAttentionReactor.enqueueProjectWorkAttentionPublication(
+                    sql,
+                    projectId,
+                    before,
+                    next,
+                    at,
+                  );
+                  const queued = yield* sql<{
+                    taskId: string;
+                    status: string;
+                  }>`SELECT task_id AS taskId,status FROM project_work_notification_publications WHERE project_id=${projectId}`;
+                  expect(queued).toEqual([{ taskId: closureTaskId, status: "pending" }]);
+                  if (invalid) {
+                    yield* sql`UPDATE project_work_notification_publications SET task_id=${` ${closureTaskId} `} WHERE project_id=${projectId}`;
+                    const altered = yield* sql<{
+                      taskId: string;
+                    }>`SELECT task_id AS taskId FROM project_work_notification_publications WHERE project_id=${projectId}`;
+                    expect(altered[0]?.taskId).toBe(` ${closureTaskId} `);
+                  }
+                  const result = yield* reactor.drain;
+                  expect(result.claimed).toBe(1);
+                  const retained = yield* sql<{
+                    status: string;
+                    ownerId: string | null;
+                    outcome: string;
+                    deliveredAt: string | null;
+                  }>`SELECT status,owner_id AS ownerId,outcome_json AS outcome,delivered_at AS deliveredAt FROM project_work_notification_publications WHERE project_id=${projectId}`;
+                  expect(retained).toHaveLength(1);
+                  expect(retained[0]?.ownerId).toBeNull();
+                  if (invalid) {
+                    expect(result.retried).toBe(1);
+                    expect(result.delivered).toBe(0);
+                    expect(sent).toEqual([]);
+                    expect(retained[0]?.status).toBe("pending");
+                    expect(retained[0]?.deliveredAt).toBeNull();
+                    expect(yield* decodeNotificationOutcome(retained[0]?.outcome)).toEqual({
+                      attemptedDestinationIds: [],
+                      deliveredDestinationIds: [],
+                      failedDestinationIds: [],
+                      outcomes: [],
+                    });
+                  } else {
+                    expect(result.delivered).toBe(1);
+                    expect(retained[0]?.status).toBe("sent");
+                    expect(sent).toHaveLength(1);
+                    expect(sent[0]?.relativeRoute).toBe(
+                      "/work/remote%20server/attention-project?taskId=closure-task",
+                    );
+                    expect(sent[0]?.deepLink).toBe(
+                      "t3code://work/remote%20server/attention-project/tasks/closure-task",
+                    );
+                    expect(sent[0]?.projectWork).toMatchObject({
+                      projectId,
+                      taskId: closureTaskId,
+                      revision: next.tasks[0]?.revision,
+                    });
+                  }
+                }),
+              );
+            }).pipe(
+              Effect.provide(
+                ProjectWorkAttentionReactor.layer.pipe(
+                  Layer.provide(notificationLayer),
+                  Layer.provideMerge(
+                    Layer.succeed(ServerEnvironment.ServerEnvironment, {
+                      getEnvironmentId: Effect.succeed(owner),
+                      getDescriptor: Effect.die("unused"),
+                    }),
+                  ),
+                  Layer.provideMerge(NodeSqliteClient.layerMemory()),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
 
   effectIt.effect("fences a partial publication and records destination outcomes", () =>
     Effect.gen(function* () {

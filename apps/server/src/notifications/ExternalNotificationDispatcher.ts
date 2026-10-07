@@ -9,6 +9,8 @@ import {
   ExternalNotificationTestResult,
   type EnvironmentId,
   ThreadId,
+  ProjectWorkTaskState,
+  ProjectWorkAttentionReason,
 } from "@t3tools/contracts";
 import type { RelayAgentActivityState } from "@t3tools/contracts/relay";
 import * as Context from "effect/Context";
@@ -24,6 +26,16 @@ import * as HomeAssistantWebhookAdapter from "./HomeAssistantWebhookAdapter.ts";
 import * as ProjectWorkContentGuard from "../projectWork/ProjectWorkContentGuard.ts";
 
 const MAX_DESTINATION_CONCURRENCY = 4;
+const isWorkNotificationState = Schema.is(
+  Schema.Struct({
+    state: ProjectWorkTaskState,
+    reason: ProjectWorkAttentionReason,
+    revision: Schema.Int.check(
+      Schema.isGreaterThanOrEqualTo(0),
+      Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+    ),
+  }),
+);
 
 export interface ExternalNotificationDispatchInput {
   readonly environmentId: EnvironmentId;
@@ -101,6 +113,8 @@ export function buildExternalNotificationPayload(input: {
   readonly test: boolean;
   readonly projectWork?: ExternalNotificationDispatchInput["projectWork"];
 }): ExternalNotificationPayload {
+  if (input.projectWork !== undefined && !isWorkNotificationState(input.projectWork))
+    throw new TypeError("Invalid durable Work notification state");
   return {
     schemaVersion: 1,
     test: input.test,
@@ -117,11 +131,16 @@ export function buildExternalNotificationPayload(input: {
           headline: input.state.headline,
           ...(input.state.detail === undefined ? {} : { detail: input.state.detail }),
         }),
-    relativeRoute: buildExternalNotificationRelativeRoute(input),
+    relativeRoute: buildExternalNotificationRelativeRoute({
+      environmentId: input.environmentId,
+      threadId: input.threadId,
+      ...(input.projectWork === undefined ? {} : { projectWork: input.projectWork }),
+    }),
     deepLink: buildExternalNotificationDeepLink({
       appScheme: input.appScheme,
       environmentId: input.environmentId,
       threadId: input.threadId,
+      ...(input.projectWork === undefined ? {} : { projectWork: input.projectWork }),
     }),
     ...(input.projectWork === undefined
       ? {}
@@ -200,7 +219,9 @@ export const make = Effect.gen(function* () {
       return next;
     });
     const identity = externalNotificationPublishIdentity(input.state, input.projectWork);
-    const payload = buildExternalNotificationPayload({ ...input, appScheme, test: false });
+    const payload = yield* Effect.try(() =>
+      buildExternalNotificationPayload({ ...input, appScheme, test: false }),
+    );
     const safePayload =
       contentGuard._tag === "None"
         ? payload

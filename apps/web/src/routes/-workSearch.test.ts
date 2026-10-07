@@ -6,6 +6,7 @@ import {
   createRouter,
 } from "@tanstack/react-router";
 import { describe, expect, it } from "vite-plus/test";
+import { buildExternalNotificationRelativeRoute } from "@t3tools/contracts";
 
 import { validateWorkRouteSearch } from "./-workSearch";
 
@@ -24,6 +25,24 @@ function workRouter(entry: string) {
 }
 
 describe("project Work URLs", () => {
+  it("opens the exact task from an emitted Work notification link", async () => {
+    const entry = buildExternalNotificationRelativeRoute({
+      environmentId: "env/remote %雪",
+      threadId: "project-work:obsolete",
+      projectWork: { projectId: "project/?#%", taskId: "task/with space💡" },
+    });
+    for (const router of [workRouter(entry), workRouter(entry)]) {
+      await router.load();
+      expect(router.state.matches.at(-1)?.params).toMatchObject({
+        environmentId: "env/remote %雪",
+        projectId: "project/?#%",
+      });
+      expect(router.state.matches.at(-1)?.search).toEqual({
+        tab: "tasks",
+        taskId: "task/with space💡",
+      });
+    }
+  });
   it("opens a task without losing escaped environment/project identity on reload", async () => {
     const entry = "/work/remote%20server/shared%20project?taskId=task%2F42";
     for (const router of [workRouter(entry), workRouter(entry)]) {
