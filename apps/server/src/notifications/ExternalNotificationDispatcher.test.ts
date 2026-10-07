@@ -326,6 +326,12 @@ it.effect(
         { ...valid, projectWork: { ...valid.projectWork, reason: "future-reason" } },
         { ...valid, projectWork: { ...valid.projectWork, revision: -1 } },
         { ...valid, projectWork: { ...valid.projectWork, revision: Number.NaN } },
+        { ...valid, environmentId: EnvironmentId.make(".") },
+        { ...valid, environmentId: EnvironmentId.make("..") },
+        { ...valid, projectWork: { ...valid.projectWork, projectId: "." } },
+        { ...valid, projectWork: { ...valid.projectWork, projectId: ".." } },
+        { ...valid, projectWork: { ...valid.projectWork, taskId: "." } },
+        { ...valid, projectWork: { ...valid.projectWork, taskId: ".." } },
       ];
       for (const input of invalid) {
         assert.throws(() =>

@@ -91,7 +91,12 @@ interface NotificationLinkTarget {
 }
 
 const exactWorkIdentity = (value: string) =>
-  typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value;
+  typeof value === "string" &&
+  value.length > 0 &&
+  value.length <= 256 &&
+  value.trim() === value &&
+  value !== "." &&
+  value !== "..";
 
 function workLinkSegments(input: NotificationLinkTarget) {
   if (input.projectWork === undefined) return undefined;
