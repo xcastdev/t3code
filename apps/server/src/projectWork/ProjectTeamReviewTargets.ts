@@ -1,6 +1,7 @@
 import {
   canonicalProjectWorkPayload,
   ProjectTeamGate,
+  ProjectTeamReviewFindingProvenance,
   ProjectTeamRunBinding,
   ProjectTeamRoleRevision,
   ProjectVerificationJobManifest,
@@ -14,7 +15,8 @@ import {
   makeProjectTeamDispatchJournal,
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
-import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
+import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { makeProjectWorkVerificationJobs } from "./ProjectWorkVerificationJobs.ts";
 import { makeProjectWorkVerificationGate } from "./ProjectWorkVerificationGate.ts";
 
@@ -81,6 +83,9 @@ const decodeStoredTarget = Schema.decodeUnknownSync(
   Schema.fromJsonString(ProjectTeamReviewTarget),
   { onExcessProperty: "error" },
 );
+const decodeProvenance = Schema.decodeUnknownSync(ProjectTeamReviewFindingProvenance, {
+  onExcessProperty: "error",
+});
 const decodeOptions = Schema.decodeUnknownSync(Options, { onExcessProperty: "error" });
 const isTargetError = Schema.is(ProjectTeamReviewTargetError);
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
@@ -98,9 +103,13 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
     if (capturedOptions === undefined) return yield* deny("Invalid review environment");
     const options = capturedOptions;
     const sql = yield* SqlClient.SqlClient;
+    const repository = yield* ProjectWorkRepository;
     const jobs = yield* makeProjectWorkVerificationJobs({ environmentId: options.environmentId });
     const gates = yield* makeProjectWorkVerificationGate(options);
     const journal = yield* makeProjectTeamDispatchJournal(options);
+    const freshness = yield* makeProjectTeamReviewFreshness({
+      environmentId: options.environmentId,
+    });
     const transaction = Effect.gen(function* () {
       if (
         (yield* SqlClient.SqlClient) !== sql ||
@@ -143,13 +152,14 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
         return yield* deny("Original consumed human review assignment is missing");
       return { original, binding, state, grant, proof, parentPlan: proof.parentPlan };
     });
-    const read = Effect.fn("ProjectTeamReviewTargets.read")(function* (
-      snapshot: ProjectTeamDispatchSnapshot,
-      historical = false,
+    const readStored = Effect.fn("ProjectTeamReviewTargets.readStored")(function* (
+      dispatchId: string,
+      bindingId: string,
+      generation: number,
+      projectId: string,
     ) {
-      const owner = yield* resolve(snapshot, historical);
       const rows =
-        yield* sql`SELECT environment_id,dispatch_id,project_id,binding_id,generation,dispatch_intent_hash,sha256,CASE WHEN length(CAST(manifest_json AS BLOB))<=131072 THEN manifest_json ELSE NULL END AS manifest_json FROM project_team_review_target WHERE environment_id=${options.environmentId} AND (dispatch_id=${snapshot.fence.dispatchId} OR (binding_id=${owner.binding.recordId} AND generation=${owner.binding.generation})) LIMIT 2`;
+        yield* sql`SELECT environment_id,dispatch_id,project_id,binding_id,generation,dispatch_intent_hash,sha256,CASE WHEN length(CAST(manifest_json AS BLOB))<=131072 THEN manifest_json ELSE NULL END AS manifest_json FROM project_team_review_target WHERE environment_id=${options.environmentId} AND (dispatch_id=${dispatchId} OR (binding_id=${bindingId} AND generation=${generation})) LIMIT 2`;
       if (rows.length === 0) return undefined;
       if (rows.length !== 1) return yield* deny("Review target ownership is ambiguous");
       const row = rows[0]!;
@@ -163,7 +173,7 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
       if (
         row.environment_id !== options.environmentId ||
         row.dispatch_id !== target.dispatchId ||
-        row.project_id !== owner.binding.projectId ||
+        row.project_id !== projectId ||
         row.binding_id !== target.reviewer.bindingId ||
         row.generation !== target.reviewer.generation ||
         row.dispatch_intent_hash !== target.dispatchIntentHash ||
@@ -171,7 +181,26 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
         row.manifest_json !== canonical(target)
       )
         return yield* deny("Retained review target owner or hash changed");
-      yield* validate(owner, target);
+      if (
+        target.dispatchId !== dispatchId ||
+        target.reviewer.bindingId !== bindingId ||
+        target.reviewer.generation !== generation
+      )
+        return yield* deny("Retained review target selection changed");
+      return target;
+    });
+    const read = Effect.fn("ProjectTeamReviewTargets.read")(function* (
+      snapshot: ProjectTeamDispatchSnapshot,
+      historical = false,
+    ) {
+      const owner = yield* resolve(snapshot, historical);
+      const target = yield* readStored(
+        snapshot.fence.dispatchId,
+        owner.binding.recordId,
+        owner.binding.generation,
+        owner.binding.projectId,
+      );
+      if (target) yield* validate(owner, target);
       return target;
     });
     const validate = Effect.fn("ProjectTeamReviewTargets.validate")(function* (
@@ -437,6 +466,103 @@ export function makeProjectTeamReviewTargets(input: typeof Options.Type) {
         return target;
       });
     };
-    return { captureInitial, readForDispatch, readRetainedForDispatch };
+    const readHistoricalInside = Effect.fn("ProjectTeamReviewTargets.readHistoricalInside")(
+      function* (provenance: ProjectTeamReviewFindingProvenance) {
+        yield* transaction;
+        const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+        if (Option.isNone(suppliedRepository) || suppliedRepository.value !== repository)
+          return yield* deny("Historical review association requires its original repository");
+        const original = yield* journal.readRetained(provenance.dispatchId);
+        yield* journal.readStageReceipts(provenance.dispatchId);
+        const transition = original.intent.compiledClaim.transition;
+        if (transition?.kind !== "claim")
+          return yield* deny("Historical reviewer claim is missing");
+        const binding = transition.binding;
+        const target = yield* readStored(
+          provenance.dispatchId,
+          provenance.bindingId,
+          provenance.generation,
+          binding.projectId,
+        );
+        if (!target) return yield* deny("Historical reviewer target is missing");
+        const state = yield* readCurrentState(sql, binding.projectId);
+        const roles =
+          state.foundationRecords?.filter((r) => r.recordId === binding.roleRevisionId) ?? [];
+        const grants =
+          state.foundationRecords?.filter((r) => r.recordId === binding.authorizationGateId) ?? [];
+        const role = roles[0];
+        const grant = grants[0];
+        const assignment = grant?.kind === "gate" ? grant.assignmentAuthorization : undefined;
+        const manifest = target.prepared.manifest;
+        if (
+          binding.environmentId !== options.environmentId ||
+          binding.recordId !== provenance.bindingId ||
+          binding.generation !== provenance.generation ||
+          binding.taskId !== provenance.reviewTaskId ||
+          binding.memberId !== provenance.memberId ||
+          binding.providerInstanceId !== provenance.providerInstanceId ||
+          binding.threadId !== provenance.threadId ||
+          roles.length !== 1 ||
+          grants.length !== 1 ||
+          role?.kind !== "role-revision" ||
+          role.role !== "reviewer" ||
+          grant?.kind !== "gate" ||
+          grant.gate !== "assignment" ||
+          grant.attribution.actor.kind !== "human" ||
+          assignment?.assignmentKind !== "review" ||
+          !assignment.parentPlan ||
+          target.dispatchIntentHash !== hash(original.intent) ||
+          target.reviewer.taskId !== binding.taskId ||
+          target.reviewer.initializeOperationId !== provenance.initializeOperationId ||
+          provenance.initializeOperationId !== original.intent.request.initializeOperationId ||
+          target.assignment.gateId !== binding.authorizationGateId ||
+          target.assignment.parentTaskId !== assignment.parentTaskId ||
+          target.assignment.specRevision !== assignment.parentSpecRevision ||
+          target.assignment.planRevision !== assignment.parentPlan.planRevision ||
+          hash(target) !== provenance.targetSha256 ||
+          manifest.projectId !== binding.projectId ||
+          manifest.environmentId !== options.environmentId ||
+          manifest.taskId !== target.assignment.parentTaskId ||
+          manifest.specRevision !== target.assignment.specRevision ||
+          manifest.planRevision !== target.assignment.planRevision ||
+          target.verificationGate.attribution.actor.kind !== "human" ||
+          !["approved", "consumed"].includes(target.verificationGate.status) ||
+          target.verificationGate.verificationJobId !== manifest.jobId ||
+          target.verificationGate.contentHash !== target.prepared.sha256
+        )
+          return yield* deny("Historical reviewer association changed");
+        const prepared = yield* jobs.readPreparedInTransaction(manifest.jobId);
+        if (!prepared || !same(prepared, { manifest, sha256: target.prepared.sha256 }))
+          return yield* deny("Historical prepared verification job changed");
+        // This rehashes retained disposable SDK bytes and original owner/drain metadata; it performs no filesystem read.
+        const initialized = yield* freshness.readForSessionInTransaction({
+          projectId: binding.projectId,
+          taskId: binding.taskId,
+          bindingId: binding.recordId,
+          generation: binding.generation,
+          providerInstanceId: binding.providerInstanceId,
+          threadId: binding.threadId,
+          sessionId: provenance.sessionId,
+          specRevision: binding.specRevision,
+          planRevision: binding.planRevision,
+        });
+        if (initialized.operationId !== provenance.initializeOperationId)
+          return yield* deny("Historical reviewer initialization identity changed");
+        return target;
+      },
+    );
+    const readHistoricalAssociation = (input: {
+      provenance: ProjectTeamReviewFindingProvenance;
+    }) => {
+      try {
+        const owned = decodeProvenance(clone(input.provenance));
+        if (!same(owned, input.provenance) || Object.keys(input).length !== 1)
+          return Effect.fail(deny("Invalid historical reviewer association"));
+        return readHistoricalInside(owned);
+      } catch {
+        return Effect.fail(deny("Invalid historical reviewer association"));
+      }
+    };
+    return { captureInitial, readForDispatch, readRetainedForDispatch, readHistoricalAssociation };
   });
 }

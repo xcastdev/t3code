@@ -21,7 +21,10 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectTeamAuthority, ProjectTeamPrincipal } from "./ProjectTeamAuthorization.ts";
+import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamReviewQualification } from "./ProjectTeamReviewQualification.ts";
+import { makeProjectTeamReviewResolutionReader } from "./ProjectTeamReviewResolution.ts";
+import { indexReviewFindings, selectReviewFindings } from "./ProjectTeamReviewResolutionRecords.ts";
 import {
   ProjectTeamReviewCriterionAssessmentSnapshot,
   snapshotReviewCriterionAssessments,
@@ -179,7 +182,6 @@ const Owner = Schema.Struct({
 const decodeOwner = Schema.decodeUnknownEffect(Schema.fromJsonString(Owner), strict);
 const decodeCriterion = Schema.decodeUnknownSync(ProjectWorkCriterion, strict);
 const decodeEvidence = Schema.decodeUnknownSync(ProjectWorkEvidence, strict);
-const decodeFinding = Schema.decodeUnknownSync(ProjectTeamReviewFinding, strict);
 const RootIntent = Schema.Struct({
   resourceHash: Digest,
   allocation: PiManagedProcessAllocationSchema,
@@ -209,6 +211,7 @@ export const makeProjectTeamReviewCompletionProposals = <E, R>(
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const repository = yield* ProjectWorkRepository;
     const qualification = yield* makeProjectTeamReviewQualification(resolveAuthority);
     const contentGuard = yield* Effect.serviceOption(ProjectWorkContentGuard);
     const assertSafe = (value: unknown) =>
@@ -538,28 +541,22 @@ export const makeProjectTeamReviewCompletionProposals = <E, R>(
         )
       )
         return yield* deny("Completion report does not cover every required child criterion");
-      const findings = records.filter(
-        (r) =>
-          r.kind === "review-finding" &&
-          r.taskId === target.taskId &&
-          canonical(r.target) === canonical(target),
-      );
-      if (findings.length > 256) return yield* deny("Original target findings exceed their bound");
-      const findingSnapshots = findings
-        .flatMap((r) =>
-          r.kind === "review-finding"
-            ? [
-                {
-                  findingId: r.findingId,
-                  revision: r.revision,
-                  sha256: hash(exact(r, decodeFinding)),
-                },
-              ]
-            : [],
-        )
-        .sort((a, b) => a.findingId.localeCompare(b.findingId));
-      if (new Set(findingSnapshots.map((f) => f.findingId)).size !== findingSnapshots.length)
-        return yield* deny("Original target findings are ambiguous");
+      const selectedFindings = selectReviewFindings(indexReviewFindings(state), target);
+      if (selectedFindings.records.some((r) => r.status === "resolved")) {
+        const resolutionReader = yield* makeProjectTeamReviewResolutionReader({
+          environmentId: binding.environmentId,
+        }).pipe(Effect.provideService(ProjectWorkRepository, repository));
+        for (const finding of selectedFindings.records) {
+          if (finding.status !== "resolved") continue;
+          const association = yield* resolutionReader.readInTransaction({
+            findingRecordId: finding.recordId,
+            expectedFindingRevision: finding.revision,
+            expectedFindingSha256: hash(finding),
+          });
+          if (!association) return yield* deny("Resolved finding proof is unavailable");
+        }
+      }
+      const findingSnapshots = selectedFindings.snapshots;
       const criterionAssessments = yield* snapshotReviewCriterionAssessments({
         assessments: report.criterionAssessments,
         state,

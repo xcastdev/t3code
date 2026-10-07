@@ -1565,7 +1565,44 @@ export const ProjectWorkPublicationOutcome = Schema.Union([
   }),
 ]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectWorkPublicationOutcome = typeof ProjectWorkPublicationOutcome.Type;
+/** Host-qualified repair proof; never accepted as a public review-tool input. */
+export const ProjectTeamReviewResolutionProof = Schema.Struct({
+  version: Schema.Literal(1),
+  environmentId: EnvironmentId,
+  prior: Schema.optionalKey(
+    Schema.Struct({
+      revision: JoinedRunCounter,
+      sha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+    }),
+  ),
+  target: ProjectTeamReviewFinding.fields.target,
+  reviewTargetSha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  jobId: GuidedId,
+  manifestHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  attemptId: GuidedId,
+  resultHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  artifacts: Schema.Array(
+    Schema.Struct({
+      artifactId: GuidedId,
+      sha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+      byteCount: JoinedRunCounter.check(Schema.isLessThanOrEqualTo(1048576)),
+    }),
+  ).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(2),
+    Schema.makeFilter(
+      (artifacts) => new Set(artifacts.map((a) => a.artifactId)).size === artifacts.length,
+    ),
+  ),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamReviewResolutionProof = typeof ProjectTeamReviewResolutionProof.Type;
+
 export const ProjectWorkTeamTransition = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("review.resolve"),
+    finding: ProjectTeamReviewFinding,
+    proof: ProjectTeamReviewResolutionProof,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
   Schema.Struct({
     kind: Schema.Literal("verification.claim"),
     taskId: ProjectWorkTaskId,

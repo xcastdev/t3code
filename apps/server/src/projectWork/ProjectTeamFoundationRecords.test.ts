@@ -1,5 +1,7 @@
 import {
+  canonicalProjectWorkPayload,
   CommandId,
+  EnvironmentId,
   ProjectId,
   ProjectWorkTaskId,
   ProjectWorkCriterionId,
@@ -14,6 +16,14 @@ import {
   emptyProjectWorkReducerState,
 } from "./ProjectWorkDecider.ts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
+import {
+  REVIEW_FINDING_RESOLUTION_MAX_FINDING_BYTES,
+  REVIEW_FINDING_RESOLUTION_MAX_EVENT_BYTES,
+  indexReviewFindings,
+  selectReviewFindings,
+  reviewFindingResolutionHash,
+  readReviewFindingResolutionEvidence,
+} from "./ProjectTeamReviewResolutionRecords.ts";
 
 const projectId = ProjectId.make("foundation-guided");
 const taskId = ProjectWorkTaskId.make("foundation-task");
@@ -156,6 +166,195 @@ describe("review finding foundation invariants", () => {
         human,
       ),
     ).toThrow();
+  });
+  it("records a trusted repaired-head resolution without rewriting its origin or completing the task", () => {
+    const current = { ...state(), foundationRecords: [finding] };
+    const resolved = {
+      ...finding,
+      revision: 1,
+      status: "resolved" as const,
+      resolutionArtifactIds: ["retained-output"],
+    };
+    const target = { ...finding.target, headSha: "repaired-head" };
+    const proof = {
+      version: 1 as const,
+      environmentId: EnvironmentId.make("environment"),
+      prior: { revision: finding.revision, sha256: reviewFindingResolutionHash(finding) },
+      target,
+      reviewTargetSha256: resolved.reportedBy.targetSha256,
+      jobId: "verified-job",
+      manifestHash: "b".repeat(64),
+      attemptId: "verified-attempt",
+      resultHash: "c".repeat(64),
+      artifacts: [{ artifactId: "retained-output", sha256: "d".repeat(64), byteCount: 4 }],
+    };
+    const attribution = {
+      actor: {
+        kind: "agent" as const,
+        id: `agent:mcp:${provenance.providerInstanceId}:${provenance.threadId}`,
+      },
+      source: { kind: "mcp" as const, id: "project-work.report" },
+      recordedAt: at,
+    };
+    const command = {
+      type: "project-work.foundation.commit" as const,
+      commandId: CommandId.make("resolve-finding"),
+      projectId,
+      expectedRevision: current.revision,
+      records: [],
+      transition: { kind: "review.resolve" as const, finding: resolved, proof },
+      attribution,
+      committedAt: at,
+    };
+    const events = decideProjectWorkCommand(current, command);
+    expect(events.map((e) => e.type)).toEqual([
+      "project-work.foundation.recorded",
+      "project-work.evidence.added",
+    ]);
+    const next = applyProjectWorkEvents(current, events);
+    expect(next.tasks).toEqual(current.tasks);
+    expect(next.foundationRecords?.[0]).toEqual(resolved);
+    expect(resolved.target).toEqual(finding.target);
+    expect(resolved.originReviewer).toEqual(finding.originReviewer);
+    const association = readReviewFindingResolutionEvidence({ state: next, finding: resolved });
+    expect(association?.detail.proof.target).toEqual(target);
+    const index = indexReviewFindings(next);
+    expect(selectReviewFindings(index, target).records).toEqual([resolved]);
+    expect(selectReviewFindings(index, finding.target).snapshots).toEqual(
+      selectReviewFindings(index, target).snapshots,
+    );
+    expect(selectReviewFindings(indexReviewFindings(current), target).records).toEqual([]);
+    expect(
+      selectReviewFindings(indexReviewFindings({ ...next, evidence: [] }), target).records,
+    ).toEqual([]);
+    expect(decideProjectWorkCommand(next, { ...command, expectedRevision: next.revision })).toEqual(
+      [],
+    );
+    expect(() =>
+      decideProjectWorkCommand(
+        { ...next, evidence: [] },
+        {
+          ...command,
+          expectedRevision: next.revision,
+        },
+      ),
+    ).toThrow();
+    expect(() => decideProjectWorkCommand(current, { ...command, attribution: human })).toThrow();
+    expect(() =>
+      decideProjectWorkCommand(current, {
+        ...command,
+        transition: {
+          ...command.transition,
+          proof: { ...proof, prior: { revision: 0, sha256: "f".repeat(64) } },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decideProjectWorkCommand(current, {
+        ...command,
+        transition: { ...command.transition, finding: { ...resolved, target } },
+      }),
+    ).toThrow();
+    expect(() => validateProjectTeamRecord(current, resolved, attribution)).toThrow();
+  });
+  it("rejects oversized resolution findings atomically while retaining readable boundary findings", () => {
+    const wideProvenance = {
+      ...provenance,
+      bindingId: "\u0001".repeat(254) + "bi",
+      memberId: "\u0001".repeat(254) + "me",
+      threadId: ThreadId.make("\u0001".repeat(254) + "th"),
+      sessionId: "\u0001".repeat(254) + "se",
+      initializeOperationId: "\u0001".repeat(254) + "in",
+      dispatchId: "\u0001".repeat(254) + "di",
+    };
+    const criterionIds = Array.from({ length: 64 }, (_, i) =>
+      ProjectWorkCriterionId.make(String(i) + "\u0001".repeat(136) + "x"),
+    );
+    const base = state();
+    const current = {
+      ...base,
+      criteria: criterionIds.map((id) => ({ ...base.criteria[0]!, criterionId: id })),
+    };
+    const oversized = {
+      ...finding,
+      criterionIds,
+      detail: "x" + "\u0001".repeat(31999),
+      status: "resolved" as const,
+      resolutionArtifactIds: ["retained-output"],
+      originReviewer: wideProvenance,
+      reportedBy: wideProvenance,
+    };
+    const bytes = (value: unknown) => Buffer.byteLength(canonicalProjectWorkPayload(value), "utf8");
+    expect(bytes(oversized)).toBeGreaterThan(REVIEW_FINDING_RESOLUTION_MAX_FINDING_BYTES);
+    const excess = bytes(oversized) - REVIEW_FINDING_RESOLUTION_MAX_FINDING_BYTES;
+    const readable = { ...oversized, detail: "x" + "\u0001".repeat(31999 - Math.ceil(excess / 6)) };
+    expect(bytes(readable)).toBeLessThanOrEqual(REVIEW_FINDING_RESOLUTION_MAX_FINDING_BYTES);
+    expect(bytes(readable)).toBeGreaterThan(REVIEW_FINDING_RESOLUTION_MAX_FINDING_BYTES - 6);
+    const command = {
+      type: "project-work.foundation.commit" as const,
+      commandId: CommandId.make("boundary-resolution"),
+      projectId,
+      expectedRevision: current.revision,
+      records: [],
+      transition: {
+        kind: "review.resolve" as const,
+        finding: readable,
+        proof: {
+          version: 1 as const,
+          environmentId: EnvironmentId.make("environment"),
+          target: finding.target,
+          reviewTargetSha256: provenance.targetSha256,
+          jobId: "verified-job",
+          manifestHash: "b".repeat(64),
+          attemptId: "verified-attempt",
+          resultHash: "c".repeat(64),
+          artifacts: [{ artifactId: "retained-output", sha256: "d".repeat(64), byteCount: 4 }],
+        },
+      },
+      attribution: {
+        actor: {
+          kind: "agent" as const,
+          id: `agent:mcp:${provenance.providerInstanceId}:${wideProvenance.threadId}`,
+        },
+        source: { kind: "mcp" as const, id: "project-work.report" },
+        recordedAt: at,
+      },
+      committedAt: at,
+    };
+    const events = decideProjectWorkCommand(current, command);
+    expect(events).toHaveLength(2);
+    expect(events.every((event) => bytes(event) <= REVIEW_FINDING_RESOLUTION_MAX_EVENT_BYTES)).toBe(
+      true,
+    );
+    const next = applyProjectWorkEvents(current, events);
+    expect(readReviewFindingResolutionEvidence({ state: next, finding: readable })).toBeDefined();
+    expect(decideProjectWorkCommand(next, { ...command, expectedRevision: next.revision })).toEqual(
+      [],
+    );
+    expect(() =>
+      decideProjectWorkCommand(current, {
+        ...command,
+        transition: { ...command.transition, finding: oversized },
+      }),
+    ).toThrow("Finding resolution exceeds its retained finding byte bound");
+    expect(current.evidence).toEqual(base.evidence);
+    const prior = { ...oversized, status: "open" as const, resolutionArtifactIds: [] };
+    expect(() =>
+      decideProjectWorkCommand(
+        { ...current, foundationRecords: [prior] },
+        {
+          ...command,
+          transition: {
+            ...command.transition,
+            finding: { ...readable, revision: 1 },
+            proof: {
+              ...command.transition.proof,
+              prior: { revision: 0, sha256: reviewFindingResolutionHash(prior) },
+            },
+          },
+        },
+      ),
+    ).toThrow("Finding resolution exceeds its retained finding byte bound");
   });
 });
 describe("guided foundation invariants", () => {

@@ -7,6 +7,7 @@ import {
   ProjectId,
   ProjectTeamRecord,
   ProjectTeamReviewCompletionProof,
+  ProjectTeamReviewResolutionProof,
   ProjectWorkCriterion,
   ProjectWorkEvidence,
   ProjectWorkTask,
@@ -22,6 +23,7 @@ import {
   invalidateReviewCriterionProgress,
   assertRetainedReviewCriterionProgress,
 } from "./ProjectTeamReviewCriterionProgress.ts";
+import { prepareReviewFindingResolutionEvidence } from "./ProjectTeamReviewResolutionRecords.ts";
 
 const canonical = canonicalProjectWorkPayload;
 const hash = (value: unknown) =>
@@ -32,6 +34,7 @@ const evidence = Schema.decodeUnknownSync(ProjectWorkEvidence, strict);
 const record = Schema.decodeUnknownSync(ProjectTeamRecord, strict);
 const task = Schema.decodeUnknownSync(ProjectWorkTask, strict);
 const proof = Schema.decodeUnknownSync(ProjectTeamReviewCompletionProof, strict);
+const decodeResolutionProof = Schema.decodeUnknownSync(ProjectTeamReviewResolutionProof, strict);
 const at = "2026-01-01T00:00:00.000Z";
 const human = {
   actor: { kind: "human", id: "human" },
@@ -484,6 +487,77 @@ function finding(criterionId: string, severity: "low" | "critical") {
     reportedBy: reviewer,
   });
 }
+it("repaired-head resolution supports progress and receipt drift removes that support", () => {
+  const original = finding("selected", "critical");
+  if (original.kind !== "review-finding") throw new Error("Invalid finding fixture");
+  const resolved = {
+    ...original,
+    target: { ...target, headSha: "old-head" },
+    revision: 1,
+    status: "resolved" as const,
+    resolutionArtifactIds: ["stdout"],
+  };
+  const resolutionProof = decodeResolutionProof({
+    version: 1,
+    environmentId: verification.environmentId,
+    prior: { revision: 0, sha256: "f".repeat(64) },
+    target,
+    reviewTargetSha256: reviewer.targetSha256,
+    jobId: verification.jobId,
+    manifestHash: verification.manifestHash,
+    attemptId: verification.attemptId,
+    resultHash: verification.resultHash,
+    artifacts: [{ artifactId: "stdout", sha256: "a".repeat(64), byteCount: 4 }],
+  });
+  const receipt = prepareReviewFindingResolutionEvidence({
+    finding: resolved,
+    proof: resolutionProof,
+    commandId: "resolution-command",
+    at,
+    attribution: human,
+  });
+  const initial = fixture().state;
+  const state = {
+    ...initial,
+    foundationRecords: [...(initial.foundationRecords ?? []), resolved],
+    evidence: [...initial.evidence, receipt],
+  };
+  const completion = completed(state);
+  const exact = {
+    ...completion,
+    findings: [
+      {
+        findingId: resolved.findingId,
+        revision: resolved.revision,
+        sha256: hash({ finding: resolved, receipt }),
+      },
+    ],
+  };
+  expect(() => prepare(state, completion)).toThrow();
+  const active = project(state, prepare(state, exact)).state;
+  expect(active.criteria.find((c) => c.criterionId === "selected")?.status).toBe("satisfied");
+  const missingReceipt = {
+    ...active,
+    evidence: active.evidence.filter((e) => e.evidenceId !== receipt.evidenceId),
+  };
+  const invalidated = invalidateReviewCriterionProgress({ state: missingReceipt, at });
+  expect(invalidated).toHaveLength(1);
+  expect(invalidated[0]?.criterion.status).toBe("unsatisfied");
+  const changedReceipt = {
+    ...active,
+    evidence: active.evidence.map((e) =>
+      e.evidenceId === receipt.evidenceId ? { ...e, summary: "Changed retained receipt" } : e,
+    ),
+  };
+  expect(invalidateReviewCriterionProgress({ state: changedReceipt, at })).toHaveLength(1);
+  const waived = {
+    ...missingReceipt,
+    criteria: missingReceipt.criteria.map((c) =>
+      c.criterionId === "selected" ? { ...c, status: "waived" as const } : c,
+    ),
+  };
+  expect(invalidateReviewCriterionProgress({ state: waived, at })).toEqual([]);
+});
 it("an unrelated low finding preserves support while a relevant finding invalidates it", () => {
   const active = project(fixture().state, prepare(fixture().state)).state;
   const unrelated = {

@@ -6,6 +6,8 @@ import {
   ProjectTeamGuidedIntent,
   ProjectWorkTeamTransition,
   ProjectTeamReviewCompletionProof,
+  ProjectTeamReviewResolutionProof,
+  ProjectTeamReviewFindingIntent,
   ProjectWorkExport,
   ProjectWorkMarkdownExport,
   ProjectWorkCriterionRead,
@@ -36,6 +38,67 @@ const decodeTaskRead = Schema.decodeUnknownSync(ProjectWorkTaskRead);
 const decodeClientCommand = Schema.decodeUnknownSync(ClientOrchestrationCommand);
 
 describe("project work contracts", () => {
+  it("bounds private repair proof to exact selected raw output identities", () => {
+    const decode = Schema.decodeUnknownSync(ProjectTeamReviewResolutionProof, {
+      onExcessProperty: "error",
+    });
+    const proof = {
+      version: 1,
+      environmentId: "environment",
+      target: {
+        projectId: "project",
+        taskId: "task",
+        specRevision: 1,
+        planRevision: 1,
+        baseSha: "base",
+        headSha: "repair",
+      },
+      reviewTargetSha256: "a".repeat(64),
+      jobId: "job",
+      manifestHash: "b".repeat(64),
+      attemptId: "attempt",
+      resultHash: "c".repeat(64),
+      artifacts: [{ artifactId: "stdout", sha256: "d".repeat(64), byteCount: 4 }],
+    };
+    expect(decode(proof).prior).toBeUndefined();
+    expect(
+      decode({ ...proof, prior: { revision: 0, sha256: "e".repeat(64) } }).prior?.revision,
+    ).toBe(0);
+    for (const artifacts of [
+      [],
+      [proof.artifacts[0], proof.artifacts[0]],
+      [
+        ...proof.artifacts,
+        { ...proof.artifacts[0], artifactId: "stderr" },
+        { ...proof.artifacts[0], artifactId: "other" },
+      ],
+      [{ ...proof.artifacts[0], byteCount: 1048577 }],
+      [{ ...proof.artifacts[0], sha256: "success-looking" }],
+    ])
+      expect(() => decode({ ...proof, artifacts })).toThrow();
+    expect(() => decode({ ...proof, filesystemCurrent: true })).toThrow();
+    const decodeIntent = Schema.decodeUnknownSync(ProjectTeamReviewFindingIntent);
+    const intent = {
+      type: "project-team.review.finding.record",
+      commandId: "resolve",
+      projectId: "project",
+      taskId: "review-child",
+      expectedRevision: 1,
+      expectedTaskRevision: 0,
+      specRevision: 1,
+      planRevision: 1,
+      findingId: "finding",
+      revision: 1,
+      severity: "high",
+      criterionIds: ["criterion"],
+      detail: "The repair addresses the original finding",
+      status: "resolved",
+      resolutionArtifactIds: ["stdout"],
+    };
+    expect(decodeIntent(intent).resolutionArtifactIds).toEqual(["stdout"]);
+    expect(() => decodeIntent({ ...intent, proof })).toThrow();
+    expect(() => decodeIntent({ ...intent, target: proof.target })).toThrow();
+  });
   it("accepts a title-only draft command without a thread or provider", () => {
     const command = decodeTaskCreate({
       type: "project-work.task.create",

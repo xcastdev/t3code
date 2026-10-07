@@ -5,6 +5,7 @@ import { decideProjectTeamGuidedLifecycle } from "./ProjectTeamGuidedLifecycle.t
 import { decideProjectTeamVerificationClaim } from "./ProjectTeamVerificationTransitions.ts";
 import { decideProjectTeamMemoryReflection } from "./ProjectTeamMemoryTransitions.ts";
 import { decideProjectTeamPublicationTransition } from "./ProjectTeamPublicationTransitions.ts";
+import { decideProjectTeamReviewResolution } from "./ProjectTeamReviewResolutionTransitions.ts";
 import { decideProjectTeamGuidedTransition } from "./ProjectTeamGuidedTransitions.ts";
 import { isGuidedProjectTeamTask, projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import {
@@ -754,6 +755,8 @@ export function decideProjectWorkCommand(
       return events;
     }
     case "project-work.foundation.commit": {
+      if (command.transition?.kind === "review.resolve")
+        return decideProjectTeamReviewResolution(mutableState(state), command, event);
       if (
         command.transition?.kind === "publication.claim" ||
         command.transition?.kind === "publication.reflect"

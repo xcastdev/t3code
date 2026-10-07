@@ -19,6 +19,7 @@ import {
   canonicalProjectWorkPayload,
   GitCommandError,
   ProjectTeamReviewFindingIntent,
+  ProjectTeamReviewFinding,
   ProjectTeamReviewFindingProvenance,
   ProjectTeamRecord,
   ProjectWorkFoundationCommitCommand,
@@ -46,6 +47,7 @@ import {
   ProjectTeamReviewCompletionProposalError,
   type ProjectTeamReviewCompletionProposalManifest,
 } from "./ProjectTeamReviewCompletionProposals.ts";
+import { makeProjectTeamReviewResolutionReader } from "./ProjectTeamReviewResolution.ts";
 import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
@@ -58,6 +60,10 @@ import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiR
 import * as ManagedGit from "../git/ManagedGitExecution.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import { snapshotReviewCriterionAssessments } from "./ProjectTeamReviewCriterionAssessments.ts";
+import {
+  makeProjectWorkVerificationPreparation,
+  ProjectWorkVerificationPreparationError,
+} from "./ProjectWorkVerificationPreparation.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import {
   makeProjectWorkVerificationGate,
@@ -65,7 +71,7 @@ import {
   ProjectWorkVerificationGateError,
 } from "./ProjectWorkVerificationGate.ts";
 import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
-import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
+import { projectTeamDerivedRecordId, projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamWorkspaceReceipt,
@@ -93,6 +99,10 @@ import {
 const canonical = canonicalProjectWorkPayload;
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 const strict = { onExcessProperty: "error" } as const;
+const decodeStoredResolutionFinding = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectTeamReviewFinding),
+  strict,
+);
 const decodeIntent = Schema.decodeUnknownSync(ProjectTeamReviewFindingIntent, strict);
 const decodeCommit = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand, strict);
 const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord, strict);
@@ -576,12 +586,22 @@ const retainControlledVerification = (
       finishedAtMs: yield* Clock.currentTimeMillis,
     });
   });
-const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "success" | "failed") =>
+const makeFindingFixture = (
+  coherentCustody = false,
+  verificationOutcome?: "success" | "failed",
+  existing?: Effect.Success<typeof verificationFixture> & {
+    readonly reviewRootBindingId: string | undefined;
+  },
+  suffix = "",
+) =>
   Effect.gen(function* () {
-    const initial = yield* verificationFixture;
-    const f = coherentCustody
-      ? yield* establishControlledReviewRoot(initial)
-      : { ...initial, reviewRootBindingId: undefined };
+    const initial = existing ?? (yield* verificationFixture);
+    const key = (id: string) => id + suffix;
+    const f =
+      existing ??
+      (coherentCustody
+        ? yield* establishControlledReviewRoot(initial)
+        : { ...initial, reviewRootBindingId: undefined });
     const controlledWorkspace = coherentCustody
       ? yield* (yield* FileSystem.FileSystem).makeTempDirectoryScoped()
       : undefined;
@@ -608,7 +628,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     });
     const human = {
       actor: f.principal.actor,
-      source: { kind: "web" as const, id: "findings-fixture" },
+      source: { kind: "web" as const, id: key("findings-fixture") },
       recordedAt: at,
     };
     const trust = (expectedRevision: number) =>
@@ -630,7 +650,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     const proposal = decodeTeamIntent({
       ...f.selection,
       type: "project-team.verification.propose",
-      commandId: "findings-verification-propose",
+      commandId: key("findings-verification-propose"),
     });
     yield* repository.execute(
       yield* auth
@@ -650,7 +670,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
       return yield* Effect.die("Missing original human verification gate");
     const response = decodeTeamIntent({
       type: "project-team.gate.respond",
-      commandId: "findings-verification-approve",
+      commandId: key("findings-verification-approve"),
       projectId,
       taskId: f.selection.taskId,
       expectedRevision: current.revision,
@@ -698,7 +718,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     const reviewRole = decodeRecord({
       ...role,
       model: coherentCustody ? "inclusionai/ling-3.1-flash:free" : role.model,
-      recordId: "review-role",
+      recordId: key("review-role"),
       roleId: "reviewer",
       role: "reviewer",
       tools: ["pi.read", "project-work.report"],
@@ -715,19 +735,27 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
       );
       if (configured?.kind !== "limits")
         return yield* Effect.die("Missing controlled model limits");
-      yield* commitRecords("findings-review-model-policy", [
-        decodeRecord({ ...configured, recordId: "review-model-limits", model: reviewRole.model }),
+      yield* commitRecords(key("findings-review-model-policy"), [
+        decodeRecord({
+          ...configured,
+          recordId: key("review-model-limits"),
+          model: reviewRole.model,
+        }),
       ]);
     }
-    yield* commitRecords("findings-review-member", [
+    yield* commitRecords(key("findings-review-member"), [
       reviewRole,
-      decodeRecord({ ...member, recordId: "review-member", roleRevisionId: "review-role" }),
+      decodeRecord({
+        ...member,
+        recordId: key("review-member"),
+        roleRevisionId: key("review-role"),
+      }),
     ]);
     current = yield* state();
     yield* repository.execute(
       decodeCommit({
         type: "project-work.foundation.commit",
-        commandId: "findings-assignment",
+        commandId: key("findings-assignment"),
         projectId,
         expectedRevision: current.revision,
         attribution: human,
@@ -736,7 +764,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
         guided: {
           intent: {
             type: "project-team.assignment.start",
-            commandId: "findings-assignment",
+            commandId: key("findings-assignment"),
             projectId,
             taskId: parent.taskId,
             expectedRevision: current.revision,
@@ -760,7 +788,10 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     );
     current = yield* state();
     const grant = current.foundationRecords?.find(
-      (r) => r.kind === "gate" && r.gate === "assignment" && r.taskId !== parent.taskId,
+      (r) =>
+        r.kind === "gate" &&
+        r.gate === "assignment" &&
+        r.recordId === projectTeamDerivedRecordId(key("findings-assignment"), "assignment"),
     );
     const child = current.tasks.find(
       (t) => t.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
@@ -769,17 +800,17 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     const binding = decodeRecord({
       kind: "run-binding",
       projectId,
-      recordId: "review-binding",
+      recordId: key("review-binding"),
       revision: 0,
       generation: 0,
       updatedAt: at,
       status: "reserved",
       taskId: child.taskId,
-      attemptId: "review-attempt",
-      memberId: "review-member",
-      roleRevisionId: "review-role",
+      attemptId: key("review-attempt"),
+      memberId: key("review-member"),
+      roleRevisionId: key("review-role"),
       providerInstanceId: "pi",
-      threadId: "review-thread",
+      threadId: key("review-thread"),
       environmentId: "environment",
       model: reviewRole.model,
       configuration: {
@@ -809,7 +840,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     const claim = decodeCommit({
       type: "project-work.foundation.commit",
       projectId,
-      commandId: "findings-review-claim",
+      commandId: key("findings-review-claim"),
       expectedRevision: (yield* state()).revision,
       attribution,
       committedAt: at,
@@ -825,19 +856,19 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
           type: "project-work.task.claim",
           projectId,
           taskId: child.taskId,
-          commandId: "findings-review-claim",
+          commandId: key("findings-review-claim"),
           attemptId: binding.attemptId,
-          leaseToken: "review-lease",
+          leaseToken: key("review-lease"),
           leasedUntil: "2030-01-01T00:00:00.000Z",
           claimedAt: at,
         },
       },
     });
     const reservation = yield* journal.reserve({
-      dispatchId: "review-dispatch",
+      dispatchId: key("review-dispatch"),
       claim,
       git: {
-        effectId: "review-dispatch",
+        effectId: key("review-dispatch"),
         runId: binding.recordId,
         generation: 0,
         primaryRoot: "/workspace",
@@ -846,12 +877,12 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
         branchRef: binding.branch,
         baseRef: "refs/heads/main",
         baseOid: "a".repeat(40),
-        ownershipToken: "review-owner",
+        ownershipToken: key("review-owner"),
         policyHash: "b".repeat(64),
       },
-      setupId: "review-setup",
-      initializeOperationId: "review-initialize",
-      assignmentOperationId: "review-assignment",
+      setupId: key("review-setup"),
+      initializeOperationId: key("review-initialize"),
+      assignmentOperationId: key("review-assignment"),
       assignment: "Review the original target",
     });
     const snapshot = yield* journal.claimEffect(reservation.fence);
@@ -899,7 +930,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     });
     const request = {
       kind: "initialize",
-      operationId: "review-initialize",
+      operationId: key("review-initialize"),
       threadId: binding.threadId,
       resumeCursor: null,
     };
@@ -937,8 +968,8 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
       kernel: "populated 0\nfrozen 0\n",
     };
     const terminal = {
-      identity: { workerId: "review-worker", generation: 0 },
-      operation: { operationId: "review-initialize", operationKind: "initialize" },
+      identity: { workerId: key("review-worker"), generation: 0 },
+      operation: { operationId: key("review-initialize"), operationKind: "initialize" },
       outcome: "success",
       ownerCaptured: true,
       native,
@@ -947,10 +978,10 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
     };
     yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
     operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json,native_json,terminal_json)
-    VALUES ('review-initialize','environment',${projectId},${binding.recordId},0,${binding.providerInstanceId},${binding.threadId},'review-worker',0,'initialize',${digest(canonical(request))},
+    VALUES (${key("review-initialize")},'environment',${projectId},${binding.recordId},0,${binding.providerInstanceId},${binding.threadId},${key("review-worker")},0,'initialize',${digest(canonical(request))},
       ${binding.recordId},${binding.taskId},1000,100000,'settled',${canonical(nativeIntent)},${canonical(native)},${canonical(terminal)})`;
     yield* sql`INSERT INTO project_team_pi_process (unit,operation_id,allocation_json,status,owner_json,drain_json)
-    VALUES (${allocation.unit},'review-initialize',${canonical(allocation)},'drained',${canonical(owner)},${canonical(drain)})`;
+    VALUES (${allocation.unit},${key("review-initialize")},${canonical(allocation)},'drained',${canonical(owner)},${canonical(drain)})`;
     const freshness = yield* makeProjectTeamReviewFreshness({ environmentId: "environment" });
     yield* freshness.capture({
       projectId,
@@ -959,7 +990,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
       generation: 0,
       providerInstanceId: binding.providerInstanceId,
       threadId: binding.threadId,
-      operationId: "review-initialize",
+      operationId: key("review-initialize"),
       specRevision: binding.specRevision,
       planRevision: 0,
       sessionDirectoryRoot,
@@ -1010,6 +1041,7 @@ const makeFindingFixture = (coherentCustody = false, verificationOutcome?: "succ
       sql.withTransaction(compiler.compile(principal, intent, reportAttribution, false));
     return {
       ...f,
+      verificationBase: f,
       compiler,
       principal,
       reportAttribution,
@@ -1610,9 +1642,15 @@ it.effect("stable finding identity rejects reuse against a replaced original tar
 );
 
 const decodeCompletionReport = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, strict);
-const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "success" | "failed") =>
+const makeProposalFixture = (
+  coherentCustody = false,
+  verificationOutcome?: "success" | "failed",
+  existing?: Effect.Success<ReturnType<typeof makeFindingFixture>>,
+  suffix = "",
+) =>
   Effect.gen(function* () {
-    const f = yield* makeFindingFixture(coherentCustody, verificationOutcome);
+    const f = existing ?? (yield* makeFindingFixture(coherentCustody, verificationOutcome));
+    const key = (value: string) => value + suffix;
     const current = yield* f.state();
     const task = current.tasks.find((t) => t.taskId === f.running.taskId)!;
     const memberships =
@@ -1635,7 +1673,7 @@ const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "suc
       "assignment-intent",
     ] as const) {
       snapshot = yield* journal.advanceStage(snapshot.fence, {
-        receiptId: "proposal-stage-" + stage,
+        receiptId: key("proposal-stage-" + stage),
         stage,
         evidence: { controlledCustody: true },
       });
@@ -1661,10 +1699,10 @@ const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "suc
     if (roots.length !== 1 || root?.kind !== "run-binding")
       return yield* Effect.die("Missing original root binding");
     const originalInitialize = { ...f.nativeIntent, rootBudget, operationLimits };
-    yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(originalInitialize)},root_binding_id=${root.recordId},root_task_id=${root.taskId},maximum_tokens=${operationLimits.maximumTokens},deadline_at_ms=${operationLimits.deadlineAtMs} WHERE operation_id='review-initialize'`;
+    yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(originalInitialize)},root_binding_id=${root.recordId},root_task_id=${root.taskId},maximum_tokens=${operationLimits.maximumTokens},deadline_at_ms=${operationLimits.deadlineAtMs} WHERE operation_id=${key("review-initialize")}`;
     const request = {
       kind: "prompt",
-      operationId: "review-assignment",
+      operationId: key("review-assignment"),
       threadId: f.running.threadId,
       prompt: "Review the original target",
       resumeCursor: f.native,
@@ -1672,7 +1710,7 @@ const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "suc
     const intent = { ...originalInitialize, request, binding: f.running };
     yield* f.sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
     operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json)
-    VALUES ('review-assignment','environment',${projectId},${f.running.recordId},0,${f.running.providerInstanceId},${f.running.threadId},'review-assignment-worker',1,'prompt',${digest(canonical(request))},
+    VALUES (${key("review-assignment")},'environment',${projectId},${f.running.recordId},0,${f.running.providerInstanceId},${f.running.threadId},${key("review-assignment-worker")},1,'prompt',${digest(canonical(request))},
     ${root.recordId},${root.taskId},${operationLimits.maximumTokens},${operationLimits.deadlineAtMs},'running',${canonical(intent)})`;
     // Synthetic retained custody only; no process is started by this fixture.
     const allocation = coherentCustody
@@ -1697,8 +1735,8 @@ const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "suc
       cgroup: "/sys/fs/cgroup/" + allocation.unit,
     };
     const assignedIntent = { ...intent, allocation };
-    yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(assignedIntent)} WHERE operation_id='review-assignment'`;
-    yield* f.sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status,owner_json) VALUES (${allocation.unit},'review-assignment',${canonical(allocation)},'captured',${canonical(assignmentOwner)})`;
+    yield* f.sql`UPDATE project_team_pi_operation SET intent_json=${canonical(assignedIntent)} WHERE operation_id=${key("review-assignment")}`;
+    yield* f.sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status,owner_json) VALUES (${allocation.unit},${key("review-assignment")},${canonical(allocation)},'captured',${canonical(assignmentOwner)})`;
     const operation = {
       environmentId: "environment",
       projectId,
@@ -1707,9 +1745,9 @@ const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "suc
       generation: 0,
       providerInstanceId: f.running.providerInstanceId,
       threadId: f.running.threadId,
-      operationId: "review-assignment",
+      operationId: key("review-assignment"),
       operationKind: "prompt" as const,
-      workerId: "review-assignment-worker",
+      workerId: key("review-assignment-worker"),
       ordinal: 1,
     };
     const criteria = current.criteria.filter(
@@ -1719,7 +1757,7 @@ const makeProposalFixture = (coherentCustody = false, verificationOutcome?: "suc
     );
     const report = decodeCompletionReport({
       type: "project-team.assignment.report",
-      commandId: "review-completion-report",
+      commandId: key("review-completion-report"),
       projectId,
       taskId: task.taskId,
       expectedRevision: current.revision,
@@ -1861,9 +1899,10 @@ const makeConsumedReviewFixture = (
     readonly assessmentVerdict?: "met" | "not-met";
     readonly verificationOutcome?: "success" | "failed";
   } = {},
+  existing?: Effect.Success<ReturnType<typeof makeProposalFixture>>,
 ) =>
   Effect.gen(function* () {
-    const f = yield* makeProposalFixture(true, options.verificationOutcome);
+    const f = existing ?? (yield* makeProposalFixture(true, options.verificationOutcome));
     if (options.criticalFinding)
       yield* f.repository.execute(yield* f.compile(yield* f.report({ severity: "critical" })));
     const initial = yield* f.state();
@@ -5054,6 +5093,447 @@ it.effect(
         expect((yield* readProposal(f))?.manifest).toEqual(manifest);
         expect((yield* f.compileProposal().pipe(Effect.result))._tag).toBe("Failure");
         expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+it.effect(
+  "actual successful verification artifacts and an independent Pi resolution report retain one resolution receipt",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFindingFixture(true, "success");
+        const resultRows = yield* f.sql<{
+          attemptId: string;
+        }>`SELECT attempt_id AS attemptId FROM project_work_verification_execution WHERE environment_id='environment' AND job_id=${f.prepared.manifest.jobId}`;
+        expect(resultRows).toHaveLength(1);
+        const intent = yield* f.report({
+          commandId: ProjectTeamReviewFindingIntent.fields.commandId.make("é".repeat(256)),
+          status: "resolved",
+          resolutionArtifactIds: [
+            resultRows[0]!.attemptId + ":stdout",
+            resultRows[0]!.attemptId + ":stderr",
+          ],
+        });
+        const before = yield* f.state();
+        const firstWrite = yield* reportTool(f, intent).pipe(Effect.result);
+        expect(firstWrite, "first actual resolution write").toMatchObject({ _tag: "Success" });
+        const after = yield* f.state();
+        const finding = after.foundationRecords?.find(
+          (r) => r.kind === "review-finding" && r.findingId === intent.findingId,
+        );
+        expect(finding).toMatchObject({
+          status: "resolved",
+          revision: 0,
+          target: {
+            headSha: f.prepared.manifest.target.headSha,
+          },
+          reportedBy: { dispatchId: f.snapshot.fence.dispatchId },
+        });
+        expect(
+          after.evidence.filter((e) => e.evidenceId.startsWith("review-finding-resolution:")),
+        ).toHaveLength(1);
+        expect(after.tasks).toEqual(before.tasks);
+        expect(after.criteria).toEqual(before.criteria);
+        if (finding?.kind !== "review-finding")
+          return yield* Effect.die("Resolution finding missing");
+        const reader = yield* makeProjectTeamReviewResolutionReader({
+          environmentId: "environment",
+        });
+        const historical = yield* f.sql
+          .withTransaction(
+            reader.readInTransaction({
+              findingRecordId: finding.recordId,
+              expectedFindingRevision: finding.revision,
+              expectedFindingSha256: digest(canonical(finding)),
+            }),
+          )
+          .pipe(Effect.result);
+        expect(historical, "historical retained resolution audit before retry").toMatchObject({
+          _tag: "Success",
+        });
+        const replay = yield* reportTool(f, intent).pipe(Effect.result);
+        expect(replay, "exact actual resolution retry").toMatchObject({ _tag: "Success" });
+        expect(yield* f.state()).toEqual(after);
+      }),
+    ),
+);
+
+it.effect(
+  "a repaired-head independent Pi report resolves the old finding without replacing its origin",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const first = yield* makeFindingFixture(true, "success");
+        const originalIntent = yield* first.report();
+        yield* reportTool(first, originalIntent);
+        const original = (yield* first.state()).foundationRecords?.find(
+          (r) => r.kind === "review-finding" && r.findingId === originalIntent.findingId,
+        );
+        if (original?.kind !== "review-finding")
+          return yield* Effect.die("Original finding missing");
+        const oldGate = (yield* first.state()).foundationRecords?.find(
+          (r) => r.kind === "gate" && r.verificationJobId === first.prepared.manifest.jobId,
+        );
+        if (oldGate?.kind !== "gate")
+          return yield* Effect.die("Original verification gate missing");
+        yield* first.commitRecords("invalidate-old-resolution-job", [
+          decodeRecord({ ...oldGate, status: "invalidated", revision: oldGate.revision + 1 }),
+        ]);
+        // Synthetic settled binding only: its disposable initialize already has joined custody. This does not prove production cleanup.
+        yield* restoreHistoricalBinding(
+          decodeRecord({
+            ...first.running,
+            status: "settled",
+            revision: first.running.revision + 1,
+          }),
+        );
+        const current = yield* first.state();
+        const selection = {
+          ...first.selection,
+          jobId: "verification-repaired",
+          expectedRevision: current.revision,
+        };
+        const human = { actor: { kind: "human" as const, id: "maintainer" } };
+        const preparation = yield* makeProjectWorkVerificationPreparation({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          assertHumanCurrent: () => Effect.void,
+          captureWorkspace: (original, use) =>
+            use({
+              receipt: original.receipt,
+              cwd: original.receipt.assignment.worktreePath,
+              baseSha: "a".repeat(40),
+              headSha: "e".repeat(40),
+              testedCommit: "e".repeat(40),
+              testedTree: "f".repeat(40),
+            }),
+          captureExecutable: (_binding, command, use) =>
+            use({
+              executableTarget: command.executable,
+              sha256: "e".repeat(64),
+              runtimeClosureSha256: "f".repeat(64),
+            }),
+          retainPrepared: (manifest) =>
+            first.jobs.retainPrepared(manifest).pipe(
+              Effect.mapError(
+                () =>
+                  new ProjectWorkVerificationPreparationError({
+                    reason: "Controlled repaired target retention failed",
+                  }),
+              ),
+            ),
+        });
+        const prepared = yield* preparation.prepare(selection, human);
+        expect(prepared.manifest.target.headSha).toBe("e".repeat(40));
+        const second = yield* makeFindingFixture(
+          true,
+          "success",
+          {
+            ...first.verificationBase,
+            state: yield* first.state(),
+            principal: human,
+            selection,
+            prepared,
+          },
+          "-repaired",
+        );
+        const attempts = yield* second.sql<{
+          attemptId: string;
+        }>`SELECT attempt_id AS attemptId FROM project_work_verification_execution WHERE environment_id='environment' AND job_id=${prepared.manifest.jobId}`;
+        const intent = yield* second.report({
+          commandId: ProjectTeamReviewFindingIntent.fields.commandId.make("resolve-repaired-head"),
+          revision: 1,
+          status: "resolved",
+          resolutionArtifactIds: [
+            attempts[0]!.attemptId + ":stdout",
+            attempts[0]!.attemptId + ":stderr",
+          ],
+        });
+        const before = yield* second.state();
+        yield* reportTool(second, intent);
+        const after = yield* second.state();
+        const resolved = after.foundationRecords?.find((r) => r.recordId === original.recordId);
+        expect(resolved).toMatchObject({
+          revision: 1,
+          status: "resolved",
+          target: original.target,
+          originReviewer: original.originReviewer,
+          reportedBy: {
+            bindingId: "review-binding-repaired",
+            targetSha256: digest(canonical(second.target)),
+          },
+        });
+        if (resolved?.kind !== "review-finding")
+          return yield* Effect.die("Resolved finding missing");
+        const reader = yield* makeProjectTeamReviewResolutionReader({
+          environmentId: "environment",
+        });
+        const association = yield* second.sql.withTransaction(
+          reader.readInTransaction({
+            findingRecordId: resolved.recordId,
+            expectedFindingRevision: 1,
+            expectedFindingSha256: digest(canonical(resolved)),
+          }),
+        );
+        expect(association?.detail.proof.target.headSha).toBe("e".repeat(40));
+        expect(association?.finding.target.headSha).toBe("c".repeat(40));
+        expect(after.tasks).toEqual(before.tasks);
+        expect(after.criteria).toEqual(before.criteria);
+        const retry = yield* second.report({
+          ...intent,
+          commandId: ProjectTeamReviewFindingIntent.fields.commandId.make(
+            "semantic-resolution-retry",
+          ),
+          expectedRevision: after.revision,
+        });
+        yield* reportTool(second, retry);
+        expect(yield* second.state()).toEqual(after);
+        yield* reportTool(second, intent);
+        expect(yield* second.state()).toEqual(after);
+        const proposal = yield* makeProposalFixture(true, undefined, second, "-repaired");
+        const consumed = yield* makeConsumedReviewFixture({}, proposal);
+        const retainedProposal = yield* readProposal(consumed);
+        expect(retainedProposal?.manifest.findings).toHaveLength(1);
+        expect(retainedProposal?.manifest.target.headSha).toBe("e".repeat(40));
+        const proof = yield* consumed.prepare();
+        expect(proof).toMatchObject({ status: "completed", target: { headSha: "e".repeat(40) } });
+        if (proof?.status !== "completed")
+          return yield* Effect.die("Repaired review completion denied");
+        expect(proof.findings).toEqual(retainedProposal?.manifest.findings);
+        expect((yield* consumed.state()).tasks.find((t) => t.taskId === taskId)?.state).not.toBe(
+          "completed",
+        );
+      }),
+    ),
+);
+
+for (const failure of [
+  "missing-result",
+  "failed-result",
+  "arbitrary-artifact",
+  "corrupt-stdout",
+  "foreign-artifact-scope",
+] as const) {
+  it.effect(`an actual Pi resolution denies ${failure} without finding or receipt effects`, () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFindingFixture(
+          true,
+          failure === "missing-result"
+            ? undefined
+            : failure === "failed-result"
+              ? "failed"
+              : "success",
+        );
+        const rows = yield* f.sql<{
+          attemptId: string;
+        }>`SELECT attempt_id AS attemptId FROM project_work_verification_execution WHERE environment_id='environment' AND job_id=${f.prepared.manifest.jobId}`;
+        const artifactId = (rows[0]?.attemptId ?? "missing-verification-attempt") + ":stdout";
+        if (failure === "corrupt-stdout" || failure === "foreign-artifact-scope") {
+          yield* f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+          if (failure === "corrupt-stdout")
+            yield* f.sql`UPDATE project_work_artifacts SET raw_bytes=${new Uint8Array([255, 0, 1])} WHERE artifact_id=${artifactId}`;
+          else
+            yield* f.sql`UPDATE project_work_artifacts SET project_id='foreign-project' WHERE artifact_id=${artifactId}`;
+        }
+        const intent = yield* f.report({
+          status: "resolved",
+          resolutionArtifactIds: [
+            failure === "arbitrary-artifact" ? "unrelated-output" : artifactId,
+          ],
+        });
+        const before = yield* f.state();
+        const outcome = yield* reportTool(f, intent).pipe(Effect.result);
+        expect(outcome).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "ProjectTeamAuthorizationError" },
+        });
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
+        ).toEqual([{ count: 0 }]);
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "resolution history remains readable after reviewer revocation while fresh semantic reports stay denied",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFindingFixture(true, "success");
+        const rows = yield* f.sql<{
+          attemptId: string;
+        }>`SELECT attempt_id AS attemptId FROM project_work_verification_execution WHERE environment_id='environment' AND job_id=${f.prepared.manifest.jobId}`;
+        const intent = yield* f.report({
+          status: "resolved",
+          resolutionArtifactIds: [rows[0]!.attemptId + ":stdout"],
+        });
+        yield* reportTool(f, intent);
+        const finding = (yield* f.state()).foundationRecords?.find(
+          (r) => r.kind === "review-finding" && r.findingId === intent.findingId,
+        );
+        if (finding?.kind !== "review-finding")
+          return yield* Effect.die("Missing retained resolution");
+        yield* restoreHistoricalBinding(
+          decodeRecord({ ...f.running, status: "revoked", revision: f.running.revision + 1 }),
+        );
+        const reader = yield* makeProjectTeamReviewResolutionReader({
+          environmentId: "environment",
+        });
+        const historical = yield* f.sql.withTransaction(
+          reader.readInTransaction({
+            findingRecordId: finding.recordId,
+            expectedFindingRevision: finding.revision,
+            expectedFindingSha256: digest(canonical(finding)),
+          }),
+        );
+        expect(historical?.finding).toEqual(finding);
+        const before = yield* f.state();
+        const retry = yield* f.report({
+          ...intent,
+          commandId: ProjectTeamReviewFindingIntent.fields.commandId.make(
+            "revoked-resolution-retry",
+          ),
+          expectedRevision: before.revision,
+        });
+        expect((yield* reportTool(f, retry).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+);
+
+for (const corrupt of ["stderr", "receipt-attribution", "receipt-events"] as const) {
+  it.effect(
+    `resolution historical audit denies corrupt ${corrupt} and never produces replacement proof`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const f = yield* makeFindingFixture(true, "success");
+          const rows = yield* f.sql<{
+            attemptId: string;
+          }>`SELECT attempt_id AS attemptId FROM project_work_verification_execution WHERE environment_id='environment' AND job_id=${f.prepared.manifest.jobId}`;
+          const intent = yield* f.report({
+            status: "resolved",
+            resolutionArtifactIds: [rows[0]!.attemptId + ":stdout"],
+          });
+          yield* reportTool(f, intent);
+          const after = yield* f.state();
+          const finding = after.foundationRecords?.find(
+            (r) => r.kind === "review-finding" && r.findingId === intent.findingId,
+          );
+          if (finding?.kind !== "review-finding")
+            return yield* Effect.die("Missing retained resolution");
+          if (corrupt === "stderr") {
+            yield* f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+            yield* f.sql`UPDATE project_work_artifacts SET raw_bytes=${new Uint8Array([0, 255])} WHERE artifact_id=${rows[0]!.attemptId + ":stderr"}`;
+          } else if (corrupt === "receipt-attribution")
+            yield* f.sql`UPDATE project_work_command_receipts SET actor_id='another-reviewer' WHERE command_id=${intent.commandId}`;
+          else
+            yield* f.sql`UPDATE project_work_command_receipts SET event_ids_json='[]' WHERE command_id=${intent.commandId}`;
+          const reader = yield* makeProjectTeamReviewResolutionReader({
+            environmentId: "environment",
+          });
+          expect(
+            (yield* f.sql
+              .withTransaction(
+                reader.readInTransaction({
+                  findingRecordId: finding.recordId,
+                  expectedFindingRevision: finding.revision,
+                  expectedFindingSha256: digest(canonical(finding)),
+                }),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          const retry = yield* f.report({
+            ...intent,
+            commandId: ProjectTeamReviewFindingIntent.fields.commandId.make(
+              "corrupt-resolution-retry",
+            ),
+            expectedRevision: after.revision,
+          });
+          expect((yield* reportTool(f, retry).pipe(Effect.result))._tag).toBe("Failure");
+          expect(yield* f.state()).toEqual(after);
+        }),
+      ),
+  );
+}
+
+it.effect(
+  "a resolution failed owning COMMIT exposes no retained proof and exact retry keeps the original judgment",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFindingFixture(true, "success");
+        const rows = yield* f.sql<{
+          attemptId: string;
+        }>`SELECT attempt_id AS attemptId FROM project_work_verification_execution WHERE environment_id='environment' AND job_id=${f.prepared.manifest.jobId}`;
+        const intent = yield* f.report({
+          status: "resolved",
+          resolutionArtifactIds: [rows[0]!.attemptId + ":stdout"],
+        });
+        const before = yield* f.state();
+        yield* f.sql`CREATE TABLE controlled_resolution_parent (id TEXT PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE controlled_resolution_child (id TEXT REFERENCES controlled_resolution_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* f.sql`CREATE TRIGGER controlled_resolution_commit_failure AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'review-finding-resolution:%' BEGIN INSERT INTO controlled_resolution_child VALUES ('missing'); END`;
+        let escaped = false;
+        expect(
+          (yield* reportTool(f, intent).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                escaped = true;
+              }),
+            ),
+            Effect.exit,
+          ))._tag,
+        ).toBe("Failure");
+        expect(escaped).toBe(false);
+        expect(yield* f.sql`SELECT COUNT(*) AS count FROM controlled_resolution_child`).toEqual([
+          { count: 1 },
+        ]);
+        const reader = yield* makeProjectTeamReviewResolutionReader({
+          environmentId: "environment",
+        });
+        const uncommitted = yield* f.sql<{
+          recordId: string;
+          payload: string;
+        }>`SELECT record_id AS recordId,payload_json AS payload FROM project_team_review_finding WHERE project_id=${projectId}`;
+        expect(uncommitted).toHaveLength(1);
+        const finding = yield* decodeStoredResolutionFinding(uncommitted[0]!.payload);
+        if (finding.kind !== "review-finding")
+          return yield* Effect.die("Missing uncommitted finding");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              reader.readInTransaction({
+                findingRecordId: finding.recordId,
+                expectedFindingRevision: finding.revision,
+                expectedFindingSha256: digest(canonical(finding)),
+              }),
+            )
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        // Disposal of this controlled failed physical transaction only; no production foreign-loan rollback.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* f.state()).toEqual(before);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
+        ).toEqual([{ count: 0 }]);
+        yield* f.sql`DROP TRIGGER controlled_resolution_commit_failure`;
+        yield* reportTool(f, intent);
+        const after = yield* f.state();
+        expect(
+          after.evidence.filter((e) => e.evidenceId.startsWith("review-finding-resolution:")),
+        ).toHaveLength(1);
+        yield* reportTool(f, intent);
+        expect(yield* f.state()).toEqual(after);
       }),
     ),
 );

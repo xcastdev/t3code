@@ -1,3 +1,4 @@
+import { ProjectTeamReviewFindingProvenance } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -118,4 +119,37 @@ it.effect("historical target reader preserves actual SQL failure for settlement 
       if (result._tag === "Failure") expect(SqlError.isSqlError(result.failure)).toBe(true);
     }),
   ),
+);
+
+it.effect(
+  "historical reviewer association cannot borrow an implementer or another transaction",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* verificationFixture;
+        const targets = yield* makeProjectTeamReviewTargets(options);
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Original claim missing");
+        const provenance = ProjectTeamReviewFindingProvenance.make({
+          reviewTaskId: f.selection.taskId,
+          bindingId: f.selection.bindingId,
+          generation: f.selection.generation,
+          memberId: claim.binding.memberId,
+          providerInstanceId: claim.binding.providerInstanceId,
+          threadId: claim.binding.threadId,
+          sessionId: "original",
+          initializeOperationId: f.snapshot.intent.request.initializeOperationId,
+          dispatchId: f.snapshot.fence.dispatchId,
+          targetSha256: "a".repeat(64),
+        });
+        const invalid = yield* f.sql
+          .withTransaction(targets.readHistoricalAssociation({ provenance: provenance }))
+          .pipe(Effect.result);
+        expect(invalid._tag).toBe("Failure");
+        const absent = yield* targets
+          .readHistoricalAssociation({ provenance: provenance })
+          .pipe(Effect.result);
+        expect(absent._tag).toBe("Failure");
+      }),
+    ),
 );

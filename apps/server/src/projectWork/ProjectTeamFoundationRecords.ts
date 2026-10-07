@@ -79,6 +79,7 @@ export const validateProjectTeamRecord = (
     ProjectWorkTeamTransition,
     { kind: "publication.claim" | "publication.reflect" }
   >,
+  reviewResolution?: Extract<ProjectWorkTeamTransition, { kind: "review.resolve" }>,
 ): TeamRecord => {
   const r = decodeTeamRecord(input);
   const records = state.foundationRecords ?? [];
@@ -86,7 +87,13 @@ export const validateProjectTeamRecord = (
   const old = records.find((entry) => entry.recordId === r.recordId);
   if (r.kind === "review-finding") {
     if (r.generation !== 0) reject("Review finding ledger generation cannot change");
-    if (r.status !== "open") reject("Finding resolution requires trusted repair evidence");
+    if (
+      r.status !== "open" &&
+      (reviewResolution === undefined ||
+        canonicalProjectWorkPayload(reviewResolution.finding) !== canonicalProjectWorkPayload(r) ||
+        reviewResolution.proof.reviewTargetSha256 !== r.reportedBy.targetSha256)
+    )
+      reject("Finding resolution requires trusted repair evidence");
     if (
       r.criterionIds.some(
         (id) => !state.criteria.some((c) => c.criterionId === id && c.taskId === r.taskId),

@@ -18,6 +18,8 @@ import {
 import { makeProjectTeamReviewCompletionProposals } from "./ProjectTeamReviewCompletionProposals.ts";
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
+import { makeProjectTeamReviewResolutionReader } from "./ProjectTeamReviewResolution.ts";
+import { indexReviewFindings, selectReviewFindings } from "./ProjectTeamReviewResolutionRecords.ts";
 import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
 import { makeProjectWorkVerificationResultReader } from "./ProjectWorkVerificationExecutionJournal.ts";
 import {
@@ -167,6 +169,9 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
     const repository = yield* ProjectWorkRepository;
     const journal = yield* makeProjectTeamDispatchJournal(options);
     const targets = yield* makeProjectTeamReviewTargets(options);
+    const resolutionReader = yield* makeProjectTeamReviewResolutionReader({
+      environmentId: options.environmentId,
+    });
     const freshness = yield* makeProjectTeamReviewFreshness({
       environmentId: options.environmentId,
     });
@@ -585,15 +590,17 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
         )
         .map((e) => ({ id: e.evidenceId, revision: e.revision, sha256: hash(e) }))
         .sort((a, b) => a.id.localeCompare(b.id));
-      const findings = records
-        .flatMap((r) =>
-          r.kind === "review-finding" &&
-          r.taskId === manifest.target.taskId &&
-          same(r.target, manifest.target)
-            ? [{ findingId: r.findingId, revision: r.revision, sha256: hash(r) }]
-            : [],
-        )
-        .sort((a, b) => a.findingId.localeCompare(b.findingId));
+      const selectedFindings = selectReviewFindings(indexReviewFindings(state), manifest.target);
+      for (const finding of selectedFindings.records) {
+        if (finding.status !== "resolved") continue;
+        const association = yield* resolutionReader.readInTransaction({
+          findingRecordId: finding.recordId,
+          expectedFindingRevision: finding.revision,
+          expectedFindingSha256: hash(finding),
+        });
+        if (!association) return yield* deny("stale-proof");
+      }
+      const findings = selectedFindings.snapshots;
       const outputs = (report.outputs ?? []).map((output, index) => ({
         evidenceId: projectTeamDerivedRecordId(report.commandId, `report-output:${index}`),
         criterionId: output.criterionId,

@@ -4,6 +4,7 @@ import {
   ProjectTeamCredential,
   ProjectTeamReviewFinding,
   ProjectTeamReviewFindingIntent,
+  type ProjectTeamReviewResolutionProof,
   ProjectWorkActor,
   ProjectWorkAttribution,
   ProjectWorkFoundationCommitCommand,
@@ -14,6 +15,11 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectTeamAuthority, ProjectTeamPrincipal } from "./ProjectTeamAuthorization.ts";
 import { evaluateReviewFindingTransition } from "./ProjectTeamReview.ts";
+import {
+  makeProjectTeamReviewResolution,
+  makeProjectTeamReviewResolutionReader,
+} from "./ProjectTeamReviewResolution.ts";
+import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamReviewQualification } from "./ProjectTeamReviewQualification.ts";
 
 export class ProjectTeamReviewFindingsError extends Schema.TaggedError<ProjectTeamReviewFindingsError>()(
@@ -50,6 +56,7 @@ export const makeProjectTeamReviewFindings = <E, R>(
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const repository = yield* ProjectWorkRepository;
     const qualification = yield* makeProjectTeamReviewQualification(resolveAuthority);
     const requireTransaction = Effect.gen(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
@@ -103,7 +110,11 @@ export const makeProjectTeamReviewFindings = <E, R>(
       )
         return yield* deny("Finding identity conflicts with retained history");
       const current = matches[0]?.kind === "review-finding" ? decodeRecord(matches[0]) : undefined;
-      if (current && canonical(current.target) !== canonical(target))
+      if (
+        current &&
+        intent.status !== "resolved" &&
+        canonical(current.target) !== canonical(target)
+      )
         return yield* deny("Original finding target changed");
       const proposed = decodeRecord({
         kind: "review-finding",
@@ -119,16 +130,51 @@ export const makeProjectTeamReviewFindings = <E, R>(
         detail: intent.detail,
         status: intent.status,
         resolutionArtifactIds: intent.resolutionArtifactIds,
-        target,
+        target: current?.target ?? target,
         originReviewer: current?.originReviewer ?? provenance,
         reportedBy: provenance,
       });
+      let resolutionProof: ProjectTeamReviewResolutionProof | undefined;
+      if (proposed.status === "resolved") {
+        if (current?.status === "resolved" && current.revision === proposed.revision) {
+          const reader = yield* makeProjectTeamReviewResolutionReader({
+            environmentId: retained.environmentId,
+          }).pipe(Effect.provideService(ProjectWorkRepository, repository));
+          const association = yield* reader.readInTransaction({
+            findingRecordId: current.recordId,
+            expectedFindingRevision: current.revision,
+            expectedFindingSha256: hash(current),
+          });
+          if (!association || canonical(current.reportedBy) !== canonical(provenance))
+            return yield* deny(
+              "Resolution replay requires its original qualified reporter and retained receipt",
+            );
+          resolutionProof = association.detail.proof;
+        } else {
+          const resolutions = yield* makeProjectTeamReviewResolution({
+            environmentId: retained.environmentId,
+          }).pipe(Effect.provideService(ProjectWorkRepository, repository));
+          resolutionProof = yield* resolutions.qualifyInTransaction({
+            ...(current ? { originalFinding: current } : {}),
+            proposedFinding: proposed,
+            qualifiedReviewTarget: retained,
+            provenance,
+          });
+        }
+      }
+      const proof = resolutionProof;
       const decision = evaluateReviewFindingTransition({
         target,
         ...(current ? { currentFinding: current } : {}),
         proposedFinding: proposed,
         currentCriterionIds: criteria,
-        retainedResolutionEvidence: [],
+        retainedResolutionEvidence: proof
+          ? proof.artifacts.map((a) => ({
+              artifactId: a.artifactId,
+              target: proof.target,
+              findings: [{ findingId: proposed.findingId, revision: proposed.revision }],
+            }))
+          : [],
       });
       if (decision.status === "rejected")
         return yield* deny(`Finding transition denied: ${decision.reason}`);
@@ -139,7 +185,16 @@ export const makeProjectTeamReviewFindings = <E, R>(
         expectedRevision: intent.expectedRevision,
         attribution,
         committedAt: attribution.recordedAt,
-        records: [decision.status === "duplicate" ? current! : proposed],
+        records: resolutionProof ? [] : [decision.status === "duplicate" ? current! : proposed],
+        ...(resolutionProof
+          ? {
+              transition: {
+                kind: "review.resolve",
+                finding: decision.status === "duplicate" ? current! : proposed,
+                proof: resolutionProof,
+              },
+            }
+          : {}),
       });
     });
     const compile = Effect.fn("ProjectTeamReviewFindings.compile")(function* (

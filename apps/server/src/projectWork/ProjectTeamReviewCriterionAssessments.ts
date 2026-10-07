@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type { ProjectWorkState } from "./ProjectWorkPolicy.ts";
 import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
+import { indexReviewFindings, selectReviewFindings } from "./ProjectTeamReviewResolutionRecords.ts";
 
 const strict = { onExcessProperty: "error" } as const;
 const canonical = canonicalProjectWorkPayload;
@@ -122,14 +123,10 @@ export const snapshotReviewCriterionAssessments = (input: {
           else evidenceById.set(id, [entry]);
         }
       }
-      const canonicalTarget = canonical(target);
-      const hasOpenCriticalFinding = (state.foundationRecords ?? []).some(
-        (record) =>
-          record.kind === "review-finding" &&
-          record.severity === "critical" &&
-          record.status === "open" &&
-          canonical(record.target) === canonicalTarget,
-      );
+      const hasOpenCriticalFinding = selectReviewFindings(
+        indexReviewFindings(state),
+        target,
+      ).records.some((record) => record.severity === "critical" && record.status === "open");
       return input.assessments.map((raw) => {
         const assessment = exact(raw, decodeAssessment);
         const selected = selectedById.get(assessment.criterionId) ?? [];

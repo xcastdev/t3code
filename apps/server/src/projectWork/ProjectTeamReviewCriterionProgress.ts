@@ -15,10 +15,10 @@ import {
 import type { ProjectWorkEvent, ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
+import { indexReviewFindings, selectReviewFindings } from "./ProjectTeamReviewResolutionRecords.ts";
 
 type Completed = Extract<ProjectTeamReviewCompletionProof, { status: "completed" }>;
 type Plan = Extract<ProjectTeamRecord, { kind: "plan-revision" }>;
-type Finding = Extract<ProjectTeamRecord, { kind: "review-finding" }>;
 type CriterionEvent = Extract<ProjectWorkEvent, { type: "project-work.criterion.upserted" }>;
 type ProgressEvent =
   | CriterionEvent
@@ -184,10 +184,7 @@ function indexes(state: ProjectWorkReducerState) {
       records.filter((r): r is Plan => r.kind === "plan-revision" && r.status === "proposed"),
       (r) => canonical([r.taskId, r.specRevision, r.planRevision]),
     ),
-    findings: index(
-      records.filter((r): r is Finding => r.kind === "review-finding"),
-      (r) => canonical(r.target),
-    ),
+    findings: indexReviewFindings(state),
     scopes: new Map<string, string>(),
   };
 }
@@ -202,17 +199,7 @@ function parentScope(state: ProjectWorkReducerState, lookup: Indexes, taskId: st
   return scope;
 }
 function findingSnapshots(lookup: Indexes, target: Provenance["target"], criterionId?: string) {
-  const records = (lookup.findings.get(canonical(target)) ?? []).filter(
-    (r) =>
-      criterionId === undefined ||
-      r.criterionIds.some((id) => id === criterionId) ||
-      r.severity === "critical",
-  );
-  if (records.length > 256 || new Set(records.map((r) => r.findingId)).size !== records.length)
-    deny("Review progress findings are ambiguous or exceed their bound");
-  return records
-    .map((r) => ({ findingId: r.findingId, revision: r.revision, sha256: hash(r) }))
-    .sort((a, b) => a.findingId.localeCompare(b.findingId));
+  return selectReviewFindings(lookup.findings, target, criterionId).snapshots;
 }
 function readSupport(lookup: Indexes, id: string, criterion: ProjectWorkCriterion) {
   const entry = unique(lookup.evidence.get(id), "Review progress evidence is missing or ambiguous");
@@ -422,7 +409,7 @@ export function prepareReviewCriterionProgress(input: {
   const lookup = indexes(state);
   if (canonical(findingSnapshots(lookup, completion.target)) !== canonical(completion.findings))
     deny("Review progress original findings changed");
-  const openCritical = (lookup.findings.get(canonical(completion.target)) ?? []).some(
+  const openCritical = selectReviewFindings(lookup.findings, completion.target).records.some(
     (r) => r.severity === "critical" && r.status === "open",
   );
   const drafts: Draft[] = [];
