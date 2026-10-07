@@ -41,7 +41,10 @@ import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts"
 import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 import type { PiNativeReference } from "../provider/pi/PiWorkerProtocol.ts";
 
-import { continueProjectTeamMailboxTurn } from "./ProjectTeamExecutionHost.ts";
+import {
+  continueProjectTeamMailboxTurn,
+  readProjectTeamOwnedOperationHistory,
+} from "./ProjectTeamExecutionHost.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
@@ -334,7 +337,10 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
     yield* commit([message], `create:${id}`);
     return message;
   });
-  const reserveInput = Effect.fn("laterTest.reserveInput")(function* (op = prompt) {
+  const reserveInput = Effect.fn("laterTest.reserveInput")(function* (
+    op = prompt,
+    usage = { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+  ) {
     yield* activate(op, native);
     const accounting = yield* makeAccounting({
       environmentId: "environment",
@@ -351,21 +357,20 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
       routeId: "command-code-ling-free",
       provider: "command-code" as const,
       model,
-      maxInputTokens: 1000,
-      maxOutputTokens: 100,
+      maxInputTokens: Math.max(1000, usage.prompt_tokens),
+      maxOutputTokens: Math.max(100, usage.completion_tokens),
       callCount: 1 as const,
       deadlineAtMs: op.deadlineAtMs,
     };
     const reservation = yield* accounting.reserve(op.principal, fields);
     const settle = Effect.gen(function* () {
-      const usage = { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 };
       const settled = yield* accounting.settle({
         ...fields,
         reservationId: reservation.reservationId,
         outcome: "reported",
         transportDrained: true,
-        chargedInputTokens: 10,
-        chargedOutputTokens: 2,
+        chargedInputTokens: usage.prompt_tokens,
+        chargedOutputTokens: usage.completion_tokens,
         reportedModel: model,
         reportedUsage: usage,
       });
@@ -427,6 +432,183 @@ export const laterFixture = Effect.gen(function* () {
   });
   return { ...f, snapshot, turns };
 });
+
+it.effect(
+  "Host cleanup includes two original operations and 128 later prompts, but rejects excess",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* laterFixture;
+        // Metadata fixtures exercise the production scan against migrated SQLite. They do not
+        // establish valid process receipts or stand in for a fully executed mailbox chain.
+        yield* f.sql`WITH RECURSIVE later(n) AS (
+        SELECT 2 UNION ALL SELECT n+1 FROM later WHERE n<129
+      ) INSERT INTO project_team_pi_operation
+        (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,
+         thread_id,worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,
+         root_task_id,maximum_tokens,deadline_at_ms,status,intent_json)
+        SELECT 'cleanup-later-'||n,environment_id,project_id,binding_id,generation,
+          provider_instance_id,thread_id,'cleanup-worker-'||n,n,'prompt',request_hash,
+          root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,'settled',intent_json
+        FROM project_team_pi_operation,later WHERE operation_id=${f.prompt.operation.operationId}`;
+        const insertOutside = (
+          id: string,
+          environment: string,
+          binding: string,
+          generation: number,
+        ) =>
+          f.sql`INSERT INTO project_team_pi_operation
+          (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,
+           thread_id,worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,
+           root_task_id,maximum_tokens,deadline_at_ms,status,intent_json)
+          SELECT ${id},${environment},project_id,${binding},${generation},provider_instance_id,
+            ${id},${id},130,'prompt',request_hash,root_binding_id,root_task_id,maximum_tokens,
+            deadline_at_ms,'settled',intent_json FROM project_team_pi_operation
+          WHERE operation_id=${f.prompt.operation.operationId}`;
+        yield* insertOutside("cleanup-other-environment", "other", f.binding.recordId, 0);
+        yield* insertOutside("cleanup-other-binding", "environment", "other", 0);
+        yield* insertOutside("cleanup-other-generation", "environment", f.binding.recordId, 1);
+        const rows = yield* readProjectTeamOwnedOperationHistory(f.sql, "environment", f.snapshot);
+        expect(rows).toHaveLength(130);
+        expect(rows.at(-1)?.operation_id).toBe("cleanup-later-129");
+        expect(rows.every((row) => row.status === "settled")).toBe(true);
+        yield* insertOutside("cleanup-excess", "environment", f.binding.recordId, 0);
+        const excess = yield* readProjectTeamOwnedOperationHistory(
+          f.sql,
+          "environment",
+          f.snapshot,
+        ).pipe(Effect.result);
+        expect(excess._tag).toBe("Failure");
+        if (excess._tag === "Failure") {
+          expect(excess.failure).toBeInstanceOf(ProjectTeamDispatchJournalError);
+          expect(excess.failure).toMatchObject({
+            reason: "Owned operation history exceeds its cleanup bound",
+          });
+        }
+      }),
+    ),
+);
+it.effect(
+  "successive qualified boundaries deliver two queued messages with the original budget and latest cursor",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* laterFixture;
+        yield* f.addMessage("first-successive", "First queued message");
+        yield* f.addMessage("second-successive", "Second queued message");
+        const first = yield* f.turns.claim(f.snapshot);
+        if (first._tag !== "Selected") return yield* Effect.die("Expected first selected turn");
+        const firstRequest = first.decision.request;
+        const firstOperation = yield* f.operations.prepare(
+          { providerInstanceId, threadId },
+          firstRequest,
+          hash(firstRequest),
+          {
+            allocation: yield* f.allocation,
+            workerId: "first-successive-worker",
+            operationId: firstRequest.operationId,
+            resourceHash: first.decision.resourceHash,
+          },
+        );
+        yield* f.turns.seal({
+          operationId: firstRequest.operationId,
+          baseSystemText: "First required context",
+        });
+        const firstInput = yield* f.reserveInput(firstOperation);
+        yield* f.turns.bindInput({
+          operationId: firstRequest.operationId,
+          reservationId: firstInput.reservationId,
+          encodedRequestSha256: "a".repeat(64),
+        });
+        const firstCursor = { ...native, leafId: "first-successive-leaf" };
+        yield* f.complete(firstOperation, firstCursor, "success", [yield* firstInput.settle]);
+        expect((yield* f.turns.reflect({ operationId: firstRequest.operationId }))._tag).toBe(
+          "Delivered",
+        );
+        const second = yield* f.turns.claim(f.snapshot, {
+          afterOperationId: firstRequest.operationId,
+        });
+        expect(second._tag).toBe("Selected");
+        if (second._tag !== "Selected") return yield* Effect.die("Expected second selected turn");
+        expect(second.decision.message.recordId).toBe("second-successive");
+        expect(second.decision.request.operationId).not.toBe(firstRequest.operationId);
+        expect(second.decision.commandId).not.toBe(first.decision.commandId);
+        expect(second.decision.request.resumeCursor).toEqual(firstCursor);
+        expect(second.decision.rootBudget).toEqual(first.decision.rootBudget);
+        expect(second.decision.attemptLimits).toEqual(first.decision.attemptLimits);
+        const secondRequest = second.decision.request;
+        const secondOperation = yield* f.operations.prepare(
+          { providerInstanceId, threadId },
+          secondRequest,
+          hash(secondRequest),
+          {
+            allocation: yield* f.allocation,
+            workerId: "second-successive-worker",
+            operationId: secondRequest.operationId,
+            resourceHash: second.decision.resourceHash,
+          },
+        );
+        expect(secondOperation.ordinal).toBe(firstOperation.ordinal + 1);
+        expect(secondOperation.maximumTokens).toBe(firstOperation.maximumTokens);
+        expect(secondOperation.deadlineAtMs).toBe(firstOperation.deadlineAtMs);
+        expect(
+          (yield* f.operations
+            .lookup(
+              { providerInstanceId, threadId },
+              firstRequest,
+              hash(firstRequest),
+              first.decision.resourceHash,
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* f.turns.reflect({ operationId: firstRequest.operationId }))._tag).toBe(
+          "Retained",
+        );
+        const restarted = yield* makeProjectTeamMailboxTurns({
+          environmentId: "environment",
+          lookupInTransaction: f.operations.lookupInTransaction,
+        });
+        expect(
+          (yield* restarted.claim(f.snapshot, { afterOperationId: firstRequest.operationId }))
+            .decision,
+        ).toEqual(second.decision);
+        yield* f.turns.seal({
+          operationId: secondRequest.operationId,
+          baseSystemText: "Second required context",
+        });
+        const secondInput = yield* f.reserveInput(secondOperation);
+        yield* f.turns.bindInput({
+          operationId: secondRequest.operationId,
+          reservationId: secondInput.reservationId,
+          encodedRequestSha256: "b".repeat(64),
+        });
+        yield* f.complete(
+          secondOperation,
+          { ...native, leafId: "second-successive-leaf" },
+          "success",
+          [yield* secondInput.settle],
+        );
+        expect((yield* f.turns.reflect({ operationId: secondRequest.operationId }))._tag).toBe(
+          "Delivered",
+        );
+        expect((yield* f.messages).map((message) => [message.recordId, message.status])).toEqual([
+          ["first-successive", "delivered"],
+          ["second-successive", "delivered"],
+        ]);
+        const end = yield* f.turns.claim(f.snapshot, {
+          afterOperationId: secondRequest.operationId,
+        });
+        expect(end._tag).toBe("None");
+        yield* f.addMessage("late-successive", "Arrived after the final empty decision");
+        expect(
+          yield* f.turns.claim(f.snapshot, { afterOperationId: secondRequest.operationId }),
+        ).toEqual(end);
+        expect(
+          (yield* f.messages).find((message) => message.recordId === "late-successive")?.status,
+        ).toBe("queued");
+      }),
+    ),
+);
 it.effect("freezes an empty first successful boundary and never absorbs a late message", () =>
   scoped(
     Effect.gen(function* () {
@@ -672,35 +854,40 @@ it.effect("reflects only a drained accounted later prompt and replays the commit
   ),
 );
 
-export const laterExecutionFixture = Effect.gen(function* () {
-  const f = yield* laterFixture;
-  yield* f.addMessage("next", "Exactly retained later input");
-  const selected = yield* f.turns.claim(f.snapshot);
-  if (selected._tag !== "Selected") return yield* Effect.die("Expected selected message");
-  const request = selected.decision.request;
-  const later = yield* f.operations.prepare(
-    { providerInstanceId, threadId },
-    request,
-    hash(request),
-    {
-      allocation: yield* f.allocation,
-      workerId: "later-worker",
+const laterExecutionFixtureFor = (
+  usage = { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+) =>
+  Effect.gen(function* () {
+    const f = yield* laterFixture;
+    yield* f.addMessage("next", "Exactly retained later input");
+    const selected = yield* f.turns.claim(f.snapshot);
+    if (selected._tag !== "Selected") return yield* Effect.die("Expected selected message");
+    const request = selected.decision.request;
+    const later = yield* f.operations.prepare(
+      { providerInstanceId, threadId },
+      request,
+      hash(request),
+      {
+        allocation: yield* f.allocation,
+        workerId: "later-worker",
+        operationId: request.operationId,
+        resourceHash: selected.decision.resourceHash,
+      },
+    );
+    const seal = yield* f.turns.seal({
       operationId: request.operationId,
-      resourceHash: selected.decision.resourceHash,
-    },
-  );
-  const seal = yield* f.turns.seal({
-    operationId: request.operationId,
-    baseSystemText: "Current required context",
+      baseSystemText: "Current required context",
+    });
+    const input = yield* f.reserveInput(later, usage);
+    yield* f.turns.bindInput({
+      operationId: request.operationId,
+      reservationId: input.reservationId,
+      encodedRequestSha256: "b".repeat(64),
+    });
+    return { ...f, later, seal, input, decision: selected.decision };
   });
-  const input = yield* f.reserveInput(later);
-  yield* f.turns.bindInput({
-    operationId: request.operationId,
-    reservationId: input.reservationId,
-    encodedRequestSha256: "b".repeat(64),
-  });
-  return { ...f, later, seal, input, decision: selected.decision };
-});
+
+export const laterExecutionFixture = laterExecutionFixtureFor();
 
 it.effect(
   "retains uncertainty without replacement and permits revoked-owner cleanup without delivering",
@@ -883,15 +1070,31 @@ it.effect(
 );
 
 it.effect(
-  "production-used Host continuation subscribes first, sends one exact turn, waits for actual SQL delivery, and never resends",
+  "production-used Host continuation subscribes first, sends two exact turns, waits for actual SQL delivery, and never resends",
   () =>
     scoped(
       Effect.gen(function* () {
         const f = yield* laterFixture;
-        yield* f.addMessage("next", "One later turn through the Host");
-        yield* f.addMessage("other", "Remain queued for a future leaf");
+        yield* f.addMessage("next", "First later turn through the Host");
+        yield* f.addMessage("other", "Second later turn through the Host");
         const commands: OrchestrationCommand[] = [];
-        const sent = yield* Deferred.make<OrchestrationCommand>();
+        const firstSent = yield* Deferred.make<OrchestrationCommand>();
+        const secondSent = yield* Deferred.make<OrchestrationCommand>();
+        let resolve: NonNullable<PiProductionRuntimeHooks["resolveOperationId"]> | undefined;
+        yield* makeProjectTeamRuntime({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+        }).pipe(
+          Effect.provide(
+            Layer.mock(ProjectTeamPiRuntime)({
+              installOperationResolver: (callback) =>
+                Effect.sync(() => {
+                  resolve = callback;
+                }),
+            }),
+          ),
+        );
+        if (!resolve) return yield* Effect.die("Resolver was not installed");
         const events = yield* PubSub.unbounded<typeof OrchestrationEvent.Type>();
         let subscribed = false;
         const engine = Layer.mock(OrchestrationEngineService)({
@@ -905,7 +1108,7 @@ it.effect(
             Effect.gen(function* () {
               expect(subscribed).toBe(true);
               commands.push(command);
-              yield* Deferred.succeed(sent, command);
+              yield* Deferred.succeed(commands.length === 1 ? firstSent : secondSent, command);
               return { sequence: 1 };
             }),
         });
@@ -915,77 +1118,116 @@ it.effect(
           assertCurrent: Effect.void,
         }).pipe(Effect.provide(engine));
         const fiber = yield* run.pipe(Effect.forkChild);
-        const command = yield* Deferred.await(sent);
-        const selected = yield* f.turns.claim(f.snapshot);
-        if (selected._tag !== "Selected" || command.type !== "thread.turn.start")
-          return yield* Effect.die("Expected selected turn command");
-        expect(command.commandId).toBe(selected.decision.commandId);
-        expect(command.message.messageId).toBe(selected.decision.userMessageId);
-        expect(command.message.text).toBe(selected.decision.request.prompt);
-        expect(command.message.displayText).toBe(
-          "Team message\n\n" + selected.decision.message.body,
-        );
-        expect((yield* f.messages).every((m) => m.status === "queued")).toBe(true);
-        const request = selected.decision.request;
-        const later = yield* f.operations.prepare(
-          { providerInstanceId, threadId },
-          request,
-          hash(request),
-          {
-            allocation: yield* f.allocation,
-            workerId: "later-worker",
-            operationId: request.operationId,
-            resourceHash: selected.decision.resourceHash,
-          },
-        );
-        yield* f.turns.seal({
-          operationId: request.operationId,
-          baseSystemText: "Required task context",
-        });
-        const input = yield* f.reserveInput(later);
-        yield* f.turns.bindInput({
-          operationId: request.operationId,
-          reservationId: input.reservationId,
-          encodedRequestSha256: "b".repeat(64),
-        });
-        yield* f.complete(later, native, "success", [yield* input.settle]);
-        const event = yield* decodeOrchestrationEvent({
-          type: "thread.session-set",
-          sequence: 1,
-          eventId: "later-observed",
-          aggregateKind: "thread",
-          aggregateId: threadId,
-          occurredAt: at,
-          commandId: null,
-          causationEventId: null,
-          correlationId: null,
-          metadata: {},
-          payload: {
-            threadId,
-            session: {
-              threadId,
-              status: "ready",
-              providerName: "pi",
-              runtimeMode: "approval-required",
-              activeTurnId: null,
-              lastError: null,
-              updatedAt: at,
+        let afterOperationId: string | undefined;
+        let cursor = { ...native, leafId: "assignment-leaf" };
+        const commandIds: string[] = [];
+        for (const [index, sent] of [firstSent, secondSent].entries()) {
+          const command = yield* Deferred.await(sent);
+          const selected = yield* f.turns.claim(
+            f.snapshot,
+            afterOperationId === undefined ? undefined : { afterOperationId },
+          );
+          if (selected._tag !== "Selected" || command.type !== "thread.turn.start")
+            return yield* Effect.die("Expected selected turn command");
+          expect(command.commandId).toBe(selected.decision.commandId);
+          expect(command.message.messageId).toBe(selected.decision.userMessageId);
+          expect(command.message.text).toBe(selected.decision.request.prompt);
+          expect(command.message.displayText).toBe(
+            "Team message\n\n" + selected.decision.message.body,
+          );
+          expect((yield* f.messages).filter((m) => m.status === "delivered")).toHaveLength(index);
+          const request = selected.decision.request;
+          expect(request.resumeCursor).toEqual(cursor);
+          expect(request.prompt).toContain(index === 0 ? "First later turn" : "Second later turn");
+          expect(request.prompt).not.toContain(
+            index === 0 ? "Second later turn" : "First later turn",
+          );
+          const adapterRequest = {
+            threadId: request.threadId,
+            kind: "prompt" as const,
+            prompt: request.prompt,
+            ...(request.modelSelection === undefined
+              ? {}
+              : { modelSelection: request.modelSelection }),
+            ...(request.skillPlan === undefined ? {} : { skillPlan: request.skillPlan }),
+          };
+          expect(yield* resolve(providerInstanceId, adapterRequest)).toBe(request.operationId);
+          expect(
+            (yield* resolve(providerInstanceId, { ...adapterRequest, resumeCursor: native }).pipe(
+              Effect.result,
+            ))._tag,
+          ).toBe("Failure");
+          commandIds.push(command.commandId);
+          const later = yield* f.operations.prepare(
+            { providerInstanceId, threadId },
+            request,
+            hash(request),
+            {
+              allocation: yield* f.allocation,
+              workerId: `later-worker-${index}`,
+              operationId: request.operationId,
+              resourceHash: selected.decision.resourceHash,
             },
-          },
-        });
-        yield* PubSub.publish(events, event);
+          );
+          yield* f.turns.seal({
+            operationId: request.operationId,
+            baseSystemText: "Required task context",
+          });
+          const input = yield* f.reserveInput(later);
+          yield* f.turns.bindInput({
+            operationId: request.operationId,
+            reservationId: input.reservationId,
+            encodedRequestSha256: "b".repeat(64),
+          });
+          cursor = { ...native, leafId: `host-later-leaf-${index}` };
+          yield* f.complete(later, cursor, "success", [yield* input.settle]);
+          afterOperationId = request.operationId;
+          const event = yield* decodeOrchestrationEvent({
+            type: "thread.session-set",
+            sequence: index + 1,
+            eventId: `later-observed:${index}`,
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt: at,
+            commandId: null,
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            payload: {
+              threadId,
+              session: {
+                threadId,
+                status: "ready",
+                providerName: "pi",
+                runtimeMode: "approval-required",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: at,
+              },
+            },
+          });
+          yield* PubSub.publish(events, event);
+        }
         yield* Fiber.join(fiber);
+        expect(new Set(commandIds).size).toBe(2);
         expect(
           (yield* f.messages)
             .sort((a, b) => a.recordId.localeCompare(b.recordId))
             .map((m) => [m.recordId, m.status]),
         ).toEqual([
           ["next", "delivered"],
-          ["other", "queued"],
+          ["other", "delivered"],
         ]);
+        yield* f.addMessage("late-host", "No idle continuation after the empty boundary");
         yield* run;
-        expect(commands).toHaveLength(1);
-      }),
+        expect(commands).toHaveLength(2);
+        expect(
+          (yield* f.messages).find((message) => message.recordId === "late-host")?.status,
+        ).toBe("queued");
+      }).pipe(
+        Effect.provide(layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true })),
+        Effect.scoped,
+      ),
     ),
 );
 
@@ -1176,6 +1418,190 @@ it.effect(
             .reflect({ operationId: f.decision.request.operationId })
             .pipe(Effect.exit))._tag,
         ).toBe("Failure");
+      }),
+    ),
+);
+
+for (const state of ["active", "failed", "unreflected", "foreign"] as const) {
+  it.effect(`successor admission rejects an ${state} predecessor without replacement`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* laterExecutionFixture;
+        yield* f.addMessage("second", "Must remain queued without a qualified predecessor");
+        if (state === "failed" || state === "unreflected")
+          yield* f.complete(f.later, native, state === "failed" ? "failed" : "success", [
+            yield* f.input.settle,
+          ]);
+        if (state === "failed")
+          expect(
+            (yield* f.turns.reflect({ operationId: f.decision.request.operationId }))._tag,
+          ).toBe("Uncertain");
+        const boundary = {
+          afterOperationId:
+            state === "foreign" ? "foreign-operation" : f.decision.request.operationId,
+        };
+        expect((yield* f.turns.claim(f.snapshot, boundary).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* f.sql`SELECT operation_id FROM project_team_mailbox_successor`).toEqual([]);
+        expect((yield* f.messages).find((message) => message.recordId === "second")?.status).toBe(
+          "queued",
+        );
+        if (state === "unreflected") {
+          expect(
+            (yield* f.turns.reflect({ operationId: f.decision.request.operationId }))._tag,
+          ).toBe("Delivered");
+          expect((yield* f.turns.claim(f.snapshot, boundary))._tag).toBe("Selected");
+        }
+      }),
+    ),
+  );
+}
+
+for (const change of ["owner", "sender", "scope", "deadline", "budget"] as const) {
+  it.effect(`successor admission preserves the original ${change} fence`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* change === "budget"
+          ? laterExecutionFixtureFor({
+              prompt_tokens: 10000,
+              completion_tokens: 10000,
+              total_tokens: 20000,
+            })
+          : laterExecutionFixture;
+        yield* f.complete(f.later, native, "success", [yield* f.input.settle]);
+        expect((yield* f.turns.reflect({ operationId: f.decision.request.operationId }))._tag).toBe(
+          "Delivered",
+        );
+        if (change === "sender") {
+          const records = (yield* readCurrentState(f.sql, projectId)).foundationRecords ?? [];
+          const owner = records.find(
+            (record) => record.kind === "member" && record.recordId === f.binding.memberId,
+          );
+          if (owner?.kind !== "member") return yield* Effect.die("Missing member");
+          yield* f.commit(
+            [{ ...owner, recordId: "second-sender", revision: 0, name: "Other sender" }],
+            "second-sender",
+          );
+        }
+        yield* f.addMessage(
+          "second",
+          "Only current authority may select this",
+          change === "sender" ? { senderId: "second-sender" } : {},
+        );
+        if (change === "owner" || change === "sender") {
+          const id = change === "sender" ? "second-sender" : f.binding.memberId;
+          const member = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+            (record) => record.kind === "member" && record.recordId === id,
+          );
+          if (member?.kind !== "member") return yield* Effect.die("Missing member");
+          yield* f.commit(
+            [{ ...member, revision: member.revision + 1, status: "paused" }],
+            `pause-${change}`,
+          );
+        }
+        if (change === "scope") {
+          const membership = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+            (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
+          );
+          if (membership?.kind !== "task-membership")
+            return yield* Effect.die("Missing task scope");
+          yield* f.commit(
+            [{ ...membership, revision: membership.revision + 1, status: "removed" }],
+            "remove-recipient-scope",
+          );
+        }
+        if (change === "deadline") yield* TestClock.setTime(f.later.deadlineAtMs + 1);
+        const outcome = yield* f.turns
+          .claim(f.snapshot, { afterOperationId: f.decision.request.operationId })
+          .pipe(Effect.result);
+        // An inactive sender is excluded from selection, leaving an immutable empty boundary.
+        expect(outcome._tag).toBe(change === "sender" ? "Success" : "Failure");
+        if (change === "sender" && outcome._tag === "Success")
+          expect(outcome.success._tag).toBe("None");
+        expect((yield* f.messages).find((message) => message.recordId === "second")?.status).toBe(
+          "queued",
+        );
+        expect(
+          yield* f.sql`SELECT operation_id FROM project_team_mailbox_successor WHERE operation_id IS NOT NULL`,
+        ).toEqual([]);
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "successor COMMIT failure exposes no decision and retries retain the exact selected successor",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* laterExecutionFixture;
+        yield* f.complete(f.later, native, "success", [yield* f.input.settle]);
+        expect((yield* f.turns.reflect({ operationId: f.decision.request.operationId }))._tag).toBe(
+          "Delivered",
+        );
+        yield* f.addMessage("second", "Retain this exact successor");
+        yield* f.sql`PRAGMA foreign_keys=ON`;
+        yield* f.sql`CREATE TABLE successor_parent(id TEXT PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE successor_child(id TEXT REFERENCES successor_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* f.sql`CREATE TRIGGER fail_successor_commit AFTER INSERT ON project_team_mailbox_successor BEGIN INSERT INTO successor_child VALUES('missing'); END`;
+        const supplied = { afterOperationId: f.decision.request.operationId };
+        let escaped = false;
+        expect(
+          (yield* f.turns.claim(f.snapshot, supplied).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                escaped = true;
+              }),
+            ),
+            Effect.exit,
+          ))._tag,
+        ).toBe("Failure");
+        expect(escaped).toBe(false);
+        const reader = yield* makeProjectTeamMailboxTurnDecisionReader({
+          environmentId: "environment",
+        });
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              reader.readInTransaction({ dispatchId: f.snapshot.fence.dispatchId, ...supplied }),
+            )
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        // Dispose only this fixture's physically failed COMMIT loan.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* f.sql`SELECT operation_id FROM project_team_mailbox_successor`).toEqual([]);
+        yield* f.sql`DROP TRIGGER fail_successor_commit`;
+        const capture = f.turns.claim(f.snapshot, supplied);
+        supplied.afterOperationId = "foreign-operation";
+        const selected = yield* capture;
+        if (selected._tag !== "Selected") return yield* Effect.die("Expected selected successor");
+        const restarted = yield* makeProjectTeamMailboxTurns({
+          environmentId: "environment",
+          lookupInTransaction: f.operations.lookupInTransaction,
+        });
+        const locator = { afterOperationId: f.decision.request.operationId };
+        const retries = yield* Effect.all(
+          [f.turns.claim(f.snapshot, locator), restarted.claim(f.snapshot, locator)],
+          { concurrency: 2 },
+        );
+        expect(retries.map((retry) => retry.decision)).toEqual([
+          selected.decision,
+          selected.decision,
+        ]);
+        expect(
+          yield* f.sql.withTransaction(
+            reader.readHeadInTransaction({ dispatchId: f.snapshot.fence.dispatchId }),
+          ),
+        ).toEqual(selected.decision);
+        expect((yield* f.messages).find((message) => message.recordId === "second")?.status).toBe(
+          "queued",
+        );
       }),
     ),
 );

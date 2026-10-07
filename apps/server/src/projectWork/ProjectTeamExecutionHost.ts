@@ -112,6 +112,22 @@ const bindingFor = (snapshot: Snapshot) => {
   if (transition?.kind !== "claim") throw denied("Original dispatch binding is missing");
   return transition.binding;
 };
+
+/** Reads the bounded ownership history; individual receipts still require reconciliation. */
+export const readProjectTeamOwnedOperationHistory = Effect.fn(
+  "ProjectTeamExecutionHost.operationRows",
+)(function* (sql: SqlClient.SqlClient, environmentId: string, snapshot: Snapshot) {
+  const binding = bindingFor(snapshot);
+  const rows = yield* sql<{
+    operation_id: string;
+    status: string;
+  }>`SELECT operation_id,status FROM project_team_pi_operation
+    WHERE environment_id=${environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation}
+    ORDER BY operation_ordinal LIMIT 131`;
+  // Initialization and assignment precede at most 128 later mailbox prompts.
+  if (rows.length > 130) return yield* denied("Owned operation history exceeds its cleanup bound");
+  return rows;
+});
 const setupInput = (snapshot: Snapshot) => {
   const binding = bindingFor(snapshot);
   return {
@@ -138,7 +154,7 @@ export const waitForProjectTeamAssignmentChange = Effect.fn("waitForProjectTeamA
   },
 );
 
-/** Continues only the first retained mailbox decision while the original executor still owns the turn. */
+/** Delivers a bounded chain of queued messages while the original executor owns each safe boundary. */
 export const continueProjectTeamMailboxTurn = Effect.fn("continueProjectTeamMailboxTurn")(
   function* (input: {
     readonly original: Snapshot;
@@ -155,62 +171,79 @@ export const continueProjectTeamMailboxTurn = Effect.fn("continueProjectTeamMail
         ),
       ),
     );
-    yield* input.assertCurrent;
-    const claimed = yield* input.turns.claim(input.original);
-    if (claimed._tag === "None" || claimed._tag === "Retained") return;
-    if (claimed._tag === "Uncertain") {
-      const reflected = yield* input.turns.reflect({
-        operationId: claimed.decision.request.operationId,
-      });
-      if (reflected._tag === "Delivered" || reflected._tag === "Retained") return;
-      return yield* denied("Original mailbox turn requires reconciliation");
-    }
-    const decision = claimed.decision;
-    if (claimed._tag === "Selected") {
+    let afterOperationId: string | undefined;
+    for (let boundaryIndex = 0; boundaryIndex <= 128; boundaryIndex++) {
       yield* input.assertCurrent;
-      yield* engine.dispatch({
-        type: "thread.turn.start",
-        commandId: decision.commandId,
-        threadId: decision.request.threadId,
-        message: {
-          messageId: decision.userMessageId,
-          role: "user",
-          text: decision.request.prompt,
-          displayText: `Team message\n\n${decision.message.body}`,
-          attachments: [],
-        },
-        ...(decision.request.modelSelection === undefined
-          ? {}
-          : { modelSelection: decision.request.modelSelection }),
-        runtimeMode: "approval-required",
-        interactionMode: "default",
-        createdAt: decision.message.updatedAt,
-      });
-    }
-    for (;;) {
-      yield* input.assertCurrent;
-      const reflected = yield* input.turns.reflect({ operationId: decision.request.operationId });
-      if (reflected._tag === "Delivered" || reflected._tag === "Retained") return;
-      if (reflected._tag === "Uncertain")
-        return yield* denied("Original mailbox turn has no qualified delivery");
-      const events = yield* waitForProjectTeamAssignmentChange(
-        pull,
-        Math.min(
-          input.original.intent.limits.deadlineAtMs,
-          input.original.intent.limits.rootDeadlineAtMs,
-        ),
+      const claimed = yield* input.turns.claim(
+        input.original,
+        afterOperationId === undefined ? undefined : { afterOperationId },
       );
-      if (
-        events.some(
-          (event) =>
-            event.type === "thread.session-set" &&
-            (event.payload.session.status === "error" ||
-              event.payload.session.status === "stopped" ||
-              event.payload.session.status === "interrupted"),
+      if (claimed._tag === "None") return;
+      if (claimed._tag === "Retained") {
+        afterOperationId = claimed.decision.request.operationId;
+        continue;
+      }
+      if (claimed._tag === "Uncertain") {
+        const reflected = yield* input.turns.reflect({
+          operationId: claimed.decision.request.operationId,
+        });
+        if (reflected._tag === "Delivered" || reflected._tag === "Retained") {
+          afterOperationId = claimed.decision.request.operationId;
+          continue;
+        }
+        return yield* denied("Original mailbox turn requires reconciliation");
+      }
+      const decision = claimed.decision;
+      if (claimed._tag === "Selected") {
+        yield* input.assertCurrent;
+        yield* engine.dispatch({
+          type: "thread.turn.start",
+          commandId: decision.commandId,
+          threadId: decision.request.threadId,
+          message: {
+            messageId: decision.userMessageId,
+            role: "user",
+            text: decision.request.prompt,
+            displayText: `Team message\n\n${decision.message.body}`,
+            attachments: [],
+          },
+          ...(decision.request.modelSelection === undefined
+            ? {}
+            : { modelSelection: decision.request.modelSelection }),
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt: decision.message.updatedAt,
+        });
+      }
+      for (;;) {
+        yield* input.assertCurrent;
+        const reflected = yield* input.turns.reflect({ operationId: decision.request.operationId });
+        if (reflected._tag === "Delivered" || reflected._tag === "Retained") {
+          afterOperationId = decision.request.operationId;
+          break;
+        }
+        if (reflected._tag === "Uncertain")
+          return yield* denied("Original mailbox turn has no qualified delivery");
+        const events = yield* waitForProjectTeamAssignmentChange(
+          pull,
+          Math.min(
+            input.original.intent.limits.deadlineAtMs,
+            input.original.intent.limits.rootDeadlineAtMs,
+          ),
+        );
+        if (
+          events.some(
+            (event) =>
+              event.type === "thread.session-set" &&
+              (event.payload.session.status === "error" ||
+                event.payload.session.status === "stopped" ||
+                event.payload.session.status === "interrupted"),
+          )
         )
-      )
-        return yield* denied("Original mailbox turn terminated without qualified delivery");
+          return yield* denied("Original mailbox turn terminated without qualified delivery");
+      }
     }
+    return yield* denied("Mailbox chain exceeded its retained boundary limit");
   },
   Effect.scoped,
 );
@@ -381,20 +414,8 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
           }),
         ),
     }).pipe(Effect.provide(services), Effect.provideService(Scope.Scope, scope), Effect.cached);
-    const operationRows = Effect.fn("ProjectTeamExecutionHost.operationRows")(function* (
-      snapshot: Snapshot,
-    ) {
-      const binding = bindingFor(snapshot);
-      const rows = yield* sql<{
-        operation_id: string;
-        status: string;
-      }>`SELECT operation_id,status FROM project_team_pi_operation
-      WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation}
-      ORDER BY operation_ordinal LIMIT 129`;
-      if (rows.length > 128)
-        return yield* denied("Owned operation history exceeds its cleanup bound");
-      return rows;
-    });
+    const operationRows = (snapshot: Snapshot) =>
+      readProjectTeamOwnedOperationHistory(sql, options.environmentId, snapshot);
     const collectDrain = Effect.fn("ProjectTeamExecutionHost.collectDrain")(function* (
       snapshot: Snapshot,
     ) {
@@ -570,7 +591,7 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       if (evidence._tag === "Failure")
         return { _tag: "Uncertain" as const, cause: Cause.fail(evidence.failure) };
       const decision = yield* sql.withTransaction(
-        mailboxTurnDecisions.readInTransaction({ dispatchId: snapshot.fence.dispatchId }),
+        mailboxTurnDecisions.readHeadInTransaction({ dispatchId: snapshot.fence.dispatchId }),
       );
       if (decision?.kind === "one")
         yield* mailboxTurns.reflect({ operationId: decision.request.operationId });

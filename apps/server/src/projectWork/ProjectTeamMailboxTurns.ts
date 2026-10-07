@@ -160,9 +160,42 @@ const One = Schema.Struct({
   commandId: CommandId,
   userMessageId: MessageId,
 });
-export const ProjectTeamMailboxTurnDecision = Schema.Union([None, One]);
+const Predecessor = Schema.Struct({
+  operationId: Id,
+  operationOrdinal: Safe,
+  decisionSha256: Digest,
+  deliveryReceiptSha256: Digest,
+  operationReceiptSha256: Digest,
+  native: PiNativeReference,
+});
+const SuccessorFields = {
+  version: Schema.Literal(2),
+  turnIndex: Positive.check(Schema.isLessThanOrEqualTo(128)),
+  predecessor: Predecessor,
+};
+const SuccessorNone = Schema.Struct({
+  ...None.fields,
+  ...SuccessorFields,
+  stopReason: Schema.Literals(["empty", "chain-limit"]),
+}).check(
+  Schema.makeFilter((value) =>
+    value.turnIndex === 128 ? value.stopReason === "chain-limit" : value.stopReason === "empty",
+  ),
+);
+const SuccessorOne = Schema.Struct({ ...One.fields, ...SuccessorFields }).check(
+  Schema.makeFilter((value) => value.turnIndex < 128),
+);
+const Selected = Schema.Union([One, SuccessorOne]);
+const Successor = Schema.Union([SuccessorNone, SuccessorOne]);
+const isSuccessor = Schema.is(Successor);
+export const ProjectTeamMailboxTurnDecision = Schema.Union([
+  None,
+  One,
+  SuccessorNone,
+  SuccessorOne,
+]);
 export type ProjectTeamMailboxTurnDecision = typeof ProjectTeamMailboxTurnDecision.Type;
-export type ProjectTeamSelectedMailboxTurn = typeof One.Type;
+export type ProjectTeamSelectedMailboxTurn = typeof Selected.Type;
 const DecisionRow = Schema.Struct({
   environment_id: Id,
   dispatch_id: Id,
@@ -173,8 +206,14 @@ const DecisionRow = Schema.Struct({
   decision_sha256: Digest,
   operation_id: Schema.NullOr(Id),
 });
+const SuccessorRow = Schema.Struct({
+  ...DecisionRow.fields,
+  predecessor_operation_id: Id,
+  turn_index: Positive.check(Schema.isLessThanOrEqualTo(128)),
+});
 const OperationRow = Schema.Struct({
   operation_id: Id,
+  operation_ordinal: Safe,
   environment_id: Id,
   project_id: ProjectId,
   binding_id: Id,
@@ -316,6 +355,7 @@ const decodeDecision = Schema.decodeUnknownEffect(
   strict,
 );
 const decodeRow = Schema.decodeUnknownEffect(DecisionRow, strict);
+const decodeSuccessorRow = Schema.decodeUnknownEffect(SuccessorRow, strict);
 const decodeIntent = Schema.decodeUnknownEffect(Schema.fromJsonString(PreparedIntent), strict);
 const exact = <A>(value: unknown, decode: (input: unknown) => A) => {
   const copy: unknown = structuredClone(value);
@@ -335,6 +375,22 @@ const immutableBinding = (binding: typeof ProjectTeamRunBinding.Type) => {
 };
 const derivedId = (kind: string, environmentId: string, dispatchId: string) =>
   `${kind}_${hash({ environmentId, dispatchId })}`;
+const boundaryId = (
+  kind: string,
+  environmentId: string,
+  dispatchId: string,
+  predecessorOperationId?: string,
+) =>
+  predecessorOperationId === undefined
+    ? derivedId(kind, environmentId, dispatchId)
+    : `${kind}_${hash({ environmentId, dispatchId, predecessorOperationId })}`;
+const decisionId = (kind: string, decision: ProjectTeamMailboxTurnDecision) =>
+  boundaryId(
+    kind,
+    decision.environmentId,
+    decision.dispatchId,
+    isSuccessor(decision) ? decision.predecessor.operationId : undefined,
+  );
 
 type Operations = Effect.Success<ReturnType<typeof makeProjectTeamPiOperations>>;
 export type ProjectTeamMailboxTurnOperationReceipt = NonNullable<
@@ -349,11 +405,11 @@ export type ProjectTeamMailboxTurnDeliveryReceipt = {
   readonly message: typeof ProjectTeamMessage.Type;
 };
 export type ProjectTeamMailboxTurnClaim =
-  | { readonly _tag: "None"; readonly decision: typeof None.Type }
-  | { readonly _tag: "Selected" | "Active" | "Uncertain"; readonly decision: typeof One.Type }
+  | { readonly _tag: "None"; readonly decision: typeof None.Type | typeof SuccessorNone.Type }
+  | { readonly _tag: "Selected" | "Active" | "Uncertain"; readonly decision: typeof Selected.Type }
   | {
       readonly _tag: "Retained";
-      readonly decision: typeof One.Type;
+      readonly decision: typeof Selected.Type;
       readonly receipt: ProjectTeamMailboxTurnDeliveryReceipt;
     };
 export type ProjectTeamMailboxTurnReflection =
@@ -366,6 +422,8 @@ export type ProjectTeamMailboxTurnReflection =
 const decodeId = Schema.decodeUnknownEffect(Id, strict);
 const decodeNone = Schema.decodeUnknownEffect(None, strict);
 const decodeOne = Schema.decodeUnknownEffect(One, strict);
+const decodeSuccessorNone = Schema.decodeUnknownEffect(SuccessorNone, strict);
+const decodeSuccessorOne = Schema.decodeUnknownEffect(SuccessorOne, strict);
 const decodeOperationRow = Schema.decodeUnknownEffect(OperationRow, strict);
 const decodeBatchRow = Schema.decodeUnknownEffect(BatchRow, strict);
 const decodeSealManifest = Schema.decodeUnknownEffect(Schema.fromJsonString(SealManifest), strict);
@@ -393,14 +451,315 @@ const captureLocator = Schema.decodeUnknownSync(
   Schema.Struct({
     dispatchId: Schema.optionalKey(Id),
     operationId: Schema.optionalKey(Id),
+    afterOperationId: Schema.optionalKey(Id),
   }),
   strict,
 );
+const captureBoundary = Schema.decodeUnknownSync(Schema.Struct({ afterOperationId: Id }), strict);
+const captureHead = Schema.decodeUnknownSync(Schema.Struct({ dispatchId: Id }), strict);
 const captureSnapshotInput = Schema.decodeUnknownSync(SnapshotInput, strict);
 const captureReadInput = Schema.decodeUnknownSync(ReadInput, strict);
 const captureSealInput = Schema.decodeUnknownSync(SealInput, strict);
 const captureBindInput = Schema.decodeUnknownSync(BindInput, strict);
 const captureReflectInput = Schema.decodeUnknownSync(ReflectInput, strict);
+function makeMailboxTurnHistory(sql: SqlClient.SqlClient, environmentId: string) {
+  const operation = Effect.fn("mailboxTurn.operation")(function* (decision: typeof Selected.Type) {
+    const rows =
+      yield* sql`SELECT operation_id,operation_ordinal,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,request_hash,root_task_id,maximum_tokens,deadline_at_ms,status,
+      CASE WHEN length(CAST(intent_json AS BLOB)) <= 1048576 THEN intent_json ELSE NULL END AS intent_json
+      FROM project_team_pi_operation WHERE operation_id=${decision.request.operationId} LIMIT 2`;
+    if (rows.length !== 1) return yield* deny("Later operation is missing or ambiguous");
+    const row = yield* decodeOperationRow(rows[0]).pipe(
+      Effect.mapError(() => deny("Later operation columns are malformed")),
+    );
+    const intent = yield* decodeIntent(row.intent_json).pipe(
+      Effect.mapError(() => deny("Later operation intent is malformed")),
+    );
+    if (
+      row.environment_id !== environmentId ||
+      row.project_id !== decision.projectId ||
+      row.binding_id !== decision.bindingId ||
+      row.generation !== decision.generation ||
+      row.provider_instance_id !== decision.binding.providerInstanceId ||
+      row.thread_id !== decision.request.threadId ||
+      row.request_hash !== decision.requestSha256 ||
+      canonical(intent.request) !== canonical(decision.request) ||
+      row.intent_json !== canonical(intent) ||
+      intent.resourceHash !== decision.resourceHash ||
+      immutableBinding(intent.binding) !== immutableBinding(decision.binding) ||
+      row.root_task_id !== decision.rootBudget.rootTaskId ||
+      canonical(intent.rootBudget) !== canonical(decision.rootBudget) ||
+      row.maximum_tokens !== intent.operationLimits.maximumTokens ||
+      row.deadline_at_ms !== intent.operationLimits.deadlineAtMs ||
+      row.maximum_tokens > decision.attemptLimits.maximumTokens ||
+      row.deadline_at_ms > decision.attemptLimits.deadlineAtMs
+    )
+      return yield* deny("Later operation differs from its original selected identity");
+    return { row, intent };
+  });
+  const batch = Effect.fn("mailboxTurn.batch")(function* (decision: typeof Selected.Type) {
+    const rows =
+      yield* sql`SELECT operation_id,batch_id,environment_id,project_id,dispatch_id,binding_id,generation,
+      CASE WHEN length(CAST(manifest_json AS BLOB)) <= 262144 THEN manifest_json ELSE NULL END AS manifest_json,manifest_sha256,
+      CASE WHEN length(CAST(system_text AS BLOB)) <= 65536 THEN system_text ELSE NULL END AS system_text,system_text_sha256,revision,status
+      FROM project_team_mailbox_batch WHERE operation_id=${decision.request.operationId} LIMIT 2`;
+    if (rows.length === 0) return undefined;
+    if (rows.length !== 1) return yield* deny("Later seal is ambiguous");
+    const row = yield* decodeBatchRow(rows[0]).pipe(
+      Effect.mapError(() => deny("Later seal columns are malformed")),
+    );
+    const manifest = yield* decodeSealManifest(row.manifest_json).pipe(
+      Effect.mapError(() => deny("Later seal manifest is malformed")),
+    );
+    if (
+      canonical(manifest) !== row.manifest_json ||
+      textHash(row.manifest_json) !== row.manifest_sha256 ||
+      textHash(row.system_text) !== row.system_text_sha256 ||
+      manifest.decisionSha256 !== hash(decision) ||
+      manifest.operationId !== decision.request.operationId ||
+      manifest.environmentId !== environmentId ||
+      manifest.projectId !== decision.projectId ||
+      manifest.dispatchId !== decision.dispatchId ||
+      manifest.bindingId !== decision.bindingId ||
+      manifest.generation !== decision.generation ||
+      manifest.claimGeneration !== decision.claimGeneration ||
+      manifest.requestHash !== decision.requestSha256 ||
+      manifest.resourceHash !== decision.resourceHash ||
+      row.operation_id !== manifest.operationId ||
+      row.environment_id !== manifest.environmentId ||
+      row.project_id !== manifest.projectId ||
+      row.dispatch_id !== manifest.dispatchId ||
+      row.binding_id !== manifest.bindingId ||
+      row.generation !== manifest.generation
+    )
+      return yield* deny("Later seal digest or identity differs");
+    return { row, manifest };
+  });
+  const reflectionPhase = Effect.fn("mailboxTurn.reflectionPhase")(function* (
+    operationId: string,
+    status: "uncertain" | "delivered",
+  ) {
+    const rows =
+      yield* sql`SELECT operation_id,phase,CASE WHEN length(CAST(command_json AS BLOB))<=262144 THEN command_json ELSE NULL END AS command_json,
+      command_sha256,observation_sha256,observed_at,CASE WHEN length(CAST(outcome_json AS BLOB))<=262144 THEN outcome_json ELSE NULL END AS outcome_json
+      FROM project_team_mailbox_reflection WHERE operation_id=${operationId} AND phase=${status} LIMIT 2`;
+    if (!rows.length) return undefined;
+    if (rows.length !== 1) return yield* deny("Later reflection is ambiguous");
+    const row = yield* decodeReflectionRow(rows[0]);
+    const commands = yield* decodeCommands(row.command_json);
+    const outcomes = yield* decodeOutcomes(row.outcome_json);
+    if (
+      row.operation_id !== operationId ||
+      row.phase !== status ||
+      canonical(commands) !== row.command_json ||
+      canonical(outcomes) !== row.outcome_json ||
+      hash(commands) !== row.command_sha256 ||
+      commands.length !== 1 ||
+      outcomes.length !== 1
+    )
+      return yield* deny("Later reflection integrity differs");
+    const message = outcomes[0];
+    if (!message) return yield* deny("Later retained outcome is missing");
+    return { row, commands, message };
+  });
+  const observation = Effect.fn("mailboxTurn.observation")(function* (
+    decision: typeof Selected.Type,
+  ) {
+    const op = yield* operation(decision);
+    const rows = yield* sql<{ terminal_json: string | null; native_json: string | null }>`SELECT
+      CASE WHEN length(CAST(terminal_json AS BLOB))<=262144 THEN terminal_json ELSE NULL END AS terminal_json,
+      CASE WHEN length(CAST(native_json AS BLOB))<=4096 THEN native_json ELSE NULL END AS native_json
+      FROM project_team_pi_operation WHERE operation_id=${decision.request.operationId} LIMIT 2`;
+    if (rows.length !== 1 || !rows[0]?.terminal_json)
+      return yield* deny("Later terminal observation is missing");
+    const terminal = yield* decodeTerminal(rows[0].terminal_json);
+    if (
+      canonical(terminal) !== rows[0].terminal_json ||
+      terminal.operation.operationId !== decision.request.operationId ||
+      terminal.operation.operationKind !== "prompt" ||
+      terminal.identity.workerId !== op.row.worker_id ||
+      terminal.identity.generation !== decision.generation
+    )
+      return yield* deny("Later terminal identity differs");
+    const processes =
+      yield* sql`SELECT operation_id,unit,allocation_json,status,owner_json,drain_json FROM project_team_pi_process WHERE operation_id=${decision.request.operationId} LIMIT 2`;
+    if (processes.length !== 1) return yield* deny("Later physical process is ambiguous");
+    const accounting =
+      yield* sql`SELECT reservation_id,status,capacity_state,settlement_json,accounting_receipt_id FROM project_team_model_request WHERE operation_id=${decision.request.operationId} ORDER BY request_id LIMIT 257`;
+    if (accounting.length > 256) return yield* deny("Later accounting exceeds its bound");
+    const inputs =
+      yield* sql`SELECT reservation_id,operation_id,request_id,worker_id,generation,route_id,provider,model,system_text_sha256,encoded_request_sha256 FROM project_team_mailbox_input WHERE operation_id=${decision.request.operationId} ORDER BY request_id LIMIT 257`;
+    if (inputs.length > 256) return yield* deny("Later inputs exceed their bound");
+    const checkedInputs = yield* Effect.forEach(inputs, (row) => decodeBoundInput(row));
+    return {
+      op,
+      terminal,
+      sha256: hash({
+        status: op.row.status,
+        terminal,
+        nativeJson: rows[0].native_json,
+        process: processes[0],
+        accounting,
+        inputs: checkedInputs,
+      }),
+    };
+  });
+  const physicalMessage = Effect.fn("mailboxTurn.physicalMessage")(function* (
+    message: typeof ProjectTeamMessage.Type,
+  ) {
+    const rows =
+      yield* sql`SELECT record_id,project_id,status,revision,generation,updated_at,task_id,attempt_id,member_id,source_id,scope_key,slot,unique_key,provider_instance_id,thread_id,session_id,
+      CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json ELSE NULL END AS payload_json FROM project_team_message WHERE record_id=${message.recordId} AND project_id=${message.projectId} LIMIT 2`;
+    if (rows.length !== 1 || !rows[0]) return yield* deny("Later physical message is missing");
+    const row = rows[0];
+    const payload = yield* decodeProjectTeamMessage(row.payload_json);
+    const { payload_json: _, ...columns } = row;
+    const expected = {
+      record_id: message.recordId,
+      project_id: message.projectId,
+      status: message.status,
+      revision: message.revision,
+      generation: message.generation,
+      updated_at: message.updatedAt,
+      task_id: message.taskId ?? null,
+      attempt_id: null,
+      member_id: null,
+      source_id: null,
+      scope_key: null,
+      slot: null,
+      unique_key: message.commandId,
+      provider_instance_id: null,
+      thread_id: null,
+      session_id: null,
+    };
+    if (canonical(payload) !== canonical(message) || canonical(columns) !== canonical(expected))
+      return yield* deny("Later physical message write was skipped or changed");
+  });
+  const verifyPhase = Effect.fn("mailboxTurn.verifyPhase")(function* (
+    decision: typeof Selected.Type,
+    saved: NonNullable<Effect.Success<ReturnType<typeof reflectionPhase>>>,
+    previous?: NonNullable<Effect.Success<ReturnType<typeof reflectionPhase>>>,
+  ) {
+    const prior = previous?.message ?? decision.message;
+    const expected = {
+      ...prior,
+      revision: prior.revision + 1,
+      status: saved.row.phase,
+      updatedAt: saved.row.observed_at,
+      deliveryGeneration: decision.target.deliveryGeneration,
+      deliveryCursor: decision.target.deliveryCursor,
+    };
+    if (canonical(saved.message) !== canonical(expected))
+      return yield* deny("Later retained outcome differs");
+    const command = saved.commands[0];
+    const attribution = {
+      actor: { kind: "system", id: "project-team-mailbox-turns" },
+      source: { kind: "system", id: "project-team-mailbox-turns" },
+      recordedAt: saved.row.observed_at,
+    };
+    if (
+      !command ||
+      command.commandId !==
+        derivedId(`mailbox-${saved.row.phase}`, environmentId, decision.request.operationId) ||
+      command.projectId !== decision.projectId ||
+      command.committedAt !== saved.row.observed_at ||
+      canonical(command.attribution) !== canonical(attribution) ||
+      canonical(command.records) !== canonical([saved.message]) ||
+      command.guided !== undefined ||
+      command.transition !== undefined
+    )
+      return yield* deny("Later retained command differs");
+    const receipts = yield* sql<{
+      payload_fingerprint: string;
+    }>`SELECT payload_fingerprint FROM project_work_command_receipts WHERE project_id=${decision.projectId} AND command_id=${command.commandId} LIMIT 2`;
+    if (
+      receipts.length !== 1 ||
+      receipts[0]?.payload_fingerprint !==
+        projectWorkPayloadFingerprint({
+          ...command,
+          attribution: { actor: attribution.actor, source: attribution.source },
+        })
+    )
+      return yield* deny("Later command receipt differs");
+    const events = yield* sql<{
+      payload_json: string;
+    }>`SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=1048576 THEN payload_json ELSE NULL END AS payload_json FROM project_work_events WHERE project_id=${decision.projectId} AND command_id=${command.commandId} ORDER BY sequence LIMIT 2`;
+    if (events.length !== 1 || !events[0]) return yield* deny("Later delivery event is missing");
+    const payload = yield* decodeEventPayload(events[0].payload_json);
+    const event = yield* Effect.try({
+      try: () => decodeProjectWorkEvent(payload),
+      catch: () => deny("Later delivery event is invalid"),
+    });
+    if (
+      event.type !== "project-work.foundation.recorded" ||
+      canonical(event.record) !== canonical(saved.message)
+    )
+      return yield* deny("Later delivery event differs");
+  });
+  const historical = Effect.fn("mailboxTurn.historical")(function* (
+    decision: typeof Selected.Type,
+    sealed: NonNullable<Effect.Success<ReturnType<typeof batch>>>,
+    saved: NonNullable<Effect.Success<ReturnType<typeof reflectionPhase>>>,
+    uncertain: Effect.Success<ReturnType<typeof reflectionPhase>>,
+  ) {
+    if (sealed.row.status !== "delivered" || sealed.row.revision !== (uncertain ? 2 : 1))
+      return yield* deny("Later delivery phase differs");
+    if (uncertain) yield* verifyPhase(decision, uncertain);
+    yield* verifyPhase(decision, saved, uncertain);
+    const observed = yield* observation(decision);
+    if (
+      observed.op.row.status !== "settled" ||
+      observed.terminal.outcome !== "success" ||
+      saved.row.observation_sha256 !== observed.sha256
+    )
+      return yield* deny("Later successful observation changed");
+    const state = yield* readCurrentState(sql, decision.projectId);
+    const matches =
+      state.foundationRecords?.filter(
+        (r) => r.kind === "message" && r.recordId === decision.message.recordId,
+      ) ?? [];
+    const value = matches[0];
+    if (
+      matches.length !== 1 ||
+      value?.kind !== "message" ||
+      value.revision < saved.message.revision ||
+      !["delivered", "acknowledged", "resolved"].includes(value.status)
+    )
+      return yield* deny("Later delivery history changed");
+    const immutable = (message: typeof ProjectTeamMessage.Type) => {
+      const {
+        revision: _,
+        status: _s,
+        updatedAt: _at,
+        acknowledgedAt: _ack,
+        resolvedAt: _res,
+        ...rest
+      } = message;
+      return canonical(rest);
+    };
+    if (immutable(value) !== immutable(saved.message))
+      return yield* deny("Later delivered message identity changed");
+    yield* physicalMessage(value);
+    return {
+      operationId: decision.request.operationId,
+      decisionSha256: hash(decision),
+      batchId: sealed.row.batch_id,
+      observationSha256: observed.sha256,
+      commandId: (yield* decodeProjectWorkFoundationCommitCommand(saved.commands[0])).commandId,
+      message: saved.message,
+    };
+  });
+  return {
+    operation,
+    batch,
+    reflectionPhase,
+    observation,
+    physicalMessage,
+    verifyPhase,
+    historical,
+  };
+}
+
 /** Strict retained association only; callers separately derive current authority. */
 export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
   "makeProjectTeamMailboxTurnDecisionReader",
@@ -414,6 +773,7 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
   const readInside = Effect.fn("mailboxTurn.readInside")(function* (input: {
     readonly dispatchId?: string;
     readonly operationId?: string;
+    readonly afterOperationId?: string;
   }) {
     const current = yield* Effect.serviceOption(SqlClient.SqlClient);
     if (
@@ -422,18 +782,30 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
       Option.isNone(yield* Effect.serviceOption(sql.transactionService))
     )
       return yield* deny("Mailbox decision requires its captured SQL transaction");
-    if ((input.dispatchId === undefined) === (input.operationId === undefined))
+    if (
+      (input.dispatchId === undefined) === (input.operationId === undefined) ||
+      (input.afterOperationId !== undefined && input.dispatchId === undefined)
+    )
       return yield* deny("Decision locator is ambiguous");
-    const filter =
-      input.dispatchId === undefined
-        ? sql`operation_id=${input.operationId}`
-        : sql`dispatch_id=${input.dispatchId}`;
-    const rows = yield* sql`SELECT environment_id,dispatch_id,project_id,binding_id,generation,
-      CASE WHEN length(CAST(decision_json AS BLOB)) <= 262144 THEN decision_json ELSE NULL END AS decision_json,
-      decision_sha256,operation_id FROM project_team_mailbox_turn WHERE environment_id=${environmentId} AND ${filter} LIMIT 2`;
+    const selected = input.operationId !== undefined;
+    const legacy =
+      selected || input.afterOperationId === undefined
+        ? yield* sql`SELECT environment_id,dispatch_id,project_id,binding_id,generation,
+        CASE WHEN length(CAST(decision_json AS BLOB)) <= 262144 THEN decision_json ELSE NULL END AS decision_json,
+        decision_sha256,operation_id FROM project_team_mailbox_turn WHERE environment_id=${environmentId}
+        AND ${selected ? sql`operation_id=${input.operationId}` : sql`dispatch_id=${input.dispatchId}`} LIMIT 2`
+        : [];
+    const successors =
+      selected || input.afterOperationId !== undefined
+        ? yield* sql`SELECT environment_id,dispatch_id,project_id,binding_id,generation,predecessor_operation_id,turn_index,
+        CASE WHEN length(CAST(decision_json AS BLOB)) <= 262144 THEN decision_json ELSE NULL END AS decision_json,
+        decision_sha256,operation_id FROM project_team_mailbox_successor WHERE environment_id=${environmentId}
+        AND ${selected ? sql`operation_id=${input.operationId}` : sql`dispatch_id=${input.dispatchId} AND predecessor_operation_id=${input.afterOperationId}`} LIMIT 2`
+        : [];
+    const rows = [...legacy, ...successors];
     if (rows.length === 0) return undefined;
     if (rows.length !== 1) return yield* deny("Mailbox decision is ambiguous");
-    const row = yield* decodeRow(rows[0]).pipe(
+    const row = yield* (legacy.length ? decodeRow(rows[0]) : decodeSuccessorRow(rows[0])).pipe(
       Effect.mapError(() => deny("Mailbox decision columns are malformed")),
     );
     const decision = yield* decodeDecision(row.decision_json).pipe(
@@ -451,6 +823,12 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
       decision.binding.environmentId !== environmentId ||
       decision.binding.projectId !== decision.projectId ||
       decision.binding.generation !== decision.generation ||
+      (isSuccessor(decision)
+        ? !("predecessor_operation_id" in row) ||
+          !("turn_index" in row) ||
+          row.predecessor_operation_id !== decision.predecessor.operationId ||
+          row.turn_index !== decision.turnIndex
+        : "predecessor_operation_id" in row) ||
       (decision.kind === "none"
         ? row.operation_id !== null
         : row.operation_id !== decision.request.operationId ||
@@ -469,12 +847,9 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
         decision.target.bindingGeneration !== decision.generation ||
         decision.target.attemptId !== decision.binding.attemptId ||
         decision.request.threadId !== decision.binding.threadId ||
-        decision.request.operationId !==
-          derivedId("mailbox-turn", environmentId, decision.dispatchId) ||
-        decision.commandId !==
-          derivedId("mailbox-turn-command", environmentId, decision.dispatchId) ||
-        decision.userMessageId !==
-          derivedId("mailbox-turn-message", environmentId, decision.dispatchId))
+        decision.request.operationId !== decisionId("mailbox-turn", decision) ||
+        decision.commandId !== decisionId("mailbox-turn-command", decision) ||
+        decision.userMessageId !== decisionId("mailbox-turn-message", decision))
     )
       return yield* deny("Mailbox decision selected identity differs");
     return decision;
@@ -482,6 +857,7 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
   const readInTransaction = (input: {
     readonly dispatchId?: string;
     readonly operationId?: string;
+    readonly afterOperationId?: string;
   }) => {
     try {
       return readInside(exact(input, captureLocator));
@@ -489,47 +865,148 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
       return Effect.fail(deny("Mailbox decision locator is invalid"));
     }
   };
-  const verifyOriginalInTransaction = Effect.fn("mailboxTurn.verifyOriginalInTransaction")(
-    function* (snapshot: ProjectTeamDispatchSnapshot, decision: ProjectTeamMailboxTurnDecision) {
-      const saved = yield* readInTransaction({ dispatchId: snapshot.fence.dispatchId });
+  const history = makeMailboxTurnHistory(sql, environmentId);
+  const readPredecessorInTransaction = Effect.fn("mailboxTurn.readPredecessorInTransaction")(
+    function* (operationId: string) {
+      const decision = yield* readInTransaction({ operationId });
+      if (!decision || decision.kind !== "one")
+        return yield* deny("Predecessor has no selected mailbox decision");
+      const sealed = yield* history.batch(decision);
+      const delivered = yield* history.reflectionPhase(operationId, "delivered");
+      if (!sealed || !delivered)
+        return yield* deny("Predecessor has no committed successful mailbox delivery");
+      const receipt = yield* history.historical(
+        decision,
+        sealed,
+        delivered,
+        yield* history.reflectionPhase(operationId, "uncertain"),
+      );
+      const observed = yield* history.observation(decision);
+      const native = observed.terminal.native;
       if (
-        !saved ||
-        canonical(saved) !== canonical(decision) ||
-        decision.dispatchIntentSha256 !== hash(snapshot.intent) ||
-        decision.claimGeneration !== snapshot.fence.claimGeneration ||
-        decision.fenceRevision !== snapshot.fence.revision
+        !native ||
+        !observed.terminal.ownerCaptured ||
+        !observed.terminal.drain ||
+        observed.terminal.failureCode !== undefined
       )
-        return yield* deny("Original mailbox decision fence differs");
-      const receipt = yield* receipts.readAssignment(snapshot);
-      if (
-        !receipt ||
-        receipt.operation.operationId !== decision.originalAssignmentOperationId ||
-        hash(receipt) !== decision.originalAssignmentReceiptSha256
-      )
-        return yield* deny("Original mailbox receipt differs");
-      const transition = snapshot.intent.compiledClaim.transition;
-      if (
-        transition?.kind !== "claim" ||
-        immutableBinding(transition.binding) !== immutableBinding(decision.binding) ||
-        canonical(decision.rootBudget) !==
-          canonical({
-            rootTaskId: snapshot.intent.limits.rootTaskId,
-            maximumTokens: snapshot.intent.limits.maximumTokens,
-            deadlineAtMs: snapshot.intent.limits.rootDeadlineAtMs,
-          }) ||
-        canonical(decision.attemptLimits) !==
-          canonical({
-            maximumTokens: snapshot.intent.limits.attemptMaximumTokens,
-            deadlineAtMs: snapshot.intent.limits.deadlineAtMs,
-          }) ||
-        (decision.kind === "one" &&
-          (canonical(decision.request.resumeCursor) !== canonical(receipt.native) ||
-            decision.resourceHash !== receipt.resourceHash))
-      )
-        return yield* deny("Original mailbox scope, native reference or budget differs");
+        return yield* deny("Predecessor successful ownership is incomplete");
+      return {
+        decision,
+        receipt,
+        operationOrdinal: observed.op.row.operation_ordinal,
+        native,
+        operationReceiptSha256: hash({
+          operation: observed.terminal.operation,
+          terminal: observed.terminal,
+          native,
+        }),
+      };
     },
   );
-  return { readInTransaction, verifyOriginalInTransaction };
+  const verifyOriginalInTransaction = Effect.fn("mailboxTurn.verifyOriginalInTransaction")(
+    function* (snapshot: ProjectTeamDispatchSnapshot, decision: ProjectTeamMailboxTurnDecision) {
+      const receipt = yield* receipts.readAssignment(snapshot);
+      if (!receipt) return yield* deny("Original assignment receipt is missing");
+      const transition = snapshot.intent.compiledClaim.transition;
+      let checked = decision;
+      for (let count = 0; count <= 128; count++) {
+        const saved = yield* readInTransaction(
+          isSuccessor(checked)
+            ? {
+                dispatchId: snapshot.fence.dispatchId,
+                afterOperationId: checked.predecessor.operationId,
+              }
+            : { dispatchId: snapshot.fence.dispatchId },
+        );
+        if (
+          !saved ||
+          canonical(saved) !== canonical(checked) ||
+          checked.dispatchIntentSha256 !== hash(snapshot.intent) ||
+          checked.claimGeneration !== snapshot.fence.claimGeneration ||
+          checked.fenceRevision !== snapshot.fence.revision ||
+          checked.originalAssignmentOperationId !== receipt.operation.operationId ||
+          checked.originalAssignmentReceiptSha256 !== hash(receipt) ||
+          transition?.kind !== "claim" ||
+          immutableBinding(transition.binding) !== immutableBinding(checked.binding) ||
+          canonical(checked.rootBudget) !==
+            canonical({
+              rootTaskId: snapshot.intent.limits.rootTaskId,
+              maximumTokens: snapshot.intent.limits.maximumTokens,
+              deadlineAtMs: snapshot.intent.limits.rootDeadlineAtMs,
+            }) ||
+          canonical(checked.attemptLimits) !==
+            canonical({
+              maximumTokens: snapshot.intent.limits.attemptMaximumTokens,
+              deadlineAtMs: snapshot.intent.limits.deadlineAtMs,
+            }) ||
+          (checked.kind === "one" && checked.resourceHash !== receipt.resourceHash)
+        )
+          return yield* deny("Original mailbox fence, scope or budget differs");
+        if (!isSuccessor(checked)) {
+          if (
+            checked.kind === "one" &&
+            canonical(checked.request.resumeCursor) !== canonical(receipt.native)
+          )
+            return yield* deny("Original mailbox native reference differs");
+          return;
+        }
+        const previous = yield* readPredecessorInTransaction(checked.predecessor.operationId);
+        if (
+          checked.turnIndex !==
+            (isSuccessor(previous.decision) ? previous.decision.turnIndex + 1 : 1) ||
+          checked.predecessor.decisionSha256 !== hash(previous.decision) ||
+          checked.predecessor.deliveryReceiptSha256 !== hash(previous.receipt) ||
+          checked.predecessor.operationReceiptSha256 !== previous.operationReceiptSha256 ||
+          checked.predecessor.operationOrdinal !== previous.operationOrdinal ||
+          canonical(checked.predecessor.native) !== canonical(previous.native) ||
+          (checked.kind === "one" &&
+            canonical(checked.request.resumeCursor) !== canonical(previous.native))
+        )
+          return yield* deny("Mailbox predecessor receipt differs");
+        checked = previous.decision;
+      }
+      return yield* deny("Mailbox chain exceeds its boundary limit");
+    },
+  );
+  const readHeadInside = Effect.fn("mailboxTurn.readHeadInside")(function* (dispatchId: string) {
+    let head = yield* readInTransaction({ dispatchId });
+    const rows = yield* sql<{
+      predecessor_operation_id: string;
+      turn_index: number;
+    }>`SELECT predecessor_operation_id,turn_index
+      FROM project_team_mailbox_successor WHERE environment_id=${environmentId} AND dispatch_id=${dispatchId} ORDER BY turn_index LIMIT 129`;
+    if (rows.length > 128) return yield* deny("Mailbox chain exceeds its boundary limit");
+    for (const [index, row] of rows.entries()) {
+      if (
+        !head ||
+        head.kind !== "one" ||
+        row.turn_index !== index + 1 ||
+        row.predecessor_operation_id !== head.request.operationId
+      )
+        return yield* deny("Mailbox chain is missing, forked or follows a terminal decision");
+      const next = yield* readInTransaction({
+        dispatchId,
+        afterOperationId: head.request.operationId,
+      });
+      if (!next || !isSuccessor(next) || next.predecessor.decisionSha256 !== hash(head))
+        return yield* deny("Mailbox successor identity differs");
+      head = next;
+    }
+    return head;
+  });
+  const readHeadInTransaction = (input: { readonly dispatchId: string }) => {
+    try {
+      return readHeadInside(exact(input, captureHead).dispatchId);
+    } catch {
+      return Effect.fail(deny("Mailbox head locator is invalid"));
+    }
+  };
+  return {
+    readInTransaction,
+    readHeadInTransaction,
+    readPredecessorInTransaction,
+    verifyOriginalInTransaction,
+  };
 });
 
 /** One committed boundary decision; delivery grants no acknowledgment, completion or new scope. */
@@ -544,6 +1021,15 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
     const repository = yield* ProjectWorkRepository;
     const authorization = yield* ProjectTeamAuthorization;
     const reader = yield* makeProjectTeamMailboxTurnDecisionReader({ environmentId });
+    const {
+      operation,
+      batch,
+      reflectionPhase,
+      observation,
+      physicalMessage,
+      verifyPhase,
+      historical,
+    } = makeMailboxTurnHistory(sql, environmentId);
     const journal = yield* makeProjectTeamDispatchJournal({
       environmentId,
       maximumEnvironmentModelCalls: 128,
@@ -629,11 +1115,16 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
     });
     const claimInside = Effect.fn("mailboxTurn.claimInside")(function* (
       captured: typeof SnapshotInput.Type,
+      boundary?: { readonly afterOperationId: string },
     ) {
       const original = yield* journal.readRetained(captured.fence.dispatchId);
       if (canonical(original) !== canonical(captured))
         return yield* deny("Original boundary snapshot differs");
-      const prior = yield* reader.readInTransaction({ dispatchId: original.fence.dispatchId });
+      const locator =
+        boundary === undefined
+          ? { dispatchId: original.fence.dispatchId }
+          : { dispatchId: original.fence.dispatchId, afterOperationId: boundary.afterOperationId };
+      const prior = yield* reader.readInTransaction(locator);
       if (prior) return yield* classify(prior);
       if (original.fence.stage !== "assignment-observed")
         return yield* deny(
@@ -642,6 +1133,31 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
       yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });
       const receipt = yield* sessions.readAssignment(original);
       if (!receipt) return yield* deny("Original assignment receipt is missing");
+      const predecessor =
+        boundary === undefined
+          ? undefined
+          : yield* reader.readPredecessorInTransaction(boundary.afterOperationId);
+      if (predecessor) {
+        const head = yield* reader.readHeadInTransaction({ dispatchId: original.fence.dispatchId });
+        if (canonical(head) !== canonical(predecessor.decision))
+          return yield* deny("Requested predecessor is not the original mailbox head");
+        yield* reader.verifyOriginalInTransaction(original, predecessor.decision);
+        const fresh = yield* lookupInTransaction(
+          {
+            providerInstanceId: predecessor.decision.binding.providerInstanceId,
+            threadId: predecessor.decision.binding.threadId,
+          },
+          predecessor.decision.request,
+          predecessor.decision.requestSha256,
+          predecessor.decision.resourceHash,
+        );
+        if (
+          !fresh ||
+          hash({ operation: fresh.operation, terminal: fresh.terminal, native: fresh.native }) !==
+            predecessor.operationReceiptSha256
+        )
+          return yield* deny("Predecessor is not the current qualified successful operation");
+      }
       const owner = yield* current(original);
       const common = {
         environmentId,
@@ -666,6 +1182,27 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
           deadlineAtMs: original.intent.limits.deadlineAtMs,
         },
       };
+      const turnIndex =
+        predecessor === undefined
+          ? 0
+          : isSuccessor(predecessor.decision)
+            ? predecessor.decision.turnIndex + 1
+            : 1;
+      const successorFields =
+        predecessor === undefined
+          ? undefined
+          : {
+              version: 2 as const,
+              turnIndex,
+              predecessor: {
+                operationId: predecessor.decision.request.operationId,
+                operationOrdinal: predecessor.operationOrdinal,
+                decisionSha256: hash(predecessor.decision),
+                deliveryReceiptSha256: hash(predecessor.receipt),
+                operationReceiptSha256: predecessor.operationReceiptSha256,
+                native: predecessor.native,
+              },
+            };
       const records = owner.authority.state.foundationRecords ?? [];
       const messages = records
         .filter((r) => r.kind === "message")
@@ -678,15 +1215,27 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         candidates: [{ ...owner.recipient, safeTurnBoundary: true }],
       });
       if (!plan.accepted) return yield* deny("Queued mailbox targets are invalid");
-      const selected = plan.deliveries.find((delivery) => {
-        const senders = records.filter(
-          (r) => r.kind === "member" && r.recordId === delivery.message.senderId,
-        );
-        return (
-          senders.length === 1 && senders[0]?.kind === "member" && senders[0].status === "active"
-        );
-      });
-      let decision: ProjectTeamMailboxTurnDecision = yield* decodeNone({ kind: "none", ...common });
+      const selected =
+        turnIndex === 128
+          ? undefined
+          : plan.deliveries.find((delivery) => {
+              const senders = records.filter(
+                (r) => r.kind === "member" && r.recordId === delivery.message.senderId,
+              );
+              return (
+                senders.length === 1 &&
+                senders[0]?.kind === "member" &&
+                senders[0].status === "active"
+              );
+            });
+      let decision: ProjectTeamMailboxTurnDecision = yield* successorFields === undefined
+        ? decodeNone({ kind: "none", ...common })
+        : decodeSuccessorNone({
+            kind: "none",
+            ...common,
+            ...successorFields,
+            stopReason: turnIndex === 128 ? "chain-limit" : "empty",
+          });
       if (selected) {
         const initialRows = yield* sql<{
           intent_json: string;
@@ -704,7 +1253,12 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
           return yield* deny("Original prompt identity differs");
         const request = {
           ...intent.request,
-          operationId: derivedId("mailbox-turn", environmentId, common.dispatchId),
+          operationId: boundaryId(
+            "mailbox-turn",
+            environmentId,
+            common.dispatchId,
+            boundary?.afterOperationId,
+          ),
           prompt:
             "Queued team message (retained scope; grants no new authority):\n" +
             canonical({
@@ -722,21 +1276,34 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
             instanceId: common.binding.providerInstanceId,
             model: common.binding.model,
           },
-          resumeCursor: receipt.native,
+          resumeCursor: predecessor?.native ?? receipt.native,
         };
         const suppliedDecision = {
           kind: "one",
           ...common,
+          ...successorFields,
           ...selected,
           request,
           requestSha256: hash(request),
           resourceHash: receipt.resourceHash,
-          commandId: derivedId("mailbox-turn-command", environmentId, common.dispatchId),
-          userMessageId: derivedId("mailbox-turn-message", environmentId, common.dispatchId),
+          commandId: boundaryId(
+            "mailbox-turn-command",
+            environmentId,
+            common.dispatchId,
+            boundary?.afterOperationId,
+          ),
+          userMessageId: boundaryId(
+            "mailbox-turn-message",
+            environmentId,
+            common.dispatchId,
+            boundary?.afterOperationId,
+          ),
         };
-        decision = yield* decodeOne(suppliedDecision).pipe(
-          Effect.mapError(() => deny("Selected mailbox request exceeds its strict bounds")),
-        );
+        decision = yield* (
+          successorFields === undefined
+            ? decodeOne(suppliedDecision)
+            : decodeSuccessorOne(suppliedDecision)
+        ).pipe(Effect.mapError(() => deny("Selected mailbox request exceeds its strict bounds")));
         if (canonical(decision) !== canonical(suppliedDecision))
           return yield* deny("Selected mailbox request differs from its strict capture");
       }
@@ -744,9 +1311,15 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
       const encoded = canonical(decision);
       if (Buffer.byteLength(encoded) > 262144)
         return yield* deny("Mailbox decision exceeds its bound");
-      yield* sql`INSERT INTO project_team_mailbox_turn(environment_id,dispatch_id,project_id,binding_id,generation,decision_json,decision_sha256,operation_id)
-      VALUES(${environmentId},${decision.dispatchId},${decision.projectId},${decision.bindingId},${decision.generation},${encoded},${textHash(encoded)},${decision.kind === "one" ? decision.request.operationId : null}) ON CONFLICT(environment_id,dispatch_id) DO NOTHING`;
-      const saved = yield* reader.readInTransaction({ dispatchId: decision.dispatchId });
+      if (isSuccessor(decision)) {
+        yield* sql`INSERT INTO project_team_mailbox_successor(environment_id,dispatch_id,predecessor_operation_id,turn_index,project_id,binding_id,generation,decision_json,decision_sha256,operation_id)
+          VALUES(${environmentId},${decision.dispatchId},${decision.predecessor.operationId},${decision.turnIndex},${decision.projectId},${decision.bindingId},${decision.generation},${encoded},${textHash(encoded)},${decision.kind === "one" ? decision.request.operationId : null})
+          ON CONFLICT(environment_id,dispatch_id,predecessor_operation_id) DO NOTHING`;
+      } else {
+        yield* sql`INSERT INTO project_team_mailbox_turn(environment_id,dispatch_id,project_id,binding_id,generation,decision_json,decision_sha256,operation_id)
+          VALUES(${environmentId},${decision.dispatchId},${decision.projectId},${decision.bindingId},${decision.generation},${encoded},${textHash(encoded)},${decision.kind === "one" ? decision.request.operationId : null}) ON CONFLICT(environment_id,dispatch_id) DO NOTHING`;
+      }
+      const saved = yield* reader.readInTransaction(locator);
       if (!saved || canonical(saved) !== encoded)
         return yield* deny("Mailbox boundary first winner differs");
       const final = yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });
@@ -758,20 +1331,26 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         finalOwner.authority.state.revision !== common.boundaryRevision
       )
         return yield* deny("Mailbox authority changed during boundary capture");
+      yield* reader.verifyOriginalInTransaction(final, decision);
       return decision.kind === "none"
         ? { _tag: "None" as const, decision }
         : { _tag: "Selected" as const, decision };
     });
-    const claim = (input: ProjectTeamDispatchSnapshot) => {
+    const claim = (
+      input: ProjectTeamDispatchSnapshot,
+      boundary?: { readonly afterOperationId: string },
+    ) => {
       try {
         const captured = exact(input, captureSnapshotInput);
-        return own(claimInside(captured));
+        const capturedBoundary =
+          boundary === undefined ? undefined : exact(boundary, captureBoundary);
+        return own(claimInside(captured, capturedBoundary));
       } catch {
         return Effect.fail(deny("Mailbox boundary input is invalid"));
       }
     };
     const selectedCurrent = Effect.fn("mailboxTurn.selectedCurrent")(function* (
-      decision: typeof One.Type,
+      decision: typeof Selected.Type,
     ) {
       const original = yield* journal.inspect(decision.dispatchId, { requireClaim: true });
       if (
@@ -838,8 +1417,23 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
             input.request.operationId === original.intent.request.assignmentOperationId))
       )
         return { _tag: "NotLaterTurn" as const };
-      const decision = yield* reader.readInTransaction({ dispatchId: original.fence.dispatchId });
-      if (!decision || decision.kind !== "one" || input.request.kind !== "prompt")
+      if (input.request.kind !== "prompt")
+        return yield* deny("Later prompt has no selected decision");
+      const legacyMatches = yield* sql<{
+        operation_id: string;
+      }>`SELECT operation_id FROM project_team_mailbox_turn
+        WHERE environment_id=${environmentId} AND dispatch_id=${original.fence.dispatchId} AND operation_id IS NOT NULL
+        AND json_extract(decision_json,'$.request.prompt')=${input.request.prompt} LIMIT 2`;
+      const successorMatches = yield* sql<{
+        operation_id: string;
+      }>`SELECT operation_id FROM project_team_mailbox_successor
+        WHERE environment_id=${environmentId} AND dispatch_id=${original.fence.dispatchId} AND operation_id IS NOT NULL
+        AND json_extract(decision_json,'$.request.prompt')=${input.request.prompt} LIMIT 2`;
+      const matches = [...legacyMatches, ...successorMatches];
+      if (matches.length !== 1 || !matches[0])
+        return yield* deny("Later prompt has no unique exact selected decision");
+      const decision = yield* reader.readInTransaction({ operationId: matches[0].operation_id });
+      if (!decision || decision.kind !== "one")
         return yield* deny("Later prompt has no selected decision");
       const request = {
         ...input.request,
@@ -880,80 +1474,8 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         return yield* deny("Later operation has no selected decision");
       return decision;
     });
-    const operation = Effect.fn("mailboxTurn.operation")(function* (decision: typeof One.Type) {
-      const rows =
-        yield* sql`SELECT operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,request_hash,root_task_id,maximum_tokens,deadline_at_ms,status,
-      CASE WHEN length(CAST(intent_json AS BLOB)) <= 1048576 THEN intent_json ELSE NULL END AS intent_json
-      FROM project_team_pi_operation WHERE operation_id=${decision.request.operationId} LIMIT 2`;
-      if (rows.length !== 1) return yield* deny("Later operation is missing or ambiguous");
-      const row = yield* decodeOperationRow(rows[0]).pipe(
-        Effect.mapError(() => deny("Later operation columns are malformed")),
-      );
-      const intent = yield* decodeIntent(row.intent_json).pipe(
-        Effect.mapError(() => deny("Later operation intent is malformed")),
-      );
-      if (
-        row.environment_id !== environmentId ||
-        row.project_id !== decision.projectId ||
-        row.binding_id !== decision.bindingId ||
-        row.generation !== decision.generation ||
-        row.provider_instance_id !== decision.binding.providerInstanceId ||
-        row.thread_id !== decision.request.threadId ||
-        row.request_hash !== decision.requestSha256 ||
-        canonical(intent.request) !== canonical(decision.request) ||
-        row.intent_json !== canonical(intent) ||
-        intent.resourceHash !== decision.resourceHash ||
-        immutableBinding(intent.binding) !== immutableBinding(decision.binding) ||
-        row.root_task_id !== decision.rootBudget.rootTaskId ||
-        canonical(intent.rootBudget) !== canonical(decision.rootBudget) ||
-        row.maximum_tokens !== intent.operationLimits.maximumTokens ||
-        row.deadline_at_ms !== intent.operationLimits.deadlineAtMs ||
-        row.maximum_tokens > decision.attemptLimits.maximumTokens ||
-        row.deadline_at_ms > decision.attemptLimits.deadlineAtMs
-      )
-        return yield* deny("Later operation differs from its original selected identity");
-      return { row, intent };
-    });
-    const batch = Effect.fn("mailboxTurn.batch")(function* (decision: typeof One.Type) {
-      const rows =
-        yield* sql`SELECT operation_id,batch_id,environment_id,project_id,dispatch_id,binding_id,generation,
-      CASE WHEN length(CAST(manifest_json AS BLOB)) <= 262144 THEN manifest_json ELSE NULL END AS manifest_json,manifest_sha256,
-      CASE WHEN length(CAST(system_text AS BLOB)) <= 65536 THEN system_text ELSE NULL END AS system_text,system_text_sha256,revision,status
-      FROM project_team_mailbox_batch WHERE operation_id=${decision.request.operationId} LIMIT 2`;
-      if (rows.length === 0) return undefined;
-      if (rows.length !== 1) return yield* deny("Later seal is ambiguous");
-      const row = yield* decodeBatchRow(rows[0]).pipe(
-        Effect.mapError(() => deny("Later seal columns are malformed")),
-      );
-      const manifest = yield* decodeSealManifest(row.manifest_json).pipe(
-        Effect.mapError(() => deny("Later seal manifest is malformed")),
-      );
-      if (
-        canonical(manifest) !== row.manifest_json ||
-        textHash(row.manifest_json) !== row.manifest_sha256 ||
-        textHash(row.system_text) !== row.system_text_sha256 ||
-        manifest.decisionSha256 !== hash(decision) ||
-        manifest.operationId !== decision.request.operationId ||
-        manifest.environmentId !== environmentId ||
-        manifest.projectId !== decision.projectId ||
-        manifest.dispatchId !== decision.dispatchId ||
-        manifest.bindingId !== decision.bindingId ||
-        manifest.generation !== decision.generation ||
-        manifest.claimGeneration !== decision.claimGeneration ||
-        manifest.requestHash !== decision.requestSha256 ||
-        manifest.resourceHash !== decision.resourceHash ||
-        row.operation_id !== manifest.operationId ||
-        row.environment_id !== manifest.environmentId ||
-        row.project_id !== manifest.projectId ||
-        row.dispatch_id !== manifest.dispatchId ||
-        row.binding_id !== manifest.bindingId ||
-        row.generation !== manifest.generation
-      )
-        return yield* deny("Later seal digest or identity differs");
-      return { row, manifest };
-    });
     const remainingBudget = Effect.fn("mailboxTurn.remainingBudget")(function* (
-      decision: typeof One.Type,
+      decision: typeof Selected.Type,
     ) {
       const budgets =
         yield* sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE environment_id=${environmentId} AND project_id=${decision.projectId} AND root_task_id=${decision.rootBudget.rootTaskId} LIMIT 2`;
@@ -1020,7 +1542,7 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         baseSystemTextSha256: textHash(input.baseSystemText),
       };
       const encoded = canonical(manifest),
-        batchId = derivedId("mailbox-turn-batch", environmentId, decision.dispatchId);
+        batchId = decisionId("mailbox-turn-batch", decision);
       yield* sql`INSERT INTO project_team_mailbox_batch(operation_id,batch_id,environment_id,project_id,dispatch_id,binding_id,generation,manifest_json,manifest_sha256,system_text,system_text_sha256,revision,status)
       VALUES(${input.operationId},${batchId},${environmentId},${decision.projectId},${decision.dispatchId},${decision.bindingId},${decision.generation},${encoded},${textHash(encoded)},${text},${textHash(text)},0,'sealed') ON CONFLICT(operation_id) DO NOTHING`;
       const stored = yield* batch(decision);
@@ -1143,75 +1665,8 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         return Effect.fail(deny("Later input binding is invalid"));
       }
     };
-    const reflectionPhase = Effect.fn("mailboxTurn.reflectionPhase")(function* (
-      operationId: string,
-      status: "uncertain" | "delivered",
-    ) {
-      const rows =
-        yield* sql`SELECT operation_id,phase,CASE WHEN length(CAST(command_json AS BLOB))<=262144 THEN command_json ELSE NULL END AS command_json,
-      command_sha256,observation_sha256,observed_at,CASE WHEN length(CAST(outcome_json AS BLOB))<=262144 THEN outcome_json ELSE NULL END AS outcome_json
-      FROM project_team_mailbox_reflection WHERE operation_id=${operationId} AND phase=${status} LIMIT 2`;
-      if (!rows.length) return undefined;
-      if (rows.length !== 1) return yield* deny("Later reflection is ambiguous");
-      const row = yield* decodeReflectionRow(rows[0]);
-      const commands = yield* decodeCommands(row.command_json);
-      const outcomes = yield* decodeOutcomes(row.outcome_json);
-      if (
-        row.operation_id !== operationId ||
-        row.phase !== status ||
-        canonical(commands) !== row.command_json ||
-        canonical(outcomes) !== row.outcome_json ||
-        hash(commands) !== row.command_sha256 ||
-        commands.length !== 1 ||
-        outcomes.length !== 1
-      )
-        return yield* deny("Later reflection integrity differs");
-      const message = outcomes[0];
-      if (!message) return yield* deny("Later retained outcome is missing");
-      return { row, commands, message };
-    });
-    const observation = Effect.fn("mailboxTurn.observation")(function* (decision: typeof One.Type) {
-      const op = yield* operation(decision);
-      const rows = yield* sql<{ terminal_json: string | null; native_json: string | null }>`SELECT
-      CASE WHEN length(CAST(terminal_json AS BLOB))<=262144 THEN terminal_json ELSE NULL END AS terminal_json,
-      CASE WHEN length(CAST(native_json AS BLOB))<=4096 THEN native_json ELSE NULL END AS native_json
-      FROM project_team_pi_operation WHERE operation_id=${decision.request.operationId} LIMIT 2`;
-      if (rows.length !== 1 || !rows[0]?.terminal_json)
-        return yield* deny("Later terminal observation is missing");
-      const terminal = yield* decodeTerminal(rows[0].terminal_json);
-      if (
-        canonical(terminal) !== rows[0].terminal_json ||
-        terminal.operation.operationId !== decision.request.operationId ||
-        terminal.operation.operationKind !== "prompt" ||
-        terminal.identity.workerId !== op.row.worker_id ||
-        terminal.identity.generation !== decision.generation
-      )
-        return yield* deny("Later terminal identity differs");
-      const processes =
-        yield* sql`SELECT operation_id,unit,allocation_json,status,owner_json,drain_json FROM project_team_pi_process WHERE operation_id=${decision.request.operationId} LIMIT 2`;
-      if (processes.length !== 1) return yield* deny("Later physical process is ambiguous");
-      const accounting =
-        yield* sql`SELECT reservation_id,status,capacity_state,settlement_json,accounting_receipt_id FROM project_team_model_request WHERE operation_id=${decision.request.operationId} ORDER BY request_id LIMIT 257`;
-      if (accounting.length > 256) return yield* deny("Later accounting exceeds its bound");
-      const inputs =
-        yield* sql`SELECT reservation_id,operation_id,request_id,worker_id,generation,route_id,provider,model,system_text_sha256,encoded_request_sha256 FROM project_team_mailbox_input WHERE operation_id=${decision.request.operationId} ORDER BY request_id LIMIT 257`;
-      if (inputs.length > 256) return yield* deny("Later inputs exceed their bound");
-      const checkedInputs = yield* Effect.forEach(inputs, (row) => decodeBoundInput(row));
-      return {
-        op,
-        terminal,
-        sha256: hash({
-          status: op.row.status,
-          terminal,
-          nativeJson: rows[0].native_json,
-          process: processes[0],
-          accounting,
-          inputs: checkedInputs,
-        }),
-      };
-    });
     const qualified = Effect.fn("mailboxTurn.qualified")(function* (
-      decision: typeof One.Type,
+      decision: typeof Selected.Type,
       sealed: NonNullable<Effect.Success<ReturnType<typeof batch>>>,
       receipt: ProjectTeamMailboxTurnOperationReceipt,
     ) {
@@ -1246,151 +1701,6 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
           return yield* deny("Later consumed request differs from its bound input");
         seen.add(input.reservation_id);
       }
-    });
-    const physicalMessage = Effect.fn("mailboxTurn.physicalMessage")(function* (
-      message: typeof ProjectTeamMessage.Type,
-    ) {
-      const rows =
-        yield* sql`SELECT record_id,project_id,status,revision,generation,updated_at,task_id,attempt_id,member_id,source_id,scope_key,slot,unique_key,provider_instance_id,thread_id,session_id,
-      CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json ELSE NULL END AS payload_json FROM project_team_message WHERE record_id=${message.recordId} AND project_id=${message.projectId} LIMIT 2`;
-      if (rows.length !== 1 || !rows[0]) return yield* deny("Later physical message is missing");
-      const row = rows[0];
-      const payload = yield* decodeProjectTeamMessage(row.payload_json);
-      const { payload_json: _, ...columns } = row;
-      const expected = {
-        record_id: message.recordId,
-        project_id: message.projectId,
-        status: message.status,
-        revision: message.revision,
-        generation: message.generation,
-        updated_at: message.updatedAt,
-        task_id: message.taskId ?? null,
-        attempt_id: null,
-        member_id: null,
-        source_id: null,
-        scope_key: null,
-        slot: null,
-        unique_key: message.commandId,
-        provider_instance_id: null,
-        thread_id: null,
-        session_id: null,
-      };
-      if (canonical(payload) !== canonical(message) || canonical(columns) !== canonical(expected))
-        return yield* deny("Later physical message write was skipped or changed");
-    });
-    const verifyPhase = Effect.fn("mailboxTurn.verifyPhase")(function* (
-      decision: typeof One.Type,
-      saved: NonNullable<Effect.Success<ReturnType<typeof reflectionPhase>>>,
-      previous?: NonNullable<Effect.Success<ReturnType<typeof reflectionPhase>>>,
-    ) {
-      const prior = previous?.message ?? decision.message;
-      const expected = {
-        ...prior,
-        revision: prior.revision + 1,
-        status: saved.row.phase,
-        updatedAt: saved.row.observed_at,
-        deliveryGeneration: decision.target.deliveryGeneration,
-        deliveryCursor: decision.target.deliveryCursor,
-      };
-      if (canonical(saved.message) !== canonical(expected))
-        return yield* deny("Later retained outcome differs");
-      const command = saved.commands[0];
-      const attribution = {
-        actor: { kind: "system", id: "project-team-mailbox-turns" },
-        source: { kind: "system", id: "project-team-mailbox-turns" },
-        recordedAt: saved.row.observed_at,
-      };
-      if (
-        !command ||
-        command.commandId !==
-          derivedId(`mailbox-${saved.row.phase}`, environmentId, decision.request.operationId) ||
-        command.projectId !== decision.projectId ||
-        command.committedAt !== saved.row.observed_at ||
-        canonical(command.attribution) !== canonical(attribution) ||
-        canonical(command.records) !== canonical([saved.message]) ||
-        command.guided !== undefined ||
-        command.transition !== undefined
-      )
-        return yield* deny("Later retained command differs");
-      const receipts = yield* sql<{
-        payload_fingerprint: string;
-      }>`SELECT payload_fingerprint FROM project_work_command_receipts WHERE project_id=${decision.projectId} AND command_id=${command.commandId} LIMIT 2`;
-      if (
-        receipts.length !== 1 ||
-        receipts[0]?.payload_fingerprint !==
-          projectWorkPayloadFingerprint({
-            ...command,
-            attribution: { actor: attribution.actor, source: attribution.source },
-          })
-      )
-        return yield* deny("Later command receipt differs");
-      const events = yield* sql<{
-        payload_json: string;
-      }>`SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=1048576 THEN payload_json ELSE NULL END AS payload_json FROM project_work_events WHERE project_id=${decision.projectId} AND command_id=${command.commandId} ORDER BY sequence LIMIT 2`;
-      if (events.length !== 1 || !events[0]) return yield* deny("Later delivery event is missing");
-      const payload = yield* decodeEventPayload(events[0].payload_json);
-      const event = yield* Effect.try({
-        try: () => decodeProjectWorkEvent(payload),
-        catch: () => deny("Later delivery event is invalid"),
-      });
-      if (
-        event.type !== "project-work.foundation.recorded" ||
-        canonical(event.record) !== canonical(saved.message)
-      )
-        return yield* deny("Later delivery event differs");
-    });
-    const historical = Effect.fn("mailboxTurn.historical")(function* (
-      decision: typeof One.Type,
-      sealed: NonNullable<Effect.Success<ReturnType<typeof batch>>>,
-      saved: NonNullable<Effect.Success<ReturnType<typeof reflectionPhase>>>,
-      uncertain: Effect.Success<ReturnType<typeof reflectionPhase>>,
-    ) {
-      if (sealed.row.status !== "delivered" || sealed.row.revision !== (uncertain ? 2 : 1))
-        return yield* deny("Later delivery phase differs");
-      if (uncertain) yield* verifyPhase(decision, uncertain);
-      yield* verifyPhase(decision, saved, uncertain);
-      const observed = yield* observation(decision);
-      if (
-        observed.op.row.status !== "settled" ||
-        observed.terminal.outcome !== "success" ||
-        saved.row.observation_sha256 !== observed.sha256
-      )
-        return yield* deny("Later successful observation changed");
-      const state = yield* readCurrentState(sql, decision.projectId);
-      const matches =
-        state.foundationRecords?.filter(
-          (r) => r.kind === "message" && r.recordId === decision.message.recordId,
-        ) ?? [];
-      const value = matches[0];
-      if (
-        matches.length !== 1 ||
-        value?.kind !== "message" ||
-        value.revision < saved.message.revision ||
-        !["delivered", "acknowledged", "resolved"].includes(value.status)
-      )
-        return yield* deny("Later delivery history changed");
-      const immutable = (message: typeof ProjectTeamMessage.Type) => {
-        const {
-          revision: _,
-          status: _s,
-          updatedAt: _at,
-          acknowledgedAt: _ack,
-          resolvedAt: _res,
-          ...rest
-        } = message;
-        return canonical(rest);
-      };
-      if (immutable(value) !== immutable(saved.message))
-        return yield* deny("Later delivered message identity changed");
-      yield* physicalMessage(value);
-      return {
-        operationId: decision.request.operationId,
-        decisionSha256: hash(decision),
-        batchId: sealed.row.batch_id,
-        observationSha256: observed.sha256,
-        commandId: (yield* decodeProjectWorkFoundationCommitCommand(saved.commands[0])).commandId,
-        message: saved.message,
-      };
     });
     const classify = Effect.fn("mailboxTurn.classifyInside")(function* (
       decision: ProjectTeamMailboxTurnDecision,

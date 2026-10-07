@@ -1287,6 +1287,82 @@ it.effect(
     ),
 );
 
+it.effect(
+  "latest-only stable lookup denies a predecessor after successor allocation and honest cancellation",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixtureFor(true);
+        yield* f.activate;
+        const terminal = f.terminal("success", true);
+        yield* f.operations.persistTerminal(f.op, terminal);
+        const read = () =>
+          f.operations.lookup(f.identity, f.request, f.requestHash, f.resourceHash);
+        expect((yield* read())?.terminal).toEqual(terminal);
+        const original = f.allocation.launch;
+        const allocation = yield* preallocatePiManagedProcess({
+          workspaceRoot: original.workspaceRoot,
+          workspaceAccess: original.workspaceAccess,
+          nativeStateRoot: original.nativeStateRoot,
+          protectedRoots: original.protectedRoots,
+          runtimeFiles: original.runtimeFiles.map((file) => ({
+            source: file.source,
+            target: file.target,
+          })),
+          argv: original.argv,
+          memoryBytes: original.memoryBytes,
+          runtimeSeconds: original.runtimeSeconds,
+        });
+        const request = {
+          threadId,
+          kind: "prompt" as const,
+          operationId: "stable-successor",
+          prompt: "Same assignment",
+          resumeCursor: nativeReference,
+        };
+        const requestHash = NodeCrypto.createHash("sha256")
+          .update(canonicalProjectWorkPayload(request))
+          .digest("hex");
+        const successor = yield* f.operations.prepare(f.identity, request, requestHash, {
+          allocation,
+          workerId: "successor-worker",
+          operationId: request.operationId,
+          resourceHash: f.resourceHash,
+        });
+        expect(successor.ordinal).toBe(f.op.ordinal + 1);
+        expect(successor.deadlineAtMs).toBe(f.op.deadlineAtMs);
+        expect(successor.maximumTokens).toBe(f.op.maximumTokens);
+        yield* typedDenial(read(), "conflict");
+        yield* f.sql.withTransaction(
+          typedDenial(
+            f.operations.lookupInTransaction(f.identity, f.request, f.requestHash, f.resourceHash),
+            "conflict",
+          ),
+        );
+        const canceled: PiSessionTerminal = {
+          identity: {
+            workerId: successor.workerId,
+            generation: successor.authority.binding.generation,
+          },
+          operation: successor.operation,
+          outcome: "canceled",
+          ownerCaptured: false,
+          native: null,
+          drain: null,
+          accountingReceipts: [],
+        };
+        yield* f.operations.persistTerminal(successor, canceled);
+        yield* typedDenial(read(), "conflict");
+        expect(
+          yield* f.sql`SELECT status FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`,
+        ).toEqual([{ status: "settled" }]);
+        expect(
+          yield* f.sql`SELECT status FROM project_team_pi_operation WHERE operation_id=${request.operationId}`,
+        ).toEqual([{ status: "settled" }]);
+      }),
+    ),
+);
+
 const terminalFixture = terminalFixtureFor();
 
 for (const mode of [

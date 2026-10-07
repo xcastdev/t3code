@@ -712,7 +712,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         if (operation.operationId !== originalOperationId) {
           const validateMailbox = Effect.gen(function* () {
             const decision = yield* mailboxDecisions
-              .readInTransaction({ dispatchId: snapshot.fence.dispatchId })
+              .readInTransaction({ operationId: operation.operationId })
               .pipe(Effect.mapError(() => deny("Mailbox operation association is unavailable")));
             if (
               operation.operationKind !== "prompt" ||

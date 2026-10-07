@@ -1700,6 +1700,7 @@ it.effect(
             [37, "ProjectTeamMailboxConsumption"],
             [38, "ProjectTeamReviewCompletionProposals"],
             [39, "ProjectTeamMailboxTurns"],
+            [40, "ProjectTeamMailboxSuccessors"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(
