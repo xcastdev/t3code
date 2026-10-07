@@ -503,6 +503,29 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         }
         audited.add(row.command_id);
       }
+      if (
+        event.type === "project-work.decision.proposed" ||
+        event.type === "project-work.decision.superseded" ||
+        event.type === "project-work.knowledge.promoted"
+      ) {
+        const nested =
+          event.type === "project-work.decision.proposed"
+            ? event.decision.attribution
+            : event.type === "project-work.decision.superseded"
+              ? event.replacement.attribution
+              : event.knowledge.attribution;
+        const authenticated = event.attribution;
+        if (
+          !nested ||
+          !authenticated ||
+          nested.actor.kind !== authenticated.actor.kind ||
+          nested.actor.id !== authenticated.actor.id ||
+          nested.source.kind !== authenticated.source.kind ||
+          nested.source.id !== authenticated.source.id ||
+          nested.recordedAt !== authenticated.recordedAt
+        )
+          return yield* deny("Retained record attribution disagrees with its authenticated event");
+      }
       if (event.type === "project-work.knowledge.promoted") {
         if (
           event.knowledge.projectId !== projectId ||

@@ -562,10 +562,22 @@ const denied = Effect.fn("contextFixture.denied")(function* <A, E, R>(
   expect(result._tag).toBe("Failure");
   if (result._tag === "Failure") expect(result.failure).toBeInstanceOf(ProjectTeamContextError);
 });
-const retainedWriter = Effect.fn("contextFixture.retainedWriter")(function* () {
+const retainedWriter = Effect.fn("contextFixture.retainedWriter")(function* (decorations?: {
+  readonly displayName: string;
+  readonly uri: string;
+  readonly createdAt?: string;
+}) {
   const gateway = yield* ProjectWorkGateway;
-  const actor = { kind: "human" as const, id: "retained-human" };
-  const source = { kind: "web" as const, id: "retained-browser" };
+  const actor = {
+    kind: "human" as const,
+    id: "retained-human",
+    ...(decorations === undefined ? {} : { displayName: decorations.displayName }),
+  };
+  const source = {
+    kind: "web" as const,
+    id: "retained-browser",
+    ...(decorations === undefined ? {} : { uri: decorations.uri }),
+  };
   const write = (input: unknown) =>
     decodeRetainedIntent(input).pipe(
       Effect.flatMap((intent) => gateway.write(intent, actor, source)),
@@ -577,7 +589,7 @@ const retainedWriter = Effect.fn("contextFixture.retainedWriter")(function* () {
     body,
     state: "proposed",
     revision: 0,
-    createdAt: at,
+    createdAt: decorations?.createdAt ?? at,
     updatedAt: at,
   });
   return {
@@ -629,7 +641,7 @@ const retainedWriter = Effect.fn("contextFixture.retainedWriter")(function* () {
           sourceKind: "manual",
           sourceId: actor.id,
           revision: 0,
-          createdAt: at,
+          createdAt: decorations?.createdAt ?? at,
           updatedAt: at,
           ...(previous === undefined ? {} : { supersedesKnowledgeId: previous }),
         },
@@ -935,6 +947,181 @@ for (const kind of ["decision", "knowledge"] as const)
         }),
       ),
     );
+for (const producer of ["proposal", "replacement", "knowledge"] as const)
+  for (const corruption of [
+    "missing",
+    "actor-kind",
+    "actor-id",
+    "source-kind",
+    "source-id",
+    "recordedAt",
+  ] as const)
+    it.effect(`retained context binds nested ${producer} attribution for ${corruption}`, () =>
+      withRetainedGateway(
+        Effect.gen(function* () {
+          const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+          const w = yield* retainedWriter();
+          const id = "nested-current";
+          if (producer === "knowledge") yield* w.promote(id);
+          else {
+            yield* w.propose(producer === "replacement" ? "nested-original" : id);
+            if (producer === "replacement") {
+              yield* w.accept("nested-original");
+              yield* w.replace("nested-original", id);
+            }
+            yield* w.accept(id);
+          }
+          const before = yield* f.reader.readRequired(f.snapshot);
+          const commandId =
+            producer === "knowledge"
+              ? "promote-" + id
+              : producer === "replacement"
+                ? "replace-nested-original"
+                : "propose-" + id;
+          const custody = () => f.sql`
+            SELECT json_extract(e.payload_json,'$.attribution') AS attribution,
+            e.event_id,e.occurred_at,r.actor_kind,r.actor_id,r.source_kind,r.source_id,r.created_at,r.event_ids_json,r.result_json
+            FROM project_work_events e JOIN project_work_command_receipts r
+            ON r.project_id=e.project_id AND r.command_id=e.command_id
+            WHERE e.project_id=${projectId} AND e.command_id=${commandId}`;
+          const original = yield* custody();
+          expect(original).toHaveLength(1);
+          expect(original[0]).toMatchObject({
+            actor_id: "retained-human",
+            source_id: "retained-browser",
+          });
+          const field =
+            corruption === "actor-kind"
+              ? ".actor.kind"
+              : corruption === "actor-id"
+                ? ".actor.id"
+                : corruption === "source-kind"
+                  ? ".source.kind"
+                  : corruption === "source-id"
+                    ? ".source.id"
+                    : corruption === "recordedAt"
+                      ? ".recordedAt"
+                      : "";
+          const value =
+            corruption === "actor-kind"
+              ? "agent"
+              : corruption === "source-kind"
+                ? "mcp"
+                : corruption === "recordedAt"
+                  ? "2026-01-02T00:00:00.000Z"
+                  : "substituted-authority";
+          const nested =
+            producer === "knowledge"
+              ? "knowledge"
+              : producer === "replacement"
+                ? "replacement"
+                : "decision";
+          const eventPath = "$." + nested + ".attribution" + field;
+          const stateField = producer === "knowledge" ? "knowledge" : "decisions";
+          const idField = producer === "knowledge" ? "knowledgeId" : "decisionId";
+          if (corruption === "missing") {
+            yield* f.sql`UPDATE project_work_events SET payload_json=json_remove(payload_json,${eventPath}) WHERE project_id=${projectId} AND command_id=${commandId}`;
+            if (producer === "knowledge")
+              yield* f.sql`UPDATE project_work_knowledge SET attribution_json=NULL WHERE project_id=${projectId} AND knowledge_id=${id}`;
+            else
+              yield* f.sql`UPDATE project_work_decisions SET attribution_json=NULL WHERE project_id=${projectId} AND decision_id=${id}`;
+            yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_remove(state_json,(SELECT fullkey||'.attribution' FROM json_each(state_json,${"$." + stateField}) WHERE json_extract(value,${"$." + idField})=${id})) WHERE project_id=${projectId}`;
+          } else {
+            yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,${eventPath},${value}) WHERE project_id=${projectId} AND command_id=${commandId}`;
+            if (producer === "knowledge")
+              yield* f.sql`UPDATE project_work_knowledge SET attribution_json=json_set(attribution_json,${"$" + field},${value}) WHERE project_id=${projectId} AND knowledge_id=${id}`;
+            else
+              yield* f.sql`UPDATE project_work_decisions SET attribution_json=json_set(attribution_json,${"$" + field},${value}) WHERE project_id=${projectId} AND decision_id=${id}`;
+            yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,(SELECT fullkey||'.attribution'||${field} FROM json_each(state_json,${"$." + stateField}) WHERE json_extract(value,${"$." + idField})=${id}),${value}) WHERE project_id=${projectId}`;
+          }
+          expect(yield* custody()).toEqual(original);
+          const changed = yield* readCurrentState(f.sql, projectId);
+          const record =
+            producer === "knowledge"
+              ? changed.knowledge?.find((entry) => entry.knowledgeId === id)
+              : changed.decisions?.find((entry) => entry.decisionId === id);
+          expect(record).toBeDefined();
+          if (corruption === "missing") expect(record?.attribution).toBeUndefined();
+          else
+            expect(record?.attribution).not.toEqual(
+              producer === "knowledge"
+                ? before.retainedKnowledge.records[0]?.attribution
+                : before.required.decisions[0]?.attribution,
+            );
+          if (producer === "knowledge") {
+            const after = yield* f.reader.readRequired(f.snapshot);
+            expect(after.required).toEqual(before.required);
+            expect(after.retainedKnowledge).toMatchObject({ status: "degraded", records: [] });
+            expect(after.text).toContain("Optional same-project knowledge status: degraded.");
+          } else yield* denied(f.reader.readRequired(f.snapshot));
+        }),
+      ),
+    );
+
+it.effect("retained context preserves nested producer decorations and distinct timestamps", () =>
+  withRetainedGateway(
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+      const createdAt = "2025-12-31T00:00:00.000Z";
+      const w = yield* retainedWriter({
+        displayName: "Original human",
+        uri: "https://example.test/source",
+        createdAt,
+      });
+      yield* w.propose("decorated-proposal");
+      yield* w.accept("decorated-proposal");
+      yield* w.propose("decorated-original");
+      yield* w.accept("decorated-original");
+      yield* w.replace("decorated-original", "decorated-replacement");
+      yield* w.accept("decorated-replacement");
+      yield* w.promote("decorated-knowledge");
+      const produced = yield* f.sql<{
+        recordedAt: string;
+        nestedAt: string;
+        receiptAt: string;
+        eventAt: string;
+        createdAt: string;
+      }>`SELECT
+        json_extract(e.payload_json,'$.attribution.recordedAt') AS recordedAt,
+        COALESCE(json_extract(e.payload_json,'$.decision.attribution.recordedAt'),json_extract(e.payload_json,'$.replacement.attribution.recordedAt'),json_extract(e.payload_json,'$.knowledge.attribution.recordedAt')) AS nestedAt,
+        COALESCE(json_extract(e.payload_json,'$.decision.createdAt'),json_extract(e.payload_json,'$.replacement.createdAt'),json_extract(e.payload_json,'$.knowledge.createdAt')) AS createdAt,
+        e.occurred_at AS eventAt,r.created_at AS receiptAt
+        FROM project_work_events e JOIN project_work_command_receipts r ON r.project_id=e.project_id AND r.command_id=e.command_id
+        WHERE e.project_id=${projectId} AND e.command_id IN ('propose-decorated-proposal','replace-decorated-original','promote-decorated-knowledge')`;
+      expect(produced).toHaveLength(3);
+      for (const row of produced) {
+        expect(row.recordedAt).toBe(row.nestedAt);
+        expect(row.recordedAt).not.toBe(row.receiptAt);
+        expect(row.createdAt).toBe(createdAt);
+        expect(row.createdAt).not.toBe(row.eventAt);
+        expect(row.eventAt).toBe(row.receiptAt);
+      }
+      const before = yield* f.reader.readRequired(f.snapshot);
+      for (const record of [...before.required.decisions, ...before.retainedKnowledge.records])
+        expect(record.attribution).toMatchObject({
+          actor: { kind: "human", id: "retained-human", displayName: "Original human" },
+          source: { kind: "web", id: "retained-browser", uri: "https://example.test/source" },
+        });
+      // Decorations may differ without substituting authority or its server timestamp.
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.decision.attribution.actor.displayName','Record label','$.decision.attribution.source.uri','https://example.test/record') WHERE project_id=${projectId} AND command_id='propose-decorated-proposal'`;
+      yield* f.sql`UPDATE project_work_decisions SET attribution_json=json_set(attribution_json,'$.actor.displayName','Record label','$.source.uri','https://example.test/record') WHERE project_id=${projectId} AND decision_id='decorated-proposal'`;
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,(SELECT fullkey||'.attribution.actor.displayName' FROM json_each(state_json,'$.decisions') WHERE json_extract(value,'$.decisionId')='decorated-proposal'),'Record label',(SELECT fullkey||'.attribution.source.uri' FROM json_each(state_json,'$.decisions') WHERE json_extract(value,'$.decisionId')='decorated-proposal'),'https://example.test/record') WHERE project_id=${projectId}`;
+      const after = yield* f.reader.readRequired(f.snapshot);
+      expect(after.required.decisions.map((record) => record.decisionId)).toEqual(
+        before.required.decisions.map((record) => record.decisionId),
+      );
+      expect(
+        after.required.decisions.find((record) => record.decisionId === "decorated-proposal")
+          ?.attribution,
+      ).toMatchObject({
+        actor: { kind: "human", id: "retained-human", displayName: "Record label" },
+        source: { kind: "web", id: "retained-browser", uri: "https://example.test/record" },
+      });
+      expect(after.retainedKnowledge).toEqual(before.retainedKnowledge);
+    }),
+  ),
+);
+
 const makeBudgetFixture = (writableWorkers = 1) =>
   Effect.gen(function* () {
     const f = yield* makeFixture("implementer", writableWorkers);
