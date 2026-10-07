@@ -77,15 +77,16 @@ approved source selection and its recorded combination. Its tested commit must c
 selected commit. **Integration verification** without that coverage describes only the
 integrator's tested assignment.
 
-To publish reviewed team work from web or desktop, open Source Control for its recorded branch.
+To publish reviewed team work, open Source Control for its recorded branch. On mobile, open
+the thread’s Git overview.
 Push the exact reviewed commit, then choose **Create PR**. The branch must be clean,
 with current verification and an accepted independent review. Changed scope, revoked approvals,
 or a different remote commit require attention before publication can proceed.
 
 PR creation retains your decision before contacting GitHub. If the result is uncertain, inspect
 the task's delivery status before retrying. A confirmed PR is linked to its thread. Managed merge
-remains unavailable. Use web or desktop for managed PR creation. Satisfied
-criteria, a completed reviewer task, or an open PR do not mean the parent code task was delivered.
+remains unavailable. If the branch or selected work changes while confirming, reopen the action
+and review its current source. Satisfied criteria, a completed reviewer task, or an open PR do not mean the parent code task was delivered.
 
 ## When an action is unavailable
 

@@ -1,9 +1,6 @@
 import { resolveDefaultBranchActionDialogCopy } from "@t3tools/client-runtime/state/vcs";
-import { resolveAutoFeatureBranchName } from "@t3tools/shared/git";
-import * as Arr from "effect/Array";
-import * as Result from "effect/Result";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Platform, View } from "react-native";
 
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -11,7 +8,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { AndroidSheetHeader } from "../../../components/AndroidScreenHeader";
 import { AppText as Text } from "../../../components/AppText";
 import { useSelectedThreadGitActions } from "../../../state/use-selected-thread-git-actions";
-import { useSelectedThreadGitState } from "../../../state/use-selected-thread-git-state";
+import { cloneDisplayedGitSource, type DisplayedGitSource } from "./git-action-source";
 import { SheetActionButton } from "./gitSheetComponents";
 
 type GitConfirmSheetProps = StaticScreenProps<{
@@ -22,22 +19,29 @@ type GitConfirmSheetProps = StaticScreenProps<{
   readonly includesCommit?: string;
   readonly commitMessage?: string;
   readonly filePaths?: string;
+  readonly source?: DisplayedGitSource | null;
 }>;
 
 export function GitConfirmSheet(props: GitConfirmSheetProps) {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
-  const gitState = useSelectedThreadGitState();
   const gitActions = useSelectedThreadGitActions();
 
   const params = props.route.params;
+  const [source] = useState(() => cloneDisplayedGitSource(params.source));
+  const sourceIsCurrent =
+    source !== null &&
+    source.environmentId === params.environmentId &&
+    source.threadId === params.threadId &&
+    gitActions.isDisplayedSourceCurrent(source);
 
-  const confirmAction = params.confirmAction as
-    | "push"
-    | "create_pr"
-    | "commit_push"
-    | "commit_push_pr"
-    | undefined;
+  const confirmAction =
+    params.confirmAction === "push" ||
+    params.confirmAction === "create_pr" ||
+    params.confirmAction === "commit_push" ||
+    params.confirmAction === "commit_push_pr"
+      ? params.confirmAction
+      : undefined;
   const branchName = params.branchName ?? "";
   const includesCommit = params.includesCommit === "true";
   const environmentId = params.environmentId ?? "";
@@ -56,48 +60,52 @@ export function GitConfirmSheet(props: GitConfirmSheetProps) {
   );
 
   const continuePendingAction = useCallback(async () => {
-    if (!confirmAction) return;
+    if (!confirmAction || !sourceIsCurrent) return;
     navigation.dispatch(StackActions.replace("Thread", { environmentId, threadId }));
-    await gitActions.onRunSelectedThreadGitAction({
-      action: confirmAction,
-      ...(params.commitMessage ? { commitMessage: params.commitMessage } : {}),
-      ...(params.filePaths ? { filePaths: params.filePaths.split(",") } : {}),
-    });
-  }, [confirmAction, environmentId, gitActions, params, navigation, threadId]);
+    await gitActions.onRunSelectedThreadGitAction(
+      {
+        action: confirmAction,
+        ...(params.commitMessage ? { commitMessage: params.commitMessage } : {}),
+        ...(params.filePaths ? { filePaths: params.filePaths.split(",") } : {}),
+      },
+      source,
+    );
+  }, [
+    confirmAction,
+    environmentId,
+    gitActions,
+    params,
+    navigation,
+    source,
+    sourceIsCurrent,
+    threadId,
+  ]);
 
   const movePendingActionToFeatureBranch = useCallback(async () => {
-    if (!confirmAction) return;
+    if (!confirmAction || !sourceIsCurrent) return;
+    if (!includesCommit) {
+      navigation.dispatch(StackActions.replace("GitBranches", { environmentId, threadId }));
+      return;
+    }
     navigation.dispatch(StackActions.replace("Thread", { environmentId, threadId }));
-
-    if (includesCommit) {
-      await gitActions.onRunSelectedThreadGitAction({
+    await gitActions.onRunSelectedThreadGitAction(
+      {
         action: confirmAction,
         featureBranch: true,
         ...(params.commitMessage ? { commitMessage: params.commitMessage } : {}),
         ...(params.filePaths ? { filePaths: params.filePaths.split(",") } : {}),
-      });
-      return;
-    }
-
-    const branches =
-      gitState.selectedThreadBranches.length > 0
-        ? gitState.selectedThreadBranches
-        : await gitActions.refreshSelectedThreadBranches();
-    const newBranchName = resolveAutoFeatureBranchName(
-      Arr.filterMap(branches, (branch) =>
-        branch.isRemote ? Result.failVoid : Result.succeed(branch.name),
-      ),
+      },
+      source,
     );
-    await gitActions.onCreateSelectedThreadBranch(newBranchName);
-    await gitActions.onRunSelectedThreadGitAction({ action: confirmAction });
   }, [
     confirmAction,
-    gitActions,
-    gitState.selectedThreadBranches,
-    includesCommit,
-    params,
-    navigation,
     environmentId,
+    gitActions,
+    includesCommit,
+    navigation,
+    params,
+    source,
+    sourceIsCurrent,
     threadId,
   ]);
 
@@ -117,19 +125,26 @@ export function GitConfirmSheet(props: GitConfirmSheetProps) {
           {copy?.title ?? "Run action on default branch?"}
         </Text>
         <Text className="text-center text-foreground-secondary text-sm font-medium leading-normal">
-          {copy?.description ?? "Choose how to continue."}
+          {includesCommit
+            ? (copy?.description ?? "Choose how to continue.")
+            : "Continue on this branch, or choose another branch and review the action there."}
         </Text>
       </View>
 
+      {!sourceIsCurrent ? (
+        <Text>Git source changed or is unavailable. Close this sheet and review it again.</Text>
+      ) : null}
       <View className="gap-3 px-5 pt-2" style={{ paddingBottom: Math.max(insets.bottom, 18) + 8 }}>
         <SheetActionButton
           icon="arrow.right.circle"
           label={copy?.continueLabel ?? "Continue"}
+          disabled={!sourceIsCurrent}
           onPress={() => void continuePendingAction()}
         />
         <SheetActionButton
           icon="arrow.branch"
-          label="Feature branch & continue"
+          label={includesCommit ? "Feature branch & continue" : "Choose another branch"}
+          disabled={!sourceIsCurrent}
           tone="primary"
           onPress={() => void movePendingActionToFeatureBranch()}
         />

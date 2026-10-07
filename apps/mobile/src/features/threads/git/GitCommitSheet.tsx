@@ -12,14 +12,20 @@ import { useSelectedThreadGitActions } from "../../../state/use-selected-thread-
 import { useSelectedThreadGitState } from "../../../state/use-selected-thread-git-state";
 import { useSelectedThreadWorktree } from "../../../state/use-selected-thread-worktree";
 import { vcsEnvironment } from "../../../state/vcs";
+import {
+  captureDisplayedGitSource,
+  cloneDisplayedGitSource,
+  type DisplayedGitSource,
+} from "./git-action-source";
 import { SheetActionButton } from "./gitSheetComponents";
 
 type GitCommitSheetProps = StaticScreenProps<{
   readonly environmentId: string;
   readonly threadId: string;
+  readonly source?: DisplayedGitSource | null;
 }>;
 
-export function GitCommitSheet(_props: GitCommitSheetProps) {
+export function GitCommitSheet(props: GitCommitSheetProps) {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const { selectedThread } = useThreadSelection();
@@ -35,6 +41,27 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
         })
       : null,
   );
+
+  const [source, setSource] = useState(() => cloneDisplayedGitSource(props.route.params.source));
+  // A deep-linked sheet may wait for its first complete displayed status. An
+  // existing confirmation always keeps its original source.
+  if (
+    source === null &&
+    props.route.params.source === undefined &&
+    !gitStatus.error &&
+    !gitStatus.isPending
+  ) {
+    const initial = captureDisplayedGitSource(
+      {
+        environmentId: props.route.params.environmentId,
+        threadId: props.route.params.threadId,
+        cwd: selectedThreadCwd,
+      },
+      gitStatus.data,
+    );
+    if (initial !== null) setSource(initial);
+  }
+  const sourceIsCurrent = gitActions.isDisplayedSourceCurrent(source);
 
   const busy = gitState.gitOperationLabel !== null;
   const isDefaultRef = gitStatus.data?.isDefaultRef ?? false;
@@ -53,22 +80,29 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
 
   const runCommitAction = useCallback(
     async (featureBranch: boolean) => {
+      if (!gitActions.isDisplayedSourceCurrent(source)) return;
       const commitMessage = dialogCommitMessage.trim();
       navigation.goBack();
-      await gitActions.onRunSelectedThreadGitAction({
-        action: "commit",
-        featureBranch,
-        ...(commitMessage ? { commitMessage } : {}),
-        ...(!allSelected ? { filePaths: selectedFiles.map((file) => file.path) } : {}),
-      });
+      await gitActions.onRunSelectedThreadGitAction(
+        {
+          action: "commit",
+          featureBranch,
+          ...(commitMessage ? { commitMessage } : {}),
+          ...(!allSelected ? { filePaths: selectedFiles.map((file) => file.path) } : {}),
+        },
+        source,
+      );
     },
-    [allSelected, dialogCommitMessage, gitActions, navigation, selectedFiles],
+    [allSelected, dialogCommitMessage, gitActions, navigation, selectedFiles, source],
   );
 
   return (
     <View collapsable={false} className="flex-1 bg-sheet">
       {Platform.OS === "android" ? (
         <AndroidSheetHeader title="Commit changes" onBack={() => navigation.goBack()} />
+      ) : null}
+      {!sourceIsCurrent ? (
+        <Text>Git source changed or is unavailable. Close this sheet and review it again.</Text>
       ) : null}
       <ScrollView
         className="flex-1"
@@ -213,7 +247,7 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
             <SheetActionButton
               icon="arrow.branch"
               label="Commit on new branch"
-              disabled={noneSelected || busy}
+              disabled={noneSelected || busy || !sourceIsCurrent}
               onPress={() => void runCommitAction(true)}
             />
           </View>
@@ -222,7 +256,7 @@ export function GitCommitSheet(_props: GitCommitSheetProps) {
               icon="checkmark.circle"
               label="Commit"
               tone="primary"
-              disabled={noneSelected || busy}
+              disabled={noneSelected || busy || !sourceIsCurrent}
               onPress={() => void runCommitAction(false)}
             />
           </View>

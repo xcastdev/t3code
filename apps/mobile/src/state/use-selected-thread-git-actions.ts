@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 
 import { EnvironmentProject, EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
@@ -14,6 +14,13 @@ import {
 } from "@t3tools/shared/git";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
+
+import {
+  cloneDisplayedGitSource,
+  matchesDisplayedGitSource,
+  type DisplayedGitSource,
+} from "../features/threads/git/git-action-source";
+import { useEnvironmentQuery } from "./query";
 
 import { useBranches } from "../state/queries";
 import { threadEnvironment } from "../state/threads";
@@ -35,7 +42,8 @@ export function useSelectedThreadGitActions() {
   const createRef = useAtomCommand(vcsEnvironment.createRef, { reportFailure: false });
   const createWorktree = useAtomCommand(vcsEnvironment.createWorktree, { reportFailure: false });
   const pull = useAtomCommand(vcsEnvironment.pull, { reportFailure: false });
-  const { selectedThread, selectedThreadProject } = useThreadSelection();
+  const { selectedThread, selectedThreadProject, selectedEnvironmentRuntime } =
+    useThreadSelection();
   const { selectedThreadCwd, selectedThreadWorktreePath } = useSelectedThreadWorktree();
   const runStackedAction = useAtomCommand(
     vcsActionManager.runStackedAction({
@@ -44,6 +52,48 @@ export function useSelectedThreadGitActions() {
     }),
     { reportFailure: false },
   );
+
+  const displayedStatus = useEnvironmentQuery(
+    selectedThread && selectedThreadCwd
+      ? vcsEnvironment.status({
+          environmentId: selectedThread.environmentId,
+          input: { cwd: selectedThreadCwd },
+        })
+      : null,
+  );
+  const isDisplayedSourceCurrent = useCallback(
+    (source: DisplayedGitSource | null) => {
+      return (
+        selectedThread !== null &&
+        selectedThreadProject !== null &&
+        selectedEnvironmentRuntime?.connectionState === "connected" &&
+        !displayedStatus.error &&
+        !displayedStatus.isPending &&
+        matchesDisplayedGitSource(
+          source,
+          {
+            environmentId: selectedThread.environmentId,
+            threadId: selectedThread.id,
+            cwd: selectedThreadCwd,
+          },
+          displayedStatus.data,
+        )
+      );
+    },
+    [
+      displayedStatus.data,
+      displayedStatus.error,
+      displayedStatus.isPending,
+      selectedEnvironmentRuntime?.connectionState,
+      selectedThread,
+      selectedThreadCwd,
+      selectedThreadProject,
+    ],
+  );
+  const currentSourceCheck = useRef(isDisplayedSourceCurrent);
+  useLayoutEffect(() => {
+    currentSourceCheck.current = isDisplayedSourceCurrent;
+  });
 
   const selectedThreadGitRootCwd = selectedThreadProject?.workspaceRoot ?? null;
   const branchTarget = useMemo(
@@ -318,20 +368,47 @@ export function useSelectedThreadGitActions() {
   }, [pull, refreshSelectedThreadGitStatus, runSelectedThreadGitMutation]);
 
   const onRunSelectedThreadGitAction = useCallback(
-    async (input: GitActionRequestInput): Promise<GitRunStackedActionResult | null> => {
+    async (
+      input: GitActionRequestInput,
+      source: DisplayedGitSource | null,
+    ): Promise<GitRunStackedActionResult | null> => {
+      const capturedSource = cloneDisplayedGitSource(source);
+      if (!currentSourceCheck.current(capturedSource)) {
+        showGitActionResult({
+          type: "error",
+          title: "Git source changed",
+          description: "Review the current source before running this action.",
+        });
+        return null;
+      }
+      const capturedInput = {
+        ...input,
+        ...(input.filePaths !== undefined ? { filePaths: [...input.filePaths] } : {}),
+      };
       const actionId = uuidv4();
       return await runSelectedThreadGitMutation(
         "run_change_request",
         "Running source control action",
         async ({ thread, cwd }) => {
+          if (
+            !capturedSource ||
+            !currentSourceCheck.current(capturedSource) ||
+            thread.environmentId !== capturedSource.environmentId ||
+            thread.id !== capturedSource.threadId ||
+            cwd !== capturedSource.cwd
+          )
+            return AsyncResult.failure(
+              Cause.fail(new Error("Review the current source before running this action.")),
+            );
           const result = await runStackedAction({
             actionId,
-            action: input.action,
-            ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
-            ...(input.featureBranch ? { featureBranch: input.featureBranch } : {}),
-            ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
+            action: capturedInput.action,
+            ...(capturedInput.commitMessage ? { commitMessage: capturedInput.commitMessage } : {}),
+            ...(capturedInput.featureBranch ? { featureBranch: capturedInput.featureBranch } : {}),
+            ...(capturedInput.filePaths?.length ? { filePaths: [...capturedInput.filePaths] } : {}),
             // A pull request the action opens is linked to the thread it ran beside.
             threadId: thread.id,
+            precondition: capturedSource.precondition,
           });
           if (AsyncResult.isFailure(result)) {
             return result;
@@ -382,5 +459,6 @@ export function useSelectedThreadGitActions() {
     onCreateSelectedThreadWorktree,
     onPullSelectedThreadBranch,
     onRunSelectedThreadGitAction,
+    isDisplayedSourceCurrent,
   };
 }

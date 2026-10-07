@@ -34,6 +34,7 @@ import { useSelectedThreadGitState } from "../../../state/use-selected-thread-gi
 import { useSelectedThreadWorktree } from "../../../state/use-selected-thread-worktree";
 import { vcsEnvironment } from "../../../state/vcs";
 import { resolveGitOverviewReviewNavigationAction } from "./git-overview-navigation";
+import { captureDisplayedGitSource } from "./git-action-source";
 import { MetaCard, SheetListRow, menuItemIconName, statusSummary } from "./gitSheetComponents";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
@@ -79,6 +80,15 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
       : null,
   );
 
+  const displayedSource =
+    !gitStatus.error && !gitStatus.isPending
+      ? captureDisplayedGitSource(
+          { environmentId, threadId, cwd: selectedThreadCwd },
+          gitStatus.data,
+        )
+      : null;
+  const canRunDisplayedSource = gitActions.isDisplayedSourceCurrent(displayedSource);
+
   const currentBranchLabel = gitStatus.data?.refName ?? selectedThread?.branch ?? "Detached HEAD";
   const currentStatusSummary = statusSummary(gitStatus.data);
   const currentWorktreePath = selectedThreadWorktreePath;
@@ -96,15 +106,21 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
   const sheetMenuItems = useMemo(
     () =>
       menuItems.map((item) => ({
-        item,
+        item:
+          item.kind === "open_dialog" && !canRunDisplayedSource
+            ? { ...item, disabled: true }
+            : item,
         disabledReason: getGitActionDisabledReason({
-          item,
+          item:
+            item.kind === "open_dialog" && !canRunDisplayedSource
+              ? { ...item, disabled: true }
+              : item,
           gitStatus: gitStatus.data,
           isBusy: busy,
           hasOriginRemote: hasPrimaryRemote,
         }),
       })),
-    [busy, gitStatus.data, hasPrimaryRemote, menuItems],
+    [busy, canRunDisplayedSource, gitStatus.data, hasPrimaryRemote, menuItems],
   );
 
   useEffect(() => {
@@ -124,6 +140,7 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
 
   const runActionWithPrompt = useCallback(
     async (input: GitActionRequestInput) => {
+      if (!gitActions.isDisplayedSourceCurrent(displayedSource)) return;
       const confirmableAction =
         input.action === "push" ||
         input.action === "create_pr" ||
@@ -143,6 +160,7 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
           threadId: String(threadId),
           confirmAction: confirmableAction,
           branchName,
+          source: displayedSource,
           includesCommit: String(
             input.action === "commit_push" || input.action === "commit_push_pr",
           ),
@@ -153,14 +171,27 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
       if (!isInspector) {
         navigation.goBack();
       }
-      await gitActions.onRunSelectedThreadGitAction(input);
+      await gitActions.onRunSelectedThreadGitAction(input, displayedSource);
     },
-    [environmentId, gitActions, gitStatus.data, isDefaultRef, isInspector, navigation, threadId],
+    [
+      displayedSource,
+      environmentId,
+      gitActions,
+      gitStatus.data,
+      isDefaultRef,
+      isInspector,
+      navigation,
+      threadId,
+    ],
   );
 
   const onPressMenuItem = useCallback(
     async (item: (typeof menuItems)[number]) => {
-      if (item.disabled) return;
+      if (
+        item.disabled ||
+        (item.kind === "open_dialog" && !gitActions.isDisplayedSourceCurrent(displayedSource))
+      )
+        return;
       if (item.kind === "open_pr") {
         await openExistingPr();
         return;
@@ -169,6 +200,7 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
         navigation.navigate("GitCommit", {
           environmentId: String(environmentId),
           threadId: String(threadId),
+          source: displayedSource,
         });
         return;
       }
@@ -180,7 +212,15 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
         await runActionWithPrompt({ action: "create_pr" });
       }
     },
-    [environmentId, openExistingPr, navigation, runActionWithPrompt, threadId],
+    [
+      displayedSource,
+      environmentId,
+      gitActions,
+      openExistingPr,
+      navigation,
+      runActionWithPrompt,
+      threadId,
+    ],
   );
 
   // Status facts live on the relevant rows instead of crowding the header

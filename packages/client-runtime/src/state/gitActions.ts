@@ -39,7 +39,7 @@ export type DefaultBranchConfirmableAction =
 
 export type GitActionRequestInput = Pick<
   GitRunStackedActionInput,
-  "action" | "commitMessage" | "featureBranch" | "filePaths"
+  "action" | "commitMessage" | "featureBranch" | "filePaths" | "precondition"
 >;
 
 export function buildMenuItems(
@@ -62,12 +62,13 @@ export function buildMenuItems(
     !isBehind &&
     gitStatus.aheadCount > 0 &&
     (gitStatus.hasUpstream || canPushWithoutUpstream);
+  const hasPrCommits = (gitStatus.aheadOfDefaultCount ?? gitStatus.aheadCount) > 0;
   const canCreatePr =
     !isBusy &&
     hasBranch &&
     !hasChanges &&
     !hasOpenPr &&
-    gitStatus.aheadCount > 0 &&
+    hasPrCommits &&
     !isBehind &&
     (gitStatus.hasUpstream || canPushWithoutUpstream);
   const canOpenPr = !isBusy && hasOpenPr;
@@ -231,6 +232,15 @@ export function resolveQuickAction(
     };
   }
 
+  if (
+    !hasOpenPr &&
+    !isDefaultBranch &&
+    hasOriginRemote &&
+    (gitStatus.aheadOfDefaultCount ?? 0) > 0
+  ) {
+    return { label: "Create PR", disabled: false, kind: "run_action", action: "create_pr" };
+  }
+
   if (hasOpenPr && gitStatus.hasUpstream) {
     return { label: "View PR", disabled: false, kind: "open_pr" };
   }
@@ -298,7 +308,7 @@ export function getGitActionDisabledReason(input: {
   if (!gitStatus.hasUpstream && !hasOriginRemote) {
     return 'Add an "origin" remote before creating a PR.';
   }
-  if (!isAhead) {
+  if ((gitStatus.aheadOfDefaultCount ?? gitStatus.aheadCount) === 0) {
     return "No local commits to include in a PR.";
   }
   if (isBehind) {

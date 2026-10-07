@@ -14,6 +14,9 @@ import { useNavigation } from "@react-navigation/native";
 import { NativeHeaderToolbar } from "../../native/StackHeader";
 import { useCallback, useMemo } from "react";
 import { Alert } from "react-native";
+import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
+import { useThreadSelection } from "../../state/use-thread-selection";
+import { captureDisplayedGitSource, type DisplayedGitSource } from "./git/git-action-source";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import {
   basename,
@@ -87,7 +90,10 @@ export type ThreadGitMenuProps = {
   readonly onOpenFilesInspector?: () => void;
   readonly onOpenGitInspector?: () => void;
   readonly onPull: () => Promise<void>;
-  readonly onRunAction: (input: GitActionRequestInput) => Promise<GitRunStackedActionResult | null>;
+  readonly onRunAction: (
+    input: GitActionRequestInput,
+    source: DisplayedGitSource | null,
+  ) => Promise<GitRunStackedActionResult | null>;
 };
 
 type ThreadGitControlsProps = ThreadGitMenuProps & {
@@ -112,6 +118,22 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
   const threadId = props.threadId;
   const { gitStatus, gitOperationLabel, onPull, onRunAction } = props;
 
+  const { selectedThreadCwd } = useSelectedThreadWorktree();
+  const { selectedThread, selectedEnvironmentRuntime } = useThreadSelection();
+  const displayedSource =
+    selectedThread?.id === threadId &&
+    selectedThread.environmentId === environmentId &&
+    selectedEnvironmentRuntime?.connectionState === "connected"
+      ? captureDisplayedGitSource(
+          {
+            environmentId: String(environmentId),
+            threadId: String(threadId),
+            cwd: selectedThreadCwd,
+          },
+          gitStatus,
+        )
+      : null;
+
   const currentBranchLabel = gitStatus?.refName ?? props.currentBranch ?? "Detached HEAD";
   const busy = gitOperationLabel !== null;
   const isRepo = gitStatus?.isRepo ?? true;
@@ -131,8 +153,17 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
     [busy, gitStatus, hasPrimaryRemote, isDefaultRef, isRepo],
   );
 
-  const quickActionHint = quickAction.disabled
-    ? (quickAction.hint ?? "This action is unavailable.")
+  const guardedQuickAction =
+    quickAction.kind === "run_action" && displayedSource === null
+      ? {
+          ...quickAction,
+          disabled: true,
+          hint: "Git source is unavailable. Refresh its status before running an action.",
+        }
+      : quickAction;
+
+  const quickActionHint = guardedQuickAction.disabled
+    ? (guardedQuickAction.hint ?? "This action is unavailable.")
     : null;
 
   const quickActionIcon: QuickActionIcon = (() => {
@@ -159,6 +190,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
 
   const runActionWithPrompt = useCallback(
     async (input: GitActionRequestInput) => {
+      if (!displayedSource) return;
       const confirmableAction =
         input.action === "push" ||
         input.action === "create_pr" ||
@@ -178,6 +210,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
           threadId: String(threadId),
           confirmAction: confirmableAction,
           branchName,
+          source: displayedSource,
           includesCommit: String(
             input.action === "commit_push" || input.action === "commit_push_pr",
           ),
@@ -185,12 +218,13 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
         return;
       }
 
-      await onRunAction(input);
+      await onRunAction(input, displayedSource);
     },
-    [environmentId, gitStatus, isDefaultRef, onRunAction, navigation, threadId],
+    [displayedSource, environmentId, gitStatus, isDefaultRef, onRunAction, navigation, threadId],
   );
 
   const runQuickAction = useCallback(async () => {
+    if (guardedQuickAction.disabled) return;
     if (quickAction.kind === "open_pr") {
       await openExistingPr();
       return;
@@ -202,7 +236,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
     if (quickAction.kind === "run_action" && quickAction.action) {
       await runActionWithPrompt({ action: quickAction.action });
     }
-  }, [onPull, openExistingPr, quickAction, runActionWithPrompt]);
+  }, [guardedQuickAction.disabled, onPull, openExistingPr, quickAction, runActionWithPrompt]);
 
   const openFiles = useCallback(() => {
     if (props.onOpenFilesInspector) {
@@ -239,7 +273,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
     openFiles,
     openGitInspector,
     openReview,
-    quickAction,
+    quickAction: guardedQuickAction,
     quickActionHint,
     quickActionIcon,
     runQuickAction,
