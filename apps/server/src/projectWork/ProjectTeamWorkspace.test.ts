@@ -307,7 +307,7 @@ const fixture = Effect.fn("workspaceTest.fixture")(function* (controlledManager 
     const stages = yield* makeProjectTeamDispatchJournal({
       ...options,
       verifyStage: (_input, current) =>
-        consumer.verifyWorkspace(current, receipt).pipe(
+        consumer.verifyWorkspace(current, receipt.workspace).pipe(
           Effect.provideService(Scope.Scope, operationScope),
           Effect.mapError(
             () => new ProjectTeamDispatchJournalError({ reason: "Workspace verification failed" }),
@@ -317,7 +317,7 @@ const fixture = Effect.fn("workspaceTest.fixture")(function* (controlledManager 
     return yield* stages.advanceStage(snapshot.fence, {
       receiptId: "workspace-ready",
       stage: "workspace-ready",
-      evidence: { workspace: receipt },
+      evidence: receipt,
     });
   });
   if (claim.transition?.kind !== "claim") return yield* Effect.die("Missing original claim");
@@ -371,9 +371,9 @@ describe("actual managed Git and SQLite workspace consumer", () => {
               yield* f.sql`UPDATE projection_projects SET scripts_json=${encodeJson([{ id: "setup", name: "Prepare", icon: "configure", command: "printf prepared", runOnWorktreeCreate: true, async: true }])} WHERE project_id=${projectId}`;
               const loan = yield* Scope.make();
               yield* f.publish.pipe(Effect.provideService(Scope.Scope, loan));
-              expect((yield* f.consumer.setup(snapshot, workspace).pipe(Effect.result))._tag).toBe(
-                "Failure",
-              );
+              expect(
+                (yield* f.consumer.setup(snapshot, workspace.workspace).pipe(Effect.result))._tag,
+              ).toBe("Failure");
               const journal = yield* makeProjectManagedSetupJournal({
                 ...f.options,
                 validateSelection: () => Effect.void,
@@ -429,10 +429,8 @@ describe("actual managed Git and SQLite workspace consumer", () => {
             );
             expect(yield* reopened.workspace(f.snapshot)).toEqual(receipt);
             const advanced = yield* f.advance(receipt);
-            yield* reopened.verifyWorkspace(advanced, receipt);
-            expect((yield* f.dispatch.readStageReceipts("dispatch"))[0]?.evidence).toEqual({
-              workspace: receipt,
-            });
+            yield* reopened.verifyWorkspace(advanced, receipt.workspace);
+            expect((yield* f.dispatch.readStageReceipts("dispatch"))[0]?.evidence).toEqual(receipt);
           }),
         ),
       ),
@@ -460,13 +458,14 @@ describe("actual managed Git and SQLite workspace consumer", () => {
               yield* git(f.primary, ["config", "core.hooksPath", "/tmp/foreign"]);
             if (change === "ownership")
               yield* f.fs.writeFileString(
-                f.path.join(receipt.gitDirectory.path, "t3-managed-owner"),
+                f.path.join(receipt.workspace.gitDirectory.path, "t3-managed-owner"),
                 "foreign",
               );
             if (change === "registration")
               yield* git(f.primary, ["worktree", "remove", "--force", f.worktree]);
             expect(
-              (yield* f.consumer.verifyWorkspace(f.snapshot, receipt).pipe(Effect.result))._tag,
+              (yield* f.consumer.verifyWorkspace(f.snapshot, receipt.workspace).pipe(Effect.result))
+                ._tag,
             ).toBe("Failure");
             expect(
               yield* f.sql`SELECT receipt_json FROM project_team_workspace_receipt`,
@@ -511,7 +510,8 @@ describe("actual managed Git and SQLite workspace consumer", () => {
             "Failure",
           );
           expect(
-            (yield* f.consumer.verifyWorkspace(f.snapshot, receipt).pipe(Effect.result))._tag,
+            (yield* f.consumer.verifyWorkspace(f.snapshot, receipt.workspace).pipe(Effect.result))
+              ._tag,
           ).toBe("Failure");
           expect(
             (yield* f.sql`SELECT claim_generation FROM project_team_workspace_receipt`)[0]
@@ -577,7 +577,7 @@ describe("actual managed Git and SQLite workspace consumer", () => {
               Effect.fail(new ProjectTeamDispatchJournalError({ reason: "Replacement callback" }));
             yield* Deferred.succeed(release, undefined);
             const receipt = yield* Fiber.join(running);
-            expect(receipt.worktree.path).toBe(f.worktree);
+            expect(receipt.workspace.worktree.path).toBe(f.worktree);
             expect(yield* f.fs.exists(f.path.join(f.primary, "foreign"))).toBe(false);
           }),
         ),
@@ -593,11 +593,12 @@ describe("actual managed Git and SQLite workspace consumer", () => {
             const workspace = yield* f.consumer.workspace(f.snapshot);
             const snapshot = yield* f.advance(workspace);
             yield* f.publish;
-            const receipt = yield* f.consumer.setup(snapshot, workspace);
+            const receipt = yield* f.consumer.setup(snapshot, workspace.workspace);
             yield* f.sql`UPDATE projection_projects SET scripts_json=${encodeJson([{ id: "changed", name: "Changed", icon: "configure", command: "false", runOnWorktreeCreate: true, async: true }])} WHERE project_id=${projectId}`;
             expect(
-              (yield* f.consumer.verifySetup(snapshot, workspace, receipt).pipe(Effect.result))
-                ._tag,
+              (yield* f.consumer
+                .verifySetup(snapshot, workspace.workspace, receipt)
+                .pipe(Effect.result))._tag,
             ).toBe("Failure");
             expect(
               (yield* f.sql`SELECT status,activation,unit FROM project_team_setup_process`)[0],
@@ -617,18 +618,18 @@ describe("actual managed Git and SQLite workspace consumer", () => {
             const workspace = yield* f.consumer.workspace(f.snapshot);
             const snapshot = yield* f.advance(workspace);
             yield* f.publish;
-            const receipt = yield* f.consumer.setup(snapshot, workspace);
+            const receipt = yield* f.consumer.setup(snapshot, workspace.workspace);
             expect(receipt.outcome).toBe("skipped");
-            yield* f.consumer.verifySetup(snapshot, workspace, receipt);
-            expect(yield* f.consumer.setup(snapshot, workspace)).toEqual(receipt);
+            yield* f.consumer.verifySetup(snapshot, workspace.workspace, receipt);
+            expect(yield* f.consumer.setup(snapshot, workspace.workspace)).toEqual(receipt);
             expect(f.assetChecks()).toBeGreaterThan(0);
             expect(
               yield* f.sql`SELECT status,activation,unit FROM project_team_setup_process`,
             ).toEqual([{ status: "no-script", activation: "unlaunched", unit: null }]);
             f.revoke();
-            expect((yield* f.consumer.setup(snapshot, workspace).pipe(Effect.result))._tag).toBe(
-              "Failure",
-            );
+            expect(
+              (yield* f.consumer.setup(snapshot, workspace.workspace).pipe(Effect.result))._tag,
+            ).toBe("Failure");
             expect(yield* f.consumer.reconcile(snapshot)).toEqual(receipt);
             expect(yield* f.sql`SELECT status FROM project_team_reservation`).toEqual([
               { status: "held" },
@@ -644,15 +645,17 @@ describe("actual managed Git and SQLite workspace consumer", () => {
           const f = yield* fixture();
           const workspace = yield* f.consumer.workspace(f.snapshot);
           const snapshot = yield* f.advance(workspace);
-          expect((yield* f.consumer.setup(snapshot, workspace).pipe(Effect.result))._tag).toBe(
-            "Failure",
-          );
+          expect(
+            (yield* f.consumer.setup(snapshot, workspace.workspace).pipe(Effect.result))._tag,
+          ).toBe("Failure");
           const loan = yield* Scope.make();
           yield* f.publish.pipe(Effect.provideService(Scope.Scope, loan));
-          const receipt = yield* f.consumer.setup(snapshot, workspace);
+          const receipt = yield* f.consumer.setup(snapshot, workspace.workspace);
           yield* Scope.close(loan, Exit.void);
           expect(
-            (yield* f.consumer.verifySetup(snapshot, workspace, receipt).pipe(Effect.result))._tag,
+            (yield* f.consumer
+              .verifySetup(snapshot, workspace.workspace, receipt)
+              .pipe(Effect.result))._tag,
           ).toBe("Failure");
           expect(yield* f.consumer.reconcile(snapshot)).toEqual(receipt);
         }),
@@ -669,10 +672,10 @@ describe("actual managed Git and SQLite workspace consumer", () => {
             const workspace = yield* f.consumer.workspace(f.snapshot);
             const snapshot = yield* f.advance(workspace);
             yield* f.publish;
-            const receipt = yield* f.consumer.setup(snapshot, workspace);
+            const receipt = yield* f.consumer.setup(snapshot, workspace.workspace);
             expect(
               (yield* f.consumer
-                .verifySetup(snapshot, workspace, { ...receipt, reason: "forged" })
+                .verifySetup(snapshot, workspace.workspace, { ...receipt, reason: "forged" })
                 .pipe(Effect.result))._tag,
             ).toBe("Failure");
             const journal = yield* makeProjectManagedSetupJournal({
@@ -692,9 +695,9 @@ describe("actual managed Git and SQLite workspace consumer", () => {
               reconciliation: null,
               reason: "Fixture retains uncertainty",
             });
-            expect((yield* f.consumer.setup(snapshot, workspace).pipe(Effect.result))._tag).toBe(
-              "Failure",
-            );
+            expect(
+              (yield* f.consumer.setup(snapshot, workspace.workspace).pipe(Effect.result))._tag,
+            ).toBe("Failure");
             expect((yield* f.consumer.reconcile(snapshot).pipe(Effect.result))._tag).toBe(
               "Failure",
             );

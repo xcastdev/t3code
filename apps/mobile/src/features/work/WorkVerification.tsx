@@ -149,7 +149,8 @@ function reviewTarget(
     gate.specRevision !== manifest.specRevision ||
     gate.planRevision !== manifest.planRevision ||
     found.plan.planRevision !== manifest.planRevision ||
-    found.plan.contentHash !== manifest.planHash
+    found.plan.contentHash !== manifest.planHash ||
+    (found.plan.integrationSources !== undefined) !== (manifest.integrationCoverage !== undefined)
   )
     return null;
   const binding = found.bindings.find(
@@ -454,6 +455,7 @@ function VerificationSession(props: WorkVerificationProps) {
       const fresh = before?.gates.find((entry) => entry.recordId === gate.recordId);
       if (
         !mounted.current ||
+        !before ||
         !fresh?.verificationJobId ||
         canonicalProjectWorkPayload(fresh) !== canonicalProjectWorkPayload(gate)
       )
@@ -482,6 +484,14 @@ function VerificationSession(props: WorkVerificationProps) {
         )) !== copied.sha256
       )
         throw Error("The prepared verification manifest hash does not match.");
+      if (
+        before.plan?.integrationSources !== undefined &&
+        (await digestStringAsync(
+          CryptoDigestAlgorithm.SHA256,
+          canonicalProjectWorkPayload(before.plan.integrationSources),
+        )) !== copied.manifest.integrationCoverage?.selectionSha256
+      )
+        throw Error("The verification preview does not cover the approved source selection.");
       const after = live.current.readCurrent();
       const afterGate = view(after, owner)?.gates.find((g) => g.recordId === gate.recordId);
       const signature =
@@ -654,11 +664,20 @@ function VerificationSession(props: WorkVerificationProps) {
               {usable?.gateId === gate.recordId ? (
                 <View className="gap-1">
                   <Notice>
-                    {usable.preview.manifest.integration === true
-                      ? "Integration verification"
-                      : "Implementation verification"}
+                    {usable.preview.manifest.integrationCoverage !== undefined
+                      ? "Combined source integration verification"
+                      : usable.preview.manifest.integration === true
+                        ? "Integration verification"
+                        : "Implementation verification"}
                   </Notice>
                   <Notice>Prepared manifest {usable.preview.sha256}</Notice>
+                  {usable.preview.manifest.integrationCoverage ? (
+                    <Notice>
+                      Approved source selection{" "}
+                      {usable.preview.manifest.integrationCoverage.selectionSha256} · combination
+                      receipt {usable.preview.manifest.integrationCoverage.combinationSha256}
+                    </Notice>
+                  ) : null}
                   <Notice>
                     Command {JSON.stringify(usable.preview.manifest.command.executable)} · arguments{" "}
                     {JSON.stringify(usable.preview.manifest.command.argv)}

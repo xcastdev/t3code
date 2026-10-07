@@ -1,3 +1,4 @@
+import { staleIntegrationTaskIds } from "./ProjectTeamIntegrationSourceState.ts";
 import { invalidateReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
 import type { ProjectTeamRecord } from "@t3tools/contracts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
@@ -10,6 +11,7 @@ import { decideProjectTeamGuidedTransition } from "./ProjectTeamGuidedTransition
 import { isGuidedProjectTeamTask, projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import {
   EventId,
+  ProjectId,
   ProjectWorkAttemptId,
   ProjectWorkBlockerId,
   ProjectWorkCriterionId,
@@ -589,6 +591,126 @@ const withEventMetadata = (
  * Every event timestamp is copied from the command that caused it.
  */
 export function decideProjectWorkCommand(
+  state: ProjectWorkState,
+  command: ProjectWorkCommand,
+): ReadonlyArray<ProjectWorkEvent> {
+  const events = decideProjectWorkCommandEvents(state, command);
+  const selectedTaskIds = new Set(
+    (state.foundationRecords ?? []).flatMap((record) =>
+      record.kind === "plan-revision" && record.status === "proposed"
+        ? (record.integrationSources?.sources.map((source) => source.taskId) ?? [])
+        : [],
+    ),
+  );
+  if (selectedTaskIds.size === 0) return events;
+  const relevant = events.some((event) => {
+    if (event.type === "project-work.foundation.recorded") {
+      const record = event.record;
+      if (record.kind === "review-finding") return selectedTaskIds.has(record.target.taskId);
+      return (
+        "taskId" in record && record.taskId !== undefined && selectedTaskIds.has(record.taskId)
+      );
+    }
+    if (event.type === "project-work.criterion.upserted")
+      return selectedTaskIds.has(event.criterion.taskId);
+    return (
+      "taskId" in event &&
+      event.taskId !== undefined &&
+      selectedTaskIds.has(event.taskId) &&
+      [
+        "project-work.task.specified",
+        "project-work.task.specification-revised",
+        "project-work.task.canceled",
+        "project-work.task.failed",
+      ].includes(event.type)
+    );
+  });
+  if (!relevant) return events;
+  let current = applyProjectWorkEvents(mutableState(state), events);
+  const result = [...events];
+  const stale = new Set(staleIntegrationTaskIds(current));
+  if (stale.size === 0) return result;
+  const at = events.at(-1)!.occurredAt;
+  const origin =
+    command.type === "project-work.attempt.expire" && command.attribution === undefined
+      ? {
+          actor: { kind: "system" as const, id: "project-work-lease" },
+          source: { kind: "system" as const, id: "project-work-lease" },
+          recordedAt: at,
+        }
+      : assertProjectWorkAttribution(command.attribution, command.type);
+  const record = (next: ProjectTeamRecord) => {
+    const draft = validateProjectTeamRecord(current, next, origin);
+    const event = withEventMetadata(
+      String(command.commandId),
+      state.projectId,
+      state.revision + result.length + 1,
+      result.length,
+      {
+        type: "project-work.foundation.recorded",
+        record: draft,
+        occurredAt: at,
+      },
+    );
+    result.push(event);
+    current = applyProjectWorkEvents(current, [event]);
+  };
+  for (const item of current.foundationRecords ?? []) {
+    if (!("taskId" in item) || item.taskId === undefined || !stale.has(item.taskId)) continue;
+    if (item.kind === "gate" && item.gate !== "specification" && item.status !== "invalidated")
+      record({ ...item, status: "invalidated", revision: item.revision + 1, updatedAt: at });
+    if (item.kind === "evidence-applicability" && item.status === "current")
+      record({ ...item, status: "stale", revision: item.revision + 1, updatedAt: at });
+    if (item.kind === "run-binding" && ["reserved", "running"].includes(item.status)) {
+      record({ ...item, status: "stopping", revision: item.revision + 1, updatedAt: at });
+      const effectId = projectTeamDerivedRecordId(
+        String(command.commandId),
+        `integration-source-stop:${item.recordId}`,
+      );
+      record({
+        kind: "effect",
+        recordId: effectId,
+        effectId,
+        projectId: ProjectId.make(state.projectId),
+        revision: 0,
+        generation: item.generation,
+        updatedAt: at,
+        status: "pending",
+        effectKind: "stop",
+        taskId: item.taskId,
+        runId: item.recordId,
+        targetId: item.recordId,
+        payload: {
+          recordIds: [item.recordId],
+          expectedRevision: item.revision,
+          summary: "An approved integration source changed",
+        },
+        claimGeneration: item.generation,
+        availableAt: at,
+      });
+    }
+    if (
+      item.kind === "effect" &&
+      ["dispatch", "setup"].includes(item.effectKind) &&
+      item.status === "pending"
+    )
+      record({ ...item, status: "canceled", revision: item.revision + 1, updatedAt: at });
+  }
+  for (const draft of invalidateReviewCriterionProgress({ state: current, at })) {
+    const event = withEventMetadata(
+      String(command.commandId),
+      state.projectId,
+      state.revision + result.length + 1,
+      result.length,
+      draft,
+    );
+    result.push(event);
+    current = applyProjectWorkEvents(current, [event]);
+  }
+  return result;
+}
+
+function decideProjectWorkCommandEvents(
   state: ProjectWorkState,
   command: ProjectWorkCommand,
 ): ReadonlyArray<ProjectWorkEvent> {

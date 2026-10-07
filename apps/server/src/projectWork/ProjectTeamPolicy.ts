@@ -74,8 +74,34 @@ export const projectTeamSpecificationHash = (state: ProjectWorkState, taskId: st
   });
 };
 
-export const projectTeamPlanHash = (plan: Pick<Plan, "content" | "dependencyTaskIds">) =>
-  scopeDigest({ content: plan.content, dependencyTaskIds: [...plan.dependencyTaskIds].sort() });
+export const projectTeamAssignmentRole = (
+  kind: Membership["deliverableKind"],
+  plan?: Pick<Plan, "integrationSources">,
+) => {
+  switch (kind) {
+    case "research":
+      return "investigator";
+    case "plan":
+      return "planner";
+    case "review":
+      return "reviewer";
+    case "code":
+      return plan?.integrationSources === undefined ? "implementer" : "integrator";
+    default:
+      return undefined;
+  }
+};
+
+export const projectTeamPlanHash = (
+  plan: Pick<Plan, "content" | "dependencyTaskIds"> & Pick<Partial<Plan>, "integrationSources">,
+) =>
+  scopeDigest({
+    content: plan.content,
+    dependencyTaskIds: [...plan.dependencyTaskIds].sort(),
+    ...(plan.integrationSources === undefined
+      ? {}
+      : { integrationSources: plan.integrationSources }),
+  });
 
 export const projectTeamScopeHash = (state: ProjectWorkState, taskId: string, plan?: Plan) =>
   scopeDigest({

@@ -32,7 +32,7 @@ import type { ProjectTeamConfiguredAdmissionFacts } from "./ProjectTeamConfigure
 import { projectTeamConfigurationGeneration } from "./ProjectTeamConfiguration.ts";
 import type { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
-import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
+import { projectTeamDerivedRecordId, projectTeamAssignmentRole } from "./ProjectTeamPolicy.ts";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
 
@@ -363,16 +363,15 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
           reject("Configured active member is unavailable");
         return member!;
       });
-      const name =
-        currentMembership.deliverableKind === "research"
-          ? "investigator"
-          : currentMembership.deliverableKind === "plan"
-            ? "planner"
-            : currentMembership.deliverableKind === "review"
-              ? "reviewer"
-              : currentMembership.deliverableKind === "code"
-                ? "implementer"
-                : undefined;
+      const integrationPlan = records
+        .filter(
+          (record): record is RecordOf<"plan-revision"> =>
+            record.kind === "plan-revision" &&
+            record.taskId === input.taskId &&
+            record.status === "proposed",
+        )
+        .sort((left, right) => right.planRevision - left.planRevision)[0];
+      const name = projectTeamAssignmentRole(currentMembership.deliverableKind, integrationPlan);
       const member =
         currentMembership.requestedSuccessorMemberId === undefined
           ? members[roles.findIndex((role) => role.role === name)]

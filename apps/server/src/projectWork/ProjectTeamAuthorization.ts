@@ -1,9 +1,11 @@
 import {
   CommandId,
+  ProjectId,
   canonicalProjectWorkPayload,
   ProjectTeamCredential,
   ProjectTeamRecord,
   ProjectTeamGuidedIntent,
+  ProjectTeamIntegrationSources,
   ProjectWorkKnowledgeId,
   type ProjectWorkActor,
   type ProjectWorkAttribution,
@@ -16,6 +18,8 @@ import {
 import * as NodeCrypto from "node:crypto";
 import * as Option from "effect/Option";
 import { ProjectWorkVerificationApproval } from "./ProjectWorkVerificationGate.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
@@ -119,6 +123,61 @@ export const layer = Layer.effect(
   ProjectTeamAuthorization,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const environmentIdentity = yield* Effect.serviceOption(
+      ServerEnvironment.ServerEnvironmentIdentity,
+    );
+    const serverEnvironment = yield* Effect.serviceOption(ServerEnvironment.ServerEnvironment);
+    const sourceService = Effect.fn("ProjectTeamAuthorization.sourceService")(function* () {
+      const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const transaction = yield* Effect.serviceOption(sql.transactionService);
+      const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(currentSql) ||
+        currentSql.value !== sql ||
+        Option.isNone(transaction) ||
+        Option.isNone(repository)
+      )
+        return yield* deny("Integration source qualification requires its original transaction");
+      const environmentId = Option.isSome(environmentIdentity)
+        ? yield* environmentIdentity.value.getEnvironmentId.pipe(
+            Effect.mapError(() => deny("Environment identity unavailable")),
+          )
+        : Option.isSome(serverEnvironment)
+          ? yield* serverEnvironment.value.getEnvironmentId.pipe(
+              Effect.mapError(() => deny("Environment identity unavailable")),
+            )
+          : undefined;
+      if (environmentId === undefined) return yield* deny("Environment identity unavailable");
+      return yield* makeProjectTeamIntegrationSources({ environmentId }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.provideService(ProjectWorkRepository, repository.value),
+        Effect.mapError(() => deny("Integration source reader unavailable")),
+      );
+    });
+    const assertSelectedSources = Effect.fn("ProjectTeamAuthorization.assertSelectedSources")(
+      function* (state: ProjectWorkReducerState, taskId: string) {
+        const plan = (state.foundationRecords ?? [])
+          .filter(
+            (record): record is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+              record.kind === "plan-revision" &&
+              record.taskId === taskId &&
+              record.status === "proposed",
+          )
+          .sort((left, right) => right.planRevision - left.planRevision)[0];
+        if (plan?.integrationSources === undefined) return;
+        const service = yield* sourceService();
+        yield* service
+          .assertCurrentInTransaction({
+            projectId: ProjectId.make(state.projectId),
+            integrationTaskId: plan.taskId,
+            sources: plan.integrationSources,
+          })
+          .pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.mapError(() => deny("Approved integration sources changed")),
+          );
+      },
+    );
     const managedIdentities = new Set<string>();
     const managedThreads = new Set<string>();
     const stateFor = Effect.fn("ProjectTeamAuthorization.stateFor")(function* (projectId: string) {
@@ -459,6 +518,9 @@ export const layer = Layer.effect(
       }
       const authority = yield* resolve(principal);
       const state = authority?.state ?? (yield* stateFor(input.projectId));
+      if (input.type === "project-team.gate.respond" && input.response === "approved")
+        yield* assertSelectedSources(state, input.taskId);
+
       if (input.type === "project-team.configure") {
         if (
           principal.actor.kind !== "human" ||
@@ -991,6 +1053,28 @@ export const layer = Layer.effect(
           return yield* deny("Frozen role does not grant this guided action");
       }
       const state = authority?.state ?? (yield* stateFor(intent.projectId));
+      let integrationSources: typeof ProjectTeamIntegrationSources.Type | undefined;
+      if (
+        intent.type === "project-team.plan.propose" &&
+        intent.integrationSourceRefs !== undefined
+      ) {
+        if (principal.actor.kind !== "human" || principal.managed !== undefined)
+          return yield* deny("Only the authenticated human can select integration sources");
+        const service = yield* sourceService();
+        integrationSources = yield* service
+          .compileInTransaction({
+            projectId: intent.projectId,
+            integrationTaskId: intent.taskId,
+            refs: intent.integrationSourceRefs,
+          })
+          .pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.mapError(() => deny("Selected integration sources are no longer qualified")),
+          );
+      }
+      if (intent.type === "project-team.execution.start")
+        yield* assertSelectedSources(state, intent.taskId);
+
       if (
         intent.type === "project-team.assignment.report" &&
         intent.outcome === "complete" &&
@@ -1051,6 +1135,7 @@ export const layer = Layer.effect(
         records: [],
         guided: {
           intent,
+          ...(integrationSources === undefined ? {} : { integrationSources }),
           ...(authority === undefined
             ? {}
             : { bindingId: authority.binding.recordId, generation: authority.binding.generation }),

@@ -112,6 +112,95 @@ export const ProjectTeamMember = Schema.Struct({
   coordinator: Schema.Boolean,
   roleRevisionId: Text,
 });
+const IntegrationId = Text.check(Schema.isMaxLength(256));
+const IntegrationDigest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u));
+const IntegrationOid = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u));
+const IntegrationRevision = NonNegativeInt.check(
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+);
+/** Human-selected identities. Only the host can qualify and freeze the referenced code. */
+export const ProjectTeamIntegrationSourceRef = Schema.Struct({
+  taskId: ProjectWorkTaskId.check(Schema.isMaxLength(256)),
+  bindingId: IntegrationId,
+  expectedBindingRevision: IntegrationRevision,
+  generation: IntegrationRevision,
+  reviewDispatchId: IntegrationId,
+  expectedReviewProposalSha256: IntegrationDigest,
+  verificationJobId: IntegrationId,
+  expectedManifestHash: IntegrationDigest,
+  expectedBranchRef: IntegrationId,
+  expectedBaseSha: IntegrationOid,
+  expectedHeadSha: IntegrationOid,
+  expectedTestedTree: IntegrationOid,
+});
+export type ProjectTeamIntegrationSourceRef = typeof ProjectTeamIntegrationSourceRef.Type;
+export const ProjectTeamIntegrationSourceRefs = Schema.Array(ProjectTeamIntegrationSourceRef).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(64),
+  Schema.makeFilter(
+    (sources) => new Set(sources.map((source) => source.taskId)).size === sources.length,
+  ),
+);
+/** Captured by the host and retained in the plan approved by the human. */
+export const ProjectTeamIntegrationSource = Schema.Struct({
+  taskId: ProjectWorkTaskId.check(Schema.isMaxLength(256)),
+  bindingId: IntegrationId,
+  bindingRevision: IntegrationRevision,
+  generation: IntegrationRevision,
+  dispatchId: IntegrationId,
+  workspaceReceiptSha256: IntegrationDigest,
+  specRevision: IntegrationRevision,
+  planRevision: IntegrationRevision,
+  scopeHash: IntegrationDigest,
+  branchRef: IntegrationId,
+  baseSha: IntegrationOid,
+  headSha: IntegrationOid,
+  testedTree: IntegrationOid,
+  reviewDispatchId: IntegrationId,
+  reviewProposalSha256: IntegrationDigest,
+  joinedReceiptId: IntegrationId,
+  jobId: IntegrationId,
+  manifestHash: IntegrationDigest,
+  attemptId: IntegrationId,
+  resultHash: IntegrationDigest,
+});
+export type ProjectTeamIntegrationSource = typeof ProjectTeamIntegrationSource.Type;
+export const ProjectTeamIntegrationSources = Schema.Struct({
+  version: Schema.Literal(1),
+  environmentId: EnvironmentId.check(Schema.isMaxLength(256)),
+  sources: Schema.Array(ProjectTeamIntegrationSource).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(64),
+    Schema.makeFilter(
+      (sources) => new Set(sources.map((source) => source.taskId)).size === sources.length,
+    ),
+  ),
+}).check(
+  Schema.makeFilter(
+    (value) => new TextEncoder().encode(JSON.stringify(value)).byteLength <= 131_072,
+  ),
+);
+export type ProjectTeamIntegrationSources = typeof ProjectTeamIntegrationSources.Type;
+
+/** Bounded host-qualified candidates for selecting a plan's inputs; this read grants no approval. */
+export const ProjectTeamIntegrationSourcePage = Schema.Struct({
+  environmentId: EnvironmentId.check(Schema.isMaxLength(256)),
+  projectId: ProjectId.check(Schema.isMaxLength(256)),
+  taskId: ProjectWorkTaskId.check(Schema.isMaxLength(256)),
+  revision: IntegrationRevision,
+  taskRevision: IntegrationRevision,
+  candidates: Schema.Array(
+    Schema.Struct({
+      ref: ProjectTeamIntegrationSourceRef,
+      source: ProjectTeamIntegrationSource,
+      taskTitle: Text,
+    }),
+  ).check(Schema.isMaxLength(64)),
+  nextOffset: IntegrationRevision,
+  hasMore: Schema.Boolean,
+});
+export type ProjectTeamIntegrationSourcePage = typeof ProjectTeamIntegrationSourcePage.Type;
+
 export const ProjectTeamPlanRevision = Schema.Struct({
   ...Fields,
   kind: Schema.Literal("plan-revision"),
@@ -122,6 +211,7 @@ export const ProjectTeamPlanRevision = Schema.Struct({
   content: Body,
   contentHash: Text,
   dependencyTaskIds: Schema.Array(ProjectWorkTaskId).check(Schema.isMaxLength(64)),
+  integrationSources: Schema.optionalKey(ProjectTeamIntegrationSources),
 });
 const VerificationId = Schema.String.check(
   Schema.isTrimmed(),

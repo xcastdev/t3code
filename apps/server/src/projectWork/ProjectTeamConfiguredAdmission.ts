@@ -22,6 +22,7 @@ import { projectTeamConfigurationGeneration } from "./ProjectTeamConfiguration.t
 import { resolveProjectTeamLimits } from "./ProjectTeamLimits.ts";
 import {
   projectTeamDerivedRecordId,
+  projectTeamAssignmentRole,
   projectTeamScopeHash,
   projectTeamSpecificationHash,
 } from "./ProjectTeamPolicy.ts";
@@ -311,16 +312,19 @@ export const prepareProjectTeamConfiguredAdmission = (input: {
         reject("Configured member generation is inactive");
       return member;
     });
-    const defaultRole =
-      membership.deliverableKind === "research"
-        ? "investigator"
-        : membership.deliverableKind === "plan"
-          ? "planner"
-          : membership.deliverableKind === "review"
-            ? "reviewer"
-            : membership.deliverableKind === "code"
-              ? "implementer"
-              : undefined;
+    const plans = records.filter(
+      (r): r is Plan =>
+        r.kind === "plan-revision" && r.taskId === taskId && r.status === "proposed",
+    );
+    for (const plan of plans) checked(plan);
+    const plan = [...plans].sort((a, b) => b.planRevision - a.planRevision)[0];
+    if (
+      plan &&
+      (!validSafe(plan.planRevision) ||
+        plans.filter((p) => p.planRevision === plan.planRevision).length !== 1)
+    )
+      reject("Current plan revision is ambiguous");
+    const defaultRole = projectTeamAssignmentRole(membership.deliverableKind, plan);
     if (defaultRole === undefined) reject("Assignment requires explicit supported role selection");
     const member =
       membership.requestedSuccessorMemberId === undefined
@@ -330,7 +334,9 @@ export const prepareProjectTeamConfiguredAdmission = (input: {
     const role = roles.find((r) => r.recordId === member!.roleRevisionId)!;
     if (
       membership.deliverableKind === "code"
-        ? role.role !== "implementer" && role.role !== "integrator"
+        ? plan?.integrationSources !== undefined
+          ? role.role !== "integrator"
+          : role.role !== "implementer" && role.role !== "integrator"
         : role.role !== defaultRole
     )
       reject("Successor role does not match assignment");
@@ -425,18 +431,6 @@ export const prepareProjectTeamConfiguredAdmission = (input: {
       )
         reject("Original root capacity or depth is exhausted");
     }
-    const plans = records.filter(
-      (r): r is Plan =>
-        r.kind === "plan-revision" && r.taskId === taskId && r.status === "proposed",
-    );
-    for (const plan of plans) checked(plan);
-    const plan = [...plans].sort((a, b) => b.planRevision - a.planRevision)[0];
-    if (
-      plan &&
-      (!validSafe(plan.planRevision) ||
-        plans.filter((p) => p.planRevision === plan.planRevision).length !== 1)
-    )
-      reject("Current plan revision is ambiguous");
     const specGate = records.find(
       (r): r is Gate =>
         r.kind === "gate" &&

@@ -1,5 +1,6 @@
 import {
   canonicalProjectWorkPayload,
+  ProjectTeamIntegrationSources,
   type ProjectTeamReviewCompletionProof,
   projectWorkPayloadFingerprint,
   CommandId,
@@ -19,7 +20,11 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
-import { assertProjectTeamRunAuthority, projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
+import {
+  assertProjectTeamRunAuthority,
+  projectTeamDerivedRecordId,
+  projectTeamPlanHash,
+} from "./ProjectTeamPolicy.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
 import { resolveProjectTeamLimits } from "./ProjectTeamLimits.ts";
@@ -135,12 +140,41 @@ const RootCaps = Schema.Struct({
   projectWritableWorkers: Safe.check(Schema.isLessThanOrEqualTo(64)),
   modelCalls: Positive.check(Schema.isLessThanOrEqualTo(128)),
 });
+const selectionHash = (value: unknown) =>
+  NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
 const Intent = Schema.Struct({
   request: Request,
   compiledClaim: ProjectWorkFoundationCommitCommand,
   limits: Limits,
   rootCaps: RootCaps,
   writableReservationId: Schema.optionalKey(Id),
+  integration: Schema.optionalKey(
+    Schema.Struct({
+      version: Schema.Literal(1),
+      planId: Id,
+      planRevision: Safe,
+      planContentHash: Id,
+      selection: ProjectTeamIntegrationSources,
+      selectionSha256: Digest,
+    }),
+  ),
+});
+export const ProjectTeamIntegrationCombinationReceipt = Schema.Struct({
+  version: Schema.Literal(1),
+  selectionSha256: Digest,
+  baseSha: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
+  combinedHeadSha: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
+  combinedTree: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
+  sourceHeads: Schema.Array(Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u))).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(64),
+  ),
+});
+export type ProjectTeamIntegrationCombinationReceipt =
+  typeof ProjectTeamIntegrationCombinationReceipt.Type;
+export const ProjectTeamWorkspaceEvidence = Schema.Struct({
+  workspace: ProjectTeamWorkspaceReceipt,
+  integration: Schema.optionalKey(ProjectTeamIntegrationCombinationReceipt),
 });
 export type ProjectTeamDispatchRequest = typeof Request.Type;
 export type ProjectTeamDispatchStage = typeof Stage.Type;
@@ -342,6 +376,13 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         intent.request.git.generation !== row.generation
       )
         return yield* deny("Dispatch identity does not match its retained intent");
+      if (
+        intent.integration !== undefined &&
+        (intent.integration.selection.environmentId !== environmentId ||
+          intent.integration.selectionSha256 !== selectionHash(intent.integration.selection) ||
+          intent.integration.selection.sources.some((source) => source.taskId === binding.taskId))
+      )
+        return yield* deny("Frozen integration selection identity changed");
       return { row, intent };
     });
     const readClaimBaseline = Effect.fn("ProjectTeamDispatchJournal.readClaimBaseline")(function* (
@@ -545,6 +586,35 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       if (now >= intent.limits.deadlineAtMs) return yield* deny("Frozen attempt deadline expired");
       const state = yield* readCurrentState(sql, row.project_id);
       const records = state.foundationRecords ?? [];
+      if (intent.integration !== undefined) {
+        const selection = intent.integration;
+        const plans = records.filter(
+          (record) => record.kind === "plan-revision" && record.recordId === selection.planId,
+        );
+        const plan = plans[0];
+        const original = intent.compiledClaim.transition;
+        const roles =
+          original?.kind === "claim"
+            ? records.filter(
+                (record) =>
+                  record.kind === "role-revision" &&
+                  record.recordId === original.binding.roleRevisionId,
+              )
+            : [];
+        if (
+          plans.length !== 1 ||
+          plan?.kind !== "plan-revision" ||
+          plan.status !== "proposed" ||
+          plan.planRevision !== selection.planRevision ||
+          plan.contentHash !== selection.planContentHash ||
+          plan.integrationSources === undefined ||
+          selectionHash(plan.integrationSources) !== selection.selectionSha256 ||
+          roles.length !== 1 ||
+          roles[0]?.kind !== "role-revision" ||
+          roles[0].role !== "integrator"
+        )
+          return yield* deny("Approved integration source plan changed");
+      }
       const bindings = records.filter(
         (r): r is Binding => r.kind === "run-binding" && r.recordId === row.binding_id,
       );
@@ -965,8 +1035,42 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
               },
             },
           };
+          const selectedPlans = records.filter(
+            (record) =>
+              record.kind === "plan-revision" &&
+              record.taskId === binding.taskId &&
+              record.specRevision === binding.specRevision &&
+              record.planRevision === binding.planRevision &&
+              record.status === "proposed",
+          );
+          const selectedPlan = selectedPlans[0];
+          const integration =
+            writable &&
+            selectedPlan?.kind === "plan-revision" &&
+            selectedPlan.integrationSources !== undefined
+              ? {
+                  version: 1 as const,
+                  planId: selectedPlan.recordId,
+                  planRevision: selectedPlan.planRevision,
+                  planContentHash: selectedPlan.contentHash,
+                  selection: selectedPlan.integrationSources,
+                  selectionSha256: selectionHash(selectedPlan.integrationSources),
+                }
+              : undefined;
+          if (
+            integration !== undefined &&
+            (selectedPlans.length !== 1 ||
+              role.role !== "integrator" ||
+              integration.selection.environmentId !== environmentId ||
+              selectedPlan?.kind !== "plan-revision" ||
+              projectTeamPlanHash(selectedPlan) !== integration.planContentHash)
+          )
+            return yield* deny(
+              "Integration dispatch requires its exact approved source plan and original integrator",
+            );
           const intent: typeof Intent.Type = {
             request,
+            ...(integration === undefined ? {} : { integration }),
             compiledClaim,
             limits,
             rootCaps,
@@ -1354,6 +1458,23 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         }),
       );
     });
+    const readHistoricalInTransaction = Effect.fn(
+      "ProjectTeamDispatchJournal.readHistoricalInTransaction",
+    )(function* (dispatchId: string) {
+      const suppliedSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(suppliedSql) ||
+        suppliedSql.value !== sql ||
+        Option.isNone(suppliedRepository) ||
+        suppliedRepository.value !== repository ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny("Dispatch history requires its original caller transaction");
+      const value = yield* read(yield* decodeId(dispatchId));
+      const receipts = yield* readStageHistory(value.row, value.intent);
+      return { snapshot: { fence: fence(value.row), intent: value.intent }, receipts };
+    });
     const readStageReceipts = Effect.fn("ProjectTeamDispatchJournal.readStageReceipts")(function* (
       dispatchId: string,
     ) {
@@ -1484,103 +1605,20 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         state: Effect.Success<ReturnType<typeof readCurrentState>>,
       ) =>
         Effect.gen(function* () {
-          const rows = yield* sql<
-            Record<string, unknown>
-          >`SELECT * FROM project_work_events WHERE project_id=${projectId} AND command_id=${joinedCommandId} ORDER BY sequence LIMIT 513`;
-          const commands = yield* sql<
-            Record<string, unknown>
-          >`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${joinedCommandId} LIMIT 2`;
-          // Historical settlements with no joined command grant no progress.
-          if (rows.length === 0 && commands.length === 0 && parentProgress === undefined) return;
-          const command = commands[0];
-          if (!command || commands.length !== 1 || rows.length === 0 || rows.length > 512)
-            return yield* deny("Joined review command receipt is missing or ambiguous");
-          const events = yield* Effect.try({
-            try: () =>
-              rows.map((row) => {
-                const event = decodeProjectWorkEvent(JSON.parse(String(row.payload_json)));
-                if (
-                  event.projectId !== projectId ||
-                  row.event_id !== event.eventId ||
-                  row.event_type !== event.type ||
-                  row.occurred_at !== event.occurredAt ||
-                  !Number.isSafeInteger(event.revision) ||
-                  event.revision <= 0 ||
-                  deadline(event.occurredAt) === undefined
-                )
-                  throw new Error("Invalid retained joined event metadata");
-                return event;
-              }),
-            catch: () => deny("Joined review retained events are invalid"),
+          const audited = yield* readCompletedReviewCommand({
+            sql,
+            projectId,
+            commandId: joinedCommandId,
+            dispatchId: expected.dispatchId,
+            joinedReceiptId: receipt.receiptId,
+            state,
+            required: parentProgress !== undefined,
+            parentCriteria,
+            ...(joinedFingerprint === undefined ? {} : { expectedFingerprint: joinedFingerprint }),
+            ...(parentProgress === undefined ? {} : { expectedDrafts: parentProgress }),
           });
-          const result = yield* decodeWriteResult(command.result_json).pipe(
-            Effect.mapError(() => deny("Joined review command result is invalid")),
-          );
-          const ids = yield* decodeEventIds(command.event_ids_json).pipe(
-            Effect.mapError(() => deny("Joined review command event IDs are invalid")),
-          );
-          const last = events[events.length - 1]!;
-          if (
-            command.actor_kind !== "system" ||
-            command.actor_id !== "project-team-runtime" ||
-            command.source_kind !== "system" ||
-            command.source_id !== "project-team-runtime" ||
-            typeof command.payload_fingerprint !== "string" ||
-            !/^[a-f0-9]{8}$/.test(command.payload_fingerprint) ||
-            (joinedFingerprint !== undefined &&
-              command.payload_fingerprint !== joinedFingerprint) ||
-            command.created_at !== events[0]!.occurredAt ||
-            events.some(
-              (event, i) =>
-                event.revision !== last.revision - events.length + i + 1 ||
-                event.occurredAt !== command.created_at,
-            ) ||
-            new Set(ids).size !== ids.length ||
-            fingerprint(ids) !== fingerprint(events.map((event) => event.eventId)) ||
-            result.projectId !== projectId ||
-            result.revision !== last.revision ||
-            result.receipt.commandId !== joinedCommandId ||
-            result.receipt.projectId !== projectId ||
-            result.receipt.status !== "accepted" ||
-            result.receipt.revision !== last.revision ||
-            result.receipt.eventCount !== events.length ||
-            result.delta.projectId !== projectId ||
-            result.delta.revision !== last.revision ||
-            fingerprint(result.delta.eventIds) !== fingerprint(ids)
-          )
-            return yield* deny("Joined review command receipt disagrees with its original events");
-          if (parentProgress !== undefined) {
-            const observed = events
-              .filter(
-                (event) =>
-                  (event.type === "project-work.evidence.added" &&
-                    event.evidence.evidenceId.startsWith("review-criterion-progress:")) ||
-                  (event.type === "project-work.criterion.upserted" &&
-                    parentCriteria.some(
-                      (criterion) => criterion.criterionId === event.criterion.criterionId,
-                    )),
-              )
-              .map(
-                ({ eventId: _eventId, projectId: _projectId, revision: _revision, ...draft }) =>
-                  draft,
-              );
-            if (fingerprint(observed) !== fingerprint(parentProgress))
-              return yield* deny("Joined review progress events differ from the prepared changes");
-          }
-          yield* Effect.try({
-            try: () =>
-              assertRetainedReviewCriterionProgress({
-                state,
-                events,
-                settlement: {
-                  commandId: joinedCommandId,
-                  commandFingerprint: String(command.payload_fingerprint),
-                  dispatchId: expected.dispatchId,
-                  joinedReceiptId: receipt.receiptId,
-                },
-              }),
-            catch: () => deny("Joined review immutable progress provenance changed"),
-          });
+          if (audited === undefined) return;
+          const { events } = audited;
           // Replay checks immutable evidence, while later criterion revisions remain legitimate.
           for (const event of events) {
             if (
@@ -1922,11 +1960,127 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       inspect,
       claimEffect,
       readRetained,
+      readHistoricalInTransaction,
       readRecoveryPage,
       readRecoveryCandidates,
       advanceStage,
       readStageReceipts,
       settleAfterJoined,
     };
+  },
+);
+
+/** Shared original joined-command audit. Current criterion revisions may legitimately invalidate old support. */
+export const readCompletedReviewCommand = Effect.fn("ProjectTeamReviewCompleted.readCommand")(
+  function* (input: {
+    readonly sql: SqlClient.SqlClient;
+    readonly projectId: string;
+    readonly commandId: string;
+    readonly dispatchId: string;
+    readonly joinedReceiptId: string;
+    readonly state: Effect.Success<ReturnType<typeof readCurrentState>>;
+    readonly required: boolean;
+    readonly expectedFingerprint?: string;
+    readonly expectedDrafts?: readonly ReturnType<typeof prepareReviewCriterionProgress>[number][];
+    readonly parentCriteria: readonly ProjectWorkCriterion[];
+  }) {
+    const { sql, projectId, commandId: joinedCommandId, state } = input;
+    const rows = yield* sql<
+      Record<string, unknown>
+    >`SELECT * FROM project_work_events WHERE project_id=${projectId} AND command_id=${joinedCommandId} ORDER BY sequence LIMIT 513`;
+    const commands = yield* sql<
+      Record<string, unknown>
+    >`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${joinedCommandId} LIMIT 2`;
+    // Historical settlements with no joined command grant no progress.
+    if (rows.length === 0 && commands.length === 0 && !input.required) return undefined;
+    const command = commands[0];
+    if (!command || commands.length !== 1 || rows.length === 0 || rows.length > 512)
+      return yield* deny("Joined review command receipt is missing or ambiguous");
+    const events = yield* Effect.try({
+      try: () =>
+        rows.map((row) => {
+          const event = decodeProjectWorkEvent(JSON.parse(String(row.payload_json)));
+          if (
+            event.projectId !== projectId ||
+            row.event_id !== event.eventId ||
+            row.event_type !== event.type ||
+            row.occurred_at !== event.occurredAt ||
+            !Number.isSafeInteger(event.revision) ||
+            event.revision <= 0 ||
+            deadline(event.occurredAt) === undefined
+          )
+            throw new Error("Invalid retained joined event metadata");
+          return event;
+        }),
+      catch: () => deny("Joined review retained events are invalid"),
+    });
+    const result = yield* decodeWriteResult(command.result_json).pipe(
+      Effect.mapError(() => deny("Joined review command result is invalid")),
+    );
+    const ids = yield* decodeEventIds(command.event_ids_json).pipe(
+      Effect.mapError(() => deny("Joined review command event IDs are invalid")),
+    );
+    const last = events[events.length - 1]!;
+    if (
+      command.actor_kind !== "system" ||
+      command.actor_id !== "project-team-runtime" ||
+      command.source_kind !== "system" ||
+      command.source_id !== "project-team-runtime" ||
+      typeof command.payload_fingerprint !== "string" ||
+      !/^[a-f0-9]{8}$/.test(command.payload_fingerprint) ||
+      (input.expectedFingerprint !== undefined &&
+        command.payload_fingerprint !== input.expectedFingerprint) ||
+      command.created_at !== events[0]!.occurredAt ||
+      events.some(
+        (event, i) =>
+          event.revision !== last.revision - events.length + i + 1 ||
+          event.occurredAt !== command.created_at,
+      ) ||
+      new Set(ids).size !== ids.length ||
+      fingerprint(ids) !== fingerprint(events.map((event) => event.eventId)) ||
+      result.projectId !== projectId ||
+      result.revision !== last.revision ||
+      result.receipt.commandId !== joinedCommandId ||
+      result.receipt.projectId !== projectId ||
+      result.receipt.status !== "accepted" ||
+      result.receipt.revision !== last.revision ||
+      result.receipt.eventCount !== events.length ||
+      result.delta.projectId !== projectId ||
+      result.delta.revision !== last.revision ||
+      fingerprint(result.delta.eventIds) !== fingerprint(ids)
+    )
+      return yield* deny("Joined review command receipt disagrees with its original events");
+    if (input.expectedDrafts !== undefined) {
+      const observed = events
+        .filter(
+          (event) =>
+            (event.type === "project-work.evidence.added" &&
+              event.evidence.evidenceId.startsWith("review-criterion-progress:")) ||
+            (event.type === "project-work.criterion.upserted" &&
+              input.parentCriteria.some(
+                (criterion) => criterion.criterionId === event.criterion.criterionId,
+              )),
+        )
+        .map(
+          ({ eventId: _eventId, projectId: _projectId, revision: _revision, ...draft }) => draft,
+        );
+      if (fingerprint(observed) !== fingerprint(input.expectedDrafts))
+        return yield* deny("Joined review progress events differ from the prepared changes");
+    }
+    yield* Effect.try({
+      try: () =>
+        assertRetainedReviewCriterionProgress({
+          state,
+          events,
+          settlement: {
+            commandId: joinedCommandId,
+            commandFingerprint: String(command.payload_fingerprint),
+            dispatchId: input.dispatchId,
+            joinedReceiptId: input.joinedReceiptId,
+          },
+        }),
+      catch: () => deny("Joined review immutable progress provenance changed"),
+    });
+    return { events, result, commandFingerprint: String(command.payload_fingerprint) };
   },
 );

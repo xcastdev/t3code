@@ -438,6 +438,7 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
   const tasks = read("environment-data:project-work:tasks");
   const knowledge = read("environment-data:project-work:knowledge");
   const attention = read("environment-data:project-work:attention");
+  const integrationSources = read("environment-data:project-work:integration-sources");
   const verificationJob = read("environment-data:project-work:verification-job");
   const verificationFamily = Atom.family((key: string) => {
     const [environmentId, input] = JSON.parse(key) as [EnvironmentId, ProjectWorkReadIntent];
@@ -657,6 +658,22 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
       const key = projectWorkPageTargetKey(target);
       return target.poll === false ? pageFamily(key) : pollingPage(key);
     },
+    integrationSources: (
+      target: ProjectWorkReadTarget & {
+        readonly taskId: ProjectWorkTaskId;
+        readonly offset?: number;
+      },
+    ) =>
+      integrationSources({
+        environmentId: target.environmentId,
+        input: {
+          projectId: target.projectId,
+          taskId: target.taskId,
+          operation: "integration-sources",
+          offset: target.offset ?? 0,
+          limit: 50,
+        },
+      }),
     verificationJob: (target: ProjectWorkVerificationJobTarget) => {
       const input = decodeVerificationRead({
         projectId: target.projectId,

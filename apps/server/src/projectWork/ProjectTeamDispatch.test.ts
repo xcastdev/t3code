@@ -229,11 +229,11 @@ const harness = Effect.gen(function* () {
         events.push(next.stage);
         return snapshot;
       }),
-    workspace: () =>
+    withWorkspace: (_, _snapshot, use) =>
       Effect.sync(() => {
         events.push("workspace");
-        return workspace;
-      }),
+        return { workspace };
+      }).pipe(Effect.flatMap(use)),
     setup: () =>
       Effect.sync(() => {
         events.push("setup");
@@ -328,6 +328,81 @@ it.effect(
     ),
 );
 
+it.effect(
+  "holds the combination loan through durable workspace persistence and retains its receipt",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        let held = false;
+        const loan = h.ports.withWorkspace;
+        const append = h.ports.appendStage;
+        const integration = {
+          version: 1 as const,
+          selectionSha256: "a".repeat(64),
+          baseSha: "b".repeat(40),
+          combinedHeadSha: "c".repeat(40),
+          combinedTree: "d".repeat(40),
+          sourceHeads: ["e".repeat(40)],
+        };
+        h.ports.withWorkspace = (owner, snapshot, use) =>
+          Effect.acquireUseRelease(
+            Effect.sync(() => {
+              held = true;
+            }),
+            () => loan(owner, snapshot, (evidence) => use({ ...evidence, integration })),
+            () =>
+              Effect.sync(() => {
+                held = false;
+                h.events.push("loan-released");
+              }),
+          );
+        h.ports.appendStage = (owner, snapshot, receipt) => {
+          if (receipt.stage === "workspace-ready") expect(held).toBe(true);
+          else expect(held).toBe(false);
+          expect(receipt.integration).toEqual(integration);
+          return append(owner, snapshot, receipt);
+        };
+        expect((yield* h.make().dispatch(h.request.dispatchId))._tag).toBe("Observed");
+        expect(h.events.indexOf("loan-released")).toBe(h.events.indexOf("workspace-ready") + 1);
+        expect(h.getReceipt()?.integration).toEqual(integration);
+      }),
+    ),
+);
+
+it.effect("releases the combination loan before cleanup when workspace persistence fails", () =>
+  scoped(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      let held = false;
+      const loan = h.ports.withWorkspace;
+      const join = h.ports.stopAndJoin;
+      h.ports.withWorkspace = (owner, snapshot, use) =>
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            held = true;
+          }),
+          () => loan(owner, snapshot, use),
+          () =>
+            Effect.sync(() => {
+              held = false;
+              h.events.push("loan-released");
+            }),
+        );
+      h.ports.appendStage = () =>
+        Effect.fail(new ProjectTeamDispatchError({ reason: "Storage refused workspace" }));
+      h.ports.stopAndJoin = (...args) => {
+        expect(held).toBe(false);
+        return join(...args);
+      };
+      expect((yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit))._tag).toBe(
+        "Failure",
+      );
+      expect(h.events).toEqual(["claim", "workspace", "loan-released", "joined"]);
+    }),
+  ),
+);
+
 it.effect("awaits setup; a concurrent ordinary caller leaves the winner alone", () =>
   scoped(
     Effect.gen(function* () {
@@ -368,9 +443,11 @@ for (const boundary of ["workspace", "setup", "initialize", "sendAssignment"] as
       Effect.gen(function* () {
         const h = yield* harness;
         if (boundary === "workspace") {
-          const call = h.ports.workspace;
-          h.ports.workspace = (...args) =>
-            call(...args).pipe(Effect.tap(() => Effect.sync(h.revoke)));
+          const call = h.ports.withWorkspace;
+          h.ports.withWorkspace = (owner, snapshot, use) =>
+            call(owner, snapshot, (evidence) =>
+              Effect.sync(h.revoke).pipe(Effect.andThen(use(evidence))),
+            );
         }
         if (boundary === "setup") {
           const call = h.ports.setup;
@@ -519,7 +596,7 @@ for (const boundary of ["workspace", "setup", "initialize", "sendAssignment"] as
         const cleanupEntered = yield* Deferred.make<void>();
         const cleanupComplete = yield* Deferred.make<void>();
         const wait = Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
-        if (boundary === "workspace") h.ports.workspace = () => wait;
+        if (boundary === "workspace") h.ports.withWorkspace = () => wait;
         if (boundary === "setup") h.ports.setup = () => wait;
         if (boundary === "initialize") h.ports.initialize = () => wait;
         if (boundary === "sendAssignment") h.ports.sendAssignment = () => wait;

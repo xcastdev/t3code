@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Disposable SDK JSONL is the retained observation under test.
 import { expect, it, vi } from "@effect/vitest";
+import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
+import { makeProjectTeamWorkspace } from "./ProjectTeamWorkspace.ts";
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -11,12 +13,16 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
 import * as Clock from "effect/Clock";
 import {
   canonicalProjectWorkPayload,
+  EnvironmentId,
   GitCommandError,
   ProjectTeamReviewFindingIntent,
   ProjectTeamReviewFinding,
@@ -31,6 +37,8 @@ import {
   ProjectWorkEvidenceId,
   ProjectWorkCommand,
   ProjectWorkRelationship,
+  ProjectWorkTaskId,
+  ProjectTeamIntegrationSourceRef,
 } from "@t3tools/contracts";
 import {
   scoped,
@@ -64,7 +72,11 @@ import {
   makeProjectWorkVerificationPreparation,
   ProjectWorkVerificationPreparationError,
 } from "./ProjectWorkVerificationPreparation.ts";
-import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
+import {
+  verificationFixture,
+  makeVerificationFixture,
+  makeVerificationAssignmentFixture,
+} from "./ProjectWorkVerification.testFixtures.ts";
 import {
   makeProjectWorkVerificationGate,
   ProjectWorkVerificationApproval,
@@ -75,7 +87,11 @@ import { projectTeamDerivedRecordId, projectTeamScopeHash } from "./ProjectTeamP
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamWorkspaceReceipt,
+  ProjectTeamWorkspaceEvidence,
+  ProjectTeamDispatchJournalError,
 } from "./ProjectTeamDispatchJournal.ts";
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
+import { makeProjectTeamCompletedReviewReader } from "./ProjectTeamReviewCompleted.ts";
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
@@ -189,13 +205,27 @@ it.effect(
 );
 
 /** Actual migrated SQLite, real authorization and original claim; no worker or model execution. */
-const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixture>) =>
+const establishControlledReviewRoot = (
+  f: Effect.Success<typeof verificationFixture>,
+  suffix = "",
+) =>
   Effect.gen(function* () {
+    const key = (id: string) => id + suffix;
     const state = () => readCurrentState(f.sql, projectId);
     let current = yield* state();
-    const old = current.foundationRecords?.find((r) => r.kind === "run-binding");
-    const role = current.foundationRecords?.find((r) => r.kind === "role-revision");
-    const member = current.foundationRecords?.find((r) => r.kind === "member");
+    const old = current.foundationRecords?.find(
+      (r) => r.kind === "run-binding" && r.recordId === f.selection.bindingId,
+    );
+    const role = current.foundationRecords?.find(
+      (r) =>
+        r.kind === "role-revision" &&
+        r.recordId === (old?.kind === "run-binding" ? old.roleRevisionId : undefined),
+    );
+    const member = current.foundationRecords?.find(
+      (r) =>
+        r.kind === "member" &&
+        r.recordId === (old?.kind === "run-binding" ? old.memberId : undefined),
+    );
     const limits = current.foundationRecords?.find(
       (r) => r.kind === "limits" && r.status === "configured",
     );
@@ -208,40 +238,73 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
       !task
     )
       return yield* Effect.die("Missing original root fixture scope");
-    const rootRole = decodeRecord({
-      ...role,
-      recordId: "review-root-role",
-      roleId: "review-root",
-      role: "coordinator",
-      model: "inclusionai/ling-3.1-flash:free",
-      tools: ["pi.read"],
-    });
+    const existingCoordinator = suffix
+      ? current.foundationRecords?.find(
+          (record) => record.kind === "member" && record.coordinator && record.status === "active",
+        )
+      : undefined;
+    const existingRootRole =
+      existingCoordinator?.kind === "member"
+        ? current.foundationRecords?.find(
+            (record) =>
+              record.kind === "role-revision" &&
+              record.recordId === existingCoordinator.roleRevisionId,
+          )
+        : undefined;
+    const rootRole =
+      existingRootRole ??
+      decodeRecord({
+        ...role,
+        recordId: key("review-root-role"),
+        roleId: key("review-root"),
+        role: "coordinator",
+        model: "inclusionai/ling-3.1-flash:free",
+        tools: ["pi.read"],
+      });
     if (rootRole.kind !== "role-revision") return yield* Effect.die("Invalid controlled root role");
-    yield* f.repository.execute(
-      decodeCommit({
-        type: "project-work.foundation.commit",
-        commandId: "review-root-profile",
-        projectId,
-        expectedRevision: current.revision,
-        attribution,
-        committedAt: at,
-        records: [
-          rootRole,
-          decodeRecord({
-            ...member,
-            recordId: "review-root-member",
-            roleRevisionId: rootRole.recordId,
-            coordinator: true,
-          }),
-          decodeRecord({ ...limits, recordId: "review-model-limits", model: rootRole.model }),
-        ],
-      }),
-    );
+    const rootMember =
+      existingCoordinator ??
+      decodeRecord({
+        ...member,
+        recordId: key("review-root-member"),
+        roleRevisionId: rootRole.recordId,
+        coordinator: true,
+      });
+    if (rootMember.kind !== "member") return yield* Effect.die("Invalid controlled root member");
+    if (!existingCoordinator)
+      yield* f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          commandId: key("review-root-profile"),
+          projectId,
+          expectedRevision: current.revision,
+          attribution,
+          committedAt: at,
+          records: [
+            rootRole,
+            rootMember,
+            ...(current.foundationRecords?.some(
+              (record) =>
+                record.kind === "limits" &&
+                record.status === "configured" &&
+                record.model === rootRole.model,
+            )
+              ? []
+              : [
+                  decodeRecord({
+                    ...limits,
+                    recordId: key("review-model-limits"),
+                    model: rootRole.model,
+                  }),
+                ]),
+          ],
+        }),
+      );
     current = yield* state();
     yield* f.repository.execute(
       decodeCommit({
         type: "project-work.foundation.commit",
-        commandId: "review-root-resume",
+        commandId: key("review-root-resume"),
         projectId,
         expectedRevision: current.revision,
         attribution: { ...attribution, actor: f.principal.actor },
@@ -250,7 +313,7 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
         guided: {
           intent: {
             type: "project-team.task.control",
-            commandId: "review-root-resume",
+            commandId: key("review-root-resume"),
             projectId,
             taskId: task.taskId,
             expectedRevision: current.revision,
@@ -283,16 +346,16 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
     const { sessionId: _oldSession, ...oldIdentity } = old;
     const binding = decodeRecord({
       ...oldIdentity,
-      recordId: "review-root-binding",
+      recordId: key("review-root-binding"),
       status: "reserved",
       revision: 0,
       generation: 1,
       leaseGeneration: 1,
       updatedAt: at,
-      attemptId: "review-root-attempt",
-      memberId: "review-root-member",
+      attemptId: key("review-root-attempt"),
+      memberId: rootMember.recordId,
       roleRevisionId: rootRole.recordId,
-      threadId: "review-root-thread",
+      threadId: key("review-root-thread"),
       model: rootRole.model,
       worktree: workspace,
       branch: "refs/heads/review-root",
@@ -306,7 +369,7 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
     if (binding.kind !== "run-binding") return yield* Effect.die("Invalid controlled root binding");
     const rootClaim = decodeCommit({
       type: "project-work.foundation.commit",
-      commandId: "review-root-claim",
+      commandId: key("review-root-claim"),
       projectId,
       expectedRevision: current.revision,
       attribution,
@@ -323,9 +386,9 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
           type: "project-work.task.claim",
           projectId,
           taskId: task.taskId,
-          commandId: "review-root-claim",
+          commandId: key("review-root-claim"),
           attemptId: binding.attemptId,
-          leaseToken: "review-root-lease",
+          leaseToken: key("review-root-lease"),
           leasedUntil: "2030-01-01T00:00:00.000Z",
           claimedAt: at,
         },
@@ -336,10 +399,10 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
       maximumEnvironmentModelCalls: 4,
     });
     const reservedRoot = yield* rootJournal.reserve({
-      dispatchId: "review-root-dispatch",
+      dispatchId: key("review-root-dispatch"),
       claim: rootClaim,
       git: {
-        effectId: "review-root-dispatch",
+        effectId: key("review-root-dispatch"),
         runId: binding.recordId,
         generation: binding.generation,
         primaryRoot: "/workspace",
@@ -348,12 +411,12 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
         branchRef: binding.branch,
         baseRef: "refs/heads/main",
         baseOid: "a".repeat(40),
-        ownershipToken: "review-root-owner",
+        ownershipToken: key("review-root-owner"),
         policyHash: "b".repeat(64),
       },
-      setupId: "review-root-setup",
-      initializeOperationId: "review-root-initialize",
-      assignmentOperationId: "review-root-assignment",
+      setupId: key("review-root-setup"),
+      initializeOperationId: key("review-root-initialize"),
+      assignmentOperationId: key("review-root-assignment"),
       assignment: "Own the bounded review root",
     });
     yield* rootJournal.claimEffect(reservedRoot.fence);
@@ -370,7 +433,7 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
     const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
     const request = {
       kind: "initialize" as const,
-      operationId: "review-root-initialize",
+      operationId: key("review-root-initialize"),
       threadId: binding.threadId,
     };
     const initialize = yield* operations.prepare(
@@ -379,7 +442,7 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
       digest(canonical(request)),
       {
         allocation,
-        workerId: "review-root-worker",
+        workerId: key("review-root-worker"),
         operationId: request.operationId,
         resourceHash: "a".repeat(64),
       },
@@ -399,7 +462,7 @@ const establishControlledReviewRoot = (f: Effect.Success<typeof verificationFixt
     yield* operations.persistence(initialize).claimActivation(allocation);
     yield* operations.persistence(initialize).beforeStart(owner);
     yield* operations.persistNative(initialize, {
-      sessionId: "controlled-review-root",
+      sessionId: key("controlled-review-root"),
       sessionReference: "sessions/root.jsonl",
       leafId: null,
       persisted: true,
@@ -427,7 +490,10 @@ const retainControlledVerification = (
     );
     if (gate?.kind !== "gate") return yield* Effect.die("Missing approved verification gate");
     const job = f.prepared.manifest;
-    const nonce = "22222222-2222-4222-8222-222222222222";
+    const nonce =
+      job.jobId === "verification-1"
+        ? "22222222-2222-4222-8222-222222222222"
+        : "33333333-3333-4333-8333-333333333333";
     const memoryBytes = 536870912;
     const runtimeSeconds = Math.ceil(job.command.limits.maxDurationMs / 1000);
     const allocation = {
@@ -538,7 +604,7 @@ const retainControlledVerification = (
       command: canonical({ executable: job.command.executable, argv: job.command.argv }),
       exitCode,
       environmentSummary,
-      integration: false,
+      integration: job.integration === true,
     };
     const artifacts = yield* makeProjectWorkArtifacts({
       environmentId: "environment",
@@ -652,15 +718,16 @@ const makeFindingFixture = (
       type: "project-team.verification.propose",
       commandId: key("findings-verification-propose"),
     });
-    yield* repository.execute(
-      yield* auth
+    yield* repository.executeAtomic(
+      auth
         .intent(f.principal, proposal, human, false)
         .pipe(
           Effect.provideService(
             ProjectWorkVerificationApproval,
             trust(f.selection.expectedRevision),
           ),
-        ),
+        )
+        .pipe(Effect.map((command) => [command])),
     );
     let current = yield* state();
     const verificationGate = current.foundationRecords?.find(
@@ -681,8 +748,8 @@ const makeFindingFixture = (
       expectedGateRevision: verificationGate.revision,
       response: "approved",
     });
-    yield* repository.execute(
-      yield* auth
+    yield* repository.executeAtomic(
+      auth
         .intent(f.principal, response, human, false)
         .pipe(
           Effect.provideService(ProjectWorkVerificationApproval, trust(current.revision)),
@@ -690,7 +757,8 @@ const makeFindingFixture = (
             ProjectWorkVerificationRequest,
             ProjectWorkVerificationRequest.of({ assertCurrent: () => Effect.void }),
           ),
-        ),
+        )
+        .pipe(Effect.map((command) => [command])),
     );
     if (verificationOutcome) yield* retainControlledVerification(f, verificationOutcome);
     current = yield* state();
@@ -1278,7 +1346,21 @@ it.effect(
 const scopedGateway = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
     Effect.scoped,
-    Effect.provide(Layer.fresh(ProjectWorkProjectionLive.pipe(Layer.provideMerge(gatewayRuntime)))),
+    Effect.provide(
+      Layer.fresh(
+        ProjectWorkProjectionLive.pipe(
+          Layer.provideMerge(
+            gatewayRuntime.pipe(
+              Layer.provide(
+                Layer.succeed(ServerEnvironmentIdentity, {
+                  getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+                }),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
   );
 const decodePage = Schema.decodeUnknownSync(
   Schema.Struct({ items: Schema.Array(ProjectTeamRecordRead) }),
@@ -1898,6 +1980,7 @@ const makeConsumedReviewFixture = (
     readonly withoutCurrentTarget?: boolean;
     readonly assessmentVerdict?: "met" | "not-met";
     readonly verificationOutcome?: "success" | "failed";
+    readonly suffix?: string;
   } = {},
   existing?: Effect.Success<ReturnType<typeof makeProposalFixture>>,
 ) =>
@@ -2183,7 +2266,7 @@ const makeConsumedReviewFixture = (
       return yield* makeConsumer;
     }).pipe(Effect.provideService(ProjectTeamReviewCurrentTarget, targetService));
     const joined = {
-      receiptId: "review-original-joined",
+      receiptId: "review-original-joined" + (options.suffix ?? ""),
       stage: "settled" as const,
       evidence: yield* decodeControlledJson(
         canonical({
@@ -2276,6 +2359,982 @@ const makeConsumedReviewFixture = (
     };
   });
 const consumedReviewFixture = makeConsumedReviewFixture();
+
+it.effect(
+  "a historical completed review reader authenticates accepted joined review without a new target loan",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const proof = yield* f.prepare();
+        if (proof?.status !== "completed")
+          return yield* Effect.die("Missing controlled completed review");
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        const reader = yield* makeProjectTeamCompletedReviewReader({
+          environmentId: "environment",
+        });
+        const loans = f.targetControl.permits;
+        const retained = yield* f.sql.withTransaction(
+          reader.readInTransaction({
+            dispatchId: f.proposalSnapshot.fence.dispatchId,
+            expectedProposalSha256: proof.proposalSha256,
+          }),
+        );
+        expect(retained.proposal.sha256).toBe(proof.proposalSha256);
+        expect(retained.proposal.manifest.target).toEqual(proof.target);
+        expect(retained.joined.receiptId).toBe(f.joined.receiptId);
+        expect(f.targetControl.permits).toBe(loans);
+        expect(
+          (yield* reader
+            .readInTransaction({
+              dispatchId: f.proposalSnapshot.fence.dispatchId,
+              expectedProposalSha256: proof.proposalSha256,
+            })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+const completeIntegrationSourceReview = Effect.fn("integrationTest.completeSourceReview")(
+  function* (f: Effect.Success<ReturnType<typeof makeConsumedReviewFixture>>) {
+    const proof = yield* f.prepare();
+    if (proof?.status !== "completed")
+      return yield* Effect.die("Missing actual accepted source review");
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 128,
+      verifyStage: () => Effect.void,
+      verifySettlement: () => Effect.void,
+      prepareReviewCompletion: f.consumer.prepare,
+      verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+    });
+    yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+    const current = yield* f.state();
+    const binding = current.foundationRecords?.find(
+      (record) => record.kind === "run-binding" && record.recordId === f.selection.bindingId,
+    );
+    if (binding?.kind !== "run-binding")
+      return yield* Effect.die("Missing selected original source binding");
+    const job = f.prepared.manifest;
+    return yield* decodeIntegrationSourceRef({
+      taskId: job.taskId,
+      bindingId: job.bindingId,
+      expectedBindingRevision: binding.revision,
+      generation: job.generation,
+      reviewDispatchId: f.proposalSnapshot.fence.dispatchId,
+      expectedReviewProposalSha256: proof.proposalSha256,
+      verificationJobId: job.jobId,
+      expectedManifestHash: f.prepared.sha256,
+      expectedBranchRef: job.target.branchRef,
+      expectedBaseSha: job.target.baseSha,
+      expectedHeadSha: job.target.headSha,
+      expectedTestedTree: job.target.testedTree,
+    });
+  },
+);
+const decodeIntegrationSourceRef = Schema.decodeUnknownEffect(
+  ProjectTeamIntegrationSourceRef,
+  strict,
+);
+const integrationSelectionTask = Effect.fn("integrationTest.selectionTask")(function* (
+  f: Effect.Success<ReturnType<typeof makeConsumedReviewFixture>>,
+) {
+  const task = ProjectWorkTaskId.make("integration-selection");
+  const criterion = ProjectWorkCriterionId.make("integration-selection-criterion");
+  yield* f.repository.execute({
+    type: "project-work.task.create",
+    projectId,
+    taskId: task,
+    commandId: ProjectTeamReviewFindingIntent.fields.commandId.make("integration-selection-create"),
+    title: "Combine the selected reviewed commits",
+    createdAt: at,
+  });
+  const state = yield* f.state();
+  const selected = state.tasks.find((row) => row.taskId === task);
+  if (!selected) return yield* Effect.die("Missing integration task");
+  const human = {
+    actor: { kind: "human" as const, id: "maintainer" },
+    source: { kind: "web" as const, id: "integration-selection-test" },
+    recordedAt: at,
+  };
+  yield* f.repository.execute(
+    decodeCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "integration-selection-spec",
+      expectedRevision: state.revision,
+      attribution: human,
+      committedAt: at,
+      records: [],
+      guided: {
+        intent: {
+          type: "project-team.specification.propose",
+          projectId,
+          taskId: task,
+          commandId: "integration-selection-spec",
+          expectedRevision: state.revision,
+          expectedTaskRevision: selected.revision,
+          expectedSpecRevision: 0,
+          specification: {
+            objective: "Combine approved inputs",
+            scopeIn: "Selected exact commits",
+            scopeOut: "Other sources",
+            criterionIds: [criterion],
+            revision: 1,
+            protected: false,
+          },
+          criterionSnapshots: [
+            {
+              criterionId: criterion,
+              taskId: task,
+              description: "Verify the combined commits",
+              required: true,
+              status: "unsatisfied",
+              satisfiedByEvidenceIds: [],
+              revision: 0,
+              updatedAt: at,
+            },
+          ],
+        },
+      },
+    }),
+  );
+  return { task, human };
+});
+it.effect(
+  "integration source selection freezes actual accepted review and raw verification facts",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const ref = yield* completeIntegrationSourceReview(f);
+        const integration = yield* integrationSelectionTask(f);
+        const sources = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+        const request = { projectId, integrationTaskId: integration.task, refs: [ref] };
+        expect((yield* sources.compileInTransaction(request).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        const selected = yield* f.sql.withTransaction(sources.compileInTransaction(request));
+        expect(selected.sources).toHaveLength(1);
+        expect(selected.sources[0]).toMatchObject({
+          taskId: f.selection.taskId,
+          branchRef: f.prepared.manifest.target.branchRef,
+          headSha: f.prepared.manifest.target.headSha,
+          manifestHash: f.prepared.sha256,
+          reviewProposalSha256: ref.expectedReviewProposalSha256,
+          joinedReceiptId: f.joined.receiptId,
+        });
+        expect(
+          (yield* f.state()).tasks.find((task) => task.taskId === f.selection.taskId)?.state,
+        ).not.toBe("completed");
+        expect(yield* f.sql.withTransaction(sources.compileInTransaction(request))).toEqual(
+          selected,
+        );
+        const mutable = { ...request, refs: [{ ...ref }] };
+        const originalRequest = sources.compileInTransaction(mutable);
+        mutable.refs[0]!.expectedHeadSha = "0".repeat(40);
+        expect(yield* f.sql.withTransaction(originalRequest)).toEqual(selected);
+        const page = yield* f.sql.withTransaction(
+          sources.candidatesInTransaction({
+            projectId,
+            integrationTaskId: integration.task,
+            offset: 0,
+            limit: 1,
+          }),
+        );
+        expect(page.candidates.map((candidate) => candidate.ref)).toEqual([ref]);
+        expect(page.nextOffset).toBe(1);
+        yield* f.sql.withTransaction(
+          sources.assertCurrentInTransaction({
+            projectId,
+            integrationTaskId: integration.task,
+            sources: selected,
+          }),
+        );
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              sources.compileInTransaction({
+                ...request,
+                refs: [{ ...ref, expectedHeadSha: "0".repeat(40) }],
+              }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              sources.compileInTransaction({ ...request, integrationTaskId: ref.taskId }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+it.effect(
+  "integration source selection preserves explicit order across two independently reviewed tasks",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const first = yield* makeConsumedReviewFixture({ verificationOutcome: "success" });
+        const firstRef = yield* completeIntegrationSourceReview(first);
+        const secondBase = yield* makeVerificationFixture("implementer", "-second");
+        const secondRoot = yield* establishControlledReviewRoot(secondBase, "-second");
+        const secondFinding = yield* makeFindingFixture(true, "success", secondRoot, "-second");
+        const secondProposal = yield* makeProposalFixture(
+          true,
+          "success",
+          secondFinding,
+          "-second",
+        );
+        const second = yield* makeConsumedReviewFixture({ suffix: "-second" }, secondProposal);
+        const secondRef = yield* completeIntegrationSourceReview(second);
+        const integration = yield* integrationSelectionTask(first);
+        const sources = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+        const selection = yield* first.sql.withTransaction(
+          sources.compileInTransaction({
+            projectId,
+            integrationTaskId: integration.task,
+            refs: [secondRef, firstRef],
+          }),
+        );
+        expect(selection.sources.map((source) => source.taskId)).toEqual([
+          secondRef.taskId,
+          firstRef.taskId,
+        ]);
+        expect(selection.sources.map((source) => source.headSha)).toEqual([
+          secondRef.expectedHeadSha,
+          firstRef.expectedHeadSha,
+        ]);
+        const before = yield* first.state();
+        yield* first.sql.withTransaction(
+          sources.assertCurrentInTransaction({
+            projectId,
+            integrationTaskId: integration.task,
+            sources: selection,
+          }),
+        );
+        expect(yield* first.state()).toEqual(before);
+      }),
+    ),
+);
+it.effect(
+  "integration source qualification rejects a reviewed transitive source after its original input grant is revoked",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const original = yield* makeConsumedReviewFixture({
+          parentAssessment: "empty",
+          verificationOutcome: "success",
+        });
+        const originalRef = yield* completeIntegrationSourceReview(original);
+        const owner = yield* integrationSelectionTask(original);
+        const sources = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+        const originalSelection = yield* original.sql.withTransaction(
+          sources.compileInTransaction({
+            projectId,
+            integrationTaskId: owner.task,
+            refs: [originalRef],
+          }),
+        );
+        const firstBase = yield* makeVerificationFixture(
+          "integrator",
+          "-nested-a",
+          originalSelection,
+        );
+        const wrongRole = yield* makeVerificationAssignmentFixture(
+          "implementer",
+          "-wrong-nested",
+          originalSelection,
+        );
+        const beforeWrongRole = yield* original.state();
+        const wrongRoleResult = yield* wrongRole.journal
+          .reserve(wrongRole.request)
+          .pipe(Effect.result);
+        expect(wrongRoleResult._tag).toBe("Failure");
+        if (wrongRoleResult._tag === "Failure")
+          expect(wrongRoleResult.failure).toMatchObject({
+            _tag: "ProjectTeamDispatchJournalError",
+            reason:
+              "Integration dispatch requires its exact approved source plan and original integrator",
+          });
+        expect(yield* original.state()).toEqual(beforeWrongRole);
+        const firstRoot = yield* establishControlledReviewRoot(firstBase, "-nested-a");
+        const rootHistory = yield* original.sql.withTransaction(
+          firstBase.journal.readHistoricalInTransaction("review-root-dispatch-nested-a"),
+        );
+        expect(rootHistory.snapshot.intent.integration).toBeUndefined();
+        expect(rootHistory.snapshot.intent.limits.writable).toBe(false);
+        const rootRequest = rootHistory.snapshot.intent.request;
+        const rootTransition = rootRequest.claim.transition;
+        if (rootTransition?.kind !== "claim")
+          return yield* Effect.die("Missing original coordinator claim");
+        const beforeWritableCoordinator = yield* original.state();
+        const writableCoordinator = yield* firstBase.journal
+          .reserve({
+            ...rootRequest,
+            dispatchId: "writable-coordinator-dispatch",
+            git: { ...rootRequest.git, effectId: "writable-coordinator-dispatch" },
+            claim: {
+              ...rootRequest.claim,
+              transition: {
+                ...rootTransition,
+                binding: {
+                  ...rootTransition.binding,
+                  configuration: {
+                    ...rootTransition.binding.configuration,
+                    toolIds: ["pi.read", "pi.bash"],
+                  },
+                },
+              },
+            },
+          })
+          .pipe(Effect.result);
+        expect(writableCoordinator._tag).toBe("Failure");
+        if (writableCoordinator._tag === "Failure")
+          expect(writableCoordinator.failure).toMatchObject({
+            _tag: "ProjectTeamDispatchJournalError",
+            reason:
+              "Integration dispatch requires its exact approved source plan and original integrator",
+          });
+        expect(yield* original.state()).toEqual(beforeWritableCoordinator);
+        const verificationGate = yield* makeProjectWorkVerificationGate({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+        });
+        expect(
+          yield* original.sql
+            .withTransaction(
+              verificationGate.assertCurrent(
+                yield* original.state(),
+                firstRoot.prepared,
+                firstRoot.selection,
+              ),
+            )
+            .pipe(Effect.result),
+        ).toMatchObject({ _tag: "Success" });
+        const firstFinding = yield* makeFindingFixture(true, "success", firstRoot, "-nested-a");
+        const firstProposal = yield* makeProposalFixture(
+          true,
+          "success",
+          firstFinding,
+          "-nested-a",
+        );
+        const first = yield* makeConsumedReviewFixture(
+          { suffix: "-nested-a", parentAssessment: "empty" },
+          firstProposal,
+        );
+        const firstRef = yield* completeIntegrationSourceReview(first);
+        const firstSelection = yield* original.sql.withTransaction(
+          sources.compileInTransaction({
+            projectId,
+            integrationTaskId: owner.task,
+            refs: [firstRef],
+          }),
+        );
+        const secondBase = yield* makeVerificationFixture(
+          "integrator",
+          "-nested-b",
+          firstSelection,
+        );
+        const secondRoot = yield* establishControlledReviewRoot(secondBase, "-nested-b");
+        const secondFinding = yield* makeFindingFixture(true, "success", secondRoot, "-nested-b");
+        const secondProposal = yield* makeProposalFixture(
+          true,
+          "success",
+          secondFinding,
+          "-nested-b",
+        );
+        const second = yield* makeConsumedReviewFixture(
+          { suffix: "-nested-b", parentAssessment: "empty" },
+          secondProposal,
+        );
+        const secondRef = yield* completeIntegrationSourceReview(second);
+        const request = { projectId, integrationTaskId: owner.task, refs: [secondRef] };
+        const selected = yield* original.sql.withTransaction(sources.compileInTransaction(request));
+        yield* original.sql.withTransaction(
+          sources.assertCurrentInTransaction({
+            projectId,
+            integrationTaskId: owner.task,
+            sources: selected,
+          }),
+        );
+        const before = yield* original.state();
+        const gate = before.foundationRecords?.find(
+          (record) =>
+            record.kind === "gate" && record.verificationJobId === originalRef.verificationJobId,
+        );
+        if (gate?.kind !== "gate") return yield* Effect.die("Missing original nested input grant");
+        yield* original.repository.execute(
+          decodeCommit({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "revoke-nested-original-input",
+            expectedRevision: before.revision,
+            attribution: owner.human,
+            committedAt: at,
+            records: [{ ...gate, status: "invalidated", revision: gate.revision + 1 }],
+          }),
+        );
+        const page = yield* original.sql.withTransaction(
+          sources.candidatesInTransaction({
+            projectId,
+            integrationTaskId: owner.task,
+            offset: 0,
+            limit: 64,
+          }),
+        );
+        expect(page.candidates.some((candidate) => candidate.ref.taskId === secondRef.taskId)).toBe(
+          false,
+        );
+        expect(
+          (yield* original.sql
+            .withTransaction(sources.compileInTransaction(request))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* original.sql
+            .withTransaction(
+              sources.assertCurrentInTransaction({
+                projectId,
+                integrationTaskId: owner.task,
+                sources: selected,
+              }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const after = yield* original.state();
+        for (const ref of [originalRef, firstRef, secondRef]) {
+          expect(after.tasks.find((task) => task.taskId === ref.taskId)?.state).not.toBe(
+            "completed",
+          );
+          const plan = after.foundationRecords?.find(
+            (record) => record.kind === "plan-revision" && record.taskId === ref.taskId,
+          );
+          expect(plan).toEqual(
+            before.foundationRecords?.find((record) => record.recordId === plan?.recordId),
+          );
+        }
+      }),
+    ),
+);
+it.effect("source grant revocation retains the integration list and invalidates its approval", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({ verificationOutcome: "success" });
+      const ref = yield* completeIntegrationSourceReview(f);
+      const integration = yield* integrationSelectionTask(f);
+      const sources = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+      const selection = yield* f.sql.withTransaction(
+        sources.compileInTransaction({
+          projectId,
+          integrationTaskId: integration.task,
+          refs: [ref],
+        }),
+      );
+      let state = yield* f.state();
+      const task = state.tasks.find((task) => task.taskId === integration.task)!;
+      const intent = {
+        type: "project-team.plan.propose",
+        projectId,
+        taskId: integration.task,
+        commandId: "integration-list-plan",
+        expectedRevision: state.revision,
+        expectedTaskRevision: task.revision,
+        specRevision: task.specRevision,
+        content: "Combine and test exactly the approved sources",
+        dependencyTaskIds: [],
+        integrationSourceRefs: [ref],
+      };
+      yield* f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: intent.commandId,
+          expectedRevision: state.revision,
+          attribution: integration.human,
+          records: [],
+          committedAt: at,
+          guided: { intent, integrationSources: selection },
+        }),
+      );
+      state = yield* f.state();
+      const gate = state.foundationRecords?.find(
+        (record) =>
+          record.kind === "gate" && record.taskId === integration.task && record.gate === "plan",
+      );
+      if (gate?.kind !== "gate") return yield* Effect.die("Missing integration plan gate");
+      yield* f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "integration-list-approve",
+          expectedRevision: state.revision,
+          attribution: integration.human,
+          committedAt: at,
+          records: [
+            {
+              ...gate,
+              status: "approved",
+              revision: gate.revision + 1,
+              attribution: integration.human,
+            },
+          ],
+        }),
+      );
+      state = yield* f.state();
+      const sourceGate = state.foundationRecords?.find(
+        (record) => record.kind === "gate" && record.verificationJobId === ref.verificationJobId,
+      );
+      if (sourceGate?.kind !== "gate")
+        return yield* Effect.die("Missing original source verification approval");
+      yield* f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "invalidate-selected-source",
+          expectedRevision: state.revision,
+          attribution: integration.human,
+          committedAt: at,
+          records: [{ ...sourceGate, status: "invalidated", revision: sourceGate.revision + 1 }],
+        }),
+      );
+      const invalidated = yield* f.state();
+      expect(
+        invalidated.foundationRecords?.find(
+          (record) => record.kind === "gate" && record.recordId === gate.recordId,
+        )?.status,
+      ).toBe("invalidated");
+      const plan = invalidated.foundationRecords?.find(
+        (record) => record.kind === "plan-revision" && record.taskId === integration.task,
+      );
+      expect(plan?.kind === "plan-revision" ? plan.integrationSources : undefined).toEqual(
+        selection,
+      );
+      expect(
+        (yield* f.sql
+          .withTransaction(
+            sources.assertCurrentInTransaction({
+              projectId,
+              integrationTaskId: integration.task,
+              sources: selection,
+            }),
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }),
+  ),
+);
+it.effect(
+  "integration candidate pages advance past a pending independent review without treating it as accepted",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({ verificationOutcome: "success" });
+        const proof = yield* f.prepare();
+        if (proof?.status !== "completed")
+          return yield* Effect.die("Missing pending completed judgment");
+        const integration = yield* integrationSelectionTask(f);
+        const service = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+        const page = yield* f.sql.withTransaction(
+          service.candidatesInTransaction({
+            projectId,
+            integrationTaskId: integration.task,
+            offset: 0,
+            limit: 1,
+          }),
+        );
+        expect(page).toEqual({ candidates: [], nextOffset: 1, hasMore: false });
+        expect(
+          (yield* f.state()).tasks.find((task) => task.taskId === f.running.taskId)?.state,
+        ).not.toBe("completed");
+      }),
+    ),
+);
+for (const corruption of ["raw output", "accepted command", "failed result"] as const)
+  it.effect(`integration sources reject ${corruption} instead of inventing review proof`, () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          verificationOutcome: corruption === "failed result" ? "failed" : "success",
+        });
+        const ref = yield* completeIntegrationSourceReview(f);
+        const integration = yield* integrationSelectionTask(f);
+        if (corruption === "raw output") {
+          yield* f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+          yield* f.sql`UPDATE project_work_artifacts SET raw_bytes=${new Uint8Array([255])},byte_count=1 WHERE task_id=${ref.taskId}`;
+        } else if (corruption === "accepted command") {
+          yield* f.sql`UPDATE project_work_command_receipts SET actor_id='unrelated' WHERE command_id=${projectTeamDerivedRecordId(f.joined.receiptId, "joined-domain")}`;
+        }
+        const service = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+        const before = yield* f.state();
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              service.compileInTransaction({
+                projectId,
+                integrationTaskId: integration.task,
+                refs: [ref],
+              }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* f.state()).toEqual(before);
+      }),
+    ),
+  );
+it.effect("an integration selection cannot escape its failed owning COMMIT", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({ verificationOutcome: "success" });
+      const ref = yield* completeIntegrationSourceReview(f);
+      const integration = yield* integrationSelectionTask(f);
+      const service = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+      yield* f.sql`CREATE TABLE controlled_sources_parent(id TEXT PRIMARY KEY)`;
+      yield* f.sql`CREATE TABLE controlled_sources_child(id TEXT REFERENCES controlled_sources_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      let escaped = false;
+      const effect = f.sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* f.sql`INSERT INTO controlled_sources_child VALUES ('missing')`;
+            return yield* service.compileInTransaction({
+              projectId,
+              integrationTaskId: integration.task,
+              refs: [ref],
+            });
+          }),
+        )
+        .pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              escaped = true;
+            }),
+          ),
+          Effect.exit,
+        );
+      expect((yield* effect)._tag).toBe("Failure");
+      expect(escaped).toBe(false);
+      // Dispose this test's failed physical transaction; production does not roll back another owner.
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const connection = yield* f.sql.reserve;
+          yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+        }),
+      );
+      const selected = yield* f.sql.withTransaction(
+        service.compileInTransaction({
+          projectId,
+          integrationTaskId: integration.task,
+          refs: [ref],
+        }),
+      );
+      expect(selected.sources).toHaveLength(1);
+    }),
+  ),
+);
+it.effect(
+  "integration verification preparation and approval consume the exact retained combination coverage",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const source = yield* makeConsumedReviewFixture({ verificationOutcome: "success" });
+        const ref = yield* completeIntegrationSourceReview(source);
+        const owner = yield* integrationSelectionTask(source);
+        const sources = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+        const selected = yield* source.sql.withTransaction(
+          sources.compileInTransaction({ projectId, integrationTaskId: owner.task, refs: [ref] }),
+        );
+        // Actual approved plan/dispatch/stage/preparation and Gate; only the physical capture is controlled.
+        const integration = yield* makeVerificationFixture("integrator", "-combined", selected);
+        const job = integration.prepared.manifest;
+        expect(job.integration).toBe(true);
+        expect(job.integrationCoverage?.selectionSha256).toBe(digest(canonical(selected)));
+        const retained = yield* integration.sql.withTransaction(
+          integration.journal.readHistoricalInTransaction(integration.snapshot.fence.dispatchId),
+        );
+        const stage = retained.receipts.find((receipt) => receipt.stage === "workspace-ready");
+        if (!stage) return yield* Effect.die("Missing retained integration Workspace stage");
+        const envelope = yield* decodeIntegrationWorkspace(stage.evidence);
+        if (!envelope.integration)
+          return yield* Effect.die("Missing retained integration combination");
+        expect(job.integrationCoverage?.combinationSha256).toBe(
+          digest(canonical(envelope.integration)),
+        );
+        const gate = yield* makeProjectWorkVerificationGate({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+        });
+        yield* integration.sql.withTransaction(
+          gate.assertCurrent(integration.state, integration.prepared, integration.selection),
+        );
+        const { integrationCoverage: _coverage, ...missing } = job;
+        expect(
+          (yield* integration.sql
+            .withTransaction(
+              gate.assertCurrent(
+                integration.state,
+                { manifest: missing, sha256: digest(canonical(missing)) },
+                integration.selection,
+              ),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const wrong = {
+          ...job,
+          integrationCoverage: {
+            version: 1 as const,
+            selectionSha256: "0".repeat(64),
+            combinationSha256: job.integrationCoverage!.combinationSha256,
+          },
+        };
+        expect(
+          (yield* integration.sql
+            .withTransaction(
+              gate.assertCurrent(
+                integration.state,
+                { manifest: wrong, sha256: digest(canonical(wrong)) },
+                integration.selection,
+              ),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* integration.jobs.readPrepared(job.jobId)).toEqual(integration.prepared);
+      }),
+    ),
+);
+it.effect(
+  "actual integration Workspace holds controlled physical loans through the first Journal stage commit",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const source = yield* makeConsumedReviewFixture({ verificationOutcome: "success" });
+        const ref = yield* completeIntegrationSourceReview(source);
+        const selectionTask = yield* integrationSelectionTask(source);
+        const sources = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+        const selection = yield* source.sql.withTransaction(
+          sources.compileInTransaction({
+            projectId,
+            integrationTaskId: selectionTask.task,
+            refs: [ref],
+          }),
+        );
+        const f = yield* makeVerificationAssignmentFixture("integrator", "-loan", selection);
+        let current = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+        const constructors = new WeakMap<
+          ManagedGit.ManagedGitExecution,
+          Parameters<typeof ManagedGit.make>[0]
+        >();
+        const originalMake = ManagedGit.make;
+        let loans = 0,
+          permit = false,
+          merges = 0;
+        const make = vi
+          .spyOn(ManagedGit, "make")
+          .mockImplementation((input) =>
+            originalMake(input).pipe(
+              Effect.tap((context) => Effect.sync(() => constructors.set(context, input))),
+            ),
+          );
+        const target = (context: ManagedGit.ManagedGitExecution) => {
+          const options = constructors.get(context);
+          if (!options?.priorReceipt) throw Error("Missing controlled original ownership");
+          const selected = selection.sources.find(
+            (selected) => selected.bindingId === options.assignment.runId,
+          );
+          return {
+            options,
+            target: {
+              receipt: options.priorReceipt,
+              cwd: options.assignment.worktreePath,
+              baseSha: options.assignment.baseOid,
+              headSha: selected?.headSha ?? "9".repeat(40),
+              testedCommit: selected?.headSha ?? "9".repeat(40),
+              testedTree: selected?.testedTree ?? "8".repeat(40),
+            },
+          };
+        };
+        const controlledRead: typeof ManagedGit.withManagedVerificationTarget = (context, use) =>
+          Effect.gen(function* () {
+            const captured = target(context);
+            yield* captured.options.revalidate;
+            loans++;
+            return yield* use(captured.target).pipe(
+              Effect.tap(() => captured.options.revalidate),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  loans--;
+                }),
+              ),
+            );
+          });
+        const read = vi
+          .spyOn(ManagedGit, "withManagedVerificationTarget")
+          .mockImplementation(controlledRead);
+        const controlledCombine: typeof ManagedGit.withManagedIntegrationTarget = (
+          context,
+          input,
+          use,
+        ) =>
+          Effect.gen(function* () {
+            expect(permit).toBe(true);
+            expect(input.sourceHeads).toEqual(selection.sources.map((source) => source.headSha));
+            merges++;
+            return yield* controlledRead(context, use);
+          });
+        const combine = vi
+          .spyOn(ManagedGit, "withManagedIntegrationTarget")
+          .mockImplementation(controlledCombine);
+        const controlledAncestry: typeof ManagedGit.withManagedVerificationAncestry = (
+          context,
+          _input,
+          use,
+        ) => controlledRead(context, use);
+        const ancestry = vi
+          .spyOn(ManagedGit, "withManagedVerificationAncestry")
+          .mockImplementation(controlledAncestry);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            make.mockRestore();
+            read.mockRestore();
+            combine.mockRestore();
+            ancestry.mockRestore();
+          }),
+        );
+        const workflow = Layer.mock(GitWorkflowService, {
+          withRepositoryPermit: (_operation, _cwd, effect) =>
+            Effect.gen(function* () {
+              expect(permit).toBe(false);
+              permit = true;
+              return yield* effect.pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    permit = false;
+                  }),
+                ),
+              );
+            }),
+          createWorktree: (input, options) =>
+            Effect.gen(function* () {
+              if (!options?.managed) return yield* Effect.die("Missing managed context");
+              const captured = constructors.get(options.managed);
+              if (!captured) return yield* Effect.die("Missing real branded controlled context");
+              const receipt = captured.priorReceipt ?? {
+                assignment: captured.assignment,
+                primary: { path: captured.assignment.primaryRoot, dev: "1", ino: "1" },
+                worktree: { path: captured.assignment.worktreePath, dev: "1", ino: "2" },
+                common: { path: captured.assignment.commonGitDirectory, dev: "1", ino: "3" },
+                gitDirectory: {
+                  path: captured.assignment.commonGitDirectory + "/worktrees/integration-loan",
+                  dev: "1",
+                  ino: "4",
+                },
+                initialHeadOid: captured.assignment.baseOid,
+                pointerAndConfigurationHash: "b".repeat(64),
+              };
+              yield* captured.persistWorkspace(receipt);
+              return {
+                worktree: {
+                  path: captured.assignment.worktreePath,
+                  refName: captured.assignment.branchRef.slice(11),
+                },
+              };
+            }),
+        });
+        const workspace = yield* makeProjectTeamWorkspace({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          launchPolicy: { memoryBytes: 536870912, runtimeSeconds: 2 },
+          protectedRoots: [],
+          assertCurrent: (snapshot) =>
+            Effect.gen(function* () {
+              const observed = yield* f.journal.inspect(snapshot.fence.dispatchId);
+              expect(observed.fence).toEqual(snapshot.fence);
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new ProjectTeamDispatchJournalError({
+                    reason: "Controlled current Workspace dispatch unavailable",
+                  }),
+              ),
+            ),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              workflow,
+              Layer.mock(ProjectTeamPiRuntime, {
+                withInstance: () => Effect.die("No runtime entry"),
+              }),
+              Layer.mock(ProjectionSnapshotQuery, {}),
+            ),
+          ),
+          Effect.provideService(HostProcessPlatform, "linux"),
+          Effect.provideService(HostProcessUserId, 0),
+        );
+        const operationScope = yield* Scope.Scope;
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: (receipt, snapshot) =>
+            Effect.gen(function* () {
+              expect(loans).toBe(2);
+              expect(permit).toBe(true);
+              const evidence = yield* decodeIntegrationWorkspace(receipt.evidence);
+              yield* workspace.verifyWorkspace(snapshot, evidence.workspace);
+              if (!evidence.integration) return yield* Effect.die("Missing integration receipt");
+              yield* workspace.verifyIntegration(snapshot, evidence.integration);
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new ProjectTeamDispatchJournalError({
+                    reason: "Controlled Workspace verification failed",
+                  }),
+              ),
+              Effect.provideService(Scope.Scope, operationScope),
+            ),
+        });
+        const ready = yield* workspace.withWorkspace(current, (evidence) =>
+          Effect.gen(function* () {
+            expect(loans).toBe(2);
+            expect(permit).toBe(true);
+            current = yield* journal.advanceStage(current.fence, {
+              receiptId: "actual-integration-stage",
+              stage: "workspace-ready",
+              evidence,
+            });
+            return evidence;
+          }),
+        );
+        expect(ready.integration?.sourceHeads).toEqual([ref.expectedHeadSha]);
+        expect(current.fence.stage).toBe("workspace-ready");
+        expect(loans).toBe(0);
+        expect(permit).toBe(false);
+        expect(merges).toBe(1);
+        const retained = yield* f.sql.withTransaction(
+          journal.readHistoricalInTransaction(current.fence.dispatchId),
+        );
+        expect(
+          retained.receipts.find((receipt) => receipt.stage === "workspace-ready")?.evidence,
+        ).toEqual(ready);
+        yield* workspace.withWorkspace(current, Effect.succeed);
+        expect(merges).toBe(1);
+      }),
+    ),
+);
+const decodeIntegrationWorkspace = Schema.decodeUnknownEffect(ProjectTeamWorkspaceEvidence, strict);
 it.effect("current review target denies assessment completion without a concrete target loan", () =>
   scoped(
     Effect.gen(function* () {

@@ -7,13 +7,18 @@ import type {
   makeProjectTeamDispatchJournal,
   ProjectTeamDispatchFence,
   ProjectTeamWorkspaceReceipt,
+  ProjectTeamIntegrationCombinationReceipt,
 } from "./ProjectTeamDispatchJournal.ts";
 
 type Journal = Effect.Success<ReturnType<typeof makeProjectTeamDispatchJournal>>;
 export type ProjectTeamDispatchSnapshot = Effect.Success<ReturnType<Journal["inspect"]>>;
 type Workspace = typeof ProjectTeamWorkspaceReceipt.Type;
+export interface ProjectTeamDispatchWorkspace {
+  readonly workspace: Workspace;
+  readonly integration?: typeof ProjectTeamIntegrationCombinationReceipt.Type;
+}
 
-export type ProjectTeamDispatchReceipt<Setup, Session, Assignment> =
+export type ProjectTeamDispatchReceipt<Setup, Session, Assignment> = (
   | { readonly stage: "workspace-ready"; readonly workspace: Workspace }
   | { readonly stage: "setup-complete"; readonly workspace: Workspace; readonly setup: Setup }
   | {
@@ -28,7 +33,8 @@ export type ProjectTeamDispatchReceipt<Setup, Session, Assignment> =
       readonly setup: Setup;
       readonly session: Session;
       readonly assignment: Assignment;
-    };
+    }
+) & { readonly integration?: typeof ProjectTeamIntegrationCombinationReceipt.Type };
 
 export type ProjectTeamDispatchOutcome =
   | { readonly _tag: "Busy" }
@@ -82,10 +88,11 @@ export interface ProjectTeamDispatchPorts<
     snapshot: ProjectTeamDispatchSnapshot,
     receipt: ProjectTeamDispatchReceipt<Setup, Session, Assignment>,
   ) => Effect.Effect<ProjectTeamDispatchSnapshot, Error, Services>;
-  readonly workspace: (
+  readonly withWorkspace: <A, E, R>(
     owner: Owner,
     snapshot: ProjectTeamDispatchSnapshot,
-  ) => Effect.Effect<Workspace, Error, Services>;
+    use: (evidence: ProjectTeamDispatchWorkspace) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, Error | E, Services | R>;
   readonly setup: (
     owner: Owner,
     snapshot: ProjectTeamDispatchSnapshot,
@@ -195,16 +202,20 @@ export function makeProjectTeamDispatch<
             }
             if (snapshot.fence.stage === "reserved") {
               yield* current();
-              const workspace = yield* ports.workspace(owner, snapshot);
-              yield* current();
-              receipt = { stage: "workspace-ready", workspace };
-              yield* append(receipt);
+              receipt = yield* ports.withWorkspace(owner, snapshot, (workspace) =>
+                Effect.gen(function* () {
+                  yield* current();
+                  const ready = { stage: "workspace-ready" as const, ...workspace };
+                  yield* append(ready);
+                  return ready;
+                }),
+              );
             }
             if (receipt?.stage === "workspace-ready") {
               yield* current();
               const setup = yield* ports.setup(owner, snapshot, receipt.workspace);
               yield* current();
-              receipt = { stage: "setup-complete", workspace: receipt.workspace, setup };
+              receipt = { ...receipt, stage: "setup-complete", setup };
               yield* append(receipt);
             }
             if (receipt?.stage === "setup-complete") {

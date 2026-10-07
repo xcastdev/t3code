@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import { canonicalProjectWorkPayload, GitCommandError } from "@t3tools/contracts";
 import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
 import * as Clock from "effect/Clock";
@@ -25,8 +26,12 @@ import {
   makeProjectTeamDispatchJournal,
   ProjectTeamDispatchJournalError,
   ProjectTeamWorkspaceReceipt,
+  ProjectTeamWorkspaceEvidence,
+  ProjectTeamIntegrationCombinationReceipt,
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
+import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 
 interface Options {
@@ -50,6 +55,11 @@ const jsonReceipt = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectTeamWorkspaceReceipt),
   strict,
 );
+const decodeEvidence = Schema.decodeUnknownEffect(ProjectTeamWorkspaceEvidence, {
+  onExcessProperty: "error",
+});
+const digest = (value: unknown) =>
+  NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
 const encodeReceipt = Schema.encodeSync(Schema.fromJsonString(ProjectTeamWorkspaceReceipt));
 const text = Schema.String.check(Schema.isMaxLength(262144));
 const rowSchema = Schema.Struct({
@@ -100,6 +110,10 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
     assertCurrent: supplied.assertCurrent,
   });
   const sql = yield* SqlClient.SqlClient;
+  const repository = yield* ProjectWorkRepository;
+  const sources = yield* makeProjectTeamIntegrationSources({
+    environmentId: options.environmentId,
+  });
   const workflow = yield* GitWorkflowService;
   const pi = yield* ProjectTeamPiRuntime;
   const dispatch = yield* makeProjectTeamDispatchJournal(options);
@@ -225,6 +239,13 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
     yield* assertCurrent(snapshot);
     return retained;
   });
+  const activeWorkspaces = new Map<
+    string,
+    {
+      readonly snapshot: ProjectTeamDispatchSnapshot;
+      readonly evidence: typeof ProjectTeamWorkspaceEvidence.Type;
+    }
+  >();
   const verifyWorkspace = Effect.fn("ProjectTeamWorkspace.verifyWorkspace")(function* (
     snapshot: ProjectTeamDispatchSnapshot,
     receipt: ManagedGit.ManagedWorkspaceReceipt,
@@ -233,7 +254,327 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
     const retained = yield* readWorkspace(snapshot);
     if (!retained || !same(retained, receipt))
       return yield* denied("Workspace evidence does not match its original retained receipt");
+    const active = activeWorkspaces.get(snapshot.fence.dispatchId);
+    if (active && same(active.snapshot, snapshot) && same(active.evidence.workspace, receipt))
+      return;
     yield* physicalWorkspace(snapshot, retained);
+  });
+  const assertSources = Effect.fn("ProjectTeamWorkspace.assertSources")(function* (
+    snapshot: ProjectTeamDispatchSnapshot,
+  ) {
+    const integration = snapshot.intent.integration;
+    if (integration === undefined) return;
+    const claim = snapshot.intent.compiledClaim.transition;
+    if (claim?.kind !== "claim") return yield* denied("Integration binding is missing");
+    yield* sql
+      .withTransaction(
+        sources.assertCurrentInTransaction({
+          projectId: claim.binding.projectId,
+          integrationTaskId: claim.binding.taskId,
+          sources: integration.selection,
+        }),
+      )
+      .pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.provideService(ProjectWorkRepository, repository),
+      );
+  });
+  const retainedEnvelope = Effect.fn("ProjectTeamWorkspace.retainedEnvelope")(function* (
+    snapshot: ProjectTeamDispatchSnapshot,
+  ) {
+    const history = yield* sql
+      .withTransaction(dispatch.readHistoricalInTransaction(snapshot.fence.dispatchId))
+      .pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.provideService(ProjectWorkRepository, repository),
+      );
+    const receipts = history.receipts.filter((receipt) => receipt.stage === "workspace-ready");
+    if (receipts.length === 0) return null;
+    if (receipts.length !== 1) return yield* denied("Integration workspace stage is ambiguous");
+    return yield* decodeEvidence(receipts[0]?.evidence);
+  });
+  const sourceContexts = Effect.fn("ProjectTeamWorkspace.sourceContexts")(function* (
+    snapshot: ProjectTeamDispatchSnapshot,
+    revalidate: Effect.Effect<
+      void,
+      | Effect.Error<ReturnType<typeof assertCurrent>>
+      | Effect.Error<ReturnType<typeof assertSources>>
+      | Effect.Error<ReturnType<typeof retainedEnvelope>>,
+      | Effect.Services<ReturnType<typeof assertCurrent>>
+      | Effect.Services<ReturnType<typeof assertSources>>
+    >,
+  ) {
+    const selected = snapshot.intent.integration;
+    if (!selected) return [];
+    yield* assertSources(snapshot);
+    return yield* Effect.forEach(selected.selection.sources, (source) =>
+      Effect.gen(function* () {
+        const history = yield* sql
+          .withTransaction(dispatch.readHistoricalInTransaction(source.dispatchId))
+          .pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository),
+          );
+        const original = yield* readWorkspace(history.snapshot);
+        if (
+          !original ||
+          digest(original) !== source.workspaceReceiptSha256 ||
+          original.assignment.primaryRoot !== snapshot.intent.request.git.primaryRoot ||
+          original.common.path !== snapshot.intent.request.git.commonGitDirectory
+        )
+          return yield* denied("Selected source physical repository or ownership changed");
+        const context = yield* ManagedGit.make({
+          assignment: history.snapshot.intent.request.git,
+          priorReceipt: original,
+          revalidate: revalidate.pipe(
+            Effect.scoped,
+            Effect.provide(services),
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.mapError(
+              (cause) =>
+                new GitCommandError({
+                  operation: "integration.source",
+                  command: "/usr/bin/git",
+                  cwd: original.assignment.worktreePath,
+                  detail: "Selected source authority changed",
+                  cause,
+                }),
+            ),
+          ),
+          persistWorkspace: () =>
+            Effect.fail(
+              new GitCommandError({
+                operation: "integration.source",
+                command: "/usr/bin/git",
+                cwd: original.assignment.worktreePath,
+                detail: "Source capture cannot replace ownership",
+              }),
+            ),
+        });
+        return { context, source };
+      }),
+    );
+  });
+  const withSources = <A, E, R>(
+    contexts: Effect.Success<ReturnType<typeof sourceContexts>>,
+    use: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E | GitCommandError, R> => {
+    const next = contexts[0];
+    if (!next) return use;
+    return ManagedGit.withManagedVerificationTarget(next.context, (target) =>
+      Effect.gen(function* () {
+        if (
+          target.baseSha !== next.source.baseSha ||
+          target.headSha !== next.source.headSha ||
+          target.testedTree !== next.source.testedTree ||
+          digest(target.receipt) !== next.source.workspaceReceiptSha256
+        )
+          return yield* new GitCommandError({
+            operation: "integration.source",
+            command: "/usr/bin/git",
+            cwd: target.cwd,
+            detail: "Selected reviewed source commit changed",
+          });
+        return yield* withSources(contexts.slice(1), use);
+      }),
+    );
+  };
+  const withWorkspace = <A, E, R>(
+    supplied: ProjectTeamDispatchSnapshot,
+    use: (evidence: typeof ProjectTeamWorkspaceEvidence.Type) => Effect.Effect<A, E, R>,
+  ) => {
+    const original = captureSnapshot(supplied);
+    return provide(
+      Effect.gen(function* () {
+        yield* assertCurrent(original);
+        const prior = yield* readWorkspace(original);
+        const retained = yield* retainedEnvelope(original);
+        if (original.intent.integration !== undefined && prior !== null && retained === null)
+          return yield* denied(
+            "Integration ownership exists without a committed combination; uncertain combination cannot be repeated",
+          );
+        const workspace = yield* physicalWorkspace(original, prior ?? undefined);
+        if (original.intent.integration === undefined)
+          return yield* Effect.suspend(() => use(copy({ workspace })));
+        const selection = original.intent.integration;
+        let expected: typeof ProjectTeamWorkspaceEvidence.Type | undefined;
+        const revalidate = Effect.gen(function* () {
+          const actual = yield* dispatch.readRetained(original.fence.dispatchId);
+          if (
+            !same(actual.intent, original.intent) ||
+            actual.fence.claimGeneration !== original.fence.claimGeneration ||
+            (!same(actual.fence, original.fence) &&
+              (actual.fence.stage !== "workspace-ready" ||
+                actual.fence.revision !== original.fence.revision + 1))
+          )
+            return yield* denied("Integration capture fence changed");
+          if (
+            !same(actual.fence, original.fence) &&
+            (!expected || !same(yield* retainedEnvelope(actual), expected))
+          )
+            return yield* denied("Integration stage did not retain the exact physical combination");
+          yield* options.assertCurrent(actual);
+          yield* assertSources(actual);
+        });
+        return yield* workflow.withRepositoryPermit(
+          "integration.combine",
+          workspace.assignment.primaryRoot,
+          Effect.gen(function* () {
+            const contexts = yield* sourceContexts(original, revalidate);
+            const context = yield* ManagedGit.make({
+              assignment: workspace.assignment,
+              priorReceipt: workspace,
+              revalidate: revalidate.pipe(
+                Effect.scoped,
+                Effect.provide(services),
+                Effect.provideService(SqlClient.SqlClient, sql),
+                Effect.mapError(
+                  (cause) =>
+                    new GitCommandError({
+                      operation: "integration.combine",
+                      command: "/usr/bin/git",
+                      cwd: workspace.assignment.worktreePath,
+                      detail: "Integration authority changed",
+                      cause,
+                    }),
+                ),
+              ),
+              persistWorkspace: () =>
+                Effect.fail(
+                  new GitCommandError({
+                    operation: "integration.combine",
+                    command: "/usr/bin/git",
+                    cwd: workspace.assignment.worktreePath,
+                    detail: "Combination cannot replace original ownership",
+                  }),
+                ),
+            });
+            const persist = (target: ManagedGit.ManagedVerificationTarget) =>
+              Effect.gen(function* () {
+                const integration: typeof ProjectTeamIntegrationCombinationReceipt.Type =
+                  retained?.integration ?? {
+                    version: 1,
+                    selectionSha256: selection.selectionSha256,
+                    baseSha: target.baseSha,
+                    combinedHeadSha: target.headSha,
+                    combinedTree: target.testedTree,
+                    sourceHeads: selection.selection.sources.map((source) => source.headSha),
+                  };
+                if (
+                  integration.selectionSha256 !== selection.selectionSha256 ||
+                  integration.baseSha !== workspace.assignment.baseOid ||
+                  !same(
+                    integration.sourceHeads,
+                    selection.selection.sources.map((source) => source.headSha),
+                  )
+                )
+                  return yield* denied("Integration stage selection changed");
+                if (
+                  retained &&
+                  (target.headSha !== integration.combinedHeadSha ||
+                    target.testedTree !== integration.combinedTree)
+                )
+                  return yield* denied("Retained original combined target changed before setup");
+                const evidence = copy({ workspace, integration });
+                expected = evidence;
+                if (activeWorkspaces.has(original.fence.dispatchId))
+                  return yield* denied("An original workspace capture is already active");
+                activeWorkspaces.set(original.fence.dispatchId, { snapshot: original, evidence });
+                return yield* Effect.suspend(() => use(evidence)).pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => activeWorkspaces.delete(original.fence.dispatchId)),
+                  ),
+                );
+              });
+            if (retained && !retained.integration)
+              return yield* denied("Integration dispatch is missing its combination receipt");
+            return yield* withSources(
+              contexts,
+              retained?.integration
+                ? ManagedGit.withManagedVerificationAncestry(
+                    context,
+                    {
+                      requiredHeads: [
+                        retained.integration.combinedHeadSha,
+                        ...retained.integration.sourceHeads,
+                      ],
+                    },
+                    persist,
+                  )
+                : ManagedGit.withManagedIntegrationTarget(
+                    context,
+                    {
+                      baseSha: workspace.assignment.baseOid,
+                      sourceHeads: selection.selection.sources.map((source) => source.headSha),
+                    },
+                    persist,
+                  ),
+            );
+          }),
+        );
+      }),
+    );
+  };
+  const verifyIntegration = Effect.fn("ProjectTeamWorkspace.verifyIntegration")(function* (
+    snapshot: ProjectTeamDispatchSnapshot,
+    combination: typeof ProjectTeamIntegrationCombinationReceipt.Type,
+  ) {
+    yield* assertCurrent(snapshot);
+    yield* assertSources(snapshot);
+    const active = activeWorkspaces.get(snapshot.fence.dispatchId);
+    if (active && same(active.snapshot, snapshot) && same(active.evidence.integration, combination))
+      return;
+    const retained = yield* retainedEnvelope(snapshot);
+    if (
+      !retained?.integration ||
+      !same(retained.integration, combination) ||
+      combination.selectionSha256 !== snapshot.intent.integration?.selectionSha256
+    )
+      return yield* denied("Original combination stage changed");
+    const revalidate = assertCurrent(snapshot).pipe(Effect.andThen(assertSources(snapshot)));
+    return yield* workflow.withRepositoryPermit(
+      "integration.verify",
+      retained.workspace.assignment.primaryRoot,
+      Effect.gen(function* () {
+        const contexts = yield* sourceContexts(snapshot, revalidate);
+        const context = yield* ManagedGit.make({
+          assignment: retained.workspace.assignment,
+          priorReceipt: retained.workspace,
+          revalidate: revalidate.pipe(
+            Effect.scoped,
+            Effect.provide(services),
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.mapError(
+              (cause) =>
+                new GitCommandError({
+                  operation: "integration.verify",
+                  command: "/usr/bin/git",
+                  cwd: retained.workspace.assignment.worktreePath,
+                  detail: "Integration authority changed",
+                  cause,
+                }),
+            ),
+          ),
+          persistWorkspace: () =>
+            Effect.fail(
+              new GitCommandError({
+                operation: "integration.verify",
+                command: "/usr/bin/git",
+                cwd: retained.workspace.assignment.worktreePath,
+                detail: "Read cannot replace ownership",
+              }),
+            ),
+        });
+        yield* withSources(
+          contexts,
+          ManagedGit.withManagedVerificationAncestry(
+            context,
+            { requiredHeads: [combination.combinedHeadSha, ...combination.sourceHeads] },
+            () => Effect.void,
+          ),
+        );
+      }),
+    );
   });
   const setupJournal = yield* makeProjectManagedSetupJournal({
     ...options,
@@ -256,6 +597,12 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
     prior?: ProjectManagedSetupReceipt,
   ) {
     yield* verifyWorkspace(snapshot, workspace);
+    const envelope = yield* retainedEnvelope(snapshot);
+    if (snapshot.intent.integration !== undefined) {
+      if (!envelope?.integration)
+        return yield* denied("Setup requires its retained original combination");
+      yield* verifyIntegration(snapshot, envelope.integration);
+    }
     const claim = snapshot.intent.compiledClaim.transition;
     if (claim?.kind !== "claim") return yield* denied("Setup binding is missing");
     const input = setupInput(snapshot);
@@ -316,17 +663,16 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
   });
   // Root supplies the operation scope; setup keeps its driver loan through the joined result.
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    effect.pipe(Effect.provide(services));
+    effect.pipe(Effect.provideService(SqlClient.SqlClient, sql), Effect.provide(services));
   return {
-    workspace: (snapshot: ProjectTeamDispatchSnapshot) =>
+    withWorkspace,
+    workspace: (snapshot: ProjectTeamDispatchSnapshot) => withWorkspace(snapshot, Effect.succeed),
+    verifyIntegration: (
+      snapshot: ProjectTeamDispatchSnapshot,
+      combination: typeof ProjectTeamIntegrationCombinationReceipt.Type,
+    ) =>
       provide(
-        Effect.suspend(() => {
-          const original = captureSnapshot(snapshot);
-          return assertCurrent(original).pipe(
-            Effect.andThen(readWorkspace(original)),
-            Effect.flatMap((prior) => physicalWorkspace(original, prior ?? undefined)),
-          );
-        }),
+        Effect.suspend(() => verifyIntegration(captureSnapshot(snapshot), copy(combination))),
       ),
     verifyWorkspace: (
       snapshot: ProjectTeamDispatchSnapshot,

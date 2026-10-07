@@ -9,7 +9,10 @@ import { projectTeamPlanHash, projectTeamSpecificationHash } from "./ProjectTeam
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamWorkspaceReceipt,
+  ProjectTeamWorkspaceEvidence,
 } from "./ProjectTeamDispatchJournal.ts";
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
+import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { ProjectWorkVerificationPreparationSelection } from "./ProjectWorkVerificationPreparation.ts";
 import type { ProjectWorkPreparedVerificationReceipt } from "./ProjectWorkVerificationJobs.ts";
 
@@ -30,7 +33,13 @@ const decodeReceipt = Schema.decodeUnknownSync(
   }),
   { onExcessProperty: "error" },
 );
-const decodeSelection = Schema.decodeUnknownSync(ProjectWorkVerificationPreparationSelection, {
+const decodeSelection = Schema.decodeUnknownSync(
+  Schema.suspend(() => ProjectWorkVerificationPreparationSelection),
+  {
+    onExcessProperty: "error",
+  },
+);
+const decodeEvidence = Schema.decodeUnknownEffect(ProjectTeamWorkspaceEvidence, {
   onExcessProperty: "error",
 });
 const decodeWorkspace = Schema.decodeUnknownEffect(
@@ -38,6 +47,7 @@ const decodeWorkspace = Schema.decodeUnknownEffect(
   { onExcessProperty: "error" },
 );
 const canonical = canonicalProjectWorkPayload;
+const sameIntegration = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const hash = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(canonical(value)).digest("hex");
 export class ProjectWorkVerificationGateError extends Schema.TaggedError<ProjectWorkVerificationGateError>()(
@@ -78,6 +88,7 @@ export function makeProjectWorkVerificationGate(input: typeof Options.Type) {
   return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const journal = yield* makeProjectTeamDispatchJournal(options);
+    const repository = yield* ProjectWorkRepository;
     const assertCurrent = (
       state: ProjectWorkReducerState,
       receipt: ProjectWorkPreparedVerificationReceipt,
@@ -220,6 +231,52 @@ export function makeProjectWorkVerificationGate(input: typeof Options.Type) {
         const transition = snapshot.intent.compiledClaim.transition;
         if (snapshot.fence.stage !== "settled" || transition?.kind !== "claim")
           return yield* deny("Original implementation dispatch changed");
+        if (
+          plan.integrationSources !== undefined ||
+          snapshot.intent.integration !== undefined ||
+          job.integrationCoverage !== undefined
+        ) {
+          const integration = snapshot.intent.integration,
+            coverage = job.integrationCoverage;
+          if (
+            roles[0].role !== "integrator" ||
+            job.integration !== true ||
+            plan.integrationSources === undefined ||
+            integration === undefined ||
+            coverage === undefined ||
+            integration.planId !== plan.recordId ||
+            integration.planContentHash !== plan.contentHash ||
+            integration.selectionSha256 !== hash(plan.integrationSources) ||
+            !sameIntegration(integration.selection, plan.integrationSources) ||
+            coverage.selectionSha256 !== integration.selectionSha256
+          )
+            return yield* deny("Original integration selection or coverage changed");
+          const sources = yield* makeProjectTeamIntegrationSources({
+            environmentId: options.environmentId,
+          }).pipe(Effect.provideService(ProjectWorkRepository, repository));
+          yield* sources.assertCurrentInTransaction({
+            projectId: job.projectId,
+            integrationTaskId: job.taskId,
+            sources: integration.selection,
+          });
+          const history = yield* journal.readHistoricalInTransaction(job.dispatchId);
+          const stages = history.receipts.filter((stage) => stage.stage === "workspace-ready");
+          if (stages.length !== 1)
+            return yield* deny("Original integration combination is missing or ambiguous");
+          const evidence = yield* decodeEvidence(stages[0]?.evidence);
+          if (
+            !evidence.integration ||
+            hash(evidence.integration) !== coverage.combinationSha256 ||
+            evidence.integration.selectionSha256 !== coverage.selectionSha256 ||
+            evidence.integration.baseSha !== job.target.baseSha ||
+            !sameIntegration(
+              evidence.integration.sourceHeads,
+              integration.selection.sources.map((source) => source.headSha),
+            ) ||
+            hash(evidence.workspace) !== job.workspaceReceiptHash
+          )
+            return yield* deny("Verification coverage differs from original combination");
+        }
         for (const key of [
           "recordId",
           "projectId",

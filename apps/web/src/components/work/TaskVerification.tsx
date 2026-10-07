@@ -189,7 +189,11 @@ function reviewTarget(
     gate.specRevision !== manifest.specRevision ||
     gate.planRevision !== manifest.planRevision ||
     found.plan.planRevision !== manifest.planRevision ||
-    found.plan.contentHash !== manifest.planHash
+    found.plan.contentHash !== manifest.planHash ||
+    (found.plan.integrationSources !== undefined) !==
+      (manifest.integrationCoverage !== undefined) ||
+    (found.plan.integrationSources !== undefined &&
+      manifest.integrationCoverage?.selectionSha256 !== digest(found.plan.integrationSources))
   )
     return null;
   const binding = found.bindings.find(
@@ -800,10 +804,21 @@ function VerificationSession(props: TaskVerificationProps) {
                 <dl className="grid gap-1">
                   <dt>Verification type</dt>
                   <dd>
-                    {manifest.integration === true
-                      ? "Integration verification"
-                      : "Implementation verification"}
+                    {manifest.integrationCoverage !== undefined
+                      ? "Combined source integration verification"
+                      : manifest.integration === true
+                        ? "Integration verification"
+                        : "Implementation verification"}
                   </dd>
+                  {manifest.integrationCoverage && (
+                    <>
+                      <dt>Approved source selection / combination receipt</dt>
+                      <dd className="break-all font-mono">
+                        {manifest.integrationCoverage.selectionSha256} /{" "}
+                        {manifest.integrationCoverage.combinationSha256}
+                      </dd>
+                    </>
+                  )}
                   <dt>Executable</dt>
                   <dd className="break-all font-mono">{manifest.command.executable}</dd>
                   <dt>Arguments in order</dt>

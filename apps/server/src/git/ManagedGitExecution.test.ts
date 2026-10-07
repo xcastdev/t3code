@@ -946,6 +946,10 @@ const verificationFixture = Effect.fn("ManagedGitExecution.test.verificationFixt
     untracked: "",
     tracked: "H file.txt\0",
     config: "core.repositoryformatversion\n0\0core.bare\nfalse\0",
+    mergeCode: 0,
+    ancestorCode: 0,
+    combinedHead: "4".repeat(40),
+    combinedTree: "5".repeat(40),
   };
   const spawner = ChildProcessSpawner.make((input) => {
     if (!ChildProcess.isStandardCommand(input)) throw Error("No pipeline accepted");
@@ -977,7 +981,15 @@ const verificationFixture = Effect.fn("ManagedGitExecution.test.verificationFixt
         : input.args.includes("--others")
           ? answers.untracked
           : answers.tracked;
-    else throw Error("Unexpected injected command");
+    else if (input.args.includes("merge-base")) code = answers.ancestorCode;
+    else if (input.args.includes("merge")) {
+      code = answers.mergeCode;
+      if (code === 0) {
+        answers.head = answers.combinedHead;
+        answers.worktreeHead = answers.combinedHead;
+        answers.tree = answers.combinedTree;
+      }
+    } else throw Error("Unexpected injected command");
     return Effect.succeed(
       ChildProcessSpawner.makeHandle({
         pid: ChildProcessSpawner.ProcessId(0),
@@ -1593,3 +1605,123 @@ describe("Managed verification target capture (synthetic Git)", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
+
+it.effect(
+  "managed integration combines only fixed approved commits and holds capture through persistence",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* verificationFixture();
+        f.answers.head = f.base;
+        f.answers.worktreeHead = f.base;
+        const context = yield* Managed.make({
+          assignment: f.assignment,
+          priorReceipt: f.receipt,
+          revalidate: Effect.void,
+          persistWorkspace: () => Effect.die("Cannot replace ownership"),
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, f.spawner));
+        const result = yield* Managed.withManagedIntegrationTarget(
+          context,
+          { baseSha: f.base, sourceHeads: ["6".repeat(40), "7".repeat(40)] },
+          (target) => Effect.succeed({ head: target.headSha, tree: target.testedTree }),
+        );
+        expect(result).toEqual({ head: "4".repeat(40), tree: "5".repeat(40) });
+        const merges = f.commands.filter((command) => command.args.includes("merge"));
+        expect(merges).toHaveLength(1);
+        expect(merges[0]?.args.slice(-3)).toEqual(["--", "6".repeat(40), "7".repeat(40)]);
+        expect(
+          f.commands.every(
+            (command) =>
+              command.command === "/usr/bin/git" &&
+              !command.args.includes("push") &&
+              !command.args.includes("fetch"),
+          ),
+        ).toBe(true);
+        expect(
+          (yield* Managed.withManagedIntegrationTarget(
+            context,
+            { baseSha: f.base, sourceHeads: ["6".repeat(40)] },
+            () => Effect.void,
+          ).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(f.commands.filter((command) => command.args.includes("merge"))).toHaveLength(1);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer), Effect.provideService(HostProcessPlatform, "linux")),
+);
+
+for (const failure of ["conflict", "ancestry", "dirty persistence"] as const) {
+  it.effect(`managed integration denies ${failure} without a second combination`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* verificationFixture();
+        f.answers.head = f.base;
+        f.answers.worktreeHead = f.base;
+        if (failure === "conflict") f.answers.mergeCode = 1;
+        if (failure === "ancestry") f.answers.ancestorCode = 1;
+        const context = yield* Managed.make({
+          assignment: f.assignment,
+          priorReceipt: f.receipt,
+          revalidate: Effect.void,
+          persistWorkspace: () => Effect.die("Ownership is immutable"),
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, f.spawner));
+        let persisted = false;
+        const result = yield* Managed.withManagedIntegrationTarget(
+          context,
+          { baseSha: f.base, sourceHeads: ["6".repeat(40), "7".repeat(40)] },
+          () =>
+            Effect.sync(() => {
+              persisted = true;
+              if (failure === "dirty persistence") f.answers.untracked = "unknown-input\0";
+            }),
+        ).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(persisted).toBe(failure === "dirty persistence");
+        expect(f.commands.filter((command) => command.args.includes("merge"))).toHaveLength(1);
+        expect(
+          f.commands.every(
+            (command) =>
+              !command.args.includes("reset") &&
+              !command.args.includes("push") &&
+              !command.args.includes("fetch"),
+          ),
+        ).toBe(true);
+        expect(verificationFds(f.assigned)).toEqual([]);
+        expect(verificationFds(f.metadata)).toEqual([]);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer), Effect.provideService(HostProcessPlatform, "linux")),
+  );
+}
+it.effect("managed integration rejects a source commit that is not in the tested descendant", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* verificationFixture();
+      const context = yield* Managed.make({
+        assignment: f.assignment,
+        priorReceipt: f.receipt,
+        revalidate: Effect.void,
+        persistWorkspace: () => Effect.die("Read cannot write"),
+      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, f.spawner));
+      expect(
+        yield* Managed.withManagedVerificationAncestry(
+          context,
+          { requiredHeads: ["6".repeat(40), "7".repeat(40)] },
+          (target) => Effect.succeed(target.headSha),
+        ),
+      ).toBe(f.answers.head);
+      f.answers.ancestorCode = 1;
+      let escaped = false;
+      expect(
+        (yield* Managed.withManagedVerificationAncestry(
+          context,
+          { requiredHeads: ["6".repeat(40)] },
+          () =>
+            Effect.sync(() => {
+              escaped = true;
+            }),
+        ).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(escaped).toBe(false);
+      expect(f.commands.some((command) => command.args.includes("merge"))).toBe(false);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer), Effect.provideService(HostProcessPlatform, "linux")),
+);

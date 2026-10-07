@@ -68,6 +68,11 @@ export const decideProjectTeamGuidedLifecycle = (
     reject("Guided intent does not match its enclosing command");
   if (command.records.length !== 0 || command.claim !== undefined)
     reject("Guided intent cannot carry caller-created records or a raw claim");
+  if (
+    guided.integrationSources !== undefined &&
+    (intent.type !== "project-team.plan.propose" || intent.integrationSourceRefs === undefined)
+  )
+    reject("Frozen integration sources require their selected plan proposal");
   let state = initial;
   const events: Array<ProjectWorkEvent> = [];
   const at = command.committedAt;
@@ -287,12 +292,15 @@ export const decideProjectTeamGuidedLifecycle = (
     ))
       record({ ...effect, status: "canceled", revision: effect.revision + 1, updatedAt: at });
   };
+  const invalidating = new Set<string>();
   const invalidate = (
     targetId: string,
     reason: string,
     includeSpecification = true,
     preservePlan = false,
   ) => {
+    if (invalidating.has(targetId)) return;
+    invalidating.add(targetId);
     for (const r of records()) {
       if (
         r.kind === "gate" &&
@@ -330,6 +338,15 @@ export const decideProjectTeamGuidedLifecycle = (
           record({ ...r, status: "stale", revision: r.revision + 1, updatedAt: at });
       }
       stop(childId, reason);
+    }
+    for (const plan of records()) {
+      if (
+        plan.kind === "plan-revision" &&
+        plan.status === "proposed" &&
+        currentPlan(plan.taskId)?.recordId === plan.recordId &&
+        plan.integrationSources?.sources.some((source) => descendants.has(source.taskId))
+      )
+        invalidate(plan.taskId, "An approved integration source changed", false);
     }
   };
   const gate = (
@@ -621,6 +638,35 @@ export const decideProjectTeamGuidedLifecycle = (
     }
     case "project-team.plan.propose": {
       ensureMembership(task);
+      const integrationSources = guided.integrationSources;
+      if ((intent.integrationSourceRefs === undefined) !== (integrationSources === undefined))
+        reject("Integration sources require host qualification");
+      if (integrationSources !== undefined) {
+        if (command.attribution.actor.kind !== "human" || guided.bindingId !== undefined)
+          reject("Integration source selection requires human authority");
+        if (
+          integrationSources.sources.length !== intent.integrationSourceRefs!.length ||
+          integrationSources.sources.some((source, index) => {
+            const ref = intent.integrationSourceRefs![index]!;
+            return (
+              source.taskId === task.taskId ||
+              source.taskId !== ref.taskId ||
+              source.bindingId !== ref.bindingId ||
+              source.bindingRevision !== ref.expectedBindingRevision ||
+              source.generation !== ref.generation ||
+              source.reviewDispatchId !== ref.reviewDispatchId ||
+              source.reviewProposalSha256 !== ref.expectedReviewProposalSha256 ||
+              source.jobId !== ref.verificationJobId ||
+              source.manifestHash !== ref.expectedManifestHash ||
+              source.branchRef !== ref.expectedBranchRef ||
+              source.baseSha !== ref.expectedBaseSha ||
+              source.headSha !== ref.expectedHeadSha ||
+              source.testedTree !== ref.expectedTestedTree
+            );
+          })
+        )
+          reject("Frozen integration sources differ from the selected ordered inputs");
+      }
       if (task.specification === undefined || intent.specRevision !== task.specRevision)
         reject("Plan requires current specification");
       const previous = currentPlan(task.taskId);
@@ -692,7 +738,11 @@ export const decideProjectTeamGuidedLifecycle = (
         planRevision: (previous?.planRevision ?? 0) + 1,
         content: intent.content,
         dependencyTaskIds: intent.dependencyTaskIds,
-        contentHash: projectTeamPlanHash(intent),
+        ...(integrationSources === undefined ? {} : { integrationSources }),
+        contentHash: projectTeamPlanHash({
+          ...intent,
+          ...(integrationSources === undefined ? {} : { integrationSources }),
+        }),
       };
       record(plan);
       gate("plan-gate", task, "plan", plan.contentHash, plan.planRevision);

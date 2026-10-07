@@ -41,6 +41,13 @@ const GitOid = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u));
 export const ProjectVerificationJobManifest = Schema.Struct({
   version: Schema.Literal(1),
   integration: Schema.optionalKey(Schema.Literal(true)),
+  integrationCoverage: Schema.optionalKey(
+    Schema.Struct({
+      version: Schema.Literal(1),
+      selectionSha256: Digest,
+      combinationSha256: Digest,
+    }),
+  ),
   jobId: Id,
   environmentId: EnvironmentId.check(Schema.isMaxLength(256)),
   projectId: ProjectId.check(Schema.isMaxLength(256)),

@@ -13,6 +13,7 @@ import {
   EnvironmentId,
   canonicalProjectWorkPayload,
   ProjectTeamReviewCompletionProof,
+  ProjectTeamIntegrationSources,
   type ProjectTeamGuidedIntent,
   ProjectTeamRecord,
   type ProjectWorkCommand,
@@ -24,14 +25,18 @@ import {
   emptyProjectWorkReducerState,
   type ProjectWorkReducerState,
 } from "./ProjectWorkDecider.ts";
+import { staleIntegrationTaskIds } from "./ProjectTeamIntegrationSourceState.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import {
   assertProjectTeamRunAuthority,
   projectTeamScopeHash,
+  projectTeamPlanHash,
+  projectTeamAssignmentRole,
   projectTeamSpecificationHash,
   projectTeamDerivedRecordId,
 } from "./ProjectTeamPolicy.ts";
 
+const decodeIntegrationSources = Schema.decodeUnknownSync(ProjectTeamIntegrationSources);
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const decodeReviewCompletionProof = Schema.decodeUnknownSync(ProjectTeamReviewCompletionProof, {
   onExcessProperty: "error",
@@ -2801,4 +2806,631 @@ it("trusted review settlement rejects exhausted task revisions before stopping a
       },
     }),
   ).toThrow();
+});
+
+describe("approved integration source plans", () => {
+  const frozen = decodeIntegrationSources({
+    version: 1,
+    environmentId: "environment",
+    sources: ["source-a", "source-b"].map((taskId) => ({
+      taskId,
+      bindingId: `binding-${taskId}`,
+      bindingRevision: 1,
+      generation: 0,
+      dispatchId: `dispatch-${taskId}`,
+      workspaceReceiptSha256: "a".repeat(64),
+      specRevision: 1,
+      planRevision: 1,
+      scopeHash: "b".repeat(64),
+      branchRef: `refs/heads/${taskId}`,
+      baseSha: "c".repeat(40),
+      headSha: (taskId === "source-a" ? "d" : "e").repeat(40),
+      testedTree: "f".repeat(40),
+      reviewDispatchId: `review-${taskId}`,
+      reviewProposalSha256: "1".repeat(64),
+      joinedReceiptId: `joined-${taskId}`,
+      jobId: `job-${taskId}`,
+      manifestHash: "2".repeat(64),
+      attemptId: `attempt-${taskId}`,
+      resultHash: "3".repeat(64),
+    })),
+  });
+  const refs = frozen.sources.map((source) => ({
+    taskId: source.taskId,
+    bindingId: source.bindingId,
+    expectedBindingRevision: 1,
+    generation: source.generation,
+    reviewDispatchId: source.reviewDispatchId,
+    expectedReviewProposalSha256: source.reviewProposalSha256,
+    verificationJobId: source.jobId,
+    expectedManifestHash: source.manifestHash,
+    expectedBranchRef: source.branchRef,
+    expectedBaseSha: source.baseSha,
+    expectedHeadSha: source.headSha,
+    expectedTestedTree: source.testedTree,
+  }));
+  it("selects the configured integrator for a source-list code plan in the shared admission policy", () => {
+    expect(projectTeamAssignmentRole("code")).toBe("implementer");
+    expect(projectTeamAssignmentRole("code", { integrationSources: frozen })).toBe("integrator");
+    expect(projectTeamAssignmentRole("review", { integrationSources: frozen })).toBe("reviewer");
+  });
+  it("keeps legacy plan hashes and binds the exact ordered frozen commit list", () => {
+    const legacy = { content: "Combine and test", dependencyTaskIds: [taskId] };
+    const priorHash = NodeCrypto.createHash("sha256")
+      .update(
+        canonicalProjectWorkPayload({
+          content: legacy.content,
+          dependencyTaskIds: [...legacy.dependencyTaskIds].sort(),
+        }),
+      )
+      .digest("hex");
+    expect(projectTeamPlanHash(legacy)).toBe(priorHash);
+    const selected = { ...legacy, integrationSources: frozen };
+    expect(projectTeamPlanHash(selected)).not.toBe(priorHash);
+    expect(
+      projectTeamPlanHash({
+        ...selected,
+        integrationSources: { ...frozen, sources: frozen.sources.toReversed() },
+      }),
+    ).not.toBe(projectTeamPlanHash(selected));
+    expect(
+      projectTeamPlanHash({
+        ...selected,
+        integrationSources: {
+          ...frozen,
+          sources: frozen.sources.map((source, index) =>
+            index === 0 ? { ...source, headSha: "0".repeat(40) } : source,
+          ),
+        },
+      }),
+    ).not.toBe(projectTeamPlanHash(selected));
+  });
+  it("denies caller-selected sources without host qualification", () => {
+    const state = approveGates(propose());
+    const command = compile({
+      ...envelope(state, "select-unqualified"),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      content: "Combine reviewed work",
+      dependencyTaskIds: [],
+      integrationSourceRefs: refs,
+    });
+    expect(() => decideProjectWorkCommand(state, command)).toThrow("host qualification");
+  });
+  it("invalidates an approved integration plan when a selected source scope changes", () => {
+    let state = approveGates(propose());
+    const sourceId = frozen.sources[0]!.taskId;
+    state = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        type: "project-work.task.create",
+        projectId,
+        taskId: sourceId,
+        commandId: CommandId.make("create-selected-source"),
+        title: "Reviewed source",
+        createdAt: at,
+      }),
+    );
+    const sourceCriterion = ProjectWorkCriterionId.make("source-criterion");
+    state = run(state, {
+      ...envelope(state, "source-spec", sourceId),
+      type: "project-team.specification.propose",
+      expectedSpecRevision: 0,
+      specification: {
+        objective: "Implement source",
+        scopeIn: "Source",
+        scopeOut: "Other work",
+        criterionIds: [sourceCriterion],
+        revision: 1,
+        protected: false,
+      },
+      criterionSnapshots: [
+        {
+          criterionId: sourceCriterion,
+          taskId: sourceId,
+          description: "Source behavior",
+          required: true,
+          status: "unsatisfied",
+          satisfiedByEvidenceIds: [],
+          revision: 0,
+          updatedAt: at,
+        },
+      ],
+    });
+    const command = compile({
+      ...envelope(state, "integration-before-source-change"),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      content: "Combine reviewed work",
+      dependencyTaskIds: [],
+      integrationSourceRefs: refs,
+    });
+    state = approveGates(
+      applyProjectWorkEvents(
+        state,
+        decideProjectWorkCommand(state, {
+          ...command,
+          guided: { ...command.guided!, integrationSources: frozen },
+        }),
+      ),
+    );
+    state = run(state, {
+      ...envelope(state, "change-source-plan", sourceId),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      content: "Repair the source",
+      dependencyTaskIds: [],
+    });
+    expect(
+      state.foundationRecords!.find(
+        (record) => record.kind === "gate" && record.taskId === taskId && record.gate === "plan",
+      )?.status,
+    ).toBe("invalidated");
+    expect(
+      state.foundationRecords!.find(
+        (record) => record.kind === "plan-revision" && record.taskId === taskId,
+      )?.kind === "plan-revision",
+    ).toBe(true);
+  });
+  it("invalidates transitive integration grants and stops their owned consumer in one command", () => {
+    const fixture = activeRun();
+    let state = fixture.state;
+    const fields = (recordId: string) => ({
+      recordId,
+      projectId,
+      revision: 0,
+      generation: 0,
+      updatedAt: at,
+    });
+    const add = (record: unknown) => {
+      state = {
+        ...state,
+        foundationRecords: [...state.foundationRecords!, decodeTeamRecord(record)],
+      };
+    };
+    // Trusted pure-decider observations only; nested accepted-review qualification has its own SQL control.
+    const source = (label: string, inputs?: typeof ProjectTeamIntegrationSources.Type) => {
+      const id = ProjectWorkTaskId.make(`chain-${label}`);
+      const criterionId = ProjectWorkCriterionId.make(`chain-criterion-${label}`);
+      const original = state.tasks.find((task) => task.taskId === taskId)!;
+      state = {
+        ...state,
+        tasks: [
+          ...state.tasks,
+          {
+            ...original,
+            taskId: id,
+            title: label,
+            state: "specified",
+            specification: {
+              ...original.specification!,
+              objective: label,
+              criterionIds: [criterionId],
+            },
+          },
+        ],
+        criteria: [
+          ...state.criteria,
+          { ...state.criteria[0]!, criterionId, taskId: id, description: label },
+        ],
+        attempts: [
+          ...state.attempts,
+          {
+            ...state.attempts[0]!,
+            attemptId: ProjectWorkAttemptId.make(`chain-attempt-${label}`),
+            taskId: id,
+            state: "succeeded",
+            endedAt: at,
+          },
+        ],
+      };
+      add({
+        ...fields(`chain-membership-${label}`),
+        kind: "task-membership",
+        status: "active",
+        taskId: id,
+        executionKind: "managed",
+        deliverableKind: "code",
+      });
+      let plan: Extract<ProjectTeamRecord, { kind: "plan-revision" }> = {
+        ...fields(`chain-plan-revision-${label}`),
+        kind: "plan-revision",
+        status: "proposed",
+        taskId: id,
+        specRevision: 1,
+        planRevision: 1,
+        content: `Reviewed ${label}`,
+        dependencyTaskIds: [],
+        ...(inputs === undefined ? {} : { integrationSources: inputs }),
+        contentHash: "pending",
+      };
+      plan = { ...plan, contentHash: projectTeamPlanHash(plan) };
+      add(plan);
+      const retained = decodeIntegrationSources({
+        version: 1,
+        environmentId: "fixture-env",
+        sources: [
+          {
+            ...frozen.sources[0]!,
+            taskId: id,
+            bindingId: `chain-binding-${label}`,
+            bindingRevision: 0,
+            generation: 0,
+            dispatchId: `chain-dispatch-${label}`,
+            specRevision: 1,
+            planRevision: 1,
+            scopeHash: projectTeamScopeHash(state, id, plan),
+            branchRef: `refs/heads/chain-${label}`,
+            jobId: `chain-job-${label}`,
+            attemptId: `chain-verification-${label}`,
+            reviewDispatchId: `chain-review-${label}`,
+            joinedReceiptId: `chain-joined-${label}`,
+          },
+        ],
+      });
+      const facts = retained.sources[0]!;
+      add({
+        ...fixture.binding,
+        ...fields(facts.bindingId),
+        status: "settled",
+        taskId: id,
+        attemptId: ProjectWorkAttemptId.make(`chain-attempt-${label}`),
+        branch: facts.branchRef,
+        scopeHash: facts.scopeHash,
+      });
+      for (const gate of ["specification", "plan", "verification"] as const)
+        add({
+          ...fields(`chain-${gate}-${label}`),
+          kind: "gate",
+          status: gate === "verification" ? "consumed" : "approved",
+          taskId: id,
+          gate,
+          specRevision: 1,
+          planRevision: gate === "specification" ? 0 : 1,
+          contentHash:
+            gate === "specification"
+              ? projectTeamSpecificationHash(state, id)
+              : gate === "plan"
+                ? plan.contentHash
+                : facts.manifestHash,
+          evidenceIds: [],
+          attribution,
+          ...(gate === "verification"
+            ? { verificationJobId: facts.jobId, consumedByRunId: facts.attemptId }
+            : {}),
+        });
+      return retained;
+    };
+    const input = source("X");
+    const middle = source("A", input);
+    const independentInput = source("Y");
+    const independent = source("D", independentInput);
+    state = {
+      ...state,
+      foundationRecords: state.foundationRecords!.map((record) => {
+        if (record.kind !== "plan-revision" || record.taskId !== taskId) return record;
+        const plan = { ...record, integrationSources: middle };
+        return { ...plan, contentHash: projectTeamPlanHash(plan) };
+      }),
+    };
+    const plan = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+        r.kind === "plan-revision" && r.taskId === taskId,
+    )!;
+    const scopeHash = projectTeamScopeHash(state, taskId, plan);
+    state = {
+      ...state,
+      foundationRecords: state.foundationRecords!.map((record) => {
+        if (!("taskId" in record) || record.taskId !== taskId) return record;
+        if (record.kind === "run-binding") return { ...record, scopeHash };
+        if (record.kind === "gate" && record.gate === "plan")
+          return { ...record, contentHash: plan.contentHash };
+        if (record.kind === "gate" && record.gate === "execution")
+          return { ...record, contentHash: scopeHash };
+        return record;
+      }),
+    };
+    add({
+      ...fields("chain-reservation"),
+      kind: "reservation",
+      status: "held",
+      taskId,
+      runId: fixture.binding.recordId,
+      attemptId: fixture.binding.attemptId,
+      environmentId: fixture.binding.environmentId,
+      scope: "project",
+      resourceKey: "chain-work",
+      slot: 0,
+      maximumTokens: 1000,
+      consumedTokens: 0,
+    });
+    for (const effectKind of ["dispatch", "setup"] as const)
+      add({
+        ...fields(`chain-${effectKind}`),
+        kind: "effect",
+        status: "pending",
+        taskId,
+        effectId: `chain-${effectKind}`,
+        effectKind,
+        runId: fixture.binding.recordId,
+        targetId: fixture.binding.recordId,
+        payload: {
+          recordIds: [fixture.binding.recordId],
+          expectedRevision: fixture.binding.revision,
+        },
+        claimGeneration: 0,
+        availableAt: at,
+      });
+    add({
+      ...fields("chain-applicability"),
+      kind: "evidence-applicability",
+      status: "current",
+      taskId,
+      evidenceId: "chain-evidence",
+      specRevision: 1,
+      planRevision: 1,
+      repository: "fixture",
+      worktree: fixture.binding.worktree,
+      testedTree: "a".repeat(40),
+      baseSha: "b".repeat(40),
+      headSha: "c".repeat(40),
+      command: "controlled check",
+      exitCode: 0,
+      artifactId: "chain-artifact",
+      environmentSummary: "controlled",
+      integration: true,
+    });
+    expect(staleIntegrationTaskIds(state)).toEqual([]);
+    const middlePlan = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+        r.kind === "plan-revision" && r.taskId === middle.sources[0]!.taskId,
+    )!;
+    const ambiguous = {
+      ...state,
+      foundationRecords: [
+        ...state.foundationRecords!,
+        { ...middlePlan, recordId: "chain-ambiguous-A" },
+      ],
+    };
+    expect(staleIntegrationTaskIds(ambiguous)).toContain(taskId);
+    // Imported cycles cannot retain coherent immutable hashes; reject them rather than inventing valid proof.
+    const cyclic = {
+      ...state,
+      foundationRecords: state.foundationRecords!.map((r) =>
+        r.kind === "plan-revision" && r.taskId === input.sources[0]!.taskId
+          ? { ...r, integrationSources: middle }
+          : r,
+      ),
+    };
+    expect(staleIntegrationTaskIds(cyclic)).toEqual(
+      expect.arrayContaining([input.sources[0]!.taskId, middle.sources[0]!.taskId, taskId]),
+    );
+
+    const grant = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+        r.kind === "gate" && r.recordId === "chain-verification-X",
+    )!;
+    const next = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: CommandId.make("revoke-chain-X"),
+        expectedRevision: state.revision,
+        attribution,
+        committedAt: at,
+        records: [{ ...grant, status: "invalidated", revision: grant.revision + 1 }],
+      }),
+    );
+    expect(
+      next.foundationRecords!.filter(
+        (r) => r.kind === "gate" && r.taskId === independent.sources[0]!.taskId,
+      ),
+    ).toEqual(
+      state.foundationRecords!.filter(
+        (r) => r.kind === "gate" && r.taskId === independent.sources[0]!.taskId,
+      ),
+    );
+    expect(staleIntegrationTaskIds(next)).not.toContain(independent.sources[0]!.taskId);
+    for (const id of [middle.sources[0]!.taskId, taskId])
+      expect(
+        next
+          .foundationRecords!.filter(
+            (r) => r.kind === "gate" && r.taskId === id && r.gate !== "specification",
+          )
+          .every((r) => r.status === "invalidated"),
+      ).toBe(true);
+    expect(
+      next.foundationRecords!.find((r) => r.recordId === fixture.binding.recordId)?.status,
+    ).toBe("stopping");
+    const stop = next.foundationRecords!.find(
+      (r) => r.kind === "effect" && r.effectKind === "stop" && r.runId === fixture.binding.recordId,
+    );
+    expect(stop).toMatchObject({
+      status: "pending",
+      payload: { expectedRevision: fixture.binding.revision },
+    });
+    for (const id of ["chain-dispatch", "chain-setup"])
+      expect(next.foundationRecords!.find((r) => r.recordId === id)?.status).toBe("canceled");
+    expect(next.foundationRecords!.find((r) => r.recordId === "chain-applicability")?.status).toBe(
+      "stale",
+    );
+    expect(next.foundationRecords!.filter((r) => r.kind === "reservation")).toEqual(
+      state.foundationRecords!.filter((r) => r.kind === "reservation"),
+    );
+    expect(next.foundationRecords!.find((r) => r.recordId === "chain-reservation")?.status).toBe(
+      "held",
+    );
+    expect(
+      next
+        .foundationRecords!.filter((r) => r.kind === "plan-revision")
+        .map((r) => r.integrationSources),
+    ).toEqual(
+      state
+        .foundationRecords!.filter((r) => r.kind === "plan-revision")
+        .map((r) => r.integrationSources),
+    );
+  });
+  it("stops a running consumer when its selected source is canceled without releasing ownership", () => {
+    const fixture = activeRun();
+    let state = fixture.state;
+    const sourceId = frozen.sources[0]!.taskId;
+    state = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        type: "project-work.task.create",
+        projectId,
+        taskId: sourceId,
+        commandId: CommandId.make("create-cancelable-source"),
+        title: "Selected source",
+        createdAt: at,
+      }),
+    );
+    // Trusted pure-decider boundary only; authenticated source qualification is covered by SQL controls.
+    state = {
+      ...state,
+      foundationRecords: state.foundationRecords!.map((record) => {
+        if (record.kind === "plan-revision" && record.taskId === taskId) {
+          const plan = { ...record, integrationSources: frozen };
+          return { ...plan, contentHash: projectTeamPlanHash(plan) };
+        }
+        return record;
+      }),
+    };
+    const next = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        type: "project-work.task.cancel",
+        projectId,
+        taskId: sourceId,
+        commandId: CommandId.make("cancel-selected-source"),
+        canceledAt: at,
+        attribution,
+      }),
+    );
+    expect(
+      next.foundationRecords!.find((record) => record.recordId === fixture.binding.recordId)
+        ?.status,
+    ).toBe("stopping");
+    expect(
+      next.foundationRecords!.some(
+        (record) =>
+          record.kind === "effect" &&
+          record.effectKind === "stop" &&
+          record.runId === fixture.binding.recordId &&
+          record.status === "pending",
+      ),
+    ).toBe(true);
+    expect(next.foundationRecords!.filter((record) => record.kind === "reservation")).toEqual(
+      state.foundationRecords!.filter((record) => record.kind === "reservation"),
+    );
+  });
+  it("does not invalidate a replacement plan because its superseded source list changed", () => {
+    let state = approveGates(propose());
+    const selected = compile({
+      ...envelope(state, "old-source-list"),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      content: "Combine reviewed work",
+      dependencyTaskIds: [],
+      integrationSourceRefs: refs,
+    });
+    state = approveGates(
+      applyProjectWorkEvents(
+        state,
+        decideProjectWorkCommand(state, {
+          ...selected,
+          guided: { ...selected.guided!, integrationSources: frozen },
+        }),
+      ),
+    );
+    const old = state.foundationRecords!.find((record) => record.kind === "plan-revision");
+    if (old?.kind !== "plan-revision") throw new Error("Missing original plan");
+    state = approveGates(
+      run(state, {
+        ...envelope(state, "replacement-plan"),
+        type: "project-team.plan.propose",
+        specRevision: 1,
+        content: "Implement directly",
+        dependencyTaskIds: [],
+        previousPlanId: old.recordId,
+        expectedPreviousPlanRevision: old.revision,
+      }),
+    );
+    const sourceId = frozen.sources[0]!.taskId;
+    state = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        type: "project-work.task.create",
+        projectId,
+        taskId: sourceId,
+        commandId: CommandId.make("create-retired-source"),
+        title: "Retired source",
+        createdAt: at,
+      }),
+    );
+    state = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        type: "project-work.task.cancel",
+        projectId,
+        taskId: sourceId,
+        commandId: CommandId.make("cancel-retired-source"),
+        canceledAt: at,
+        attribution,
+      }),
+    );
+    const latest = state
+      .foundationRecords!.filter((record) => record.kind === "plan-revision")
+      .sort((a, b) => b.planRevision - a.planRevision)[0]!;
+    expect(
+      state.foundationRecords!.find(
+        (record) =>
+          record.kind === "gate" &&
+          record.taskId === taskId &&
+          record.gate === "plan" &&
+          record.contentHash === latest.contentHash,
+      )?.status,
+    ).toBe("approved");
+    expect(old.integrationSources).toEqual(frozen);
+  });
+  it("retains sources in the plan and rejects a changed order before emitting a plan", () => {
+    const state = approveGates(propose());
+    const command = compile({
+      ...envelope(state, "select-qualified"),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      content: "Combine reviewed work",
+      dependencyTaskIds: [],
+      integrationSourceRefs: refs,
+    });
+    const qualified = { ...command, guided: { ...command.guided!, integrationSources: frozen } };
+    const next = applyProjectWorkEvents(state, decideProjectWorkCommand(state, qualified));
+    const plan = next.foundationRecords!.find((record) => record.kind === "plan-revision");
+    expect(plan?.kind === "plan-revision" && plan.integrationSources).toEqual(frozen);
+    expect(() =>
+      decideProjectWorkCommand(state, {
+        ...qualified,
+        guided: {
+          ...qualified.guided,
+          integrationSources: { ...frozen, sources: frozen.sources.toReversed() },
+        },
+      }),
+    ).toThrow("ordered inputs");
+    const selectedIntent = command.guided!.intent;
+    if (selectedIntent.type !== "project-team.plan.propose")
+      throw new Error("Missing plan proposal");
+    expect(() =>
+      decideProjectWorkCommand(state, {
+        ...qualified,
+        guided: {
+          ...qualified.guided,
+          intent: {
+            ...selectedIntent,
+            integrationSourceRefs: [{ ...refs[0]!, expectedHeadSha: "9".repeat(40) }, refs[1]!],
+          },
+        },
+      }),
+    ).toThrow("ordered inputs");
+  });
 });

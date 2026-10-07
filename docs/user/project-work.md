@@ -30,6 +30,11 @@ Open the task to inspect its internal findings. Use **Propose a revised specific
 the objective, included and excluded scope, and acceptance criteria. Then use **Propose a plan**
 to describe the implementation and validation work.
 
+For integration work, use the web or desktop plan editor to load reviewed sources. Select the
+exact task branches and commits, then arrange them in the order to combine. Propose the plan and
+review its retained source list before approving it. Changed sources require a replacement list
+and approval. Mobile can inspect and approve an existing list.
+
 In **Approvals and execution**, review and approve the current specification and plan, or reject
 them. Approval applies to the displayed revision. Proposing a revised specification resets
 criterion satisfaction and invalidates the previous scope's approvals and execution permission.
@@ -67,8 +72,10 @@ alone does not confirm execution or passing tests.
 Open **Evidence** to inspect recorded verification applicability and review findings. Findings
 show severity, open or resolved status, affected parent criteria, original reviewer, latest
 reporter, frozen target, and resolution artifact references. A recorded resolution does not by
-itself establish current approval. **Integration verification** describes the integrator's tested
-assignment; it does not establish that all implementation branches were combined.
+itself establish current approval. **Combined source integration verification** identifies the
+approved source selection and its recorded combination. Its tested commit must contain every
+selected commit. **Integration verification** without that coverage describes only the
+integrator's tested assignment.
 
 Managed team PR creation and merge are currently unavailable. Satisfied criteria or a completed
 reviewer task do not mean the parent code task was delivered.

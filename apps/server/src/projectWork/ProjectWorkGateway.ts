@@ -5,6 +5,7 @@ import {
   ProjectTeamWriteIntent,
   ProjectWorkVerificationJobRead,
   ProjectTeamGuidedIntent,
+  ProjectTeamIntegrationSourcePage,
   ProjectTeamSupervisionSummary,
   type ProjectWorkAttribution,
   type ProjectWorkCommand,
@@ -34,6 +35,7 @@ import {
   makeProjectWorkVerificationGate,
 } from "./ProjectWorkVerificationGate.ts";
 import { ProjectWorkVerificationPreparationSelection } from "./ProjectWorkVerificationPreparation.ts";
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import * as ProjectTeamAuthorization from "./ProjectTeamAuthorization.ts";
 import * as ProjectWorkBriefing from "./ProjectWorkBriefing.ts";
 import * as IssueComments from "./ProjectIssueComments.ts";
@@ -336,6 +338,7 @@ const decodeVerificationSelection = Schema.decodeUnknownEffect(
 const decodeVerificationPreview = Schema.decodeUnknownEffect(ProjectWorkVerificationJobRead, {
   onExcessProperty: "error",
 });
+const decodeIntegrationSourcePage = Schema.decodeUnknownEffect(ProjectTeamIntegrationSourcePage);
 const decodeSupervision = Schema.decodeUnknownEffect(ProjectTeamSupervisionSummary);
 const SUPERVISION_CAPTIONS = new Set(["name", "title", "reason"]);
 const SUPERVISION_IDENTITY = /\.(?:[A-Za-z]*Id|availability)$/u;
@@ -481,6 +484,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     };
     const result: Effect.Effect<unknown, ProjectionRepositoryError> = (() => {
       switch (boundedInput.operation) {
+        case "integration-sources":
         case "verification-job":
           return Effect.fail(
             toPersistenceSqlError("ProjectWorkGateway.read")(
@@ -1053,6 +1057,89 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     });
 
   const read: ProjectWorkGatewayShape["read"] = (input, principal) => {
+    if (input.operation === "integration-sources")
+      return sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const deny = () =>
+              new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+                reason: "Current human integration source candidates unavailable",
+              });
+            const request = yield* Effect.serviceOption(ProjectWorkVerificationRequest);
+            if (
+              !principal ||
+              principal.actor.kind !== "human" ||
+              principal.managed !== undefined ||
+              Option.isNone(request) ||
+              Option.isNone(teamAuthorization) ||
+              input.taskId === undefined
+            )
+              return yield* deny();
+            yield* request.value
+              .assertCurrent(principal, input.projectId, "read")
+              .pipe(Effect.mapError(deny));
+            const settings = yield* serverSettings.getSettings.pipe(Effect.mapError(deny));
+            if (!settings.projectWorkEnabled) return yield* deny();
+            yield* teamAuthorization.value.read(principal, input);
+            const environmentId = Option.isSome(environmentIdentity)
+              ? yield* environmentIdentity.value.getEnvironmentId.pipe(Effect.mapError(deny))
+              : Option.isSome(serverEnvironment)
+                ? yield* serverEnvironment.value.getEnvironmentId.pipe(Effect.mapError(deny))
+                : undefined;
+            if (environmentId === undefined) return yield* deny();
+            const service = yield* makeProjectTeamIntegrationSources({ environmentId }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, repository),
+              Effect.mapError(deny),
+            );
+            const state = yield* ProjectWorkRepository.readCurrentState(sql, input.projectId);
+            const task = state.tasks.find((entry) => entry.taskId === input.taskId);
+            if (task === undefined) return yield* deny();
+            const candidates = yield* service
+              .candidatesInTransaction({
+                projectId: input.projectId,
+                integrationTaskId: task.taskId,
+                offset: Math.min(1_000_000, input.offset ?? 0),
+                limit: Math.min(64, input.limit ?? 50),
+              })
+              .pipe(Effect.provideService(SqlClient.SqlClient, sql), Effect.mapError(deny));
+            const page = {
+              ...candidates,
+              environmentId,
+              projectId: input.projectId,
+              taskId: task.taskId,
+              revision: state.revision,
+              taskRevision: task.revision,
+            };
+            const redacted =
+              contentGuard._tag === "Some"
+                ? (yield* contentGuard.value.redact(page)).value
+                : redactProjectWorkContent(page).value;
+            const decoded = yield* decodeIntegrationSourcePage(redacted).pipe(
+              Effect.mapError(deny),
+            );
+            if (
+              canonicalProjectWorkPayload(
+                decoded.candidates.map(({ ref, source }) => ({ ref, source })),
+              ) !==
+              canonicalProjectWorkPayload(
+                page.candidates.map(({ ref, source }) => ({ ref, source })),
+              )
+            )
+              return yield* deny();
+            yield* request.value
+              .assertCurrent(principal, input.projectId, "read")
+              .pipe(Effect.mapError(deny));
+            return sanitizePublicValue(decoded);
+          }),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isTeamAuthorizationError(cause)
+              ? cause
+              : toPersistenceSqlError("ProjectWorkGateway.read")(cause),
+          ),
+        );
     if (input.operation === "verification-job")
       return Effect.gen(function* () {
         const denied = () =>

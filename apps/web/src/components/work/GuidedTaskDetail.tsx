@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import {
   CommandId,
   ProjectTeamRecord,
+  ProjectTeamIntegrationSourceRefs,
   ProjectWorkCriterionId,
   ProjectWorkCriterion,
   ProjectWorkTask,
@@ -21,6 +22,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
+import { IntegrationSources } from "./IntegrationSources";
 import { WorkCard } from "./WorkDataNotice";
 import {
   beginGuidedTaskSubmission,
@@ -58,6 +60,9 @@ type Intent =
 type Kind = Intent["type"];
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
 type Plan = Extract<ProjectTeamRecord, { kind: "plan-revision" }>;
+const decodeIntegrationSourceRefs = Schema.decodeUnknownSync(
+  Schema.fromJsonString(ProjectTeamIntegrationSourceRefs),
+);
 const decodeIntent = Schema.decodeUnknownSync(Schema.fromJsonString(ProjectWorkWriteIntent));
 const descriptionJson = Schema.fromJsonString(Schema.Record(Schema.String, Schema.String));
 const encodeDescriptions = Schema.encodeSync(descriptionJson);
@@ -214,7 +219,13 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   });
   const planHash =
     plan &&
-    digest({ content: plan.content, dependencyTaskIds: [...plan.dependencyTaskIds].sort() });
+    digest({
+      content: plan.content,
+      dependencyTaskIds: [...plan.dependencyTaskIds].sort(),
+      ...(plan.integrationSources === undefined
+        ? {}
+        : { integrationSources: plan.integrationSources }),
+    });
   const specGate = one(
     gates.filter(
       (gate) =>
@@ -374,6 +385,9 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
                 plan?.content ??
                 "Describe the implementation and validation plan",
               dependencyTaskIds: plan?.dependencyTaskIds ?? [],
+              ...(selectedSources(fields).length === 0
+                ? {}
+                : { integrationSourceRefs: selectedSources(fields) }),
               ...(plan
                 ? { previousPlanId: plan.recordId, expectedPreviousPlanRevision: plan.revision }
                 : {}),
@@ -450,6 +464,28 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     }
   }
 
+  const retainedSources = () =>
+    plan?.integrationSources?.sources.map((source) => ({
+      taskId: source.taskId,
+      bindingId: source.bindingId,
+      expectedBindingRevision: source.bindingRevision,
+      generation: source.generation,
+      reviewDispatchId: source.reviewDispatchId,
+      expectedReviewProposalSha256: source.reviewProposalSha256,
+      verificationJobId: source.jobId,
+      expectedManifestHash: source.manifestHash,
+      expectedBranchRef: source.branchRef,
+      expectedBaseSha: source.baseSha,
+      expectedHeadSha: source.headSha,
+      expectedTestedTree: source.testedTree,
+    })) ?? [];
+  function selectedSources(fields: Readonly<Record<string, string>>) {
+    const value = fields.integrationSourceRefs;
+    if (value === undefined) return retainedSources();
+    if (value === "[]") return [];
+    return decodeIntegrationSourceRefs(value);
+  }
+
   function defaultFields(kind: Kind): Readonly<Record<string, string>> {
     if (!task) return {};
     if (kind === "project-team.specification.propose")
@@ -465,7 +501,11 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
           ),
         ),
       };
-    if (kind === "project-team.plan.propose") return { content: plan?.content ?? "" };
+    if (kind === "project-team.plan.propose")
+      return {
+        content: plan?.content ?? "",
+        integrationSourceRefs: JSON.stringify(retainedSources()),
+      };
     if (kind === "project-team.task.control") return { reason: "" };
     return {};
   }
@@ -967,6 +1007,26 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
         ) : (
           <p className="text-sm text-muted-foreground">No current plan proposed.</p>
         )}
+        {plan?.integrationSources && (
+          <div className="mt-3 space-y-2 text-xs">
+            <p className="font-medium">Frozen integration sources for this plan</p>
+            <ol className="space-y-2">
+              {plan.integrationSources.sources.map((source, index) => (
+                <li key={source.taskId} className="rounded border border-border p-2">
+                  <p>
+                    {index + 1}. Task {source.taskId}
+                  </p>
+                  <p className="break-all font-mono">{source.branchRef}</p>
+                  <p className="break-all font-mono">Commit {source.headSha}</p>
+                  <p className="break-all font-mono text-muted-foreground">Base {source.baseSha}</p>
+                </li>
+              ))}
+            </ol>
+            <p className="text-muted-foreground">
+              Plan approval includes these exact reviewed commits in this order.
+            </p>
+          </div>
+        )}
         <details className="mt-3">
           <summary className="cursor-pointer text-sm font-medium">Propose a plan</summary>
           <div className="mt-3 space-y-3">
@@ -977,6 +1037,26 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               plan?.content ?? "",
               32000,
             )}
+            <IntegrationSources
+              environmentId={environmentId}
+              projectId={projectId}
+              taskId={task.taskId}
+              revision={context!.revision}
+              taskRevision={task.revision}
+              disabled={
+                !canWrite ||
+                terminal ||
+                membership?.deliverableKind !== "code" ||
+                !task.specification ||
+                Boolean(draftFor("project-team.plan.propose")?.pending)
+              }
+              selected={selectedSources(draftFor("project-team.plan.propose")?.fields ?? {})}
+              onChange={(selected) =>
+                edit("project-team.plan.propose", {
+                  integrationSourceRefs: JSON.stringify(selected),
+                })
+              }
+            />
             <Button
               size="sm"
               disabled={

@@ -47,6 +47,20 @@ export interface ManagedVerificationTarget {
   readonly testedCommit: string;
   readonly testedTree: string;
 }
+const CommitOid = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u));
+const IntegrationSelection = Schema.Struct({
+  baseSha: CommitOid,
+  sourceHeads: Schema.Array(CommitOid).check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+});
+const AncestrySelection = Schema.Struct({
+  requiredHeads: Schema.Array(CommitOid).check(Schema.isMinLength(1), Schema.isMaxLength(65)),
+});
+const decodeIntegrationSelection = Schema.decodeUnknownSync(IntegrationSelection, {
+  onExcessProperty: "error",
+});
+const decodeAncestrySelection = Schema.decodeUnknownSync(AncestrySelection, {
+  onExcessProperty: "error",
+});
 const encodeAssignment = Schema.encodeSync(Schema.fromJsonString(Assignment));
 const encodeReceipt = Schema.encodeSync(Schema.fromJsonString(Receipt));
 const decodeAssignment = Schema.decodeUnknownEffect(Assignment);
@@ -59,6 +73,14 @@ export interface ManagedGitExecution {
 interface Execution {
   readonly assignment: ManagedGitAssignment;
   readonly withVerificationTarget: <A, E, R>(
+    use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | GitCommandError, R>;
+  readonly withIntegrationTarget: <A, E, R>(
+    selection: typeof IntegrationSelection.Type,
+    use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | GitCommandError, R>;
+  readonly withVerificationAncestry: <A, E, R>(
+    selection: typeof AncestrySelection.Type,
     use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | GitCommandError, R>;
   readonly prepare: (input: VcsCreateWorktreeInput) => Effect.Effect<string, GitCommandError>;
@@ -161,6 +183,43 @@ export const withManagedVerificationTarget = <A, E, R>(
   getExecution(context, "").pipe(
     Effect.flatMap((execution) => execution.withVerificationTarget(use)),
   );
+
+/** Combine fixed approved local OIDs only; the callback persists the immutable receipt under the same loan. */
+export const withManagedIntegrationTarget = <A, E, R>(
+  context: ManagedGitExecution,
+  input: typeof IntegrationSelection.Type,
+  use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+) => {
+  let selection: typeof IntegrationSelection.Type | undefined;
+  try {
+    selection = decodeIntegrationSelection(structuredClone(input));
+  } catch {
+    /* Fail before mutation. */
+  }
+  return Effect.gen(function* () {
+    if (!selection) return yield* error("", "Invalid frozen integration commits.");
+    const execution = yield* getExecution(context, "");
+    return yield* execution.withIntegrationTarget(selection, use);
+  });
+};
+/** Read-only ancestry of actual captured commits, never branch-name inference. */
+export const withManagedVerificationAncestry = <A, E, R>(
+  context: ManagedGitExecution,
+  input: typeof AncestrySelection.Type,
+  use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+) => {
+  let selection: typeof AncestrySelection.Type | undefined;
+  try {
+    selection = decodeAncestrySelection(structuredClone(input));
+  } catch {
+    /* Fail closed. */
+  }
+  return Effect.gen(function* () {
+    if (!selection) return yield* error("", "Invalid frozen integration ancestry.");
+    const execution = yield* getExecution(context, "");
+    return yield* execution.withVerificationAncestry(selection, use);
+  });
+};
 
 /** Canonical common metadata is also the permit key for ordinary linked-worktree mutations. */
 export const canonicalGitMutationKey = (common: string, cwd: string) =>
@@ -403,7 +462,10 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
         const segments = ref.split("/");
         if (
           segments.some((segment) => !segment || segment === "." || segment === "..") ||
-          /[\x00-\x20~^:?*\[\\]/.test(ref) ||
+          [...ref].some((character) => character.charCodeAt(0) <= 32) ||
+          /[~^:?*]/u.test(ref) ||
+          ref.includes("[") ||
+          ref.includes("\\") ||
           ref.includes("@{") ||
           ref.includes("..") ||
           ref.endsWith(".lock")
@@ -897,7 +959,147 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
       ),
     );
   }, Effect.scoped);
+  const ancestors = Effect.fn("ManagedGitExecution.ancestors")(function* (
+    state: ReturnType<typeof snapshot>,
+    heads: readonly string[],
+    target: string,
+  ) {
+    const workspace = state.workspace;
+    if (!workspace) return yield* deny("Integration workspace receipt is missing.");
+    for (const head of heads) {
+      const result = yield* command(
+        [
+          `--git-dir=${workspace.gitDirectory.path}`,
+          `--work-tree=${a.worktreePath}`,
+          "merge-base",
+          "--is-ancestor",
+          head,
+          target,
+        ],
+        state,
+        false,
+      );
+      if (result.code !== 0 || result.stdout !== "")
+        return yield* deny(
+          "An approved integration commit is not an ancestor of the captured target.",
+        );
+    }
+  });
+  const withVerificationAncestry = <A, E, R>(
+    selection: typeof AncestrySelection.Type,
+    use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+  ) =>
+    withVerificationTarget((target) =>
+      Effect.gen(function* () {
+        const current = yield* acquireSnapshot(true);
+        yield* ancestors(current, selection.requiredHeads, target.headSha);
+        const value = yield* Effect.suspend(() => use(target));
+        yield* options.revalidate;
+        yield* ancestors(current, selection.requiredHeads, target.headSha);
+        return value;
+      }),
+    );
+  const withIntegrationTarget = Effect.fn("ManagedGitExecution.withIntegrationTarget")(function* <
+    A,
+    E,
+    R,
+  >(
+    selection: typeof IntegrationSelection.Type,
+    use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
+  ) {
+    if (!prior) return yield* deny("A retained workspace receipt is required for integration.");
+    yield* options.revalidate;
+    const current = yield* acquireSnapshot(true);
+    const workspace = current.workspace;
+    if (!workspace || encodeReceipt(workspace) !== priorText)
+      return yield* deny("Original integration ownership changed.");
+    yield* supportedConfiguration(current);
+    const original = yield* inspectVerificationTarget(current);
+    yield* options.revalidate;
+    yield* verify(current);
+    const entered = yield* inspectVerificationTarget(current);
+    if (
+      selection.baseSha !== a.baseOid ||
+      original.baseSha !== selection.baseSha ||
+      original.headSha !== selection.baseSha ||
+      entered.headSha !== original.headSha ||
+      entered.testedTree !== original.testedTree
+    )
+      return yield* deny(
+        "Integration requires the untouched original clean base; uncertain combination is never repeated.",
+      );
+    const merged = yield* command(
+      [
+        `--git-dir=${workspace.gitDirectory.path}`,
+        `--work-tree=${a.worktreePath}`,
+        "merge",
+        "--no-ff",
+        "--no-edit",
+        "--no-verify",
+        "--no-gpg-sign",
+        "--no-autostash",
+        "--",
+        ...selection.sourceHeads,
+      ],
+      current,
+      false,
+    );
+    if (merged.code !== 0)
+      return yield* deny(
+        "Approved integration commits did not combine cleanly; original uncertain inputs are retained.",
+      );
+    const combined = yield* inspectVerificationTarget(current);
+    yield* ancestors(current, selection.sourceHeads, combined.headSha);
+    yield* options.revalidate;
+    yield* verify(current);
+    const checked = yield* inspectVerificationTarget(current);
+    if (
+      checked.baseSha !== combined.baseSha ||
+      checked.headSha !== combined.headSha ||
+      checked.testedTree !== combined.testedTree
+    )
+      return yield* deny("Combined target changed before persistence.");
+    const receipt = Object.freeze({
+      ...workspace,
+      assignment: Object.freeze({ ...workspace.assignment }),
+      primary: Object.freeze({ ...workspace.primary }),
+      worktree: Object.freeze({ ...workspace.worktree }),
+      common: Object.freeze({ ...workspace.common }),
+      gitDirectory: Object.freeze({ ...workspace.gitDirectory }),
+    });
+    const target: ManagedVerificationTarget = Object.freeze({
+      receipt,
+      cwd: a.worktreePath,
+      ...combined,
+      testedCommit: combined.headSha,
+    });
+    return yield* Effect.suspend(() => use(target)).pipe(
+      Effect.onExit(() =>
+        Effect.gen(function* () {
+          yield* options.revalidate;
+          yield* supportedConfiguration(current);
+          yield* ancestors(current, selection.sourceHeads, combined.headSha);
+          yield* options.revalidate;
+          yield* verify(current);
+          const final = yield* inspectVerificationTarget(current);
+          if (
+            final.baseSha !== combined.baseSha ||
+            final.headSha !== combined.headSha ||
+            final.testedTree !== combined.testedTree
+          )
+            return yield* deny("Combined target changed during persistence.");
+        }),
+      ),
+    );
+  }, Effect.scoped);
   const context: ManagedGitExecution = Object.freeze({ [brand]: true as const });
-  executions.set(context, { assignment: a, prepare, create, withVerificationTarget });
+  executions.set(context, {
+    assignment: a,
+    prepare,
+    create,
+    withVerificationTarget,
+    withIntegrationTarget,
+    withVerificationAncestry,
+  });
   return context;
 });

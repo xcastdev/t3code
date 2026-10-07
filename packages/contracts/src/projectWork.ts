@@ -10,6 +10,8 @@ import {
   ProjectTeamTaskMembership,
   ProjectTeamReviewFinding,
   ProjectTeamReviewFindingProvenance,
+  ProjectTeamIntegrationSourceRefs,
+  ProjectTeamIntegrationSources,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1241,6 +1243,7 @@ export const ProjectTeamGuidedIntent = Schema.Union([
     specRevision: NonNegativeInt,
     content: GuidedBody,
     dependencyTaskIds: Schema.Array(ProjectWorkTaskId).check(Schema.isMaxLength(64)),
+    integrationSourceRefs: Schema.optionalKey(ProjectTeamIntegrationSourceRefs),
     previousPlanId: Schema.optionalKey(GuidedId),
     expectedPreviousPlanRevision: Schema.optionalKey(NonNegativeInt),
   }).check(
@@ -1353,6 +1356,7 @@ export type ProjectTeamGuidedIntent = typeof ProjectTeamGuidedIntent.Type;
 /** Private gateway compilation; raw foundation commands remain denied by transports. */
 export const ProjectWorkGuidedTransition = Schema.Struct({
   intent: ProjectTeamGuidedIntent,
+  integrationSources: Schema.optionalKey(ProjectTeamIntegrationSources),
   bindingId: Schema.optionalKey(GuidedId),
   generation: Schema.optionalKey(NonNegativeInt),
 }).check(
@@ -1822,6 +1826,7 @@ export const ProjectWorkReadOperation = Schema.Literals([
   "task",
   "task-context",
   "verification-job",
+  "integration-sources",
   "tasks",
   "attempts",
   "criteria",
@@ -1883,6 +1888,16 @@ export const ProjectWorkReadIntent = Schema.Struct({
         input.query === undefined &&
         input.state === undefined),
     { message: "Verification previews require an exact task and job ID without search selectors" },
+  ),
+  Schema.makeFilter(
+    (input) =>
+      input.operation !== "integration-sources" ||
+      (input.taskId !== undefined &&
+        input.query === undefined &&
+        input.state === undefined &&
+        input.cursor === undefined &&
+        (input.limit === undefined || input.limit <= 64)),
+    { message: "Integration source candidates require an exact task and bounded page" },
   ),
 );
 export type ProjectWorkReadIntent = typeof ProjectWorkReadIntent.Type;

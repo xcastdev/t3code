@@ -1,3 +1,4 @@
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import {
   canonicalProjectWorkPayload,
   ProjectTeamRecord as TeamRecordSchema,
@@ -210,6 +211,9 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
   readonly maximumEnvironmentModelCalls: number;
 }) {
   const sql = yield* SqlClient.SqlClient;
+  const sourceService = yield* makeProjectTeamIntegrationSources({
+    environmentId: options.environmentId,
+  });
   const journal = yield* makeProjectTeamDispatchJournal(options);
   const reviewTargets = yield* makeProjectTeamReviewTargets(options);
   const readRecord = Effect.fn("ProjectTeamContext.readRecord")(function* (
@@ -715,6 +719,15 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           const claim = original.intent.compiledClaim.transition;
           if (claim?.kind !== "claim") return yield* deny("Original dispatch claim is missing");
           const binding = claim.binding;
+          if (original.intent.integration !== undefined) {
+            yield* sourceService
+              .assertCurrentInTransaction({
+                projectId: binding.projectId,
+                integrationTaskId: binding.taskId,
+                sources: original.intent.integration.selection,
+              })
+              .pipe(Effect.mapError(() => deny("Approved integration sources changed")));
+          }
           const projects = yield* sql`SELECT project.project_id FROM projection_projects AS project
         LEFT JOIN project_lifecycle AS lifecycle ON lifecycle.project_id=project.project_id
         WHERE project.project_id=${binding.projectId} AND project.deleted_at IS NULL

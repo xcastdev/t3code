@@ -746,6 +746,20 @@ function WorkTaskSession({
           </WorkCard>
           <WorkCard title={review.plan ? `Plan ${review.plan.planRevision}` : "Plan"}>
             <Text selectable>{review.plan?.content ?? "No current plan proposed."}</Text>
+            {review.plan?.integrationSources ? (
+              <>
+                <Notice>Plan approval includes these reviewed commits in this order.</Notice>
+                {review.plan.integrationSources.sources.map((source, index) => (
+                  <View key={source.taskId} className="gap-1">
+                    <Text selectable>
+                      {index + 1}. Task {source.taskId} · {source.branchRef}
+                    </Text>
+                    <Text selectable>Commit {source.headSha}</Text>
+                    <Notice>Base {source.baseSha}</Notice>
+                  </View>
+                ))}
+              </>
+            ) : null}
             {review.planGate ? (
               <GateButtons gate={review.planGate} locked={locked} session={session} />
             ) : null}

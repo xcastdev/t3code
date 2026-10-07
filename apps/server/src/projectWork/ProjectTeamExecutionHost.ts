@@ -32,6 +32,7 @@ import {
   makeProjectTeamDispatchJournal,
   ProjectTeamDispatchJournalError,
   ProjectTeamWorkspaceReceipt,
+  ProjectTeamIntegrationCombinationReceipt,
   type ProjectTeamDispatchSnapshot,
   type ProjectTeamDispatchFence,
 } from "./ProjectTeamDispatchJournal.ts";
@@ -55,6 +56,7 @@ import {
 import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 
 type Snapshot = ProjectTeamDispatchSnapshot;
@@ -88,6 +90,9 @@ const asJson = Schema.decodeUnknownEffect(Schema.JsonObject, { onExcessProperty:
 const workspaceDecode = Schema.decodeUnknownEffect(ProjectTeamWorkspaceReceipt, {
   onExcessProperty: "error",
 });
+const decodeIntegrationCombination = Schema.decodeUnknownEffect(
+  ProjectTeamIntegrationCombinationReceipt,
+);
 const decodeRecord = Schema.decodeUnknownEffect(ProjectTeamRecord, { onExcessProperty: "error" });
 const OwnerSchema = Schema.Struct({
   type: Schema.Literal("owner"),
@@ -279,6 +284,9 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       validateSelection: () =>
         Effect.fail(new ProjectManagedSetupError({ reason: "Cleanup cannot authorize setup" })),
     });
+    const integrationSources = yield* makeProjectTeamIntegrationSources({
+      environmentId: options.environmentId,
+    });
     const receipts = yield* makeProjectTeamSessionReceipts(options);
     const mailbox = yield* makeProjectTeamMailboxConsumption({
       environmentId: options.environmentId,
@@ -339,6 +347,14 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       }
       const workspace = yield* workspaceDecode(input.evidence.workspace);
       yield* (yield* workspaceService).verifyWorkspace(snapshot, workspace);
+      const integration =
+        input.evidence.integration === undefined
+          ? undefined
+          : yield* decodeIntegrationCombination(input.evidence.integration);
+      if ((snapshot.intent.integration !== undefined) !== (integration !== undefined))
+        return yield* denied("Integration stage evidence does not match its approved selection");
+      if (integration !== undefined)
+        yield* (yield* workspaceService).verifyIntegration(snapshot, integration);
       const setup = input.stage === "workspace-ready" ? undefined : yield* retainedSetup(snapshot);
       const session =
         input.stage === "session-bound" ||
@@ -361,6 +377,7 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
         return yield* denied("Original assignment receipt is unavailable");
       const expected = yield* asJson({
         workspace,
+        ...(integration === undefined ? {} : { integration }),
         ...(setup === undefined ? {} : { setup }),
         ...(session === undefined ? {} : { session }),
         ...(assignment === undefined ? {} : { assignment }),
@@ -403,6 +420,26 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       owner.snapshot = current;
       return current;
     });
+    const assertIntegrationCurrent = Effect.fn("ProjectTeamExecutionHost.assertIntegrationCurrent")(
+      function* (snapshot: Snapshot) {
+        if (snapshot.intent.integration === undefined) return;
+        const claim = snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* denied("Integration has no original binding");
+        yield* sql
+          .withTransaction(
+            integrationSources.assertCurrentInTransaction({
+              projectId: claim.binding.projectId,
+              integrationTaskId: claim.binding.taskId,
+              sources: snapshot.intent.integration.selection,
+            }),
+          )
+          .pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository),
+            Effect.mapError(() => denied("Approved integration sources changed")),
+          );
+      },
+    );
     const workspaceService = yield* makeProjectTeamWorkspace({
       ...options,
       assertCurrent: (snapshot) =>
@@ -655,25 +692,34 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       const workspace = yield* workspaceDecode(stored.evidence.workspace).pipe(
         Effect.mapError(() => denied("Retained workspace stage is invalid")),
       );
+      const integration =
+        stored.evidence.integration === undefined
+          ? undefined
+          : yield* decodeIntegrationCombination(stored.evidence.integration).pipe(
+              Effect.mapError(() => denied("Retained integration stage is invalid")),
+            );
+      if ((snapshot.intent.integration !== undefined) !== (integration !== undefined))
+        return yield* denied("Retained combination does not match original selected sources");
+      const physical = { workspace, ...(integration === undefined ? {} : { integration }) };
       if (snapshot.fence.stage === "workspace-ready")
-        return { stage: "workspace-ready", workspace };
+        return { stage: "workspace-ready", ...physical };
       const setup = yield* retainedSetup(snapshot).pipe(
         Effect.mapError(() => denied("Retained setup stage is invalid")),
       );
       if (snapshot.fence.stage === "setup-complete")
-        return { stage: "setup-complete", workspace, setup };
+        return { stage: "setup-complete", ...physical, setup };
       const session = yield* receipts
         .readInitialization(snapshot)
         .pipe(Effect.mapError(() => denied("Retained initialization stage is invalid")));
       if (session === undefined) return yield* denied("Retained initialization stage is missing");
       if (snapshot.fence.stage === "session-bound" || snapshot.fence.stage === "assignment-intent")
-        return { stage: snapshot.fence.stage, workspace, setup, session };
+        return { stage: snapshot.fence.stage, ...physical, setup, session };
       const assignment = yield* receipts
         .readAssignment(snapshot)
         .pipe(Effect.mapError(() => denied("Retained assignment stage is invalid")));
       if (snapshot.fence.stage !== "assignment-observed" || assignment === undefined)
         return yield* denied("Dispatch cannot resume its retained cleanup stage");
-      return { stage: "assignment-observed", workspace, setup, session, assignment };
+      return { stage: "assignment-observed", ...physical, setup, session, assignment };
     });
     const readAssignmentObservation = Effect.fn(
       "ProjectTeamExecutionHost.readAssignmentObservation",
@@ -797,21 +843,24 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
             return next;
           }),
         ),
-      workspace: (_owner, snapshot) =>
+      withWorkspace: (_owner, snapshot, use) =>
         boundary(
           Effect.gen(function* () {
-            return yield* (yield* workspaceService).workspace(snapshot);
+            yield* assertIntegrationCurrent(snapshot);
+            return yield* (yield* workspaceService).withWorkspace(snapshot, use);
           }),
         ),
       setup: (_owner, snapshot, workspace) =>
         boundary(
           Effect.gen(function* () {
+            yield* assertIntegrationCurrent(snapshot);
             return yield* (yield* workspaceService).setup(snapshot, workspace);
           }),
         ),
       initialize: (owner, snapshot) =>
         boundary(
           Effect.gen(function* () {
+            yield* assertIntegrationCurrent(snapshot);
             yield* assertCurrent(owner, snapshot.fence);
             const binding = bindingFor(snapshot);
             yield* engine.dispatch({
@@ -858,7 +907,10 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
             return receipt;
           }),
         ),
-      sendAssignment: (owner: Owner, snapshot) => boundary(sendAssignment(owner, snapshot)),
+      sendAssignment: (owner: Owner, snapshot) =>
+        boundary(
+          assertIntegrationCurrent(snapshot).pipe(Effect.andThen(sendAssignment(owner, snapshot))),
+        ),
       readAssignmentObservation: (_owner, snapshot) =>
         boundary(readAssignmentObservation(snapshot)),
       recordUncertain: (owner) => boundary(quarantine(owner)),

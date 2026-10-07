@@ -25,9 +25,13 @@ import type { ProjectTeamPrincipal } from "./ProjectTeamAuthorization.ts";
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamWorkspaceReceipt,
+  ProjectTeamWorkspaceEvidence,
+  type ProjectTeamIntegrationCombinationReceipt,
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
 import { projectTeamPlanHash, projectTeamSpecificationHash } from "./ProjectTeamPolicy.ts";
+import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
+import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { makeProjectWorkVerificationJobs } from "./ProjectWorkVerificationJobs.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
@@ -69,6 +73,7 @@ type Workspace = {
 type Original = {
   readonly snapshot: ProjectTeamDispatchSnapshot;
   readonly receipt: typeof ProjectTeamWorkspaceReceipt.Type;
+  readonly combination?: ProjectTeamIntegrationCombinationReceipt;
 };
 type Fingerprint = {
   readonly executableTarget: string;
@@ -80,6 +85,9 @@ export class ProjectWorkVerificationPreparationError extends Schema.TaggedError<
   "ProjectWorkVerificationPreparationError",
   { reason: Schema.String },
 ) {}
+const decodeWorkspaceEvidence = Schema.decodeUnknownEffect(ProjectTeamWorkspaceEvidence, {
+  onExcessProperty: "error",
+});
 const decodeEnvironmentId = Schema.decodeUnknownEffect(Id);
 const isPreparationError = Schema.is(ProjectWorkVerificationPreparationError);
 const deny = (reason: string) => new ProjectWorkVerificationPreparationError({ reason });
@@ -161,6 +169,7 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
     yield* decodeEnvironmentId(options.environmentId);
     const sql = yield* SqlClient.SqlClient;
     const journal = yield* makeProjectTeamDispatchJournal(options);
+    const repository = yield* ProjectWorkRepository;
     const assertTransactionOwner = Effect.gen(function* () {
       const current = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(current) && current.value !== sql)
@@ -331,7 +340,50 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
             row.receipt_json !== canonicalProjectWorkPayload(receipt)
           )
             return yield* deny("Original workspace receipt contradicts the retained assignment");
+          let combination: ProjectTeamIntegrationCombinationReceipt | undefined;
+          if (plan.integrationSources !== undefined || snapshot.intent.integration !== undefined) {
+            const integration = snapshot.intent.integration;
+            if (
+              roles[0].role !== "integrator" ||
+              plan.integrationSources === undefined ||
+              integration === undefined ||
+              integration.planId !== plan.recordId ||
+              integration.planRevision !== plan.planRevision ||
+              integration.planContentHash !== plan.contentHash ||
+              integration.selectionSha256 !== hash(plan.integrationSources) ||
+              !same(integration.selection, plan.integrationSources)
+            )
+              return yield* deny("Original integration selection changed");
+            const sources = yield* makeProjectTeamIntegrationSources({
+              environmentId: options.environmentId,
+            }).pipe(Effect.provideService(ProjectWorkRepository, repository));
+            yield* sources.assertCurrentInTransaction({
+              projectId: selection.projectId,
+              integrationTaskId: selection.taskId,
+              sources: integration.selection,
+            });
+            const history = yield* journal.readHistoricalInTransaction(snapshot.fence.dispatchId);
+            const workspaceStages = history.receipts.filter(
+              (stage) => stage.stage === "workspace-ready",
+            );
+            if (workspaceStages.length !== 1)
+              return yield* deny("Original integration combination is missing or ambiguous");
+            const envelope = yield* decodeWorkspaceEvidence(workspaceStages[0]?.evidence);
+            combination = envelope.integration;
+            if (
+              !combination ||
+              !same(envelope.workspace, receipt) ||
+              combination.selectionSha256 !== integration.selectionSha256 ||
+              combination.baseSha !== assignment.baseOid ||
+              !same(
+                combination.sourceHeads,
+                integration.selection.sources.map((source) => source.headSha),
+              )
+            )
+              return yield* deny("Original combination does not cover approved sources");
+          }
           return freeze({
+            ...(combination === undefined ? {} : { combination }),
             binding: structuredClone(binding),
             integration: roles[0].role === "integrator",
             snapshot,
@@ -343,7 +395,7 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
               revision: rows[0]!.revision,
             })),
           });
-        }),
+        }).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
       );
     });
     const prepare = (input: Selection, caller: ProjectTeamPrincipal) => {
@@ -387,6 +439,15 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
                         capture(decodeManifest, {
                           version: 1,
                           ...(original.integration ? { integration: true } : {}),
+                          ...(original.combination === undefined
+                            ? {}
+                            : {
+                                integrationCoverage: {
+                                  version: 1,
+                                  selectionSha256: original.combination.selectionSha256,
+                                  combinationSha256: hash(original.combination),
+                                },
+                              }),
                           jobId: selection.jobId,
                           environmentId: options.environmentId,
                           projectId: selection.projectId,
@@ -486,7 +547,18 @@ export const makeProjectWorkVerificationPreparationRoot = Effect.fn(
               revalidate: revalidate.pipe(Effect.mapError(changed)),
               persistWorkspace: () => Effect.fail(changed()),
             });
-            return yield* ManagedGit.withManagedVerificationTarget(context, use);
+            return yield* original.combination === undefined
+              ? ManagedGit.withManagedVerificationTarget(context, use)
+              : ManagedGit.withManagedVerificationAncestry(
+                  context,
+                  {
+                    requiredHeads: [
+                      original.combination.combinedHeadSha,
+                      ...original.combination.sourceHeads,
+                    ],
+                  },
+                  use,
+                );
           }).pipe(Effect.scoped, provideHost),
         )
         .pipe(Effect.mapError(translate("Host verification workspace capture failed"))),

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import {
   ProjectTeamCredential,
+  ProjectTeamIntegrationSourceRefs,
   ProjectTeamWriteIntent,
   ProjectTeamRecord,
   ProjectTeamRecordRead,
@@ -670,4 +671,45 @@ describe("authenticated review finding wire contracts", () => {
     ])
       expect(() => decodeTeamRecord(value)).toThrow();
   });
+});
+
+it("accepts bounded source references while rejecting caller-frozen plan facts", () => {
+  const ref = {
+    taskId: "source",
+    bindingId: "binding",
+    expectedBindingRevision: 1,
+    generation: 0,
+    reviewDispatchId: "review",
+    expectedReviewProposalSha256: "a".repeat(64),
+    verificationJobId: "job",
+    expectedManifestHash: "b".repeat(64),
+    expectedBranchRef: "refs/heads/source",
+    expectedBaseSha: "c".repeat(40),
+    expectedHeadSha: "d".repeat(40),
+    expectedTestedTree: "e".repeat(40),
+  };
+  const decode = Schema.decodeUnknownSync(ProjectTeamIntegrationSourceRefs);
+  expect(decode([ref])).toEqual([ref]);
+  expect(() => decode([])).toThrow();
+  expect(() => decode([ref, ref])).toThrow();
+  expect(() => decode([{ ...ref, expectedManifestHash: "missing" }])).toThrow();
+  const proposal = {
+    type: "project-team.plan.propose",
+    commandId: "source-plan",
+    projectId: "project",
+    taskId: "integration",
+    expectedRevision: 1,
+    expectedTaskRevision: 1,
+    specRevision: 1,
+    content: "Combine selected reviewed commits",
+    dependencyTaskIds: [],
+    integrationSourceRefs: [ref],
+  };
+  expect(decodeGuided(proposal)).toEqual(proposal);
+  expect(() =>
+    decodeGuided({
+      ...proposal,
+      integrationSources: { version: 1, environmentId: "environment", sources: [] },
+    }),
+  ).toThrow();
 });
