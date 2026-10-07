@@ -1,3 +1,4 @@
+import { invalidateReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
 import type { ProjectTeamRecord } from "@t3tools/contracts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
 import { decideProjectTeamGuidedLifecycle } from "./ProjectTeamGuidedLifecycle.ts";
@@ -891,6 +892,19 @@ export function decideProjectWorkCommand(
             }
           }
         }
+      }
+      for (const draft of invalidateReviewCriterionProgress({
+        state: working,
+        at: command.committedAt,
+      })) {
+        if (!Number.isSafeInteger(state.revision + events.length + 1))
+          throw new ProjectWorkPolicyError(
+            "invalid-state",
+            "Review criterion invalidation revision is exhausted",
+          );
+        const next = event(draft, events.length);
+        events.push(next);
+        working = applyProjectWorkEvents(working, [next]);
       }
       return events;
     }

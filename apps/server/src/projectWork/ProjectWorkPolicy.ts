@@ -1,3 +1,4 @@
+import { projectWorkPayloadFingerprint } from "@t3tools/contracts";
 import type {
   ProjectTeamRecord,
   ProjectWorkAction,
@@ -655,3 +656,50 @@ export function projectWorkActorKey(actor: ProjectWorkActor): string {
 export function activeProjectWorkAttemptStates(): ReadonlySet<string> {
   return activeAttemptStates;
 }
+
+/** Server-generated attribution timestamps must not make a retry look like a
+ * different command. Actor and source are stored and compared separately. */
+const withoutAttributionTimestamps = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(withoutAttributionTimestamps);
+  if (value === null || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  const isAttribution = "actor" in record && "source" in record && "recordedAt" in record;
+  const isActor =
+    "kind" in record &&
+    !("source" in record) &&
+    !("uri" in record) &&
+    ("id" in record || "displayName" in record);
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(
+        ([key]) =>
+          !(isAttribution && key === "recordedAt") &&
+          !(isActor && key === "displayName") &&
+          // approvalToken is bearer proof, not command intent. A renewed
+          // session may present a different proof while retrying the same
+          // command, and it must never be written to a receipt.
+          !(key === "approvalToken"),
+      )
+      .map(([key, entry]) => {
+        if (isAttribution && key === "source" && entry !== null && typeof entry === "object") {
+          const source = entry as Record<string, unknown>;
+          return [
+            key,
+            Object.fromEntries(
+              Object.entries(source)
+                .filter(([sourceKey]) => sourceKey !== "uri")
+                .map(([sourceKey, sourceValue]) => [
+                  sourceKey,
+                  withoutAttributionTimestamps(sourceValue),
+                ]),
+            ),
+          ];
+        }
+        return [key, withoutAttributionTimestamps(entry)];
+      }),
+  );
+};
+
+/** Match the durable repository receipt identity when preparing private command evidence. */
+export const projectWorkCommandFingerprint = (command: unknown) =>
+  projectWorkPayloadFingerprint(withoutAttributionTimestamps(command));

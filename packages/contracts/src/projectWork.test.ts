@@ -791,6 +791,73 @@ it("review completion proof requires a complete typed report and rejects credent
   expect(() => decode({ ...denied, reason: "" })).toThrow();
 });
 
+it("private parent review proof bounds selected identities and preserves legacy completion receipts", () => {
+  const decode = Schema.decodeUnknownSync(ProjectTeamReviewCompletionProof);
+  const snapshot = {
+    assessmentSha256: proofHash,
+    projectId: "project",
+    taskId: "parent",
+    target: reviewCompletionProof.target,
+    parentScopeHash: "parent-scope",
+    criterion: { id: "parent-criterion", revision: 1, sha256: proofHash },
+    evidence: [
+      {
+        id: "parent-evidence",
+        revision: 0,
+        sha256: proofHash,
+        taskId: "parent",
+        criterionId: "parent-criterion",
+        scopeHash: "parent-scope",
+      },
+    ],
+  };
+  const parentAssessments = {
+    snapshots: [snapshot],
+    verification: {
+      environmentId: "environment",
+      jobId: "job",
+      manifestHash: proofHash,
+      attemptId: "verification-attempt",
+      resultHash: proofHash,
+      outcome: "success",
+      exitCode: 0,
+      evidenceId: "test-evidence",
+      applicabilityId: "applicability",
+    },
+  };
+  const proof = {
+    ...reviewCompletionProof,
+    report: { ...reviewProofReport, criterionAssessments: [criterionAssessment] },
+    parentAssessments,
+  };
+  expect(decode(proof)).toEqual(proof);
+  expect(decode(reviewCompletionProof)).toEqual(reviewCompletionProof);
+  for (const changed of [
+    { ...parentAssessments, credential: "not-a-proof-field" },
+    { ...parentAssessments, snapshots: [snapshot, snapshot] },
+    {
+      ...parentAssessments,
+      snapshots: [{ ...snapshot, evidence: [...snapshot.evidence, ...snapshot.evidence] }],
+    },
+    {
+      ...parentAssessments,
+      snapshots: Array.from({ length: 65 }, (_, index) => ({
+        ...snapshot,
+        criterion: { ...snapshot.criterion, id: `parent-${index}` },
+      })),
+    },
+    {
+      ...parentAssessments,
+      verification: { ...parentAssessments.verification, resultHash: "invalid" },
+    },
+    {
+      ...parentAssessments,
+      verification: { ...parentAssessments.verification, exitCode: Number.MAX_SAFE_INTEGER + 1 },
+    },
+  ])
+    expect(() => decode({ ...proof, parentAssessments: changed })).toThrow();
+});
+
 it("review completion proof enforces its total UTF8 byte bound across valid bounded fields", () => {
   const decode = Schema.decodeUnknownSync(ProjectTeamReviewCompletionProof);
   const id = (index: number) => "界".repeat(240) + index;

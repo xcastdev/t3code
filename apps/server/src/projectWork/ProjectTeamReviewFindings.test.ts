@@ -2282,8 +2282,23 @@ it.effect(
           before.tasks.find((task) => task.taskId === f.selection.taskId),
         );
         expect(
-          settled.criteria.filter((criterion) => criterion.taskId === f.selection.taskId),
-        ).toEqual(before.criteria.filter((criterion) => criterion.taskId === f.selection.taskId));
+          settled.criteria.find(
+            (criterion) => criterion.criterionId === f.selection.criterionIds[0],
+          )?.status,
+        ).toBe("satisfied");
+        expect(
+          settled.criteria.filter(
+            (criterion) =>
+              criterion.taskId === f.selection.taskId &&
+              !f.selection.criterionIds.includes(criterion.criterionId),
+          ),
+        ).toEqual(
+          before.criteria.filter(
+            (criterion) =>
+              criterion.taskId === f.selection.taskId &&
+              !f.selection.criterionIds.includes(criterion.criterionId),
+          ),
+        );
         expect(f.targetControl.calls).toBe(2);
         expect(f.targetControl.permits).toBe(1);
         yield* TestClock.setTime(Date.parse("2030-01-01T00:00:00.000Z") + 1);
@@ -2297,6 +2312,275 @@ it.effect(
       }),
     ),
 );
+
+it.effect(
+  "qualified joined review advances only its selected parent criterion and exact retry retains the original progress",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const before = yield* f.state();
+        const selectedId = f.selection.criterionIds[0];
+        const original = before.criteria.find(
+          (criterion) =>
+            criterion.criterionId === selectedId && criterion.taskId === f.selection.taskId,
+        );
+        if (!original) return yield* Effect.die("Missing selected parent criterion");
+        expect(original.status).toBe("unsatisfied");
+        expect(original.satisfiedByEvidenceIds).toEqual([]);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          // Actual disposable SQL and retained SDK/custody records; native entry and drain ports remain controlled.
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        const receipt = yield* f.withTarget(
+          journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined),
+        );
+        expect(receipt.fence.stage).toBe("settled");
+        const after = yield* f.state();
+        const selected = after.criteria.find(
+          (criterion) =>
+            criterion.criterionId === selectedId && criterion.taskId === f.selection.taskId,
+        );
+        expect(selected?.status).toBe("satisfied");
+        expect(selected?.satisfiedByEvidenceIds).toHaveLength(1);
+        const reviewEvidence = after.evidence.find(
+          (evidence) => evidence.evidenceId === selected?.satisfiedByEvidenceIds[0],
+        );
+        expect(reviewEvidence).toMatchObject({
+          taskId: f.selection.taskId,
+          criterionId: selectedId,
+          kind: "review",
+          attribution: {
+            actor: { kind: "system", id: "project-team-review-criterion-progress" },
+            source: { kind: "system", id: "project-team-review-criterion-progress" },
+          },
+        });
+        if (!reviewEvidence?.detail)
+          return yield* Effect.die("Missing qualified parent review provenance");
+        expect(yield* decodeControlledJson(reviewEvidence.detail)).toMatchObject({
+          version: 1,
+          kind: "project-team.review-criterion-progress",
+          proposalCommandId: f.completionReport.commandId,
+          joinedReceiptId: f.joined.receiptId,
+          verification: {
+            jobId: f.target.prepared.manifest.jobId,
+            manifestHash: f.target.prepared.sha256,
+            outcome: "success",
+            exitCode: 0,
+          },
+        });
+        expect(
+          before.evidence.some((evidence) => evidence.evidenceId === reviewEvidence.evidenceId),
+        ).toBe(false);
+        expect(after.tasks.find((task) => task.taskId === f.running.taskId)?.state).toBe(
+          "completed",
+        );
+        expect(after.tasks.find((task) => task.taskId === f.selection.taskId)).toEqual(
+          before.tasks.find((task) => task.taskId === f.selection.taskId),
+        );
+        expect(
+          after.criteria.filter(
+            (criterion) =>
+              criterion.taskId === f.selection.taskId && criterion.criterionId !== selectedId,
+          ),
+        ).toEqual(
+          before.criteria.filter(
+            (criterion) =>
+              criterion.taskId === f.selection.taskId && criterion.criterionId !== selectedId,
+          ),
+        );
+        const counts =
+          yield* f.sql`SELECT (SELECT COUNT(*) FROM project_work_events WHERE project_id=${projectId}) AS events,(SELECT COUNT(*) FROM project_work_command_receipts WHERE project_id=${projectId}) AS receipts,(SELECT COUNT(*) FROM project_work_evidence WHERE project_id=${projectId}) AS evidence`;
+        expect(
+          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).duplicate,
+        ).toBe(true);
+        expect(yield* f.state()).toEqual(after);
+        expect(
+          yield* f.sql`SELECT (SELECT COUNT(*) FROM project_work_events WHERE project_id=${projectId}) AS events,(SELECT COUNT(*) FROM project_work_command_receipts WHERE project_id=${projectId}) AS receipts,(SELECT COUNT(*) FROM project_work_evidence WHERE project_id=${projectId}) AS evidence`,
+        ).toEqual(counts);
+        const query = yield* ProjectWorkQuery;
+        expect(
+          (yield* query.snapshot(projectId)).criteria.find(
+            (criterion) => criterion.criterionId === selectedId,
+          ),
+        ).toEqual(selected);
+      }),
+    ),
+);
+
+for (const assessmentMode of ["negative", "empty", "absent"] as const) {
+  it.effect(
+    `joined ${assessmentMode} review retains its judgment without granting parent progress`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* makeConsumedReviewFixture({
+            ...(assessmentMode === "negative"
+              ? { parentAssessment: true, assessmentVerdict: "not-met" }
+              : assessmentMode === "empty"
+                ? { parentAssessment: "empty" }
+                : {}),
+            verificationOutcome: assessmentMode === "negative" ? "failed" : "success",
+          });
+          const before = yield* f.state();
+          const journal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 128,
+            // SQL/SDK observations are controlled; no actual native entry or drain is exercised.
+            verifyStage: () => Effect.void,
+            verifySettlement: () => Effect.void,
+            prepareReviewCompletion: f.consumer.prepare,
+            verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+          });
+          yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+          const after = yield* f.state();
+          expect(after.criteria.filter((c) => c.taskId === f.selection.taskId)).toEqual(
+            before.criteria.filter((c) => c.taskId === f.selection.taskId),
+          );
+          expect(after.tasks.find((t) => t.taskId === f.selection.taskId)).toEqual(
+            before.tasks.find((t) => t.taskId === f.selection.taskId),
+          );
+          expect(after.tasks.find((t) => t.taskId === f.running.taskId)?.state).toBe("completed");
+          const added = after.evidence.filter(
+            (e) =>
+              e.taskId === f.selection.taskId &&
+              !before.evidence.some((old) => old.evidenceId === e.evidenceId),
+          );
+          expect(added).toHaveLength(assessmentMode === "negative" ? 1 : 0);
+          if (assessmentMode === "negative") {
+            expect(added[0]?.kind).toBe("review");
+            expect(yield* decodeControlledJson(added[0]?.detail ?? "")).toMatchObject({
+              assessment: { verdict: "not-met" },
+              verification: { outcome: "failed", exitCode: 1 },
+            });
+          }
+        }),
+      ),
+  );
+}
+
+it.effect(
+  "retained applicability drift revokes original criterion progress and exact settlement replay does not regrant it",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeConsumedReviewFixture({
+          parentAssessment: true,
+          verificationOutcome: "success",
+        });
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        const active = yield* f.state();
+        const selected = active.criteria.find((c) => c.criterionId === f.selection.criterionIds[0]);
+        expect(selected?.status).toBe("satisfied");
+        const applicability = active.foundationRecords?.find(
+          (r) =>
+            r.kind === "evidence-applicability" &&
+            r.taskId === f.selection.taskId &&
+            r.status === "current",
+        );
+        if (applicability?.kind !== "evidence-applicability")
+          return yield* Effect.die("Missing original verification applicability");
+        yield* f.repository.execute(
+          decodeCommit({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "invalidate-original-review-applicability",
+            expectedRevision: active.revision,
+            attribution: {
+              actor: { kind: "human", id: "fixture-human" },
+              source: { kind: "web", id: "fixture-browser" },
+              recordedAt: at,
+            },
+            committedAt: at,
+            records: [
+              {
+                ...applicability,
+                status: "stale",
+                revision: applicability.revision + 1,
+                updatedAt: at,
+              },
+            ],
+          }),
+        );
+        const revoked = yield* f.state();
+        expect(revoked.criteria.find((c) => c.criterionId === selected?.criterionId)).toMatchObject(
+          { status: "unsatisfied", satisfiedByEvidenceIds: [] },
+        );
+        expect(revoked.evidence).toEqual(active.evidence);
+        expect(
+          (yield* journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)).duplicate,
+        ).toBe(true);
+        expect(yield* f.state()).toEqual(revoked);
+      }),
+    ),
+);
+
+for (const projectionFailure of ["dropped", "corrupt"] as const) {
+  it.effect(
+    `${projectionFailure} parent criterion projection rolls back qualified progress and preserves exact retry`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* makeConsumedReviewFixture({
+            parentAssessment: true,
+            verificationOutcome: "success",
+          });
+          const before = yield* f.state();
+          const history = yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId);
+          const counts =
+            yield* f.sql`SELECT (SELECT COUNT(*) FROM project_work_events WHERE project_id=${projectId}) AS events,(SELECT COUNT(*) FROM project_work_command_receipts WHERE project_id=${projectId}) AS receipts`;
+          const selectedId = f.selection.criterionIds[0];
+          yield* f.sql`CREATE TABLE controlled_parent_progress_target (criterion_id TEXT NOT NULL)`;
+          yield* f.sql`INSERT INTO controlled_parent_progress_target VALUES (${selectedId})`;
+          if (projectionFailure === "dropped")
+            yield* f.sql`CREATE TRIGGER break_parent_progress BEFORE INSERT ON project_work_criteria WHEN NEW.criterion_id IN (SELECT criterion_id FROM controlled_parent_progress_target) AND NEW.status='satisfied' BEGIN SELECT RAISE(IGNORE); END`;
+          else
+            yield* f.sql`CREATE TRIGGER break_parent_progress AFTER INSERT ON project_work_criteria WHEN NEW.criterion_id IN (SELECT criterion_id FROM controlled_parent_progress_target) AND NEW.status='satisfied' BEGIN UPDATE project_work_criteria SET status='unsatisfied',satisfied_by_evidence_ids_json='[]' WHERE criterion_id=NEW.criterion_id AND project_id=NEW.project_id; END`;
+          const journal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 128,
+            verifyStage: () => Effect.void,
+            verifySettlement: () => Effect.void,
+            prepareReviewCompletion: f.consumer.prepare,
+            verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+          });
+          expect(
+            (yield* f
+              .withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined))
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(yield* f.state()).toEqual(before);
+          expect(yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId)).toEqual(
+            history,
+          );
+          expect(
+            yield* f.sql`SELECT (SELECT COUNT(*) FROM project_work_events WHERE project_id=${projectId}) AS events,(SELECT COUNT(*) FROM project_work_command_receipts WHERE project_id=${projectId}) AS receipts`,
+          ).toEqual(counts);
+          yield* f.sql`DROP TRIGGER break_parent_progress`;
+          yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+          expect(
+            (yield* f.state()).criteria.find((c) => c.criterionId === selectedId)?.status,
+          ).toBe("satisfied");
+        }),
+      ),
+  );
+}
 
 it.effect("current review target requires its final hook before advancing the original stage", () =>
   scoped(
@@ -2481,9 +2765,29 @@ it.effect(
         expect(after.tasks.find((task) => task.taskId === f.selection.taskId)).toEqual(
           before.tasks.find((task) => task.taskId === f.selection.taskId),
         );
+        const selectedId = f.selection.criterionIds[0];
         expect(
-          after.criteria.filter((criterion) => criterion.taskId === f.selection.taskId),
-        ).toEqual(before.criteria.filter((criterion) => criterion.taskId === f.selection.taskId));
+          after.criteria.find((criterion) => criterion.criterionId === selectedId),
+        ).toMatchObject({
+          status: "satisfied",
+          revision:
+            before.criteria.find((criterion) => criterion.criterionId === selectedId)!.revision + 1,
+        });
+        expect(
+          after.criteria.find((criterion) => criterion.criterionId === selectedId)
+            ?.satisfiedByEvidenceIds,
+        ).toHaveLength(1);
+        expect(
+          after.criteria.filter(
+            (criterion) =>
+              criterion.taskId === f.selection.taskId && criterion.criterionId !== selectedId,
+          ),
+        ).toEqual(
+          before.criteria.filter(
+            (criterion) =>
+              criterion.taskId === f.selection.taskId && criterion.criterionId !== selectedId,
+          ),
+        );
       }),
     ),
 );
@@ -2667,8 +2971,19 @@ it.effect(
         expect(after.tasks.find((t) => t.taskId === f.selection.taskId)).toEqual(
           before.tasks.find((t) => t.taskId === f.selection.taskId),
         );
-        expect(after.criteria.filter((c) => c.taskId === f.selection.taskId)).toEqual(
-          before.criteria.filter((c) => c.taskId === f.selection.taskId),
+        expect(
+          after.criteria.find((c) => c.criterionId === f.selection.criterionIds[0])?.status,
+        ).toBe("satisfied");
+        expect(
+          after.criteria.filter(
+            (c) =>
+              c.taskId === f.selection.taskId && !f.selection.criterionIds.includes(c.criterionId),
+          ),
+        ).toEqual(
+          before.criteria.filter(
+            (c) =>
+              c.taskId === f.selection.taskId && !f.selection.criterionIds.includes(c.criterionId),
+          ),
         );
         expect(
           (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)))

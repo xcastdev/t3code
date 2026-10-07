@@ -7,7 +7,6 @@ import {
 import {
   type ProjectWorkMutationDelta,
   type ProjectWorkWriteResult,
-  projectWorkPayloadFingerprint,
   type ProjectWorkCommand,
   type ProjectWorkAttempt,
 } from "@t3tools/contracts";
@@ -33,7 +32,7 @@ import {
   persistProjectWorkState,
   type ProjectWorkProjectionState,
 } from "./ProjectWorkProjection.ts";
-import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { ProjectWorkPolicyError, projectWorkCommandFingerprint } from "./ProjectWorkPolicy.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
 import { enqueueProjectWorkAttentionPublication } from "./ProjectWorkAttentionReactor.ts";
@@ -208,49 +207,6 @@ const decodeMutationDelta = (
   return mutationDeltaFor(projectId, fallbackRevision, fallbackEvents);
 };
 
-/** Server-generated attribution timestamps must not make a retry look like a
- * different command. Actor and source are stored and compared separately. */
-const withoutAttributionTimestamps = (value: unknown): unknown => {
-  if (Array.isArray(value)) return value.map(withoutAttributionTimestamps);
-  if (value === null || typeof value !== "object") return value;
-  const record = value as Record<string, unknown>;
-  const isAttribution = "actor" in record && "source" in record && "recordedAt" in record;
-  const isActor =
-    "kind" in record &&
-    !("source" in record) &&
-    !("uri" in record) &&
-    ("id" in record || "displayName" in record);
-  return Object.fromEntries(
-    Object.entries(value)
-      .filter(
-        ([key]) =>
-          !(isAttribution && key === "recordedAt") &&
-          !(isActor && key === "displayName") &&
-          // approvalToken is bearer proof, not command intent. A renewed
-          // session may present a different proof while retrying the same
-          // command, and it must never be written to a receipt.
-          !(key === "approvalToken"),
-      )
-      .map(([key, entry]) => {
-        if (isAttribution && key === "source" && entry !== null && typeof entry === "object") {
-          const source = entry as Record<string, unknown>;
-          return [
-            key,
-            Object.fromEntries(
-              Object.entries(source)
-                .filter(([sourceKey]) => sourceKey !== "uri")
-                .map(([sourceKey, sourceValue]) => [
-                  sourceKey,
-                  withoutAttributionTimestamps(sourceValue),
-                ]),
-            ),
-          ];
-        }
-        return [key, withoutAttributionTimestamps(entry)];
-      }),
-  );
-};
-
 const makeProjectWorkRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const contentGuard = yield* Effect.serviceOption(ProjectWorkContentGuard.ProjectWorkContentGuard);
@@ -342,8 +298,7 @@ const makeProjectWorkRepository = Effect.gen(function* () {
                 }
               : commandForDecision;
           const commandFingerprint =
-            receiptFingerprint ??
-            projectWorkPayloadFingerprint(withoutAttributionTimestamps(commandForFingerprint));
+            receiptFingerprint ?? projectWorkCommandFingerprint(commandForFingerprint);
           const attribution = commandForDecision.attribution;
           const priorReceiptRows = yield* sql<Record<string, unknown>>`
             SELECT payload_fingerprint AS payloadFingerprint,

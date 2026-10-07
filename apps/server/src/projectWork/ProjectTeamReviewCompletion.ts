@@ -20,6 +20,10 @@ import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
 import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
 import { makeProjectWorkVerificationResultReader } from "./ProjectWorkVerificationExecutionJournal.ts";
+import {
+  prepareVerificationEvidence,
+  assertVerificationEvidence,
+} from "./ProjectWorkVerificationEvidence.ts";
 import { snapshotReviewCriterionAssessments } from "./ProjectTeamReviewCriterionAssessments.ts";
 import {
   ProjectTeamReviewCurrentTarget,
@@ -427,6 +431,10 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
         hash(fresh.native) !== manifest.freshness.sessionSHA256
       )
         return yield* deny("stale-proof");
+      let parentAssessments: Extract<
+        ProjectTeamReviewCompletionProof,
+        { status: "completed" }
+      >["parentAssessments"];
       if (report.criterionAssessments !== undefined) {
         const verification = yield* verificationResults
           .readInTransaction({
@@ -504,6 +512,44 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
             }),
           );
         if (!targetCurrent) return yield* deny("stale-proof");
+        const qualifiedEvidence =
+          verification.result.outcome === "success"
+            ? yield* Effect.try({
+                try: () => {
+                  const prepared = prepareVerificationEvidence(
+                    state,
+                    { receipt: target.prepared },
+                    verification.result,
+                  );
+                  assertVerificationEvidence(
+                    state,
+                    prepared,
+                    { receipt: target.prepared },
+                    verification.result,
+                  );
+                  return prepared;
+                },
+                catch: () => fail("Qualified verification evidence or applicability changed"),
+              })
+            : undefined;
+        parentAssessments = {
+          snapshots: assessments,
+          verification: {
+            environmentId: options.environmentId,
+            jobId: manifest.prepared.jobId,
+            manifestHash: target.prepared.sha256,
+            attemptId: verification.snapshot.attemptId,
+            resultHash: verification.metadata.resultHash,
+            outcome: verification.result.outcome,
+            exitCode: verification.result.exitCode,
+            ...(qualifiedEvidence === undefined
+              ? {}
+              : {
+                  evidenceId: qualifiedEvidence.evidence.evidence.evidenceId,
+                  applicabilityId: qualifiedEvidence.applicability.records[0]!.recordId,
+                }),
+          },
+        };
       }
       for (const prior of records.filter(
         (r) => r.kind === "run-binding" && r.taskId === manifest.target.taskId,
@@ -671,6 +717,7 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
         reportEvidenceId: manifest.reportEvidenceId,
         reportCommentId: manifest.reportCommentId,
         findings: manifest.findings,
+        ...(parentAssessments === undefined ? {} : { parentAssessments }),
       });
     });
     return {

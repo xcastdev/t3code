@@ -9,6 +9,8 @@ import {
   ProjectWorkFoundationCommitCommand,
   ProjectWorkWriteResult,
   type ProjectTeamRecord,
+  type ProjectWorkCriterion,
+  type ProjectWorkEvidence,
 } from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
@@ -21,6 +23,13 @@ import { assertProjectTeamRunAuthority, projectTeamDerivedRecordId } from "./Pro
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
 import { resolveProjectTeamLimits } from "./ProjectTeamLimits.ts";
+import { projectWorkCommandFingerprint } from "./ProjectWorkPolicy.ts";
+import { decodeProjectWorkEvent } from "./ProjectWorkEventStore.ts";
+import {
+  prepareReviewCriterionProgress,
+  assertRetainedReviewCriterionProgress,
+} from "./ProjectTeamReviewCriterionProgress.ts";
+import { makeProjectWorkVerificationResultReader } from "./ProjectWorkVerificationExecutionJournal.ts";
 
 const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
 const Text = Schema.String.check(Schema.isMaxLength(4096));
@@ -279,6 +288,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     const verifyReviewTarget = options.verifyReviewTarget;
     const environmentId = yield* decodeEnvironment(options.environmentId);
     const environmentCalls = yield* decodeCalls(options.maximumEnvironmentModelCalls);
+    const verificationResults = yield* makeProjectWorkVerificationResultReader({ environmentId });
     const read = Effect.fn("ProjectTeamDispatchJournal.read")(function* (dispatchId: string) {
       const rows = yield* sql<Row>`SELECT * FROM project_team_dispatch
       WHERE dispatch_id=${dispatchId} AND environment_id=${environmentId}`;
@@ -1365,6 +1375,221 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       if (receipt.stage !== "settled" || verify === undefined)
         return yield* deny("Original joined-owner settlement verification is unavailable");
       let settled: Effect.Success<ReturnType<typeof advanceStage>> | undefined;
+      let parentProgress:
+        | readonly ReturnType<typeof prepareReviewCriterionProgress>[number][]
+        | undefined;
+      let parentCriteria: readonly ProjectWorkCriterion[] = [];
+      let inputEvidence: readonly ProjectWorkEvidence[] = [];
+      let applicability: Extract<ProjectTeamRecord, { kind: "evidence-applicability" }> | undefined;
+      let verification: Extract<
+        ProjectTeamReviewCompletionProof,
+        { status: "completed" }
+      >["parentAssessments"];
+      let joinedFingerprint: string | undefined;
+      const joinedCommandId = projectTeamDerivedRecordId(receipt.receiptId, "joined-domain");
+      const assertCriterion = (projectId: string, criterion: ProjectWorkCriterion) =>
+        Effect.gen(function* () {
+          const rows =
+            yield* sql`SELECT * FROM project_work_criteria WHERE project_id=${projectId} AND criterion_id=${criterion.criterionId}`;
+          const expectedRow = {
+            criterion_id: criterion.criterionId,
+            project_id: projectId,
+            task_id: criterion.taskId,
+            description: criterion.description,
+            required: criterion.required ? 1 : 0,
+            status: criterion.status,
+            satisfied_by_evidence_ids_json: encodeProjectionJson(criterion.satisfiedByEvidenceIds),
+            waiver_json:
+              criterion.waiver === undefined ? null : encodeProjectionJson(criterion.waiver),
+            revision: criterion.revision,
+            updated_at: criterion.updatedAt,
+          };
+          if (rows.length !== 1 || fingerprint(rows[0]) !== fingerprint(expectedRow))
+            return yield* deny("Joined review physical parent criterion changed");
+        });
+      const assertEvidence = (projectId: string, evidence: ProjectWorkEvidence) =>
+        Effect.gen(function* () {
+          const rows =
+            yield* sql`SELECT * FROM project_work_evidence WHERE project_id=${projectId} AND evidence_id=${evidence.evidenceId}`;
+          const expectedRow = {
+            evidence_id: evidence.evidenceId,
+            project_id: projectId,
+            task_id: evidence.taskId ?? null,
+            criterion_id: evidence.criterionId ?? null,
+            kind: evidence.kind,
+            summary: evidence.summary,
+            detail: evidence.detail ?? null,
+            uri: evidence.uri ?? null,
+            recorded_at: evidence.recordedAt,
+            revision: evidence.revision,
+            attribution_json:
+              evidence.attribution === undefined
+                ? null
+                : encodeProjectionJson(evidence.attribution),
+            scope_hash: evidence.scopeHash ?? null,
+            output_artifact_ids_json:
+              evidence.outputArtifactIds === undefined
+                ? null
+                : encodeProjectionJson(evidence.outputArtifactIds),
+          };
+          if (rows.length !== 1 || fingerprint(rows[0]) !== fingerprint(expectedRow))
+            return yield* deny("Joined review physical evidence changed");
+        });
+      const assertInputs = (projectId: string) =>
+        Effect.gen(function* () {
+          for (const evidence of inputEvidence) yield* assertEvidence(projectId, evidence);
+          if (applicability !== undefined) {
+            const rows =
+              yield* sql`SELECT * FROM project_team_evidence_applicability WHERE project_id=${projectId} AND record_id=${applicability.recordId}`;
+            const expectedRow = {
+              record_id: applicability.recordId,
+              project_id: projectId,
+              status: applicability.status,
+              revision: applicability.revision,
+              generation: applicability.generation,
+              updated_at: applicability.updatedAt,
+              task_id: applicability.taskId,
+              attempt_id: null,
+              member_id: null,
+              source_id: null,
+              scope_key: null,
+              slot: null,
+              unique_key: null,
+              provider_instance_id: null,
+              thread_id: null,
+              session_id: null,
+              payload_json: encodeProjectionJson(applicability),
+            };
+            if (rows.length !== 1 || fingerprint(rows[0]) !== fingerprint(expectedRow))
+              return yield* deny("Joined review physical verification applicability changed");
+          }
+          if (verification !== undefined) {
+            const original = verification.verification;
+            const retained = yield* verificationResults.readInTransaction({
+              jobId: original.jobId,
+              expectedManifestHash: original.manifestHash,
+            });
+            if (
+              retained._tag !== "Terminal" ||
+              retained.metadata.resultHash !== original.resultHash ||
+              retained.result.attemptId !== original.attemptId ||
+              retained.result.outcome !== original.outcome ||
+              retained.result.exitCode !== original.exitCode
+            )
+              return yield* deny("Joined review original verification result changed");
+          }
+        });
+      const assertProgressReceipt = (
+        projectId: string,
+        state: Effect.Success<ReturnType<typeof readCurrentState>>,
+      ) =>
+        Effect.gen(function* () {
+          const rows = yield* sql<
+            Record<string, unknown>
+          >`SELECT * FROM project_work_events WHERE project_id=${projectId} AND command_id=${joinedCommandId} ORDER BY sequence LIMIT 513`;
+          const commands = yield* sql<
+            Record<string, unknown>
+          >`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${joinedCommandId} LIMIT 2`;
+          // Historical settlements with no joined command grant no progress.
+          if (rows.length === 0 && commands.length === 0 && parentProgress === undefined) return;
+          const command = commands[0];
+          if (!command || commands.length !== 1 || rows.length === 0 || rows.length > 512)
+            return yield* deny("Joined review command receipt is missing or ambiguous");
+          const events = yield* Effect.try({
+            try: () =>
+              rows.map((row) => {
+                const event = decodeProjectWorkEvent(JSON.parse(String(row.payload_json)));
+                if (
+                  event.projectId !== projectId ||
+                  row.event_id !== event.eventId ||
+                  row.event_type !== event.type ||
+                  row.occurred_at !== event.occurredAt ||
+                  !Number.isSafeInteger(event.revision) ||
+                  event.revision <= 0 ||
+                  deadline(event.occurredAt) === undefined
+                )
+                  throw new Error("Invalid retained joined event metadata");
+                return event;
+              }),
+            catch: () => deny("Joined review retained events are invalid"),
+          });
+          const result = yield* decodeWriteResult(command.result_json).pipe(
+            Effect.mapError(() => deny("Joined review command result is invalid")),
+          );
+          const ids = yield* decodeEventIds(command.event_ids_json).pipe(
+            Effect.mapError(() => deny("Joined review command event IDs are invalid")),
+          );
+          const last = events[events.length - 1]!;
+          if (
+            command.actor_kind !== "system" ||
+            command.actor_id !== "project-team-runtime" ||
+            command.source_kind !== "system" ||
+            command.source_id !== "project-team-runtime" ||
+            typeof command.payload_fingerprint !== "string" ||
+            !/^[a-f0-9]{8}$/.test(command.payload_fingerprint) ||
+            (joinedFingerprint !== undefined &&
+              command.payload_fingerprint !== joinedFingerprint) ||
+            command.created_at !== events[0]!.occurredAt ||
+            events.some(
+              (event, i) =>
+                event.revision !== last.revision - events.length + i + 1 ||
+                event.occurredAt !== command.created_at,
+            ) ||
+            new Set(ids).size !== ids.length ||
+            fingerprint(ids) !== fingerprint(events.map((event) => event.eventId)) ||
+            result.projectId !== projectId ||
+            result.revision !== last.revision ||
+            result.receipt.commandId !== joinedCommandId ||
+            result.receipt.projectId !== projectId ||
+            result.receipt.status !== "accepted" ||
+            result.receipt.revision !== last.revision ||
+            result.receipt.eventCount !== events.length ||
+            result.delta.projectId !== projectId ||
+            result.delta.revision !== last.revision ||
+            fingerprint(result.delta.eventIds) !== fingerprint(ids)
+          )
+            return yield* deny("Joined review command receipt disagrees with its original events");
+          if (parentProgress !== undefined) {
+            const observed = events
+              .filter(
+                (event) =>
+                  (event.type === "project-work.evidence.added" &&
+                    event.evidence.evidenceId.startsWith("review-criterion-progress:")) ||
+                  (event.type === "project-work.criterion.upserted" &&
+                    parentCriteria.some(
+                      (criterion) => criterion.criterionId === event.criterion.criterionId,
+                    )),
+              )
+              .map(
+                ({ eventId: _eventId, projectId: _projectId, revision: _revision, ...draft }) =>
+                  draft,
+              );
+            if (fingerprint(observed) !== fingerprint(parentProgress))
+              return yield* deny("Joined review progress events differ from the prepared changes");
+          }
+          yield* Effect.try({
+            try: () =>
+              assertRetainedReviewCriterionProgress({
+                state,
+                events,
+                settlement: {
+                  commandId: joinedCommandId,
+                  commandFingerprint: String(command.payload_fingerprint),
+                  dispatchId: expected.dispatchId,
+                  joinedReceiptId: receipt.receiptId,
+                },
+              }),
+            catch: () => deny("Joined review immutable progress provenance changed"),
+          });
+          // Replay checks immutable evidence, while later criterion revisions remain legitimate.
+          for (const event of events) {
+            if (
+              event.type === "project-work.evidence.added" &&
+              event.evidence.evidenceId.startsWith("review-criterion-progress:")
+            )
+              yield* assertEvidence(projectId, event.evidence);
+          }
+        });
       const assertDomainSettled = Effect.gen(function* () {
         const value = yield* read(expected.dispatchId);
         yield* readStageHistory(value.row, value.intent);
@@ -1533,6 +1758,24 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           return yield* deny(
             "Joined settlement physical task or attempt disagrees with domain state",
           );
+        if (parentProgress !== undefined) {
+          for (const criterion of parentCriteria) {
+            const changed = parentProgress.find(
+              (draft) =>
+                draft.type === "project-work.criterion.upserted" &&
+                draft.criterion.criterionId === criterion.criterionId,
+            );
+            yield* assertCriterion(
+              value.row.project_id,
+              changed?.type === "project-work.criterion.upserted" ? changed.criterion : criterion,
+            );
+          }
+          for (const draft of parentProgress)
+            if (draft.type === "project-work.evidence.added")
+              yield* assertEvidence(value.row.project_id, draft.evidence);
+          yield* assertInputs(value.row.project_id);
+        }
+        yield* assertProgressReceipt(value.row.project_id, state);
       });
       let reviewTargetSnapshot: ProjectTeamDispatchSnapshot | undefined;
       yield* repository.executeAtomic(
@@ -1618,6 +1861,48 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
               ),
             },
           };
+          if (reviewCompletion?.status === "completed") {
+            joinedFingerprint = projectWorkCommandFingerprint(command);
+            parentProgress = yield* Effect.try({
+              try: () =>
+                prepareReviewCriterionProgress({
+                  state,
+                  completion: reviewCompletion,
+                  settlementCommandId: joinedCommandId,
+                  settlementCommandFingerprint: joinedFingerprint!,
+                  at,
+                }),
+              catch: () => deny("Joined review parent progress cannot be prepared"),
+            });
+            const snapshots = reviewCompletion.parentAssessments?.snapshots ?? [];
+            const criterionIds = new Set(snapshots.map((snapshot) => snapshot.criterion.id));
+            parentCriteria = state.criteria.filter((criterion) =>
+              criterionIds.has(criterion.criterionId),
+            );
+            const evidenceIds = new Set(
+              snapshots.flatMap((snapshot) => snapshot.evidence.map((evidence) => evidence.id)),
+            );
+            verification = snapshots.length === 0 ? undefined : reviewCompletion.parentAssessments;
+            const originalVerification = verification?.verification;
+            if (originalVerification?.evidenceId !== undefined)
+              evidenceIds.add(originalVerification.evidenceId);
+            inputEvidence = state.evidence.filter((evidence) =>
+              evidenceIds.has(evidence.evidenceId),
+            );
+            applicability =
+              originalVerification?.applicabilityId === undefined
+                ? undefined
+                : state.foundationRecords?.find(
+                    (
+                      record,
+                    ): record is Extract<ProjectTeamRecord, { kind: "evidence-applicability" }> =>
+                      record.kind === "evidence-applicability" &&
+                      record.recordId === originalVerification.applicabilityId,
+                  );
+            for (const criterion of parentCriteria)
+              yield* assertCriterion(original.row.project_id, criterion);
+            yield* assertInputs(original.row.project_id);
+          }
           return [command];
         }),
         assertDomainSettled.pipe(

@@ -17,6 +17,7 @@ import {
   assertNoActiveAttempt,
   deriveProjectWorkClaimPrerequisites,
   ProjectWorkPolicyError,
+  projectWorkCommandFingerprint,
 } from "./ProjectWorkPolicy.ts";
 import {
   assertProjectTeamRunAuthority,
@@ -27,6 +28,7 @@ import {
   projectTeamDerivedRecordId,
 } from "./ProjectTeamPolicy.ts";
 import { projectTeamRepairHash } from "./ProjectTeamGuidedLifecycle.ts";
+import { prepareReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
 
 const isReviewCompletionProof = Schema.is(ProjectTeamReviewCompletionProof);
 
@@ -483,7 +485,20 @@ export const decideProjectTeamGuidedTransition = (
         )
           reject("Joined reviewer outputs or original report identity changed");
       }
+      const parentProgress =
+        completion?.status === "completed"
+          ? prepareReviewCriterionProgress({
+              state,
+              completion,
+              settlementCommandId: String(command.commandId),
+              settlementCommandFingerprint: projectWorkCommandFingerprint(command),
+              at,
+            })
+          : [];
       const revisions = [
+        ...parentProgress.flatMap((draft) =>
+          draft.type === "project-work.criterion.upserted" ? [draft.criterion.revision - 1] : [],
+        ),
         run!.revision,
         ...effects.map((r) => r.revision),
         ...writers.map((r) => r.revision),
@@ -501,6 +516,7 @@ export const decideProjectTeamGuidedTransition = (
         reject("Joined review attention task revision is exhausted");
       const eventCount =
         1 +
+        parentProgress.length +
         writers.length +
         effects.length +
         (completion?.status === "completed"
@@ -577,6 +593,7 @@ export const decideProjectTeamGuidedTransition = (
             attribution: completion.reportAttribution,
           },
         });
+        for (const draft of parentProgress) emit(draft);
         emit({
           type: "project-work.task.completed",
           taskId: task.taskId,

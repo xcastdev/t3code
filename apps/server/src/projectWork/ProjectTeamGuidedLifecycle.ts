@@ -1,3 +1,4 @@
+import { invalidateReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
 import {
   ProjectWorkTaskId,
   ProjectWorkCriterionId,
@@ -1277,6 +1278,11 @@ export const decideProjectTeamGuidedLifecycle = (
       }
       break;
     }
+  }
+  for (const draft of invalidateReviewCriterionProgress({ state, at })) {
+    if (!Number.isSafeInteger(initial.revision + events.length + 1))
+      reject("Review criterion invalidation revision is exhausted");
+    emit(draft);
   }
   return events;
 };

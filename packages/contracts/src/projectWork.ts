@@ -1380,6 +1380,56 @@ export const ProjectTeamReviewCompletionDenialReason = Schema.Literals([
   "dependency-incomplete",
   "invalid-proof",
 ]);
+const ReviewParentAssessmentSnapshot = Schema.Struct({
+  assessmentSha256: ReviewProofDigest,
+  projectId: GuidedId,
+  taskId: GuidedId,
+  target: ProjectTeamReviewFinding.fields.target,
+  parentScopeHash: GuidedId,
+  criterion: ReviewProofSnapshot,
+  evidence: Schema.Array(
+    Schema.Struct({
+      ...ReviewProofSnapshot.fields,
+      taskId: GuidedId,
+      criterionId: Schema.optionalKey(GuidedId),
+      scopeHash: GuidedId,
+    }),
+  ).check(
+    Schema.isMaxLength(64),
+    Schema.makeFilter((values) => new Set(values.map((value) => value.id)).size === values.length),
+  ),
+});
+const ReviewParentAssessments = Schema.Struct({
+  snapshots: Schema.Array(ReviewParentAssessmentSnapshot).check(
+    Schema.isMaxLength(64),
+    Schema.makeFilter(
+      (values) => new Set(values.map((value) => value.criterion.id)).size === values.length,
+    ),
+  ),
+  verification: Schema.Struct({
+    environmentId: GuidedId,
+    jobId: GuidedId,
+    manifestHash: ReviewProofDigest,
+    attemptId: GuidedId,
+    resultHash: ReviewProofDigest,
+    outcome: Schema.Literals([
+      "success",
+      "failed",
+      "timed-out",
+      "overflow",
+      "canceled",
+      "revoked",
+      "abandoned",
+    ]),
+    exitCode: Schema.NullOr(
+      Schema.Int.check(
+        Schema.isBetween({ minimum: Number.MIN_SAFE_INTEGER, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+    ),
+    evidenceId: Schema.optionalKey(GuidedId),
+    applicabilityId: Schema.optionalKey(GuidedId),
+  }),
+});
 /** Private joined settlement carries retained child proof, never an approval grant. */
 export const ProjectTeamReviewCompletionProof = Schema.Union([
   Schema.Struct({
@@ -1421,6 +1471,7 @@ export const ProjectTeamReviewCompletionProof = Schema.Union([
     findings: Schema.Array(
       Schema.Struct({ findingId: GuidedId, revision: JoinedRunCounter, sha256: ReviewProofDigest }),
     ).check(Schema.isMaxLength(256)),
+    parentAssessments: Schema.optionalKey(ReviewParentAssessments),
   }),
   Schema.Struct({
     status: Schema.Literal("denied"),
