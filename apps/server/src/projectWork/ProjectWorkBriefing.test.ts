@@ -4,11 +4,14 @@ import {
   ProjectWorkDecisionId,
   ProjectWorkKnowledgeId,
   ProjectWorkTaskId,
+  ProjectWorkWriteIntent,
+  ProjectWorkBriefing as BriefingRecord,
   type ProjectWorkAttribution,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
@@ -22,9 +25,84 @@ import {
 import { ProjectWorkQuery, ProjectWorkQueryLive } from "./ProjectWorkQuery.ts";
 import type { ProjectWorkSnapshot } from "./ProjectWorkQuery.ts";
 import { ProjectWorkRepository, ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
+import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
+import { gatewayRuntime } from "./ProjectTeamAuthorization.testFixtures.ts";
 
 const at = "2026-01-01T00:00:00.000Z";
 const projectId = ProjectId.make("briefing-project");
+const decodeBriefingIntent = Schema.decodeUnknownEffect(ProjectWorkWriteIntent, {
+  onExcessProperty: "error",
+});
+const decodeBriefingRecord = Schema.decodeUnknownEffect(BriefingRecord);
+
+const correctionFixture = Effect.fn("briefingTest.correctionFixture")(function* () {
+  const gateway = yield* ProjectWorkGateway;
+  const sql = yield* SqlClient.SqlClient;
+  const briefing = yield* ProjectWorkBriefing;
+  const query = yield* ProjectWorkQuery;
+  const owner = ProjectId.make("briefing-correction-project");
+  const actor = { kind: "human" as const, id: "correction-maintainer" };
+  const source = { kind: "web" as const, id: "correction-browser" };
+  const write = (input: unknown) =>
+    decodeBriefingIntent(input).pipe(
+      Effect.flatMap((intent) => gateway.write(intent, actor, source)),
+    );
+  yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+    VALUES (${owner},'Corrections','/corrections','[]',${at},${at})`;
+  yield* write({
+    type: "project-work.task.create",
+    projectId: owner,
+    commandId: "correction-task-create",
+    taskId: "correction-task",
+    title: "Keep the required task",
+    createdAt: at,
+  });
+  yield* write({
+    type: "project-work.decision.propose",
+    projectId: owner,
+    commandId: "correction-decision-propose",
+    proposedAt: at,
+    decision: {
+      decisionId: "correction-decision",
+      projectId: owner,
+      title: "Keep the accepted constraint",
+      body: "Required decisions survive optional knowledge failures.",
+      state: "proposed",
+      revision: 0,
+      createdAt: at,
+      updatedAt: at,
+    },
+  });
+  yield* write({
+    type: "project-work.decision.accept",
+    projectId: owner,
+    commandId: "correction-decision-accept",
+    decisionId: "correction-decision",
+    acceptedAt: at,
+  });
+  const promote = (id: string, previous?: string, updatedAt = at, createdAt = at) =>
+    write({
+      type: "project-work.knowledge.promote",
+      projectId: owner,
+      commandId: "correction-promote-" + id,
+      promotedAt: at,
+      knowledge: {
+        knowledgeId: id,
+        projectId: owner,
+        title: id,
+        body: "Body for " + id,
+        sourceKind: "manual",
+        sourceId: actor.id,
+        revision: 0,
+        createdAt,
+        updatedAt,
+        ...(previous === undefined ? {} : { supersedesKnowledgeId: previous }),
+      },
+    });
+  return { gateway, sql, briefing, query, owner, promote };
+});
+const withCorrectionGateway = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
 
 const snapshot = (taskCount: number): ProjectWorkSnapshot => ({
   projectId,
@@ -103,6 +181,228 @@ describe("ProjectWorkBriefing", () => {
 });
 
 const sqlLayer = it.layer(NodeSqliteClient.layerMemory());
+
+describe("current knowledge briefing", () => {
+  it.effect(
+    "retains only the terminal correction through Gateway reads before display truncation",
+    () =>
+      withCorrectionGateway(
+        Effect.gen(function* () {
+          const f = yield* correctionFixture();
+          yield* f.promote("correction-a", undefined, "2026-01-03T00:00:00.000Z");
+          yield* f.promote("correction-b", "correction-a");
+          yield* f.promote("correction-c", "correction-b");
+          const bounded = yield* f.briefing.generate({
+            projectId: f.owner,
+            kind: "compact",
+            maxKnowledge: 1,
+          });
+          expect(bounded.includedKnowledgeIds).toEqual(["correction-c"]);
+          expect(bounded.text).toContain("Body for correction-c");
+          expect(bounded.text).not.toContain("Body for correction-a");
+          expect(bounded.text).not.toContain("Body for correction-b");
+          expect(bounded.omittedReasons).not.toContain("knowledge-bound");
+          const remote = yield* f.gateway
+            .read({ projectId: f.owner, operation: "briefing", kind: "compact" })
+            .pipe(Effect.flatMap(decodeBriefingRecord));
+          expect(remote.includedKnowledgeIds).toEqual(["correction-c"]);
+          expect(remote.text).toContain("Keep the required task");
+          expect(remote.text).toContain("Keep the accepted constraint");
+          expect(
+            (yield* f.query.listKnowledge({ projectId: f.owner }))
+              .map((record) => record.knowledgeId)
+              .toSorted(),
+          ).toEqual(["correction-a", "correction-b", "correction-c"]);
+        }),
+      ),
+  );
+
+  it.effect("preserves valid offset timestamps in selected knowledge records", () =>
+    withCorrectionGateway(
+      Effect.gen(function* () {
+        const f = yield* correctionFixture();
+        const createdAt = "2025-12-31T19:00:00-05:00";
+        const updatedAt = "2026-01-01T02:30:00+02:30";
+        yield* f.promote("correction-offset", undefined, updatedAt, createdAt);
+        const current = yield* f.query.briefingSnapshot(f.owner, 2);
+        expect(current.knowledge).toHaveLength(1);
+        expect(current.knowledge[0]?.createdAt).toBe(createdAt);
+        expect(current.knowledge[0]?.updatedAt).toBe(updatedAt);
+        expect(current.knowledgeOmittedReason).toBeUndefined();
+        const result = yield* f.briefing.generate({ projectId: f.owner, kind: "compact" });
+        expect(result.includedKnowledgeIds).toEqual(["correction-offset"]);
+        expect(result.text).toContain("Body for correction-offset");
+        expect(result.text).toContain("Keep the required task");
+        expect(result.text).toContain("Keep the accepted constraint");
+      }),
+    ),
+  );
+
+  for (const invalid of ["missing", "foreign", "self", "fork", "cycle"] as const) {
+    it.effect(
+      `omits ${invalid} correction history while preserving required task and decisions`,
+      () =>
+        withCorrectionGateway(
+          Effect.gen(function* () {
+            const f = yield* correctionFixture();
+            if (invalid === "foreign") {
+              const foreign = ProjectId.make("foreign-correction-project");
+              yield* f.sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+            VALUES (${foreign},'Foreign','/foreign','[]',${at},${at})`;
+              yield* f.sql`INSERT INTO project_work_knowledge
+            (knowledge_id,project_id,title,body,source_kind,source_id,revision,created_at,updated_at)
+            VALUES ('foreign-knowledge',${foreign},'Foreign body','Private knowledge','manual','human',0,${at},${at})`;
+              yield* f.promote("correction-a", "foreign-knowledge");
+            } else if (invalid === "missing") yield* f.promote("correction-a", "absent-knowledge");
+            else if (invalid === "self") yield* f.promote("correction-a", "correction-a");
+            else if (invalid === "fork") {
+              yield* f.promote("correction-a");
+              yield* f.promote("correction-b", "correction-a");
+              yield* f.promote("correction-c", "correction-a");
+            } else {
+              yield* f.promote("correction-a", "correction-b");
+              yield* f.promote("correction-b", "correction-a");
+            }
+            const result = yield* f.briefing.generate({ projectId: f.owner, kind: "compact" });
+            expect(result.includedKnowledgeIds).toEqual([]);
+            expect(result.omittedReasons).toContain("knowledge-closure-invalid");
+            expect(result.text).toContain("Knowledge omitted");
+            expect(result.text).toContain("Keep the required task");
+            expect(result.text).toContain("Keep the accepted constraint");
+            expect(result.text).not.toContain("Body for correction-a");
+            expect(result.text).not.toContain("Private knowledge");
+          }),
+        ),
+    );
+  }
+
+  for (const field of [
+    "source",
+    "createdAt",
+    "updatedAt",
+    "attribution",
+    "revision",
+    "body-bound",
+    "metadata-bound",
+    "revision-bound",
+  ] as const) {
+    it.effect(`degrades ${field} knowledge corruption without hiding required briefing`, () =>
+      withCorrectionGateway(
+        Effect.gen(function* () {
+          const f = yield* correctionFixture();
+          yield* f.promote("correction-a");
+          if (field === "source")
+            yield* f.sql`UPDATE project_work_knowledge SET source_kind='unknown' WHERE project_id=${f.owner}`;
+          else if (field === "createdAt")
+            yield* f.sql`UPDATE project_work_knowledge SET created_at='not-a-time' WHERE project_id=${f.owner}`;
+          else if (field === "updatedAt")
+            yield* f.sql`UPDATE project_work_knowledge SET updated_at='not-a-time' WHERE project_id=${f.owner}`;
+          else if (field === "attribution")
+            yield* f.sql`UPDATE project_work_knowledge SET attribution_json='{}' WHERE project_id=${f.owner}`;
+          else if (field === "revision")
+            yield* f.sql`UPDATE project_work_knowledge SET revision='invalid-revision' WHERE project_id=${f.owner}`;
+          else if (field === "body-bound")
+            yield* f.sql`UPDATE project_work_knowledge SET body=${"x".repeat(262145)} WHERE project_id=${f.owner}`;
+          else if (field === "revision-bound")
+            yield* f.sql`UPDATE project_work_knowledge SET revision=${"x".repeat(262145)} WHERE project_id=${f.owner}`;
+          else
+            yield* f.sql`UPDATE project_work_knowledge SET source_id=${"x".repeat(262145)} WHERE project_id=${f.owner}`;
+          const physical = yield* f.sql<{
+            sourceKind: string;
+            createdAt: string;
+            updatedAt: string;
+            attribution: string;
+            bodyBytes: number;
+            sourceBytes: number;
+            revisionType: string;
+            revisionBytes: number;
+          }>`SELECT source_kind AS sourceKind,created_at AS createdAt,updated_at AS updatedAt,
+          attribution_json AS attribution,length(CAST(body AS BLOB)) AS bodyBytes,length(CAST(source_id AS BLOB)) AS sourceBytes
+          ,typeof(revision) AS revisionType,length(CAST(revision AS BLOB)) AS revisionBytes
+          FROM project_work_knowledge WHERE knowledge_id='correction-a' AND project_id=${f.owner}`;
+          expect(physical).toHaveLength(1);
+          if (field === "source") expect(physical[0]?.sourceKind).toBe("unknown");
+          else if (field === "createdAt") expect(physical[0]?.createdAt).toBe("not-a-time");
+          else if (field === "updatedAt") expect(physical[0]?.updatedAt).toBe("not-a-time");
+          else if (field === "attribution") expect(physical[0]?.attribution).toBe("{}");
+          else if (field === "revision" || field === "revision-bound") {
+            expect(physical[0]?.revisionType).toBe("text");
+            expect(physical[0]?.revisionBytes).toBe(
+              field === "revision-bound" ? 262145 : "invalid-revision".length,
+            );
+          } else if (field === "body-bound") expect(physical[0]?.bodyBytes).toBe(262145);
+          else expect(physical[0]?.sourceBytes).toBe(262145);
+          const result = yield* f.briefing.generate({ projectId: f.owner, kind: "compact" });
+          expect(result.includedKnowledgeIds).toEqual([]);
+          expect(result.omittedReasons).toContain(
+            field.endsWith("bound") ? "knowledge-closure-bound" : "knowledge-unavailable",
+          );
+          expect(result.text).toContain("Keep the required task");
+          expect(result.text).toContain("Keep the accepted constraint");
+        }),
+      ),
+    );
+  }
+
+  it.effect("omits overfull knowledge closure independently of the display count", () =>
+    withCorrectionGateway(
+      Effect.gen(function* () {
+        const f = yield* correctionFixture();
+        yield* f.sql`WITH RECURSIVE generated(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM generated WHERE value<257)
+        INSERT INTO project_work_knowledge (knowledge_id,project_id,title,body,source_kind,source_id,revision,created_at,updated_at)
+        SELECT printf('overflow-%03d',value),${f.owner},'Overflow','Optional body','manual','human',0,${at},${at} FROM generated`;
+        const result = yield* f.briefing.generate({
+          projectId: f.owner,
+          kind: "compact",
+          maxKnowledge: 1,
+        });
+        expect(result.includedKnowledgeIds).toEqual([]);
+        expect(result.omittedReasons).toContain("knowledge-closure-bound");
+        expect(result.text).toContain("Keep the required task");
+        expect(result.text).toContain("Keep the accepted constraint");
+      }),
+    ),
+  );
+
+  it.effect("omits unavailable knowledge storage while surfacing required storage failures", () =>
+    withCorrectionGateway(
+      Effect.gen(function* () {
+        const f = yield* correctionFixture();
+        yield* f.sql`DROP TABLE project_work_knowledge`;
+        const result = yield* f.briefing.generate({ projectId: f.owner, kind: "compact" });
+        expect(result.includedKnowledgeIds).toEqual([]);
+        expect(result.omittedReasons).toContain("knowledge-unavailable");
+        expect(result.text).toContain("Keep the required task");
+        expect(result.text).toContain("Keep the accepted constraint");
+        yield* f.sql`DROP TABLE project_work_decisions`;
+        expect(
+          (yield* f.briefing.generate({ projectId: f.owner, kind: "compact" }).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+      }),
+    ),
+  );
+
+  it("omits duplicate and incomplete private snapshot closures without a timestamp winner", () => {
+    const base = snapshot(1);
+    const record = base.knowledge[0];
+    expect(record).toBeDefined();
+    if (record === undefined) return;
+    for (const invalid of [
+      { ...base, knowledge: [record, { ...record, updatedAt: "2026-01-02T00:00:00.000Z" }] },
+      { ...base, knowledgeOmittedReason: "knowledge-closure-bound" },
+    ]) {
+      const result = buildProjectWorkBriefing(invalid, {
+        projectId,
+        kind: "compact",
+        generatedAt: at,
+      });
+      expect(result.includedKnowledgeIds).toEqual([]);
+      expect(result.text).toContain("Task 0");
+      expect(result.text).toContain("Knowledge omitted");
+    }
+  });
+});
 
 sqlLayer("ProjectWorkBriefing service", (it) => {
   it.effect("bounds accepted decisions independently and excludes other projects and states", () =>

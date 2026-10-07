@@ -1,4 +1,5 @@
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
+import { selectCurrentProjectWorkKnowledge } from "./ProjectWorkKnowledgeSelection.ts";
 import {
   canonicalProjectWorkPayload,
   ProjectTeamRecord as TeamRecordSchema,
@@ -721,27 +722,13 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       )
         return yield* deny("Knowledge projection disagrees with its original events");
     }
-    const records = new Map(retained.map((record) => [record.knowledgeId, record]));
-    const replacements = new Map<string, string>();
-    for (const record of retained) {
-      const previous = record.supersedesKnowledgeId;
-      if (previous === undefined) continue;
-      if (previous === record.knowledgeId || !records.has(previous) || replacements.has(previous))
-        return yield* deny("Knowledge replacement closure is missing or ambiguous");
-      replacements.set(previous, record.knowledgeId);
-    }
-    for (const record of retained) {
-      const seen = new Set<string>();
-      let id: string | undefined = record.knowledgeId;
-      while (id !== undefined) {
-        if (seen.has(id)) return yield* deny("Knowledge replacement closure contains a cycle");
-        seen.add(id);
-        id = replacements.get(id);
-      }
-    }
-    const terminals = retained
-      .filter((record) => !replacements.has(record.knowledgeId))
-      .sort((a, b) => a.knowledgeId.localeCompare(b.knowledgeId));
+    const selection = selectCurrentProjectWorkKnowledge({
+      projectId: state.projectId,
+      records: retained,
+      complete: true,
+    });
+    if (selection.status === "degraded") return yield* deny(selection.reason);
+    const terminals = selection.records;
     if (terminals.length > 12) return yield* deny("Current knowledge selection exceeds bounds");
     if (Buffer.byteLength(canonicalProjectWorkPayload(terminals), "utf8") > 8192)
       return yield* deny("Current knowledge selection exceeds its UTF8 bound");

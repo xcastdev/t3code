@@ -15,7 +15,9 @@ import {
   ProjectWorkQuery,
   type ProjectWorkQueryShape,
   type ProjectWorkSnapshot,
+  type ProjectWorkBriefingSnapshot,
 } from "./ProjectWorkQuery.ts";
+import { selectCurrentProjectWorkKnowledge } from "./ProjectWorkKnowledgeSelection.ts";
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
 
 export interface ProjectWorkBriefingInput {
@@ -92,8 +94,10 @@ const sortTasks = (snapshot: ProjectWorkSnapshot): ReadonlyArray<ProjectWorkTask
   });
 };
 
-const sortKnowledge = (snapshot: ProjectWorkSnapshot): ReadonlyArray<ProjectWorkKnowledge> =>
-  [...snapshot.knowledge].sort((left, right) => {
+const sortKnowledge = (
+  records: readonly ProjectWorkKnowledge[],
+): ReadonlyArray<ProjectWorkKnowledge> =>
+  records.toSorted((left, right) => {
     const timeDelta = compareDescendingTime(left.updatedAt, right.updatedAt);
     return timeDelta !== 0
       ? timeDelta
@@ -170,12 +174,20 @@ const clipTo = (value: string, maxCharacters: number): string => {
  * can never make the structured context unavailable.
  */
 export const buildProjectWorkBriefing = (
-  snapshot: ProjectWorkSnapshot,
+  snapshot: ProjectWorkBriefingSnapshot,
   input: ProjectWorkBriefingInput,
 ): ProjectWorkBriefingRecord => {
   const limits = limitsFor(input);
   const tasks = sortTasks(snapshot);
-  const knowledge = sortKnowledge(snapshot);
+  const selectedKnowledge = selectCurrentProjectWorkKnowledge({
+    projectId: input.projectId,
+    records: snapshot.knowledge,
+    complete: snapshot.knowledgeOmittedReason === undefined,
+  });
+  const knowledge = sortKnowledge(selectedKnowledge.records);
+  const knowledgeOmittedReason =
+    snapshot.knowledgeOmittedReason ??
+    (selectedKnowledge.status === "degraded" ? selectedKnowledge.reason : undefined);
   const decisions = snapshot.decisions
     .filter(
       (decision) => decision.state === "accepted" && String(decision.projectId) === input.projectId,
@@ -186,7 +198,8 @@ export const buildProjectWorkBriefing = (
         ? timeDelta
         : String(left.decisionId).localeCompare(String(right.decisionId));
     });
-  const omittedReasons: Array<string> = [];
+  const omittedReasons: Array<string> =
+    knowledgeOmittedReason === undefined ? [] : [knowledgeOmittedReason];
   const includedTaskIds: Array<ProjectWorkTaskId> = [];
   const includedKnowledgeIds: Array<ProjectWorkKnowledgeId> = [];
   const lines: Array<string> = [
@@ -229,6 +242,15 @@ export const buildProjectWorkBriefing = (
     }
     if (decisions.length > limits.maxKnowledge) omittedReasons.push("decision-bound");
   }
+  if (
+    knowledgeOmittedReason !== undefined &&
+    !appendWithinLimit(
+      lines,
+      "Knowledge omitted: current replacement history is unavailable.",
+      limits.maxCharacters,
+    )
+  )
+    omittedReasons.push("character-bound");
   const text = clipTo(lines.join("\n"), limits.maxCharacters);
   // The service boundary supplies current time; pure callers should pass a
   // timestamp explicitly when they need byte-for-byte reproducibility.
@@ -267,9 +289,8 @@ const makeProjectWorkBriefing = Effect.gen(function* () {
   const query = yield* ProjectWorkQuery;
   const generate: ProjectWorkBriefingShape["generate"] = (input) =>
     query
-      // Keep one trusted sentinel through rendering so an exact boundary and
-      // a truncated result remain distinguishable for knowledge and decisions,
-      // including maxKnowledge=0.
+      // Decisions retain a display-count sentinel. Knowledge validates its
+      // complete bounded replacement closure independently of display count.
       .briefingSnapshot(input.projectId, limitsFor(input).maxKnowledge + 1)
       .pipe(Effect.map((snapshot) => buildProjectWorkBriefing(snapshot, input)));
   return {

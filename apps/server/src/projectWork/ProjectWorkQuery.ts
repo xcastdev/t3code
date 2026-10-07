@@ -1,5 +1,11 @@
 import { readProjectTeamPage } from "./ProjectTeamsPersistence.ts";
-import { ProjectTeamRunBinding, ProjectTeamRecordRead } from "@t3tools/contracts";
+import {
+  ProjectTeamRunBinding,
+  ProjectTeamRecordRead,
+  ProjectWorkKnowledge,
+  ProjectWorkAttribution,
+} from "@t3tools/contracts";
+import { PROJECT_WORK_KNOWLEDGE_CLOSURE_LIMIT } from "./ProjectWorkKnowledgeSelection.ts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -24,7 +30,6 @@ import {
   type ProjectWorkEvidence,
   type ProjectWorkRelationship,
   type ProjectWorkBlocker,
-  type ProjectWorkKnowledge,
   type ProjectWorkDecision,
   type ProjectWorkComment,
   type ProjectWorkAttention,
@@ -42,6 +47,14 @@ const encodeFoundationPage = Schema.encodeEffect(
   Schema.fromJsonString(Schema.Array(ProjectTeamRecordRead)),
 );
 const decodeRunBindingJson = Schema.decodeEffect(Schema.fromJsonString(ProjectTeamRunBinding));
+const decodeBriefingKnowledge = Schema.decodeUnknownEffect(ProjectWorkKnowledge, {
+  onExcessProperty: "error",
+});
+const decodeBriefingDateTime = Schema.decodeUnknownEffect(Schema.DateTimeUtcFromString);
+const decodeBriefingAttribution = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectWorkAttribution),
+  { onExcessProperty: "error" },
+);
 
 export interface ProjectWorkTaskQuery extends ProjectWorkRecordQuery {
   readonly state?: string;
@@ -83,6 +96,16 @@ export interface ProjectWorkExportSnapshot {
   readonly foundationRecords?: ReadonlyArray<ProjectTeamRecordRead>;
   readonly history?: ReadonlyArray<unknown>;
 }
+
+export interface ProjectWorkBriefingSnapshot extends ProjectWorkSnapshot {
+  readonly knowledgeOmittedReason?: string;
+}
+
+interface BriefingKnowledge {
+  readonly records: readonly ProjectWorkKnowledge[];
+  readonly reason?: string;
+}
+const omittedBriefingKnowledge = (reason: string): BriefingKnowledge => ({ records: [], reason });
 
 export interface ProjectWorkQueryShape {
   readonly getRunBindingForSession: (input: {
@@ -186,7 +209,7 @@ export interface ProjectWorkQueryShape {
   readonly briefingSnapshot: (
     projectId: string,
     maxKnowledge: number,
-  ) => Effect.Effect<ProjectWorkSnapshot, ProjectionRepositoryError>;
+  ) => Effect.Effect<ProjectWorkBriefingSnapshot, ProjectionRepositoryError>;
   readonly getSnapshot: (
     projectId: string,
   ) => Effect.Effect<ProjectWorkSnapshot, ProjectionRepositoryError>;
@@ -771,6 +794,74 @@ const makeProjectWorkQuery = Effect.gen(function* () {
       .withTransaction(readSnapshot(projectId))
       .pipe(Effect.mapError((cause) => toPersistenceSqlError("ProjectWorkQuery.snapshot")(cause)));
 
+  const readBriefingKnowledge = Effect.fn("ProjectWorkQuery.readBriefingKnowledge")(
+    function* (projectId: string) {
+      const rowLimit = PROJECT_WORK_KNOWLEDGE_CLOSURE_LIMIT + 1;
+      const maximumRowBytes = 262144;
+      const metadata = yield* sql<{ bytes: number }>`SELECT
+        length(CAST(knowledge_id AS BLOB))+length(CAST(project_id AS BLOB))+length(CAST(title AS BLOB))+length(CAST(body AS BLOB))+
+        length(CAST(source_kind AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(revision AS BLOB))+COALESCE(length(CAST(supersedes_knowledge_id AS BLOB)),0)+
+        length(CAST(created_at AS BLOB))+length(CAST(updated_at AS BLOB))+COALESCE(length(CAST(attribution_json AS BLOB)),0) AS bytes
+        FROM project_work_knowledge WHERE project_id=${projectId} ORDER BY knowledge_id LIMIT ${rowLimit}`;
+      if (
+        metadata.length > PROJECT_WORK_KNOWLEDGE_CLOSURE_LIMIT ||
+        metadata.some(
+          (row) =>
+            !Number.isSafeInteger(row.bytes) || row.bytes <= 0 || row.bytes > maximumRowBytes,
+        ) ||
+        metadata.reduce((total, row) => total + row.bytes, 0) > 16777216
+      )
+        return omittedBriefingKnowledge("knowledge-closure-bound");
+      const rows = yield* sql<{
+        knowledgeId: string;
+        projectId: string;
+        title: string | null;
+        body: string | null;
+        sourceKind: string;
+        sourceId: string;
+        revision: number;
+        supersedesKnowledgeId: string | null;
+        createdAt: string;
+        updatedAt: string;
+        attribution: string | null;
+      }>`SELECT knowledge_id AS knowledgeId,project_id AS projectId,source_kind AS sourceKind,source_id AS sourceId,revision,
+        supersedes_knowledge_id AS supersedesKnowledgeId,created_at AS createdAt,updated_at AS updatedAt,
+        CASE WHEN length(CAST(title AS BLOB))<=${maximumRowBytes} THEN title END AS title,
+        CASE WHEN length(CAST(body AS BLOB))<=${maximumRowBytes} THEN body END AS body,
+        CASE WHEN length(CAST(attribution_json AS BLOB))<=${maximumRowBytes} THEN attribution_json END AS attribution
+        FROM project_work_knowledge WHERE project_id=${projectId} ORDER BY knowledge_id LIMIT ${rowLimit}`;
+      if (rows.length !== metadata.length)
+        return omittedBriefingKnowledge("knowledge-closure-invalid");
+      const records = yield* Effect.forEach(
+        rows,
+        Effect.fn("ProjectWorkQuery.decodeBriefingKnowledge")(function* (row) {
+          yield* decodeBriefingDateTime(row.createdAt);
+          yield* decodeBriefingDateTime(row.updatedAt);
+          return yield* decodeBriefingKnowledge({
+            knowledgeId: row.knowledgeId,
+            projectId: row.projectId,
+            title: row.title,
+            body: row.body,
+            sourceKind: row.sourceKind,
+            sourceId: row.sourceId,
+            revision: row.revision,
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+            ...(row.supersedesKnowledgeId === null
+              ? {}
+              : { supersedesKnowledgeId: row.supersedesKnowledgeId }),
+            ...(row.attribution === null
+              ? {}
+              : { attribution: yield* decodeBriefingAttribution(row.attribution) }),
+          });
+        }),
+      );
+      const result: BriefingKnowledge = { records };
+      return result;
+    },
+    Effect.catch(() => Effect.succeed(omittedBriefingKnowledge("knowledge-unavailable"))),
+  );
+
   const briefingSnapshot: ProjectWorkQueryShape["briefingSnapshot"] = (projectId, maxKnowledge) =>
     sql
       .withTransaction(
@@ -781,7 +872,7 @@ const makeProjectWorkQuery = Effect.gen(function* () {
           criteria: listCriteria({ projectId, trusted: true }),
           blockers: listBlockers({ projectId, trusted: true }),
           attention: listAttention({ projectId, trusted: true }),
-          knowledge: listKnowledge({ projectId, limit: maxKnowledge, trusted: true }),
+          knowledge: readBriefingKnowledge(projectId),
           decisions: listDecisions({
             projectId,
             state: "accepted",
@@ -789,9 +880,11 @@ const makeProjectWorkQuery = Effect.gen(function* () {
             trusted: true,
           }),
         }).pipe(
-          Effect.map((value) => ({
+          Effect.map(({ knowledge, ...value }) => ({
             projectId,
             ...value,
+            knowledge: knowledge.records,
+            ...(knowledge.reason === undefined ? {} : { knowledgeOmittedReason: knowledge.reason }),
             evidence: [],
             relationships: [],
             activities: [],

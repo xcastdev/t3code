@@ -22,6 +22,7 @@ import {
   OrchestrationThreadShell,
   ProjectId,
   ProjectWorkDecisionId,
+  ProjectWorkKnowledgeId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -6092,6 +6093,52 @@ describe("durable project-work provider envelope", () => {
         assert(!replacementContext.briefing.includes(original.title));
         assert(!replacementContext.briefing.includes(original.body));
         assert.equal(replacementContext.narrative, undefined);
+        const promote = (id: string, previous?: string, updatedAt = at) =>
+          repository.execute({
+            type: "project-work.knowledge.promote",
+            commandId: CommandId.make("provider-knowledge-promote-" + id),
+            projectId,
+            knowledge: {
+              knowledgeId: ProjectWorkKnowledgeId.make(id),
+              projectId,
+              title: id,
+              body: "Knowledge body for " + id,
+              sourceKind: "manual",
+              sourceId: attribution.actor.id,
+              revision: 0,
+              createdAt: at,
+              updatedAt,
+              ...(previous === undefined
+                ? {}
+                : { supersedesKnowledgeId: ProjectWorkKnowledgeId.make(previous) }),
+            },
+            promotedAt: at,
+            attribution,
+          });
+        yield* promote("provider-knowledge-a", undefined, "2026-01-03T00:00:00.000Z");
+        yield* provider.startSession(threadId, input);
+        const firstKnowledgeContext = codex.startSession.mock.calls[2]?.[0].projectWork;
+        assert(firstKnowledgeContext);
+        assert(firstKnowledgeContext.briefing.includes("Knowledge body for provider-knowledge-a"));
+        yield* promote("provider-knowledge-b", "provider-knowledge-a");
+        yield* promote("provider-knowledge-c", "provider-knowledge-b");
+        yield* provider.startSession(threadId, input);
+        const correctedContext = codex.startSession.mock.calls[3]?.[0].projectWork;
+        assert(correctedContext);
+        assert(correctedContext.briefing.includes("Knowledge body for provider-knowledge-c"));
+        assert(!correctedContext.briefing.includes("Knowledge body for provider-knowledge-a"));
+        assert(!correctedContext.briefing.includes("Knowledge body for provider-knowledge-b"));
+        assert(correctedContext.briefing.includes("Move both clients to the replacement parser."));
+        assert.equal(correctedContext.narrative, undefined);
+        yield* promote("provider-knowledge-fork", "provider-knowledge-a");
+        yield* provider.startSession(threadId, input);
+        const degradedContext = codex.startSession.mock.calls[4]?.[0].projectWork;
+        assert(degradedContext);
+        assert(degradedContext.briefing.includes("Knowledge omitted"));
+        assert(!degradedContext.briefing.includes("Knowledge body for provider-knowledge-"));
+        assert(degradedContext.briefing.includes("Move both clients to the replacement parser."));
+        assert.equal(degradedContext.narrative, undefined);
+        assert.equal(codex.startSession.mock.calls.length, 5);
         yield* provider.stopSession({ threadId });
       }).pipe(
         Effect.provide(ProjectWorkRepositoryLive.pipe(Layer.provideMerge(SqlitePersistenceMemory))),
