@@ -29,6 +29,11 @@ import {
 } from "./ProjectTeamPolicy.ts";
 import { projectTeamRepairHash } from "./ProjectTeamGuidedLifecycle.ts";
 import { prepareReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
+import {
+  assertDeliveryAcceptanceCurrent,
+  prepareDeliveryAcceptanceEvidence,
+  DELIVERY_ACCEPTANCE_PRODUCER,
+} from "./ProjectTeamDeliveryAcceptanceState.ts";
 
 const isReviewCompletionProof = Schema.is(ProjectTeamReviewCompletionProof);
 
@@ -234,6 +239,41 @@ export const decideProjectTeamGuidedTransition = (
     });
   };
   switch (transition!.kind) {
+    case "delivery.accept": {
+      const t = transition!;
+      if (
+        command.attribution.actor.kind !== "system" ||
+        command.attribution.actor.id !== DELIVERY_ACCEPTANCE_PRODUCER ||
+        command.attribution.source.kind !== "system" ||
+        command.attribution.source.id !== DELIVERY_ACCEPTANCE_PRODUCER ||
+        command.attribution.recordedAt !== at
+      )
+        reject("Delivery acceptance requires its private producer");
+      const tasks = state.tasks.filter((task) => task.taskId === t.proof.source.taskId);
+      const task = tasks[0];
+      if (
+        tasks.length !== 1 ||
+        !task ||
+        task.projectId !== command.projectId ||
+        task.revision !== t.expectedTaskRevision ||
+        ["completed", "canceled", "failed"].includes(task.state) ||
+        task.activeAttemptId !== undefined
+      )
+        reject("Delivered task is no longer available for acceptance");
+      assertDeliveryAcceptanceCurrent(state, t.proof);
+      const evidence = prepareDeliveryAcceptanceEvidence(command);
+      if (state.evidence.some((e) => e.evidenceId === evidence.evidenceId))
+        reject("Delivery acceptance is already retained");
+      emit({ type: "project-work.evidence.added", evidence, addedAt: at, occurredAt: at });
+      emit({
+        type: "project-work.task.completed",
+        taskId: task.taskId,
+        satisfiedCriterionIds: [],
+        completedAt: at,
+        occurredAt: at,
+      });
+      return events;
+    }
     case "verification.claim":
       return reject("Verification consumption requires its dedicated private producer");
     case "memory.reflect":
@@ -392,6 +432,7 @@ export const decideProjectTeamGuidedTransition = (
         }
         for (const dependency of dependencies) {
           const result = evaluateProjectTeamDependency({
+            state,
             projectId: command.projectId,
             taskId: dependency,
             task: state.tasks.find((t) => t.taskId === dependency),
@@ -407,6 +448,7 @@ export const decideProjectTeamGuidedTransition = (
             r.kind === "task-membership" && r.parentTaskId === task.taskId && r.status === "active",
         )) {
           const result = evaluateProjectTeamDependency({
+            state,
             projectId: command.projectId,
             taskId: child.taskId,
             task: state.tasks.find((t) => t.taskId === child.taskId),
@@ -869,6 +911,7 @@ export const decideProjectTeamGuidedTransition = (
       }
       for (const dependency of plan?.dependencyTaskIds ?? []) {
         const result = evaluateProjectTeamDependency({
+          state,
           projectId: task.projectId,
           taskId: dependency,
           task: state.tasks.find((entry) => entry.taskId === dependency),

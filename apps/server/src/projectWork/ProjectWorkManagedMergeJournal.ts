@@ -560,6 +560,31 @@ export const makeProjectWorkManagedMergeJournal = (options: { readonly environme
         operationId: string;
       }>`SELECT operation_id AS operationId FROM project_work_managed_merge WHERE environment_id=${environmentId} AND status IN ('pending','claimed','uncertain') AND ${afterOperationId === undefined ? sql`1=1` : sql`operation_id>${afterOperationId}`} ORDER BY operation_id LIMIT 64`;
     });
+    const confirmedUnacceptedInTransaction = Effect.fn("ManagedMergeJournal.confirmedUnaccepted")(
+      function* (afterOperationId?: string) {
+        yield* loan;
+        if (
+          afterOperationId !== undefined &&
+          !/^managed-merge:[a-f0-9]{64}$/u.test(afterOperationId)
+        )
+          return yield* deny();
+        return yield* sql<{
+          operationId: string;
+        }>`SELECT m.operation_id AS operationId FROM project_work_managed_merge m
+        WHERE m.environment_id=${environmentId} AND m.status='confirmed'
+        AND ${afterOperationId === undefined ? sql`1=1` : sql`m.operation_id>${afterOperationId}`}
+        AND NOT EXISTS (SELECT 1 FROM project_work_evidence e WHERE e.project_id=m.project_id AND e.task_id=m.task_id
+          AND e.evidence_id LIKE 'delivery-acceptance:%' AND json_valid(e.detail)
+          AND json_extract(e.detail,'$.proof.operationId')=m.operation_id)
+        ORDER BY m.operation_id LIMIT 64`;
+      },
+    );
+    const auditCommandInTransaction = Effect.fn("ManagedMergeJournal.auditRetainedCommand")(
+      function* (command: ProjectWorkCommand) {
+        yield* loan;
+        yield* auditCommand(command);
+      },
+    );
     return {
       environmentId,
       gateApprovalInTransaction,
@@ -570,6 +595,8 @@ export const makeProjectWorkManagedMergeJournal = (options: { readonly environme
       uncertainInTransaction,
       completeInTransaction,
       pendingInTransaction,
+      confirmedUnacceptedInTransaction,
+      auditCommandInTransaction,
     };
   });
 };

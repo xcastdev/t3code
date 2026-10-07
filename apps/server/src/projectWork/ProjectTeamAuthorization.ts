@@ -10,6 +10,7 @@ import {
   ProjectWorkAttribution,
   ProjectWorkWriteResult,
   EventId,
+  ProjectWorkTaskId,
   type ProjectWorkActor,
   type ProjectWorkCommand,
   type ProjectWorkReadIntent,
@@ -20,6 +21,8 @@ import {
 import * as NodeCrypto from "node:crypto";
 import * as Option from "effect/Option";
 import { ProjectWorkVerificationApproval } from "./ProjectWorkVerificationGate.ts";
+import { deliveryDependencyIds } from "./ProjectTeamDeliveryAcceptanceState.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
@@ -133,6 +136,7 @@ export const layer = Layer.effect(
   ProjectTeamAuthorization,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const settings = yield* Effect.serviceOption(ServerSettingsService);
     const environmentIdentity = yield* Effect.serviceOption(
       ServerEnvironment.ServerEnvironmentIdentity,
     );
@@ -163,6 +167,49 @@ export const layer = Layer.effect(
         Effect.provideService(ProjectWorkRepository, repository.value),
         Effect.mapError(() => deny("Integration source reader unavailable")),
       );
+    });
+    const assertDeliveredDependencies = Effect.fn(
+      "ProjectTeamAuthorization.assertDeliveredDependencies",
+    )(function* (state: ProjectWorkReducerState, taskId: string) {
+      const dependencies = yield* Effect.try({
+        try: () => deliveryDependencyIds(state, taskId),
+        catch: () => deny("Dependency lineage is invalid"),
+      });
+      if (dependencies.length === 0) return;
+      const owner = yield* Effect.serviceOption(ProjectWorkRepository);
+      const client = yield* Effect.serviceOption(SqlClient.SqlClient);
+      if (Option.isNone(owner) || (Option.isSome(client) && client.value !== sql))
+        return yield* deny("Delivery history requires its original SQL and repository");
+      const environmentId = Option.isSome(environmentIdentity)
+        ? yield* environmentIdentity.value.getEnvironmentId.pipe(
+            Effect.mapError(() => deny("Environment identity unavailable")),
+          )
+        : Option.isSome(serverEnvironment)
+          ? yield* serverEnvironment.value.getEnvironmentId.pipe(
+              Effect.mapError(() => deny("Environment identity unavailable")),
+            )
+          : undefined;
+      if (environmentId === undefined || Option.isNone(settings))
+        return yield* deny("Delivery qualification services unavailable");
+      const { makeProjectTeamDeliveryAcceptance } = yield* Effect.promise(
+        () => import("./ProjectTeamDeliveryAcceptance.ts"),
+      );
+      const service = yield* makeProjectTeamDeliveryAcceptance({ environmentId }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.provideService(ProjectWorkRepository, owner.value),
+        Effect.provideService(ServerSettingsService, settings.value),
+        Effect.mapError(() => deny("Delivery reader unavailable")),
+      );
+      yield* service
+        .assertTaskDependencies({
+          projectId: ProjectId.make(state.projectId),
+          taskId: ProjectWorkTaskId.make(taskId),
+        })
+        .pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.provideService(ProjectWorkRepository, owner.value),
+          Effect.mapError(() => deny("Delivered dependency history is no longer qualified")),
+        );
     });
     const assertSelectedSources = Effect.fn("ProjectTeamAuthorization.assertSelectedSources")(
       function* (state: ProjectWorkReducerState, taskId: string) {
@@ -347,6 +394,7 @@ export const layer = Layer.effect(
           try: () => assertProjectTeamRunAuthority(state, binding, role, issuing),
           catch: () => deny("Managed assignment or approval changed"),
         });
+        yield* assertDeliveredDependencies(state, binding.taskId);
         const lifecycleTable =
           yield* sql`SELECT name FROM sqlite_master WHERE type='table' AND name='project_lifecycle'`;
         if (lifecycleTable.length) {
@@ -1087,8 +1135,10 @@ export const layer = Layer.effect(
             Effect.mapError(() => deny("Selected integration sources are no longer qualified")),
           );
       }
-      if (intent.type === "project-team.execution.start")
+      if (intent.type === "project-team.execution.start") {
         yield* assertSelectedSources(state, intent.taskId);
+        yield* assertDeliveredDependencies(state, intent.taskId);
+      }
 
       if (
         intent.type === "project-team.assignment.report" &&

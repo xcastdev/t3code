@@ -621,6 +621,97 @@ export const runProjectWorkManagedMergeRecovery = Effect.fn("runProjectWorkManag
     );
   },
 );
+/** Read bounded identities first; each receipt is independently audited without starving later pages. */
+export const runProjectTeamDeliveryAcceptanceRecovery = Effect.fn(
+  "runProjectTeamDeliveryAcceptanceRecovery",
+)(function* (
+  service: Pick<
+    import("./ProjectTeamDeliveryAcceptance.ts").ProjectTeamDeliveryAcceptance["Service"],
+    "pending" | "recover"
+  >,
+  ready: Effect.Effect<void>,
+  isEnabled: Effect.Effect<boolean, ServerSettingsError> = Effect.succeed(true),
+  enabledChanges: Stream.Stream<unknown> = Stream.empty,
+) {
+  const bus = yield* ProjectWorkEventBus.ProjectWorkEventBus;
+  const changes = yield* bus.subscribe;
+  const drain = Effect.gen(function* () {
+    if (!(yield* isEnabled)) return;
+    let after: string | undefined;
+    while (true) {
+      if (!(yield* isEnabled)) return;
+      const rows = yield* service.pending(after);
+      for (const row of rows) {
+        if (!(yield* isEnabled)) return;
+        yield* service
+          .recover(row.operationId)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.failCause(cause)
+                : Effect.logWarning("Delivered work remains unaccepted", cause),
+            ),
+          );
+      }
+      if (rows.length < 64) return;
+      const last = rows.at(-1)?.operationId;
+      if (last === undefined || (after !== undefined && last <= after))
+        return yield* Effect.die("Delivery acceptance page did not advance");
+      after = last;
+    }
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.failCause(cause)
+        : Effect.logWarning("Delivery acceptance history unavailable", cause),
+    ),
+  );
+  yield* ready;
+  yield* drain;
+  const committed = changes.pipe(
+    Stream.filter(
+      ({ event }) =>
+        event.type === "project-work.foundation.recorded" ||
+        event.type === "project-work.criterion.upserted" ||
+        event.type === "project-work.criterion.waived" ||
+        event.type === "project-work.evidence.added" ||
+        event.type === "project-work.task.reopened" ||
+        event.type === "project-work.task.completed",
+    ),
+    Stream.map(() => undefined),
+  );
+  yield* Stream.merge(committed, enabledChanges).pipe(Stream.runForEach(() => drain));
+});
+export const deliveryAcceptanceServicesLayer = Layer.effectContext(
+  Effect.gen(function* () {
+    const identity = yield* ServerEnvironmentIdentity;
+    const { makeProjectTeamDeliveryAcceptance, ProjectTeamDeliveryAcceptance } =
+      yield* Effect.promise(() => import("./ProjectTeamDeliveryAcceptance.ts"));
+    return Context.make(
+      ProjectTeamDeliveryAcceptance,
+      yield* makeProjectTeamDeliveryAcceptance({ environmentId: yield* identity.getEnvironmentId }),
+    );
+  }),
+);
+export const deliveryAcceptanceRecoveryLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const { ProjectTeamDeliveryAcceptance } = yield* Effect.promise(
+      () => import("./ProjectTeamDeliveryAcceptance.ts"),
+    );
+    const service = yield* ProjectTeamDeliveryAcceptance;
+    const issues = yield* ProjectIssueRuntime;
+    const settings = yield* ServerSettingsService;
+    const changes = yield* settings.subscribeChanges;
+    yield* Effect.forkScoped(
+      runProjectTeamDeliveryAcceptanceRecovery(
+        service,
+        issues.ready,
+        settings.getSettings.pipe(Effect.map((value) => value.projectWorkEnabled)),
+        changes.pipe(Stream.filter((value) => value.projectWorkEnabled)),
+      ),
+    );
+  }),
+);
 export const managedMergeServicesLayer = Layer.effect(
   ProjectWorkManagedMerge,
   Effect.gen(function* () {

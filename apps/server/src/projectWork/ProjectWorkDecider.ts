@@ -1,4 +1,5 @@
 import { staleIntegrationTaskIds } from "./ProjectTeamIntegrationSourceState.ts";
+import { DELIVERY_ACCEPTANCE_PREFIX } from "./ProjectTeamDeliveryAcceptanceState.ts";
 import { invalidateReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
 import type { ProjectTeamRecord } from "@t3tools/contracts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
@@ -1776,6 +1777,11 @@ function decideProjectWorkCommandEvents(
     }
     case "project-work.evidence.add": {
       const evidence = command.evidence;
+      if (evidence.evidenceId.startsWith(DELIVERY_ACCEPTANCE_PREFIX))
+        throw new ProjectWorkPolicyError(
+          "authority-required",
+          "Delivery acceptance evidence requires its private audited transition",
+        );
       assertUniqueId(
         state.evidence.map((entry) => String(entry.evidenceId)),
         evidence.evidenceId,

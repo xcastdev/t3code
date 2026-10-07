@@ -28,6 +28,7 @@ import {
   mergeHash,
 } from "./ProjectWorkManagedMergeJournal.ts";
 import type { ProviderExactHeadMergeConfirmation } from "../pullRequest/PullRequestProvider.ts";
+import { makeProjectTeamDeliveryAcceptance } from "./ProjectTeamDeliveryAcceptance.ts";
 const strict = { onExcessProperty: "error" } as const;
 const decodeInput = Schema.decodeUnknownSync(PullRequestActionInput, strict);
 const decodeGate = Schema.decodeUnknownEffect(ProjectTeamGate, strict);
@@ -78,6 +79,7 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
     const authorization = yield* ProjectWorkPublicationAuthorization;
     const guard = yield* ProjectWorkPullRequestActionGuard;
     const journal = yield* makeProjectWorkManagedMergeJournal(capturedOptions);
+    const acceptance = yield* makeProjectTeamDeliveryAcceptance(capturedOptions);
     const serial = yield* Semaphore.make(1);
     const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
@@ -282,6 +284,7 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
       )
         return yield* denied();
       let decision: ManagedMergeDecision | undefined;
+      let historicalReceipt = false;
       yield* repository.executeAtomic(
         provide(
           Effect.gen(function* () {
@@ -296,7 +299,6 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
             if (!found.managed || !found.publication) return yield* denied();
             const { request: publication, outcome: publicationOutcome } = found.publication;
             if (publication.target.projectId !== projectId) return yield* denied();
-            yield* authorization.assertCurrent(publication, "dispatch");
             const state = yield* readCurrentState(sql, projectId);
             const method = input.mergeMethod ?? "merge";
             const contentHash = mergeHash({ publication, publicationOutcome, method });
@@ -361,8 +363,11 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
               )
                 return yield* denied();
               decision = retained.decision;
+              historicalReceipt = retained.receipt !== undefined;
+              if (!historicalReceipt) yield* current(retained.decision);
               return [];
             }
+            yield* authorization.assertCurrent(publication, "dispatch");
             const gateApproval =
               existingGate === undefined
                 ? undefined
@@ -422,7 +427,7 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
           Effect.gen(function* () {
             if (!decision) return yield* denied();
             yield* permission.assertCurrent(projectId, input);
-            yield* current(decision);
+            if (!historicalReceipt) yield* current(decision);
             const stored = yield* journal.readInTransaction(decision.operationId);
             if (
               !stored ||
@@ -434,6 +439,18 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
       );
       if (!decision) return yield* denied();
       return decision;
+    });
+    const acceptDelivered = Effect.fn("ManagedMerge.acceptDelivered")(function* (
+      receipt: ManagedMergeReceipt,
+    ) {
+      yield* acceptance
+        .accept({ operationId: receipt.operationId, expectedReceiptSha256: mergeHash(receipt) })
+        .pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("Confirmed delivery awaits task acceptance", cause),
+          ),
+        );
+      return receipt;
     });
     return ProjectWorkManagedMerge.of({
       run(raw, target, permission, ports) {
@@ -449,7 +466,9 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
           .withPermits(1)(
             Effect.gen(function* () {
               const decision = yield* enqueue(input, resolved, permission);
-              return yield* dispatch(decision.operationId, capturedPorts);
+              return yield* dispatch(decision.operationId, capturedPorts).pipe(
+                Effect.andThen(acceptDelivered),
+              );
             }),
           )
           .pipe(Effect.mapError(error));
@@ -457,7 +476,9 @@ export const makeProjectWorkManagedMerge = (options: { readonly environmentId: s
       resume(operationId, ports) {
         const capturedPorts = { ...ports };
         return serial
-          .withPermits(1)(dispatch(operationId, capturedPorts))
+          .withPermits(1)(
+            dispatch(operationId, capturedPorts).pipe(Effect.andThen(acceptDelivered)),
+          )
           .pipe(Effect.mapError(error));
       },
       pending(afterOperationId) {
