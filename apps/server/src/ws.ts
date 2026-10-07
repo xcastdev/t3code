@@ -44,6 +44,7 @@ import {
   OrchestrationThread,
   type GitActionProgressEvent,
   type GitManagerServiceError,
+  GitManagerError,
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
   type OrchestrationShellStreamEvent,
@@ -263,6 +264,10 @@ import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
 import { pullRequestSyncKey } from "./pullRequest/pullRequestSyncKey.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AuthSessionRepository } from "./persistence/AuthSessions.ts";
+import {
+  ProjectWorkHumanPublication,
+  makeProjectWorkHumanPublicationRequest,
+} from "./projectWork/ProjectWorkHumanPublicationRequest.ts";
 import {
   ProjectWorkVerificationRequest,
   makeProjectWorkVerificationRequest,
@@ -1363,6 +1368,8 @@ const makeWsRpcLayer = (
 ) =>
   WsCoreRpcGroup.toLayer(
     Effect.gen(function* () {
+      const publicationSessions = yield* Effect.serviceOption(AuthSessionRepository);
+      const humanPublication = yield* Effect.serviceOption(ProjectWorkHumanPublication);
       const currentSessionId = currentSession.sessionId;
       const crypto = yield* Crypto.Crypto;
       const sql = yield* SqlClient.SqlClient;
@@ -6750,17 +6757,42 @@ const makeWsRpcLayer = (
             gitWorkflow.getWorkingTreeDiff(input),
             { "rpc.aggregate": "vcs" },
           ),
-        [WS_METHODS.gitRunStackedAction]: (input) =>
-          observeRpcStream(
+        [WS_METHODS.gitRunStackedAction]: (input) => {
+          const permission = makeProjectWorkHumanPublicationRequest(currentSession, input);
+          const capturedPermission = Effect.gen(function* () {
+            if (Option.isNone(publicationSessions) || Option.isNone(humanPublication))
+              return undefined;
+            return yield* permission.pipe(
+              Effect.provideService(AuthSessionRepository, publicationSessions.value),
+              Effect.mapError(
+                (cause) =>
+                  new GitManagerError({
+                    operation: "runStackedAction",
+                    cwd: input.cwd,
+                    detail: "Human publication permission is unavailable.",
+                    cause,
+                  }),
+              ),
+            );
+          });
+          return observeRpcStream(
             WS_METHODS.gitRunStackedAction,
             Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
-              gitWorkflow
-                .runStackedAction(input, {
-                  actionId: input.actionId,
-                  progressReporter: {
-                    publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
-                  },
-                })
+              capturedPermission
+                .pipe(
+                  Effect.flatMap((permission) =>
+                    gitWorkflow.runStackedAction(input, {
+                      actionId: input.actionId,
+                      ...(permission === undefined ? {} : { humanPublicationRequest: permission }),
+                      ...(Option.isNone(humanPublication)
+                        ? {}
+                        : { humanPublication: humanPublication.value }),
+                      progressReporter: {
+                        publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
+                      },
+                    }),
+                  ),
+                )
                 .pipe(
                   Effect.matchCauseEffect({
                     onFailure: (cause) => Queue.failCause(queue, cause),
@@ -6789,7 +6821,8 @@ const makeWsRpcLayer = (
                 ),
             ),
             { "rpc.aggregate": "vcs" },
-          ),
+          );
+        },
         [WS_METHODS.gitResolvePullRequest]: (input) =>
           observeRpcEffect(
             WS_METHODS.gitResolvePullRequest,

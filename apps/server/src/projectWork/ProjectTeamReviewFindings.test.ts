@@ -20,9 +20,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as TestClock from "effect/testing/TestClock";
 import * as DateTime from "effect/DateTime";
 import * as Clock from "effect/Clock";
+import * as Redacted from "effect/Redacted";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import * as VcsProcess from "../vcs/VcsProcess.ts";
 import {
   canonicalProjectWorkPayload,
   EnvironmentId,
+  AuthOrchestrationOperateScope,
+  AuthSessionId,
+  type GitRunStackedActionInput,
   GitCommandError,
   ProjectTeamReviewFindingIntent,
   ProjectTeamReviewFinding,
@@ -36,6 +42,7 @@ import {
   ThreadId,
   ProjectWorkEvidenceId,
   ProjectWorkCommand,
+  ProjectWorkPublicationRequest,
   ProjectWorkRelationship,
   ProjectWorkTaskId,
   ProjectTeamIntegrationSourceRef,
@@ -91,6 +98,22 @@ import {
   ProjectTeamDispatchJournalError,
 } from "./ProjectTeamDispatchJournal.ts";
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
+import { makeProjectTeamReviewedWorkReader } from "./ProjectTeamReviewedWorkReader.ts";
+import {
+  makeProjectWorkPublicationAuthorization,
+  ProjectWorkPublicationAuthorization,
+} from "./ProjectWorkPublicationAuthorization.ts";
+import {
+  makeProjectWorkHumanPublicationRequest,
+  makeProjectWorkHumanPublication,
+} from "./ProjectWorkHumanPublicationRequest.ts";
+import * as Publication from "./ProjectWorkPullRequests.ts";
+import * as AuthSessions from "../persistence/AuthSessions.ts";
+import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import {
+  bindIssueRepositoryProject,
+  ensureIssueRepositoryTables,
+} from "./ProjectIssueRepositoryState.ts";
 import { makeProjectTeamCompletedReviewReader } from "./ProjectTeamReviewCompleted.ts";
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
@@ -2443,6 +2466,585 @@ const completeIntegrationSourceReview = Effect.fn("integrationTest.completeSourc
     });
   },
 );
+const noPublicationNetwork = () => Effect.die("Publication enqueue must not execute GitHub");
+const makeHumanPublicationFixture = Effect.fn("publicationTest.authenticFixture")(function* (
+  options: {
+    readonly accepted?: boolean;
+    readonly verificationOutcome?: "success" | "failed";
+  } = {},
+  shared?: Effect.Success<ReturnType<typeof makeConsumedReviewFixture>>,
+) {
+  const f =
+    shared ??
+    (yield* makeConsumedReviewFixture({
+      verificationOutcome: options.verificationOutcome ?? "success",
+    }));
+  if (options.accepted !== false) yield* completeIntegrationSourceReview(f);
+  yield* ensureIssueRepositoryTables(f.sql);
+  yield* bindIssueRepositoryProject(f.sql, {
+    key: { host: "github.com", repositoryNodeId: "R_publication" },
+    projectId,
+    repositoryName: "owner/reviewed",
+    accountNodeId: "U_publication",
+    credentialEpoch: "controlled-epoch",
+    since: at.replace(".000Z", "Z"),
+    expectedBindingRevision: null,
+  });
+  const sessions = yield* AuthSessions.make;
+  const now = yield* Clock.currentTimeMillis;
+  const session = {
+    sessionId: AuthSessionId.make("human-publication-session"),
+    subject: "user:publication-human",
+    identity: { kind: "user" as const, id: "user:publication-human" },
+    scopes: [AuthOrchestrationOperateScope],
+    method: "browser-session-cookie" as const,
+    expiresAt: DateTime.makeUnsafe(now + 60000),
+  };
+  yield* sessions.create({
+    ...session,
+    issuedAt: DateTime.makeUnsafe(now),
+    client: {
+      label: null,
+      ipAddress: null,
+      userAgent: null,
+      deviceType: "unknown",
+      os: null,
+      browser: null,
+    },
+  });
+  const job = f.prepared.manifest;
+  const target = {
+    cwd: job.target.worktree,
+    localBranch: job.target.branchRef.slice("refs/heads/".length),
+    headSha: job.target.headSha,
+    testedTree: job.target.testedTree,
+    indexTree: job.target.testedTree,
+    remoteName: "origin",
+    remoteUrl: "git@github.com:owner/reviewed.git",
+  };
+  const input: GitRunStackedActionInput = {
+    cwd: target.cwd,
+    action: "create_pr",
+    actionId: "reviewed-human-pr",
+    precondition: {
+      expectedHeadCommit: target.headSha,
+      expectedIndexTree: target.indexTree,
+      expectedRefName: job.target.branchRef,
+    },
+  };
+  const permission = yield* makeProjectWorkHumanPublicationRequest(session, input).pipe(
+    Effect.provideService(AuthSessions.AuthSessionRepository, sessions),
+  );
+  const authorization = yield* makeProjectWorkPublicationAuthorization({
+    environmentId: "environment",
+  });
+  const publication = yield* Publication.make({
+    authorizePublication: authorization.assertCurrent,
+    resolveCredential: () =>
+      Effect.fail(new Publication.PublicationError({ reason: "credential-mismatch" })),
+  }).pipe(
+    Effect.provideService(GitHubCli.GitHubCli, {
+      execute: noPublicationNetwork,
+      listOpenPullRequests: noPublicationNetwork,
+      getPullRequest: noPublicationNetwork,
+      getRepositoryCloneUrls: noPublicationNetwork,
+      createRepository: noPublicationNetwork,
+      createPullRequest: noPublicationNetwork,
+      getDefaultBranch: noPublicationNetwork,
+      checkoutPullRequest: noPublicationNetwork,
+    }),
+  );
+  return { f, sessions, session, now, job, target, input, permission, authorization, publication };
+});
+it.effect(
+  "a human publication atomically retains accepted review and verification before exact retry and background audit",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const {
+          f,
+          sessions,
+          session,
+          now,
+          job,
+          target,
+          input,
+          permission,
+          authorization,
+          publication,
+        } = yield* makeHumanPublicationFixture();
+        const before = yield* f.repository.replay(projectId);
+        const prepared = authorization.prepareInTransaction({ input, target, permission });
+        const first = yield* publication.enqueuePrepared(prepared);
+        expect(first).toMatchObject({ status: "pending", duplicate: false });
+        const after = yield* f.repository.replay(projectId);
+        const added = after.slice(before.length);
+        expect(added.map((event) => event.type)).toEqual([
+          "project-work.evidence.added",
+          "project-work.foundation.recorded",
+        ]);
+        const evidence = added[0];
+        const pending = added[1];
+        if (
+          evidence?.type !== "project-work.evidence.added" ||
+          pending?.type !== "project-work.foundation.recorded" ||
+          pending.record.kind !== "effect"
+        )
+          return yield* Effect.die("Missing actual publication permission and pending effect");
+        expect(evidence.evidence.attribution?.actor).toEqual({
+          kind: "human",
+          id: "user:publication-human",
+        });
+        expect(pending.record.status).toBe("pending");
+        const request = yield* decodeControlledPublicationRequest(pending.record.payload.summary);
+        expect(request.target.headSha).toBe(job.target.headSha);
+        expect(request.repository).toEqual({
+          host: "github.com",
+          nodeId: "R_publication",
+          nameWithOwner: "owner/reviewed",
+        });
+        yield* authorization.assertCurrent(request, "dispatch");
+        expect(
+          yield* publication.enqueuePrepared(
+            authorization.prepareInTransaction({ input, target, permission }),
+          ),
+        ).toMatchObject({ operationId: first.operationId, duplicate: true });
+        expect(yield* f.repository.replay(projectId)).toEqual(after);
+        yield* sessions.revoke({
+          sessionId: session.sessionId,
+          revokedAt: DateTime.makeUnsafe(now),
+        });
+        // A committed human decision remains auditable after browser/session loss; a new enqueue still needs a current request.
+        yield* authorization.assertCurrent(request, "dispatch");
+        expect(
+          (yield* publication
+            .enqueuePrepared(authorization.prepareInTransaction({ input, target, permission }))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* f.repository.replay(projectId)).toEqual(after);
+      }),
+    ),
+);
+
+for (const unavailable of ["pending-review", "failed-verification"] as const) {
+  it.effect(
+    `human publication rejects ${unavailable} without retaining permission or pending work`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const { f, input, target, permission, authorization, publication } =
+            yield* makeHumanPublicationFixture(
+              unavailable === "pending-review"
+                ? { accepted: false }
+                : { verificationOutcome: "failed" },
+            );
+          const before = yield* f.repository.replay(projectId);
+          expect(
+            (yield* publication
+              .enqueuePrepared(authorization.prepareInTransaction({ input, target, permission }))
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(yield* f.repository.replay(projectId)).toEqual(before);
+          expect(
+            yield* f.sql`SELECT record_id FROM project_team_effect WHERE json_extract(payload_json,'$.effectKind')='publication'`,
+          ).toEqual([]);
+        }),
+      ),
+  );
+}
+it.effect(
+  "human publication rejects changed local target, remote and caller loans before enqueue",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const { f, input, target, permission, authorization, publication } =
+          yield* makeHumanPublicationFixture();
+        const before = yield* f.repository.replay(projectId);
+        for (const changed of [
+          { ...target, headSha: "e".repeat(40) },
+          { ...target, indexTree: "e".repeat(40) },
+          { ...target, localBranch: "unreviewed" },
+          { ...target, remoteUrl: "git@github.com:other/repository.git" },
+        ]) {
+          expect(
+            (yield* publication
+              .enqueuePrepared(
+                authorization.prepareInTransaction({ input, target: changed, permission }),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        const prepare = authorization.prepareInTransaction({ input, target, permission });
+        expect((yield* prepare.pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(prepare.pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql })))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              prepare.pipe(Effect.provideService(ProjectWorkRepository, { ...f.repository })),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* f.sql.withTransaction(prepare)).request.target.headSha).toBe(target.headSha);
+        expect(yield* f.repository.replay(projectId)).toEqual(before);
+      }),
+    ),
+);
+it.effect(
+  "human publication captures the exact input and target synchronously before enqueue",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const { f, input, target, permission, authorization, publication } =
+          yield* makeHumanPublicationFixture();
+        const mutableInput = { ...input };
+        const mutableTarget = { ...target };
+        const prepared = authorization.prepareInTransaction({
+          input: mutableInput,
+          target: mutableTarget,
+          permission,
+        });
+        mutableInput.cwd = "/foreign-after-capture";
+        mutableTarget.headSha = "e".repeat(40);
+        mutableTarget.remoteUrl = "git@github.com:other/repository.git";
+        const receipt = yield* publication.enqueuePrepared(prepared);
+        const pending = (yield* f.state()).foundationRecords?.find(
+          (row) => row.recordId === receipt.operationId,
+        );
+        if (pending?.kind !== "effect")
+          return yield* Effect.die("Missing captured publication effect");
+        const request = yield* decodeControlledPublicationRequest(pending.payload.summary);
+        expect(request.target.headSha).toBe(target.headSha);
+        expect(request.repository.nameWithOwner).toBe("owner/reviewed");
+        yield* authorization.assertCurrent(request, "dispatch");
+      }),
+    ),
+);
+for (const corrupt of ["raw-output", "permission-receipt", "enqueue-events"] as const) {
+  it.effect(
+    `human publication refuses ${corrupt} corruption without dispatch or replacement proof`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const { f, input, target, permission, authorization, publication } =
+            yield* makeHumanPublicationFixture();
+          const receipt = yield* publication.enqueuePrepared(
+            authorization.prepareInTransaction({ input, target, permission }),
+          );
+          const pending = (yield* f.state()).foundationRecords?.find(
+            (row) => row.recordId === receipt.operationId,
+          );
+          if (pending?.kind !== "effect") return yield* Effect.die("Missing publication effect");
+          const request = yield* decodeControlledPublicationRequest(pending.payload.summary);
+          const before = yield* f.repository.replay(projectId);
+          if (corrupt === "raw-output") {
+            const rows = yield* f.sql<{
+              artifactId: string;
+              raw: Uint8Array;
+            }>`SELECT artifact_id AS artifactId,raw_bytes AS raw FROM project_work_artifacts WHERE artifact_id LIKE '%:stderr' LIMIT 2`;
+            if (rows.length !== 1 || !rows[0] || rows[0].raw.length === 0)
+              return yield* Effect.die("Missing controlled raw stderr");
+            const bytes = new Uint8Array(rows[0].raw);
+            bytes[0] = bytes[0]! ^ 255;
+            yield* f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+            yield* f.sql`UPDATE project_work_artifacts SET raw_bytes=${bytes} WHERE artifact_id=${rows[0].artifactId}`;
+          } else if (corrupt === "permission-receipt") {
+            yield* f.sql`UPDATE project_work_command_receipts SET payload_fingerprint='00000000' WHERE command_id=${"publication-permission:" + receipt.operationId}`;
+          } else {
+            yield* f.sql`UPDATE project_work_command_receipts SET event_ids_json='[]' WHERE command_id=${"publication-enqueue:" + receipt.operationId}`;
+          }
+          expect(
+            (yield* authorization.assertCurrent(request, "dispatch").pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* publication
+              .enqueuePrepared(authorization.prepareInTransaction({ input, target, permission }))
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(yield* f.repository.replay(projectId)).toEqual(before);
+          expect(
+            (yield* f.state()).foundationRecords?.find(
+              (row) => row.recordId === receipt.operationId,
+            ),
+          ).toEqual(pending);
+        }),
+      ),
+  );
+}
+it.effect(
+  "a human publication failed owning COMMIT exposes no permission and exact retry keeps one pending request",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const { f, input, target, permission, authorization, publication } =
+          yield* makeHumanPublicationFixture();
+        const before = yield* f.repository.replay(projectId);
+        yield* f.sql`CREATE TABLE controlled_publication_parent (id TEXT PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE controlled_publication_child (id TEXT REFERENCES controlled_publication_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* f.sql`CREATE TRIGGER controlled_publication_commit_failure AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'publication-permission:%' BEGIN INSERT INTO controlled_publication_child VALUES ('missing'); END`;
+        let escaped = false;
+        expect(
+          (yield* publication
+            .enqueuePrepared(authorization.prepareInTransaction({ input, target, permission }))
+            .pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  escaped = true;
+                }),
+              ),
+              Effect.exit,
+            ))._tag,
+        ).toBe("Failure");
+        expect(escaped).toBe(false);
+        const physical = yield* f.sql<{
+          payload: string;
+        }>`SELECT json_extract(payload_json,'$.payload.summary') AS payload FROM project_team_effect WHERE json_extract(payload_json,'$.effectKind')='publication' LIMIT 2`;
+        expect(physical).toHaveLength(1);
+        const request = yield* decodeControlledPublicationRequest(physical[0]!.payload);
+        expect(
+          (yield* authorization.assertCurrent(request, "dispatch").pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        // Disposal of this controlled failed physical transaction only; production never rolls back a foreign loan.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* f.repository.replay(projectId)).toEqual(before);
+        yield* f.sql`DROP TRIGGER controlled_publication_commit_failure`;
+        const retained = yield* publication.enqueuePrepared(
+          authorization.prepareInTransaction({ input, target, permission }),
+        );
+        const after = yield* f.repository.replay(projectId);
+        expect(after.slice(before.length)).toHaveLength(2);
+        expect(
+          yield* publication.enqueuePrepared(
+            authorization.prepareInTransaction({ input, target, permission }),
+          ),
+        ).toMatchObject({ operationId: retained.operationId, duplicate: true });
+        expect(yield* f.repository.replay(projectId)).toEqual(after);
+      }),
+    ),
+);
+
+it.effect(
+  "human publication pending dispatch denies a revoked original grant without external work",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const { f, input, target, permission, authorization, publication } =
+          yield* makeHumanPublicationFixture();
+        const retained = yield* publication.enqueuePrepared(
+          authorization.prepareInTransaction({ input, target, permission }),
+        );
+        const state = yield* f.state();
+        const gate = state.foundationRecords?.find(
+          (row) => row.kind === "gate" && row.verificationJobId === f.prepared.manifest.jobId,
+        );
+        if (gate?.kind !== "gate")
+          return yield* Effect.die("Missing actual original verification grant");
+        yield* f.repository.execute(
+          decodeCommit({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "revoke-publication-verification",
+            expectedRevision: state.revision,
+            attribution: {
+              actor: { kind: "human", id: "maintainer" },
+              source: { kind: "web", id: "publication-revocation" },
+              recordedAt: at,
+            },
+            committedAt: at,
+            records: [{ ...gate, status: "invalidated", revision: gate.revision + 1 }],
+          }),
+        );
+        const before = yield* f.repository.replay(projectId);
+        expect(yield* publication.dispatchPending()).toEqual({
+          processed: 1,
+          confirmed: 0,
+          uncertain: 0,
+          denied: 1,
+        });
+        expect(yield* f.repository.replay(projectId)).toEqual(before);
+        expect(
+          (yield* f.state()).foundationRecords?.find(
+            (row) => row.recordId === retained.operationId,
+          ),
+        ).toMatchObject({ status: "pending", claimGeneration: 0 });
+      }),
+    ),
+);
+it.effect(
+  "human publication pending dispatch confirms only the fixed reviewed remote head and retained receipt",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const { f, input, target, permission, authorization, publication } =
+          yield* makeHumanPublicationFixture();
+        const first = yield* publication.enqueuePrepared(
+          authorization.prepareInTransaction({ input, target, permission }),
+        );
+        const pending = (yield* f.state()).foundationRecords?.find(
+          (row) => row.recordId === first.operationId,
+        );
+        if (pending?.kind !== "effect")
+          return yield* Effect.die("Missing original pending publication");
+        const request = yield* decodeControlledPublicationRequest(pending.payload.summary);
+        let created = false;
+        let writes = 0;
+        const response = (value: unknown): VcsProcess.VcsProcessOutput => ({
+          stdout: canonical(value),
+          stderr: "",
+          exitCode: ChildProcessSpawner.ExitCode(0),
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        });
+        const run: VcsProcess.VcsProcess["Service"]["run"] = (command) =>
+          Effect.sync(() => {
+            if (command.args.includes("graphql"))
+              return response({
+                data: {
+                  base: {
+                    id: request.repository.nodeId,
+                    nameWithOwner: request.repository.nameWithOwner,
+                    ref: { name: request.target.baseRef, target: { oid: request.target.baseSha } },
+                  },
+                  head: {
+                    id: request.target.headRepositoryNodeId,
+                    nameWithOwner: request.repository.nameWithOwner,
+                    ref: { name: request.target.headRef, target: { oid: request.target.headSha } },
+                  },
+                },
+              });
+            if (command.args.includes("POST")) {
+              expect(command.stdin).toContain(`"head":"${request.target.headSelector}"`);
+              expect(command.stdin).toContain(`"base":"${request.target.baseRef}"`);
+              expect(command.stdin).toContain(request.marker);
+              writes++;
+              created = true;
+              return response({});
+            }
+            if (command.args.at(-1) === `repos/${request.repository.nameWithOwner}`)
+              return response({
+                node_id: request.repository.nodeId,
+                full_name: request.repository.nameWithOwner,
+              });
+            return response(
+              created
+                ? [
+                    {
+                      node_id: "PR_reviewed",
+                      number: 42,
+                      html_url: "https://github.com/owner/reviewed/pull/42",
+                      state: "open",
+                      merged_at: null,
+                      body: `<!-- t3-project-work-publication:v1:${request.marker} -->`,
+                      base: {
+                        sha: request.target.baseSha,
+                        ref: request.target.baseRef,
+                        repo: {
+                          node_id: request.repository.nodeId,
+                          full_name: request.repository.nameWithOwner,
+                        },
+                      },
+                      head: {
+                        sha: request.target.headSha,
+                        ref: request.target.headRef,
+                        repo: { node_id: request.target.headRepositoryNodeId },
+                      },
+                    },
+                  ]
+                : [],
+            );
+          });
+        const dispatcher = yield* Publication.make({
+          authorizePublication: authorization.assertCurrent,
+          resolveCredential: () =>
+            Effect.succeed({
+              cwd: target.cwd,
+              host: request.repository.host,
+              repositoryNodeId: request.repository.nodeId,
+              headRepositoryNodeId: request.target.headRepositoryNodeId,
+              credentialFingerprint: "controlled-epoch",
+              token: Redacted.make("synthetic-controlled-token"),
+            }),
+        }).pipe(
+          Effect.provide(
+            GitHubCli.layer.pipe(
+              Layer.provide(
+                Layer.succeed(VcsProcess.VcsProcess, VcsProcess.VcsProcess.of({ run })),
+              ),
+            ),
+          ),
+        );
+        expect(yield* dispatcher.dispatchPending()).toEqual({
+          processed: 1,
+          confirmed: 1,
+          uncertain: 0,
+          denied: 0,
+        });
+        const outcome = yield* dispatcher.dispatch(first.operationId);
+        expect(outcome).toMatchObject({
+          kind: "confirmed",
+          operationId: first.operationId,
+          pullRequest: { url: "https://github.com/owner/reviewed/pull/42" },
+        });
+        const human = yield* makeProjectWorkHumanPublication.pipe(
+          Effect.provideService(ProjectWorkPublicationAuthorization, authorization),
+          Effect.provideService(Publication.ProjectWorkPullRequests, dispatcher),
+        );
+        const mutableInput = { ...input };
+        const mutableTarget = { ...target };
+        const capturedRetry = human.create(mutableInput, mutableTarget, permission);
+        mutableInput.cwd = "/foreign-after-create";
+        mutableTarget.headSha = "e".repeat(40);
+        expect(yield* capturedRetry).toEqual(outcome);
+        expect(
+          (yield* human
+            .create(input, target, permission)
+            .pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql }), Effect.result))._tag,
+        ).toBe("Failure");
+        expect(writes).toBe(1);
+        expect(yield* dispatcher.dispatchPending()).toEqual({
+          processed: 0,
+          confirmed: 0,
+          uncertain: 0,
+          denied: 0,
+        });
+        expect(writes).toBe(1);
+        expect(
+          (yield* f.state()).foundationRecords?.find((row) => row.recordId === first.operationId),
+        ).toMatchObject({ status: "succeeded", claimGeneration: 1 });
+      }),
+    ),
+);
+
+it.effect("reviewed work batch reads cannot escape their original transaction callback", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const f = yield* makeConsumedReviewFixture({ verificationOutcome: "success" });
+      const ref = yield* completeIntegrationSourceReview(f);
+      const reader = yield* makeProjectTeamReviewedWorkReader({ environmentId: "environment" });
+      const escaped = yield* f.sql.withTransaction(
+        reader.withCurrentInTransaction({ projectId }, (read) =>
+          Effect.gen(function* () {
+            expect((yield* read(ref)).source.headSha).toBe(f.prepared.manifest.target.headSha);
+            return read(ref);
+          }),
+        ),
+      );
+      expect((yield* f.sql.withTransaction(escaped).pipe(Effect.result))._tag).toBe("Failure");
+    }),
+  ),
+);
+const decodeControlledPublicationRequest = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectWorkPublicationRequest),
+  strict,
+);
 const decodeIntegrationSourceRef = Schema.decodeUnknownEffect(
   ProjectTeamIntegrationSourceRef,
   strict,
@@ -2764,6 +3366,27 @@ it.effect(
           secondProposal,
         );
         const secondRef = yield* completeIntegrationSourceReview(second);
+        // The same accepted integrator must publish only its retained selection and combination coverage.
+        const humanPublication = yield* makeHumanPublicationFixture({ accepted: false }, second);
+        expect(second.prepared.manifest.integration).toBe(true);
+        expect(second.prepared.manifest.integrationCoverage).toBeDefined();
+        const pendingPublication = yield* humanPublication.publication.enqueuePrepared(
+          humanPublication.authorization.prepareInTransaction({
+            input: humanPublication.input,
+            target: humanPublication.target,
+            permission: humanPublication.permission,
+          }),
+        );
+        const pendingRecord = (yield* second.state()).foundationRecords?.find(
+          (row) => row.recordId === pendingPublication.operationId,
+        );
+        if (pendingRecord?.kind !== "effect")
+          return yield* Effect.die("Missing reviewed integrator publication");
+        const frozenPublication = yield* decodeControlledPublicationRequest(
+          pendingRecord.payload.summary,
+        );
+        yield* humanPublication.authorization.assertCurrent(frozenPublication, "dispatch");
+        expect(frozenPublication.target.headSha).toBe(second.prepared.manifest.target.headSha);
         const request = { projectId, integrationTaskId: owner.task, refs: [secondRef] };
         const selected = yield* original.sql.withTransaction(sources.compileInTransaction(request));
         yield* original.sql.withTransaction(
@@ -2790,6 +3413,11 @@ it.effect(
             records: [{ ...gate, status: "invalidated", revision: gate.revision + 1 }],
           }),
         );
+        expect(
+          (yield* humanPublication.authorization
+            .assertCurrent(frozenPublication, "dispatch")
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
         const page = yield* original.sql.withTransaction(
           sources.candidatesInTransaction({
             projectId,

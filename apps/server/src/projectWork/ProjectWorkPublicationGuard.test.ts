@@ -37,20 +37,27 @@ it.effect(
       expect(yield* guard.check({ cwd: root }).pipe(Effect.result)).toMatchObject({
         _tag: "Success",
       });
+      expect(yield* guard.isManaged({ cwd: root })).toBe(false);
       for (const input of [
         { cwd: managed },
         { cwd: path.join(managed, "src") },
         { cwd: root, threadId: ThreadId.make("managed-thread") },
-      ])
+      ]) {
+        expect(yield* guard.isManaged(input)).toBe(true);
         expect(yield* guard.check(input).pipe(Effect.result)).toMatchObject({
           _tag: "Failure",
           failure: { reason: "managed-publication-unavailable" },
         });
+      }
     }).pipe(Effect.provide(services), Effect.scoped),
 );
 it.effect("unavailable managed history rejects a creation instead of falling through", () =>
   Effect.gen(function* () {
     const guard = yield* ProjectWorkPublicationGuard;
+    expect(yield* guard.isManaged({ cwd: process.cwd() }).pipe(Effect.result)).toMatchObject({
+      _tag: "Failure",
+      failure: { reason: "history-unavailable" },
+    });
     expect(yield* guard.check({ cwd: process.cwd() }).pipe(Effect.result)).toMatchObject({
       _tag: "Failure",
       failure: { reason: "history-unavailable" },

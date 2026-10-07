@@ -172,13 +172,21 @@ it.effect(
 );
 
 it.effect(
-  "publication recovery runs at startup and on claimed receipts without a reflection feedback loop",
+  "publication worker dispatches pending receipts and reconciles claims without a reflection feedback loop",
   () =>
     Effect.gen(function* () {
       const bus = yield* ProjectWorkEventBus;
       const called = yield* Queue.unbounded<number>();
       let count = 0;
+      const dispatched = yield* Queue.unbounded<number>();
+      let dispatches = 0;
       const service = {
+        dispatchPending: () =>
+          Effect.gen(function* () {
+            dispatches += 1;
+            yield* Queue.offer(dispatched, dispatches);
+            return { processed: 0, confirmed: 0, uncertain: 0, denied: 0 };
+          }),
         recoverAll: () =>
           Effect.gen(function* () {
             count += 1;
@@ -190,6 +198,7 @@ it.effect(
         Effect.gen(function* () {
           yield* Effect.forkScoped(runProjectWorkPublicationRecovery(service, Effect.void));
           expect(yield* Queue.take(called)).toBe(1);
+          expect(yield* Queue.take(dispatched)).toBe(1);
           const at = "2026-10-05T00:00:00.000Z";
           const projectId = ProjectId.make("publication-worker-project");
           const effect = decodePublicationEffect({
@@ -232,9 +241,24 @@ it.effect(
             },
           ]);
           expect(yield* Queue.take(called)).toBe(2);
+          yield* bus.publish([
+            {
+              cursor: 3,
+              event: {
+                eventId: EventId.make("pending"),
+                projectId,
+                revision: 3,
+                type: "project-work.foundation.recorded",
+                record: { ...effect, status: "pending" },
+                occurredAt: at,
+              },
+            },
+          ]);
+          expect(yield* Queue.take(dispatched)).toBe(2);
         }),
       );
       expect(count).toBe(2);
+      expect(dispatches).toBe(2);
     }).pipe(Effect.provide(ProjectWorkEventBusLive)),
 );
 

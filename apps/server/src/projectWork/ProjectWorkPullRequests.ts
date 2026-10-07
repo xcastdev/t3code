@@ -4,6 +4,7 @@ import {
   ProjectTeamEffect,
   ProjectWorkPublicationRequest,
   ProjectWorkPublicationOutcome,
+  ProjectWorkEvidence,
   type ProjectWorkCommand,
 } from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
@@ -33,15 +34,26 @@ export interface Options {
 type Request = typeof ProjectWorkPublicationRequest.Type;
 type Outcome = typeof ProjectWorkPublicationOutcome.Type;
 type PublicationEffect = typeof ProjectTeamEffect.Type;
-interface Receipt {
+export interface EnqueueReceipt {
   readonly operationId: string;
   readonly status: typeof ProjectTeamEffect.Type.status;
   readonly duplicate: boolean;
 }
+export interface PreparedPublication {
+  readonly request: Request;
+  readonly authorizationEvidence: ProjectWorkEvidence;
+}
 export class ProjectWorkPullRequests extends Context.Service<
   ProjectWorkPullRequests,
   {
-    readonly enqueue: (request: Request) => Effect.Effect<Receipt, PublicationError>;
+    readonly enqueue: (request: Request) => Effect.Effect<EnqueueReceipt, PublicationError>;
+    readonly enqueuePrepared: (
+      prepare: Effect.Effect<PreparedPublication, PublicationError>,
+    ) => Effect.Effect<EnqueueReceipt, PublicationError>;
+    readonly dispatchPending: () => Effect.Effect<
+      { processed: number; confirmed: number; uncertain: number; denied: number },
+      PublicationError
+    >;
     readonly dispatch: (
       operationId: string,
     ) => Effect.Effect<ProjectWorkPublicationOutcome, PublicationError>;
@@ -55,6 +67,9 @@ export class ProjectWorkPullRequests extends Context.Service<
 const decodeEffect = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectTeamEffect));
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 const isRequest = Schema.is(ProjectWorkPublicationRequest);
+const decodeAuthorizationEvidence = Schema.decodeUnknownSync(ProjectWorkEvidence, {
+  onExcessProperty: "error",
+});
 const isOutcome = Schema.is(ProjectWorkPublicationOutcome);
 const isPublicationError = Schema.is(PublicationError);
 const digest = (value: unknown) =>
@@ -73,16 +88,40 @@ export const make = Effect.fn("ProjectWorkPullRequests.make")(function* (options
     options.authorizePublication === undefined
       ? Effect.fail(new PublicationError({ reason: "authorization-denied" }))
       : options.authorizePublication(request, phase);
-  const enqueue = Effect.fn("ProjectWorkPullRequests.enqueue")(function* (raw: Request) {
-    const request = Outbox.capturePublicationRequest(raw);
-    if (request === undefined) return yield* new PublicationError({ reason: "invalid-request" });
-    const now = DateTime.formatIso(yield* DateTime.now);
+  const enqueueInside = Effect.fn("ProjectWorkPullRequests.enqueueInside")(function* (
+    prepare: Effect.Effect<
+      { readonly request: Request; readonly authorizationEvidence?: ProjectWorkEvidence },
+      PublicationError
+    >,
+  ) {
+    let original: Request | undefined;
     let duplicate = false;
     let status: typeof ProjectTeamEffect.Type.status = "pending";
     yield* repository
       .executeAtomic(
         Effect.gen(function* () {
-          yield* authorize(request, "enqueue");
+          const prepared = yield* prepare;
+          const request = Outbox.capturePublicationRequest(prepared.request);
+          if (request === undefined)
+            return yield* new PublicationError({ reason: "invalid-request" });
+          original = request;
+          const now = DateTime.formatIso(yield* DateTime.now);
+          const authorizationEvidence =
+            prepared.authorizationEvidence === undefined
+              ? undefined
+              : yield* Effect.try({
+                  try: () =>
+                    decodeAuthorizationEvidence(structuredClone(prepared.authorizationEvidence)),
+                  catch: (cause) => new PublicationError({ reason: "invalid-request", cause }),
+                });
+          if (authorizationEvidence === undefined) yield* authorize(request, "enqueue");
+          else if (
+            authorizationEvidence.attribution === undefined ||
+            authorizationEvidence.attribution.actor.kind !== "human" ||
+            authorizationEvidence.taskId !== request.target.taskId ||
+            !request.authorizationRecordIds.includes(authorizationEvidence.evidenceId)
+          )
+            return yield* new PublicationError({ reason: "invalid-request" });
           const state = yield* readCurrentState(sql, request.target.projectId);
           const existing = state.foundationRecords?.find(
             (record) => record.recordId === request.operationId,
@@ -95,6 +134,17 @@ export const make = Effect.fn("ProjectWorkPullRequests.make")(function* (options
               existing.payload.summary !== canonicalProjectWorkPayload(request)
             )
               return yield* new PublicationError({ reason: "invalid-state" });
+            if (authorizationEvidence !== undefined) {
+              const retained = state.evidence.filter(
+                (entry) => entry.evidenceId === authorizationEvidence.evidenceId,
+              );
+              if (
+                retained.length !== 1 ||
+                canonicalProjectWorkPayload(retained[0]) !==
+                  canonicalProjectWorkPayload(authorizationEvidence)
+              )
+                return yield* new PublicationError({ reason: "invalid-state" });
+            }
             duplicate = true;
             status = existing.status;
             return [];
@@ -126,7 +176,7 @@ export const make = Effect.fn("ProjectWorkPullRequests.make")(function* (options
             type: "project-work.foundation.commit",
             commandId: CommandId.make(`publication-enqueue:${request.operationId}`),
             projectId: request.target.projectId,
-            expectedRevision: state.revision,
+            expectedRevision: state.revision + (authorizationEvidence === undefined ? 0 : 1),
             attribution: {
               actor: { kind: "system", id: "project-work-github-outbox" },
               source: { kind: "system", id: "project-work-github-outbox" },
@@ -135,7 +185,26 @@ export const make = Effect.fn("ProjectWorkPullRequests.make")(function* (options
             committedAt: now,
             records: [record],
           };
-          return [command];
+          if (authorizationEvidence === undefined) return [command];
+          if (authorizationEvidence.attribution === undefined)
+            return yield* new PublicationError({ reason: "invalid-request" });
+          if (!Number.isSafeInteger(state.revision + 2))
+            return yield* new PublicationError({ reason: "invalid-state" });
+          const permission: ProjectWorkCommand = {
+            type: "project-work.evidence.add",
+            commandId: CommandId.make(`publication-permission:${request.operationId}`),
+            projectId: request.target.projectId,
+            expectedRevision: state.revision,
+            attribution: authorizationEvidence.attribution,
+            evidence: authorizationEvidence,
+            addedAt: authorizationEvidence.recordedAt,
+          };
+          return [permission, command];
+        }),
+        Effect.gen(function* () {
+          if (original === undefined)
+            return yield* new PublicationError({ reason: "invalid-request" });
+          yield* authorize(original, "enqueue");
         }),
       )
       .pipe(
@@ -145,8 +214,15 @@ export const make = Effect.fn("ProjectWorkPullRequests.make")(function* (options
             : new PublicationError({ reason: "persistence", cause }),
         ),
       );
-    return { operationId: request.operationId, status, duplicate };
+    if (original === undefined) return yield* new PublicationError({ reason: "invalid-request" });
+    return { operationId: original.operationId, status, duplicate };
   });
+  const enqueue = (raw: Request) => {
+    const request = Outbox.capturePublicationRequest(raw);
+    return request === undefined
+      ? Effect.fail(new PublicationError({ reason: "invalid-request" }))
+      : enqueueInside(Effect.succeed({ request }));
+  };
   const load = Effect.fn("ProjectWorkPullRequests.load")(function* (operationId: string) {
     const rows = yield* sql<{
       payload: string;
@@ -349,8 +425,40 @@ export const make = Effect.fn("ProjectWorkPullRequests.make")(function* (options
       if (rows.length < 128) return counts;
     }
   });
+  const dispatchPending = Effect.fn("ProjectWorkPullRequests.dispatchPending")(function* () {
+    const counts = { processed: 0, confirmed: 0, uncertain: 0, denied: 0 };
+    let cursor = "";
+    while (true) {
+      const rows = yield* sql<{ record_id: string }>`SELECT record_id FROM project_team_effect
+        WHERE record_id>${cursor} AND status='pending' AND json_extract(payload_json,'$.effectKind')='publication'
+        ORDER BY record_id LIMIT 128`;
+      for (const row of rows) {
+        cursor = row.record_id;
+        const result = yield* protect(dispatch(row.record_id)).pipe(Effect.result);
+        counts.processed++;
+        if (result._tag === "Failure") {
+          if (
+            isPublicationError(result.failure) &&
+            result.failure.reason === "authorization-denied"
+          )
+            counts.denied++;
+          else return yield* Effect.fail(result.failure);
+        } else counts[result.success.kind]++;
+      }
+      if (rows.length < 128) return counts;
+    }
+  });
   return ProjectWorkPullRequests.of({
     enqueue: (request) => protect(enqueue(request)),
+    enqueuePrepared: (prepare) => protect(enqueueInside(prepare)),
+    dispatchPending: () =>
+      dispatchPending().pipe(
+        Effect.mapError((cause) =>
+          isPublicationError(cause)
+            ? cause
+            : new PublicationError({ reason: "persistence", cause }),
+        ),
+      ),
     dispatch: (id) => protect(dispatch(id)),
     reconcile: (id) => protect(reconcile(id)),
     recoverAll: () =>

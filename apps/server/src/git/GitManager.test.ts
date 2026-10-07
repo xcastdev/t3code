@@ -635,6 +635,7 @@ function preparePullRequestThread(
 
 function makeManager(input?: {
   publicationGuard?: ProjectWorkPublicationGuard["Service"];
+  gitDriver?: Partial<GitVcsDriver.GitVcsDriver["Service"]>;
   ghScenario?: FakeGhScenario;
   sourceControlProvider?: SourceControlProvider["Service"];
   textGeneration?: Partial<FakeGitTextGeneration>;
@@ -652,41 +653,43 @@ function makeManager(input?: {
   const serverSettingsLayer = ServerSettings.ServerSettingsService.layerTest(input?.serverSettings);
 
   const vcsDriverLayer =
-    input?.gitConfigReads || input?.workingTreeFiles
-      ? Layer.effect(
-          GitVcsDriver.GitVcsDriver,
-          GitVcsDriver.make.pipe(
-            Effect.map((service) =>
-              GitVcsDriver.GitVcsDriver.of({
-                ...service,
-                statusDetailsLocal: (cwd) =>
-                  service.statusDetailsLocal(cwd).pipe(
-                    Effect.map((status) =>
-                      input.workingTreeFiles
-                        ? {
-                            ...status,
-                            workingTree: { ...status.workingTree, files: input.workingTreeFiles },
-                          }
-                        : status,
+    input?.gitDriver !== undefined
+      ? Layer.mock(GitVcsDriver.GitVcsDriver)(input.gitDriver)
+      : input?.gitConfigReads || input?.workingTreeFiles
+        ? Layer.effect(
+            GitVcsDriver.GitVcsDriver,
+            GitVcsDriver.make.pipe(
+              Effect.map((service) =>
+                GitVcsDriver.GitVcsDriver.of({
+                  ...service,
+                  statusDetailsLocal: (cwd) =>
+                    service.statusDetailsLocal(cwd).pipe(
+                      Effect.map((status) =>
+                        input.workingTreeFiles
+                          ? {
+                              ...status,
+                              workingTree: { ...status.workingTree, files: input.workingTreeFiles },
+                            }
+                          : status,
+                      ),
                     ),
-                  ),
-                readConfigValue: (cwd, key) =>
-                  Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
-                    Effect.andThen(service.readConfigValue(cwd, key)),
-                  ),
-              }),
+                  readConfigValue: (cwd, key) =>
+                    Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
+                      Effect.andThen(service.readConfigValue(cwd, key)),
+                    ),
+                }),
+              ),
             ),
-          ),
-        ).pipe(
-          Layer.provideMerge(VcsProcess.layer),
-          Layer.provideMerge(NodeServices.layer),
-          Layer.provideMerge(serverConfigLayer),
-        )
-      : GitVcsDriver.layer.pipe(
-          Layer.provideMerge(VcsProcess.layer),
-          Layer.provideMerge(NodeServices.layer),
-          Layer.provideMerge(serverConfigLayer),
-        );
+          ).pipe(
+            Layer.provideMerge(VcsProcess.layer),
+            Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(serverConfigLayer),
+          )
+        : GitVcsDriver.layer.pipe(
+            Layer.provideMerge(VcsProcess.layer),
+            Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(serverConfigLayer),
+          );
   const sourceControlRegistryLayer = Layer.effect(
     SourceControlProviderRegistry.SourceControlProviderRegistry,
     (input?.sourceControlProvider === undefined
@@ -742,6 +745,7 @@ for (const action of ["create_pr", "commit_push_pr"] as const)
       let generated = 0;
       const { manager, ghCalls } = yield* makeManager({
         publicationGuard: {
+          isManaged: () => Effect.succeed(true),
           check: () =>
             Effect.fail(
               new ProjectWorkPublicationGuardError({ reason: "managed-publication-unavailable" }),
@@ -765,6 +769,176 @@ for (const action of ["create_pr", "commit_push_pr"] as const)
       expect(generated).toBe(0);
       expect(ghCalls).toEqual([]);
     }).pipe(Effect.provide(GitManagerTestLayer), Effect.scoped),
+  );
+
+for (const scenario of [
+  "confirmed",
+  "uncertain",
+  "stale",
+  "dirty",
+  "missing-precondition",
+  "compound",
+  "missing-permission",
+  "different-remote-ref",
+  "changed-after-remote",
+] as const)
+  it.effect(`controlled managed publication ${scenario} preserves exact reviewed source`, () =>
+    Effect.gen(function* () {
+      let generated = 0;
+      let published = 0;
+      let statusReads = 0;
+      const head = "a".repeat(40);
+      const tree = "b".repeat(40);
+      const status: GitVcsDriver.GitStatusDetails = {
+        isRepo: true,
+        hasOriginRemote: true,
+        isDefaultBranch: false,
+        branch: "reviewed",
+        headCommit: head,
+        indexTree: tree,
+        upstreamRef: "origin/reviewed",
+        hasWorkingTreeChanges: scenario === "dirty",
+        workingTree: { files: [], insertions: 0, deletions: 0 },
+        hasUpstream: true,
+        aheadCount: 0,
+        behindCount: 0,
+        aheadOfDefaultCount: 1,
+      };
+      const { manager, ghCalls } = yield* makeManager({
+        publicationGuard: {
+          isManaged: () => Effect.succeed(true),
+          check: () => Effect.die("Legacy managed path entered"),
+        },
+        gitDriver: {
+          statusDetails: () =>
+            Effect.sync(() => {
+              statusReads += 1;
+              return scenario === "changed-after-remote" && statusReads > 1
+                ? { ...status, headCommit: "f".repeat(40) }
+                : status;
+            }),
+          resolvePublicationTarget: () =>
+            Effect.succeed({
+              remoteName: "origin",
+              refName: scenario === "different-remote-ref" ? "other" : "reviewed",
+            }),
+          readConfigValue: () => Effect.succeed("https://github.com/owner/repo.git"),
+          pushCurrentBranch: () => Effect.die("Managed publication must not push"),
+        },
+        textGeneration: {
+          generatePrContent: () => {
+            generated += 1;
+            return Effect.die("Managed publication must not generate content");
+          },
+        },
+      });
+      const result = yield* manager
+        .runStackedAction(
+          {
+            cwd: "/controlled/reviewed",
+            actionId: "controlled-publication",
+            action: scenario === "compound" ? "commit_push_pr" : "create_pr",
+            ...(scenario === "missing-precondition"
+              ? {}
+              : {
+                  precondition: {
+                    expectedHeadCommit: scenario === "stale" ? "c".repeat(40) : head,
+                    expectedIndexTree: tree,
+                    expectedRefName: "reviewed",
+                  },
+                }),
+          },
+          {
+            ...(scenario === "missing-permission"
+              ? {}
+              : {
+                  humanPublicationRequest: {
+                    assertCurrent: () => Effect.die("Producer owns permission evaluation"),
+                  },
+                }),
+            humanPublication: {
+              create: (_input, target) => {
+                published += 1;
+                expect(target).toEqual({
+                  cwd: "/controlled/reviewed",
+                  localBranch: "reviewed",
+                  testedTree: "b".repeat(40),
+                  indexTree: "b".repeat(40),
+                  headSha: "a".repeat(40),
+                  remoteUrl: "https://github.com/owner/repo.git",
+                  remoteName: "origin",
+                });
+                const common = {
+                  version: 1 as const,
+                  operationId: "controlled-publication",
+                  requestHash: "d".repeat(64),
+                  claimGeneration: 1,
+                  observedAt: "2026-10-07T00:00:00.000Z",
+                };
+                return Effect.succeed(
+                  scenario === "uncertain"
+                    ? {
+                        ...common,
+                        kind: "uncertain" as const,
+                        reason: "missing-match" as const,
+                      }
+                    : {
+                        ...common,
+                        kind: "confirmed" as const,
+                        marker: "controlled-marker",
+                        repository: {
+                          host: "github.com",
+                          nodeId: "repo-node",
+                          nameWithOwner: "owner/repo",
+                        },
+                        pullRequest: {
+                          nodeId: "pr-node",
+                          number: 7,
+                          url: "https://github.com/owner/repo/pull/7",
+                          state: "OPEN" as const,
+                          baseSha: "e".repeat(40),
+                          headSha: "a".repeat(40),
+                          baseRef: "main",
+                          headRef: "reviewed",
+                          headRepositoryNodeId: "repo-node",
+                        },
+                      },
+                );
+              },
+            },
+          },
+        )
+        .pipe(Effect.result);
+      expect(result._tag).toBe(scenario === "confirmed" ? "Success" : "Failure");
+      if (scenario === "confirmed")
+        expect(result).toMatchObject({
+          success: {
+            pr: { status: "created", number: 7 },
+            push: { status: "skipped_not_requested" },
+          },
+        });
+      if (scenario !== "confirmed") {
+        if (scenario === "stale" || scenario === "changed-after-remote")
+          expect(result).toMatchObject({ failure: { code: "stale_git_state" } });
+        else
+          expect(result).toMatchObject({
+            failure: {
+              detail: expect.stringContaining(
+                scenario === "uncertain"
+                  ? "awaiting reconciliation"
+                  : scenario === "dirty" || scenario === "missing-precondition"
+                    ? "clean committed branch"
+                    : scenario === "different-remote-ref"
+                      ? "bound remote"
+                      : "retained review and publication authorization",
+              ),
+            },
+          });
+      }
+      expect(published).toBe(scenario === "confirmed" || scenario === "uncertain" ? 1 : 0);
+      expect(generated).toBe(0);
+      expect(ghCalls).toEqual([]);
+    }).pipe(Effect.scoped),
   );
 
 const GitManagerTestLayer = GitVcsDriver.layer.pipe(

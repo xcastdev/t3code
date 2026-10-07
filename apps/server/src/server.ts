@@ -666,6 +666,8 @@ const ProjectWorkPublicationServicesLive = ProjectWorkRuntime.publicationService
   Layer.provideMerge(ProjectIssueServicesLive),
   Layer.provideMerge(ProjectWorkCoreLive),
   Layer.provide(GitHubCli.layer),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(ServerSettingsLayerLive),
 );
 const ProjectWorkPublicationLinksServicesLive =
   ProjectWorkRuntime.publicationLinksServicesLayer.pipe(

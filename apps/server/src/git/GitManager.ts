@@ -14,6 +14,10 @@ import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { ProjectWorkPublicationGuard } from "../projectWork/ProjectWorkPublicationGuard.ts";
+import type {
+  ProjectWorkHumanPublication,
+  ProjectWorkHumanPublicationRequest,
+} from "../projectWork/ProjectWorkHumanPublicationRequest.ts";
 import {
   GitActionProgressEvent,
   GitActionProgressPhase,
@@ -83,6 +87,8 @@ export interface GitActionProgressReporter {
 export interface GitRunStackedActionOptions {
   readonly actionId?: string;
   readonly progressReporter?: GitActionProgressReporter;
+  readonly humanPublicationRequest?: ProjectWorkHumanPublicationRequest["Service"];
+  readonly humanPublication?: ProjectWorkHumanPublication["Service"];
 }
 
 export interface GitRemoteStatusOptions extends GitVcsDriver.GitRemoteStatusOptions {
@@ -2920,26 +2926,40 @@ export const make = Effect.gen(function* () {
         GitRunStackedActionResult,
         GitManagerServiceError
       > {
-        if (
+        const humanPublication = options?.humanPublication;
+        const humanPermission = options?.humanPublicationRequest;
+        const managedPublication =
           (input.action === "create_pr" || input.action === "commit_push_pr") &&
           Option.isSome(publicationGuard)
+            ? yield* publicationGuard.value
+                .isManaged({
+                  cwd: input.cwd,
+                  ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+                })
+                .pipe(
+                  Effect.mapError(
+                    () =>
+                      new GitManagerError({
+                        operation: "runStackedAction",
+                        cwd: input.cwd,
+                        detail:
+                          "Managed publication history is unavailable. Inspect the task's delivery status.",
+                      }),
+                  ),
+                )
+            : false;
+        if (
+          managedPublication &&
+          (input.action !== "create_pr" ||
+            humanPermission === undefined ||
+            humanPublication === undefined)
         )
-          yield* publicationGuard.value
-            .check({
-              cwd: input.cwd,
-              ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
-            })
-            .pipe(
-              Effect.mapError(
-                () =>
-                  new GitManagerError({
-                    operation: "runStackedAction",
-                    cwd: input.cwd,
-                    detail:
-                      "Managed pull request creation requires retained review and publication authorization. Inspect the task's delivery status.",
-                  }),
-              ),
-            );
+          return yield* new GitManagerError({
+            operation: "runStackedAction",
+            cwd: input.cwd,
+            detail:
+              "Managed pull request creation requires retained review and publication authorization. Inspect the task's delivery status.",
+          });
         const initialStatus = yield* gitCore.statusDetails(input.cwd);
         // This legacy compound path can be entered from confirmations which
         // were approved before it reached the repository queue. Validate the
@@ -2964,6 +2984,117 @@ export const make = Effect.gen(function* () {
               code: "stale_git_state",
             });
           }
+        }
+        if (managedPublication) {
+          if (
+            humanPublication === undefined ||
+            humanPermission === undefined ||
+            input.precondition === undefined ||
+            !initialStatus.isRepo ||
+            initialStatus.hasWorkingTreeChanges ||
+            initialStatus.branch === null ||
+            !initialStatus.headCommit ||
+            !initialStatus.indexTree ||
+            (initialStatus.pendingMergeHeads?.length ?? 0) !== 0 ||
+            initialStatus.activeConflictOperation !== undefined ||
+            input.featureBranch
+          ) {
+            return yield* new GitManagerError({
+              operation: "runStackedAction",
+              cwd: input.cwd,
+              detail: "Review the current clean committed branch before publishing managed work.",
+            });
+          }
+          const target = yield* gitCore.resolvePublicationTarget(input.cwd, initialStatus.branch);
+          const remoteUrl =
+            target.remoteName === null
+              ? null
+              : yield* gitCore.readConfigValue(input.cwd, `remote.${target.remoteName}.url`);
+          if (
+            target.remoteName === null ||
+            remoteUrl === null ||
+            target.refName !== initialStatus.branch
+          ) {
+            return yield* new GitManagerError({
+              operation: "runStackedAction",
+              cwd: input.cwd,
+              detail: "Managed publication requires the reviewed branch on its bound remote.",
+            });
+          }
+          const currentStatus = yield* gitCore.statusDetails(input.cwd);
+          if (
+            !currentStatus.isRepo ||
+            currentStatus.hasWorkingTreeChanges ||
+            currentStatus.headCommit !== initialStatus.headCommit ||
+            currentStatus.indexTree !== initialStatus.indexTree ||
+            currentStatus.branch !== initialStatus.branch ||
+            (currentStatus.pendingMergeHeads?.length ?? 0) !== 0 ||
+            currentStatus.activeConflictOperation !== undefined
+          )
+            return yield* new GitCommandError({
+              operation: "GitManager.runStackedAction.precondition",
+              command: "git",
+              cwd: input.cwd,
+              detail: "Repository changed after the action was reviewed.",
+              code: "stale_git_state",
+            });
+          yield* progress.emit({ kind: "action_started", phases: ["pr"] });
+          yield* Ref.set(currentPhase, Option.some("pr"));
+          yield* progress.emit({
+            kind: "phase_started",
+            phase: "pr",
+            label: "Publishing reviewed PR...",
+          });
+          const outcome = yield* humanPublication
+            .create(
+              input,
+              {
+                cwd: input.cwd,
+                localBranch: initialStatus.branch,
+                testedTree: initialStatus.indexTree,
+                indexTree: initialStatus.indexTree,
+                headSha: initialStatus.headCommit,
+                remoteUrl,
+                remoteName: target.remoteName,
+              },
+              humanPermission,
+            )
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new GitManagerError({
+                    operation: "runStackedAction",
+                    cwd: input.cwd,
+                    detail:
+                      "Managed publication requires current permission, reviewed work and the exact pushed commit. Inspect the task's delivery status.",
+                    cause,
+                  }),
+              ),
+            );
+          if (outcome.kind !== "confirmed")
+            return yield* new GitManagerError({
+              operation: "runStackedAction",
+              cwd: input.cwd,
+              detail:
+                "PR publication is awaiting reconciliation. Inspect the task's delivery status before retrying.",
+            });
+          const result = {
+            action: input.action,
+            branch: { status: "skipped_not_requested" as const },
+            commit: { status: "skipped_not_requested" as const },
+            push: { status: "skipped_not_requested" as const },
+            pr: {
+              status: "created" as const,
+              url: outcome.pullRequest.url,
+              number: outcome.pullRequest.number,
+            },
+            toast: {
+              title: "PR published",
+              cta: { kind: "open_pr" as const, label: "Open PR", url: outcome.pullRequest.url },
+            },
+          };
+          yield* progress.emit({ kind: "action_finished", result });
+          return result;
         }
         const wantsCommit = isCommitAction(input.action);
         const wantsPush =

@@ -2,6 +2,8 @@ import {
   CommandId,
   ProjectId,
   ProjectWorkTaskId,
+  ProjectWorkEvidenceId,
+  type ProjectWorkEvidence,
   type ProjectWorkPublicationRequest,
 } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
@@ -89,15 +91,20 @@ const rawRefs = () => ({
   },
 });
 const layer = it.layer(NodeSqliteClient.layerMemory());
-const setup = Effect.fn("publicationTest.setup")(function* () {
+const setup = Effect.fn("publicationTest.setup")(function* (
+  selectedProject = projectId,
+  selectedTask = taskId,
+) {
   yield* runMigrations();
   yield* runForkMigrations();
   const repository = yield* ProjectWorkRepository;
   yield* repository.execute({
     type: "project-work.task.create",
-    projectId,
-    taskId,
-    commandId: CommandId.make("seed-task"),
+    projectId: selectedProject,
+    taskId: selectedTask,
+    commandId: CommandId.make(
+      selectedProject === projectId ? "seed-task" : `seed-task:${selectedProject}`,
+    ),
     title: "Publication task",
     createdAt: at,
   });
@@ -119,6 +126,63 @@ const provide = <A, E, R>(
   );
 
 layer("ProjectWorkPullRequests", (it) => {
+  it.effect(
+    "atomically retains a prepared human permission and publication effect on exact retry",
+    () =>
+      provide(
+        Effect.gen(function* () {
+          const selectedProject = ProjectId.make("prepared-human-publication-repository");
+          const selectedTask = ProjectWorkTaskId.make("prepared-human-publication-task");
+          const repository = yield* setup(selectedProject, selectedTask);
+          const service = yield* PullRequests.make({
+            authorizePublication: () => Effect.void,
+            resolveCredential: () => Effect.succeed(credential),
+          });
+          const authorizationEvidence: ProjectWorkEvidence = {
+            evidenceId: ProjectWorkEvidenceId.make("human-publication-permission"),
+            taskId: selectedTask,
+            kind: "observation",
+            summary: "Human requested publication of the reviewed commit",
+            detail: "Controlled atomic permission fixture; no native publication proof",
+            revision: 0,
+            recordedAt: at,
+            attribution: {
+              actor: { kind: "human", id: "maintainer" },
+              source: { kind: "web", id: "publication-test" },
+              recordedAt: at,
+            },
+          };
+          const prepared = Effect.succeed({
+            request: {
+              ...request,
+              operationId: "prepared-human-publication",
+              marker: "opaque-marker-prepared-human",
+              target: { ...request.target, projectId: selectedProject, taskId: selectedTask },
+              authorizationRecordIds: [authorizationEvidence.evidenceId],
+            },
+            authorizationEvidence,
+          });
+          const first = yield* service.enqueuePrepared(prepared);
+          expect(first).toMatchObject({ status: "pending", duplicate: false });
+          const events = yield* repository.replay(selectedProject);
+          expect(events.filter((event) => event.type === "project-work.evidence.added")).toEqual([
+            expect.objectContaining({ evidence: authorizationEvidence }),
+          ]);
+          expect(
+            events.filter(
+              (event) =>
+                event.type === "project-work.foundation.recorded" && event.record.kind === "effect",
+            ),
+          ).toHaveLength(1);
+          expect(yield* service.enqueuePrepared(prepared)).toMatchObject({
+            operationId: first.operationId,
+            status: "pending",
+            duplicate: true,
+          });
+          expect(yield* repository.replay(selectedProject)).toEqual(events);
+        }),
+      ),
+  );
   it.effect(
     "allows only one writer across independent service instances sharing a repository",
     () => {

@@ -24,6 +24,15 @@ import { makeProjectTeamExecutionReactor } from "./ProjectTeamExecutionReactor.t
 import type { ProjectWorkPublicationRequest, ServerSettingsError } from "@t3tools/contracts";
 import * as Publication from "./ProjectWorkPullRequests.ts";
 import * as PublicationLinks from "./ProjectWorkPublicationLinks.ts";
+import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
+import {
+  ProjectWorkPublicationAuthorization,
+  makeProjectWorkPublicationAuthorization,
+} from "./ProjectWorkPublicationAuthorization.ts";
+import {
+  ProjectWorkHumanPublication,
+  makeProjectWorkHumanPublication,
+} from "./ProjectWorkHumanPublicationRequest.ts";
 import { readIssueRepositoryState } from "./ProjectIssueRepositoryState.ts";
 
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
@@ -415,7 +424,7 @@ export const issueCommentsLayer = Layer.effect(
 /** The same service serializes live dispatch and recovery. Reflections never wake another read. */
 export const runProjectWorkPublicationRecovery = Effect.fn("runProjectWorkPublicationRecovery")(
   function* (
-    service: Pick<Publication.ProjectWorkPullRequests["Service"], "recoverAll">,
+    service: Pick<Publication.ProjectWorkPullRequests["Service"], "recoverAll" | "dispatchPending">,
     ready: Effect.Effect<void>,
   ) {
     const bus = yield* ProjectWorkEventBus.ProjectWorkEventBus;
@@ -428,27 +437,55 @@ export const runProjectWorkPublicationRecovery = Effect.fn("runProjectWorkPublic
       ),
       Effect.asVoid,
     );
+    const dispatchPending = service.dispatchPending().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : Effect.logWarning("project-work pending PR dispatch failed", cause),
+      ),
+      Effect.asVoid,
+    );
     yield* ready;
     yield* recover;
+    yield* dispatchPending;
     yield* changes.pipe(
       Stream.filter(
         ({ event }) =>
           event.type === "project-work.foundation.recorded" &&
           event.record.kind === "effect" &&
           event.record.effectKind === "publication" &&
-          event.record.status === "claimed",
+          (event.record.status === "claimed" || event.record.status === "pending"),
       ),
-      Stream.runForEach(() => recover),
+      Stream.runForEach(({ event }) =>
+        event.type === "project-work.foundation.recorded" &&
+        event.record.kind === "effect" &&
+        event.record.status === "pending"
+          ? dispatchPending
+          : recover,
+      ),
     );
   },
 );
 
-export const publicationServicesLayer = Layer.effect(
-  Publication.ProjectWorkPullRequests,
+export const publicationServicesLayer = Layer.effectContext(
   Effect.gen(function* () {
     const issues = yield* ProjectIssueRuntime;
-    // Deliberately no authorizer: first managed creation remains unavailable until retained evidence and review are consumed.
-    return yield* Publication.make({ resolveCredential: issues.resolvePublicationCredential });
+    const identity = yield* ServerEnvironmentIdentity;
+    const authorization = yield* makeProjectWorkPublicationAuthorization({
+      environmentId: yield* identity.getEnvironmentId,
+    });
+    const publication = yield* Publication.make({
+      resolveCredential: issues.resolvePublicationCredential,
+      authorizePublication: authorization.assertCurrent,
+    });
+    const human = yield* makeProjectWorkHumanPublication.pipe(
+      Effect.provideService(ProjectWorkPublicationAuthorization, authorization),
+      Effect.provideService(Publication.ProjectWorkPullRequests, publication),
+    );
+    return Context.make(Publication.ProjectWorkPullRequests, publication).pipe(
+      Context.add(ProjectWorkPublicationAuthorization, authorization),
+      Context.add(ProjectWorkHumanPublication, human),
+    );
   }),
 );
 export const publicationRecoveryLayer = Layer.effectDiscard(

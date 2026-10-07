@@ -41,7 +41,8 @@ const Options = Schema.Struct({ environmentId: Id });
 const Qualify = Schema.Struct({
   originalFinding: Schema.optionalKey(ProjectTeamReviewFinding),
   proposedFinding: ProjectTeamReviewFinding,
-  qualifiedReviewTarget: ProjectTeamReviewTarget,
+  // The target reader also reaches findings through verification; defer this cyclic schema.
+  qualifiedReviewTarget: Schema.suspend(() => ProjectTeamReviewTarget),
   provenance: ProjectTeamReviewFindingProvenance,
 });
 const Read = Schema.Struct({
