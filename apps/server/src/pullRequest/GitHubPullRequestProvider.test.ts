@@ -20,6 +20,8 @@ const exactMergeInput = {
   host: "github.enterprise.test",
   number: 7,
   expectedHeadSha: "a".repeat(40),
+  expectedBaseRef: "main",
+  expectedBaseSha: "c".repeat(40),
 };
 const mergeDetail = (overrides: Readonly<Record<string, unknown>> = {}) =>
   encodeMergeFixture({
@@ -27,6 +29,10 @@ const mergeDetail = (overrides: Readonly<Record<string, unknown>> = {}) =>
     state: "OPEN",
     headRefOid: exactMergeInput.expectedHeadSha,
     autoMergeRequest: null,
+    baseRefName: "main",
+    baseRefOid: "c".repeat(40),
+    mergeCommit: null,
+    mergedBy: null,
     mergedAt: null,
     ...overrides,
   });
@@ -73,17 +79,34 @@ it.effect("merges only the exact head through a conditioned write and confirmed 
     const { provider, calls } = yield* makeMergeTransport([
       mergeDetail(),
       encodeMergeFixture({ merged: true, sha: "b".repeat(40), message: "Merged" }),
-      mergeDetail({ state: "MERGED", mergedAt: "2026-10-05T12:00:00Z" }),
+      mergeDetail({
+        state: "MERGED",
+        mergedAt: "2026-10-05T12:00:00Z",
+        mergeCommit: { oid: "b".repeat(40) },
+        mergedBy: { login: "human-merger" },
+      }),
     ]);
     const merge = provider.mergeExactHead;
     if (merge === undefined) return yield* Effect.die("exact-head adapter is absent");
-    yield* merge({ ...exactMergeInput, mergeMethod: "squash" }).pipe(
+    const confirmation = yield* merge({ ...exactMergeInput, mergeMethod: "squash" }).pipe(
       Effect.provideService(GitHubCli.PinnedGitHubCredential, {
         host: exactMergeInput.host,
         token: Redacted.make("test-pinned-token"),
         credentialFingerprint: "test-fingerprint",
       }),
     );
+    expect(confirmation).toEqual({
+      kind: "merged",
+      host: exactMergeInput.host,
+      repository: exactMergeInput.repository,
+      number: 7,
+      authorizedHeadSha: exactMergeInput.expectedHeadSha,
+      baseRef: "main",
+      mergeCommitSha: "b".repeat(40),
+      mergedAt: "2026-10-05T12:00:00Z",
+      mergedBy: "human-merger",
+      observedAt: expect.any(String),
+    });
     expect(calls).toHaveLength(3);
     expect(calls[1]?.args).toEqual([
       "api",
@@ -103,6 +126,22 @@ it.effect("merges only the exact head through a conditioned write and confirmed 
       expect(call.env?.GH_TOKEN).toBe("test-pinned-token");
       expect(call.env?.GH_HOST).toBe(exactMergeInput.host);
     }
+  }),
+);
+
+it.effect("refuses a moved original base before the conditioned managed merge write", () =>
+  Effect.gen(function* () {
+    const { provider, calls } = yield* makeMergeTransport([
+      mergeDetail({ baseRefOid: "e".repeat(40) }),
+    ]);
+    const merge = provider.mergeExactHead;
+    if (!merge) return yield* Effect.die("Missing exact-head merge");
+    expect(yield* merge(exactMergeInput).pipe(Effect.result)).toMatchObject({
+      _tag: "Failure",
+      failure: { operation: "mergeExactHead" },
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args).toContain("view");
   }),
 );
 

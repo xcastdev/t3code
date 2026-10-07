@@ -584,7 +584,12 @@ export const make = Effect.gen(function* () {
 
     mergeExactHead: (input) => {
       // The CLI preserves ordinary callers by treating an absent SHA as an ordinary merge.
-      if (input.expectedHeadSha === undefined)
+      if (
+        input.expectedHeadSha === undefined ||
+        input.expectedBaseRef === undefined ||
+        input.expectedBaseSha === undefined ||
+        cli.confirmExactHeadMerge === undefined
+      )
         return Effect.fail(
           fail("mergeExactHead")(
             new GitHubPullRequestCli.GitHubExactHeadMergeRefusedError({
@@ -596,13 +601,14 @@ export const make = Effect.gen(function* () {
           ),
         );
       return cli
-        .runPullRequestAction({
+        .confirmExactHeadMerge({
           cwd: input.cwd,
           repository: input.repository,
           host: input.host,
           number: input.number,
-          action: "merge",
           expectedHeadSha: input.expectedHeadSha,
+          expectedBaseRef: input.expectedBaseRef,
+          expectedBaseSha: input.expectedBaseSha,
           ...(input.mergeMethod === undefined ? {} : { mergeMethod: input.mergeMethod }),
         })
         .pipe(Effect.mapError(fail("mergeExactHead")));

@@ -108,6 +108,7 @@ import ForkMigration0037 from "./Migrations/fork/037_ProjectTeamMailboxConsumpti
 import ForkMigration0038 from "./Migrations/fork/038_ProjectTeamReviewCompletionProposals.ts";
 import ForkMigration0039 from "./Migrations/fork/039_ProjectTeamMailboxTurns.ts";
 import ForkMigration0040 from "./Migrations/fork/040_ProjectTeamMailboxSuccessors.ts";
+import ForkMigration0041 from "./Migrations/fork/041_ProjectWorkManagedMerge.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -216,6 +217,7 @@ export const forkMigrationEntries = [
   [38, "ProjectTeamReviewCompletionProposals", ForkMigration0038],
   [39, "ProjectTeamMailboxTurns", ForkMigration0039],
   [40, "ProjectTeamMailboxSuccessors", ForkMigration0040],
+  [41, "ProjectWorkManagedMerge", ForkMigration0041],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";

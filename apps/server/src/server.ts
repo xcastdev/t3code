@@ -517,24 +517,6 @@ const RepositoryIdentityResolverLayerLive = Layer.effect(
   }),
 ).pipe(Layer.provide(SourceControlProviderRegistryLayerLive), Layer.provide(ProcessRunner.layer));
 
-const PullRequestServiceLive = PullRequestService.layer.pipe(
-  Layer.provide(
-    ProjectWorkEvidenceInvalidation.layer.pipe(
-      Layer.provide(ProjectWorkRuntime.coreLayer),
-      Layer.provide(ProjectTeamAuthorizationLive),
-      Layer.provide(ServerSettingsLayerLive),
-      Layer.provide(SqlitePersistenceLayerLive),
-    ),
-  ),
-  Layer.provide(
-    ProjectWorkPullRequestActionGuard.layer.pipe(Layer.provide(ProjectTeamAuthorizationLive)),
-  ),
-  Layer.provide(PullRequestProviderRegistry.layer),
-  Layer.provide(PullRequestReadCache.layer),
-  Layer.provide(SourceControlProviderRegistryLayerLive),
-  Layer.provide(SourceControlRateLimit.layer),
-);
-
 const GitManagerLayerLive = GitManager.layer.pipe(
   Layer.provide(
     ProjectWorkPublicationGuard.layer.pipe(Layer.provide(ProjectTeamAuthorizationLive)),
@@ -669,6 +651,32 @@ const ProjectWorkPublicationServicesLive = ProjectWorkRuntime.publicationService
   Layer.provide(ServerEnvironmentLayerLive),
   Layer.provide(ServerSettingsLayerLive),
 );
+const ProjectWorkManagedMergeServicesLive = ProjectWorkRuntime.managedMergeServicesLayer.pipe(
+  Layer.provideMerge(ProjectWorkPublicationServicesLive),
+  Layer.provide(
+    ProjectWorkPullRequestActionGuard.layer.pipe(Layer.provide(ProjectTeamAuthorizationLive)),
+  ),
+  Layer.provide(ServerEnvironmentLayerLive),
+);
+const PullRequestServiceLive = PullRequestService.layer.pipe(
+  Layer.provide(ProjectWorkManagedMergeServicesLive),
+  Layer.provide(
+    ProjectWorkEvidenceInvalidation.layer.pipe(
+      Layer.provide(ProjectWorkRuntime.coreLayer),
+      Layer.provide(ProjectTeamAuthorizationLive),
+      Layer.provide(ServerSettingsLayerLive),
+      Layer.provide(SqlitePersistenceLayerLive),
+    ),
+  ),
+  Layer.provide(
+    ProjectWorkPullRequestActionGuard.layer.pipe(Layer.provide(ProjectTeamAuthorizationLive)),
+  ),
+  Layer.provide(PullRequestProviderRegistry.layer),
+  Layer.provide(PullRequestReadCache.layer),
+  Layer.provide(SourceControlProviderRegistryLayerLive),
+  Layer.provide(SourceControlRateLimit.layer),
+);
+
 const ProjectWorkPublicationLinksServicesLive =
   ProjectWorkRuntime.publicationLinksServicesLayer.pipe(
     Layer.provideMerge(ProjectIssueServicesLive),
@@ -677,6 +685,12 @@ const ProjectWorkPublicationLinksServicesLive =
   );
 
 const ProjectWorkServicesLive = Layer.mergeAll(
+  ProjectWorkManagedMergeServicesLive,
+  ProjectWorkRuntime.managedMergeRecoveryLayer.pipe(
+    Layer.provide(ProjectWorkManagedMergeServicesLive),
+    Layer.provide(PullRequestServiceLive),
+    Layer.provide(ProjectIssueServicesLive),
+  ),
   ProjectWorkPublicationLinksServicesLive,
   ProjectWorkRuntime.publicationLinksRecoveryLayer.pipe(
     Layer.provide(ProjectWorkPublicationLinksServicesLive),

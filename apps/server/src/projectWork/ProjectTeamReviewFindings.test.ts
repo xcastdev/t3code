@@ -1,4 +1,31 @@
 // @effect-diagnostics nodeBuiltinImport:off - Disposable SDK JSONL is the retained observation under test.
+import { runProjectWorkManagedMergeRecovery } from "./ProjectWorkRuntime.ts";
+import { ProjectWorkEventBus, ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
+import * as Queue from "effect/Queue";
+import * as PullService from "../pullRequest/PullRequestService.ts";
+import * as PullRegistry from "../pullRequest/PullRequestProviderRegistry.ts";
+import * as PullReadCache from "../pullRequest/PullRequestReadCache.ts";
+import * as GitHubPullCli from "../pullRequest/GitHubPullRequestCli.ts";
+import * as GitHubPullProvider from "../pullRequest/GitHubPullRequestProvider.ts";
+import * as SourceProviders from "../sourceControl/SourceControlProviderRegistry.ts";
+import * as SourceRateLimit from "../sourceControl/SourceControlRateLimit.ts";
+import * as PlatformPath from "@effect/platform-node/NodePath";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
+import {
+  ProjectWorkHumanMergeRequest,
+  makeProjectWorkHumanMergeRequest,
+} from "./ProjectWorkHumanMergeRequest.ts";
+import {
+  ProjectWorkManagedMerge,
+  makeProjectWorkManagedMerge,
+  type ManagedMergePorts,
+} from "./ProjectWorkManagedMerge.ts";
+import {
+  makeProjectWorkManagedMergeJournal,
+  ManagedMergeError,
+} from "./ProjectWorkManagedMergeJournal.ts";
+import * as MergeGuard from "./ProjectWorkPullRequestActionGuard.ts";
 import { expect, it, vi } from "@effect/vitest";
 import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
 import { makeProjectTeamWorkspace } from "./ProjectTeamWorkspace.ts";
@@ -25,15 +52,19 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import {
   canonicalProjectWorkPayload,
+  ProjectId,
   EnvironmentId,
   AuthOrchestrationOperateScope,
   AuthSessionId,
   type GitRunStackedActionInput,
+  type PullRequestActionInput,
+  type OrchestrationProjectShell,
   GitCommandError,
   ProjectTeamReviewFindingIntent,
   ProjectTeamReviewFinding,
   ProjectTeamReviewFindingProvenance,
   ProjectTeamRecord,
+  ProjectTeamGate,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamWriteIntent,
   ProjectTeamRecordRead,
@@ -1374,6 +1405,7 @@ const scopedGateway = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         ProjectWorkProjectionLive.pipe(
           Layer.provideMerge(
             gatewayRuntime.pipe(
+              Layer.provideMerge(ProjectWorkEventBusLive),
               Layer.provide(
                 Layer.succeed(ServerEnvironmentIdentity, {
                   getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
@@ -7221,6 +7253,778 @@ it.effect(
         ).toHaveLength(1);
         yield* reportTool(f, intent);
         expect(yield* f.state()).toEqual(after);
+      }),
+    ),
+);
+
+const makeHumanManagedMergeFixture = Effect.fn("mergeTest.authenticFixture")(function* () {
+  const p = yield* makeHumanPublicationFixture();
+  const { f, input, target, permission, authorization } = p;
+  const pending = yield* p.publication.enqueuePrepared(
+    authorization.prepareInTransaction({ input, target, permission }),
+  );
+  const effect = (yield* f.state()).foundationRecords?.find(
+    (entry) => entry.recordId === pending.operationId,
+  );
+  if (effect?.kind !== "effect") return yield* Effect.die("Missing real publication operation");
+  const request = yield* decodeControlledPublicationRequest(effect.payload.summary);
+  let created = false;
+  const pr = {
+    node_id: "PR_merge",
+    number: 42,
+    html_url: "https://github.com/owner/reviewed/pull/42",
+    state: "open",
+    merged_at: null,
+    body: `<!-- t3-project-work-publication:v1:${request.marker} -->`,
+    base: {
+      sha: request.target.baseSha,
+      ref: request.target.baseRef,
+      repo: { node_id: request.repository.nodeId, full_name: request.repository.nameWithOwner },
+    },
+    head: {
+      sha: request.target.headSha,
+      ref: request.target.headRef,
+      repo: { node_id: request.target.headRepositoryNodeId },
+    },
+  };
+  const run: VcsProcess.VcsProcess["Service"]["run"] = (command) =>
+    Effect.sync(() => {
+      let value: unknown;
+      if (command.args.includes("graphql"))
+        value = {
+          data: {
+            base: {
+              id: request.repository.nodeId,
+              nameWithOwner: request.repository.nameWithOwner,
+              ref: { name: request.target.baseRef, target: { oid: request.target.baseSha } },
+            },
+            head: {
+              id: request.target.headRepositoryNodeId,
+              nameWithOwner: request.repository.nameWithOwner,
+              ref: { name: request.target.headRef, target: { oid: request.target.headSha } },
+            },
+          },
+        };
+      else if (command.args.includes("POST")) {
+        created = true;
+        value = {};
+      } else if (command.args.at(-1) === `repos/${request.repository.nameWithOwner}`)
+        value = { node_id: request.repository.nodeId, full_name: request.repository.nameWithOwner };
+      else value = created ? [pr] : [];
+      return {
+        stdout: canonical(value),
+        stderr: "",
+        exitCode: ChildProcessSpawner.ExitCode(0),
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      };
+    });
+  const publication = yield* Publication.make({
+    authorizePublication: authorization.assertCurrent,
+    resolveCredential: () =>
+      Effect.succeed({
+        cwd: target.cwd,
+        host: request.repository.host,
+        repositoryNodeId: request.repository.nodeId,
+        headRepositoryNodeId: request.target.headRepositoryNodeId,
+        credentialFingerprint: "controlled-epoch",
+        token: Redacted.make("controlled-merge-publication-token"),
+      }),
+  }).pipe(
+    Effect.provide(
+      GitHubCli.layer.pipe(
+        Layer.provide(Layer.succeed(VcsProcess.VcsProcess, VcsProcess.VcsProcess.of({ run }))),
+      ),
+    ),
+  );
+  const published = yield* publication.dispatch(pending.operationId);
+  expect(published.kind).toBe("confirmed");
+  const mergeInput: PullRequestActionInput = {
+    projectId,
+    host: request.repository.host,
+    repository: request.repository.nameWithOwner,
+    number: 42,
+    action: "merge",
+    mergeMethod: "squash",
+  };
+  const human = yield* makeProjectWorkHumanMergeRequest(p.session, mergeInput).pipe(
+    Effect.provideService(AuthSessions.AuthSessionRepository, p.sessions),
+  );
+  const service = yield* makeProjectWorkManagedMerge({ environmentId: "environment" }).pipe(
+    Effect.provideService(ProjectWorkPublicationAuthorization, authorization),
+    Effect.provide(MergeGuard.layer),
+  );
+  const journal = yield* makeProjectWorkManagedMergeJournal({ environmentId: "environment" });
+  let writes = 0;
+  let reads = 0;
+  const ports: ManagedMergePorts = {
+    mergeExactHead: (decision) =>
+      Effect.gen(function* () {
+        const stored = yield* f.sql.withTransaction(
+          journal.readInTransaction(decision.operationId),
+        );
+        expect(stored?.status).toBe("claimed");
+        expect(stored?.decision.gate.attribution.actor.kind).toBe("human");
+        writes++;
+        return {
+          kind: "merged" as const,
+          host: request.repository.host,
+          repository: request.repository.nameWithOwner,
+          number: 42,
+          authorizedHeadSha: request.target.headSha,
+          baseRef: request.target.baseRef,
+          mergeCommitSha: "d".repeat(40),
+          mergedAt: at,
+          mergedBy: "controlled-human",
+          observedAt: at,
+        };
+      }).pipe(Effect.mapError((cause) => new ManagedMergeError({ reason: "persistence", cause }))),
+    reconcileExactHead: () =>
+      Effect.sync(() => {
+        reads++;
+        return {
+          state: "merged",
+          headSha: request.target.headSha,
+          baseRef: request.target.baseRef,
+        };
+      }),
+  };
+  return {
+    ...p,
+    request,
+    mergeInput,
+    human,
+    service,
+    journal,
+    ports,
+    counts: () => ({ writes, reads }),
+    resolved: {
+      projectId,
+      host: request.repository.host,
+      repository: request.repository.nameWithOwner,
+    },
+  };
+});
+it.effect(
+  "authenticated managed merge retains the exact human decision before sending and returns one delivery receipt",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const before = yield* m.f.state();
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        expect(receipt.confirmation.authorizedHeadSha).toBe(m.request.target.headSha);
+        expect(receipt.confirmation.baseRef).toBe(m.request.target.baseRef);
+        expect(receipt.evidence.kind).toBe("observation");
+        expect(receipt.evidence.attribution?.actor).toEqual({
+          kind: "system",
+          id: "project-work-managed-merge",
+        });
+        const after = yield* m.f.state();
+        expect(after.tasks).toEqual(before.tasks);
+        expect(
+          after.evidence.filter((entry) => entry.evidenceId === receipt.evidence.evidenceId),
+        ).toEqual([receipt.evidence]);
+        expect(yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports)).toEqual(receipt);
+        expect(yield* m.service.resume(receipt.operationId, m.ports)).toEqual(receipt);
+        expect(m.counts()).toEqual({ writes: 1, reads: 0 });
+        expect(
+          (yield* m.f.sql.withTransaction(m.journal.readInTransaction(receipt.operationId)))
+            ?.receipt,
+        ).toEqual(receipt);
+      }),
+    ),
+);
+
+it.effect(
+  "managed merge denies another selected project before retaining approval or remote work",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const foreignProject = ProjectId.make("foreign-selected-project");
+        const input = { ...m.mergeInput, projectId: foreignProject };
+        const human = yield* makeProjectWorkHumanMergeRequest(m.session, input).pipe(
+          Effect.provideService(AuthSessions.AuthSessionRepository, m.sessions),
+        );
+        const before = yield* m.f.repository.replay(projectId);
+        const receipts = yield* m.f
+          .sql`SELECT COUNT(*) AS count FROM project_work_command_receipts`;
+        const events = yield* m.f.sql`SELECT COUNT(*) AS count FROM project_work_events`;
+        const outcome = yield* m.service
+          .run(input, { ...m.resolved, projectId: foreignProject }, human, m.ports)
+          .pipe(Effect.result);
+        expect(outcome).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "ManagedMergeError", reason: "authorization-denied" },
+        });
+        expect(yield* m.f.repository.replay(projectId)).toEqual(before);
+        expect(yield* m.f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts`).toEqual(
+          receipts,
+        );
+        expect(yield* m.f.sql`SELECT COUNT(*) AS count FROM project_work_events`).toEqual(events);
+        expect(yield* m.f.sql`SELECT COUNT(*) AS count FROM project_work_managed_merge`).toEqual([
+          { count: 0 },
+        ]);
+        expect(m.counts()).toEqual({ writes: 0, reads: 0 });
+      }),
+    ),
+);
+
+const decodeMergeGate = Schema.decodeUnknownEffect(ProjectTeamGate, strict);
+const retainCompatibleMergeGate = Effect.fn("mergeTest.existingHumanGate")(function* (
+  m: Effect.Success<ReturnType<typeof makeHumanManagedMergeFixture>>,
+) {
+  const state = yield* m.f.state();
+  const human = yield* m.human.assertCurrent(projectId, m.mergeInput);
+  const gate = yield* decodeMergeGate({
+    kind: "gate",
+    recordId: "existing-reviewed-merge-gate",
+    projectId,
+    revision: 0,
+    generation: 0,
+    updatedAt: human.recordedAt,
+    status: "approved",
+    taskId: m.request.target.taskId,
+    gate: "merge",
+    specRevision: m.request.target.specRevision,
+    planRevision: m.request.target.planRevision,
+    contentHash: "existing-reviewed-fixed-approval",
+    attribution: human,
+    repository: `${m.request.repository.host}/${m.request.repository.nameWithOwner}`,
+    pullRequestNumber: 42,
+    headSha: m.request.target.headSha,
+    targetBranch: m.request.target.baseRef,
+    mergeMethod: "squash",
+    evidenceIds: m.request.authorizationRecordIds,
+  });
+  yield* m.f.repository.execute(
+    decodeCommit({
+      type: "project-work.foundation.commit",
+      commandId: "existing-merge-approval-0",
+      projectId,
+      expectedRevision: state.revision,
+      attribution: human,
+      committedAt: human.recordedAt,
+      records: [gate],
+    }),
+  );
+  return gate;
+});
+it.effect(
+  "managed merge reuses exact human approval and distinguishes a genuinely fresh gate revision",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const gate = yield* retainCompatibleMergeGate(m);
+        const first = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        const retained = yield* m.f.sql.withTransaction(
+          m.journal.readInTransaction(first.operationId),
+        );
+        expect(retained?.decision.gate).toEqual(gate);
+        expect(retained?.decision.gateApproval).toBeDefined();
+        expect(retained?.decision.commands).toHaveLength(1);
+        const state = yield* m.f.state();
+        const renewed = { ...gate, revision: 1 };
+        yield* m.f.repository.execute(
+          decodeCommit({
+            type: "project-work.foundation.commit",
+            commandId: "existing-merge-approval-1",
+            projectId,
+            expectedRevision: state.revision,
+            attribution: gate.attribution,
+            committedAt: gate.updatedAt,
+            records: [renewed],
+          }),
+        );
+        const refusal = {
+          ...m.ports,
+          mergeExactHead: () => Effect.fail(new ManagedMergeError({ reason: "uncertain" })),
+        };
+        expect(
+          (yield* m.service.run(m.mergeInput, m.resolved, m.human, refusal).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+        const rows = yield* m.f.sql<{
+          operation_id: string;
+          gate_revision: number;
+          status: string;
+        }>`SELECT operation_id,gate_revision,status FROM project_work_managed_merge ORDER BY gate_revision`;
+        expect(rows).toHaveLength(2);
+        expect(rows[0]).toMatchObject({ gate_revision: 0, status: "confirmed" });
+        expect(rows[1]).toMatchObject({ gate_revision: 1, status: "uncertain" });
+        expect(rows[1]?.operation_id).not.toBe(first.operationId);
+        expect(m.counts()).toEqual({ writes: 1, reads: 0 });
+      }),
+    ),
+);
+it.effect(
+  "managed merge failed owning COMMIT sends nothing and retains no partial approval after cleanup",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const before = yield* m.f.repository.replay(projectId);
+        yield* m.f.sql`CREATE TABLE controlled_merge_parent(id TEXT PRIMARY KEY)`;
+        yield* m.f
+          .sql`CREATE TABLE controlled_merge_child(id TEXT REFERENCES controlled_merge_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* m.f
+          .sql`CREATE TRIGGER controlled_merge_failed_commit AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'managed-merge-permission:%' BEGIN INSERT INTO controlled_merge_child VALUES ('missing'); END`;
+        expect(
+          (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect(m.counts().writes).toBe(0);
+        // Only dispose the failed physical transaction belonging to this controlled database.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const connection = yield* m.f.sql.reserve;
+            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+          }),
+        );
+        expect(yield* m.f.repository.replay(projectId)).toEqual(before);
+        expect(yield* m.f.sql`SELECT operation_id FROM project_work_managed_merge`).toEqual([]);
+        yield* m.f.sql`DROP TRIGGER controlled_merge_failed_commit`;
+        expect(
+          (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports)).confirmation.kind,
+        ).toBe("merged");
+        expect(m.counts().writes).toBe(1);
+      }),
+    ),
+);
+it.effect(
+  "managed merge uncertainty reconciles external observations without resending or producing delivery",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        let writes = 0;
+        const ambiguous = {
+          ...m.ports,
+          mergeExactHead: () =>
+            Effect.sync(() => {
+              writes++;
+              return {
+                kind: "merged" as const,
+                host: m.request.repository.host,
+                repository: m.request.repository.nameWithOwner,
+                number: 42,
+                authorizedHeadSha: "e".repeat(40),
+                baseRef: m.request.target.baseRef,
+                mergeCommitSha: "d".repeat(40),
+                mergedAt: at,
+                mergedBy: "external-human",
+                observedAt: at,
+              };
+            }),
+        };
+        expect(
+          (yield* m.service.run(m.mergeInput, m.resolved, m.human, ambiguous).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+        const pending = yield* m.service.pending();
+        expect(pending).toHaveLength(1);
+        const operation = pending[0];
+        if (!operation) return yield* Effect.die("Missing uncertain merge");
+        expect(
+          (yield* m.service.resume(operation.operationId, m.ports).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const stored = yield* m.f.sql.withTransaction(
+          m.journal.readInTransaction(operation.operationId),
+        );
+        expect(stored).toMatchObject({
+          status: "uncertain",
+          attention: { reason: "write-unconfirmed" },
+        });
+        expect(
+          (yield* m.f.state()).evidence.some((entry) =>
+            entry.evidenceId.startsWith("managed-merge-delivery:"),
+          ),
+        ).toBe(false);
+        expect(writes).toBe(1);
+        expect(m.counts()).toEqual({ writes: 0, reads: 1 });
+      }),
+    ),
+);
+it.effect(
+  "managed merge retains browser-independent consent but rejects new revoked-session and foreign-loan requests",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const before = yield* m.f.repository.replay(projectId);
+        expect(
+          (yield* m.service
+            .run(m.mergeInput, m.resolved, m.human, m.ports)
+            .pipe(Effect.provideService(SqlClient.SqlClient, { ...m.f.sql }), Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* m.f.repository.replay(projectId)).toEqual(before);
+        expect(m.counts().writes).toBe(0);
+        const receipt = yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports);
+        yield* m.f
+          .sql`UPDATE auth_sessions SET revoked_at=${DateTime.formatIso(DateTime.makeUnsafe(m.now))} WHERE session_id=${m.session.sessionId}`;
+        expect(yield* m.service.resume(receipt.operationId, m.ports)).toEqual(receipt);
+        expect(
+          (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+        expect(m.counts().writes).toBe(1);
+      }),
+    ),
+);
+it.effect("managed merge rejects changed source grants before any remote write", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const m = yield* makeHumanManagedMergeFixture();
+      const before = yield* m.f.repository.replay(projectId);
+      const grant = (yield* m.f.state()).foundationRecords?.find(
+        (entry) => entry.kind === "gate" && entry.verificationJobId === m.f.prepared.manifest.jobId,
+      );
+      if (grant?.kind !== "gate")
+        return yield* Effect.die("Missing original verification permission");
+      yield* m.f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          commandId: "merge-revoke-verification",
+          projectId,
+          expectedRevision: (yield* m.f.state()).revision,
+          attribution: grant.attribution,
+          committedAt: at,
+          records: [
+            { ...grant, status: "invalidated", revision: grant.revision + 1, updatedAt: at },
+          ],
+        }),
+      );
+      expect(
+        (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(m.counts().writes).toBe(0);
+      expect(yield* m.f.sql`SELECT operation_id FROM project_work_managed_merge`).toEqual([]);
+      expect((yield* m.f.repository.replay(projectId)).length).toBeGreaterThan(before.length);
+    }),
+  ),
+);
+
+it.effect(
+  "managed merge through the real pull request service uses the exact provider confirmation and notifies after retained delivery",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const provider = yield* GitHubPullProvider.make.pipe(
+          Effect.provide(
+            Layer.mock(GitHubPullCli.GitHubPullRequestCli)({
+              getViewerLogin: () => Effect.succeed("controlled-human"),
+              getViewerAccess: () =>
+                Effect.succeed({
+                  canWrite: true,
+                  canTriage: false,
+                  canUpdate: true,
+                  didAuthor: false,
+                }),
+              confirmExactHeadMerge: (input) =>
+                Effect.gen(function* () {
+                  expect(input).toMatchObject({
+                    repository: m.request.repository.nameWithOwner,
+                    host: m.request.repository.host,
+                    number: 42,
+                    expectedHeadSha: m.request.target.headSha,
+                    expectedBaseRef: m.request.target.baseRef,
+                    expectedBaseSha: m.request.target.baseSha,
+                    mergeMethod: "squash",
+                  });
+                  const rows = yield* m.f.sql<{
+                    operation_id: string;
+                  }>`SELECT operation_id FROM project_work_managed_merge WHERE status='claimed'`;
+                  expect(rows).toHaveLength(1);
+                  const row = rows[0];
+                  if (!row) return yield* Effect.die("Missing retained claim");
+                  const retained = yield* m.f.sql.withTransaction(
+                    m.journal.readInTransaction(row.operation_id),
+                  );
+                  if (!retained) return yield* Effect.die("Missing retained decision");
+                  return yield* m.ports.mergeExactHead(retained.decision);
+                }).pipe(
+                  Effect.provideService(SqlClient.SqlClient, m.f.sql),
+                  Effect.provideService(ProjectWorkRepository, m.f.repository),
+                  Effect.mapError(
+                    (cause) =>
+                      new GitHubPullCli.GitHubPullRequestReadError({
+                        command: "gh",
+                        cwd: input.cwd,
+                        operation: "exactHeadMergeDetail",
+                        cause,
+                      }),
+                  ),
+                ),
+              runPullRequestAction: () =>
+                Effect.die("Managed work must not enter an ordinary merge"),
+              getPullRequestSummary: () =>
+                Effect.die("The validated managed receipt supplies the merge notification"),
+            }),
+          ),
+        );
+        const shell: OrchestrationProjectShell = {
+          id: projectId,
+          title: "Reviewed work",
+          workspaceRoot: m.target.cwd,
+          repositoryIdentity: {
+            canonicalKey: "github.com/owner/reviewed",
+            locator: {
+              source: "git-remote" as const,
+              remoteName: "origin",
+              remoteUrl: "https://github.com/owner/reviewed.git",
+            },
+            provider: "github",
+            displayName: "owner/reviewed",
+          },
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: at,
+          updatedAt: at,
+        };
+        const service = yield* PullService.make.pipe(
+          Effect.provideService(ProjectWorkManagedMerge, m.service),
+          Effect.provide(
+            Layer.mergeAll(
+              MergeGuard.layer,
+              Layer.succeed(
+                PullRegistry.PullRequestProviderRegistry,
+                PullRegistry.fromProviders([provider]),
+              ),
+              Layer.succeed(PullReadCache.PullRequestReadCache, {
+                get: (_key, read) => read,
+                invalidate: Effect.void,
+              }),
+              Layer.mock(ProjectionSnapshotQuery)({
+                getProjectShells: () => Effect.succeed([shell]),
+                getProjectShellById: () => Effect.succeed(Option.some(shell)),
+              }),
+              Layer.mock(SourceProviders.SourceControlProviderRegistry)({
+                resolveLink: () => undefined,
+                resolveHandle: () => Effect.die("Unexpected repository replacement"),
+              }),
+              Layer.succeed(
+                FileSystem.FileSystem,
+                FileSystem.makeNoop({
+                  realPath: (path) => Effect.succeed(path),
+                  readFileString: () => Effect.succeed(""),
+                }),
+              ),
+              SourceRateLimit.layer,
+              PlatformPath.layer,
+            ),
+          ),
+        );
+        const merged = yield* service.subscribeMerges;
+        const observed = yield* Deferred.make<PullService.PullRequestMergeEvent>();
+        yield* Effect.forkScoped(
+          merged.pipe(
+            Stream.take(1),
+            Stream.runForEach((event) => Deferred.succeed(observed, event)),
+          ),
+        );
+        yield* service
+          .runAction(m.mergeInput)
+          .pipe(Effect.provideService(ProjectWorkHumanMergeRequest, m.human));
+        const event = yield* Deferred.await(observed);
+        expect(event).toMatchObject({
+          projectId,
+          repository: m.request.repository.nameWithOwner,
+          number: 42,
+          mergedAt: at,
+        });
+        const rows = yield* m.f.sql<{
+          operation_id: string;
+        }>`SELECT operation_id FROM project_work_managed_merge WHERE status='confirmed'`;
+        expect(rows).toHaveLength(1);
+        expect(m.counts()).toEqual({ writes: 1, reads: 0 });
+        expect(
+          (yield* m.f.state()).evidence.some((entry) =>
+            entry.evidenceId.startsWith("managed-merge-delivery:"),
+          ),
+        ).toBe(true);
+        yield* service
+          .runAction(m.mergeInput)
+          .pipe(Effect.provideService(ProjectWorkHumanMergeRequest, m.human));
+        expect(m.counts().writes).toBe(1);
+      }),
+    ),
+);
+
+it.effect(
+  "managed merge denies corrupt original verification before retaining approval or contacting the provider",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const rows = yield* m.f.sql<{
+          artifactId: string;
+          raw: Uint8Array;
+        }>`SELECT artifact_id AS artifactId,raw_bytes AS raw FROM project_work_artifacts WHERE artifact_id LIKE '%:stderr' LIMIT 2`;
+        const row = rows[0];
+        if (rows.length !== 1 || !row || !row.raw.length)
+          return yield* Effect.die("Missing original verification stderr");
+        const bytes = new Uint8Array(row.raw);
+        bytes[0] = bytes[0]! ^ 255;
+        yield* m.f.sql`DROP TRIGGER project_work_artifacts_immutable`;
+        yield* m.f
+          .sql`UPDATE project_work_artifacts SET raw_bytes=${bytes} WHERE artifact_id=${row.artifactId}`;
+        const before = yield* m.f.repository.replay(projectId);
+        expect(
+          (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+        expect(yield* m.f.repository.replay(projectId)).toEqual(before);
+        expect(yield* m.f.sql`SELECT operation_id FROM project_work_managed_merge`).toEqual([]);
+        expect(m.counts()).toEqual({ writes: 0, reads: 0 });
+      }),
+    ),
+);
+it.effect(
+  "managed merge interrupted after claiming recovers by observation without repeating its write",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const entered = yield* Deferred.make<void>();
+        let writes = 0;
+        const ports = {
+          ...m.ports,
+          mergeExactHead: () =>
+            Effect.gen(function* () {
+              writes++;
+              yield* Deferred.succeed(entered, undefined);
+              return yield* Effect.never;
+            }),
+        };
+        const running = yield* m.service
+          .run(m.mergeInput, m.resolved, m.human, ports)
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(entered);
+        yield* Fiber.interrupt(running);
+        const rows = yield* m.service.pending();
+        expect(rows).toHaveLength(1);
+        const row = rows[0];
+        if (!row) return yield* Effect.die("Missing claimed operation");
+        const restarted = yield* makeProjectWorkManagedMerge({ environmentId: "environment" }).pipe(
+          Effect.provideService(ProjectWorkPublicationAuthorization, m.authorization),
+          Effect.provide(MergeGuard.layer),
+        );
+        expect((yield* restarted.resume(row.operationId, m.ports).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        const stored = yield* m.f.sql.withTransaction(m.journal.readInTransaction(row.operationId));
+        expect(stored).toMatchObject({
+          status: "uncertain",
+          attention: { reason: "reconciled", state: "merged", headSha: m.request.target.headSha },
+        });
+        expect(writes).toBe(1);
+        expect(m.counts()).toEqual({ writes: 0, reads: 1 });
+        expect(
+          (yield* m.f.state()).evidence.some((entry) =>
+            entry.evidenceId.startsWith("managed-merge-delivery:"),
+          ),
+        ).toBe(false);
+      }),
+    ),
+);
+
+it.effect(
+  "managed merge recovery scans past sixty-four uncertain decisions without resending and catches committed wakes",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const m = yield* makeHumanManagedMergeFixture();
+        const originalGate = yield* retainCompatibleMergeGate(m);
+        let attemptedWrites = 0;
+        const interruptedPorts = {
+          ...m.ports,
+          mergeExactHead: () =>
+            Effect.sync(() => {
+              attemptedWrites++;
+              return new ManagedMergeError({ reason: "uncertain" });
+            }).pipe(Effect.flatMap(Effect.fail)),
+        };
+        for (let revision = 0; revision < 65; revision++) {
+          if (revision > 0) {
+            const gate = { ...originalGate, revision };
+            yield* m.f.repository.execute(
+              decodeCommit({
+                type: "project-work.foundation.commit",
+                commandId: `paged-merge-approval-${revision}`,
+                projectId,
+                expectedRevision: (yield* m.f.state()).revision,
+                attribution: gate.attribution,
+                committedAt: at,
+                records: [gate],
+              }),
+            );
+          }
+          expect(
+            (yield* m.service
+              .run(m.mergeInput, m.resolved, m.human, interruptedPorts)
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        const all = yield* m.f.sql<{
+          operation_id: string;
+        }>`SELECT operation_id FROM project_work_managed_merge ORDER BY operation_id`;
+        expect(all).toHaveLength(65);
+        expect(attemptedWrites).toBe(65);
+        const firstPage = yield* m.service.pending();
+        expect(firstPage).toHaveLength(64);
+        expect(
+          (yield* m.service.pending(firstPage.at(-1)?.operationId)).map((row) => row.operationId),
+        ).toEqual(all.slice(64).map((row) => row.operation_id));
+        const bus = yield* ProjectWorkEventBus;
+        const subscribed = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        const observed = yield* Queue.unbounded<string>();
+        const worker = yield* runProjectWorkManagedMergeRecovery(
+          m.service,
+          (operationId) =>
+            Effect.gen(function* () {
+              expect((yield* m.service.resume(operationId, m.ports).pipe(Effect.result))._tag).toBe(
+                "Failure",
+              );
+              yield* Queue.offer(observed, operationId);
+            }),
+          Deferred.await(ready),
+        ).pipe(
+          Effect.provideService(ProjectWorkEventBus, {
+            ...bus,
+            subscribe: bus.subscribe.pipe(
+              Effect.tap(() => Deferred.succeed(subscribed, undefined)),
+            ),
+          }),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(subscribed);
+        yield* Deferred.succeed(ready, undefined);
+        const discovered: string[] = [];
+        for (let index = 0; index < 65; index++) discovered.push(yield* Queue.take(observed));
+        expect(discovered).toEqual(all.map((row) => row.operation_id));
+        const afterWake: string[] = [];
+        // Re-publish an actual retained permission event; waking conveys no additional authority.
+        const events = yield* m.f.repository.replay(projectId);
+        const permission = events.find(
+          (event) =>
+            event.type === "project-work.evidence.added" &&
+            event.evidence.evidenceId.startsWith("managed-merge-permission:"),
+        );
+        if (!permission) return yield* Effect.die("Missing retained human permission");
+        yield* bus.publish([{ cursor: permission.revision, event: permission }]);
+        for (let index = 0; index < 65; index++) afterWake.push(yield* Queue.take(observed));
+        expect(afterWake).toEqual(discovered);
+        yield* Fiber.interrupt(worker);
+        expect(attemptedWrites).toBe(65);
+        expect(m.counts()).toEqual({ writes: 0, reads: 130 });
+        expect(
+          (yield* m.f.state()).evidence.some((entry) =>
+            entry.evidenceId.startsWith("managed-merge-delivery:"),
+          ),
+        ).toBe(false);
       }),
     ),
 );

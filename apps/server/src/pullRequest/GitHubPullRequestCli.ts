@@ -1,3 +1,4 @@
+import type { ProviderExactHeadMergeConfirmation } from "./PullRequestProvider.ts";
 import { runGitHubStackAction, type GitHubStackActionError } from "./githubStackActions.ts";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
@@ -728,6 +729,17 @@ export class GitHubPullRequestCli extends Context.Service<
       readonly applied: boolean;
     }) => Effect.Effect<void, GitHubPullRequestCliError>;
 
+    readonly confirmExactHeadMerge?: (input: {
+      readonly cwd: string;
+      readonly repository: string;
+      readonly host: string;
+      readonly number: number;
+      readonly expectedHeadSha: string;
+      readonly expectedBaseRef: string;
+      readonly expectedBaseSha: string;
+      readonly mergeMethod?: PullRequestMergeMethod;
+    }) => Effect.Effect<ProviderExactHeadMergeConfirmation, GitHubPullRequestCliError>;
+
     readonly runPullRequestAction: (input: {
       readonly cwd: string;
       readonly repository: string;
@@ -1044,6 +1056,22 @@ const decodeExactHeadMergeDetail = Schema.decodeUnknownEffect(
       headRefOid: Schema.optional(Schema.NullOr(Schema.String)),
       autoMergeRequest: Schema.optional(Schema.NullOr(Schema.Unknown)),
       mergedAt: Schema.optional(Schema.NullOr(ExactHeadMergeTimestamp)),
+      baseRefOid: Schema.optional(Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u))),
+      baseRefName: Schema.optional(
+        Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
+      ),
+      mergeCommit: Schema.optional(Schema.NullOr(Schema.Struct({ oid: ExactHeadSha }))),
+      mergedBy: Schema.optional(
+        Schema.NullOr(
+          Schema.Struct({
+            login: Schema.String.check(
+              Schema.isTrimmed(),
+              Schema.isMinLength(1),
+              Schema.isMaxLength(256),
+            ),
+          }),
+        ),
+      ),
     }),
   ),
 );
@@ -1662,7 +1690,7 @@ export const make = Effect.gen(function* () {
           String(input.number),
           ...repositoryArgs(input),
           "--json",
-          "number,state,headRefOid,autoMergeRequest,mergedAt",
+          "number,state,headRefOid,autoMergeRequest,mergedAt,baseRefName,baseRefOid,mergeCommit,mergedBy",
         ],
         maxOutputBytes: 64 * 1024,
       });
@@ -1681,7 +1709,10 @@ export const make = Effect.gen(function* () {
   );
 
   const mergeExactHead = Effect.fn("GitHubPullRequestCli.mergeExactHead")(function* (
-    input: Parameters<GitHubPullRequestCli["Service"]["runPullRequestAction"]>[0],
+    input: Parameters<GitHubPullRequestCli["Service"]["runPullRequestAction"]>[0] & {
+      readonly expectedBaseRef?: string;
+      readonly expectedBaseSha?: string;
+    },
   ) {
     const refused = (reason: GitHubExactHeadMergeRefusedError["reason"]) =>
       new GitHubExactHeadMergeRefusedError({
@@ -1698,6 +1729,10 @@ export const make = Effect.gen(function* () {
     if (current.number !== input.number) return yield* refused("identity");
     if (current.state !== "OPEN") return yield* refused("state");
     if (current.headRefOid !== input.expectedHeadSha) return yield* refused("head");
+    if (input.expectedBaseRef !== undefined && current.baseRefName !== input.expectedBaseRef)
+      return yield* refused("identity");
+    if (input.expectedBaseSha !== undefined && current.baseRefOid !== input.expectedBaseSha)
+      return yield* refused("identity");
     if (current.autoMergeRequest !== null) return yield* refused("auto-merge");
     const uncertain = (phase: GitHubExactHeadMergeUncertainError["phase"], cause: unknown) =>
       new GitHubExactHeadMergeUncertainError({
@@ -1765,7 +1800,67 @@ export const make = Effect.gen(function* () {
         new Error("GitHub did not confirm the expected pull request head as merged."),
       );
     }
+    if (input.expectedBaseRef === undefined) return;
+    if (
+      confirmed.baseRefName !== input.expectedBaseRef ||
+      !confirmed.mergeCommit ||
+      !confirmed.mergedBy ||
+      confirmed.mergeCommit.oid !== response.sha
+    )
+      return yield* uncertain(
+        "confirmation",
+        new Error("GitHub did not confirm the exact merge identity and actor."),
+      );
+    return {
+      kind: "merged" as const,
+      host: input.host,
+      repository: input.repository,
+      number: input.number,
+      authorizedHeadSha: input.expectedHeadSha,
+      baseRef: confirmed.baseRefName,
+      mergeCommitSha: confirmed.mergeCommit.oid,
+      mergedAt: confirmed.mergedAt,
+      mergedBy: confirmed.mergedBy.login,
+      observedAt: DateTime.formatIso(yield* DateTime.now),
+    };
   });
+
+  const confirmExactHeadMerge = Effect.fn("GitHubPullRequestCli.confirmExactHeadMerge")(
+    function* (input: {
+      readonly cwd: string;
+      readonly host: string;
+      readonly repository: string;
+      readonly number: number;
+      readonly expectedHeadSha: string;
+      readonly expectedBaseRef: string;
+      readonly expectedBaseSha: string;
+      readonly mergeMethod?: PullRequestMergeMethod;
+    }) {
+      const captured = { ...input };
+      if (
+        !/^[a-f0-9]{40}$/u.test(captured.expectedBaseSha) ||
+        !captured.expectedBaseRef ||
+        captured.expectedBaseRef !== captured.expectedBaseRef.trim() ||
+        captured.expectedBaseRef.length > 256
+      )
+        return yield* new GitHubExactHeadMergeRefusedError({
+          command: "gh",
+          cwd: captured.cwd,
+          number: captured.number,
+          reason: "input",
+        });
+      const result = yield* mergeExactHead({ ...captured, action: "merge" });
+      if (result === undefined)
+        return yield* new GitHubExactHeadMergeUncertainError({
+          command: "gh",
+          cwd: captured.cwd,
+          number: captured.number,
+          phase: "confirmation",
+          cause: new Error("Missing confirmed merge receipt"),
+        });
+      return result;
+    },
+  );
 
   const workflowApprovalLimit = 1_000;
   const workflowApprovalProbeLimit = String(workflowApprovalLimit + 1);
@@ -1891,6 +1986,7 @@ export const make = Effect.gen(function* () {
         );
 
   return GitHubPullRequestCli.of({
+    confirmExactHeadMerge,
     withVerifiedCredential,
     getRoutingIdentity,
     getViewerLogin: (input) =>
@@ -2604,7 +2700,7 @@ export const make = Effect.gen(function* () {
     },
 
     runPullRequestAction: (input) => {
-      if (input.expectedHeadSha !== undefined) return mergeExactHead(input);
+      if (input.expectedHeadSha !== undefined) return mergeExactHead(input).pipe(Effect.asVoid);
       if (input.stackNumber !== undefined)
         return runGitHubStackAction({ ...input, stackNumber: input.stackNumber }).pipe(
           Effect.provideService(GitHubCli.GitHubCli, github),

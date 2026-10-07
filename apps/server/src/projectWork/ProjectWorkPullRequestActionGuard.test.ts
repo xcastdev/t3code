@@ -156,6 +156,23 @@ it.effect("explicit unlink does not permit merging a retained confirmed managed 
 );
 
 const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.provide(services));
+it.effect("inspection classifies another selected project's managed PR by its original owner", () =>
+  provide(
+    Effect.gen(function* () {
+      const { guard } = yield* setup();
+      yield* retain();
+      const inspect = guard.inspect;
+      if (!inspect) return yield* Effect.die("Managed publication inspection is missing");
+      const found = yield* inspect(input);
+      expect(found.managed).toBe(true);
+      expect(found.publication?.request.target.projectId).toBe(request.target.projectId);
+      expect(yield* guard.check(input).pipe(Effect.result)).toMatchObject({
+        _tag: "Failure",
+        failure: { reason: "managed-merge-unavailable" },
+      });
+    }),
+  ),
+);
 for (const action of ["merge", "enable-auto-merge"] as const)
   it.effect(`denies ${action} for retained publication even without optional thread metadata`, () =>
     provide(

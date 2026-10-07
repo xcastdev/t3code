@@ -36,6 +36,20 @@ import type {
 } from "@t3tools/contracts";
 import { SourceControlProviderKind as SourceControlProviderKindSchema } from "@t3tools/contracts";
 
+/** Confirmed remote facts from an immediate, head-conditioned merge. */
+export interface ProviderExactHeadMergeConfirmation {
+  readonly kind: "merged";
+  readonly host: string;
+  readonly repository: string;
+  readonly number: number;
+  readonly authorizedHeadSha: string;
+  readonly baseRef: string;
+  readonly mergeCommitSha: string;
+  readonly mergedAt: string;
+  readonly mergedBy: string;
+  readonly observedAt: string;
+}
+
 /**
  * The one failure shape every provider reports, so the service can decide what a failure means
  * without knowing which CLI or API produced it.
@@ -471,9 +485,11 @@ export interface PullRequestProviderApi {
     input: ProviderRepositoryRef & {
       readonly number: number;
       readonly expectedHeadSha: string;
+      readonly expectedBaseRef: string;
+      readonly expectedBaseSha: string;
       readonly mergeMethod?: PullRequestMergeMethod;
     },
-  ) => Effect.Effect<void, PullRequestProviderError>;
+  ) => Effect.Effect<ProviderExactHeadMergeConfirmation, PullRequestProviderError>;
 
   /**
    * Rewrites the change request's own words. Only called when `capabilities.edit.changeRequest`

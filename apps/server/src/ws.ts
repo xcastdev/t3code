@@ -265,6 +265,11 @@ import { pullRequestSyncKey } from "./pullRequest/pullRequestSyncKey.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { AuthSessionRepository } from "./persistence/AuthSessions.ts";
 import {
+  makeProjectWorkHumanMergeRequest,
+  ProjectWorkHumanMergeRequest,
+} from "./projectWork/ProjectWorkHumanMergeRequest.ts";
+import { PullRequestOperationError } from "@t3tools/contracts";
+import {
   ProjectWorkHumanPublication,
   makeProjectWorkHumanPublicationRequest,
 } from "./projectWork/ProjectWorkHumanPublicationRequest.ts";
@@ -6162,10 +6167,28 @@ const makeWsRpcLayer = (
             withPullRequestViewer(input, pullRequests.diffFileContents(input)),
             { "rpc.aggregate": "pull-requests" },
           ),
-        [WS_METHODS.pullRequestsRunAction]: (input) =>
-          observeRpcEffect(
+        [WS_METHODS.pullRequestsRunAction]: (input) => {
+          const permission = makeProjectWorkHumanMergeRequest(currentSession, input);
+          const action = Effect.gen(function* () {
+            if (Option.isNone(publicationSessions)) return yield* pullRequests.runAction(input);
+            const captured = yield* permission.pipe(
+              Effect.provideService(AuthSessionRepository, publicationSessions.value),
+              Effect.mapError(
+                (cause) =>
+                  new PullRequestOperationError({
+                    operation: "runAction",
+                    detail: "Human merge permission is unavailable.",
+                    cause,
+                  }),
+              ),
+            );
+            return yield* pullRequests
+              .runAction(input)
+              .pipe(Effect.provideService(ProjectWorkHumanMergeRequest, captured));
+          });
+          return observeRpcEffect(
             WS_METHODS.pullRequestsRunAction,
-            withPullRequestViewer(input, pullRequests.runAction(input)).pipe(
+            withPullRequestViewer(input, action).pipe(
               Effect.tap(() =>
                 resolvePullRequestSyncKey(input).pipe(
                   Effect.flatMap((key) =>
@@ -6175,7 +6198,8 @@ const makeWsRpcLayer = (
               ),
             ),
             { "rpc.aggregate": "pull-requests" },
-          ),
+          );
+        },
         [WS_METHODS.pullRequestsUpdate]: (input) =>
           observeRpcEffect(
             WS_METHODS.pullRequestsUpdate,

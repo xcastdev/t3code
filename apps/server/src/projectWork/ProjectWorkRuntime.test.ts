@@ -6,6 +6,9 @@ import {
   ProjectWorkTaskId,
   ProjectTeamEffect,
   EventId,
+  ProjectWorkEvidence,
+  ProjectWorkEvidenceId,
+  type PullRequestActionInput,
 } from "@t3tools/contracts";
 import { assert, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -33,6 +36,7 @@ import {
   runProjectWorkLeaseWorker,
   runProjectWorkPublicationRecovery,
   runProjectWorkPublicationLinkRecovery,
+  runProjectWorkManagedMergeRecovery,
 } from "./ProjectWorkRuntime.ts";
 import { coreLayer, leaseLayer } from "./ProjectWorkRuntime.ts";
 
@@ -511,4 +515,84 @@ it.effect("provides one authorized core to repository, bus, stream and the real 
     yield* Deferred.await(received);
     expect(bus).toBeDefined();
   }).pipe(Effect.provide(Layer.fresh(authorizedRuntimeTestLayer))),
+);
+
+const decodeMergeWakeEvidence = Schema.decodeUnknownSync(ProjectWorkEvidence);
+it.effect(
+  "managed merge recovery retains pre-readiness decisions, wakes only on committed permission and drains with its scope",
+  () =>
+    Effect.gen(function* () {
+      const bus = yield* ProjectWorkEventBus;
+      const subscribed = yield* Deferred.make<void>();
+      const ready = yield* Deferred.make<void>();
+      const called = yield* Queue.unbounded<string>();
+      let scans = 0;
+      const input: PullRequestActionInput = {
+        projectId: ProjectId.make("merge-recovery-project"),
+        host: "github.com",
+        repository: "owner/repo",
+        number: 42,
+        action: "merge",
+      };
+      const service = {
+        pending: () =>
+          Effect.sync(() => {
+            scans++;
+            return [{ operationId: "original-operation", input }];
+          }),
+      };
+      const resume = (operationId: string, actual: PullRequestActionInput) =>
+        Effect.gen(function* () {
+          expect(actual).toEqual(input);
+          yield* Queue.offer(called, operationId);
+        });
+      const at = "2026-10-07T00:00:00.000Z";
+      const evidence = decodeMergeWakeEvidence({
+        evidenceId: "managed-merge-permission:original",
+        kind: "observation",
+        summary: "Original human merge decision",
+        recordedAt: at,
+        revision: 0,
+      });
+      const event = (id: string, revision: number) => ({
+        cursor: revision,
+        event: {
+          eventId: EventId.make(id),
+          projectId: input.projectId,
+          revision,
+          type: "project-work.evidence.added" as const,
+          evidence: { ...evidence, evidenceId: ProjectWorkEvidenceId.make(id) },
+          addedAt: at,
+          occurredAt: at,
+        },
+      });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.forkScoped(
+            runProjectWorkManagedMergeRecovery(service, resume, Deferred.await(ready)).pipe(
+              Effect.provideService(ProjectWorkEventBus, {
+                ...bus,
+                subscribe: bus.subscribe.pipe(
+                  Effect.tap(() => Deferred.succeed(subscribed, undefined)),
+                ),
+              }),
+            ),
+          );
+          yield* Deferred.await(subscribed);
+          yield* bus.publish([event("managed-merge-permission:original", 1)]);
+          expect(scans).toBe(0);
+          yield* Deferred.succeed(ready, undefined);
+          expect(yield* Queue.take(called)).toBe("original-operation");
+          expect(yield* Queue.take(called)).toBe("original-operation");
+          yield* bus.publish([
+            event("managed-merge-delivery:original", 2),
+            event("managed-merge-permission:next", 3),
+          ]);
+          expect(yield* Queue.take(called)).toBe("original-operation");
+          expect(scans).toBe(3);
+        }),
+      );
+      yield* bus.publish([event("managed-merge-permission:after-drain", 4)]);
+      expect(scans).toBe(3);
+    }).pipe(Effect.provide(ProjectWorkEventBusLive)),
 );

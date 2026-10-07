@@ -22,6 +22,8 @@ import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import type { ProjectTeamExecutionError } from "./ProjectTeamExecution.ts";
 import { makeProjectTeamExecutionReactor } from "./ProjectTeamExecutionReactor.ts";
 import type { ProjectWorkPublicationRequest, ServerSettingsError } from "@t3tools/contracts";
+import { ProjectWorkManagedMerge, makeProjectWorkManagedMerge } from "./ProjectWorkManagedMerge.ts";
+import { PullRequestService, type PullRequestError } from "../pullRequest/PullRequestService.ts";
 import * as Publication from "./ProjectWorkPullRequests.ts";
 import * as PublicationLinks from "./ProjectWorkPublicationLinks.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
@@ -566,5 +568,73 @@ export const publicationLinksRecoveryLayer = Layer.effectDiscard(
         changes.pipe(Stream.filter((value) => value.projectWorkEnabled)),
       ),
     );
+  }),
+);
+
+/** Subscribe before readiness: only committed human merge decisions wake the private journal. */
+export const runProjectWorkManagedMergeRecovery = Effect.fn("runProjectWorkManagedMergeRecovery")(
+  function* (
+    service: Pick<ProjectWorkManagedMerge["Service"], "pending">,
+    resume: (
+      operationId: string,
+      input: import("@t3tools/contracts").PullRequestActionInput,
+    ) => Effect.Effect<void, PullRequestError>,
+    ready: Effect.Effect<void>,
+  ) {
+    const bus = yield* ProjectWorkEventBus.ProjectWorkEventBus;
+    const changes = yield* bus.subscribe;
+    const drain = Effect.gen(function* () {
+      let afterOperationId: string | undefined;
+      while (true) {
+        const rows = yield* service.pending(afterOperationId);
+        for (const row of rows) {
+          yield* resume(row.operationId, row.input).pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.failCause(cause)
+                : Effect.logWarning("Managed merge needs attention", cause),
+            ),
+          );
+        }
+        if (rows.length < 64) return;
+        const last = rows.at(-1)?.operationId;
+        if (last === undefined || (afterOperationId !== undefined && last <= afterOperationId))
+          return yield* Effect.die("Managed merge journal page did not advance");
+        afterOperationId = last;
+      }
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : Effect.logWarning("Managed merge journal unavailable", cause),
+      ),
+    );
+    yield* ready;
+    yield* drain;
+    yield* changes.pipe(
+      Stream.filter(
+        ({ event }) =>
+          event.type === "project-work.evidence.added" &&
+          event.evidence.evidenceId.startsWith("managed-merge-permission:"),
+      ),
+      Stream.runForEach(() => drain),
+    );
+  },
+);
+export const managedMergeServicesLayer = Layer.effect(
+  ProjectWorkManagedMerge,
+  Effect.gen(function* () {
+    const identity = yield* ServerEnvironmentIdentity;
+    return yield* makeProjectWorkManagedMerge({ environmentId: yield* identity.getEnvironmentId });
+  }),
+);
+export const managedMergeRecoveryLayer = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const service = yield* ProjectWorkManagedMerge;
+    const pullRequests = yield* PullRequestService;
+    const issues = yield* ProjectIssueRuntime;
+    const resume = pullRequests.resumeManagedMerge;
+    if (resume === undefined) return;
+    yield* Effect.forkScoped(runProjectWorkManagedMergeRecovery(service, resume, issues.ready));
   }),
 );

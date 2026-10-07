@@ -6,6 +6,8 @@ import {
   ThreadId,
   type ProjectId,
   type PullRequestAction,
+  type ProjectWorkPublicationRequest as PublicationRequest,
+  type ProjectWorkPublicationOutcome as PublicationOutcome,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -33,6 +35,16 @@ export class ProjectWorkPullRequestActionGuard extends Context.Service<
   ProjectWorkPullRequestActionGuard,
   {
     readonly check: (input: Input) => Effect.Effect<void, ProjectWorkPullRequestActionGuardError>;
+    readonly inspect?: (input: Input) => Effect.Effect<
+      {
+        readonly managed: boolean;
+        readonly publication?: {
+          readonly request: PublicationRequest;
+          readonly outcome: Extract<PublicationOutcome, { kind: "confirmed" }>;
+        };
+      },
+      ProjectWorkPullRequestActionGuardError
+    >;
   }
 >()("t3/projectWork/ProjectWorkPullRequestActionGuard") {}
 const decodeThreadId = Schema.decodeUnknownEffect(ThreadId);
@@ -60,10 +72,18 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const authority = yield* ProjectTeamAuthorization;
-    const check = Effect.fn("ProjectWorkPullRequestActionGuard.check")(
+    const inspect = Effect.fn("ProjectWorkPullRequestActionGuard.inspect")(
       function* (raw: Input) {
         const input = Object.freeze({ ...raw });
-        if (input.action !== "merge" && input.action !== "enable-auto-merge") return;
+        if (input.action !== "merge" && input.action !== "enable-auto-merge")
+          return { managed: false };
+        let managed = false;
+        let publication:
+          | {
+              request: PublicationRequest;
+              outcome: Extract<PublicationOutcome, { kind: "confirmed" }>;
+            }
+          | undefined;
         const host = input.host.toLowerCase();
         const repository = input.repository.toLowerCase();
         if (
@@ -87,7 +107,7 @@ export const layer = Layer.effect(
             cursor = row.threadId;
             const threadId = yield* decodeThreadId(row.threadId);
             if (threadId !== row.threadId) return yield* historyUnavailable();
-            if (yield* authority.hasManagedThread(threadId)) return yield* managedUnavailable();
+            if (yield* authority.hasManagedThread(threadId)) managed = true;
           }
           if (rows.length < 128) break;
         }
@@ -188,13 +208,26 @@ export const layer = Layer.effect(
                 `https://${request.repository.host}/${request.repository.nameWithOwner}/pull/${pr.number}`
             )
               return yield* historyUnavailable();
-            if (sameRepository && pr.number === input.number) return yield* managedUnavailable();
+            if (sameRepository && pr.number === input.number) {
+              if (publication !== undefined) return yield* historyUnavailable();
+              managed = true;
+              publication = { request, outcome };
+            }
           }
           if (rows.length < 128) break;
         }
+        return { managed, ...(publication === undefined ? {} : { publication }) };
       },
       Effect.mapError((error) => (isGuardError(error) ? error : historyUnavailable())),
     );
-    return ProjectWorkPullRequestActionGuard.of({ check });
+    return ProjectWorkPullRequestActionGuard.of({
+      inspect,
+      check: (input) =>
+        inspect(input).pipe(
+          Effect.flatMap((result) =>
+            result.managed ? Effect.fail(managedUnavailable()) : Effect.void,
+          ),
+        ),
+    });
   }),
 );

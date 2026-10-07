@@ -84,9 +84,17 @@ with current verification and an accepted independent review. Changed scope, rev
 or a different remote commit require attention before publication can proceed.
 
 PR creation retains your decision before contacting GitHub. If the result is uncertain, inspect
-the task's delivery status before retrying. A confirmed PR is linked to its thread. Managed merge
-remains unavailable. If the branch or selected work changes while confirming, reopen the action
-and review its current source. Satisfied criteria, a completed reviewer task, or an open PR do not mean the parent code task was delivered.
+the task's delivery status before retrying. A confirmed PR is linked to its thread. If the branch
+or selected work changes while confirming, reopen the action and review its current source.
+
+To merge a published team PR, choose **Merge** and review its method. This approves the original
+reviewed commit and target branch. Current verification, review and work approvals are required;
+a changed remote head or base must be reviewed before merging. Automatic and stacked merges
+are unavailable for managed work. A confirmed immediate merge retains delivery evidence. An
+uncertain write is checked without sending another merge; an external merge does not establish
+that T3 completed it. Inspect an uncertain outcome before taking further action. Satisfied
+criteria, a completed reviewer task, an open PR, or merge evidence do not automatically complete
+the parent code task.
 
 ## When an action is unavailable
 
