@@ -1,17 +1,21 @@
 import { useAtomValue } from "@effect/atom-react";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   ProjectTeamRecord,
   ProjectMemorySourceRead,
   ProjectMemoryObservationRead,
   ProjectMemoryExtractionRead,
   ProjectTeamEffect,
+  CommandId,
+  ProjectTeamMemoryRetractIntent,
+  ProjectWorkWriteResult,
   type EnvironmentId,
   type ProjectId,
   type ProjectTeamRecordRead,
   type ProjectWorkAttributionRead,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useEffectEvent, useLayoutEffect, useState } from "react";
+import { useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
@@ -21,6 +25,9 @@ import {
   type WorkTeamFoundationView,
 } from "../../components/work/WorkTeamFoundation";
 import { projectWorkEnvironment } from "../../state/projectWork";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { projectWorkCommandFailure } from "../../components/work/workCommandFailure";
+import { randomUUID } from "../../lib/utils";
 
 const knownRecord = Schema.is(ProjectTeamRecord);
 const sourceRecord = Schema.is(ProjectMemorySourceRead);
@@ -30,6 +37,46 @@ const effectRecord = Schema.is(
   Schema.Struct({ ...ProjectTeamEffect.fields, status: Schema.String, effectKind: Schema.String }),
 );
 const PAGE_SIZE = 64;
+const decodeRetraction = Schema.decodeUnknownSync(ProjectTeamMemoryRetractIntent, {
+  onExcessProperty: "error",
+});
+const decodeReceipt = Schema.decodeSync(ProjectWorkWriteResult);
+const definiteRejection = Schema.is(
+  Schema.Union([
+    Schema.Struct({
+      _tag: Schema.Literals(["ProjectTeamAuthorizationError", "ProjectWorkAuthorizationError"]),
+      reason: Schema.String,
+    }),
+    Schema.Struct({
+      _tag: Schema.Literal("ProjectWorkContentRejectedError"),
+      matches: Schema.Array(Schema.Struct({ path: Schema.String, kind: Schema.String })),
+    }),
+  ]),
+);
+function rejectedWrite(error: unknown) {
+  return (
+    definiteRejection(error) ||
+    (typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      typeof error.code === "string" &&
+      [
+        "stale-revision",
+        "invalid-state",
+        "permission-denied",
+        "forbidden",
+        "unauthorized",
+        "not-found",
+        "invalid-request",
+        "authority-required",
+      ].includes(error.code))
+  );
+}
+type Submission = {
+  readonly command: ProjectTeamMemoryRetractIntent;
+  readonly status: "sending" | "uncertain" | "accepted";
+  readonly receiptRevision?: number;
+};
 type Source = Extract<ProjectTeamRecordRead, { kind: "memory-source" }>;
 type Observation = Extract<ProjectTeamRecordRead, { kind: "memory-observation" }>;
 type MemoryRecord = Extract<
@@ -43,6 +90,7 @@ export interface MemoryProps {
   readonly connected: boolean;
   readonly enabled: boolean;
   readonly supported: boolean;
+  readonly writesSupported?: boolean;
 }
 
 /** Inspect recorded memory without contacting the derived retrieval service. */
@@ -215,6 +263,29 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
   const [epoch, setEpoch] = useState({ active, blocked: result });
   const [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
+  const [inspectedSource, setInspectedSource] = useState<Source | null>(null);
+  const [submission, setSubmission] = useState<Submission | null>(null);
+  const pending = useRef<Submission | null>(null);
+  const owner = useRef(false);
+  const access = useRef(props);
+  useLayoutEffect(() => {
+    access.current = props;
+  });
+  const [notice, setNotice] = useState("");
+  const write = useAtomCommand(projectWorkEnvironment.write, {
+    reportFailure: false,
+    reportDefect: false,
+  });
+  useLayoutEffect(() => {
+    owner.current = true;
+    return () => {
+      owner.current = false;
+    };
+  }, []);
+  const store = (value: Submission | null) => {
+    pending.current = value;
+    setSubmission(value);
+  };
   if (epoch.active !== active) setEpoch({ active, blocked: result });
   const refresh = useEffectEvent(() => props.foundation.refresh());
   // Cached success from an earlier connection is not a fresh read receipt.
@@ -236,7 +307,133 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
     "",
   );
   const unknown = props.foundation.snapshot.records.some((record) => !knownRecord(record));
-  const unavailable = selectedRecord ? contentUnavailable(selectedRecord, records, fresh) : null;
+  const locallySuppressed =
+    selectedRecord !== undefined &&
+    submission !== null &&
+    (selectedRecord.recordId === submission.command.sourceRecordId ||
+      (selectedRecord.kind === "memory-observation" &&
+        selectedRecord.sourceId === submission.command.sourceRecordId));
+  const unavailable = locallySuppressed
+    ? "Retraction submitted; waiting for the recorded state."
+    : selectedRecord
+      ? contentUnavailable(selectedRecord, records, fresh)
+      : null;
+  const command = submission?.command;
+  const recorded =
+    command === undefined
+      ? undefined
+      : records.find((record) => record.recordId === command.sourceRecordId);
+  const recordedRetraction =
+    fresh &&
+    submission?.status === "accepted" &&
+    command !== undefined &&
+    recorded !== undefined &&
+    knownRecord(recorded) &&
+    recorded.kind === "memory-source" &&
+    recorded.status === "retracted" &&
+    recorded.tombstonedAt !== undefined &&
+    recorded.revision === command.expectedSourceRecordRevision + 1 &&
+    recorded.generation === command.sourceGeneration + 1 &&
+    recorded.sourceRevision === command.sourceRevision &&
+    recorded.sharedWithProjectIds.length === 0 &&
+    (props.foundation.snapshot.revision ?? -1) >= (submission.receiptRevision ?? Infinity);
+  async function retract(retry: boolean) {
+    let command: ProjectTeamMemoryRetractIntent | undefined;
+    let rejected = false;
+    try {
+      const current = access.current;
+      if (
+        !owner.current ||
+        !current.connected ||
+        !current.enabled ||
+        !current.supported ||
+        !current.writesSupported ||
+        !fresh
+      )
+        throw new Error("A complete fresh connected writable snapshot is required.");
+      const snapshot = current.foundation.verify();
+      if (retry) {
+        if (pending.current?.status !== "uncertain") return;
+        command = pending.current.command;
+      } else {
+        if (
+          (pending.current !== null && !recordedRetraction) ||
+          selectedRecord?.kind !== "memory-source" ||
+          inspectedSource === null ||
+          contentUnavailable(selectedRecord, records, fresh) !== null
+        )
+          return;
+        const selectedNow = snapshot.records.find(
+          (record) => record.recordId === selectedRecord.recordId,
+        );
+        if (
+          selectedNow === undefined ||
+          !knownRecord(selectedNow) ||
+          selectedNow.kind !== "memory-source" ||
+          selectedNow.status !== "current" ||
+          selectedNow.tombstonedAt !== undefined ||
+          selectedNow.revision !== inspectedSource.revision ||
+          selectedNow.generation !== inspectedSource.generation ||
+          selectedNow.sourceRevision !== inspectedSource.sourceRevision ||
+          selectedNow.contentHash !== inspectedSource.contentHash
+        )
+          throw new Error(
+            "The inspected source changed. Refresh and inspect the current source before retracting.",
+          );
+        command = decodeRetraction({
+          type: "project-team.memory.retract",
+          commandId: CommandId.make(randomUUID()),
+          projectId: props.projectId,
+          expectedRevision: snapshot.revision,
+          sourceRecordId: selectedRecord.recordId,
+          expectedSourceRecordRevision: selectedRecord.revision,
+          sourceRevision: selectedRecord.sourceRevision,
+          sourceGeneration: selectedRecord.generation,
+          contentHash: selectedRecord.contentHash,
+        });
+      }
+      store({ command, status: "sending" });
+      setNotice("Retracting memory. Waiting for the authoritative receipt.");
+      const outcome = await write({ environmentId: props.environmentId, input: command });
+      if (!owner.current || pending.current?.command !== command) return;
+      if (outcome._tag === "Failure") {
+        rejected =
+          outcome.cause.reasons.length > 0 &&
+          outcome.cause.reasons.every(
+            (reason) => reason._tag === "Fail" && rejectedWrite(reason.error),
+          );
+        throw squashAtomCommandFailure(outcome);
+      }
+      const receipt = decodeReceipt(outcome.value);
+      if (
+        receipt.projectId !== command.projectId ||
+        receipt.receipt.projectId !== command.projectId ||
+        receipt.receipt.commandId !== command.commandId ||
+        receipt.receipt.status !== "accepted" ||
+        receipt.receipt.eventCount !== 2 ||
+        receipt.revision !== receipt.receipt.revision ||
+        receipt.revision !== command.expectedRevision + 2
+      )
+        throw new Error(
+          "Memory retraction receipt could not be verified. Retry the exact command.",
+        );
+      store({ command, status: "accepted", receiptRevision: receipt.revision });
+      setNotice(
+        "Memory retracted locally. Backend cleanup pending; waiting for the recorded state.",
+      );
+      access.current.foundation.refresh();
+    } catch (error) {
+      if (!owner.current) return;
+      if (command !== undefined && pending.current?.command === command) {
+        store(rejected ? null : { command, status: "uncertain" });
+      }
+      setNotice(
+        rejected
+          ? "Memory retraction was rejected. Refresh the recorded source and check your write permission."
+          : projectWorkCommandFailure(error).message,
+      );
+    }
+  }
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <div>
@@ -264,6 +461,18 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
         <Button size="sm" variant="outline" disabled={!active} onClick={props.foundation.refresh}>
           Refresh memory
         </Button>
+        {notice ? (
+          <p role="status">
+            {recordedRetraction
+              ? "Memory retracted locally. Backend cleanup requires an approved task; inspect its recorded deletion outcome."
+              : notice}
+          </p>
+        ) : null}
+        {submission?.status === "uncertain" ? (
+          <Button disabled={!fresh || !props.writesSupported} onClick={() => void retract(true)}>
+            Retry exact retraction
+          </Button>
+        ) : null}
       </div>
       {records.length === 0 ? (
         <p className="text-sm text-muted-foreground">
@@ -287,7 +496,11 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
             size="sm"
             variant="outline"
             aria-pressed={selected === record.recordId}
-            onClick={() => setSelected(selected === record.recordId ? null : record.recordId)}
+            onClick={() => {
+              setSelected(selected === record.recordId ? null : record.recordId);
+              setInspectedSource(record.kind === "memory-source" ? record : null);
+              if (recordedRetraction) store(null);
+            }}
           >
             Inspect {record.recordId}
           </Button>
@@ -308,6 +521,28 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
                   : selectedRecord.body}
               </pre>
             )
+          ) : null}
+          {selectedRecord.kind === "memory-source" && sourceRecord(selectedRecord) ? (
+            <div className="mt-3">
+              <p>
+                Retract this memory copy and revoke its shares. The underlying issue, decision or
+                evidence is preserved. Physical cleanup waits for an approved task.
+              </p>
+              <Button
+                disabled={
+                  !fresh ||
+                  !props.writesSupported ||
+                  (submission !== null && !recordedRetraction) ||
+                  unavailable !== null
+                }
+                onClick={() => void retract(false)}
+              >
+                Retract memory
+              </Button>
+              {!props.writesSupported ? (
+                <p>This environment does not support human memory writes.</p>
+              ) : null}
+            </div>
           ) : null}
           <Button className="mt-3" size="sm" variant="outline" onClick={() => setSelected(null)}>
             Close inspection

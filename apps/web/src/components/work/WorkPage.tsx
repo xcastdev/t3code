@@ -302,6 +302,9 @@ function ProjectWorkPage({
                 supported={
                   serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
                 }
+                writesSupported={
+                  serverConfig?.environment?.capabilities?.projectTeamMemoryRetractions === true
+                }
               />
             ) : tab === "evidence" ? (
               <Evidence

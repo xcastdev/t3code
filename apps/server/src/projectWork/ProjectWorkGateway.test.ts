@@ -5,6 +5,8 @@ import {
   ProjectTeamRecordRead,
   ProjectWorkFoundationCommitCommand,
   ProjectWorkWriteResult,
+  ProjectWorkWriteIntent,
+  ProjectTeamMemoryRetractIntent,
   CommandId,
   EnvironmentId,
   ProjectId,
@@ -51,10 +53,18 @@ import * as ProjectWorkQuery from "./ProjectWorkQuery.ts";
 import * as ProjectWorkRepository from "./ProjectWorkRepository.ts";
 import * as ProjectWorkSearch from "./ProjectWorkSearch.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ContentGuard from "./ProjectWorkContentGuard.ts";
+import {
+  ProjectWorkVerificationRequest,
+  ProjectWorkVerificationRequestError,
+} from "./ProjectWorkVerificationRequest.ts";
+import { makeProjectMemoryService } from "./memory/ProjectMemoryService.ts";
 import { bindIssueRepositoryProject } from "./ProjectIssueRepositoryState.ts";
 
 const isTeamAuthorizationError = Schema.is(TeamAuthorization.ProjectTeamAuthorizationError);
 const decodeWriteResult = Schema.decodeUnknownEffect(ProjectWorkWriteResult);
+const decodePublicWrite = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
+const decodeMemoryRetraction = Schema.decodeUnknownEffect(ProjectTeamMemoryRetractIntent);
 const decodeFoundationCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 const decodeFoundationPage = Schema.decodeUnknownEffect(
   Schema.Struct({ items: Schema.Array(ProjectTeamRecordRead) }),
@@ -118,6 +128,226 @@ const gatewayLayer = makeGatewayLayer();
 const layer = it.layer(NodeServices.layer);
 
 layer("ProjectWorkGateway", (it) => {
+  it.effect(
+    "retracts the exact current memory source through an authenticated human receipt without processing configuration",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (${projectId},'Memory','/workspace/memory','[]',${at},${at}),('shared-project','Shared','/workspace/shared','[]',${at},${at})`;
+        const repository = yield* ProjectWorkRepository.ProjectWorkRepository;
+        const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+        const authorization = yield* TeamAuthorization.ProjectTeamAuthorization;
+        const contentGuard = yield* ContentGuard.ProjectWorkContentGuard;
+        const human = { kind: "human", id: "retention-human" } as const;
+        const web = { kind: "web", id: "memory-panel" } as const;
+        yield* repository.execute({
+          type: "project-work.task.create",
+          projectId,
+          taskId,
+          commandId: CommandId.make("memory-task-create"),
+          title: "Retained finding",
+          createdAt: at,
+        });
+        yield* gateway.write(
+          yield* decodePublicWrite({
+            type: "project-work.comment.add",
+            projectId,
+            commandId: CommandId.make("memory-finding"),
+            addedAt: at,
+            comment: {
+              commentId: "memory-comment",
+              projectId,
+              taskId,
+              body: "The parser preserves exact provenance.",
+              revision: 0,
+              createdAt: at,
+            },
+          }),
+          human,
+          web,
+        );
+        const service = makeProjectMemoryService({
+          sql,
+          repository,
+          contentGuard,
+          authorization,
+          environmentId: "gateway-environment",
+        });
+        const original = yield* service.captureRetained(projectId, {
+          kind: "comment",
+          retainedId: "memory-comment",
+        });
+        yield* service.replaceShares(projectId, original.recordId, [
+          ProjectId.make("shared-project"),
+        ]);
+        const before = yield* ProjectWorkRepository.readCurrentState(sql, projectId);
+        const selected = before.foundationRecords?.find(
+          (record) => record.kind === "memory-source" && record.status === "current",
+        );
+        if (selected?.kind !== "memory-source")
+          return yield* Effect.die("Missing current shared source");
+        const predecessor = before.foundationRecords?.find(
+          (record) => record.recordId === original.recordId,
+        );
+        const input = yield* decodeMemoryRetraction({
+          type: "project-team.memory.retract",
+          commandId: "human-memory-retract",
+          projectId,
+          expectedRevision: before.revision,
+          sourceRecordId: selected.recordId,
+          expectedSourceRecordRevision: selected.revision,
+          sourceRevision: selected.sourceRevision,
+          sourceGeneration: selected.generation,
+          contentHash: selected.contentHash,
+        });
+        expect((yield* gateway.write(input, human, web).pipe(Effect.result))._tag).toBe("Failure");
+        let permissions = 0;
+        let failAfterSelection = false;
+        let observedPendingDelete = false;
+        let observeCommit = false;
+        let observedDeferredViolation = false;
+        const permission = ProjectWorkVerificationRequest.of({
+          assertCurrent: (principal, target, purpose) =>
+            Effect.gen(function* () {
+              expect(principal).toEqual({ actor: human });
+              expect(target).toBe(projectId);
+              expect(purpose).toBe("write");
+              permissions++;
+              if (observeCommit) {
+                const rows = yield* sql`SELECT id FROM memory_retract_commit_child`.pipe(
+                  Effect.mapError(
+                    () =>
+                      new ProjectWorkVerificationRequestError({
+                        reason: "Deferred COMMIT fixture unavailable",
+                      }),
+                  ),
+                );
+                if (rows.length === 1) observedDeferredViolation = true;
+              }
+              if (failAfterSelection) {
+                const pending = yield* sql`SELECT effect_id FROM project_team_memory_job
+            WHERE json_extract(input_json,'$.source.recordId')=${selected.recordId}
+            AND json_extract(input_json,'$.effect.effectKind')='memory-delete'`.pipe(
+                  Effect.mapError(
+                    () =>
+                      new ProjectWorkVerificationRequestError({
+                        reason: "Controlled permission observation unavailable",
+                      }),
+                  ),
+                );
+                if (pending.length > 0) {
+                  observedPendingDelete = true;
+                  return yield* new ProjectWorkVerificationRequestError({
+                    reason: "Controlled permission revoked after selection",
+                  });
+                }
+              }
+            }),
+        });
+        const write = (request: typeof input, actor: Parameters<typeof gateway.write>[1] = human) =>
+          gateway
+            .write(request, actor, web)
+            .pipe(Effect.provideService(ProjectWorkVerificationRequest, permission));
+        expect(
+          (yield* write(input, { kind: "agent", id: "unmanaged" }).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const beforeJobs = yield* sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
+        expect(
+          (yield* write({
+            ...input,
+            commandId: CommandId.make("stale-source-retract"),
+            expectedSourceRecordRevision: input.expectedSourceRecordRevision + 1,
+          }).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        failAfterSelection = true;
+        expect((yield* write(input).pipe(Effect.result))._tag).toBe("Failure");
+        expect(observedPendingDelete).toBe(true);
+        expect(yield* ProjectWorkRepository.readCurrentState(sql, projectId)).toEqual(before);
+        expect(yield* sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`).toEqual(
+          beforeJobs,
+        );
+        failAfterSelection = false;
+        yield* sql`CREATE TEMP TABLE memory_retract_commit_parent (id INTEGER PRIMARY KEY)`;
+        yield* sql`CREATE TEMP TABLE memory_retract_commit_child
+        (id INTEGER REFERENCES memory_retract_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* sql`CREATE TEMP TRIGGER memory_retract_commit_fault AFTER INSERT ON project_team_memory_job
+        BEGIN INSERT INTO memory_retract_commit_child(id) VALUES(1); END`;
+        observeCommit = true;
+        const failedCommit = yield* write(input).pipe(Effect.exit);
+        expect(failedCommit._tag).toBe("Failure");
+        expect(observedDeferredViolation).toBe(true);
+        expect(yield* sql`SELECT * FROM memory_retract_commit_child`).toEqual([]);
+        expect(yield* sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`).toEqual(
+          beforeJobs,
+        );
+        expect(
+          yield* sql`SELECT command_id FROM project_work_command_receipts WHERE command_id=${input.commandId}`,
+        ).toEqual([]);
+        expect(yield* ProjectWorkRepository.readCurrentState(sql, projectId)).toEqual(before);
+        observeCommit = false;
+        yield* sql`DROP TRIGGER memory_retract_commit_fault`;
+        const accepted = yield* write(input);
+        expect(accepted.receipt).toMatchObject({
+          commandId: input.commandId,
+          status: "accepted",
+          eventCount: 2,
+        });
+        expect(permissions).toBeGreaterThan(0);
+        const after = yield* ProjectWorkRepository.readCurrentState(sql, projectId);
+        expect(after.comments).toEqual(before.comments);
+        expect(
+          after.foundationRecords?.find((record) => record.recordId === original.recordId),
+        ).toEqual(predecessor);
+        expect(
+          after.foundationRecords?.find((record) => record.recordId === selected.recordId),
+        ).toEqual({
+          ...selected,
+          revision: selected.revision + 1,
+          generation: selected.generation + 1,
+          updatedAt: after.foundationRecords?.find(
+            (record) => record.recordId === selected.recordId,
+          )?.updatedAt,
+          tombstonedAt: after.foundationRecords?.find(
+            (record) => record.recordId === selected.recordId,
+          )?.updatedAt,
+          status: "retracted",
+          sharedWithProjectIds: [],
+        });
+        const deletes =
+          after.foundationRecords?.filter(
+            (record) =>
+              record.kind === "effect" &&
+              record.effectKind === "memory-delete" &&
+              record.targetId === selected.recordId,
+          ) ?? [];
+        expect(deletes).toHaveLength(1);
+        const jobs = yield* sql<{
+          owner: string | null;
+          receipt: string | null;
+        }>`SELECT owner_json AS owner, receipt_json AS receipt
+        FROM project_team_memory_job WHERE effect_id=${deletes[0]?.recordId}`;
+        expect(jobs).toEqual([{ owner: null, receipt: null }]);
+        expect(yield* write(input)).toEqual(accepted);
+        expect(
+          (yield* write({ ...input, contentHash: "0".repeat(64) }).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const otherHuman = { kind: "human" as const, id: "different-human" };
+        expect(
+          (yield* gateway
+            .write(input, otherHuman, web)
+            .pipe(
+              Effect.provideService(
+                ProjectWorkVerificationRequest,
+                ProjectWorkVerificationRequest.of({ assertCurrent: () => Effect.void }),
+              ),
+              Effect.result,
+            ))._tag,
+        ).toBe("Failure");
+        expect(yield* ProjectWorkRepository.readCurrentState(sql, projectId)).toEqual(after);
+      }).pipe(Effect.provide(gatewayLayer.pipe(Layer.provideMerge(ContentGuard.layer)))),
+  );
   it.effect("denies internal foundation writes while negotiating new reads and V2 export", () =>
     Effect.gen(function* () {
       yield* runMigrations();

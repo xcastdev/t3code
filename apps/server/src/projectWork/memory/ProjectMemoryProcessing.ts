@@ -9,6 +9,7 @@ import {
   ProjectWorkEvidence,
   ProjectWorkWriteResult,
   ProjectTeamMemoryProcessIntent,
+  ProjectTeamMemoryRetractIntent,
   ProjectWorkFoundationCommitCommand,
   ProjectWorkAttribution,
   type ProjectWorkReadIntent,
@@ -129,6 +130,7 @@ const decodeEventIds = Schema.decodeUnknownEffect(
 );
 const decodePage = Schema.decodeUnknownEffect(ProjectTeamMemorySourcesRead, strict);
 const decodeRequest = Schema.decodeUnknownEffect(ProjectTeamMemoryProcessIntent, strict);
+const decodeRetraction = Schema.decodeUnknownEffect(ProjectTeamMemoryRetractIntent, strict);
 const decodeOwner = Schema.decodeUnknownEffect(ProjectMemoryJobOwner, strict);
 const decodeOwnerJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectMemoryJobOwner),
@@ -316,6 +318,175 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
           return yield* deny("Memory source command receipt membership is corrupt");
       });
       const items: Array<ProjectTeamMemorySourcesRead["items"][number]> = [];
+      // A human tombstone is cleanup authority only through its exact accepted
+      // request. Retain the original hash even when the cached body was redacted.
+      const auditRetraction = Effect.fn("ProjectMemoryProcessing.auditRetraction")(function* (
+        job: typeof ProjectMemoryJobInput.Type,
+      ) {
+        const tombstones = yield* sql<{
+          sequence: number;
+          commandId: string;
+          payload: string | null;
+        }>`SELECT
+          sequence,command_id AS commandId,
+          CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json END AS payload
+          FROM project_work_events WHERE project_id=${input.projectId}
+          AND event_type='project-work.foundation.recorded'
+          AND json_extract(payload_json,'$.record.recordId')=${job.source.recordId}
+          AND json_extract(payload_json,'$.record.revision')=${job.source.revision}
+          ORDER BY sequence LIMIT 2`;
+        const tombstone = tombstones[0];
+        if (tombstones.length !== 1 || tombstone === undefined || tombstone.payload === null)
+          return yield* deny("Human memory retraction event is unavailable");
+        const recorded = yield* decodeRecorded(tombstone.payload);
+        const priorRows = yield* sql<{ payload: string | null }>`SELECT
+          CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json END AS payload
+          FROM project_work_events WHERE project_id=${input.projectId}
+          AND event_type='project-work.foundation.recorded'
+          AND json_extract(payload_json,'$.record.recordId')=${job.source.recordId}
+          AND sequence<${tombstone.sequence} ORDER BY sequence DESC LIMIT 1`;
+        const priorPayload = priorRows[0]?.payload;
+        if (priorPayload === undefined || priorPayload === null)
+          return yield* deny("Original selected memory source is unavailable");
+        const previous = yield* decodeRecorded(priorPayload);
+        const original = previous.record;
+        if (
+          original.kind !== "memory-source" ||
+          original.status !== "current" ||
+          original.tombstonedAt !== undefined ||
+          original.projectId !== input.projectId ||
+          projectMemoryHash(original.content) !== original.contentHash ||
+          !same(recorded.record, job.source) ||
+          job.source.status !== "retracted" ||
+          !same(
+            {
+              ...original,
+              content: job.source.content,
+              contentHash: job.source.contentHash,
+              revision: original.revision + 1,
+              generation: original.generation + 1,
+              updatedAt: recorded.occurredAt,
+              tombstonedAt: recorded.occurredAt,
+              status: "retracted",
+              sharedWithProjectIds: [],
+            },
+            job.source,
+          )
+        )
+          return yield* deny("Human memory tombstone changed its exact selection");
+        const sizes = yield* sql<{
+          bytes: number;
+        }>`SELECT length(CAST(payload_json AS BLOB)) AS bytes
+          FROM project_work_events WHERE project_id=${input.projectId}
+          AND command_id=${tombstone.commandId} ORDER BY sequence LIMIT 3`;
+        const receiptSizes = yield* sql<{ bytes: number }>`SELECT
+          length(CAST(result_json AS BLOB))+length(CAST(event_ids_json AS BLOB))+
+          length(CAST(payload_fingerprint AS BLOB))+length(CAST(actor_kind AS BLOB))+
+          length(CAST(actor_id AS BLOB))+length(CAST(source_kind AS BLOB))+
+          length(CAST(source_id AS BLOB)) AS bytes FROM project_work_command_receipts
+          WHERE project_id=${input.projectId} AND command_id=${tombstone.commandId} LIMIT 2`;
+        if (
+          sizes.length !== 2 ||
+          sizes.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > 262144) ||
+          receiptSizes.length !== 1 ||
+          !Number.isSafeInteger(receiptSizes[0]?.bytes) ||
+          (receiptSizes[0]?.bytes ?? 524289) > 524288 ||
+          (auditBytes +=
+            Buffer.byteLength(priorPayload) +
+            Buffer.byteLength(tombstone.payload) +
+            sizes.reduce((total, row) => total + row.bytes, 0) +
+            (receiptSizes[0]?.bytes ?? 4194305)) > 4194304
+        )
+          return yield* deny("Human memory retraction proof exceeds its retained bound");
+        const events = yield* sql<{
+          id: string;
+          payload: string;
+        }>`SELECT event_id AS id,payload_json AS payload
+          FROM project_work_events WHERE project_id=${input.projectId} AND command_id=${tombstone.commandId}
+          ORDER BY sequence LIMIT 2`;
+        const rows = yield* sql<{
+          fingerprint: string;
+          actorKind: string;
+          actorId: string | null;
+          sourceKind: string;
+          sourceId: string | null;
+          result: string;
+          ids: string;
+        }>`SELECT
+          payload_fingerprint AS fingerprint,actor_kind AS actorKind,actor_id AS actorId,
+          source_kind AS sourceKind,source_id AS sourceId,result_json AS result,event_ids_json AS ids
+          FROM project_work_command_receipts WHERE project_id=${input.projectId}
+          AND command_id=${tombstone.commandId} LIMIT 2`;
+        const receipt = rows[0];
+        if (
+          rows.length !== 1 ||
+          receipt === undefined ||
+          receipt.actorKind !== "human" ||
+          events.length !== 2
+        )
+          return yield* deny("Human memory retraction receipt is unavailable");
+        const request = yield* decodeRetraction({
+          type: "project-team.memory.retract",
+          commandId: tombstone.commandId,
+          projectId: input.projectId,
+          expectedRevision: recorded.revision - 1,
+          sourceRecordId: original.recordId,
+          expectedSourceRecordRevision: original.revision,
+          sourceRevision: original.sourceRevision,
+          sourceGeneration: original.generation,
+          contentHash: original.contentHash,
+        });
+        const fingerprint =
+          "project-team-intent:" +
+          NodeCrypto.createHash("sha256")
+            .update(
+              canonicalProjectWorkPayload({
+                intent: request,
+                actor: {
+                  kind: receipt.actorKind,
+                  ...(receipt.actorId === null ? {} : { id: receipt.actorId }),
+                },
+                source: {
+                  kind: receipt.sourceKind,
+                  ...(receipt.sourceId === null ? {} : { id: receipt.sourceId }),
+                },
+                managed: null,
+              }),
+            )
+            .digest("hex");
+        const result = yield* decodeResult(receipt.result);
+        const ids = yield* decodeEventIds(receipt.ids);
+        const first = events[0],
+          second = events[1];
+        if (first === undefined || second === undefined)
+          return yield* deny("Human memory retraction events missing");
+        const sourceEvent = yield* decodeRecorded(first.payload);
+        const effectEvent = yield* decodeRecorded(second.payload);
+        if (
+          receipt.fingerprint !== fingerprint ||
+          result.projectId !== input.projectId ||
+          result.receipt.projectId !== input.projectId ||
+          result.receipt.commandId !== request.commandId ||
+          result.receipt.status !== "accepted" ||
+          result.receipt.eventCount !== 2 ||
+          !same(ids, [first.id, second.id]) ||
+          !same(ids, result.delta.eventIds) ||
+          sourceEvent.eventId !== first.id ||
+          effectEvent.eventId !== second.id ||
+          sourceEvent.projectId !== input.projectId ||
+          effectEvent.projectId !== input.projectId ||
+          sourceEvent.revision !== request.expectedRevision + 1 ||
+          effectEvent.revision !== sourceEvent.revision + 1 ||
+          result.revision !== effectEvent.revision ||
+          result.receipt.revision !== result.revision ||
+          sourceEvent.occurredAt !== effectEvent.occurredAt ||
+          !same(sourceEvent, recorded) ||
+          !same(effectEvent.record, job.effect) ||
+          job.effect.effectKind !== "memory-delete"
+        )
+          return yield* deny("Human memory retraction is not the accepted exact command");
+        return original;
+      });
       // Decisions have no task field. Cleanup is eligible only through the real
       // accepted replacement history, not a projection's superseded label.
       let decisionHistory: Array<ProjectWorkDecision> | undefined;
@@ -488,7 +659,10 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
               !includeCompletedCleanup)
           )
             return;
-          const retained = yield* decodeRetained(source.content);
+          const humanRetraction =
+            effect.effectKind === "memory-delete" && source.status === "retracted";
+          const originalSource = humanRetraction ? yield* auditRetraction(job) : source;
+          const retained = yield* decodeRetained(originalSource.content);
           const current =
             retained.kind === "comment"
               ? state.comments?.find((record) => record.commentId === retained.record.commentId)
@@ -508,6 +682,21 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
               (retained.kind === "decision" && retained.record.state !== "accepted")
             )
               return;
+          } else if (humanRetraction) {
+            if (retained.kind === "decision") {
+              const history = yield* auditDecisions();
+              if (
+                retained.record.state !== "accepted" ||
+                !historicalDecisions.some((record) => same(record, retained.record)) ||
+                !same(
+                  history.find((record) => record.decisionId === retained.record.decisionId),
+                  current,
+                )
+              )
+                return yield* deny("Retracted decision lacks its original accepted history");
+            }
+            if (job.extraction !== undefined || !same(effect.payload.recordIds, [source.recordId]))
+              return yield* deny("Human memory cleanup contains obsolete indexing");
           } else {
             // A same-task artifact may change, but must still retain the original
             // captured identity. Decisions additionally need accepted human lineage.

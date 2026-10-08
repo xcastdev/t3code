@@ -1702,12 +1702,15 @@ it.effect(
         )
         .pipe(Effect.exit);
       expect(result._tag).toBe("Failure");
+      expect(yield* f.sql`SELECT * FROM message_commit_child`).toEqual([]);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+      ).toEqual([]);
       expect(
         (yield* f.gateway
           .read({ projectId, taskId: f.recipient.taskId, operation: "task-context" })
           .pipe(Effect.result))._tag,
-      ).toBe("Failure");
-      yield* f.sql`ROLLBACK`;
+      ).toBe("Success");
       expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
       expect(
         yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
@@ -2076,12 +2079,15 @@ it.effect(
         )
         .pipe(Effect.exit);
       expect(outcome._tag).toBe("Failure");
+      expect(yield* f.sql`SELECT * FROM question_commit_child`).toEqual([]);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+      ).toEqual([]);
       expect(
         (yield* f.gateway
           .read({ projectId, taskId, operation: "task-context" })
           .pipe(Effect.result))._tag,
-      ).toBe("Failure");
-      yield* f.sql`ROLLBACK`;
+      ).toBe("Success");
       expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
       expect(
         yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
@@ -2365,11 +2371,14 @@ it.effect(
         )
         .pipe(Effect.exit);
       expect(outcome._tag).toBe("Failure");
+      expect(yield* f.sql`SELECT * FROM waiver_commit_child`).toEqual([]);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${input.commandId}`,
+      ).toEqual([]);
       expect(
         (yield* gateway.read({ projectId, taskId, operation: "task-context" }).pipe(Effect.result))
           ._tag,
-      ).toBe("Failure");
-      yield* f.sql`ROLLBACK`;
+      ).toBe("Success");
       expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
       expect(
         yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${input.commandId}`,

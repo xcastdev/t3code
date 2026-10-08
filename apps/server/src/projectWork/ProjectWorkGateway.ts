@@ -3,6 +3,7 @@ import {
   type ProjectWorkActor,
   type ProjectWorkWriteIntent,
   ProjectTeamWriteIntent,
+  type ProjectTeamMemoryRetractIntent,
   ProjectWorkVerificationJobRead,
   ProjectTeamGuidedIntent,
   ProjectTeamIntegrationSourcePage,
@@ -37,6 +38,10 @@ import {
 import { ProjectWorkVerificationPreparationSelection } from "./ProjectWorkVerificationPreparation.ts";
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { makeProjectMemoryProcessing } from "./memory/ProjectMemoryProcessing.ts";
+import {
+  makeProjectMemoryService,
+  ProjectMemoryServiceError,
+} from "./memory/ProjectMemoryService.ts";
 import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
 import {
   makeProjectMemoryQuery,
@@ -151,6 +156,7 @@ export class ProjectWorkGateway extends Context.Service<
 >()("t3/projectWork/ProjectWorkGateway") {}
 
 const isTeamAuthorizationError = Schema.is(ProjectTeamAuthorization.ProjectTeamAuthorizationError);
+const isMemoryServiceError = Schema.is(ProjectMemoryServiceError);
 const isPersistenceSqlError = Schema.is(PersistenceSqlError);
 const isIssueCommentsError = Schema.is(IssueComments.IssueCommentsError);
 const isTeamIntent = Schema.is(ProjectTeamWriteIntent);
@@ -1299,7 +1305,99 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         ),
       );
   };
+  const writeMemoryRetraction = Effect.fn("ProjectWorkGateway.writeMemoryRetraction")(function* (
+    input: ProjectTeamMemoryRetractIntent,
+    actor: ProjectWorkActor,
+    source: ProjectWorkAttribution["source"],
+    principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
+  ) {
+    const caller = principal ?? { actor };
+    const denied = (reason: string) =>
+      new ProjectTeamAuthorization.ProjectTeamAuthorizationError({ reason });
+    if (caller.actor.kind !== actor.kind || caller.actor.id !== actor.id)
+      return yield* denied("Memory retraction actor does not match the authenticated request");
+    if (Option.isNone(teamAuthorization) || Option.isNone(contentGuard))
+      return yield* denied("Memory retraction safety and authorization services are unavailable");
+    const authorization = teamAuthorization.value;
+    const guard = contentGuard.value;
+    const at = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+    const attribution = attributionFor(actor, source, at);
+    const fingerprint =
+      "project-team-intent:" +
+      NodeCrypto.createHash("sha256")
+        .update(
+          canonicalProjectWorkPayload({
+            intent: input,
+            actor: { kind: actor.kind, id: actor.id },
+            source: { kind: source.kind, id: source.id },
+            managed: caller.managed ?? null,
+          }),
+        )
+        .digest("hex");
+    const authorize = Effect.gen(function* () {
+      yield* ProjectTeamAuthorization.assertHumanMemoryRetractionInTransaction(
+        sql,
+        caller,
+        input.projectId,
+      );
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.mapError(() => denied("Project Work settings are unavailable")),
+      );
+      if (!settings.projectWorkEnabled) return yield* denied("Project Work is disabled");
+      yield* assertProjectAcceptsMutations(sql, input.projectId).pipe(
+        Effect.mapError(() => denied("Memory project cannot accept mutations")),
+      );
+    });
+    const envelope: ProjectWorkCommand = {
+      type: "project-work.foundation.commit",
+      commandId: input.commandId,
+      projectId: input.projectId,
+      expectedRevision: input.expectedRevision,
+      attribution,
+      records: [],
+      committedAt: at,
+    };
+    const result = yield* executeAuthorized(
+      envelope,
+      () =>
+        Effect.gen(function* () {
+          yield* authorize;
+          const environmentId = Option.isSome(environmentIdentity)
+            ? yield* environmentIdentity.value.getEnvironmentId
+            : Option.isSome(serverEnvironment)
+              ? yield* serverEnvironment.value.getEnvironmentId
+              : undefined;
+          if (environmentId === undefined)
+            return yield* denied("Memory environment identity is unavailable");
+          const service = makeProjectMemoryService({
+            sql,
+            repository,
+            contentGuard: guard,
+            authorization,
+            environmentId,
+          });
+          const records = yield* service
+            .prepareRetractionInTransaction(input, at)
+            .pipe(
+              Effect.mapError((error) =>
+                denied(
+                  isMemoryServiceError(error)
+                    ? error.reason
+                    : "Selected memory source is unavailable",
+                ),
+              ),
+            );
+          yield* authorize;
+          return { ...envelope, records };
+        }),
+      () => authorize,
+      fingerprint,
+    );
+    return result.writeResult;
+  });
   const write: ProjectWorkGatewayShape["write"] = (input, actor, source, principal) => {
+    if (input.type === "project-team.memory.retract")
+      return writeMemoryRetraction(input, actor, source, principal);
     if (!isTeamIntent(input) && !isGuidedIntent(input))
       return writeCommand(input, actor, source, principal);
     return Effect.gen(function* () {

@@ -14,6 +14,7 @@ import {
   ProjectWorkComment,
   ProjectWorkEvidence,
   ProjectWorkDecision,
+  ProjectTeamMemoryRetractIntent,
   ProjectTeamEffect,
   type ServerSettingsError,
 } from "@t3tools/contracts";
@@ -181,6 +182,17 @@ const systemAttribution = (at: string): ProjectWorkAttribution => ({
   recordedAt: at,
 });
 const records = (state: ProjectWorkReducerState) => state.foundationRecords ?? [];
+const sourceTombstone = (source: Source, at: string, content = source.content): Source => ({
+  ...source,
+  content,
+  contentHash: content === source.content ? source.contentHash : projectMemoryHash(content),
+  status: "retracted",
+  revision: source.revision + 1,
+  generation: source.generation + 1,
+  updatedAt: at,
+  tombstonedAt: at,
+  sharedWithProjectIds: [],
+});
 const sourceFor = (state: ProjectWorkReducerState, id: string) =>
   records(state).find(
     (record): record is Source => record.kind === "memory-source" && record.recordId === id,
@@ -567,6 +579,110 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
       return yield* deny("Memory capture requires an authenticated managed binding");
     return yield* captureRetained(authority.binding.projectId, selector, principal);
   });
+  const prepareTombstone = Effect.fn("ProjectMemoryService.prepareTombstone")(function* (
+    source: Source,
+    at: string,
+  ) {
+    const decoded = decodeCachedContent(source.content);
+    const redacted = yield* contentGuard.redact(Option.getOrElse(decoded, () => source.content));
+    const content =
+      redacted.redactions.length === 0
+        ? source.content
+        : Option.isSome(decoded)
+          ? canonicalProjectWorkPayload(redacted.value)
+          : yield* validate(Schema.String, redacted.value);
+    return sourceTombstone(source, at, content);
+  });
+  /** The human Gateway owns authorization, the original receipt and this transaction. */
+  const prepareRetractionInTransaction = Effect.fn(
+    "ProjectMemoryService.prepareRetractionInTransaction",
+  )(function* (input: ProjectTeamMemoryRetractIntent, at: string) {
+    if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+      return yield* deny("Memory retraction requires the owning SQL transaction");
+    const request = yield* validate(ProjectTeamMemoryRetractIntent, input);
+    yield* requireProject(request.projectId);
+    const state = yield* readCurrentState(sql, request.projectId);
+    const selected = sourceFor(state, request.sourceRecordId);
+    if (state.revision !== request.expectedRevision || selected === undefined)
+      return yield* deny("Selected memory source revision changed");
+    const source = yield* validate(ProjectMemorySource, selected);
+    if (
+      source.status !== "current" ||
+      source.tombstonedAt !== undefined ||
+      source.projectId !== request.projectId ||
+      source.revision !== request.expectedSourceRecordRevision ||
+      source.sourceRevision !== request.sourceRevision ||
+      source.generation !== request.sourceGeneration ||
+      source.contentHash !== request.contentHash ||
+      projectMemoryHash(source.content) !== source.contentHash
+    )
+      return yield* deny("Selected memory source is no longer current");
+    const versions = records(state).filter(
+      (entry): entry is Source =>
+        entry.kind === "memory-source" && entry.sourceId === source.sourceId,
+    );
+    if (
+      versions.length > 256 ||
+      versions.some(
+        (entry) =>
+          entry.status === "conflicted" ||
+          entry.status === "retracted" ||
+          entry.tombstonedAt !== undefined ||
+          (entry.recordId !== source.recordId &&
+            (entry.status === "current" ||
+              entry.generation > source.generation ||
+              entry.sourceRevision > source.sourceRevision)) ||
+          entry.supersedes === source.recordId,
+      )
+    )
+      return yield* deny("Selected memory source is not the effective current version");
+    const visited = new Set<string>();
+    let cursor: Source | undefined = source;
+    while (cursor !== undefined) {
+      if (visited.has(cursor.recordId))
+        return yield* deny("Memory source correction chain is invalid");
+      visited.add(cursor.recordId);
+      if (cursor.supersedes === undefined) break;
+      const parent = versions.find((entry) => entry.recordId === cursor?.supersedes);
+      if (
+        parent === undefined ||
+        parent.projectId !== source.projectId ||
+        parent.status !== "superseded" ||
+        versions.filter((entry) => entry.supersedes === parent.recordId).length !== 1
+      )
+        return yield* deny("Memory source correction chain is incomplete or ambiguous");
+      cursor = parent;
+    }
+    const metadata = yield* sql<{
+      bytes: number;
+    }>`SELECT length(CAST(payload_json AS BLOB)) AS bytes
+      FROM project_team_memory_source WHERE project_id=${request.projectId} AND record_id=${source.recordId} LIMIT 2`;
+    if (
+      metadata.length !== 1 ||
+      !Number.isSafeInteger(metadata[0]?.bytes) ||
+      (metadata[0]?.bytes ?? 262145) > 262144
+    )
+      return yield* deny("Selected physical memory source is unavailable");
+    const rows = yield* sql<{ payload: string }>`SELECT payload_json AS payload
+      FROM project_team_memory_source WHERE project_id=${request.projectId} AND record_id=${source.recordId}
+      AND length(CAST(payload_json AS BLOB))<=262144 LIMIT 2`;
+    if (
+      rows.length !== 1 ||
+      canonicalProjectWorkPayload(
+        yield* validate(Schema.fromJsonString(ProjectMemorySource), rows[0]?.payload),
+      ) !== canonicalProjectWorkPayload(source)
+    )
+      return yield* deny("Selected physical memory source changed");
+    const tombstone = yield* validate(ProjectMemorySource, yield* prepareTombstone(source, at));
+    const effect = yield* validate(ProjectTeamEffect, intent(tombstone, "memory-delete", at));
+    yield* retainProjectMemoryJob(sql, {
+      environmentId: dependencies.environmentId,
+      projectId: source.projectId,
+      effect,
+      source: tombstone,
+    });
+    return [tombstone, effect] satisfies ReadonlyArray<ProjectTeamRecord>;
+  });
   /** Root's authorized human/lifecycle action, independent of active run authority. */
   const retract = Effect.fn("ProjectMemoryService.retract")(function* (
     projectId: string,
@@ -587,28 +703,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
         const changed: Array<ProjectTeamRecord> = [];
         for (const version of versions) {
           if (version.status === "retracted") continue;
-          const decoded = decodeCachedContent(version.content);
-          const redacted = yield* contentGuard.redact(
-            Option.getOrElse(decoded, () => version.content),
-          );
-          const content =
-            redacted.redactions.length === 0
-              ? version.content
-              : Option.isSome(decoded)
-                ? canonicalProjectWorkPayload(redacted.value)
-                : yield* validate(Schema.String, redacted.value);
-          const tombstone: Source = {
-            ...version,
-            content,
-            contentHash:
-              content === version.content ? version.contentHash : projectMemoryHash(content),
-            status: "retracted",
-            revision: version.revision + 1,
-            generation: version.generation + 1,
-            updatedAt: at,
-            tombstonedAt: at,
-            sharedWithProjectIds: [],
-          };
+          const tombstone = yield* prepareTombstone(version, at);
           changed.push(tombstone, intent(tombstone, "memory-delete", at));
         }
         return yield* commit(state, changed, at);
@@ -999,6 +1094,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     capture,
     captureRetained,
     retract,
+    prepareRetractionInTransaction,
     replaceShares,
     readWork,
     currentIndex,

@@ -230,6 +230,7 @@ export const make = Effect.gen(function* () {
       projectTeamFoundationReads: true,
       projectTeamSupervisionReads: true,
       projectTeamGuidedWrites: true,
+      projectTeamMemoryRetractions: true,
       projectTeamExecution: false,
       sessionMcpCatalog: true,
       inlineMessageContext: true,

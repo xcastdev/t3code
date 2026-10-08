@@ -3018,15 +3018,12 @@ it.effect(
           ))._tag,
         ).toBe("Failure");
         expect(escaped).toBe(false);
+        expect(yield* f.sql`SELECT * FROM review_commit_child`).toEqual([]);
+        expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
         expect(
           (yield* f.reader.readForOperation(reviewOperation(f, "prompt")).pipe(Effect.exit))._tag,
         ).toBe("Failure");
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
+        expect(yield* f.sql`SELECT * FROM review_commit_child`).toEqual([]);
         expect(yield* f.sql`SELECT * FROM project_team_review_target`).toEqual([]);
         yield* f.sql`DROP TRIGGER controlled_review_commit_failure`;
         expect(

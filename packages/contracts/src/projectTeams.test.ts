@@ -39,6 +39,29 @@ const member = {
   roleRevisionId: "role",
 };
 describe("team contracts", () => {
+  it("accepts exact human memory retraction without a task, owner or renewed limits", () => {
+    const request = {
+      type: "project-team.memory.retract",
+      commandId: "retract-one",
+      projectId: "project",
+      expectedRevision: 3,
+      sourceRecordId: "source",
+      expectedSourceRecordRevision: 2,
+      sourceRevision: 1,
+      sourceGeneration: 4,
+      contentHash: "a".repeat(64),
+    };
+    expect(decodePublicWrite(request)).toEqual(request);
+    for (const [label, change] of [
+      ["stale-shaped revision", { expectedSourceRecordRevision: -1 }],
+      ["untrimmed source", { sourceRecordId: " source " }],
+      ["missing hash", { contentHash: undefined }],
+      ["caller owner", { owner: { operationId: "caller" } }],
+      ["new budget", { maximumTokens: 1000 }],
+      ["task authority", { taskId: "task" }],
+    ] as const)
+      expect(() => decodePublicWrite({ ...request, ...change }), label).toThrow();
+  });
   it("accepts bounded semantic queries without caller vectors, owners or renewed limits", () => {
     const request = {
       type: "project-team.memory.query",

@@ -3,6 +3,7 @@ import {
   ProjectTeamRecord,
   ProjectTeamRecordRead,
   ProjectTeamWriteIntent,
+  ProjectTeamMemoryRetractIntent,
   ProjectTeamRunBinding,
   ProjectTeamDeliverableKind,
   ProjectTeamEffect,
@@ -1843,6 +1844,7 @@ export type ProjectWorkCommand = typeof ProjectWorkCommand.Type;
 /** Names used by RPC and MCP adapters when referring to the command union. */
 export const ProjectWorkWriteIntent = Schema.Union([
   ProjectWorkCommand,
+  ProjectTeamMemoryRetractIntent,
   ProjectTeamWriteIntent,
   ProjectTeamGuidedIntent,
 ]);

@@ -112,6 +112,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   projectTeamSupervisionReads: Schema.optionalKey(Schema.Boolean),
   /** Revision-fenced human refinement and approval commands, before managed dispatch is available. */
   projectTeamGuidedWrites: Schema.optionalKey(Schema.Boolean),
+  /** Exact human captured-memory retraction; absent on hosts predating this action. */
+  projectTeamMemoryRetractions: Schema.optionalKey(Schema.Boolean),
   projectTeamExecution: Schema.optionalKey(Schema.Boolean),
   /** Server exposes active logical-session MCP catalog RPCs. */
   sessionMcpCatalog: Schema.optionalKey(Schema.Boolean),

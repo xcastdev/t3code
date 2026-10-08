@@ -1,7 +1,9 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlError from "effect/unstable/sql/SqlError";
 
 import * as SqliteClient from "./nodeSqliteClient.ts";
 
@@ -41,6 +43,87 @@ layer("NodeSqliteClient", (it) => {
       assert.equal(error._tag, "SqlError");
       assert.equal(error.reason.operation, "prepare");
     }),
+  );
+  it.effect(
+    "rolls back a failed deferred COMMIT before releasing the connection and preserves subsequent transactions",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA foreign_keys=ON`;
+        yield* sql`CREATE TABLE commit_parent(id INTEGER PRIMARY KEY)`;
+        yield* sql`CREATE TABLE commit_child(id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO commit_parent(id) VALUES(1)`;
+            yield* sql`INSERT INTO commit_child(id) VALUES(1)`;
+          }),
+        );
+        let bodyCompleted = false;
+        const failed = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO commit_parent(id) VALUES(2)`;
+              yield* sql`INSERT INTO commit_child(id) VALUES(999)`;
+              assert.deepEqual(yield* sql`SELECT id FROM commit_child ORDER BY id`, [
+                { id: 1 },
+                { id: 999 },
+              ]);
+              bodyCompleted = true;
+            }),
+          )
+          .pipe(Effect.exit);
+        assert.equal(bodyCompleted, true);
+        assert.equal(failed._tag, "Failure");
+        if (failed._tag === "Failure")
+          assert.equal(SqlError.isSqlError(Cause.squash(failed.cause)), true);
+        // No test-side ROLLBACK: the next borrower must see the original committed rows.
+        assert.deepEqual(yield* sql`SELECT id FROM commit_parent ORDER BY id`, [{ id: 1 }]);
+        assert.deepEqual(yield* sql`SELECT id FROM commit_child ORDER BY id`, [{ id: 1 }]);
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO commit_parent(id) VALUES(2)`;
+            yield* sql`INSERT INTO commit_child(id) VALUES(2)`;
+          }),
+        );
+        const bodyFailure = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO commit_parent(id) VALUES(3)`;
+              return yield* Effect.fail("controlled-body-failure");
+            }),
+          )
+          .pipe(Effect.result);
+        assert.equal(bodyFailure._tag, "Failure");
+        if (bodyFailure._tag === "Failure")
+          assert.equal(bodyFailure.failure, "controlled-body-failure");
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO commit_parent(id) VALUES(3)`;
+            const nested = yield* sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`INSERT INTO commit_parent(id) VALUES(4)`;
+                  return yield* Effect.fail("controlled-savepoint-failure");
+                }),
+              )
+              .pipe(Effect.result);
+            assert.equal(nested._tag, "Failure");
+            if (nested._tag === "Failure")
+              assert.equal(nested.failure, "controlled-savepoint-failure");
+            assert.deepEqual(yield* sql`SELECT id FROM commit_parent ORDER BY id`, [
+              { id: 1 },
+              { id: 2 },
+              { id: 3 },
+            ]);
+            yield* sql.withTransaction(sql`INSERT INTO commit_child(id) VALUES(3)`);
+          }),
+        );
+        assert.deepEqual(yield* sql`SELECT id FROM commit_child ORDER BY id`, [
+          { id: 1 },
+          { id: 2 },
+          { id: 3 },
+        ]);
+      }),
   );
 });
 

@@ -12,6 +12,7 @@ import {
 import {
   canonicalProjectWorkPayload,
   CommandId,
+  EnvironmentId,
   MessageId,
   ProjectWorkTaskRead,
   ProjectWorkWriteResult,
@@ -73,6 +74,11 @@ import {
   ProjectWorkRepositoryLive,
 } from "../../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkPolicyError } from "../../projectWork/ProjectWorkPolicy.ts";
+import {
+  ProjectWorkVerificationRequest,
+  ProjectWorkVerificationRequestError,
+} from "../../projectWork/ProjectWorkVerificationRequest.ts";
+import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.ts";
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamDispatchJournalError,
@@ -346,7 +352,7 @@ const reviewerFixture = Effect.gen(function* () {
   yield* restoreHistoricalBinding(role);
   return { ...f, role };
 });
-const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>, memoryRetraction = false) =>
   Effect.scoped(
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -360,7 +366,20 @@ const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         ProjectWorkNarrativeLive,
         ProjectWorkBriefingLive.pipe(Layer.provide(ProjectWorkQueryLive)),
       );
-      const live = ProjectWorkGatewayLive.pipe(
+      const gateway = memoryRetraction
+        ? ProjectWorkGatewayLive.pipe(
+            Layer.provideMerge(ProjectWorkContentGuardLive),
+            Layer.provideMerge(
+              Layer.succeed(
+                ServerEnvironmentIdentity,
+                ServerEnvironmentIdentity.of({
+                  getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+                }),
+              ),
+            ),
+          )
+        : ProjectWorkGatewayLive;
+      const live = gateway.pipe(
         Layer.provideMerge(services),
         Layer.provide(Layer.mock(EnvironmentAuth)({})),
         Layer.provideMerge(ServerSettings.layerTest({ projectWorkEnabled: true })),
@@ -5850,6 +5869,7 @@ for (const compactProof of [
   "memoryEmbeddingSecret",
   "memoryCleanup",
   "memoryCleanupGuards",
+  "memoryHumanRetraction",
   "memoryQuery",
   "memoryQueryPipeline",
   "memoryQueryModelUnknown",
@@ -5878,31 +5898,33 @@ for (const compactProof of [
                   ? "rejects newly learned escaped embedding text before its memory reservation"
                   : compactProof === "memoryCleanup"
                     ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
-                    : compactProof === "memoryCleanupGuards"
-                      ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
-                      : compactProof === "memoryQuery"
-                        ? "admits an explicit semantic query through the executing task bridge before forward stages"
-                        : compactProof === "memoryQueryPipeline"
-                          ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
-                          : compactProof === "memoryQueryMixed"
-                            ? "retains current semantic context when completed search also returns a genuinely superseded observation"
-                            : compactProof === "memoryQueryGuards"
-                              ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
-                              : compactProof === "memoryQueryNoGrant"
-                                ? "denies semantic query admission without the original frozen write intersection"
-                                : compactProof === "memoryQueryNoAccess"
-                                  ? "denies semantic query admission for an original no-memory role"
-                                  : compactProof === "memoryQueryBudget"
-                                    ? "retains authenticated query failure when the original operation budget cannot fund embedding"
-                                    : compactProof === "memoryQuerySecret"
-                                      ? "rejects a newly learned escaped query credential before embedding reservation"
-                                      : compactProof === "memoryQueryModelUnknown"
-                                        ? "retains an unknown query embedding charge until authenticated drain without resend"
-                                        : compactProof === "memoryQuerySearchUnknown"
-                                          ? "settles an uncertain query search only after its exact authenticated late drain"
-                                          : compactProof === "successorReplay"
-                                            ? "retained compact replay preserves the latest successful native head without another execution"
-                                            : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+                    : compactProof === "memoryHumanRetraction"
+                      ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
+                      : compactProof === "memoryCleanupGuards"
+                        ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
+                        : compactProof === "memoryQuery"
+                          ? "admits an explicit semantic query through the executing task bridge before forward stages"
+                          : compactProof === "memoryQueryPipeline"
+                            ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
+                            : compactProof === "memoryQueryMixed"
+                              ? "retains current semantic context when completed search also returns a genuinely superseded observation"
+                              : compactProof === "memoryQueryGuards"
+                                ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
+                                : compactProof === "memoryQueryNoGrant"
+                                  ? "denies semantic query admission without the original frozen write intersection"
+                                  : compactProof === "memoryQueryNoAccess"
+                                    ? "denies semantic query admission for an original no-memory role"
+                                    : compactProof === "memoryQueryBudget"
+                                      ? "retains authenticated query failure when the original operation budget cannot fund embedding"
+                                      : compactProof === "memoryQuerySecret"
+                                        ? "rejects a newly learned escaped query credential before embedding reservation"
+                                        : compactProof === "memoryQueryModelUnknown"
+                                          ? "retains an unknown query embedding charge until authenticated drain without resend"
+                                          : compactProof === "memoryQuerySearchUnknown"
+                                            ? "settles an uncertain query search only after its exact authenticated late drain"
+                                            : compactProof === "successorReplay"
+                                              ? "retained compact replay preserves the latest successful native head without another execution"
+                                              : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
@@ -5910,7 +5932,9 @@ for (const compactProof of [
           const lateSecret = 'controlled-memory-"key\\tail';
           const memoryProof = compactProof?.startsWith("memory") === true;
           const cleanupProof =
-            compactProof === "memoryCleanup" || compactProof === "memoryCleanupGuards";
+            compactProof === "memoryCleanup" ||
+            compactProof === "memoryCleanupGuards" ||
+            compactProof === "memoryHumanRetraction";
           let consumeMemory:
             | ((
                 principal: Authorization.ProjectTeamPrincipal,
@@ -6554,79 +6578,141 @@ for (const compactProof of [
                               kind: "decision",
                               retainedId: decision.decisionId,
                             });
-                            const replacement = yield* decodeMemorySourceDecision({
-                              ...decision,
-                              decisionId: "live-memory-decision-replacement",
-                              body: "The approved parser now rejects obsolete input.",
-                            });
-                            yield* gateway.write(
-                              {
-                                type: "project-work.decision.supersede",
-                                commandId: CommandId.make("live-memory-decision-supersede"),
-                                projectId,
-                                decisionId: decision.decisionId,
-                                replacement,
-                                supersededAt: at,
-                                attribution: { actor: human, source: humanSource, recordedAt: at },
-                              },
-                              human,
-                              humanSource,
-                              { actor: human },
-                            );
-                            yield* gateway.write(
-                              {
-                                type: "project-work.decision.accept",
-                                commandId: CommandId.make("live-memory-replacement-accept"),
-                                projectId,
-                                decisionId: replacement.decisionId,
-                                acceptedAt: at,
-                              },
-                              human,
-                              humanSource,
-                              { actor: human },
-                            );
-                            const corrected = yield* memory.capture(principal, {
-                              kind: "decision",
-                              retainedId: replacement.decisionId,
-                            });
-                            expect(corrected).toMatchObject({
-                              sourceId: original.sourceId,
-                              supersedes: original.recordId,
-                              status: "current",
-                            });
-                            const correctedState = yield* readCurrentState(f.sql, projectId);
-                            const oldSource = correctedState.foundationRecords?.find(
-                              (entry) => entry.recordId === original.recordId,
-                            );
-                            expect(oldSource).toMatchObject({
-                              kind: "memory-source",
-                              status: "superseded",
-                            });
-                            const deletion = correctedState.foundationRecords?.find(
-                              (entry) =>
-                                entry.kind === "effect" &&
-                                entry.effectKind === "memory-delete" &&
-                                entry.targetId === original.recordId,
-                            );
-                            if (deletion?.kind !== "effect")
-                              return yield* Effect.die("Correction retained no cleanup intent");
-                            cleanupEffectId = deletion.effectId;
-                            expect(
-                              yield* f.sql`SELECT status,owner_json,receipt_json,
+                            if (compactProof === "memoryHumanRetraction") {
+                              const before = yield* readCurrentState(f.sql, projectId);
+                              yield* gateway
+                                .write(
+                                  {
+                                    type: "project-team.memory.retract",
+                                    commandId: CommandId.make("live-memory-human-retract"),
+                                    projectId,
+                                    expectedRevision: before.revision,
+                                    sourceRecordId: original.recordId,
+                                    expectedSourceRecordRevision: original.revision,
+                                    sourceRevision: original.sourceRevision,
+                                    sourceGeneration: original.generation,
+                                    contentHash: original.contentHash,
+                                  },
+                                  human,
+                                  humanSource,
+                                  { actor: human },
+                                )
+                                .pipe(
+                                  Effect.provideService(
+                                    ProjectWorkVerificationRequest,
+                                    ProjectWorkVerificationRequest.of({
+                                      assertCurrent: (caller, id, permission) =>
+                                        caller.actor.kind === "human" &&
+                                        caller.managed === undefined &&
+                                        id === projectId &&
+                                        permission === "write"
+                                          ? Effect.void
+                                          : Effect.fail(
+                                              new ProjectWorkVerificationRequestError({
+                                                reason: "denied",
+                                              }),
+                                            ),
+                                    }),
+                                  ),
+                                );
+                              const retracted = yield* readCurrentState(f.sql, projectId);
+                              expect(retracted.decisions).toEqual(before.decisions);
+                              expect(
+                                retracted.foundationRecords?.find(
+                                  (entry) => entry.recordId === original.recordId,
+                                ),
+                              ).toMatchObject({
+                                status: "retracted",
+                                sharedWithProjectIds: [],
+                              });
+                              const deletion = retracted.foundationRecords?.find(
+                                (entry) =>
+                                  entry.kind === "effect" &&
+                                  entry.effectKind === "memory-delete" &&
+                                  entry.targetId === original.recordId,
+                              );
+                              if (deletion?.kind !== "effect")
+                                return yield* Effect.die("Human retraction cleanup missing");
+                              cleanupEffectId = deletion.effectId;
+                            } else {
+                              const replacement = yield* decodeMemorySourceDecision({
+                                ...decision,
+                                decisionId: "live-memory-decision-replacement",
+                                body: "The approved parser now rejects obsolete input.",
+                              });
+                              yield* gateway.write(
+                                {
+                                  type: "project-work.decision.supersede",
+                                  commandId: CommandId.make("live-memory-decision-supersede"),
+                                  projectId,
+                                  decisionId: decision.decisionId,
+                                  replacement,
+                                  supersededAt: at,
+                                  attribution: {
+                                    actor: human,
+                                    source: humanSource,
+                                    recordedAt: at,
+                                  },
+                                },
+                                human,
+                                humanSource,
+                                { actor: human },
+                              );
+                              yield* gateway.write(
+                                {
+                                  type: "project-work.decision.accept",
+                                  commandId: CommandId.make("live-memory-replacement-accept"),
+                                  projectId,
+                                  decisionId: replacement.decisionId,
+                                  acceptedAt: at,
+                                },
+                                human,
+                                humanSource,
+                                { actor: human },
+                              );
+                              const corrected = yield* memory.capture(principal, {
+                                kind: "decision",
+                                retainedId: replacement.decisionId,
+                              });
+                              expect(corrected).toMatchObject({
+                                sourceId: original.sourceId,
+                                supersedes: original.recordId,
+                                status: "current",
+                              });
+                              const correctedState = yield* readCurrentState(f.sql, projectId);
+                              const oldSource = correctedState.foundationRecords?.find(
+                                (entry) => entry.recordId === original.recordId,
+                              );
+                              expect(oldSource).toMatchObject({
+                                kind: "memory-source",
+                                status: "superseded",
+                              });
+                              const deletion = correctedState.foundationRecords?.find(
+                                (entry) =>
+                                  entry.kind === "effect" &&
+                                  entry.effectKind === "memory-delete" &&
+                                  entry.targetId === original.recordId,
+                              );
+                              if (deletion?.kind !== "effect")
+                                return yield* Effect.die("Correction retained no cleanup intent");
+                              cleanupEffectId = deletion.effectId;
+                              expect(
+                                yield* f.sql`SELECT status,owner_json,receipt_json,
                             json_extract(input_json,'$.effect.effectKind') AS kind,
                             json_extract(input_json,'$.source.recordId') AS sourceId
                             FROM project_team_memory_job WHERE effect_id=${cleanupEffectId}`,
-                            ).toEqual([
-                              {
-                                status: "pending",
-                                owner_json: null,
-                                receipt_json: null,
-                                kind: "memory-delete",
-                                sourceId: original.recordId,
-                              },
-                            ]);
-                            expect(memoryExchanges).toBe(0);
-                            expect(memoryBackendCalls).toBe(0);
+                              ).toEqual([
+                                {
+                                  status: "pending",
+                                  owner_json: null,
+                                  receipt_json: null,
+                                  kind: "memory-delete",
+                                  sourceId: original.recordId,
+                                },
+                              ]);
+                              expect(memoryExchanges).toBe(0);
+                              expect(memoryBackendCalls).toBe(0);
+                            }
                           }
                           const page = yield* gateway
                             .read(
@@ -6651,12 +6737,14 @@ for (const compactProof of [
                               retainedId: "live-memory-decision",
                               effectId: cleanupEffectId,
                             });
-                            expect(
-                              page.items.some(
-                                (entry) =>
-                                  entry.selection.retainedId === "live-memory-decision-replacement",
-                              ),
-                            ).toBe(true);
+                            if (compactProof !== "memoryHumanRetraction")
+                              expect(
+                                page.items.some(
+                                  (entry) =>
+                                    entry.selection.retainedId ===
+                                    "live-memory-decision-replacement",
+                                ),
+                              ).toBe(true);
                             expect(
                               yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='memory'`,
                             ).toEqual([]);
@@ -6704,6 +6792,34 @@ for (const compactProof of [
                             state.revision,
                           );
                           memoryReady = true;
+                          if (compactProof === "memoryHumanRetraction") {
+                            const receipts = yield* f.sql<{
+                              fingerprint: string;
+                            }>`SELECT payload_fingerprint AS fingerprint
+                              FROM project_work_command_receipts WHERE project_id=${projectId}
+                              AND command_id='live-memory-human-retract'`;
+                            const fingerprint = receipts[0]?.fingerprint;
+                            if (fingerprint === undefined)
+                              return yield* Effect.die("Human retraction receipt missing");
+                            yield* f.sql`UPDATE project_work_command_receipts SET payload_fingerprint=${"project-team-intent:" + "0".repeat(64)}
+                              WHERE project_id=${projectId} AND command_id='live-memory-human-retract'`;
+                            expect(
+                              (yield* Effect.tryPromise({
+                                try: () => input.executeBridgeTool(call, toolInput, signal),
+                                catch: controlledCallbackError,
+                              }).pipe(Effect.result))._tag,
+                            ).toBe("Failure");
+                            expect(
+                              yield* f.sql`SELECT owner_json,receipt_json FROM project_team_memory_job
+                              WHERE effect_id=${selection.effectId}`,
+                            ).toEqual([{ owner_json: null, receipt_json: null }]);
+                            expect({
+                              exchanges: memoryExchanges,
+                              backend: memoryBackendCalls,
+                            }).toEqual({ exchanges: 0, backend: 0 });
+                            yield* f.sql`UPDATE project_work_command_receipts SET payload_fingerprint=${fingerprint}
+                              WHERE project_id=${projectId} AND command_id='live-memory-human-retract'`;
+                          }
                           if (compactProof === "memoryCleanupGuards") {
                             const originalEvents = yield* f.sql<{
                               payload: string;
@@ -7246,10 +7362,19 @@ for (const compactProof of [
                               reflected.foundationRecords?.find(
                                 (entry) => entry.recordId === selection.sourceRecordId,
                               ),
-                            ).toMatchObject({ status: "superseded" });
+                            ).toMatchObject({
+                              status:
+                                compactProof === "memoryHumanRetraction"
+                                  ? "retracted"
+                                  : "superseded",
+                            });
                             expect(
                               reflected.decisions?.find(
-                                (entry) => entry.decisionId === "live-memory-decision-replacement",
+                                (entry) =>
+                                  entry.decisionId ===
+                                  (compactProof === "memoryHumanRetraction"
+                                    ? "live-memory-decision"
+                                    : "live-memory-decision-replacement"),
                               ),
                             ).toMatchObject({ state: "accepted" });
                           } else if (compactProof === "memoryPipeline" || queryForward) {
@@ -8700,6 +8825,7 @@ for (const compactProof of [
             yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`,
           ).toEqual(rows);
         }),
+        compactProof === "memoryHumanRetraction",
       ),
   );
 

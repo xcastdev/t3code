@@ -92,6 +92,19 @@ export const managedActorId = (
   credential: Pick<ProjectTeamCredential, "providerInstanceId" | "threadId">,
 ) => `agent:mcp:${credential.providerInstanceId}:${credential.threadId}`;
 const deny = (reason: string) => new ProjectTeamAuthorizationError({ reason });
+export const assertHumanMemoryRetractionInTransaction = Effect.fn(
+  "ProjectTeamAuthorization.assertHumanMemoryRetractionInTransaction",
+)(function* (sql: SqlClient.SqlClient, principal: ProjectTeamPrincipal, projectId: ProjectId) {
+  if (principal.actor.kind !== "human" || principal.managed !== undefined)
+    return yield* deny("Memory retraction requires authenticated human authority");
+  if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+    return yield* deny("Memory retraction requires the owning SQL transaction");
+  const request = yield* Effect.serviceOption(ProjectWorkVerificationRequest);
+  if (Option.isNone(request)) return yield* deny("Current human project permission is unavailable");
+  yield* request.value
+    .assertCurrent(principal, projectId, "write")
+    .pipe(Effect.mapError(() => deny("Current human project write permission is unavailable")));
+});
 type QuestionRequest = Extract<ProjectTeamWriteIntent, { type: "project-team.question.request" }>;
 type MessageRequest = Extract<ProjectTeamWriteIntent, { type: "project-team.message.send" }>;
 type Membership = Extract<ProjectTeamRecord, { kind: "task-membership" }>;

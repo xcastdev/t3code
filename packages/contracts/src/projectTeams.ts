@@ -741,6 +741,23 @@ export type ProjectTeamReviewFindingIntent = typeof ProjectTeamReviewFindingInte
 
 const MemoryId = Text.check(Schema.isMaxLength(256));
 const MemoryRevision = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+/** Human suppression is independent of a processing task or its model budget. */
+export const ProjectTeamMemoryRetractIntent = Schema.Struct({
+  type: Schema.Literal("project-team.memory.retract"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  expectedRevision: MemoryRevision,
+  sourceRecordId: Schema.String.check(
+    Schema.isTrimmed(),
+    Schema.isMinLength(1),
+    Schema.isMaxLength(256),
+  ),
+  expectedSourceRecordRevision: MemoryRevision,
+  sourceRevision: MemoryRevision,
+  sourceGeneration: MemoryRevision,
+  contentHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamMemoryRetractIntent = typeof ProjectTeamMemoryRetractIntent.Type;
 export const ProjectTeamMemorySelection = Schema.Struct({
   kind: Schema.Literals(["comment", "evidence", "decision"]),
   retainedId: MemoryId,

@@ -7,6 +7,7 @@
 import * as NodeSqlite from "node:sqlite";
 
 import * as Cache from "effect/Cache";
+import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -248,7 +249,25 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         const effect = prepare(sql).pipe(
           Effect.flatMap((statement) => runStatement(statement, params ?? [], false)),
         );
-        return rowTransform ? Effect.map(effect, rowTransform) : effect;
+        // Effect's transaction finalizer does not roll back a failed COMMIT.
+        // Rescue on this still-owned connection before its semaphore is released.
+        const guarded =
+          sql === "COMMIT"
+            ? effect.pipe(
+                Effect.catchCause((commitCause) =>
+                  prepare("ROLLBACK").pipe(
+                    Effect.flatMap((statement) => runStatement(statement, [], false)),
+                    Effect.matchCauseEffect({
+                      onSuccess: () => Effect.failCause(commitCause),
+                      onFailure: (rollbackCause) =>
+                        Effect.failCause(Cause.combine(commitCause, rollbackCause)),
+                    }),
+                  ),
+                ),
+                Effect.uninterruptible,
+              )
+            : effect;
+        return rowTransform ? Effect.map(guarded, rowTransform) : guarded;
       },
       executeStream(_sql, _params) {
         return Stream.die(new UnsupportedNodeSqliteOperationError());

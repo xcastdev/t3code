@@ -89,3 +89,23 @@ it("keeps guided human workflow capability separate from managed execution under
     decodeDescriptor({ ...descriptor, capabilities: { projectTeamGuidedWrites: "true" } }),
   ).toThrow();
 });
+
+it("keeps exact human memory retraction unsupported on older guided-write hosts", () => {
+  const older = {
+    ...descriptor,
+    capabilities: { ...descriptor.capabilities, projectTeamGuidedWrites: true },
+  };
+  expect(decodeDescriptor(older).capabilities.projectTeamMemoryRetractions).toBeUndefined();
+  expect(
+    decodeDescriptor({
+      ...older,
+      capabilities: { ...older.capabilities, projectTeamMemoryRetractions: true },
+    }).capabilities.projectTeamMemoryRetractions,
+  ).toBe(true);
+  expect(() =>
+    decodeDescriptor({
+      ...older,
+      capabilities: { ...older.capabilities, projectTeamMemoryRetractions: "true" },
+    }),
+  ).toThrow();
+});

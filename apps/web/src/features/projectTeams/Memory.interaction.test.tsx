@@ -22,6 +22,9 @@ import {
   ProjectMemorySource,
   ProjectTeamEffect,
   ProjectWorkReadIntent,
+  ProjectWorkWriteIntent,
+  ProjectWorkWriteResult,
+  type ProjectTeamMemoryRetractIntent,
   WS_METHODS,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -54,6 +57,10 @@ const otherEnvironmentId = EnvironmentId.make("environment-2");
 const projectId = ProjectId.make("project-1");
 const at = "2026-10-04T10:00:00.000Z";
 const decodeRead = Schema.decodeUnknownEffect(ProjectWorkReadIntent);
+const decodeWrite = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
+const encodeResult = Schema.encodeEffect(ProjectWorkWriteResult);
+const decodeEffect = Schema.decodeUnknownSync(ProjectTeamEffect);
+const isSource = Schema.is(ProjectMemorySource);
 function receipt() {
   let resolve = () => {};
   const promise = new Promise<void>((accept) => {
@@ -146,6 +153,10 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
       }
     | undefined;
   let fail: boolean;
+  let writes: Array<{ environmentId: EnvironmentId; input: ProjectTeamMemoryRetractIntent }>;
+  let writeMode: "accepted" | "denied" | "mixed" | "lost" | "wrong-project";
+  let accepted: Map<string, ProjectWorkWriteResult>;
+  let writeCompleted: ReturnType<typeof receipt>;
 
   const setup = Effect.gen(function* () {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -155,6 +166,10 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
     reads = [];
     held = undefined;
     fail = false;
+    writes = [];
+    writeMode = "accepted";
+    accepted = new Map();
+    writeCompleted = receipt();
     const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
     for (const id of [environmentId, otherEnvironmentId]) {
       // Use the actual generated client, decoding every request through its wire schema.
@@ -166,6 +181,123 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
           send: (clientId, request) =>
             Effect.gen(function* () {
               if (request._tag !== "Request") return;
+              if (request.tag === WS_METHODS.projectWorkWrite) {
+                const input = yield* decodeWrite(request.payload).pipe(Effect.orDie);
+                if (input.type !== "project-team.memory.retract")
+                  return yield* Effect.die("Unexpected memory action");
+                writes.push({ environmentId: id, input });
+                if (writeMode === "denied" || writeMode === "mixed") {
+                  yield* write(clientId, {
+                    _tag: "Exit",
+                    requestId: request.id,
+                    exit: {
+                      _tag: "Failure",
+                      cause: [
+                        {
+                          _tag: "Fail",
+                          error: {
+                            _tag: "ProjectTeamAuthorizationError",
+                            reason: "Human memory write denied",
+                          },
+                        },
+                        ...(writeMode === "mixed"
+                          ? [{ _tag: "Die" as const, defect: "Additional transport uncertainty" }]
+                          : []),
+                      ],
+                    },
+                  });
+                  writeCompleted.resolve();
+                  return;
+                }
+                let result = accepted.get(input.commandId);
+                if (result === undefined) {
+                  const current = records
+                    .filter(isSource)
+                    .find((record) => record.recordId === input.sourceRecordId);
+                  if (current === undefined)
+                    return yield* Effect.die("Selected source unavailable");
+                  expect(input).toMatchObject({
+                    projectId,
+                    expectedRevision: revision,
+                    expectedSourceRecordRevision: current.revision,
+                    sourceRevision: current.sourceRevision,
+                    sourceGeneration: current.generation,
+                    contentHash: current.contentHash,
+                  });
+                  const tombstone = {
+                    ...current,
+                    status: "retracted" as const,
+                    revision: current.revision + 1,
+                    generation: current.generation + 1,
+                    tombstonedAt: at,
+                    sharedWithProjectIds: [],
+                  };
+                  records = records.map((record) => (record === current ? tombstone : record));
+                  records.push(
+                    decodeEffect({
+                      ...base,
+                      recordId: "delete-1",
+                      effectId: "delete-1",
+                      kind: "effect",
+                      effectKind: "memory-delete",
+                      status: "pending",
+                      targetId: current.recordId,
+                      generation: tombstone.generation,
+                      claimGeneration: 0,
+                      availableAt: at,
+                      payload: {
+                        recordIds: [current.recordId],
+                        expectedRevision: current.sourceRevision,
+                      },
+                    }),
+                  );
+                  revision += 2;
+                  result = {
+                    projectId,
+                    revision,
+                    receipt: {
+                      projectId,
+                      revision,
+                      commandId: input.commandId,
+                      status: "accepted",
+                      eventCount: 2,
+                    },
+                    delta: {
+                      projectId,
+                      revision,
+                      eventIds: [],
+                      changedFields: ["foundationRecords"],
+                    },
+                  };
+                  accepted.set(input.commandId, result);
+                }
+                if (writeMode === "lost") {
+                  yield* write(clientId, {
+                    _tag: "Exit",
+                    requestId: request.id,
+                    exit: {
+                      _tag: "Failure",
+                      cause: [{ _tag: "Die", defect: "Reply lost after commit" }],
+                    },
+                  });
+                  writeCompleted.resolve();
+                  return;
+                }
+                const response =
+                  writeMode === "wrong-project"
+                    ? { ...result, projectId: ProjectId.make("foreign-project") }
+                    : result;
+                yield* write(clientId, {
+                  _tag: "Exit",
+                  requestId: request.id,
+                  exit: {
+                    _tag: "Success",
+                    value: yield* encodeResult(response).pipe(Effect.orDie),
+                  },
+                });
+                writeCompleted.resolve();
+                return;
+              }
               if (request.tag !== WS_METHODS.projectWorkRead)
                 return yield* Effect.die("Unexpected RPC method");
               const input = yield* decodeRead(request.payload).pipe(Effect.orDie);
@@ -305,6 +437,7 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
     connected = true,
     enabled = true,
     supported = true,
+    writesSupported = false,
     project = projectId,
     environment = environmentId,
   } = {}) {
@@ -317,6 +450,7 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
             connected={connected}
             enabled={enabled}
             supported={supported}
+            writesSupported={writesSupported}
           />
         </RegistryContext.Provider>,
       );
@@ -343,6 +477,179 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
   function hideBodies() {
     expect(host.textContent).not.toContain(source.content);
     expect(host.textContent).not.toContain(observation.body);
+  }
+
+  const writableSource = { ...source, contentHash: "1".repeat(64) };
+  function prepareRetraction() {
+    records = [writableSource, extraction, observation, indexJob];
+  }
+  async function submit(label = "Retract memory") {
+    writeCompleted = receipt();
+    await click(label);
+    await act(async () => writeCompleted.promise);
+  }
+
+  interaction(
+    "retracts the inspected exact source and hides its cached observation family during held refresh",
+    async () => {
+      prepareRetraction();
+      await render({ writesSupported: true });
+      await inspect(source.recordId);
+      expect(host.textContent).toContain(source.content);
+      held = { cursor: "", started: receipt(), released: receipt() };
+      await submit();
+      await act(async () => held?.started.promise);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).toMatchObject({
+        environmentId,
+        input: {
+          type: "project-team.memory.retract",
+          projectId,
+          expectedRevision: 10,
+          sourceRecordId: source.recordId,
+          expectedSourceRecordRevision: source.revision,
+          sourceRevision: source.sourceRevision,
+          sourceGeneration: source.generation,
+          contentHash: writableSource.contentHash,
+        },
+      });
+      hideBodies();
+      expect(host.textContent).toContain("Memory retracted locally. Backend cleanup pending");
+      await inspect(observation.recordId);
+      hideBodies();
+      await act(async () => {
+        held?.released.resolve();
+        await settle();
+      });
+      expect(host.textContent).toContain("Backend cleanup requires an approved task");
+      expect(host.textContent).toContain("Recorded retracted");
+      await inspect("delete-1");
+      expect(host.textContent).toContain("Recorded pending");
+      expect(host.textContent).toContain("physical cleanup are not verified here");
+    },
+  );
+
+  interaction(
+    "denies a stale inspected source without silently retargeting the refreshed revision",
+    async () => {
+      prepareRetraction();
+      await render({ writesSupported: true });
+      await inspect(source.recordId);
+      records = [
+        { ...writableSource, revision: 2, generation: 3, contentHash: "2".repeat(64) },
+        extraction,
+        observation,
+        indexJob,
+      ];
+      revision = 11;
+      await refresh();
+      await click("Retract memory");
+      expect(writes).toEqual([]);
+      expect(host.textContent).toContain("The inspected source changed");
+      expect(button("Retry exact retraction")).toBeUndefined();
+    },
+  );
+
+  interaction(
+    "treats an encoded authorization denial as rejected rather than an uncertain retraction",
+    async () => {
+      prepareRetraction();
+      await render({ writesSupported: true });
+      await inspect(source.recordId);
+      writeMode = "denied";
+      await submit();
+      expect(writes).toHaveLength(1);
+      expect(revision).toBe(10);
+      expect(host.textContent).toContain("Memory retraction was rejected");
+      expect(host.textContent).toContain(source.content);
+      expect(button("Retry exact retraction")).toBeUndefined();
+      expect(button("Retract memory")?.disabled).toBe(false);
+    },
+  );
+
+  interaction(
+    "retains the original retraction for a mixed authorization and transport cause",
+    async () => {
+      prepareRetraction();
+      await render({ writesSupported: true });
+      await inspect(source.recordId);
+      writeMode = "mixed";
+      await submit();
+      expect(writes).toHaveLength(1);
+      hideBodies();
+      expect(button("Retry exact retraction")).toBeDefined();
+      expect(host.textContent).not.toContain("Memory retraction was rejected");
+      writeMode = "accepted";
+      await submit("Retry exact retraction");
+      await act(async () => settle());
+      expect(writes[1]).toEqual(writes[0]);
+      expect(revision).toBe(12);
+    },
+  );
+
+  for (const mode of ["lost", "wrong-project"] as const) {
+    interaction(
+      `retries the original retraction after ${mode} receipt without renewing its selection`,
+      async () => {
+        prepareRetraction();
+        await render({ writesSupported: true });
+        await inspect(source.recordId);
+        writeMode = mode;
+        await submit();
+        const original = writes[0];
+        expect(original).toBeDefined();
+        hideBodies();
+        expect(button("Retry exact retraction")).toBeDefined();
+        await refresh();
+        writeMode = "accepted";
+        await submit("Retry exact retraction");
+        await act(async () => settle());
+        expect(writes).toEqual([original, original]);
+        expect(revision).toBe(12);
+        expect(accepted.size).toBe(1);
+        expect(button("Retry exact retraction")).toBeUndefined();
+        expect(host.textContent).toContain("Backend cleanup requires an approved task");
+        hideBodies();
+      },
+    );
+  }
+
+  for (const state of ["disconnected", "disabled", "unsupported"] as const) {
+    interaction(`does not submit human retraction while ${state}`, async () => {
+      prepareRetraction();
+      await render({ writesSupported: true });
+      await inspect(source.recordId);
+      await render({
+        connected: state !== "disconnected",
+        enabled: state !== "disabled",
+        writesSupported: state !== "unsupported",
+      });
+      expect(button("Retract memory")?.disabled).toBe(true);
+      await click("Retract memory");
+      expect(writes).toEqual([]);
+      expect(revision).toBe(10);
+    });
+  }
+
+  for (const target of ["project", "environment"] as const) {
+    interaction(`discards uncertain retraction when the ${target} changes`, async () => {
+      prepareRetraction();
+      await render({ writesSupported: true });
+      await inspect(source.recordId);
+      writeMode = "lost";
+      await submit();
+      expect(button("Retry exact retraction")).toBeDefined();
+      records = [];
+      await render({
+        writesSupported: true,
+        ...(target === "project"
+          ? { project: ProjectId.make("project-2") }
+          : { environment: otherEnvironmentId }),
+      });
+      expect(button("Retry exact retraction")).toBeUndefined();
+      expect(writes).toHaveLength(1);
+      expect(host.textContent).not.toContain(`Inspecting ${source.recordId}`);
+    });
   }
 
   interaction(

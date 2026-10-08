@@ -20,7 +20,11 @@ import {
   ProjectMemoryExtraction,
   ProjectMemoryObservation,
   ProjectMemorySource,
+  ProjectTeamEffect,
   ProjectWorkReadIntent,
+  ProjectWorkWriteIntent,
+  ProjectWorkWriteResult,
+  type ProjectTeamMemoryRetractIntent,
   ProjectTeamEvidenceApplicability,
   ProjectWorkTaskId,
   WS_METHODS,
@@ -74,6 +78,10 @@ const otherEnvironmentId = EnvironmentId.make("environment-2");
 const projectId = ProjectId.make("project-1");
 const at = "2026-10-04T10:00:00.000Z";
 const decodeRead = Schema.decodeUnknownEffect(ProjectWorkReadIntent);
+const decodeWrite = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
+const encodeResult = Schema.encodeEffect(ProjectWorkWriteResult);
+const decodeEffect = Schema.decodeUnknownSync(ProjectTeamEffect);
+const isSource = Schema.is(ProjectMemorySource);
 function receipt() {
   let resolve = () => {};
   const promise = new Promise<void>((accept) => {
@@ -170,6 +178,7 @@ type FixtureConfig = {
     capabilities: {
       projectTeamFoundationReads?: boolean;
       projectTeamGuidedWrites: boolean;
+      projectTeamMemoryRetractions?: boolean;
       projectWorkStream: boolean;
     };
   };
@@ -198,6 +207,8 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
   let otherRequests: string[];
   let config: Atom.Writable<FixtureConfig>;
   let committedText: string[];
+  let writes: Array<{ environmentId: EnvironmentId; input: ProjectTeamMemoryRetractIntent }>;
+  let writeCompleted: ReturnType<typeof receipt>;
 
   const setup = Effect.gen(function* () {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -209,6 +220,8 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
     fail = false;
     otherRequests = [];
     committedText = [];
+    writes = [];
+    writeCompleted = receipt();
     bridge.phase = "connected";
     config = Atom.make<FixtureConfig>({
       settings: { projectWorkEnabled: true },
@@ -232,6 +245,79 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
           send: (clientId, request) =>
             Effect.gen(function* () {
               if (request._tag !== "Request") return;
+              if (request.tag === WS_METHODS.projectWorkWrite) {
+                const input = yield* decodeWrite(request.payload).pipe(Effect.orDie);
+                if (input.type !== "project-team.memory.retract")
+                  return yield* Effect.die("Unexpected Work memory action");
+                const current = records
+                  .filter(isSource)
+                  .find((record) => record.recordId === input.sourceRecordId);
+                if (current === undefined) return yield* Effect.die("Selected source unavailable");
+                expect(input).toMatchObject({
+                  projectId,
+                  expectedRevision: revision,
+                  expectedSourceRecordRevision: current.revision,
+                  sourceRevision: current.sourceRevision,
+                  sourceGeneration: current.generation,
+                  contentHash: current.contentHash,
+                });
+                writes.push({ environmentId: id, input });
+                const tombstone = {
+                  ...current,
+                  status: "retracted" as const,
+                  revision: current.revision + 1,
+                  generation: current.generation + 1,
+                  tombstonedAt: at,
+                  sharedWithProjectIds: [],
+                };
+                records = records.map((record) => (record === current ? tombstone : record));
+                records.push(
+                  decodeEffect({
+                    ...base,
+                    kind: "effect",
+                    recordId: "delete-1",
+                    effectId: "delete-1",
+                    effectKind: "memory-delete",
+                    status: "pending",
+                    targetId: current.recordId,
+                    generation: tombstone.generation,
+                    claimGeneration: 0,
+                    availableAt: at,
+                    payload: {
+                      recordIds: [current.recordId],
+                      expectedRevision: current.sourceRevision,
+                    },
+                  }),
+                );
+                revision += 2;
+                const response: ProjectWorkWriteResult = {
+                  projectId,
+                  revision,
+                  receipt: {
+                    projectId,
+                    revision,
+                    commandId: input.commandId,
+                    status: "accepted",
+                    eventCount: 2,
+                  },
+                  delta: {
+                    projectId,
+                    revision,
+                    eventIds: [],
+                    changedFields: ["foundationRecords"],
+                  },
+                };
+                yield* write(clientId, {
+                  _tag: "Exit",
+                  requestId: request.id,
+                  exit: {
+                    _tag: "Success",
+                    value: yield* encodeResult(response).pipe(Effect.orDie),
+                  },
+                });
+                writeCompleted.resolve();
+                return;
+              }
               if (request.tag !== WS_METHODS.projectWorkRead) {
                 otherRequests.push(request.tag);
                 return yield* Effect.die("Unexpected RPC method");
@@ -453,14 +539,22 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
   async function configure({
     enabled = true,
     supported = true,
-  }: { enabled?: boolean; supported?: boolean } = {}) {
+    writesSupported = false,
+    guidedWrites = false,
+  }: {
+    enabled?: boolean;
+    supported?: boolean;
+    writesSupported?: boolean;
+    guidedWrites?: boolean;
+  } = {}) {
     await act(async () =>
       registry.set(config, {
         settings: { projectWorkEnabled: enabled },
         environment: {
           capabilities: {
             ...(supported ? { projectTeamFoundationReads: true } : {}),
-            projectTeamGuidedWrites: false,
+            projectTeamGuidedWrites: guidedWrites,
+            ...(writesSupported ? { projectTeamMemoryRetractions: true } : {}),
             projectWorkStream: false,
           },
         },
@@ -508,6 +602,71 @@ describe("WorkPage mounts real Memory and Evidence over encoded generated RPC", 
     expect(host.textContent).not.toContain(source.content);
     expect(host.textContent).not.toContain(observation.body);
   }
+
+  interaction(
+    "withholds human retraction on an older host that only advertises guided writes",
+    async () => {
+      records = [{ ...source, contentHash: "1".repeat(64) }, extraction, observation, evidence];
+      await render();
+      await configure({ guidedWrites: true });
+      await navigate("Memory");
+      await inspect(source.recordId);
+      expect(host.textContent).toContain(source.content);
+      expect(button("Retract memory")?.disabled).toBe(true);
+      await click("Retract memory");
+      expect(writes).toEqual([]);
+      expect(revision).toBe(10);
+      expect(host.textContent).toContain("does not support human memory writes");
+    },
+  );
+
+  interaction(
+    "uses WorkPage write capability for exact human retraction and hides cached memory until its receipt refresh",
+    async () => {
+      const selected = { ...source, contentHash: "1".repeat(64) };
+      records = [selected, extraction, observation, evidence];
+      await render();
+      await configure({ writesSupported: true });
+      await navigate("Memory");
+      await inspect(source.recordId);
+      expect(button("Retract memory")?.disabled).toBe(false);
+      expect(host.textContent).toContain(source.content);
+      held = { cursor: "", started: receipt(), released: receipt() };
+      await click("Retract memory");
+      await act(async () => writeCompleted.promise);
+      await act(async () => held?.started.promise);
+      expect(writes).toHaveLength(1);
+      expect(writes[0]).toMatchObject({
+        environmentId,
+        input: {
+          type: "project-team.memory.retract",
+          projectId,
+          expectedRevision: 10,
+          sourceRecordId: source.recordId,
+          expectedSourceRecordRevision: source.revision,
+          sourceRevision: source.sourceRevision,
+          sourceGeneration: source.generation,
+          contentHash: selected.contentHash,
+        },
+      });
+      hideBodies();
+      expect(host.textContent).toContain("Memory retracted locally. Backend cleanup pending");
+      await inspect(observation.recordId);
+      hideBodies();
+      await act(async () => {
+        held?.released.resolve();
+        await settle();
+      });
+      expect(host.textContent).toContain("Backend cleanup requires an approved task");
+      await inspect("delete-1");
+      expect(host.textContent).toContain("Recorded pending");
+      expect(records.find(isSource)).toMatchObject({
+        status: "retracted",
+        sharedWithProjectIds: [],
+      });
+      expect(otherRequests).toEqual([]);
+    },
+  );
 
   interaction(
     "lazily opens memory metadata and freshly recorded bodies while retaining Knowledge",
