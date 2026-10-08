@@ -107,6 +107,29 @@ Delivery does not satisfy criteria or complete a parent task. If acceptance is p
 remaining task requirements; the original delivery stays recorded. Downstream work can use an
 accepted delivery while its approvals, scope, and supporting evidence remain current.
 
+## Inspect and retract project memory
+
+On web or desktop, open the project's **Work → Memory** tab. Inspect the retained source,
+its provenance and any corrections before relying on an observation. Observations are derived
+from captured work; they are not accepted decisions. Retained sources and recorded index outcomes
+do not establish that extraction, retrieval or physical cleanup is available or complete.
+
+To stop reusing a memory copy, inspect its current source revision and choose **Retract memory**.
+Refresh and review the selection again if it has changed. Accepted retraction immediately excludes
+that source and its observations from memory context and revokes its memory shares. It preserves
+the underlying issue, decision or evidence. Correcting the original work and retracting its memory
+copy are separate decisions.
+
+Retraction records pending backend cleanup. An agent working on an already approved task must
+explicitly select that cleanup within the task's original remaining budget. Retraction does not
+approve new work or renew limits. If processing is unavailable or cleanup fails, inspect the
+recorded outcome; local retraction remains effective while backend cleanup is pending.
+
+Permanent local deletion waits until retained memory has completed cleanup. If deletion is refused,
+use **Open Memory** in the notice, retract the remaining sources and finish their approved
+task-funded cleanup, then retry deletion. The project and its threads remain available while
+cleanup is blocked. Deletion leaves your GitHub repository and workspace files untouched.
+
 ## When an action is unavailable
 
 Reconnect and refresh before changing cached work. Disconnected views can retain history, but
