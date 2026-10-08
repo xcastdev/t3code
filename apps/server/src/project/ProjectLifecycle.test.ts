@@ -15,6 +15,7 @@ import {
 import {
   ProjectWorkRepository,
   ProjectWorkRepositoryLive,
+  readCurrentState,
 } from "../projectWork/ProjectWorkRepository.ts";
 import {
   ProjectWorkProjection,
@@ -27,6 +28,8 @@ import {
   ProjectTeamRecord,
   ProjectWorkTaskId,
   ProjectWorkAttemptId,
+  ProjectWorkCommentId,
+  EnvironmentId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -38,6 +41,10 @@ import { describe, expect, it } from "vite-plus/test";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runForkMigrations, runMigrations } from "../persistence/Migrations.ts";
 import { bindIssueRepositoryProject } from "../projectWork/ProjectIssueRepositoryState.ts";
+import * as ContentGuard from "../projectWork/ProjectWorkContentGuard.ts";
+import * as TeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
+import { makeProjectMemoryService } from "../projectWork/memory/ProjectMemoryService.ts";
+import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 
 import {
   ProjectLifecycle,
@@ -72,7 +79,139 @@ const lifecycleLayer = ProjectLifecycleLive.pipe(
 
 describe("ProjectLifecycle", () => {
   effectIt.effect(
-    "purges every foundation table, transfers a shared cursor and fences stale writes and rebuilds",
+    "deletes a no-memory project without imposing memory authority history limits",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
+        const lifecycle = yield* ProjectLifecycle;
+        const projectId = ProjectId.make("no-memory-long-history");
+        const at = "2026-01-01T00:00:00.000Z";
+        yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (${projectId},'Ordinary project','/workspace/ordinary','[]',${at},${at})`;
+        // Metadata-only nonmemory history stresses the presence fast path. These
+        // rows confer no task or cleanup authority and are never replayed here.
+        yield* sql`WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<8193)
+        INSERT INTO project_work_events (event_id,project_id,event_type,occurred_at,command_id,payload_json)
+        SELECT 'ordinary-history-'||n,${projectId},'project-work.task.created',${at},'ordinary-history-'||n,${encodeJson({ kind: "unrelated-history" })}
+        FROM history`;
+        expect(
+          yield* sql`SELECT COUNT(*) AS count FROM project_work_events WHERE project_id=${projectId}`,
+        ).toEqual([{ count: 8193 }]);
+        const result = yield* lifecycle.permanentDelete({
+          projectId,
+          commandId: CommandId.make("ordinary-delete"),
+          workspaceRoot: "/workspace/ordinary",
+          confirmation: "permanent-local-delete",
+        });
+        expect(result.project.state).toBe("tombstoned");
+        expect(
+          yield* sql`SELECT event_id FROM project_work_events WHERE project_id=${projectId}`,
+        ).toEqual([]);
+      }).pipe(Effect.provide(lifecycleLayer)),
+  );
+  effectIt.effect(
+    "requires recorded memory cleanup before permanent deletion through the lifecycle route",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
+        const repository = yield* ProjectWorkRepository;
+        const lifecycle = yield* ProjectLifecycle;
+        const contentGuard = yield* ContentGuard.ProjectWorkContentGuard;
+        const authorization = yield* TeamAuthorization.ProjectTeamAuthorization;
+        const projectId = ProjectId.make("memory-delete-lifecycle");
+        const taskId = ProjectWorkTaskId.make("memory-delete-task");
+        const at = "2026-01-01T00:00:00.000Z";
+        yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (${projectId},'Retained memory','/workspace/memory','[]',${at},${at})`;
+        yield* repository.execute({
+          type: "project-work.task.create",
+          commandId: CommandId.make("memory-delete-task-create"),
+          projectId,
+          taskId,
+          title: "Retained cleanup task",
+          createdAt: at,
+        });
+        yield* repository.execute({
+          type: "project-work.comment.add",
+          commandId: CommandId.make("memory-delete-comment"),
+          projectId,
+          comment: {
+            commentId: ProjectWorkCommentId.make("memory-delete-comment"),
+            projectId,
+            taskId,
+            body: "Retain this finding until its recorded cleanup completes.",
+            revision: 0,
+            createdAt: at,
+          },
+          addedAt: at,
+          attribution: {
+            actor: { kind: "human", id: "memory-human" },
+            source: { kind: "web", id: "memory-panel" },
+            recordedAt: at,
+          },
+        });
+        const memory = makeProjectMemoryService({
+          sql,
+          repository,
+          contentGuard,
+          authorization,
+          environmentId: "deletion-environment",
+        });
+        const source = yield* memory.captureRetained(projectId, {
+          kind: "comment",
+          retainedId: "memory-delete-comment",
+        });
+        expect(source.status).toBe("current");
+        expect(
+          yield* sql`SELECT status,owner_json AS owner,receipt_json AS receipt
+        FROM project_team_memory_job WHERE project_id=${projectId}`,
+        ).toEqual([{ status: "pending", owner: null, receipt: null }]);
+        const before = yield* readCurrentState(sql, projectId);
+        const beforeProject =
+          yield* sql`SELECT * FROM projection_projects WHERE project_id=${projectId}`;
+        const result = yield* lifecycle
+          .permanentDelete({
+            projectId,
+            commandId: CommandId.make("delete-before-memory-cleanup"),
+            workspaceRoot: "/workspace/memory",
+            confirmation: "permanent-local-delete",
+          })
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure).toMatchObject({
+            _tag: "ProjectLifecycleError",
+            reason: "memory-cleanup-required",
+            projectId,
+          });
+        expect(yield* sql`SELECT * FROM projection_projects WHERE project_id=${projectId}`).toEqual(
+          beforeProject,
+        );
+        expect(yield* readCurrentState(sql, projectId)).toEqual(before);
+        expect(
+          yield* sql`SELECT * FROM project_lifecycle_operations WHERE project_id=${projectId}`,
+        ).toEqual([]);
+      }).pipe(
+        Effect.provide(
+          ProjectLifecycleLive.pipe(
+            Layer.provideMerge(ProjectWorkRepositoryLive),
+            Layer.provideMerge(TeamAuthorization.layer),
+            Layer.provideMerge(ContentGuard.layer),
+            Layer.provideMerge(
+              Layer.succeed(ServerEnvironmentIdentity, {
+                getEnvironmentId: Effect.succeed(EnvironmentId.make("deletion-environment")),
+              }),
+            ),
+            Layer.provideMerge(NodeSqliteClient.layerMemory()),
+            Layer.provideMerge(FileSystem.layerNoop({})),
+          ),
+        ),
+      ),
+  );
+  effectIt.effect(
+    "purges ordinary foundation data, transfers a shared cursor and fences stale writes and rebuilds",
     () =>
       Effect.gen(function* () {
         yield* runMigrations();
@@ -124,8 +263,15 @@ describe("ProjectLifecycle", () => {
           records: [mission],
         });
         yield* repo.execute(command);
+        // Retained memory requires genuine recorded cleanup; this fixture
+        // exercises ordinary purge/cursor semantics without fabricating it.
         for (const table of PROJECT_TEAM_TABLES.filter(
-          (name) => name !== "project_team_mission" && name !== "project_team_intake_cursor",
+          (name) =>
+            name !== "project_team_mission" &&
+            name !== "project_team_intake_cursor" &&
+            name !== "project_team_memory_source" &&
+            name !== "project_team_memory_extraction" &&
+            name !== "project_team_memory_observation",
         )) {
           yield* sql`INSERT INTO ${sql(table)} (record_id, project_id, status, revision, generation, updated_at, payload_json) VALUES (${table + "-deleted"}, ${projectId}, 'held', 0, 0, ${at}, '{}')`;
         }

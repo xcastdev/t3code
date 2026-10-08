@@ -43,6 +43,7 @@ import { retireProjectIssueRepositories } from "../projectWork/ProjectIssueRepos
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
 import { toPersistenceSqlError, type ProjectionRepositoryError } from "../persistence/Errors.ts";
+import { assertProjectMemoryDeletionReadyInTransaction } from "../projectWork/memory/ProjectMemoryProjectDeletion.ts";
 
 export class ProjectLifecycleError extends Schema.TaggedError<ProjectLifecycleError>()(
   "ProjectLifecycleError",
@@ -56,6 +57,7 @@ export class ProjectLifecycleError extends Schema.TaggedError<ProjectLifecycleEr
       "relocation-rejected",
       "confirmation-required",
       "operation-conflict",
+      "memory-cleanup-required",
     ]),
     projectId: ProjectId,
     detail: Schema.optional(Schema.String),
@@ -514,6 +516,20 @@ const makeProjectLifecycle = Effect.gen(function* () {
               projectId: input.projectId,
             });
           }
+          yield* assertProjectMemoryDeletionReadyInTransaction(
+            sql,
+            String(input.projectId),
+            Option.isSome(identity) ? String(environmentId) : undefined,
+          ).pipe(
+            Effect.mapError(
+              (error) =>
+                new ProjectLifecycleError({
+                  reason: "memory-cleanup-required",
+                  projectId: input.projectId,
+                  detail: error.reason,
+                }),
+            ),
+          );
           const changedAt = now();
           const tombstone = yield* decodeLifecycleTombstone({
             environmentId,

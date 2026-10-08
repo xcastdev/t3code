@@ -26,7 +26,10 @@ import {
 } from "../ProjectTeamsPersistence.ts";
 import type { MemoryBackend } from "./MemoryBackend.ts";
 import { makeProjectMemoryIndexReactor } from "./ProjectMemoryIndexReactor.ts";
-import { makeProjectMemoryOutcome } from "./ProjectMemoryOutcome.ts";
+import {
+  makeProjectMemoryOutcome,
+  readProjectMemoryCompletedDeletionInTransaction,
+} from "./ProjectMemoryOutcome.ts";
 import {
   makeProjectMemoryService,
   ProjectMemoryServiceError,
@@ -617,6 +620,46 @@ const prepareCleanup = Effect.fn("outcome.test.cleanup")(function* (
   )!;
   return effect.recordId;
 });
+
+it.effect(
+  "reads completed deletion proof without writes and rejects a missing original receipt",
+  () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        const id = yield* prepareCleanup(f);
+        expect((yield* f.reactor.consume(f.projectId, id)).status).toBe("reflected");
+        const before = yield* f.snapshot;
+        const calls = f.counts();
+        const proof = yield* f.sql.withTransaction(
+          readProjectMemoryCompletedDeletionInTransaction(f.sql, environmentId, id),
+        );
+        expect(proof.receipt).toMatchObject({
+          kind: "delete-source-complete",
+          sourceId: f.source.recordId,
+        });
+        expect(yield* f.snapshot).toEqual(before);
+        expect(f.counts()).toEqual(calls);
+        expect(
+          (yield* readProjectMemoryCompletedDeletionInTransaction(f.sql, environmentId, id).pipe(
+            Effect.result,
+          ))._tag,
+        ).toBe("Failure");
+        yield* f.sql`DELETE FROM project_work_command_receipts WHERE command_id=(
+      SELECT json_extract(reflection_json,'$.commandId') FROM project_team_memory_outcome WHERE effect_id=${id})`;
+        const missing = yield* f.snapshot;
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              readProjectMemoryCompletedDeletionInTransaction(f.sql, environmentId, id),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* f.snapshot).toEqual(missing);
+        expect(f.counts()).toEqual(calls);
+      }),
+    ),
+);
 
 it.effect(
   "review regression: original successful domain cleanup stays recoverable after purge",

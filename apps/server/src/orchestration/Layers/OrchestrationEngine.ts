@@ -23,6 +23,11 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.ts";
+import {
+  assertProjectMemoryDeletionReadyInTransaction,
+  readProjectMemoryProjectionSyncInTransaction,
+} from "../../projectWork/memory/ProjectMemoryProjectDeletion.ts";
 
 import {
   metricAttributes,
@@ -99,6 +104,7 @@ function commandToAggregateRef(command: OrchestrationCommand): {
 
 const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const environmentIdentity = yield* Effect.serviceOption(ServerEnvironmentIdentity);
   const eventStore = yield* OrchestrationEventStore;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
@@ -289,6 +295,34 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
+              if (envelope.command.type === "project.delete") {
+                const projectId = String(envelope.command.projectId);
+                const environmentId = Option.isSome(environmentIdentity)
+                  ? String(yield* environmentIdentity.value.getEnvironmentId)
+                  : undefined;
+                yield* Effect.gen(function* () {
+                  const synchronized = yield* readProjectMemoryProjectionSyncInTransaction(
+                    sql,
+                    projectId,
+                    environmentId,
+                  );
+                  if (!synchronized)
+                    yield* assertProjectMemoryDeletionReadyInTransaction(
+                      sql,
+                      projectId,
+                      environmentId,
+                    );
+                }).pipe(
+                  Effect.mapError(
+                    (error) =>
+                      new OrchestrationCommandInvariantError({
+                        commandType: envelope.command.type,
+                        detail: "memory-cleanup-required",
+                        cause: error,
+                      }),
+                  ),
+                );
+              }
               const committedEvents: OrchestrationEvent[] = [];
               const attachmentCleanups: Effect.Effect<void>[] = [];
               let nextCommandReadModel = commandReadModel;

@@ -1,4 +1,5 @@
 import * as Layer from "effect/Layer";
+import { identityLayer } from "../environment/ServerEnvironment.ts";
 
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
@@ -32,5 +33,8 @@ const OrchestrationInfrastructureLayerLive = Layer.mergeAll(
 
 export const OrchestrationLayerLive = Layer.mergeAll(
   OrchestrationInfrastructureLayerLive,
-  OrchestrationEngineLive.pipe(Layer.provide(OrchestrationInfrastructureLayerLive)),
+  OrchestrationEngineLive.pipe(
+    Layer.provide(OrchestrationInfrastructureLayerLive),
+    Layer.provide(identityLayer),
+  ),
 );

@@ -89,12 +89,11 @@ const systemAttribution = (at: string) => ({
 /** The immutable physical job supplies the project/environment. A caller supplies
  * only the verified original outcome, never replacement authority or observations.
  */
-export const makeProjectMemoryOutcome = (dependencies: {
+const makeProjectMemoryOutcomeAudit = (dependencies: {
   readonly sql: SqlClient.SqlClient;
-  readonly repository: ProjectWorkRepositoryShape;
   readonly environmentId: string;
-}): ProjectMemoryOutcomePort => {
-  const { sql, repository, environmentId } = dependencies;
+}) => {
+  const { sql, environmentId } = dependencies;
   const manifests = makeProjectMemoryManifestStore(sql);
   const loadJob = Effect.fn("ProjectMemoryOutcome.loadJob")(function* (
     outcome: ProjectMemoryVerifiedOutcome,
@@ -650,6 +649,58 @@ export const makeProjectMemoryOutcome = (dependencies: {
     )
       return yield* deny("Memory original command result does not cover the exact reflection");
   });
+  return { loadJob, loadReflection, verifyReflection, current, available, suppressed };
+};
+
+/** Read-only pre-purge proof: a raw settled status cannot replace its domain receipt. */
+export const readProjectMemoryCompletedDeletionInTransaction = Effect.fn(
+  "readProjectMemoryCompletedDeletionInTransaction",
+)(function* (
+  sql: SqlClient.SqlClient,
+  environmentId: string,
+  effectId: string,
+  phase: "before-purge" | "projection-sync" = "before-purge",
+) {
+  if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+    return yield* deny("Memory cleanup audit requires the owning transaction");
+  const metadata = yield* sql<{ bytes: number }>`SELECT length(CAST(receipt_json AS BLOB)) AS bytes
+    FROM project_team_memory_job WHERE effect_id=${effectId} LIMIT 2`;
+  const savedMetadata = metadata[0];
+  if (
+    metadata.length !== 1 ||
+    savedMetadata === undefined ||
+    !Number.isSafeInteger(savedMetadata.bytes) ||
+    savedMetadata.bytes > 262144
+  )
+    return yield* deny("Memory cleanup receipt is missing or exceeds its bound");
+  const rows = yield* sql<{ receipt: string }>`SELECT receipt_json AS receipt
+    FROM project_team_memory_job WHERE effect_id=${effectId} AND length(CAST(receipt_json AS BLOB))<=262144`;
+  const savedReceipt = rows[0];
+  if (rows.length !== 1 || savedReceipt === undefined)
+    return yield* deny("Memory cleanup receipt changed");
+  const receipt = yield* decode(Schema.fromJsonString(Receipt), savedReceipt.receipt);
+  if (receipt.kind !== "delete-source-complete")
+    return yield* deny("Memory source cleanup is not complete");
+  const audit = makeProjectMemoryOutcomeAudit({ sql, environmentId });
+  const job = yield* audit.loadJob(receipt);
+  const reflection = yield* audit.loadReflection(job);
+  if (reflection?.mode !== "domain")
+    return yield* deny("Memory cleanup lacks pre-purge domain authority");
+  // Projection synchronization first proves the recorded lifecycle purge and
+  // absence of domain authority. Its deleted events cannot be re-authenticated;
+  // only the retained immutable journal tuple is evidence on that path.
+  if (phase === "before-purge") yield* audit.verifyReflection(job, reflection);
+  return job;
+});
+
+export const makeProjectMemoryOutcome = (dependencies: {
+  readonly sql: SqlClient.SqlClient;
+  readonly repository: ProjectWorkRepositoryShape;
+  readonly environmentId: string;
+}): ProjectMemoryOutcomePort => {
+  const { sql, repository, environmentId } = dependencies;
+  const { loadJob, loadReflection, verifyReflection, current, available, suppressed } =
+    makeProjectMemoryOutcomeAudit({ sql, environmentId });
   const commitVerifiedOutcome = Effect.fn("ProjectMemoryOutcome.commitVerifiedOutcome")(
     function* (
       raw: ProjectMemoryVerifiedOutcome,

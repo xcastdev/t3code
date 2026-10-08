@@ -12,10 +12,12 @@ import {
   type EnvironmentId,
   type ProjectIconOverride,
   CommandId,
+  ProjectId,
 } from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import { DownloadIcon, FolderSyncIcon, ListTodoIcon, Trash2Icon } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -66,6 +68,14 @@ const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
     default: module.ProjectIconPickerDialog,
   })),
+);
+
+const isMemoryCleanupRequired = Schema.is(
+  Schema.Struct({
+    _tag: Schema.Literal("ProjectLifecycleError"),
+    reason: Schema.Literal("memory-cleanup-required"),
+    projectId: ProjectId,
+  }),
 );
 
 function memberKey(member: { environmentId: string; id: string }): string {
@@ -628,7 +638,33 @@ function ProjectDetail({
           () => undefined,
         );
         if (lifecycleResult._tag === "Failure") {
-          reportFailure(`Failed to clear local work for "${member.title}"`, lifecycleResult);
+          const cleanupRequired =
+            lifecycleResult.cause.reasons.length > 0 &&
+            lifecycleResult.cause.reasons.every(
+              (reason) =>
+                reason._tag === "Fail" &&
+                isMemoryCleanupRequired(reason.error) &&
+                reason.error.projectId === member.id,
+            );
+          if (cleanupRequired) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "warning",
+                title: `Memory cleanup is required for "${member.title}"`,
+                description:
+                  "Retract retained memory and finish its cleanup with an approved task's remaining budget, then retry deletion. This project and its threads are still available.",
+                actionProps: {
+                  children: "Open Memory",
+                  onClick: () =>
+                    void navigate({
+                      to: "/work/$environmentId/$projectId",
+                      params: { environmentId: member.environmentId, projectId: member.id },
+                      search: { tab: "memory" },
+                    }),
+                },
+              }),
+            );
+          } else reportFailure(`Failed to clear local work for "${member.title}"`, lifecycleResult);
           return;
         }
         // Keep the legacy project tombstone in sync after the lifecycle

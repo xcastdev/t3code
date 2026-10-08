@@ -17,6 +17,9 @@ import {
   type OrchestrationEvent,
   ProviderInstanceId,
   SkillCatalogRevision,
+  EnvironmentId,
+  ProjectWorkTaskId,
+  ProjectWorkCommentId,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
@@ -55,6 +58,18 @@ import {
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+  readCurrentState,
+} from "../../projectWork/ProjectWorkRepository.ts";
+import * as TeamAuthorization from "../../projectWork/ProjectTeamAuthorization.ts";
+import * as ContentGuard from "../../projectWork/ProjectWorkContentGuard.ts";
+import { makeProjectMemoryService } from "../../projectWork/memory/ProjectMemoryService.ts";
+import { runMigrations } from "../../persistence/Migrations.ts";
+import { ProjectLifecycle, ProjectLifecycleLive } from "../../project/ProjectLifecycle.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -118,6 +133,219 @@ async function createOrchestrationSystem(
 function now() {
   return "2026-01-01T00:00:00.000Z";
 }
+
+effectIt.effect(
+  "synchronizes only the exact recorded lifecycle deletion with no residual authority",
+  () => {
+    let host = "deletion-environment";
+    return Effect.gen(function* () {
+      yield* runMigrations();
+      const engine = yield* OrchestrationEngineService;
+      const lifecycle = yield* ProjectLifecycle;
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("memory-deletion-sync");
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("memory-deletion-sync-create"),
+        projectId,
+        title: "Cleanup complete",
+        workspaceRoot: "/workspace/cleanup",
+        createdAt: now(),
+      });
+      const deletion = yield* lifecycle.permanentDelete({
+        projectId,
+        commandId: CommandId.make("memory-deletion-sync-purge"),
+        workspaceRoot: "/workspace/cleanup",
+        confirmation: "permanent-local-delete",
+      });
+      expect(deletion.project.state).toBe("tombstoned");
+      expect(
+        yield* sql`SELECT deleted_at FROM projection_projects WHERE project_id=${projectId}`,
+      ).toEqual([{ deleted_at: null }]);
+      const receipts = yield* sql<{ fingerprint: string; result: string }>`SELECT
+      request_fingerprint AS fingerprint,result_json AS result FROM project_lifecycle_operations
+      WHERE project_id=${projectId} AND command_id='memory-deletion-sync-purge'`;
+      const original = receipts[0];
+      if (original === undefined) return yield* Effect.die("Original lifecycle result missing");
+      const rejected = Effect.fn("ProjectDeletion.syncRejected")(function* (suffix: string) {
+        const result = yield* engine
+          .dispatch({
+            type: "project.delete",
+            commandId: CommandId.make("memory-deletion-sync-" + suffix),
+            projectId,
+            force: true,
+          })
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure).toMatchObject({
+            _tag: "OrchestrationCommandInvariantError",
+            detail: "memory-cleanup-required",
+          });
+        expect(
+          yield* sql`SELECT deleted_at FROM projection_projects WHERE project_id=${projectId}`,
+        ).toEqual([{ deleted_at: null }]);
+      });
+      yield* sql`UPDATE project_lifecycle_operations SET request_fingerprint='forged'
+      WHERE project_id=${projectId} AND command_id='memory-deletion-sync-purge'`;
+      yield* rejected("forged");
+      yield* sql`UPDATE project_lifecycle_operations SET request_fingerprint=${original.fingerprint},result_json='{}'
+      WHERE project_id=${projectId} AND command_id='memory-deletion-sync-purge'`;
+      yield* rejected("corrupt");
+      yield* sql`UPDATE project_lifecycle_operations SET result_json=${original.result}
+      WHERE project_id=${projectId} AND command_id='memory-deletion-sync-purge'`;
+      host = "foreign-environment";
+      yield* rejected("foreign-host");
+      host = "deletion-environment";
+      // Controlled residual projection corruption is presence proof, not a fabricated grant.
+      yield* sql`INSERT INTO project_team_member
+      (record_id,project_id,status,revision,generation,updated_at,payload_json)
+      VALUES ('residual-member',${projectId},'active',0,0,${now()},'{}')`;
+      yield* rejected("residual-authority");
+      yield* sql`DELETE FROM project_team_member WHERE record_id='residual-member'`;
+      yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("memory-deletion-sync-final"),
+        projectId,
+        force: true,
+      });
+      expect(
+        (yield* sql<{
+          at: string | null;
+        }>`SELECT deleted_at AS at FROM projection_projects WHERE project_id=${projectId}`)[0]?.at,
+      ).not.toBeNull();
+      expect(
+        yield* sql`SELECT request_fingerprint AS fingerprint,result_json AS result FROM project_lifecycle_operations
+      WHERE project_id=${projectId} AND command_id='memory-deletion-sync-purge'`,
+      ).toEqual(receipts);
+      expect(
+        yield* sql`SELECT event_id FROM project_work_events WHERE project_id=${projectId}`,
+      ).toEqual([]);
+    }).pipe(
+      Effect.provide(
+        ProjectLifecycleLive.pipe(
+          Layer.provideMerge(makeOrchestrationLayer()),
+          Layer.provideMerge(SqlitePersistenceMemory),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(
+            Layer.succeed(ServerEnvironmentIdentity, {
+              getEnvironmentId: Effect.sync(() => EnvironmentId.make(host)),
+            }),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
+effectIt.effect(
+  "requires recorded memory cleanup before permanent deletion through the legacy route",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const engine = yield* OrchestrationEngineService;
+      const sql = yield* SqlClient.SqlClient;
+      const repository = yield* ProjectWorkRepository;
+      const contentGuard = yield* ContentGuard.ProjectWorkContentGuard;
+      const authorization = yield* TeamAuthorization.ProjectTeamAuthorization;
+      const projectId = ProjectId.make("memory-delete-legacy");
+      const taskId = ProjectWorkTaskId.make("memory-delete-task");
+      const at = now();
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("memory-delete-project-create"),
+        projectId,
+        title: "Retained memory",
+        workspaceRoot: "/workspace/memory",
+        defaultModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        createdAt: at,
+      });
+      yield* repository.execute({
+        type: "project-work.task.create",
+        commandId: CommandId.make("memory-delete-task-create"),
+        projectId,
+        taskId,
+        title: "Retained cleanup task",
+        createdAt: at,
+      });
+      yield* repository.execute({
+        type: "project-work.comment.add",
+        commandId: CommandId.make("memory-delete-comment"),
+        projectId,
+        comment: {
+          commentId: ProjectWorkCommentId.make("memory-delete-comment"),
+          projectId,
+          taskId,
+          body: "Retain this finding until its recorded cleanup completes.",
+          revision: 0,
+          createdAt: at,
+        },
+        addedAt: at,
+        attribution: {
+          actor: { kind: "human", id: "memory-human" },
+          source: { kind: "web", id: "memory-panel" },
+          recordedAt: at,
+        },
+      });
+      const memory = makeProjectMemoryService({
+        sql,
+        repository,
+        contentGuard,
+        authorization,
+        environmentId: "deletion-environment",
+      });
+      const source = yield* memory.captureRetained(projectId, {
+        kind: "comment",
+        retainedId: "memory-delete-comment",
+      });
+      expect(source.status).toBe("current");
+      expect(
+        yield* sql`SELECT status,owner_json AS owner,receipt_json AS receipt
+      FROM project_team_memory_job WHERE project_id=${projectId}`,
+      ).toEqual([{ status: "pending", owner: null, receipt: null }]);
+      const before = yield* readCurrentState(sql, projectId);
+      const beforeProject =
+        yield* sql`SELECT * FROM projection_projects WHERE project_id=${projectId}`;
+      const result = yield* engine
+        .dispatch({
+          type: "project.delete",
+          commandId: CommandId.make("delete-before-memory-cleanup"),
+          projectId,
+          force: true,
+        })
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure")
+        expect(result.failure).toMatchObject({
+          _tag: "OrchestrationCommandInvariantError",
+          commandType: "project.delete",
+          detail: "memory-cleanup-required",
+        });
+      expect(yield* sql`SELECT * FROM projection_projects WHERE project_id=${projectId}`).toEqual(
+        beforeProject,
+      );
+      expect(yield* readCurrentState(sql, projectId)).toEqual(before);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          makeOrchestrationLayer(),
+          ProjectWorkRepositoryLive,
+          TeamAuthorization.layer,
+          ContentGuard.layer,
+        ).pipe(
+          Layer.provideMerge(SqlitePersistenceMemory),
+          Layer.provideMerge(
+            Layer.succeed(ServerEnvironmentIdentity, {
+              getEnvironmentId: Effect.succeed(EnvironmentId.make("deletion-environment")),
+            }),
+          ),
+        ),
+      ),
+    ),
+);
 
 it("recovers skill desired and applied revisions from SQL after restart", async () => {
   const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-skill-recovery-"));

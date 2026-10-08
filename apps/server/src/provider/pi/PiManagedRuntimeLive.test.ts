@@ -79,6 +79,8 @@ import {
   ProjectWorkVerificationRequestError,
 } from "../../projectWork/ProjectWorkVerificationRequest.ts";
 import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.ts";
+import { ProjectLifecycle, ProjectLifecycleLive } from "../../project/ProjectLifecycle.ts";
+import { readProjectMemoryProjectionSyncInTransaction } from "../../projectWork/memory/ProjectMemoryProjectDeletion.ts";
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamDispatchJournalError,
@@ -6040,6 +6042,27 @@ for (const compactProof of [
           let queryRequest: typeof ProjectTeamMemoryQueryIntent.Type | undefined;
           let queryReceipt: typeof ProjectWorkWriteResult.Type | undefined;
           let queryWorkerId: string | undefined;
+          const deleteRetainedProject = Effect.fn("memoryLive.deleteRetainedProject")(function* () {
+            const paths = yield* f.sql<{
+              path: string;
+            }>`SELECT workspace_root AS path FROM projection_projects
+              WHERE project_id=${projectId} LIMIT 2`;
+            const path = paths[0]?.path;
+            if (paths.length !== 1 || path === undefined)
+              return yield* Effect.die("Original cleanup project path missing");
+            const lifecycle = yield* Effect.service(ProjectLifecycle).pipe(
+              Effect.provide(ProjectLifecycleLive),
+              Effect.provideService(ServerEnvironmentIdentity, {
+                getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+              }),
+            );
+            return yield* lifecycle.permanentDelete({
+              commandId: CommandId.make("live-memory-project-delete"),
+              projectId,
+              workspaceRoot: path,
+              confirmation: "permanent-local-delete",
+            });
+          });
           const journal = yield* makeProjectTeamDispatchJournal({
             environmentId: "environment",
             maximumEnvironmentModelCalls: 4,
@@ -6532,7 +6555,7 @@ for (const compactProof of [
                             contentGuard,
                             environmentId: f.binding.environmentId,
                           });
-                          yield* memory.capture(principal, {
+                          const commentSource = yield* memory.capture(principal, {
                             kind: "comment",
                             retainedId: comment.commentId,
                           });
@@ -6634,6 +6657,18 @@ for (const compactProof of [
                               if (deletion?.kind !== "effect")
                                 return yield* Effect.die("Human retraction cleanup missing");
                               cleanupEffectId = deletion.effectId;
+                              const pendingDeletion = yield* deleteRetainedProject().pipe(
+                                Effect.result,
+                              );
+                              expect(pendingDeletion._tag).toBe("Failure");
+                              if (pendingDeletion._tag === "Failure")
+                                expect(pendingDeletion.failure).toMatchObject({
+                                  _tag: "ProjectLifecycleError",
+                                  reason: "memory-cleanup-required",
+                                });
+                              expect((yield* readCurrentState(f.sql, projectId)).decisions).toEqual(
+                                retracted.decisions,
+                              );
                             } else {
                               const replacement = yield* decodeMemorySourceDecision({
                                 ...decision,
@@ -6755,6 +6790,7 @@ for (const compactProof of [
                           );
                           if (selection === undefined || task === undefined)
                             return yield* Effect.die("Memory selector missing");
+                          let expectedCleanupSelection = selection;
                           const request = yield* decodeMemoryOwnerRequest({
                             type: "project-team.memory.process",
                             commandId: "live-memory-select",
@@ -7113,13 +7149,13 @@ for (const compactProof of [
                                     expect(envelope.input).toEqual({
                                       environmentId: f.binding.environmentId,
                                       projectId,
-                                      sourceRecordId: selection.sourceRecordId,
-                                      sourceRevision: selection.sourceRevision,
-                                      sourceGeneration: selection.sourceGeneration,
+                                      sourceRecordId: expectedCleanupSelection.sourceRecordId,
+                                      sourceRevision: expectedCleanupSelection.sourceRevision,
+                                      sourceGeneration: expectedCleanupSelection.sourceGeneration,
                                     });
                                     expect(
                                       yield* f.sql`SELECT owner_json,status FROM project_team_memory_job
-                                    WHERE effect_id=${selection.effectId}`,
+                                    WHERE effect_id=${expectedCleanupSelection.effectId}`,
                                     ).toMatchObject([
                                       { owner_json: expect.any(String), status: "claimed" },
                                     ]);
@@ -7979,6 +8015,109 @@ for (const compactProof of [
                             expect(memoryExchanges).toBe(0);
                             expect(memoryBackendCalls).toBe(1);
                           }
+                          if (compactProof === "memoryHumanRetraction") {
+                            // Project deletion also requires the independently captured
+                            // current comment. Select it explicitly on the same running owner.
+                            const beforeComment = yield* readCurrentState(f.sql, projectId);
+                            const human = { kind: "human" as const, id: "live-memory-human" };
+                            yield* gateway
+                              .write(
+                                {
+                                  type: "project-team.memory.retract",
+                                  commandId: CommandId.make("live-memory-comment-retract"),
+                                  projectId,
+                                  expectedRevision: beforeComment.revision,
+                                  sourceRecordId: commentSource.recordId,
+                                  expectedSourceRecordRevision: commentSource.revision,
+                                  sourceRevision: commentSource.sourceRevision,
+                                  sourceGeneration: commentSource.generation,
+                                  contentHash: commentSource.contentHash,
+                                },
+                                human,
+                                { kind: "web", id: "live-memory-browser" },
+                                { actor: human },
+                              )
+                              .pipe(
+                                Effect.provideService(
+                                  ProjectWorkVerificationRequest,
+                                  ProjectWorkVerificationRequest.of({
+                                    assertCurrent: (caller, id, permission) =>
+                                      caller.actor.kind === "human" &&
+                                      caller.managed === undefined &&
+                                      id === projectId &&
+                                      permission === "write"
+                                        ? Effect.void
+                                        : Effect.fail(
+                                            new ProjectWorkVerificationRequestError({
+                                              reason: "denied",
+                                            }),
+                                          ),
+                                  }),
+                                ),
+                              );
+                            const remaining = yield* gateway
+                              .read(
+                                { operation: "memory-sources", projectId, taskId: task.taskId },
+                                principal,
+                              )
+                              .pipe(Effect.flatMap(decodeMemorySources));
+                            const secondSelection = remaining.items.find(
+                              (entry) => entry.selection.sourceRecordId === commentSource.recordId,
+                            )?.selection;
+                            const current = yield* readCurrentState(f.sql, projectId);
+                            const currentTask = current.tasks.find(
+                              (entry) => entry.taskId === task.taskId,
+                            );
+                            if (secondSelection === undefined || currentTask === undefined)
+                              return yield* Effect.die(
+                                "Exact current comment cleanup selection missing",
+                              );
+                            const secondRequest = yield* decodeMemoryOwnerRequest({
+                              type: "project-team.memory.process",
+                              commandId: "live-memory-comment-cleanup-select",
+                              projectId,
+                              taskId: currentTask.taskId,
+                              expectedRevision: current.revision,
+                              expectedTaskRevision: currentTask.revision,
+                              specRevision: currentTask.specRevision,
+                              planRevision: f.binding.planRevision,
+                              selection: secondSelection,
+                            });
+                            const secondInput = { arguments: { intentJSON: json(secondRequest) } };
+                            expectedCleanupSelection = secondSelection;
+                            const secondCall = {
+                              ...call,
+                              callId: 2,
+                              nativeCallId: "live-memory-comment-cleanup-select",
+                              input: {
+                                transferId: "live-memory-comment-cleanup-input",
+                                totalBytes: Buffer.byteLength(json(secondInput)),
+                              },
+                            };
+                            const second = yield* Effect.tryPromise({
+                              try: () => input.executeBridgeTool(secondCall, secondInput, signal),
+                              catch: controlledCallbackError,
+                            });
+                            if (second.kind !== "text")
+                              return yield* Effect.die(
+                                "Comment cleanup returned no retained receipt",
+                              );
+                            expect((yield* decodeReportReceipt(second.text)).receipt.status).toBe(
+                              "accepted",
+                            );
+                            expect(
+                              yield* f.sql`SELECT status,json_extract(receipt_json,'$.kind') AS kind
+                              FROM project_team_memory_job WHERE effect_id=${secondSelection.effectId}`,
+                            ).toEqual([{ status: "settled", kind: "delete-source-complete" }]);
+                            expect((yield* readCurrentState(f.sql, projectId)).comments).toEqual(
+                              beforeComment.comments,
+                            );
+                            expect(memoryExchanges).toBe(0);
+                            expect(memoryBackendCalls).toBe(2);
+                            expect(
+                              yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='memory'`,
+                            ).toEqual([]);
+                          }
                           if (compactProof === "memoryAccounting") {
                             const admitted = yield* decodeMemoryLedgerOwner(
                               jobs[0]?.owner ?? "null",
@@ -8476,7 +8615,58 @@ for (const compactProof of [
               expect(waiting.items[0]?.reason).toContain("stopped");
             } else if (cleanupProof) {
               expect(memoryExchanges).toBe(0);
-              expect(memoryBackendCalls).toBe(1);
+              expect(memoryBackendCalls).toBe(compactProof === "memoryHumanRetraction" ? 2 : 1);
+              if (compactProof === "memoryHumanRetraction") {
+                // A legal, immutable journal insert simulates a late index intent
+                // at the deleted generation; it confers no new owner authority.
+                yield* f.sql`INSERT INTO project_team_memory_job
+                  (effect_id,environment_id,project_id,input_json,claim_generation,status,receipt_json)
+                  SELECT 'live-unfenced-index',environment_id,project_id,
+                    json_set(input_json,'$.effect.effectId','live-unfenced-index',
+                      '$.effect.recordId','live-unfenced-index',
+                      '$.effect.generation',(SELECT json_extract(payload_json,'$.generation') FROM project_team_memory_source
+                        WHERE record_id=json_extract(input_json,'$.source.recordId')),
+                      '$.source.generation',(SELECT json_extract(payload_json,'$.generation') FROM project_team_memory_source
+                        WHERE record_id=json_extract(input_json,'$.source.recordId')),
+                      '$.extraction.sourceGeneration',(SELECT json_extract(payload_json,'$.generation') FROM project_team_memory_source
+                        WHERE record_id=json_extract(input_json,'$.source.recordId'))),0,'pending',NULL
+                  FROM project_team_memory_job WHERE project_id=${projectId}
+                    AND json_extract(input_json,'$.effect.effectKind')='memory-index' ORDER BY effect_id LIMIT 1`;
+                expect(
+                  yield* f.sql`SELECT effect_id FROM project_team_memory_job WHERE effect_id='live-unfenced-index'`,
+                ).toEqual([{ effect_id: "live-unfenced-index" }]);
+                expect(yield* deleteRetainedProject().pipe(Effect.result)).toMatchObject({
+                  _tag: "Failure",
+                  failure: { _tag: "ProjectLifecycleError", reason: "memory-cleanup-required" },
+                });
+                expect(
+                  yield* f.sql`SELECT deleted_at FROM projection_projects WHERE project_id=${projectId}`,
+                ).toEqual([{ deleted_at: null }]);
+                yield* f.sql`DELETE FROM project_team_memory_job WHERE effect_id='live-unfenced-index'`;
+                const journals =
+                  yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
+                const deleted = yield* deleteRetainedProject();
+                expect(deleted.project.state).toBe("tombstoned");
+                expect(deleted.filesDeleted).toBe(false);
+                expect(
+                  yield* f.sql`SELECT task_id FROM project_work_tasks WHERE project_id=${projectId}`,
+                ).toEqual([]);
+                expect(
+                  yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`,
+                ).toEqual(journals);
+                expect(
+                  yield* f.sql.withTransaction(
+                    readProjectMemoryProjectionSyncInTransaction(
+                      f.sql,
+                      String(projectId),
+                      "environment",
+                    ),
+                  ),
+                ).toBe(true);
+                expect(memoryExchanges).toBe(0);
+                expect(memoryBackendCalls).toBe(2);
+                expect(yield* deleteRetainedProject()).toEqual(deleted);
+              }
             }
             return;
           }

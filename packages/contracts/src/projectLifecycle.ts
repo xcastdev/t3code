@@ -36,7 +36,7 @@ export const ProjectLifecycleTombstone = Schema.Struct({
   repositoryKey: Schema.optionalKey(TrimmedNonEmptyString),
   tombstonedAt: IsoDateTime,
   reason: Schema.Literals(["permanent-local-delete", "legacy-project-delete"]),
-  /** External repositories, remotes, and provider records are never deleted. */
+  /** GitHub repositories, remotes, and workspace files remain untouched. */
   externalDataPreserved: Schema.Literal(true),
 });
 export type ProjectLifecycleTombstone = typeof ProjectLifecycleTombstone.Type;
@@ -96,7 +96,7 @@ export type ProjectLifecyclePermanentDeleteInput = typeof ProjectLifecyclePerman
 export const ProjectLifecycleMutationResult = Schema.Struct({
   project: ProjectLifecycleRecord,
   tombstone: Schema.optionalKey(ProjectLifecycleTombstone),
-  /** This service only removes local project metadata; files and external data remain. */
+  /** Local metadata is purged after any required memory cleanup; workspace files remain. */
   filesDeleted: Schema.Literal(false),
   externalDataPreserved: Schema.Literal(true),
 });
