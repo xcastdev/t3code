@@ -15,12 +15,14 @@ import {
   ProjectWorkEvidence,
   ProjectWorkDecision,
   ProjectTeamEffect,
+  type ServerSettingsError,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 import type { ProjectWorkContentGuardShape } from "../ProjectWorkContentGuard.ts";
 import type { ProjectWorkReducerState } from "../ProjectWorkDecider.ts";
 import { readCurrentState, type ProjectWorkRepositoryShape } from "../ProjectWorkRepository.ts";
@@ -150,6 +152,10 @@ export interface ProjectMemoryServiceDependencies {
   readonly contentGuard: ProjectWorkContentGuardShape;
   readonly authorization: ProjectTeamAuthorization["Service"];
   readonly environmentId: string;
+  /** Production capture rechecks its current project/settings gate inside the owning transaction. */
+  readonly authorizeCapture?: (
+    projectId: string,
+  ) => Effect.Effect<void, ProjectMemoryServiceError | ServerSettingsError | SqlError>;
   readonly manifests?: ProjectMemoryManifestStore;
   readonly models?: ProjectMemoryModelPorts;
 }
@@ -279,6 +285,7 @@ export const makeProjectMemoryManifestStore = (
 
 export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDependencies) => {
   const { sql, repository, contentGuard, authorization } = dependencies;
+  const authorizeCapture = dependencies.authorizeCapture ?? (() => Effect.void);
   const manifests = dependencies.manifests ?? makeProjectMemoryManifestStore(sql);
   const requireProject = Effect.fn("ProjectMemoryService.requireProject")(function* (
     projectId: string,
@@ -375,6 +382,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     let captured: Source | undefined;
     yield* repository.executeAtomic(
       Effect.gen(function* () {
+        yield* authorizeCapture(projectId);
         yield* requireProject(projectId);
         const state = yield* readCurrentState(sql, projectId);
         const current = retained(state, selector);
@@ -542,6 +550,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
           )
             return yield* deny("Current managed memory scope does not include this source");
         }
+        yield* authorizeCapture(projectId);
       }),
     );
     if (captured === undefined) return yield* deny("Source capture did not commit");

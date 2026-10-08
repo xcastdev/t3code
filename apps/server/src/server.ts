@@ -163,6 +163,7 @@ import * as ProjectWorkAttentionReactor from "./projectWork/ProjectWorkAttention
 import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.ts";
 import * as ProjectWorkExport from "./projectWork/ProjectWorkExport.ts";
 import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
+import { makeProjectMemoryCapture } from "./projectWork/memory/ProjectMemoryCapture.ts";
 import * as ProjectWorkPublicationGuard from "./projectWork/ProjectWorkPublicationGuard.ts";
 import * as ProjectWorkPullRequestActionGuard from "./projectWork/ProjectWorkPullRequestActionGuard.ts";
 import * as ProjectWorkEvidenceInvalidation from "./projectWork/ProjectWorkEvidenceInvalidation.ts";
@@ -952,10 +953,27 @@ const ProjectWorkVerificationExecutionLayerLive = Layer.effectDiscard(
   Layer.provide(PersistenceLayerLive),
 );
 
+const ProjectMemoryCaptureLayerLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const environment = yield* ServerEnvironment.ServerEnvironment;
+    yield* makeProjectMemoryCapture({
+      environmentId: yield* environment.getEnvironmentId,
+      ready: (yield* ServerActivation) ?? Effect.void,
+    });
+  }),
+).pipe(
+  Layer.provide(ProjectWorkCoreLive),
+  Layer.provide(ProjectTeamAuthorizationLive),
+  Layer.provide(ProjectWorkContentGuardLive),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(ServerSettingsLayerLive),
+);
+
 const ProviderRuntimeLayerLive = Layer.mergeAll(
   ProjectWorkVerificationExecutionLayerLive,
   ProviderSessionReaperLive,
   ProjectTeamExecutionLayerLive,
+  ProjectMemoryCaptureLayerLive,
 ).pipe(
   // Subscribes to `account.rate-limits.updated` so usage bars track live
   // telemetry instead of waiting for the next status probe.
