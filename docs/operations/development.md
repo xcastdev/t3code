@@ -97,6 +97,28 @@ startup and keeps its own SQLite data, signing key, and revocation state. Deskto
 servers ignore the value. See [environment authentication](../internals/environment-auth.md#reusable-dev-credential)
 for the security model.
 
+## Maintaining project memory
+
+When diagnosing waiting memory work, separate capture from processing readiness. Capture catches
+up retained sources on startup and settings changes. Check `project-memory-processing.json` in
+the configured server base directory: a missing file disables processing; invalid configuration
+makes it unavailable. The [server composition](../../apps/server/src/server.ts) also blocks model
+exchange and companion startup. Supplying configuration does not bypass those admission checks.
+
+Inspect [recorded memory and outcomes](../user/project-work.md#inspect-and-retract-project-memory)
+before attempting recovery. Processing requires explicit selection by an agent on an approved
+task, with its original executing operation and remaining budget. Preserve that owner, recorded
+outcomes, SQL journals and companion data when work fails or becomes uncertain. Do not reset jobs,
+rebind owners or renew limits to force progress.
+
+Restarting capture does not authorize model retries or index replay. The
+[processing consumer](../../apps/server/src/projectWork/memory/ProjectMemoryProcessing.ts) retains
+uncertain work for reconciliation; requesting cancellation does not establish transport drain.
+
+Local retraction suppresses memory use before physical cleanup completes. Permanent local deletion
+waits for recorded cleanup while task authority still exists. Follow the linked user workflow to
+resolve pending cleanup and retry deletion.
+
 ## Checks
 
 Run checks for the files and packages you changed:
