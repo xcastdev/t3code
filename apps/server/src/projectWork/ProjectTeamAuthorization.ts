@@ -1458,6 +1458,33 @@ export const layer = Layer.effect(
           CASE WHEN length(CAST(result_json AS BLOB)) <= 262144 THEN result_json END AS result
           FROM project_work_command_receipts
           WHERE project_id=${input.projectId} AND command_id=${input.commandId} LIMIT 2`;
+        if (input.type === "project-team.message.send") {
+          const commandMetadata = yield* sql<{ bytes: number | null }>`
+            SELECT length(CAST(payload_json AS BLOB)) AS bytes FROM project_work_events
+            WHERE project_id=${input.projectId} AND command_id=${input.commandId}
+            ORDER BY sequence ASC LIMIT 513`;
+          const prefixMetadata = yield* sql<{ bytes: number | null }>`
+            SELECT length(CAST(payload_json AS BLOB)) AS bytes FROM project_work_events
+            WHERE project_id=${input.projectId} AND sequence < (
+              SELECT MIN(sequence) FROM project_work_events
+              WHERE project_id=${input.projectId} AND command_id=${input.commandId}
+            ) ORDER BY sequence ASC LIMIT 8193`;
+          const metadata = [...commandMetadata, ...prefixMetadata];
+          if (
+            commandMetadata.length === 0 ||
+            commandMetadata.length > 512 ||
+            prefixMetadata.length > 8192 ||
+            metadata.some(
+              (row) =>
+                row.bytes === null ||
+                !Number.isSafeInteger(row.bytes) ||
+                row.bytes < 0 ||
+                row.bytes > 1048576,
+            ) ||
+            metadata.reduce((total, row) => total + (row.bytes ?? 0), 0) > 16777216
+          )
+            return yield* deny("Original message history is invalid");
+        }
         const rows = yield* sql<{
           payload: string | null;
           eventId: string;

@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import type * as SqlConnection from "effect/unstable/sql/SqlConnection";
 import * as TestClock from "effect/testing/TestClock";
 import * as Context from "effect/Context";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -1365,6 +1366,75 @@ for (const missing of ["role", "binding"] as const)
       ).toMatchObject({ _tag: "Failure", failure: { _tag: "ProjectTeamAuthorizationError" } });
       expect(yield* readCurrentState(f.sql, projectId)).toEqual(withdrawn);
     }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+for (const history of ["prefix", "command"] as const)
+  it.effect(
+    `message replay preflights oversized ${history} history before transferring event bodies`,
+    () =>
+      Effect.gen(function* () {
+        const f = yield* messageFixture();
+        yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+        const state = yield* readCurrentState(f.sql, projectId);
+        if (history === "prefix") {
+          yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.replayPadding',${"x".repeat(800000)}) WHERE project_id=${projectId} AND sequence < (SELECT MIN(sequence) FROM project_work_events WHERE project_id=${projectId} AND command_id=${f.request.commandId})`;
+          const sizes = yield* f.sql<{
+            bytes: number;
+            maximum: number;
+          }>`SELECT SUM(length(CAST(payload_json AS BLOB))) AS bytes,MAX(length(CAST(payload_json AS BLOB))) AS maximum FROM project_work_events WHERE project_id=${projectId} AND sequence < (SELECT MIN(sequence) FROM project_work_events WHERE project_id=${projectId} AND command_id=${f.request.commandId})`;
+          expect(sizes[0]?.bytes).toBeGreaterThan(16777216);
+          expect(sizes[0]?.maximum).toBeLessThan(1048576);
+        } else {
+          yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.replayPadding',${"x".repeat(1048577)}) WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+          const sizes = yield* f.sql<{
+            maximum: number;
+          }>`SELECT MAX(length(CAST(payload_json AS BLOB))) AS maximum FROM project_work_events WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+          expect(sizes[0]?.maximum).toBeGreaterThan(1048576);
+        }
+        let eventBodyReads = 0;
+        let eventBodyBytes = 0;
+        const result = yield* f.sql.withTransaction(
+          Effect.gen(function* () {
+            const transaction = yield* Effect.serviceOption(f.sql.transactionService);
+            if (transaction._tag === "None")
+              return yield* Effect.die("Missing original replay transaction");
+            const [connection, depth] = transaction.value;
+            const observed: SqlConnection.Connection = {
+              ...connection,
+              execute: (query, parameters, transform) =>
+                connection.execute(query, parameters, transform).pipe(
+                  Effect.tap((rows: ReadonlyArray<{ readonly payload?: unknown }>) => {
+                    if (
+                      query.includes("project_work_events") &&
+                      query.includes("CASE WHEN length(CAST(payload_json AS BLOB)) <= 1048576") &&
+                      query.includes(" AS payload") &&
+                      parameters.some((parameter) => parameter === f.request.commandId)
+                    ) {
+                      eventBodyReads += 1;
+                      for (const row of rows)
+                        if (typeof row.payload === "string")
+                          eventBodyBytes += Buffer.byteLength(row.payload, "utf8");
+                    }
+                    return Effect.void;
+                  }),
+                ),
+            };
+            return yield* f.gateway
+              .write(f.request, f.principal.actor, f.source, f.principal)
+              .pipe(
+                Effect.provideService(f.sql.transactionService, [observed, depth]),
+                Effect.result,
+              );
+          }),
+        );
+        expect(result).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "ProjectTeamAuthorizationError" },
+        });
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(state);
+        expect(eventBodyReads).toBe(0);
+        expect(eventBodyBytes).toBe(0);
+      }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
   );
 
 it.effect("message replay denies corrupt or oversized original receipts and event bodies", () =>
