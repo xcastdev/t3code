@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import { staleIntegrationTaskIds } from "./ProjectTeamIntegrationSourceState.ts";
 import { DELIVERY_ACCEPTANCE_PREFIX } from "./ProjectTeamDeliveryAcceptanceState.ts";
 import { invalidateReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
@@ -373,8 +374,24 @@ export type ProjectWorkEvent =
 
 export type ProjectWorkDeferredCommandType = never;
 
-const eventIdFor = (commandId: string, index: number): EventId =>
-  EventId.make(`${commandId}:project-work:${index}`);
+const projectScopedEventCommands = new Set<ProjectWorkCommand["type"]>([
+  "project-work.task.create",
+  "project-work.criterion.upsert",
+  "project-work.task.specify",
+  "project-work.task.approve",
+]);
+
+// Ordinary task setup has project-scoped receipts and globally unique events.
+// Other routes retain the event identities their authority readers reconstruct.
+const eventIdFor = (projectId: string, command: ProjectWorkCommand, index: number): EventId => {
+  if (!projectScopedEventCommands.has(command.type))
+    return EventId.make(`${command.commandId}:project-work:${index}`);
+  return EventId.make(
+    `project-work-event:v2:${NodeCrypto.createHash("sha256")
+      .update(canonicalProjectWorkPayload([projectId, command.commandId, index]))
+      .digest("hex")}`,
+  );
+};
 
 const activeAttempt = (
   state: ProjectWorkState,
@@ -574,7 +591,7 @@ type EventDraft = {
 };
 
 const withEventMetadata = (
-  commandId: string,
+  command: ProjectWorkCommand,
   projectId: string,
   revision: number,
   index: number,
@@ -582,7 +599,7 @@ const withEventMetadata = (
 ): ProjectWorkEvent =>
   ({
     ...draft,
-    eventId: eventIdFor(commandId, index),
+    eventId: eventIdFor(projectId, command, index),
     projectId,
     revision,
   }) as ProjectWorkEvent;
@@ -643,7 +660,7 @@ export function decideProjectWorkCommand(
   const record = (next: ProjectTeamRecord) => {
     const draft = validateProjectTeamRecord(current, next, origin);
     const event = withEventMetadata(
-      String(command.commandId),
+      command,
       state.projectId,
       state.revision + result.length + 1,
       result.length,
@@ -699,7 +716,7 @@ export function decideProjectWorkCommand(
   }
   for (const draft of invalidateReviewCriterionProgress({ state: current, at })) {
     const event = withEventMetadata(
-      String(command.commandId),
+      command,
       state.projectId,
       state.revision + result.length + 1,
       result.length,
@@ -732,9 +749,8 @@ function decideProjectWorkCommandEvents(
   }
   assertProject(state, command.projectId, command.type);
   assertProjectWorkExpectedRevision(state, command.expectedRevision, command.type);
-  const commandId = String(command.commandId);
   const event = <T extends EventDraft>(draft: T, index = 0): ProjectWorkEvent =>
-    withEventMetadata(commandId, state.projectId, state.revision + index + 1, index, draft);
+    withEventMetadata(command, state.projectId, state.revision + index + 1, index, draft);
 
   if (command.type !== "project-work.foundation.commit") {
     const allowed = new Set([
@@ -853,7 +869,7 @@ function decideProjectWorkCommandEvents(
             deliverableKind: target.deliverableKind,
             createdAt: command.refinedAt,
             attribution: origin,
-          });
+          }).map((draft, index) => event({ ...draft }, events.length + index));
           events.push(...created);
           working = applyProjectWorkEvents(working, created);
         } else {

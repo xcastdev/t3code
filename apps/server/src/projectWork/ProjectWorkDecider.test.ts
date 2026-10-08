@@ -11,6 +11,7 @@ import {
   ProjectWorkApprovalId,
   ProjectWorkCommentId,
   ProjectWorkDecisionId,
+  ProjectWorkEvidenceId,
   projectWorkPayloadFingerprint,
   type ProjectIssueIntake,
   type ProjectTeamRecord,
@@ -80,6 +81,94 @@ const emptyState = (tasks: ReadonlyArray<ProjectWorkTask> = []): ProjectWorkStat
 });
 
 describe("ProjectWorkDecider", () => {
+  it("namespaces deterministic task-setup event IDs by project, command and index without delimiter collisions", () => {
+    const create = (owner: string, commandId: string) =>
+      decideProjectWorkCommand(
+        { ...emptyState(), projectId: owner },
+        {
+          type: "project-work.task.create",
+          commandId: CommandId.make(commandId),
+          projectId: ProjectId.make(owner),
+          taskId: ProjectWorkTaskId.make("namespace-task"),
+          title: "Bounded work",
+          deliverableKind: "research",
+          createdAt: attribution.recordedAt,
+          attribution,
+        },
+      );
+    const first = create("namespace-project", "shared-command");
+    expect(create("namespace-project", "shared-command")).toEqual(first);
+    expect(first.map((event) => event.type)).toEqual([
+      "project-work.task.created",
+      "project-work.foundation.recorded",
+    ]);
+    const ids = [
+      first[0]?.eventId,
+      first[1]?.eventId,
+      create("other-project", "shared-command")[0]?.eventId,
+      create("namespace-project", "other-command")[0]?.eventId,
+      create("namespace:project", "command")[0]?.eventId,
+      create("namespace", "project:command")[0]?.eventId,
+    ];
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const id of ids) {
+      expect(id).toMatch(/^project-work-event:v2:[a-f0-9]{64}$/);
+      expect(id).not.toContain(":project-work:");
+    }
+  });
+
+  it("preserves evidence and multi-event foundation identities used by retained authority readers", () => {
+    const state = emptyState([task("task-1")]);
+    const evidence = decideProjectWorkCommand(state, {
+      type: "project-work.evidence.add",
+      commandId: CommandId.make("retained-evidence"),
+      projectId,
+      addedAt: attribution.recordedAt,
+      attribution,
+      evidence: {
+        evidenceId: ProjectWorkEvidenceId.make("retained-evidence-record"),
+        taskId: ProjectWorkTaskId.make("task-1"),
+        kind: "observation",
+        summary: "Recorded human permission",
+        revision: 0,
+        recordedAt: attribution.recordedAt,
+        attribution,
+      },
+    });
+    expect(evidence.map((event) => event.eventId)).toEqual(["retained-evidence:project-work:0"]);
+    expect(applyProjectWorkEvents(state, evidence).evidence).toMatchObject([
+      { evidenceId: "retained-evidence-record", summary: "Recorded human permission" },
+    ]);
+    const foundation = decideProjectWorkCommand(state, {
+      type: "project-work.foundation.commit",
+      commandId: CommandId.make("retained-foundation"),
+      projectId,
+      expectedRevision: state.revision,
+      committedAt: attribution.recordedAt,
+      attribution,
+      records: ["first-mission", "second-mission"].map((recordId) => ({
+        kind: "mission" as const,
+        recordId,
+        projectId,
+        revision: 0,
+        generation: 0,
+        updatedAt: attribution.recordedAt,
+        status: "draft" as const,
+        title: recordId,
+        objective: "Preserve retained authority identity",
+        requiredTaskIds: [],
+      })),
+    });
+    expect(foundation.map((event) => event.eventId)).toEqual([
+      "retained-foundation:project-work:0",
+      "retained-foundation:project-work:1",
+    ]);
+    expect(applyProjectWorkEvents(state, foundation).foundationRecords).toMatchObject([
+      { kind: "mission", recordId: "first-mission" },
+      { kind: "mission", recordId: "second-mission" },
+    ]);
+  });
+
   it("rejects a criterion upsert that smuggles in a waiver", () => {
     const state = emptyState([task("task-1")]);
     expect(() =>

@@ -133,6 +133,149 @@ const layer = it.layer(NodeServices.layer);
 
 layer("ProjectWorkGateway", (it) => {
   it.effect(
+    "preserves two-project approved receipts across recreated handles and projection rebuild",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
+        const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+        const repository = yield* ProjectWorkRepository.ProjectWorkRepository;
+        const projection = yield* ProjectWorkProjection.ProjectWorkProjection;
+        const human = { kind: "human", id: "rebuild-maintainer" } as const;
+        const source = { kind: "web", id: "rebuild-work" } as const;
+        const projects = [ProjectId.make("rebuild-a"), ProjectId.make("rebuild-b")];
+        const accepted: Array<{
+          command: typeof ProjectWorkWriteIntent.Type;
+          result: typeof ProjectWorkWriteResult.Type;
+        }> = [];
+        for (const owner of projects) {
+          const task = ProjectWorkTaskId.make(`${owner}-task`);
+          const criterionId = ProjectWorkCriterionId.make(`${owner}-criterion`);
+          yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+          VALUES(${owner},${owner},${"/workspace/" + owner},'[]',${at},${at})`;
+          for (const input of [
+            {
+              type: "project-work.task.create",
+              commandId: "rebuild-create",
+              projectId: owner,
+              taskId: task,
+              title: `Task ${owner}`,
+              createdAt: at,
+            },
+            {
+              type: "project-work.criterion.upsert",
+              commandId: "rebuild-criterion",
+              projectId: owner,
+              taskId: task,
+              criterion: {
+                criterionId,
+                taskId: task,
+                description: "Keep exact accepted history",
+                required: true,
+                status: "unsatisfied",
+                satisfiedByEvidenceIds: [],
+                revision: 0,
+                updatedAt: at,
+              },
+              updatedAt: at,
+            },
+            {
+              type: "project-work.task.specify",
+              commandId: "rebuild-specify",
+              projectId: owner,
+              taskId: task,
+              specification: {
+                objective: `Preserve ${owner}`,
+                scopeIn: "This project's retained work",
+                scopeOut: "Other projects and execution",
+                criterionIds: [criterionId],
+                revision: 1,
+                protected: false,
+              },
+              updatedAt: at,
+            },
+            {
+              type: "project-work.task.approve",
+              commandId: "rebuild-approve",
+              projectId: owner,
+              taskId: task,
+              approvalId: `${owner}-approval`,
+              specRevision: 1,
+              approvedAt: at,
+            },
+          ]) {
+            const command = yield* decodePublicWrite(input);
+            const result = yield* gateway.write(command, human, source);
+            expect(result.receipt.status).toBe("accepted");
+            accepted.push({ command, result });
+          }
+          expect((yield* ProjectWorkRepository.readCurrentState(sql, owner)).tasks).toMatchObject([
+            { taskId: task, approval: { specRevision: 1, attribution: { actor: human } } },
+          ]);
+        }
+        const beforeA = yield* ProjectWorkRepository.readCurrentState(sql, projects[0]!);
+        const beforeB = yield* ProjectWorkRepository.readCurrentState(sql, projects[1]!);
+        const historyA = yield* repository.replay(projects[0]!);
+        const historyB = yield* repository.replay(projects[1]!);
+        const history = yield* sql`SELECT * FROM project_work_events ORDER BY sequence`;
+        const receipts =
+          yield* sql`SELECT * FROM project_work_command_receipts ORDER BY project_id,command_id`;
+        const context = yield* Layer.build(Layer.fresh(ProjectWorkGateway.ProjectWorkGatewayLive));
+        const recreated = Context.get(context, ProjectWorkGateway.ProjectWorkGateway);
+        expect(recreated).not.toBe(gateway);
+        // Only derived rows are damaged. The original events and accepted receipts remain authoritative.
+        yield* sql`DELETE FROM project_work_tasks WHERE project_id=${projects[0]!}`;
+        expect(yield* recreated.read({ projectId: projects[0]!, operation: "tasks" })).toEqual([]);
+        yield* projection.rebuild(projects[0]!);
+        expect(yield* ProjectWorkRepository.readCurrentState(sql, projects[0]!)).toEqual(beforeA);
+        expect(yield* ProjectWorkRepository.readCurrentState(sql, projects[1]!)).toEqual(beforeB);
+        for (const { command, result } of accepted) {
+          expect(yield* recreated.write(command, human, source)).toEqual(result);
+        }
+        const original = accepted[0]!.command;
+        expect(
+          (yield* recreated
+            .write(
+              yield* decodePublicWrite({ ...original, title: "Changed semantic request" }),
+              human,
+              source,
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* recreated
+            .write(original, { ...human, id: "other-maintainer" }, source)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* recreated
+            .write(
+              yield* decodePublicWrite({
+                type: "project-work.task.create",
+                commandId: "rebuild-stale",
+                projectId: projects[0]!,
+                expectedRevision: beforeA.revision - 1,
+                taskId: "stale-task",
+                title: "Stale selection",
+                createdAt: at,
+              }),
+              human,
+              source,
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* repository.replay(projects[0]!)).toEqual(historyA);
+        expect(yield* repository.replay(projects[1]!)).toEqual(historyB);
+        expect(yield* sql`SELECT * FROM project_work_events ORDER BY sequence`).toEqual(history);
+        expect(
+          yield* sql`SELECT * FROM project_work_command_receipts ORDER BY project_id,command_id`,
+        ).toEqual(receipts);
+        expect(yield* sql`SELECT 1 FROM project_team_pi_operation`).toEqual([]);
+        expect(yield* sql`SELECT 1 FROM project_team_model_request`).toEqual([]);
+        expect(yield* sql`SELECT 1 FROM project_team_memory_job`).toEqual([]);
+      }).pipe(Effect.provide(gatewayLayer)),
+  );
+  it.effect(
     "returns bounded foundation accounting without changing the project revision or record authority",
     () =>
       Effect.gen(function* () {

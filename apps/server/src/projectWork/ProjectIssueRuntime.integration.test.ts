@@ -3,7 +3,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
   DEFAULT_SERVER_SETTINGS,
+  CommandId,
   ProjectId,
+  ProjectWorkTaskId,
+  ProjectWorkWriteIntent,
   ProjectTeamCredential,
   ProjectWorkPublicationRequest,
 } from "@t3tools/contracts";
@@ -30,6 +33,8 @@ import * as Config from "../config.ts";
 import * as Environment from "../environment/ServerEnvironment.ts";
 import * as Gateway from "./ProjectWorkGateway.ts";
 import * as Query from "./ProjectWorkQuery.ts";
+import * as Projection from "./ProjectWorkProjection.ts";
+import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import * as Search from "./ProjectWorkSearch.ts";
 import * as Briefing from "./ProjectWorkBriefing.ts";
 import * as Narrative from "./ProjectWorkNarrative.ts";
@@ -59,6 +64,7 @@ const decodeStoredRevision = Schema.decodeEffect(
 );
 const decodeManagedCredential = Schema.decodeUnknownEffect(ProjectTeamCredential);
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeReplayWrite = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
 const output = (stdout: string): ProcessRunner.ProcessRunOutput => ({
   stdout,
   stderr: "",
@@ -284,6 +290,92 @@ const run = <A, E>(
     | import("./ProjectWorkRepository.ts").ProjectWorkRepository
   >,
 ) => effect.pipe(Effect.scoped, Effect.provide(Layer.merge(runtimeLayer, NodeServices.layer)));
+
+it.effect(
+  "recreated issue handles preserve public receipts and rebuilt work while stopped reads stay inert",
+  () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.enableIssue();
+        const firstRuntime = yield* f.start();
+        yield* firstRuntime.refresh;
+        const firstGateway = yield* f.startGateway(firstRuntime);
+        const repository = yield* ProjectWorkRepository;
+        const owner = ProjectId.make("project");
+        const actor = { kind: "human", id: "runtime-rebuild-maintainer" } as const;
+        const source = { kind: "web", id: "runtime-rebuild-work" } as const;
+        const command = yield* decodeReplayWrite({
+          type: "project-work.task.create",
+          commandId: CommandId.make("runtime-rebuild-task"),
+          projectId: owner,
+          taskId: ProjectWorkTaskId.make("runtime-rebuild-task"),
+          title: "Retained issue work",
+          createdAt: at,
+        });
+        const result = yield* firstGateway.write(command, actor, source);
+        expect(result.receipt.status).toBe("accepted");
+        const issues = yield* f.sql<{
+          recordId: string;
+          payload: string;
+        }>`SELECT record_id AS recordId,payload_json AS payload FROM project_team_issue WHERE project_id=${owner}`;
+        const issue = issues[0];
+        if (issue === undefined) return yield* Effect.die("Missing captured issue");
+        const revision = yield* decodeStoredRevision(issue.payload);
+        const request = {
+          projectId: owner,
+          operation: "issue-comments" as const,
+          issueRecordId: issue.recordId,
+          expectedIssueRevision: revision.revision,
+        };
+        const comments = yield* firstGateway.read(request, { actor });
+        expect(comments).toMatchObject({ entries: [{ body: "Reviewed comment" }] });
+        const state = yield* readCurrentState(f.sql, owner);
+        const history = yield* repository.replay(owner);
+        const receipts =
+          yield* f.sql`SELECT * FROM project_work_command_receipts ORDER BY command_id`;
+        yield* firstRuntime.stop;
+        const callsAfterStop = f.calls.length;
+        expect((yield* firstGateway.read(request, { actor }).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* firstRuntime.refresh).toEqual({ repositories: [], pages: [] });
+        expect(f.calls).toHaveLength(callsAfterStop);
+        const nextRuntime = yield* f.start();
+        yield* nextRuntime.refresh;
+        const nextGateway = yield* f.startGateway(nextRuntime);
+        expect(nextGateway).not.toBe(firstGateway);
+        const callsAfterRestart = f.calls.length;
+        const projection = yield* Projection.ProjectWorkProjection.pipe(
+          Effect.provide(Projection.ProjectWorkProjectionLive),
+        );
+        yield* f.sql`DELETE FROM project_work_tasks WHERE project_id=${owner}`;
+        yield* projection.rebuild(owner);
+        expect(yield* readCurrentState(f.sql, owner)).toEqual(state);
+        expect(yield* nextGateway.write(command, actor, source)).toEqual(result);
+        expect(
+          (yield* nextGateway
+            .write(
+              yield* decodeReplayWrite({ ...command, title: "Changed original work" }),
+              actor,
+              source,
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* firstGateway.read(request, { actor }).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(f.calls).toHaveLength(callsAfterRestart);
+        expect(yield* repository.replay(owner)).toEqual(history);
+        expect(
+          yield* f.sql`SELECT * FROM project_work_command_receipts ORDER BY command_id`,
+        ).toEqual(receipts);
+        expect(yield* f.sql`SELECT 1 FROM project_team_pi_operation`).toEqual([]);
+        expect(yield* f.sql`SELECT 1 FROM project_team_memory_job`).toEqual([]);
+        yield* nextRuntime.stop;
+      }),
+    ),
+);
 
 it.effect("disabled startup performs no git/gh calls and retained handles are inert", () =>
   run(
