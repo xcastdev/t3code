@@ -12,17 +12,30 @@ import {
   ThreadId,
   CommandId,
   ProjectWorkEvidenceId,
+  ProjectWorkFoundationCommitCommand,
+  ProjectTeamGuidedIntent,
+  ProviderInstanceId,
 } from "@t3tools/contracts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as Authorization from "./ProjectTeamAuthorization.ts";
 import * as Registry from "../mcp/McpSessionRegistry.ts";
 import * as Invocation from "../mcp/McpInvocationContext.ts";
 import * as Environment from "../environment/ServerEnvironment.ts";
+import {
+  executePiProjectWorkBridgeTool,
+  preparePiProjectWorkTools,
+} from "../provider/pi/PiProjectWorkTools.ts";
+import { ProjectWorkToolkit } from "../mcp/toolkits/projectWork/tools.ts";
+import { ProjectWorkToolkitHandlersLive } from "../mcp/toolkits/projectWork/handlers.ts";
 
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
-import { projectTeamSpecificationHash, projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
+import {
+  projectTeamSpecificationHash,
+  projectTeamScopeHash,
+  projectTeamDerivedRecordId,
+} from "./ProjectTeamPolicy.ts";
 import {
   seed,
   createManagedAssignment,
@@ -137,6 +150,1304 @@ it.effect(
 );
 
 const encodeQuestionFixtureJSON = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeMessageFixtureCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const decodeMessageFixtureGuided = Schema.decodeUnknownEffect(ProjectTeamGuidedIntent);
+const messageFixture = Effect.fn("messageTest.fixture")(function* () {
+  const f = yield* seed("implementer");
+  const gateway = yield* ProjectWorkGateway;
+  const recipientTaskId = ProjectWorkTaskId.make("message-recipient-task");
+  yield* f.change(
+    decodeRecord({
+      ...f.member,
+      recordId: "message-recipient",
+      coordinator: false,
+      name: "Recipient",
+    }),
+  );
+  const recipient = yield* createManagedAssignment({
+    taskId: recipientTaskId,
+    recordId: "message-recipient-binding",
+    attemptId: "message-recipient-attempt",
+    commandId: "message-recipient-claim",
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    threadId: ThreadId.make("message-recipient-thread"),
+    role: f.role,
+    status: "running",
+    configuration: f.binding.configuration,
+    memberId: "message-recipient",
+    sessionId: "message-recipient-session",
+  });
+  const state = yield* readCurrentState(f.sql, projectId);
+  const memberships =
+    state.foundationRecords?.filter(
+      (r) => r.kind === "task-membership" && (r.taskId === taskId || r.taskId === recipientTaskId),
+    ) ?? [];
+  expect(memberships).toHaveLength(2);
+  yield* f.repo.execute(
+    yield* decodeMessageFixtureCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "message-active-mission",
+      expectedRevision: state.revision,
+      committedAt: "2026-01-01T00:00:00.000Z",
+      attribution: {
+        actor: { kind: "human", id: "mission-human" },
+        source: { kind: "web", id: "mission-browser" },
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      },
+      records: [
+        {
+          kind: "mission",
+          projectId,
+          recordId: "message-mission",
+          revision: 0,
+          generation: 0,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          status: "active",
+          title: "Shared approved mission",
+          objective: "Exchange bounded informational updates",
+          requiredTaskIds: [taskId, recipientTaskId],
+        },
+        ...memberships.map((r) => ({
+          ...r,
+          missionId: "message-mission",
+          revision: r.revision + 1,
+        })),
+      ],
+    }),
+  );
+  const before = yield* readCurrentState(f.sql, projectId);
+  const task = before.tasks.find((t) => t.taskId === taskId)!;
+  const membership = before.foundationRecords?.find(
+    (r) => r.kind === "task-membership" && r.taskId === recipientTaskId,
+  );
+  if (membership?.kind !== "task-membership")
+    return yield* Effect.die("Missing original recipient membership");
+  return {
+    ...f,
+    gateway,
+    recipient,
+    before,
+    membership,
+    source: { kind: "mcp" as const, id: "message-tool" },
+    request: {
+      type: "project-team.message.send" as const,
+      commandId: CommandId.make("bounded-team-message"),
+      projectId,
+      taskId,
+      expectedRevision: before.revision,
+      expectedTaskRevision: task.revision,
+      specRevision: task.specRevision,
+      planRevision: f.binding.planRevision,
+      messageId: "bounded-team-message",
+      recipientId: recipient.memberId,
+      recipientTaskId,
+      expectedRecipientMembershipRevision: membership.revision,
+      body: "Keep the original reviewed commit in your comparison.",
+      evidenceIds: [],
+    },
+  };
+});
+
+it.effect(
+  "sends an authenticated informational message to an explicit active mission teammate",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      const addresses = yield* f.sql.withTransaction(
+        f.auth.readMessageRecipientsInTransaction(f.principal),
+      );
+      expect(addresses).toEqual({
+        recipients: [
+          {
+            memberId: f.recipient.memberId,
+            taskId: f.recipient.taskId,
+            taskTitle: "Bounded task",
+            expectedRecipientMembershipRevision: f.membership.revision,
+            relation: "active-mission",
+          },
+        ],
+        omitted: 0,
+        degraded: false,
+      });
+      const receipt = yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+      const after = yield* readCurrentState(f.sql, projectId);
+      expect(
+        after.foundationRecords?.find((r) => r.recordId === f.request.messageId),
+      ).toMatchObject({
+        kind: "message",
+        status: "queued",
+        senderId: f.binding.memberId,
+        recipientId: f.recipient.memberId,
+        taskId: f.recipient.taskId,
+        missionId: "message-mission",
+        generation: f.binding.generation,
+        deliveryCursor: 0,
+        deliveryGeneration: 0,
+        body: f.request.body,
+      });
+      expect(after.foundationRecords?.filter((r) => r.kind === "gate")).toEqual(
+        f.before.foundationRecords?.filter((r) => r.kind === "gate"),
+      );
+      expect(yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal)).toEqual(
+        receipt,
+      );
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(after);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+it.effect("denies stale mission message targets without recording a message", () =>
+  Effect.gen(function* () {
+    const f = yield* messageFixture();
+    for (const changed of [
+      { recipientTaskId: taskId },
+      { recipientId: f.binding.memberId, recipientTaskId: taskId },
+      { expectedRecipientMembershipRevision: f.membership.revision + 1 },
+      { specRevision: f.request.specRevision + 1 },
+      { body: "   " },
+    ]) {
+      expect(
+        yield* f.gateway
+          .write({ ...f.request, ...changed }, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.result),
+      ).toMatchObject({ _tag: "Failure", failure: { _tag: "ProjectTeamAuthorizationError" } });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
+    }
+    const mission = f.before.foundationRecords?.find((r) => r.recordId === "message-mission");
+    if (mission?.kind !== "mission") return yield* Effect.die("Missing authentic mission");
+    yield* f.change(decodeRecord({ ...mission, status: "paused", revision: mission.revision + 1 }));
+    const paused = yield* readCurrentState(f.sql, projectId);
+    const addresses = yield* f.sql.withTransaction(
+      f.auth.readMessageRecipientsInTransaction(f.principal),
+    );
+    expect(addresses).toEqual({ recipients: [], omitted: 1, degraded: true });
+    expect(
+      yield* f.gateway
+        .write(
+          { ...f.request, expectedRevision: paused.revision },
+          f.principal.actor,
+          f.source,
+          f.principal,
+        )
+        .pipe(Effect.result),
+    ).toMatchObject({ _tag: "Failure", failure: { _tag: "ProjectTeamAuthorizationError" } });
+    expect(yield* readCurrentState(f.sql, projectId)).toEqual(paused);
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+for (const taskState of ["blocked", "completed", "canceled"] as const)
+  it.effect(`denies ${taskState} recipient tasks even with retained running bindings`, () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      const targetIndex = f.before.tasks.findIndex((t) => t.taskId === f.recipient.taskId);
+      expect(targetIndex).toBeGreaterThanOrEqual(0);
+      // Corrupt only the current projection/checkpoint to isolate task eligibility from binding revocation.
+      yield* f.sql`UPDATE project_work_tasks SET state=${taskState} WHERE project_id=${projectId} AND task_id=${f.recipient.taskId}`;
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${`$.tasks[${targetIndex}].state`},${taskState}) WHERE project_id=${projectId}`;
+      const changed = yield* readCurrentState(f.sql, projectId);
+      expect(changed.tasks.find((t) => t.taskId === f.recipient.taskId)?.state).toBe(taskState);
+      expect(changed.foundationRecords?.find((r) => r.recordId === f.recipient.recordId)).toEqual(
+        f.recipient,
+      );
+      expect(
+        yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)),
+      ).toEqual({ recipients: [], omitted: 1, degraded: true });
+      expect(
+        yield* f.gateway
+          .write(f.request, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.result),
+      ).toMatchObject({ _tag: "Failure", failure: { _tag: "ProjectTeamAuthorizationError" } });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(changed);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+it.effect(
+  "requires the original SQL transaction and repository context for message compilation",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      const compile = f.auth.intent(
+        f.principal,
+        f.request,
+        { actor: f.principal.actor, source: f.source, recordedAt: "2026-01-01T00:00:00.000Z" },
+        false,
+      );
+      expect((yield* compile.pipe(Effect.result))._tag).toBe("Failure");
+      yield* Effect.gen(function* () {
+        const foreign = yield* SqlClient.SqlClient;
+        expect(
+          (yield* f.sql
+            .withTransaction(compile.pipe(Effect.provideService(SqlClient.SqlClient, foreign)))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory({})));
+      expect(
+        (yield* f.sql
+          .withTransaction(
+            compile.pipe(
+              Effect.updateContext((context: Context.Context<never>) =>
+                Context.omit(ProjectWorkRepository)(context),
+              ),
+            ),
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.sql.withTransaction(compile)).toMatchObject({
+        type: "project-work.foundation.commit",
+        records: [{ kind: "message", taskId: f.recipient.taskId }],
+      });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
+  "messages retain current sender evidence and deny foreign or stale scope references",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      const evidenceAt = "2026-01-01T00:00:00.000Z";
+      for (const [id, owner, scopeHash] of [
+        ["message-current-evidence", taskId, f.binding.scopeHash],
+        ["message-foreign-evidence", f.recipient.taskId, f.recipient.scopeHash],
+        ["message-stale-evidence", taskId, "obsolete-scope"],
+      ] as const) {
+        yield* f.repo.execute({
+          type: "project-work.evidence.add",
+          projectId,
+          commandId: CommandId.make(id),
+          addedAt: evidenceAt,
+          evidence: {
+            evidenceId: ProjectWorkEvidenceId.make(id),
+            taskId: owner,
+            kind: "observation",
+            summary: "Retained informational reference",
+            uri: "https://example.invalid/reference",
+            ...(scopeHash === undefined ? {} : { scopeHash }),
+            recordedAt: evidenceAt,
+            revision: 0,
+            attribution: {
+              actor: { kind: "human", id: "reference-human" },
+              source: { kind: "web", id: "reference-browser" },
+              recordedAt: evidenceAt,
+            },
+          },
+        });
+      }
+      const before = yield* readCurrentState(f.sql, projectId);
+      for (const id of [
+        "message-foreign-evidence",
+        "message-stale-evidence",
+        "message-missing-evidence",
+      ]) {
+        expect(
+          yield* f.gateway
+            .write(
+              { ...f.request, expectedRevision: before.revision, evidenceIds: [id] },
+              f.principal.actor,
+              f.source,
+              f.principal,
+            )
+            .pipe(Effect.result),
+        ).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            _tag: "ProjectTeamAuthorizationError",
+            reason: "Message evidence is not applicable to its sender",
+          },
+        });
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+      }
+      yield* f.gateway.write(
+        {
+          ...f.request,
+          expectedRevision: before.revision,
+          evidenceIds: ["message-current-evidence"],
+        },
+        f.principal.actor,
+        f.source,
+        f.principal,
+      );
+      expect(
+        (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+          (r) => r.recordId === f.request.messageId,
+        ),
+      ).toMatchObject({
+        kind: "message",
+        evidenceIds: ["message-current-evidence"],
+        taskId: f.recipient.taskId,
+      });
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+const investigationRecipient = Effect.fn("messageTest.investigationRecipient")(function* (
+  f: Effect.Success<ReturnType<typeof seed>>,
+  parentTaskId: ProjectWorkTaskId,
+  commandId: string,
+  options: {
+    readonly repository?: boolean;
+    readonly issueRecordId?: string;
+    readonly planning?: boolean;
+  } = {},
+) {
+  const gateway = yield* ProjectWorkGateway;
+  const before = yield* readCurrentState(f.sql, projectId);
+  const parent = before.tasks.find((t) => t.taskId === parentTaskId);
+  if (!parent) return yield* Effect.die("Missing actual investigation parent");
+  const fields = {
+    commandId: CommandId.make(commandId),
+    projectId,
+    taskId: parentTaskId,
+    expectedRevision: before.revision,
+    expectedTaskRevision: parent.revision,
+    objective: "Inspect the original approved task",
+    outputDescriptions: ["Retained findings"],
+  };
+  let intent: ProjectTeamGuidedIntent;
+  if (options.planning) {
+    const specificationGate = before.foundationRecords?.find(
+      (r) => r.kind === "gate" && r.recordId === f.binding.specificationGateId,
+    );
+    const plan = before.foundationRecords?.find(
+      (r) => r.kind === "plan-revision" && r.taskId === parentTaskId && r.status === "proposed",
+    );
+    const planGate = before.foundationRecords?.find(
+      (r) => r.kind === "gate" && r.recordId === f.binding.planGateId,
+    );
+    if (
+      specificationGate?.kind !== "gate" ||
+      plan?.kind !== "plan-revision" ||
+      planGate?.kind !== "gate"
+    )
+      return yield* Effect.die("Missing genuine parent specification and plan approvals");
+    intent = yield* decodeMessageFixtureGuided({
+      ...fields,
+      type: "project-team.assignment.start",
+      assignmentKind: "planning",
+      specRevision: parent.specRevision,
+      specificationGateId: specificationGate.recordId,
+      expectedSpecificationGateRevision: specificationGate.revision,
+      parentPlan: {
+        recordId: plan.recordId,
+        expectedRecordRevision: plan.revision,
+        planRevision: plan.planRevision,
+        gateId: planGate.recordId,
+        expectedGateRevision: planGate.revision,
+      },
+    });
+  } else {
+    const issue = before.foundationRecords?.find(
+      (r) => r.kind === "issue" && r.recordId === options.issueRecordId,
+    );
+    if (options.issueRecordId !== undefined && issue?.kind !== "issue")
+      return yield* Effect.die("Missing actual retained issue target");
+    intent = yield* decodeMessageFixtureGuided({
+      ...fields,
+      type: "project-team.investigation.start",
+      ...(issue?.kind === "issue"
+        ? { issueRecordId: issue.recordId, expectedIssueRevision: issue.revision }
+        : {}),
+    });
+  }
+  const human = {
+    actor: { kind: "human" as const, id: "tree-human" },
+    source: { kind: "web" as const, id: "tree-browser" },
+    recordedAt: "2026-01-01T00:00:00.000Z",
+  };
+  if (options.repository)
+    yield* f.repo.execute(
+      yield* decodeMessageFixtureCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId,
+        expectedRevision: before.revision,
+        attribution: human,
+        committedAt: human.recordedAt,
+        records: [],
+        guided: { intent },
+      }),
+    );
+  else yield* gateway.write(intent, human.actor, human.source);
+  const issued = yield* readCurrentState(f.sql, projectId);
+  const grant = issued.foundationRecords?.find(
+    (r) =>
+      r.kind === "gate" &&
+      r.recordId ===
+        projectTeamDerivedRecordId(commandId, options.planning ? "assignment" : "investigation"),
+  );
+  const role = issued.foundationRecords?.find(
+    (r) =>
+      r.kind === "role-revision" &&
+      r.recordId === projectTeamDerivedRecordId(commandId, "investigator-role"),
+  );
+  if (grant?.kind !== "gate" || role?.kind !== "role-revision")
+    return yield* Effect.die("Missing real investigation issuance");
+  const child = issued.tasks.find((t) => t.taskId === grant.taskId);
+  if (!child) return yield* Effect.die("Missing issued investigation child");
+  const configuredRole = decodeRecord({
+    ...role,
+    recordId: `${commandId}:configured-role`,
+    revision: 0,
+    roleRevision: role.roleRevision + 1,
+    model: "test",
+  });
+  if (configuredRole.kind !== "role-revision")
+    return yield* Effect.die("Invalid configured readonly role");
+  yield* f.change(configuredRole);
+  const memberId = `${commandId}:member`;
+  yield* f.change(
+    decodeRecord({
+      ...f.member,
+      recordId: memberId,
+      roleRevisionId: configuredRole.recordId,
+      coordinator: false,
+    }),
+  );
+  const current = yield* readCurrentState(f.sql, projectId);
+  const reserved = decodeRecord({
+    kind: "run-binding",
+    projectId,
+    recordId: `${commandId}:binding`,
+    revision: 0,
+    generation: 0,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    status: "reserved",
+    taskId: child.taskId,
+    attemptId: `${commandId}:attempt`,
+    memberId,
+    roleRevisionId: configuredRole.recordId,
+    providerInstanceId,
+    threadId: `${commandId}:thread`,
+    sessionId: `${commandId}:session`,
+    environmentId: "environment",
+    model: configuredRole.model,
+    configuration: {
+      instructionsHash: "hash",
+      toolIds: ["read"],
+      skillIds: [],
+      runtimeVersion: "test",
+      maxTokens: 1000,
+      maxDurationMs: 1000,
+      paidFallback: false,
+    },
+    worktree: "/workspace",
+    branch: "task",
+    leaseGeneration: 0,
+    specRevision: child.specRevision,
+    planRevision: 0,
+    authorizationGateId: grant.recordId,
+    scopeHash: projectTeamScopeHash(current, child.taskId),
+  });
+  if (reserved.kind !== "run-binding")
+    return yield* Effect.die("Invalid original readonly binding");
+  yield* f.repo.execute(
+    yield* decodeMessageFixtureCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: `${commandId}:claim`,
+      expectedRevision: current.revision,
+      attribution: {
+        actor: { kind: "system", id: "tree-scheduler" },
+        source: { kind: "system", id: "tree-scheduler" },
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      },
+      committedAt: "2026-01-01T00:00:00.000Z",
+      records: [],
+      transition: {
+        kind: "claim",
+        taskId: child.taskId,
+        expectedTaskRevision: child.revision,
+        authorizationGateId: grant.recordId,
+        expectedGateRevision: grant.revision,
+        binding: reserved,
+        claim: {
+          type: "project-work.task.claim",
+          projectId,
+          taskId: child.taskId,
+          commandId: `${commandId}:claim`,
+          attemptId: reserved.attemptId,
+          leaseToken: `${commandId}:lease`,
+          leasedUntil: "2030-01-01T00:00:00.000Z",
+          claimedAt: "2026-01-01T00:00:00.000Z",
+        },
+      },
+    }),
+  );
+  const running = decodeRecord({ ...reserved, revision: 1, status: "running" });
+  yield* f.change(running);
+  if (running.kind !== "run-binding")
+    return yield* Effect.die("Invalid running readonly recipient");
+  return running;
+});
+
+it.effect(
+  "messages a genuinely human-issued investigation child without granting readonly work tools",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer");
+      const child = yield* investigationRecipient(f, taskId, "message-tree-child");
+      const state = yield* readCurrentState(f.sql, projectId);
+      const own = state.tasks.find((t) => t.taskId === taskId)!;
+      const membership = state.foundationRecords?.find(
+        (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+      );
+      if (membership?.kind !== "task-membership")
+        return yield* Effect.die("Missing authentic child membership");
+      const addresses = yield* f.sql.withTransaction(
+        f.auth.readMessageRecipientsInTransaction(f.principal),
+      );
+      expect(addresses.recipients).toEqual([
+        {
+          memberId: child.memberId,
+          taskId: child.taskId,
+          taskTitle: "Investigate: Task",
+          expectedRecipientMembershipRevision: membership.revision,
+          relation: "approved-tree",
+        },
+      ]);
+      expect(child.configuration.toolIds).toEqual(["read"]);
+      const gateway = yield* ProjectWorkGateway;
+      yield* gateway.write(
+        {
+          type: "project-team.message.send",
+          commandId: CommandId.make("message-tree-send"),
+          projectId,
+          taskId,
+          expectedRevision: state.revision,
+          expectedTaskRevision: own.revision,
+          specRevision: own.specRevision,
+          planRevision: f.binding.planRevision,
+          messageId: "message-tree-send",
+          recipientId: child.memberId,
+          recipientTaskId: child.taskId,
+          expectedRecipientMembershipRevision: membership.revision,
+          body: "Return only sourced findings",
+          evidenceIds: [],
+        },
+        f.principal.actor,
+        { kind: "mcp", id: "tree-tool" },
+        f.principal,
+      );
+      expect(
+        (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+          (r) => r.recordId === "message-tree-send",
+        ),
+      ).toMatchObject({ status: "queued", taskId: child.taskId, recipientId: child.memberId });
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+for (const mode of [
+  "Gateway issue-targeted investigation",
+  "Repository issue-targeted investigation",
+  "approved planning assignment",
+] as const)
+  it.effect(`messages an original ${mode} recipient without changing its readonly grants`, () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer");
+      const id = mode.startsWith("Gateway")
+        ? "gateway-issue-child"
+        : mode.startsWith("Repository")
+          ? "repository-issue-child"
+          : "planning-child";
+      if (mode !== "approved planning assignment")
+        yield* f.change(
+          decodeRecord({
+            kind: "issue",
+            projectId,
+            recordId: `${id}:issue`,
+            revision: 0,
+            generation: 0,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            status: "open",
+            identity: {
+              host: "github.com",
+              repositoryNodeId: "controlled-repository",
+              issueNodeId: `${id}:node`,
+              number: 1,
+            },
+            repositoryName: "controlled/repository",
+            title: "Recorded issue",
+            body: "Investigate this retained issue without remote access",
+            sourceRevision: "original-issue",
+            observedAt: "2026-01-01T00:00:00.000Z",
+            taskId,
+          }),
+        );
+      const child = yield* investigationRecipient(f, taskId, id, {
+        ...(mode !== "approved planning assignment"
+          ? { issueRecordId: `${id}:issue` }
+          : { planning: true }),
+        repository: mode.startsWith("Repository"),
+      });
+      const state = yield* readCurrentState(f.sql, projectId);
+      const own = state.tasks.find((t) => t.taskId === taskId)!;
+      const membership = state.foundationRecords?.find(
+        (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+      );
+      if (membership?.kind !== "task-membership")
+        return yield* Effect.die("Missing original compatible recipient membership");
+      expect(
+        (yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)))
+          .recipients,
+      ).toEqual([
+        {
+          memberId: child.memberId,
+          taskId: child.taskId,
+          taskTitle: mode === "approved planning assignment" ? "Plan: Task" : "Investigate: Task",
+          expectedRecipientMembershipRevision: membership.revision,
+          relation: "approved-tree",
+        },
+      ]);
+      const gateway = yield* ProjectWorkGateway;
+      yield* gateway.write(
+        {
+          type: "project-team.message.send",
+          commandId: CommandId.make(`${id}:send`),
+          projectId,
+          taskId,
+          expectedRevision: state.revision,
+          expectedTaskRevision: own.revision,
+          specRevision: own.specRevision,
+          planRevision: f.binding.planRevision,
+          messageId: `${id}:send`,
+          recipientId: child.memberId,
+          recipientTaskId: child.taskId,
+          expectedRecipientMembershipRevision: membership.revision,
+          body: "Share only information within the original approved task tree",
+          evidenceIds: [],
+        },
+        f.principal.actor,
+        { kind: "mcp", id: "compatible-tree-tool" },
+        f.principal,
+      );
+      expect(
+        (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+          (r) => r.recordId === `${id}:send`,
+        ),
+      ).toMatchObject({ status: "queued", taskId: child.taskId });
+      expect(child.configuration.toolIds).toEqual(["read"]);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+it.effect("approved tree messages remain eligible when a shared mission is paused", () =>
+  Effect.gen(function* () {
+    const f = yield* seed("implementer");
+    const child = yield* investigationRecipient(f, taskId, "message-paused-tree");
+    const gateway = yield* ProjectWorkGateway;
+    const before = yield* readCurrentState(f.sql, projectId);
+    const memberships =
+      before.foundationRecords?.filter(
+        (r) => r.kind === "task-membership" && (r.taskId === taskId || r.taskId === child.taskId),
+      ) ?? [];
+    expect(memberships).toHaveLength(2);
+    yield* f.repo.execute(
+      yield* decodeMessageFixtureCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "message-paused-tree-mission",
+        expectedRevision: before.revision,
+        committedAt: "2026-01-01T00:00:00.000Z",
+        attribution: {
+          actor: { kind: "human", id: "tree-human" },
+          source: { kind: "web", id: "tree-browser" },
+          recordedAt: "2026-01-01T00:00:00.000Z",
+        },
+        records: [
+          {
+            kind: "mission",
+            projectId,
+            recordId: "paused-tree-mission",
+            revision: 0,
+            generation: 0,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            status: "paused",
+            title: "Paused shared mission",
+            objective: "Retain the independently approved task tree",
+            requiredTaskIds: [taskId, child.taskId],
+          },
+          ...memberships.map((r) => ({
+            ...r,
+            missionId: "paused-tree-mission",
+            revision: r.revision + 1,
+          })),
+        ],
+      }),
+    );
+    const state = yield* readCurrentState(f.sql, projectId);
+    const own = state.tasks.find((t) => t.taskId === taskId)!;
+    const membership = state.foundationRecords?.find(
+      (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+    );
+    if (membership?.kind !== "task-membership")
+      return yield* Effect.die("Missing genuine paused-mission child membership");
+    expect(
+      (yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)))
+        .recipients,
+    ).toEqual([
+      {
+        memberId: child.memberId,
+        taskId: child.taskId,
+        taskTitle: "Investigate: Task",
+        expectedRecipientMembershipRevision: membership.revision,
+        relation: "approved-tree",
+      },
+    ]);
+    yield* gateway.write(
+      {
+        type: "project-team.message.send",
+        commandId: CommandId.make("paused-mission-tree-send"),
+        projectId,
+        taskId,
+        expectedRevision: state.revision,
+        expectedTaskRevision: own.revision,
+        specRevision: own.specRevision,
+        planRevision: f.binding.planRevision,
+        messageId: "paused-mission-tree-send",
+        recipientId: child.memberId,
+        recipientTaskId: child.taskId,
+        expectedRecipientMembershipRevision: membership.revision,
+        body: "Continue informational coordination within the approved task tree",
+        evidenceIds: [],
+      },
+      f.principal.actor,
+      { kind: "mcp", id: "tree-tool" },
+      f.principal,
+    );
+    expect(
+      (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+        (r) => r.recordId === "paused-mission-tree-send",
+      ),
+    ).toMatchObject({ status: "queued", taskId: child.taskId });
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect("does not turn human-approved readonly sibling investigations into send authority", () =>
+  Effect.gen(function* () {
+    const f = yield* seed("implementer");
+    const parentTaskId = ProjectWorkTaskId.make("message-unapproved-parent");
+    yield* f.repo.execute({
+      type: "project-work.task.create",
+      projectId,
+      taskId: parentTaskId,
+      commandId: CommandId.make("message-unapproved-parent"),
+      title: "Unspecified investigation",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      attribution: {
+        actor: { kind: "human", id: "tree-human" },
+        source: { kind: "web", id: "tree-browser" },
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      },
+    });
+    const sender = yield* investigationRecipient(f, parentTaskId, "message-sibling-sender");
+    const recipient = yield* investigationRecipient(f, parentTaskId, "message-sibling-recipient");
+    const issued = yield* f.auth.issueCredential({
+      providerInstanceId: sender.providerInstanceId,
+      threadId: sender.threadId,
+      bindingId: sender.recordId,
+    });
+    if (!issued) return yield* Effect.die("Missing original sibling credential");
+    const principal = {
+      actor: { kind: "agent" as const, id: Authorization.managedActorId(issued.credential) },
+      managed: issued.credential,
+    };
+    const state = yield* readCurrentState(f.sql, projectId);
+    const task = state.tasks.find((t) => t.taskId === sender.taskId)!;
+    const membership = state.foundationRecords?.find(
+      (r) => r.kind === "task-membership" && r.taskId === recipient.taskId,
+    );
+    if (membership?.kind !== "task-membership")
+      return yield* Effect.die("Missing original sibling membership");
+    expect(state.tasks.find((t) => t.taskId === parentTaskId)?.specification).toBeUndefined();
+    expect(
+      state.foundationRecords?.some(
+        (r) => r.kind === "gate" && r.taskId === parentTaskId && r.status === "approved",
+      ),
+    ).toBe(false);
+    expect(
+      yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(principal)),
+    ).toEqual({ recipients: [], omitted: 0, degraded: false });
+    const gateway = yield* ProjectWorkGateway;
+    expect(
+      (yield* gateway
+        .write(
+          {
+            type: "project-team.message.send",
+            commandId: CommandId.make("sibling-message-send"),
+            projectId,
+            taskId: sender.taskId,
+            expectedRevision: state.revision,
+            expectedTaskRevision: task.revision,
+            specRevision: task.specRevision,
+            planRevision: sender.planRevision,
+            messageId: "sibling-message-send",
+            recipientId: recipient.memberId,
+            recipientTaskId: recipient.taskId,
+            expectedRecipientMembershipRevision: membership.revision,
+            body: "Compare the independently approved investigation findings",
+            evidenceIds: [],
+          },
+          principal.actor,
+          { kind: "mcp", id: "sibling-tool" },
+          principal,
+        )
+        .pipe(Effect.result))._tag,
+    ).toBe("Failure");
+    expect(yield* readCurrentState(f.sql, projectId)).toEqual(state);
+    expect(sender.configuration.toolIds).toEqual(["read"]);
+    expect(recipient.configuration.toolIds).toEqual(["read"]);
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+for (const corruption of ["reparented", "cyclic"] as const)
+  it.effect(`denies ${corruption} task lineage after a genuine child was discoverable`, () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer");
+      const child = yield* investigationRecipient(f, taskId, `message-${corruption}-child`);
+      expect(
+        (yield* f.sql.withTransaction(
+          f.auth.readMessageRecipientsInTransaction(f.principal),
+        )).recipients.map((r) => r.taskId),
+      ).toEqual([child.taskId]);
+      const state = yield* readCurrentState(f.sql, projectId);
+      const membership = state.foundationRecords?.find(
+        (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+      );
+      if (membership?.kind !== "task-membership")
+        return yield* Effect.die("Missing current issued child");
+      const parentTaskId = corruption === "cyclic" ? child.taskId : "unrelated-parent";
+      const index =
+        state.foundationRecords?.findIndex((r) => r.recordId === membership.recordId) ?? -1;
+      expect(index).toBeGreaterThanOrEqual(0);
+      // Ordinary foundation writes forbid reparenting. Alter only the disposable derived rows.
+      yield* f.sql`UPDATE project_team_task_membership SET payload_json=json_set(payload_json,'$.parentTaskId',${parentTaskId}) WHERE project_id=${projectId} AND record_id=${membership.recordId}`;
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${`$.foundationRecords[${index}].parentTaskId`},${parentTaskId}) WHERE project_id=${projectId}`;
+      const changed = yield* readCurrentState(f.sql, projectId);
+      const altered = changed.foundationRecords?.find((r) => r.recordId === membership.recordId);
+      expect(altered).toMatchObject({
+        parentTaskId: corruption === "cyclic" ? child.taskId : "unrelated-parent",
+      });
+      expect(
+        (yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)))
+          .recipients,
+      ).toEqual([]);
+      const own = changed.tasks.find((t) => t.taskId === taskId)!;
+      const gateway = yield* ProjectWorkGateway;
+      expect(
+        (yield* gateway
+          .write(
+            {
+              type: "project-team.message.send",
+              commandId: CommandId.make(`message-${corruption}-send`),
+              projectId,
+              taskId,
+              expectedRevision: changed.revision,
+              expectedTaskRevision: own.revision,
+              specRevision: own.specRevision,
+              planRevision: f.binding.planRevision,
+              messageId: `message-${corruption}-send`,
+              recipientId: child.memberId,
+              recipientTaskId: child.taskId,
+              expectedRecipientMembershipRevision: membership.revision,
+              body: "This altered lineage must not confer an address",
+              evidenceIds: [],
+            },
+            f.principal.actor,
+            { kind: "mcp", id: "tree-tool" },
+            f.principal,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(changed);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+it.effect(
+  "denies original birth-parent substitution with an unchanged authenticated issuance receipt",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer");
+      const originalParent = ProjectWorkTaskId.make("unrelated-original-parent");
+      yield* f.repo.execute({
+        type: "project-work.task.create",
+        projectId,
+        taskId: originalParent,
+        commandId: CommandId.make("unrelated-original-parent"),
+        title: "Unrelated original task",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      const birthCommandId = "original-unrelated-child";
+      const child = yield* investigationRecipient(f, originalParent, birthCommandId);
+      expect(
+        (yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)))
+          .recipients,
+      ).toEqual([]);
+      const before = yield* readCurrentState(f.sql, projectId);
+      const index =
+        before.foundationRecords?.findIndex(
+          (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+        ) ?? -1;
+      expect(index).toBeGreaterThanOrEqual(0);
+      const membership = before.foundationRecords?.[index];
+      if (membership?.kind !== "task-membership")
+        return yield* Effect.die("Missing genuine unrelated child lineage");
+      expect(membership.parentTaskId).toBe(originalParent);
+      const receipt =
+        yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${birthCommandId}`;
+      expect(receipt).toHaveLength(1);
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.record.parentTaskId',${taskId}) WHERE project_id=${projectId} AND command_id=${birthCommandId} AND json_extract(payload_json,'$.record.recordId')=${membership.recordId}`;
+      yield* f.sql`UPDATE project_team_task_membership SET payload_json=json_set(payload_json,'$.parentTaskId',${taskId}) WHERE project_id=${projectId} AND record_id=${membership.recordId}`;
+      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${`$.foundationRecords[${index}].parentTaskId`},${taskId}) WHERE project_id=${projectId}`;
+      const changed = yield* readCurrentState(f.sql, projectId);
+      expect(changed.foundationRecords?.[index]).toMatchObject({ parentTaskId: taskId });
+      expect(
+        yield* f.sql`SELECT json_extract(payload_json,'$.record.parentTaskId') AS parent FROM project_work_events WHERE project_id=${projectId} AND command_id=${birthCommandId} AND json_extract(payload_json,'$.record.recordId')=${membership.recordId}`,
+      ).toEqual([{ parent: taskId }]);
+      expect(
+        yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${birthCommandId}`,
+      ).toEqual(receipt);
+      expect(
+        (yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)))
+          .recipients,
+      ).toEqual([]);
+      const gateway = yield* ProjectWorkGateway;
+      const own = changed.tasks.find((t) => t.taskId === taskId)!;
+      expect(
+        (yield* gateway
+          .write(
+            {
+              type: "project-team.message.send",
+              commandId: CommandId.make("forged-original-tree-send"),
+              projectId,
+              taskId,
+              expectedRevision: changed.revision,
+              expectedTaskRevision: own.revision,
+              specRevision: own.specRevision,
+              planRevision: f.binding.planRevision,
+              messageId: "forged-original-tree-send",
+              recipientId: child.memberId,
+              recipientTaskId: child.taskId,
+              expectedRecipientMembershipRevision: membership.revision,
+              body: "A substituted birth must never grant an audience",
+              evidenceIds: [],
+            },
+            f.principal.actor,
+            { kind: "mcp", id: "tree-tool" },
+            f.principal,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(changed);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+for (const status of ["delivered", "uncertain", "canceled"] as const)
+  it.effect(`historical message retries preserve ${status} delivery after sender revocation`, () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      const receipt = yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+      const state = yield* readCurrentState(f.sql, projectId);
+      const message = state.foundationRecords?.find((r) => r.recordId === f.request.messageId);
+      if (message?.kind !== "message") return yield* Effect.die("Missing original message");
+      yield* f.change(
+        decodeRecord({ ...message, status, revision: message.revision + 1, deliveryCursor: 1 }),
+      );
+      yield* f.change(
+        decodeRecord({ ...f.binding, status: "revoked", revision: f.binding.revision + 1 }),
+      );
+      const changed = yield* readCurrentState(f.sql, projectId);
+      expect(yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal)).toEqual(
+        receipt,
+      );
+      const rebuilt = yield* Authorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(Layer.fresh(Authorization.layer)),
+      );
+      expect(
+        yield* f.sql.withTransaction(
+          rebuilt.intent(
+            f.principal,
+            f.request,
+            { actor: f.principal.actor, source: f.source, recordedAt: "2026-01-03T00:00:00.000Z" },
+            true,
+          ),
+        ),
+      ).toMatchObject({
+        type: "project-work.foundation.commit",
+        records: [{ status: "queued", deliveryCursor: 0 }],
+      });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(changed);
+      for (const variation of [
+        {
+          input: { ...f.request, body: "Changed retained body" },
+          principal: f.principal,
+          source: f.source,
+        },
+        {
+          input: f.request,
+          principal: f.principal,
+          source: { ...f.source, id: "foreign-message-tool" },
+        },
+        {
+          input: f.request,
+          source: f.source,
+          principal: {
+            ...f.principal,
+            managed: { ...f.principal.managed, threadId: ThreadId.make("foreign-message-thread") },
+          },
+        },
+      ])
+        expect(
+          (yield* f.gateway
+            .write(
+              variation.input,
+              variation.principal.actor,
+              variation.source,
+              variation.principal,
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(changed);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+it.effect("replies to the original incoming sender using an explicit current recipient task", () =>
+  Effect.gen(function* () {
+    const f = yield* messageFixture();
+    yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+    const issued = yield* f.auth.issueCredential({
+      providerInstanceId: f.recipient.providerInstanceId,
+      threadId: f.recipient.threadId,
+    });
+    if (!issued) return yield* Effect.die("Missing actual reply authority");
+    const principal = {
+      actor: { kind: "agent" as const, id: Authorization.managedActorId(issued.credential) },
+      managed: issued.credential,
+    };
+    const state = yield* readCurrentState(f.sql, projectId);
+    const task = state.tasks.find((t) => t.taskId === f.recipient.taskId)!;
+    const originalSenderMembership = state.foundationRecords?.find(
+      (r) => r.kind === "task-membership" && r.taskId === taskId,
+    );
+    if (originalSenderMembership?.kind !== "task-membership")
+      return yield* Effect.die("Missing original sender's current address");
+    const request = {
+      ...f.request,
+      commandId: CommandId.make("message-explicit-reply"),
+      messageId: "message-explicit-reply",
+      taskId: f.recipient.taskId,
+      expectedRevision: state.revision,
+      expectedTaskRevision: task.revision,
+      specRevision: task.specRevision,
+      planRevision: f.recipient.planRevision,
+      recipientId: f.binding.memberId,
+      recipientTaskId: taskId,
+      expectedRecipientMembershipRevision: originalSenderMembership.revision,
+      replyTo: f.request.messageId,
+      body: "I will compare the original committed tree",
+    };
+    for (const changed of [
+      { replyTo: "missing-incoming" },
+      { recipientTaskId: f.recipient.taskId },
+      { recipientId: f.recipient.memberId },
+    ]) {
+      expect(
+        (yield* f.gateway
+          .write({ ...request, ...changed }, principal.actor, f.source, principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(state);
+    }
+    yield* f.gateway.write(request, principal.actor, f.source, principal);
+    expect(
+      (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+        (r) => r.recordId === request.messageId,
+      ),
+    ).toMatchObject({
+      senderId: f.recipient.memberId,
+      recipientId: f.binding.memberId,
+      taskId,
+      replyTo: f.request.messageId,
+      status: "queued",
+    });
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect("actual Pi and MCP write tools persist messages at the discovered recipient task", () =>
+  Effect.gen(function* () {
+    const f = yield* messageFixture();
+    expect(
+      preparePiProjectWorkTools({
+        roleTools: f.role.tools,
+        bindingTools: f.binding.configuration.toolIds,
+      }).find((t) => t.tool.function.name === "project_work_write")?.tool.function.description,
+    ).toContain("project-team.message.send");
+    const pi = yield* executePiProjectWorkBridgeTool({
+      toolName: "project_work_write",
+      arguments: { intentJSON: yield* encodeQuestionFixtureJSON(f.request) },
+      principal: f.principal,
+      source: f.source,
+    });
+    expect(pi).toMatchObject({ receipt: { status: "accepted", eventCount: 1 } });
+    const toolkit = yield* ProjectWorkToolkit.pipe(
+      Effect.provide(
+        ProjectWorkToolkitHandlersLive.pipe(
+          Layer.provide(Layer.succeed(ProjectWorkGateway, f.gateway)),
+        ),
+      ),
+    );
+    const state = yield* readCurrentState(f.sql, projectId);
+    const request = {
+      ...f.request,
+      commandId: CommandId.make("mcp-team-message"),
+      messageId: "mcp-team-message",
+      expectedRevision: state.revision,
+      body: "Retain the comparison result",
+    };
+    yield* toolkit.handle("project_work_write", request).pipe(
+      Stream.unwrap,
+      Stream.runCollect,
+      Effect.provideService(Invocation.McpInvocationContext, {
+        environmentId: EnvironmentId.make("environment"),
+        providerInstanceId,
+        threadId,
+        providerSessionId: "message-tool-session",
+        managed: f.principal.managed,
+        capabilities: new Set(["project" as const]),
+        issuedAt: 0,
+      }),
+    );
+    const after = yield* readCurrentState(f.sql, projectId);
+    for (const id of [f.request.messageId, request.messageId])
+      expect(after.foundationRecords?.find((r) => r.recordId === id)).toMatchObject({
+        kind: "message",
+        senderId: f.binding.memberId,
+        recipientId: f.recipient.memberId,
+        taskId: f.recipient.taskId,
+        status: "queued",
+      });
+    expect(after.foundationRecords?.filter((r) => r.kind === "gate")).toEqual(
+      f.before.foundationRecords?.filter((r) => r.kind === "gate"),
+    );
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+for (const missing of ["role", "binding"] as const)
+  it.effect(`message sending requires the ${missing} frozen write grant`, () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      const record = missing === "role" ? f.role : f.binding;
+      const tools = (missing === "role" ? f.role.tools : f.binding.configuration.toolIds).filter(
+        (tool) => tool !== "project-work.write",
+      );
+      const path = missing === "role" ? "$.record.tools" : "$.record.configuration.toolIds";
+      const encoded = yield* encodeQuestionFixtureJSON(tools);
+      yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,${path},json(${encoded})) WHERE project_id=${projectId} AND json_extract(payload_json,'$.record.recordId')=${record.recordId}`;
+      if (missing === "role")
+        yield* f.sql`UPDATE project_team_role_revision SET payload_json=json_set(payload_json,'$.tools',json(${encoded})) WHERE project_id=${projectId} AND record_id=${record.recordId}`;
+      else
+        yield* f.sql`UPDATE project_team_run_binding SET payload_json=json_set(payload_json,'$.configuration.toolIds',json(${encoded})) WHERE project_id=${projectId} AND record_id=${record.recordId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${projectId}`;
+      const withdrawn = yield* readCurrentState(f.sql, projectId);
+      expect(
+        withdrawn.foundationRecords?.find((r) => r.recordId === record.recordId),
+      ).toMatchObject(missing === "role" ? { tools } : { configuration: { toolIds: tools } });
+      if (missing === "role")
+        expect(
+          yield* f.sql
+            .withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal))
+            .pipe(Effect.result),
+        ).toMatchObject({ _tag: "Failure", failure: { _tag: "ProjectTeamAuthorizationError" } });
+      else
+        expect(
+          yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)),
+        ).toEqual({ recipients: [], omitted: 0, degraded: false });
+      expect(
+        yield* f.gateway
+          .write(f.request, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.result),
+      ).toMatchObject({ _tag: "Failure", failure: { _tag: "ProjectTeamAuthorizationError" } });
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(withdrawn);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+it.effect("message replay denies corrupt or oversized original receipts and event bodies", () =>
+  Effect.gen(function* () {
+    const f = yield* messageFixture();
+    const receipt = yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+    const state = yield* readCurrentState(f.sql, projectId);
+    const original = yield* f.sql<{
+      result: string;
+      actor: string;
+      at: string;
+      events: string;
+    }>`SELECT result_json AS result,actor_id AS actor,created_at AS at,event_ids_json AS events FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+    expect(original).toHaveLength(1);
+    const row = original[0]!;
+    for (const mutation of [
+      f.sql`UPDATE project_work_command_receipts SET actor_id='foreign-worker' WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+      f.sql`UPDATE project_work_command_receipts SET created_at='2026-01-02T00:00:00.000Z' WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+      f.sql`UPDATE project_work_command_receipts SET event_ids_json='[]' WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+      f.sql`UPDATE project_work_command_receipts SET result_json=${"x".repeat(262145)} WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+    ]) {
+      yield* mutation;
+      expect(
+        (yield* f.gateway
+          .write(f.request, f.principal.actor, f.source, f.principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.sql`UPDATE project_work_command_receipts SET actor_id=${row.actor},created_at=${row.at},event_ids_json=${row.events},result_json=${row.result} WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+      expect(yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal)).toEqual(
+        receipt,
+      );
+    }
+    const events = yield* f.sql<{
+      payload: string;
+    }>`SELECT payload_json AS payload FROM project_work_events WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+    expect(events).toHaveLength(1);
+    yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,'$.record.body','Substituted original message') WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+    expect(
+      (yield* f.gateway
+        .write(f.request, f.principal.actor, f.source, f.principal)
+        .pipe(Effect.result))._tag,
+    ).toBe("Failure");
+    yield* f.sql`UPDATE project_work_events SET payload_json=${events[0]!.payload} WHERE project_id=${projectId} AND command_id=${f.request.commandId}`;
+    expect(yield* readCurrentState(f.sql, projectId)).toEqual(state);
+  }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
+  "failed owning message COMMIT remains private and its exact request succeeds after rollback",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      yield* f.sql`CREATE TEMP TABLE message_commit_parent (id INTEGER PRIMARY KEY)`;
+      yield* f.sql`CREATE TEMP TABLE message_commit_child (id INTEGER REFERENCES message_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      const result = yield* f.repo
+        .executeAtomic(
+          Effect.gen(function* () {
+            yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+            yield* f.sql`INSERT INTO message_commit_child (id) VALUES (1)`;
+            return [];
+          }),
+        )
+        .pipe(Effect.exit);
+      expect(result._tag).toBe("Failure");
+      expect(
+        (yield* f.gateway
+          .read({ projectId, taskId: f.recipient.taskId, operation: "task-context" })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.sql`ROLLBACK`;
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(f.before);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${f.request.commandId}`,
+      ).toEqual([]);
+      yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+      expect(
+        (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+          (r) => r.recordId === f.request.messageId,
+        ),
+      ).toMatchObject({ status: "queued", deliveryCursor: 0 });
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
 const questionFixture = Effect.fn("questionTest.fixture")(function* (
   options: {
     readonly roleTools?: readonly string[];

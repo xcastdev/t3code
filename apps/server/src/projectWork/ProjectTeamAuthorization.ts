@@ -9,8 +9,10 @@ import {
   ProjectWorkKnowledgeId,
   ProjectWorkAttribution,
   ProjectWorkWriteResult,
+  IsoDateTime,
   EventId,
   ProjectWorkTaskId,
+  ProjectWorkTask,
   type ProjectWorkActor,
   type ProjectWorkCommand,
   type ProjectWorkReadIntent,
@@ -27,6 +29,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -38,7 +41,9 @@ import {
   decideProjectWorkCommand,
   emptyProjectWorkReducerState,
   type ProjectWorkReducerState,
+  type ProjectWorkEvent,
 } from "./ProjectWorkDecider.ts";
+import { projectWorkCommandFingerprint } from "./ProjectWorkPolicy.ts";
 import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import { makeProjectTeamReviewFindings } from "./ProjectTeamReviewFindings.ts";
 import { makeProjectTeamReviewCompletionProposals } from "./ProjectTeamReviewCompletionProposals.ts";
@@ -50,9 +55,11 @@ import {
 } from "./ProjectTeamConfiguration.ts";
 import {
   assertProjectTeamRunAuthority,
+  assertProjectTeamAssignmentAuthorization,
   assertProjectTeamSemanticWork,
   projectTeamSpecificationHash,
   projectTeamPlanHash,
+  projectTeamDerivedRecordId,
 } from "./ProjectTeamPolicy.ts";
 
 export class ProjectTeamAuthorizationError extends Schema.TaggedError<ProjectTeamAuthorizationError>()(
@@ -77,6 +84,7 @@ const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const decodeAttribution = Schema.decodeUnknownSync(ProjectWorkAttribution);
 const decodeWriteResult = Schema.decodeUnknownSync(Schema.fromJsonString(ProjectWorkWriteResult));
 const decodeEventIds = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(EventId)));
+const decodeMessageTask = Schema.decodeUnknownSync(ProjectWorkTask);
 const decodeGuidedIntent = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, {
   onExcessProperty: "error",
 });
@@ -85,6 +93,38 @@ export const managedActorId = (
 ) => `agent:mcp:${credential.providerInstanceId}:${credential.threadId}`;
 const deny = (reason: string) => new ProjectTeamAuthorizationError({ reason });
 type QuestionRequest = Extract<ProjectTeamWriteIntent, { type: "project-team.question.request" }>;
+type MessageRequest = Extract<ProjectTeamWriteIntent, { type: "project-team.message.send" }>;
+type Membership = Extract<ProjectTeamRecord, { kind: "task-membership" }>;
+export interface ProjectTeamMessageRecipient {
+  readonly memberId: string;
+  readonly taskId: ProjectWorkTaskId;
+  readonly taskTitle: string;
+  readonly expectedRecipientMembershipRevision: number;
+  readonly relation: "same-task" | "approved-tree" | "active-mission";
+}
+export interface ProjectTeamMessageRecipients {
+  readonly recipients: readonly ProjectTeamMessageRecipient[];
+  readonly omitted: number;
+  readonly degraded: boolean;
+}
+const decodeMessageFoundationEvent = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      eventId: EventId,
+      projectId: ProjectId,
+      revision: Schema.Int.check(
+        Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      occurredAt: IsoDateTime,
+      type: Schema.Literal("project-work.foundation.recorded"),
+      record: ProjectTeamRecord,
+    }),
+  ),
+  { onExcessProperty: "error" },
+);
+const messageWriteGranted = (binding: Binding, role: Role) =>
+  role.tools.includes("project-work.write") &&
+  binding.configuration.toolIds.includes("project-work.write");
 
 const compileQuestionRequest = (
   state: ProjectWorkReducerState,
@@ -202,6 +242,9 @@ export class ProjectTeamAuthorization extends Context.Service<
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) => Effect.Effect<ProjectWorkCommand, ProjectTeamAuthorizationError>;
+    readonly readMessageRecipientsInTransaction: (
+      principal: ProjectTeamPrincipal,
+    ) => Effect.Effect<ProjectTeamMessageRecipients, ProjectTeamAuthorizationError>;
     readonly guided: (
       principal: ProjectTeamPrincipal,
       input: ProjectTeamGuidedIntent,
@@ -493,6 +536,745 @@ export const layer = Layer.effect(
         isAuthorizationError(error) ? error : deny("Managed authority unavailable"),
       ),
     );
+    const messageLoan = Effect.fn("ProjectTeamAuthorization.messageLoan")(function* () {
+      const current = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const transaction = yield* Effect.serviceOption(sql.transactionService);
+      const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(current) ||
+        current.value !== sql ||
+        Option.isNone(transaction) ||
+        Option.isNone(repository)
+      )
+        return yield* deny("Team messages require their original transaction");
+    });
+    // Each selection owns one state snapshot and bounded memoized original facts, never a cross-call cache.
+    const messageSelection = (
+      state: ProjectWorkReducerState,
+      sender: Binding,
+      now: number,
+      beforeSequence?: number,
+    ) => {
+      const records = state.foundationRecords ?? [];
+      const births = new Map<string, { record: ProjectTeamRecord; commandId: string }>();
+      const receipts = new Map<
+        string,
+        {
+          actorKind: string | null;
+          actorId: string | null;
+          sourceKind: string | null;
+          sourceId: string | null;
+          createdAt: string;
+          fingerprint: string;
+          result: ProjectWorkWriteResult;
+          eventIds: readonly EventId[];
+          records: ReadonlyMap<string, ProjectTeamRecord>;
+          events: readonly ProjectWorkEvent[];
+        }
+      >();
+      let reads = 0;
+      let bytes = 0;
+      const unique = (id: string) => {
+        const matches = records.filter((r) => r.recordId === id);
+        if (matches.length !== 1 || matches[0]?.projectId !== state.projectId)
+          throw deny("Message fact is missing or ambiguous");
+        return decodeRecord(matches[0]);
+      };
+      const audit = Effect.fn("messageSelection.audit")(function* (
+        record: ProjectTeamRecord,
+        first = false,
+      ) {
+        const key = `${first ? "first" : "current"}:${record.recordId}`;
+        const cached = births.get(key);
+        if (cached) return cached;
+        if (++reads > 1024) return yield* deny("Message provenance work exceeds its bound");
+        const rows = yield* sql<{
+          payload: string | null;
+          eventId: string;
+          commandId: string;
+          occurredAt: string;
+          sequence: number;
+        }>`
+          SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json END AS payload,
+          event_id AS eventId,command_id AS commandId,occurred_at AS occurredAt,sequence
+          FROM project_work_events WHERE project_id=${state.projectId} AND event_type='project-work.foundation.recorded'
+          AND json_extract(payload_json,'$.record.recordId')=${record.recordId}
+          ${beforeSequence === undefined ? sql`` : sql`AND sequence<${beforeSequence}`}
+          ORDER BY sequence ${first ? sql`ASC` : sql`DESC`} LIMIT 1`;
+        const row = rows[0];
+        if (rows.length !== 1 || !row || row.payload === null)
+          return yield* deny("Message provenance is unavailable");
+        bytes += Buffer.byteLength(row.payload, "utf8");
+        if (bytes > 4194304) return yield* deny("Message provenance exceeds its byte bound");
+        const event = yield* Effect.try({
+          try: () => decodeMessageFoundationEvent(row.payload),
+          catch: () => deny("Message retained event is invalid"),
+        });
+        if (
+          event.projectId !== state.projectId ||
+          event.eventId !== row.eventId ||
+          event.occurredAt !== row.occurredAt ||
+          event.record.recordId !== record.recordId ||
+          (!first &&
+            canonicalProjectWorkPayload(event.record) !== canonicalProjectWorkPayload(record))
+        )
+          return yield* deny("Message retained fact changed");
+        let receipt = receipts.get(row.commandId);
+        if (!receipt) {
+          const saved = yield* sql<{
+            actorKind: string | null;
+            actorId: string | null;
+            sourceKind: string | null;
+            sourceId: string | null;
+            createdAt: string;
+            fingerprint: string;
+            result: string | null;
+            eventIds: string | null;
+          }>`
+            SELECT actor_kind AS actorKind,actor_id AS actorId,source_kind AS sourceKind,source_id AS sourceId,created_at AS createdAt,
+            payload_fingerprint AS fingerprint,
+            CASE WHEN length(CAST(result_json AS BLOB))<=262144 THEN result_json END AS result,
+            CASE WHEN length(CAST(event_ids_json AS BLOB))<=1048576 THEN event_ids_json END AS eventIds
+            FROM project_work_command_receipts WHERE project_id=${state.projectId} AND command_id=${row.commandId} LIMIT 2`;
+          const item = saved[0];
+          if (
+            saved.length !== 1 ||
+            !item ||
+            item.result === null ||
+            item.eventIds === null ||
+            !/^(?:project-team-intent:[a-f0-9]{64}|[a-f0-9]{8})$/u.test(item.fingerprint)
+          )
+            return yield* deny("Message original command receipt is unavailable");
+          bytes +=
+            Buffer.byteLength(item.result, "utf8") + Buffer.byteLength(item.eventIds, "utf8");
+          if (bytes > 4194304) return yield* deny("Message receipt bytes exceed their bound");
+          const decoded = yield* Effect.try({
+            try: () => ({
+              result: decodeWriteResult(item.result),
+              eventIds: decodeEventIds(item.eventIds),
+            }),
+            catch: () => deny("Message original receipt is invalid"),
+          });
+          if (
+            decoded.eventIds.length > 512 ||
+            new Set(decoded.eventIds).size !== decoded.eventIds.length ||
+            decoded.result.projectId !== state.projectId ||
+            decoded.result.receipt.projectId !== state.projectId ||
+            decoded.result.receipt.commandId !== row.commandId ||
+            decoded.result.receipt.status !== "accepted" ||
+            decoded.result.receipt.eventCount !== decoded.eventIds.length ||
+            decoded.result.receipt.revision !== decoded.result.revision ||
+            decoded.result.delta.projectId !== state.projectId ||
+            decoded.result.delta.revision !== decoded.result.revision ||
+            canonicalProjectWorkPayload(decoded.result.delta.eventIds) !==
+              canonicalProjectWorkPayload(decoded.eventIds.slice(0, 64))
+          )
+            return yield* deny("Message original command result changed");
+          const commandRows = yield* sql<{
+            payload: string | null;
+            eventId: string;
+            eventType: string;
+            occurredAt: string;
+          }>`
+            SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json END AS payload,
+            event_id AS eventId,event_type AS eventType,occurred_at AS occurredAt
+            FROM project_work_events WHERE project_id=${state.projectId} AND command_id=${row.commandId}
+            ORDER BY sequence LIMIT 513`;
+          if (commandRows.length === 0 || commandRows.length !== decoded.eventIds.length)
+            return yield* deny("Message original command events are incomplete");
+          const originalRecords = new Map<string, ProjectTeamRecord>();
+          const originalEvents: ProjectWorkEvent[] = [];
+          for (const [index, originalRow] of commandRows.entries()) {
+            if (originalRow.payload === null)
+              return yield* deny("Message original event exceeds its bound");
+            bytes += Buffer.byteLength(originalRow.payload, "utf8");
+            if (bytes > 4194304)
+              return yield* deny("Message original events exceed their byte bound");
+            const original = yield* Effect.try({
+              try: () =>
+                originalRow.eventType === "project-work.foundation.recorded"
+                  ? decodeMessageFoundationEvent(originalRow.payload)
+                  : decodeProjectWorkEvent(decodeUnknownJson(originalRow.payload)),
+              catch: () => deny("Message original event is invalid"),
+            });
+            if (
+              original.eventId !== originalRow.eventId ||
+              original.projectId !== state.projectId ||
+              original.type !== originalRow.eventType ||
+              original.occurredAt !== originalRow.occurredAt ||
+              original.eventId !== decoded.eventIds[index] ||
+              original.revision !== decoded.result.revision - commandRows.length + index + 1
+            )
+              return yield* deny("Message original event metadata changed");
+            if (original.type === "project-work.foundation.recorded")
+              originalRecords.set(original.eventId, original.record);
+            originalEvents.push(original);
+          }
+          if (
+            commandRows.at(-1)?.occurredAt !== item.createdAt ||
+            !decoded.result.delta.changedFields.includes("foundationRecords")
+          )
+            return yield* deny("Message original receipt disagrees with its events");
+          receipt = { ...item, ...decoded, records: originalRecords, events: originalEvents };
+          receipts.set(row.commandId, receipt);
+        }
+        const index = receipt.eventIds.indexOf(event.eventId);
+        const retained = receipt.records.get(event.eventId);
+        if (
+          index < 0 ||
+          receipt.result.revision - event.revision !== receipt.eventIds.length - index - 1 ||
+          retained === undefined ||
+          canonicalProjectWorkPayload(retained) !== canonicalProjectWorkPayload(event.record)
+        )
+          return yield* deny("Message fact is not in its accepted command result");
+        if (
+          event.record.kind === "gate" &&
+          (first || event.record.status === "approved") &&
+          (event.record.attribution.actor.kind !== receipt.actorKind ||
+            (event.record.attribution.actor.id ?? null) !== receipt.actorId ||
+            event.record.attribution.source.kind !== receipt.sourceKind ||
+            (event.record.attribution.source.id ?? null) !== receipt.sourceId)
+        )
+          return yield* deny("Message grant attribution changed");
+        if (!first && beforeSequence === undefined) {
+          const physical = yield* sql<{
+            payload: string | null;
+          }>`SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json END AS payload
+            FROM ${sql(`project_team_${record.kind.replaceAll("-", "_")}`)} WHERE record_id=${record.recordId} AND project_id=${state.projectId} LIMIT 2`;
+          if (
+            physical.length !== 1 ||
+            physical[0]?.payload === null ||
+            canonicalProjectWorkPayload(decodeRecord(decodeUnknownJson(physical[0]?.payload))) !==
+              canonicalProjectWorkPayload(record)
+          )
+            return yield* deny("Message physical record changed");
+        }
+        const value = { record: event.record, commandId: row.commandId };
+        births.set(key, value);
+        return value;
+      });
+      const membership = (taskId: string): Membership => {
+        const matches = records.filter((r) => r.kind === "task-membership" && r.taskId === taskId);
+        const record = matches[0];
+        if (
+          matches.length !== 1 ||
+          record?.kind !== "task-membership" ||
+          record.projectId !== state.projectId ||
+          record.status !== "active" ||
+          (record.controlState !== undefined && record.controlState !== "active")
+        )
+          throw deny("Message task membership is not active");
+        return record;
+      };
+      const endpoint = Effect.fn("messageSelection.endpoint")(
+        function* (binding: Binding) {
+          const role = unique(binding.roleRevisionId);
+          const member = unique(binding.memberId);
+          const m = membership(binding.taskId);
+          const task = state.tasks.find((t) => t.taskId === binding.taskId);
+          const attempt = state.attempts.find(
+            (a) => a.attemptId === binding.attemptId && a.taskId === binding.taskId,
+          );
+          if (
+            role.kind !== "role-revision" ||
+            member.kind !== "member" ||
+            member.status !== "active" ||
+            binding.status !== "running" ||
+            binding.sessionId === undefined ||
+            task?.state !== "in-progress" ||
+            task.activeAttemptId !== binding.attemptId ||
+            (attempt?.state !== "leased" && attempt?.state !== "running") ||
+            attempt.leasedUntil === undefined ||
+            Date.parse(attempt.leasedUntil) <= now
+          )
+            return yield* deny("Message recipient ownership is not current");
+          yield* Effect.try({
+            try: () => assertProjectTeamRunAuthority(state, binding, role, false),
+            catch: () => deny("Message recipient grant or scope changed"),
+          });
+          if (binding.authorizationGateId === undefined)
+            return yield* deny("Message endpoint has no original grant");
+          for (const record of [
+            binding,
+            role,
+            member,
+            m,
+            unique(binding.authorizationGateId),
+            ...(binding.specificationGateId === undefined
+              ? []
+              : [unique(binding.specificationGateId)]),
+            ...(binding.planGateId === undefined ? [] : [unique(binding.planGateId)]),
+          ])
+            yield* audit(record);
+          return { binding, role, membership: m, task };
+        },
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.failCause(
+                Cause.fromReasons<never>(cause.reasons.filter(Cause.isInterruptReason)),
+              )
+            : Effect.fail(deny("Message endpoint facts are unavailable")),
+        ),
+      );
+      const issuances = new Set<string>();
+      const auditIssuance = Effect.fn("messageSelection.auditIssuance")(function* (
+        birth: { record: Membership; commandId: string },
+        grant: Extract<ProjectTeamRecord, { kind: "gate" }>,
+      ) {
+        if (issuances.has(birth.commandId)) return;
+        const receipt = receipts.get(birth.commandId);
+        if (!receipt || receipt.actorKind !== "human" || birth.record.parentTaskId === undefined)
+          return yield* deny("Message lineage has no original human issuance");
+        const metadata = yield* sql<{ size: number }>`
+          SELECT length(CAST(payload_json AS BLOB)) AS size
+          FROM project_work_events WHERE project_id=${state.projectId} AND sequence < (
+            SELECT MIN(sequence) FROM project_work_events
+            WHERE project_id=${state.projectId} AND command_id=${birth.commandId}
+          ) ORDER BY sequence LIMIT 8193`;
+        if (
+          metadata.length > 8192 ||
+          metadata.some(
+            (row) => !Number.isSafeInteger(row.size) || row.size < 0 || row.size > 262144,
+          )
+        )
+          return yield* deny("Message issuance prefix exceeds its bound");
+        const prefixBytes = metadata.reduce((total, row) => total + row.size, 0);
+        if (prefixBytes > 4194304 - bytes)
+          return yield* deny("Message issuance bytes exceed their bound");
+        const prefix = yield* sql<{ payload: string | null }>`
+          SELECT CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json END AS payload
+          FROM project_work_events WHERE project_id=${state.projectId} AND sequence < (
+            SELECT MIN(sequence) FROM project_work_events
+            WHERE project_id=${state.projectId} AND command_id=${birth.commandId}
+          ) ORDER BY sequence LIMIT 8193`;
+        if (prefix.length !== metadata.length || prefix.some((row) => row.payload === null))
+          return yield* deny("Message issuance prefix exceeds its bound");
+        bytes += prefix.reduce(
+          (total, row) => total + Buffer.byteLength(row.payload ?? "", "utf8"),
+          0,
+        );
+        if (bytes > 4194304) return yield* deny("Message issuance bytes exceed their bound");
+        yield* Effect.try({
+          try: () => {
+            const before = applyProjectWorkEvents(
+              emptyProjectWorkReducerState(state.projectId),
+              prefix.map((row) => decodeProjectWorkEvent(decodeUnknownJson(row.payload))),
+            );
+            const parent = before.tasks.find((task) => task.taskId === birth.record.parentTaskId);
+            const created = receipt.events.filter(
+              (event) => event.type === "project-work.task.created",
+            );
+            const event = created[0];
+            if (
+              !parent ||
+              created.length !== 1 ||
+              event?.type !== "project-work.task.created" ||
+              birth.record.assignment === undefined
+            )
+              throw deny("Message original issued task is unavailable");
+            const child = decodeMessageTask(event.task);
+            if (child.taskId !== birth.record.taskId || child.summary === undefined)
+              throw deny("Message original issued task changed");
+            const fields = {
+              projectId: ProjectId.make(state.projectId),
+              taskId: parent.taskId,
+              commandId: CommandId.make(birth.commandId),
+              expectedRevision: before.revision,
+              expectedTaskRevision: parent.revision,
+              objective: child.summary,
+              outputDescriptions: birth.record.assignment.outputDescriptions,
+            };
+            const candidates: ProjectTeamGuidedIntent[] = [];
+            if (grant.gate === "investigation") {
+              const base = { ...fields, type: "project-team.investigation.start" as const };
+              candidates.push(decodeGuidedIntent(base));
+              const issues = (before.foundationRecords ?? []).filter(
+                (record) => record.kind === "issue",
+              );
+              if (issues.length > 128)
+                throw deny("Message issuance issue candidates exceed their bound");
+              for (const issue of issues)
+                candidates.push(
+                  decodeGuidedIntent({
+                    ...base,
+                    issueRecordId: issue.recordId,
+                    expectedIssueRevision: issue.revision,
+                  }),
+                );
+            } else {
+              const inherited = grant.assignmentAuthorization;
+              const specificationGate = before.foundationRecords?.find(
+                (record) =>
+                  record.kind === "gate" &&
+                  record.recordId === inherited?.parentSpecificationGateId,
+              );
+              if (!inherited || specificationGate?.kind !== "gate")
+                throw deny("Message original assignment parent approval is unavailable");
+              const parentPlan = inherited.parentPlan;
+              const plan = before.foundationRecords?.find(
+                (record) =>
+                  record.kind === "plan-revision" && record.recordId === parentPlan?.recordId,
+              );
+              const planGate = before.foundationRecords?.find(
+                (record) => record.kind === "gate" && record.recordId === parentPlan?.gateId,
+              );
+              if (parentPlan && (plan?.kind !== "plan-revision" || planGate?.kind !== "gate"))
+                throw deny("Message original assignment plan is unavailable");
+              candidates.push(
+                decodeGuidedIntent({
+                  ...fields,
+                  type: "project-team.assignment.start",
+                  assignmentKind: inherited.assignmentKind,
+                  specRevision: parent.specRevision,
+                  specificationGateId: specificationGate.recordId,
+                  expectedSpecificationGateRevision: specificationGate.revision,
+                  ...(parentPlan && plan?.kind === "plan-revision" && planGate?.kind === "gate"
+                    ? {
+                        parentPlan: {
+                          recordId: plan.recordId,
+                          expectedRecordRevision: plan.revision,
+                          planRevision: plan.planRevision,
+                          gateId: planGate.recordId,
+                          expectedGateRevision: planGate.revision,
+                        },
+                      }
+                    : {}),
+                }),
+              );
+            }
+            const matches = candidates.filter((intent) => {
+              const command: ProjectWorkCommand = {
+                type: "project-work.foundation.commit",
+                projectId: intent.projectId,
+                commandId: intent.commandId,
+                expectedRevision: intent.expectedRevision,
+                attribution: grant.attribution,
+                committedAt: receipt.createdAt,
+                records: [],
+                guided: { intent },
+              };
+              const fingerprint = receipt.fingerprint.startsWith("project-team-intent:")
+                ? "project-team-intent:" +
+                  NodeCrypto.createHash("sha256")
+                    .update(
+                      canonicalProjectWorkPayload({
+                        intent,
+                        actor: {
+                          kind: receipt.actorKind,
+                          ...(receipt.actorId === null ? {} : { id: receipt.actorId }),
+                        },
+                        source: {
+                          kind: receipt.sourceKind,
+                          ...(receipt.sourceId === null ? {} : { id: receipt.sourceId }),
+                        },
+                        managed: null,
+                      }),
+                    )
+                    .digest("hex")
+                : projectWorkCommandFingerprint(command);
+              return (
+                fingerprint === receipt.fingerprint &&
+                canonicalProjectWorkPayload(decideProjectWorkCommand(before, command)) ===
+                  canonicalProjectWorkPayload(receipt.events)
+              );
+            });
+            if (matches.length !== 1)
+              throw deny("Message lineage differs from its authenticated original issuance");
+          },
+          catch: () => deny("Message original issuance is invalid"),
+        });
+        issuances.add(birth.commandId);
+      });
+      const lineage = Effect.fn("messageSelection.lineage")(function* (taskId: string) {
+        const path: string[] = [];
+        while (true) {
+          if (path.includes(taskId) || path.length >= 9)
+            return yield* deny("Message task lineage is cyclic or exceeds its bound");
+          path.push(taskId);
+          const m = membership(taskId);
+          yield* audit(m);
+          const birth = yield* audit(m, true);
+          if (
+            birth.record.kind !== "task-membership" ||
+            birth.record.parentTaskId !== m.parentTaskId
+          )
+            return yield* deny("Message original task lineage changed");
+          if (m.parentTaskId === undefined) return path;
+          const originalGrantId = birth.record.assignment?.authorizationGateId;
+          if (originalGrantId === undefined)
+            return yield* deny("Message child has no original human-issued grant");
+          const grantFact = yield* audit(unique(originalGrantId), true);
+          const grant = grantFact.record;
+          if (
+            grant.kind !== "gate" ||
+            grantFact.commandId !== birth.commandId ||
+            grant.status !== "approved" ||
+            grant.attribution.actor.kind !== "human" ||
+            grant.taskId !== m.taskId ||
+            (grant.gate !== "investigation" && grant.gate !== "assignment")
+          )
+            return yield* deny("Message child lineage is not human-approved");
+          const suffix =
+            grant.gate === "investigation"
+              ? "research"
+              : grant.assignmentAuthorization?.assignmentKind;
+          if (
+            suffix === undefined ||
+            m.taskId !== projectTeamDerivedRecordId(birth.commandId, suffix) ||
+            grant.recordId !==
+              projectTeamDerivedRecordId(
+                birth.commandId,
+                grant.gate === "investigation" ? "investigation" : "assignment",
+              ) ||
+            (grant.assignmentAuthorization !== undefined &&
+              grant.assignmentAuthorization.parentTaskId !== m.parentTaskId)
+          )
+            return yield* deny("Message lineage differs from its issued task");
+          if (grant.gate === "assignment")
+            yield* Effect.try({
+              try: () => assertProjectTeamAssignmentAuthorization(state, grant),
+              catch: () => deny("Message inherited parent approval changed"),
+            });
+          yield* auditIssuance({ ...birth, record: birth.record }, grant);
+          taskId = m.parentTaskId;
+        }
+      });
+      const qualify = Effect.fn("messageSelection.qualify")(
+        function* (binding: Binding) {
+          if (binding.projectId !== sender.projectId || binding.memberId === sender.memberId)
+            return yield* deny("Message recipient must be another project teammate");
+          const target = yield* endpoint(binding);
+          const ownMembership = membership(sender.taskId);
+          let relation: ProjectTeamMessageRecipient["relation"];
+          if (binding.taskId === sender.taskId) relation = "same-task";
+          else {
+            const activeMission = yield* Effect.gen(function* () {
+              if (
+                ownMembership.missionId === undefined ||
+                ownMembership.missionId !== target.membership.missionId
+              )
+                return false;
+              const mission = unique(ownMembership.missionId);
+              if (mission.kind !== "mission" || mission.status !== "active") return false;
+              yield* audit(ownMembership);
+              yield* audit(mission);
+              return true;
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterrupts(cause)
+                  ? Effect.failCause(
+                      Cause.fromReasons<never>(cause.reasons.filter(Cause.isInterruptReason)),
+                    )
+                  : Effect.succeed(false),
+              ),
+            );
+            if (activeMission) relation = "active-mission";
+            else {
+              const own = yield* lineage(sender.taskId);
+              const peer = yield* lineage(binding.taskId);
+              if (!own.some((id) => peer.includes(id)))
+                return yield* deny("Message tasks have no approved shared lineage");
+              relation = "approved-tree";
+            }
+          }
+          return {
+            memberId: binding.memberId,
+            taskId: binding.taskId,
+            taskTitle: target.task.title,
+            expectedRecipientMembershipRevision: target.membership.revision,
+            relation,
+          } satisfies ProjectTeamMessageRecipient;
+        },
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.failCause(
+                Cause.fromReasons<never>(cause.reasons.filter(Cause.isInterruptReason)),
+              )
+            : Effect.fail(deny("Message recipient is unavailable or not eligible")),
+        ),
+      );
+      return { qualify, audit, membership, endpoint };
+    };
+    const readMessageRecipientsInTransaction = Effect.fn(
+      "ProjectTeamAuthorization.readMessageRecipientsInTransaction",
+    )(function* (principal: ProjectTeamPrincipal) {
+      yield* messageLoan();
+      const own = yield* resolve(principal, true);
+      if (!own) return yield* deny("Message addresses require original managed authority");
+      if (!messageWriteGranted(own.binding, own.role))
+        return {
+          recipients: [],
+          omitted: 0,
+          degraded: false,
+        } satisfies ProjectTeamMessageRecipients;
+      const bindings = (own.state.foundationRecords ?? []).filter(
+        (r): r is Binding =>
+          r.kind === "run-binding" && r.status === "running" && r.memberId !== own.binding.memberId,
+      );
+      const selector = messageSelection(own.state, own.binding, yield* Clock.currentTimeMillis);
+      const recipients: ProjectTeamMessageRecipient[] = [];
+      let omitted = Math.max(0, bindings.length - 128);
+      let degraded = bindings.length > 128;
+      let bytes = 0;
+      for (const binding of [...bindings]
+        .sort((a, b) => a.recordId.localeCompare(b.recordId))
+        .slice(0, 128)) {
+        const result = yield* selector.qualify(binding).pipe(Effect.result);
+        if (result._tag === "Failure") {
+          omitted++;
+          degraded = true;
+          continue;
+        }
+        const entry = result.success;
+        const size = Buffer.byteLength(canonicalProjectWorkPayload(entry), "utf8");
+        if (
+          Buffer.byteLength(entry.taskTitle, "utf8") > 1024 ||
+          bytes + size > 8192 ||
+          recipients.length >= 64 ||
+          recipients.some((r) => r.memberId === entry.memberId && r.taskId === entry.taskId)
+        ) {
+          omitted++;
+          degraded = true;
+          continue;
+        }
+        recipients.push(entry);
+        bytes += size;
+      }
+      return { recipients, omitted, degraded } satisfies ProjectTeamMessageRecipients;
+    });
+    const compileMessageRequest = Effect.fn("ProjectTeamAuthorization.compileMessageRequest")(
+      function* (
+        state: ProjectWorkReducerState,
+        input: MessageRequest,
+        attribution: ProjectWorkAttribution,
+        credential: ProjectTeamCredential,
+        beforeSequence?: number,
+      ) {
+        const binding = (state.foundationRecords ?? []).find(
+          (r) => r.kind === "run-binding" && r.recordId === credential.bindingId,
+        );
+        const role =
+          binding?.kind === "run-binding"
+            ? state.foundationRecords?.find(
+                (r) => r.kind === "role-revision" && r.recordId === binding.roleRevisionId,
+              )
+            : undefined;
+        const task = state.tasks.find((t) => t.taskId === input.taskId);
+        if (
+          binding?.kind !== "run-binding" ||
+          role?.kind !== "role-revision" ||
+          !messageWriteGranted(binding, role) ||
+          attribution.actor.kind !== "agent" ||
+          attribution.actor.id !== managedActorId(credential) ||
+          binding.projectId !== input.projectId ||
+          binding.taskId !== input.taskId ||
+          binding.generation !== credential.generation ||
+          binding.providerInstanceId !== credential.providerInstanceId ||
+          binding.threadId !== credential.threadId ||
+          state.revision !== input.expectedRevision ||
+          task?.revision !== input.expectedTaskRevision ||
+          task.specRevision !== input.specRevision ||
+          binding.planRevision !== input.planRevision ||
+          binding.specRevision !== input.specRevision ||
+          input.body.trim().length === 0 ||
+          state.foundationRecords?.some((r) => r.recordId === input.messageId)
+        )
+          return yield* deny("Message sender, scope or request changed");
+        yield* Effect.try({
+          try: () => assertProjectTeamRunAuthority(state, binding, role, false),
+          catch: () => deny("Message sender authority changed"),
+        });
+        const targets = (state.foundationRecords ?? []).filter(
+          (r): r is Binding =>
+            r.kind === "run-binding" &&
+            r.memberId === input.recipientId &&
+            r.taskId === input.recipientTaskId &&
+            r.status === "running",
+        );
+        if (targets.length !== 1 || !targets[0])
+          return yield* deny("Message recipient is not uniquely assigned");
+        const selector = messageSelection(
+          state,
+          binding,
+          Date.parse(attribution.recordedAt),
+          beforeSequence,
+        );
+        yield* selector.endpoint(binding);
+        const selected = yield* selector.qualify(targets[0]);
+        if (
+          selected.expectedRecipientMembershipRevision !== input.expectedRecipientMembershipRevision
+        )
+          return yield* deny("Message recipient membership changed");
+        if (input.replyTo !== undefined) {
+          const incoming = (state.foundationRecords ?? []).find(
+            (r) => r.recordId === input.replyTo,
+          );
+          if (
+            incoming?.kind !== "message" ||
+            incoming.recipientId !== binding.memberId ||
+            incoming.taskId !== binding.taskId ||
+            incoming.senderId !== input.recipientId ||
+            incoming.status === "canceled"
+          )
+            return yield* deny("Message reply has no original incoming address");
+          yield* selector.audit(incoming);
+        }
+        for (const id of input.evidenceIds) {
+          const evidence = state.evidence.filter((e) => e.evidenceId === id);
+          const applicability = (state.foundationRecords ?? []).filter(
+            (r) => r.kind === "evidence-applicability" && r.evidenceId === id,
+          );
+          if (
+            evidence.length !== 1 ||
+            evidence[0]?.taskId !== binding.taskId ||
+            evidence[0]?.scopeHash !== binding.scopeHash ||
+            applicability.length > 1 ||
+            applicability.some(
+              (r) =>
+                r.kind !== "evidence-applicability" ||
+                r.status !== "current" ||
+                r.taskId !== binding.taskId ||
+                r.scopeHash !== binding.scopeHash ||
+                r.specRevision !== binding.specRevision ||
+                r.planRevision !== binding.planRevision,
+            )
+          )
+            return yield* deny("Message evidence is not applicable to its sender");
+          for (const record of applicability) yield* selector.audit(record);
+        }
+        return {
+          type: "project-work.foundation.commit",
+          commandId: input.commandId,
+          projectId: input.projectId,
+          expectedRevision: input.expectedRevision,
+          attribution,
+          committedAt: attribution.recordedAt,
+          records: [
+            decodeRecord({
+              kind: "message",
+              recordId: input.messageId,
+              projectId: input.projectId,
+              revision: 0,
+              generation: binding.generation,
+              updatedAt: attribution.recordedAt,
+              status: "queued",
+              commandId: input.commandId,
+              senderId: binding.memberId,
+              recipientId: input.recipientId,
+              taskId: input.recipientTaskId,
+              ...(selected.relation === "active-mission"
+                ? { missionId: selector.membership(binding.taskId).missionId }
+                : {}),
+              ...(input.replyTo === undefined ? {} : { replyTo: input.replyTo }),
+              body: input.body,
+              evidenceIds: [...input.evidenceIds],
+              deliveryGeneration: 0,
+              deliveryCursor: 0,
+            }),
+          ],
+        } satisfies ProjectWorkCommand;
+      },
+    );
     const capability = Effect.fn("ProjectTeamAuthorization.capability")(function* (
       principal: ProjectTeamPrincipal,
       requested: string,
@@ -634,6 +1416,7 @@ export const layer = Layer.effect(
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) {
+      if (input.type === "project-team.message.send") yield* messageLoan();
       if (input.type === "project-team.question.request") {
         const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
         const repository = yield* Effect.serviceOption(ProjectWorkRepository);
@@ -646,7 +1429,11 @@ export const layer = Layer.effect(
         )
           return yield* deny("Human question requires its original transaction");
       }
-      if (input.type === "project-team.question.request" && duplicate) {
+      if (
+        (input.type === "project-team.question.request" ||
+          input.type === "project-team.message.send") &&
+        duplicate
+      ) {
         if (
           principal.managed === undefined ||
           principal.actor.kind !== "agent" ||
@@ -676,16 +1463,59 @@ export const layer = Layer.effect(
           eventId: string;
           eventType: string;
           occurredAt: string;
+          sequence: number;
         }>`SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1048576 THEN payload_json END AS payload,
-          event_id AS eventId,event_type AS eventType,occurred_at AS occurredAt
+          event_id AS eventId,event_type AS eventType,occurred_at AS occurredAt,sequence
           FROM project_work_events WHERE project_id=${input.projectId} AND command_id=${input.commandId}
-          ORDER BY sequence ASC`;
+          ORDER BY sequence ASC LIMIT ${input.type === "project-team.message.send" ? 513 : -1}`;
         const preceding = yield* sql<{ payload: string | null }>`
           SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1048576 THEN payload_json END AS payload
           FROM project_work_events WHERE project_id=${input.projectId} AND sequence < (
             SELECT MIN(sequence) FROM project_work_events
             WHERE project_id=${input.projectId} AND command_id=${input.commandId}
-          ) ORDER BY sequence ASC`;
+          ) ORDER BY sequence ASC LIMIT ${input.type === "project-team.message.send" ? 8193 : -1}`;
+        let replayedMessage: ProjectWorkCommand | undefined;
+        if (input.type === "project-team.message.send") {
+          const restored = yield* Effect.try({
+            try: () => {
+              const receipt = receipts[0];
+              if (
+                receipts.length !== 1 ||
+                !receipt ||
+                rows.length === 0 ||
+                rows.length > 512 ||
+                preceding.length > 8192 ||
+                [...rows, ...preceding].reduce(
+                  (n, r) => n + Buffer.byteLength(r.payload ?? "", "utf8"),
+                  0,
+                ) > 16777216
+              )
+                throw deny("Original message history exceeds its bound");
+              return {
+                before: applyProjectWorkEvents(
+                  emptyProjectWorkReducerState(input.projectId),
+                  preceding.map((r) => decodeProjectWorkEvent(decodeUnknownJson(r.payload))),
+                ),
+                attribution: decodeAttribution({
+                  actor: { kind: receipt.actorKind, id: receipt.actorId },
+                  source: {
+                    kind: receipt.sourceKind,
+                    ...(receipt.sourceId === null ? {} : { id: receipt.sourceId }),
+                  },
+                  recordedAt: receipt.createdAt,
+                }),
+              };
+            },
+            catch: () => deny("Original message history is invalid"),
+          });
+          replayedMessage = yield* compileMessageRequest(
+            restored.before,
+            input,
+            restored.attribution,
+            credential,
+            rows[0]?.sequence,
+          );
+        }
         return yield* Effect.try({
           try: () => {
             const receipt = receipts[0];
@@ -724,7 +1554,11 @@ export const layer = Layer.effect(
               emptyProjectWorkReducerState(input.projectId),
               preceding.map((r) => decodeProjectWorkEvent(decodeUnknownJson(r.payload))),
             );
-            const command = compileQuestionRequest(before, input, originalAttribution, credential);
+            const command =
+              input.type === "project-team.message.send"
+                ? replayedMessage
+                : compileQuestionRequest(before, input, originalAttribution, credential);
+            if (command === undefined) throw deny("Original message reconstruction is missing");
             const expected = decideProjectWorkCommand(before, command);
             if (
               canonicalProjectWorkPayload(expected) !== canonicalProjectWorkPayload(original) ||
@@ -801,6 +1635,16 @@ export const layer = Layer.effect(
       }
       const authority = yield* resolve(principal);
       const state = authority?.state ?? (yield* stateFor(input.projectId));
+      if (input.type === "project-team.message.send") {
+        if (
+          authority === undefined ||
+          principal.managed === undefined ||
+          attribution.actor.kind !== principal.actor.kind ||
+          attribution.actor.id !== principal.actor.id
+        )
+          return yield* deny("Message requires authenticated managed authority");
+        return yield* compileMessageRequest(state, input, attribution, authority.credential);
+      }
       if (input.type === "project-team.question.request") {
         if (
           authority === undefined ||
@@ -1613,6 +2457,7 @@ export const layer = Layer.effect(
           }),
         ),
       resolve: (p) => guard(resolve(p)),
+      readMessageRecipientsInTransaction: (p) => guard(readMessageRecipientsInTransaction(p)),
       capability: (p, c, id) => guard(capability(p, c, id)),
       read: (p, i) => guard(read(p, i)),
       write: (p, c) => guard(write(p, c)),

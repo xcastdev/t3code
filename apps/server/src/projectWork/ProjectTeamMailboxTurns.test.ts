@@ -7,6 +7,9 @@ import {
   ProjectId,
   SkillCatalogRevision,
   OrchestrationEvent,
+  CommandId,
+  ProjectWorkTaskId,
+  ThreadId,
   type OrchestrationCommand,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -28,8 +31,14 @@ import {
   seed,
   scoped,
   restoreHistoricalBinding,
+  createManagedAssignment,
+  decodeRecord,
+  gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
+import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import {
   makeProjectTeamDispatchJournal,
@@ -852,6 +861,195 @@ it.effect("reflects only a drained accounted later prompt and replays the commit
       expect(state.tasks.find((t) => t.taskId === f.binding.taskId)?.state).toBe("in-progress");
     }),
   ),
+);
+
+it.effect(
+  "delivers an authenticated produced message in a later safe turn and retains exact send retries",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* laterFixture;
+      const before = yield* readCurrentState(f.sql, projectId);
+      expect(
+        before.foundationRecords?.find((r) => r.recordId === f.binding.recordId),
+      ).toMatchObject({ status: "running", sessionId: native.sessionId });
+      const originalRole = before.foundationRecords?.find(
+        (r) => r.kind === "role-revision" && r.recordId === f.binding.roleRevisionId,
+      );
+      if (originalRole?.kind !== "role-revision")
+        return yield* Effect.die("Missing original readonly recipient role");
+      const role = decodeRecord({
+        ...originalRole,
+        recordId: "later-sender-role",
+        roleId: "later-sender-role",
+        role: "implementer",
+        roleRevision: originalRole.roleRevision + 1,
+        revision: 0,
+        tools: ["project-work.write"],
+      });
+      if (role.kind !== "role-revision")
+        return yield* Effect.die("Invalid separately configured later sender role");
+      yield* f.commit(
+        [
+          { ...originalRole, revision: originalRole.revision + 1 },
+          role,
+          decodeRecord({
+            kind: "member",
+            projectId,
+            recordId: "later-sender",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "active",
+            name: "Actual later sender",
+            coordinator: false,
+            roleRevisionId: role.recordId,
+          }),
+        ],
+        "later-sender-configuration",
+      );
+      const sender = yield* createManagedAssignment({
+        taskId: ProjectWorkTaskId.make("later-sender-task"),
+        recordId: "later-sender-binding",
+        attemptId: "later-sender-attempt",
+        commandId: "later-sender-claim",
+        providerInstanceId,
+        threadId: ThreadId.make("later-sender-thread"),
+        role,
+        memberId: "later-sender",
+        status: "running",
+        sessionId: "later-sender-session",
+        configuration: { ...f.binding.configuration, toolIds: ["project-work.write"] },
+      });
+      const assigned = yield* readCurrentState(f.sql, projectId);
+      const memberships =
+        assigned.foundationRecords?.filter(
+          (r) =>
+            r.kind === "task-membership" &&
+            (r.taskId === sender.taskId || r.taskId === f.binding.taskId),
+        ) ?? [];
+      expect(memberships).toHaveLength(2);
+      yield* f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "later-produced-mission",
+          expectedRevision: assigned.revision,
+          attribution: {
+            actor: { kind: "human", id: "mailbox-human" },
+            source: { kind: "web", id: "mailbox-browser" },
+            recordedAt: at,
+          },
+          committedAt: at,
+          records: [
+            {
+              kind: "mission",
+              projectId,
+              recordId: "later-produced-mission",
+              revision: 0,
+              generation: 0,
+              updatedAt: at,
+              status: "active",
+              title: "Safe mailbox coordination",
+              objective: "Inform the existing running teammate",
+              requiredTaskIds: [sender.taskId, f.binding.taskId],
+            },
+            ...memberships.map((r) => ({
+              ...r,
+              revision: r.revision + 1,
+              missionId: "later-produced-mission",
+            })),
+          ],
+        }),
+      );
+      const auth = yield* ProjectTeamAuthorization;
+      const issued = yield* auth.issueCredential({
+        providerInstanceId,
+        threadId: sender.threadId,
+        bindingId: sender.recordId,
+      });
+      if (!issued) return yield* Effect.die("Missing later-message sender credential");
+      const principal = {
+        actor: { kind: "agent" as const, id: managedActorId(issued.credential) },
+        managed: issued.credential,
+      };
+      const state = yield* readCurrentState(f.sql, projectId);
+      const task = state.tasks.find((t) => t.taskId === sender.taskId)!;
+      const membership = state.foundationRecords?.find(
+        (r) => r.kind === "task-membership" && r.taskId === f.binding.taskId,
+      );
+      if (membership?.kind !== "task-membership")
+        return yield* Effect.die("Missing actual later recipient membership");
+      const intent = {
+        type: "project-team.message.send" as const,
+        commandId: CommandId.make("later-produced-message"),
+        projectId,
+        taskId: sender.taskId,
+        expectedRevision: state.revision,
+        expectedTaskRevision: task.revision,
+        specRevision: task.specRevision,
+        planRevision: sender.planRevision,
+        messageId: "later-produced-message",
+        recipientId: f.binding.memberId,
+        recipientTaskId: f.binding.taskId,
+        expectedRecipientMembershipRevision: membership.revision,
+        body: "Actual authenticated later findings",
+        evidenceIds: [],
+      };
+      const gateway = yield* ProjectWorkGateway;
+      const source = { kind: "mcp" as const, id: "produced-later-tool" };
+      const receipt = yield* gateway.write(intent, principal.actor, source, principal);
+      const selected = yield* f.turns.claim(f.snapshot);
+      if (selected._tag !== "Selected")
+        return yield* Effect.die("Expected actual produced message selection");
+      const request = selected.decision.request;
+      expect(request.prompt).toContain(intent.body);
+      const later = yield* f.operations.prepare(
+        { providerInstanceId, threadId },
+        request,
+        hash(request),
+        {
+          allocation: yield* f.allocation,
+          workerId: "produced-later-worker",
+          operationId: request.operationId,
+          resourceHash: selected.decision.resourceHash,
+        },
+      );
+      const sealed = yield* f.turns.seal({
+        operationId: request.operationId,
+        baseSystemText: "Original required scope",
+      });
+      expect(sealed.systemText).toContain(intent.body);
+      const input = yield* f.reserveInput(later);
+      yield* f.turns.bindInput({
+        operationId: request.operationId,
+        reservationId: input.reservationId,
+        encodedRequestSha256: "b".repeat(64),
+      });
+      expect((yield* f.turns.reflect({ operationId: request.operationId }))._tag).toBe("Pending");
+      yield* f.complete(later, { ...native, leafId: "produced-later-leaf" }, "success", [
+        yield* input.settle,
+      ]);
+      expect((yield* f.turns.reflect({ operationId: request.operationId }))._tag).toBe("Delivered");
+      expect((yield* f.messages)[0]).toMatchObject({
+        status: "delivered",
+        revision: 1,
+        deliveryCursor: 1,
+        senderId: sender.memberId,
+        taskId: f.binding.taskId,
+      });
+      const delivered = yield* readCurrentState(f.sql, projectId);
+      expect(yield* gateway.write(intent, principal.actor, source, principal)).toEqual(receipt);
+      const restarted = yield* makeProjectTeamMailboxTurns({
+        environmentId: "environment",
+        lookupInTransaction: f.operations.lookupInTransaction,
+      });
+      expect((yield* restarted.reflect({ operationId: request.operationId }))._tag).toBe(
+        "Retained",
+      );
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(delivered);
+      expect(originalRole.tools).toEqual([]);
+      expect(f.binding.configuration.toolIds).toEqual([]);
+    }).pipe(Effect.provide(ProjectWorkProjectionLive.pipe(Layer.provideMerge(gatewayRuntime)))),
 );
 
 const laterExecutionFixtureFor = (

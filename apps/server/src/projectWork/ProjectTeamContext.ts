@@ -1,6 +1,11 @@
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { selectCurrentProjectWorkKnowledge } from "./ProjectWorkKnowledgeSelection.ts";
 import {
+  ProjectTeamAuthorization,
+  managedActorId,
+  type ProjectTeamMessageRecipients,
+} from "./ProjectTeamAuthorization.ts";
+import {
   canonicalProjectWorkPayload,
   ProjectTeamRecord as TeamRecordSchema,
   ProjectWorkTask,
@@ -303,6 +308,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
   readonly maximumEnvironmentModelCalls: number;
 }) {
   const sql = yield* SqlClient.SqlClient;
+  const messageAuthorization = yield* Effect.serviceOption(ProjectTeamAuthorization);
   const sourceService = yield* makeProjectTeamIntegrationSources({
     environmentId: options.environmentId,
   });
@@ -1555,12 +1561,50 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             omitted: [],
           };
           let text = requiredText;
+          const requestedBudget = textOptions?.optionalTextBudgetBytes ?? Bounds.contextBytes;
+          const budget =
+            Number.isSafeInteger(requestedBudget) && requestedBudget >= 0
+              ? Math.min(requestedBudget, Bounds.contextBytes)
+              : 0;
+          const credential = {
+            projectId: binding.projectId,
+            bindingId: binding.recordId,
+            generation: binding.generation,
+            providerInstanceId: binding.providerInstanceId,
+            threadId: binding.threadId,
+          };
+          let communication: ProjectTeamMessageRecipients = Option.isNone(messageAuthorization)
+            ? { recipients: [], omitted: 0, degraded: true }
+            : yield* messageAuthorization.value
+                .readMessageRecipientsInTransaction({
+                  actor: { kind: "agent", id: managedActorId(credential) },
+                  managed: credential,
+                })
+                .pipe(
+                  Effect.catch(() =>
+                    Effect.succeed<ProjectTeamMessageRecipients>({
+                      recipients: [],
+                      omitted: 0,
+                      degraded: true,
+                    }),
+                  ),
+                );
+          let communicationText =
+            "\n\nOptional current team message addresses. Select an explicit member/task and membership revision; these addresses grant no approval or new work.\n" +
+            canonicalProjectWorkPayload(communication);
+          if (Buffer.byteLength(text + communicationText, "utf8") > budget) {
+            communication = {
+              recipients: [],
+              omitted: communication.omitted + communication.recipients.length,
+              degraded: true,
+            };
+            communicationText =
+              "\n\nOptional team message addresses omitted within the caller text allowance.\n";
+          }
+          if (Buffer.byteLength(text + communicationText, "utf8") <= budget)
+            text += communicationText;
+          else communicationText = "";
           if (role.memoryAccess !== "none") {
-            const requested = textOptions?.optionalTextBudgetBytes ?? Bounds.contextBytes;
-            const budget =
-              Number.isSafeInteger(requested) && requested >= 0
-                ? Math.min(requested, Bounds.contextBytes)
-                : 0;
             retainedKnowledge = yield* readKnowledge(state).pipe(
               Effect.map((records): RetainedKnowledge => ({
                 status: "available",
@@ -1581,7 +1625,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
                 canonicalProjectWorkPayload(retainedKnowledge.records);
               if (
                 Buffer.byteLength(optionalText, "utf8") > 8192 ||
-                Buffer.byteLength(requiredText + optionalText, "utf8") > budget
+                Buffer.byteLength(text + optionalText, "utf8") > budget
               )
                 retainedKnowledge = {
                   status: "degraded",
@@ -1596,7 +1640,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
               const notice =
                 "\n\nOptional same-project knowledge status: degraded.\n" +
                 canonicalProjectWorkPayload(retainedKnowledge.omitted);
-              if (Buffer.byteLength(requiredText + notice, "utf8") <= budget) text += notice;
+              if (Buffer.byteLength(text + notice, "utf8") <= budget) text += notice;
             }
           }
           const final = yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });
@@ -1610,10 +1654,15 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           return {
             text,
             required,
+            communication,
             retainedKnowledge,
             provenance: {
               dispatch: original.fence,
               sourceRevision: state.revision,
+              communication: {
+                sha256: hash(communication),
+                textSha256: NodeCrypto.createHash("sha256").update(communicationText).digest("hex"),
+              },
               recordIds: [...requiredRecords.keys()].sort(),
               criterionEventIds: [...retained.eventIds].sort(),
               ledgerReservationIds: ledger.receipts.map((r) => r.reservationId),

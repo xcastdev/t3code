@@ -751,6 +751,17 @@ export const ProjectTeamWriteIntent = Schema.Union([
   }),
   Schema.Struct({
     ...IntentFields,
+    type: Schema.Literal("project-team.message.send"),
+    messageId: Text.check(Schema.isMaxLength(256)),
+    recipientId: Text.check(Schema.isMaxLength(256)),
+    recipientTaskId: ProjectWorkTaskId,
+    expectedRecipientMembershipRevision: NonNegativeInt,
+    body: Body,
+    replyTo: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+    evidenceIds: Ids,
+  }),
+  Schema.Struct({
+    ...IntentFields,
     type: Schema.Literal("project-team.question.request"),
     questionId: Text,
     targetGateId: Text,

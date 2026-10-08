@@ -39,6 +39,40 @@ const member = {
   roleRevisionId: "role",
 };
 describe("team contracts", () => {
+  it("accepts explicit recipient task messages without caller identity or delivery authority", () => {
+    const request = {
+      type: "project-team.message.send",
+      commandId: "send-one",
+      projectId: "project",
+      taskId: "sender-task",
+      expectedRevision: 3,
+      expectedTaskRevision: 1,
+      specRevision: 1,
+      planRevision: 1,
+      messageId: "message",
+      recipientId: "peer",
+      recipientTaskId: "peer-task",
+      expectedRecipientMembershipRevision: 2,
+      body: "Informational update",
+      evidenceIds: [],
+    };
+    expect(decodeIntent(request)).toEqual(request);
+    expect(decodeIntent({ ...request, replyTo: "incoming" })).toEqual({
+      ...request,
+      replyTo: "incoming",
+    });
+    for (const change of [
+      { senderId: "forged" },
+      { generation: 4 },
+      { status: "delivered" },
+      { attribution: {} },
+      { recipientTaskId: undefined },
+      { expectedRecipientMembershipRevision: -1 },
+      { body: "x".repeat(32001) },
+      { evidenceIds: Array.from({ length: 65 }, (_, i) => `e-${i}`) },
+    ])
+      expect(() => decodeIntent({ ...request, ...change })).toThrow();
+  });
   it("accepts bounded human-question requests without caller identity or approval fields", () => {
     const request = {
       type: "project-team.question.request",

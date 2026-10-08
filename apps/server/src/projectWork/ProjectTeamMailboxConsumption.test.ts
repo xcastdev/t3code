@@ -4,9 +4,13 @@ import {
   canonicalProjectWorkPayload,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamMessage,
+  CommandId,
+  ProjectWorkTaskId,
+  ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Context from "effect/Context";
+import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
@@ -20,8 +24,14 @@ import {
   seed,
   scoped,
   restoreHistoricalBinding,
+  createManagedAssignment,
+  decodeRecord,
+  gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
+import { ProjectTeamAuthorization, managedActorId } from "./ProjectTeamAuthorization.ts";
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
+import { ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import {
@@ -55,6 +65,7 @@ const native: PiNativeReference = {
 // Disposable SQL and controlled custody receipts only: no worker is started.
 const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   assignment = "Investigate the original approved task",
+  retainRoleReceipt = false,
 ) {
   const repository = yield* ProjectWorkRepository;
   const sql = yield* SqlClient.SqlClient;
@@ -87,6 +98,26 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
   if (role?.kind !== "role-revision") return yield* Effect.die("Missing original role");
   yield* restoreHistoricalBinding({ ...role, model });
+  if (retainRoleReceipt) {
+    const restored = yield* readCurrentState(sql, projectId);
+    const currentRole = restored.foundationRecords?.find(
+      (r) => r.kind === "role-revision" && r.recordId === role.recordId,
+    );
+    if (currentRole?.kind !== "role-revision")
+      return yield* Effect.die("Missing restored readonly role");
+    // Retain the current role before preparing the immutable operation authority.
+    yield* repository.execute(
+      decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "mailbox-original-role-receipt",
+        expectedRevision: restored.revision,
+        attribution,
+        committedAt: at,
+        records: [{ ...currentRole, revision: currentRole.revision + 1 }],
+      }),
+    );
+  }
   const fs = yield* FileSystem.FileSystem;
   const worktree = yield* fs.makeTempDirectoryScoped();
   const nativeRoot = yield* fs.makeTempDirectoryScoped();
@@ -388,6 +419,176 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   };
 });
 const fixture = fixtureWithAssignment();
+
+it.effect(
+  "delivers an authenticated produced message through the original sealed assignment exactly once",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixtureWithAssignment("Investigate the original approved task", true);
+      const before = yield* readCurrentState(f.sql, projectId);
+      expect(
+        before.foundationRecords?.find((r) => r.recordId === f.binding.recordId),
+      ).toMatchObject({ status: "running", sessionId: native.sessionId });
+      const originalRole = before.foundationRecords?.find(
+        (r) => r.kind === "role-revision" && r.recordId === f.binding.roleRevisionId,
+      );
+      if (originalRole?.kind !== "role-revision")
+        return yield* Effect.die("Missing original readonly recipient role");
+      const role = decodeRecord({
+        ...originalRole,
+        recordId: "produced-sender-role",
+        roleId: "produced-sender-role",
+        role: "implementer",
+        roleRevision: originalRole.roleRevision + 1,
+        revision: 0,
+        tools: ["project-work.write"],
+      });
+      if (role.kind !== "role-revision")
+        return yield* Effect.die("Invalid separately configured sender role");
+      yield* f.commit(
+        [
+          role,
+          decodeRecord({
+            kind: "member",
+            projectId,
+            recordId: "produced-sender",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "active",
+            name: "Actual sender",
+            coordinator: false,
+            roleRevisionId: role.recordId,
+          }),
+        ],
+        "produced-sender-configuration",
+      );
+      const sender = yield* createManagedAssignment({
+        taskId: ProjectWorkTaskId.make("produced-sender-task"),
+        recordId: "produced-sender-binding",
+        attemptId: "produced-sender-attempt",
+        commandId: "produced-sender-claim",
+        providerInstanceId,
+        threadId: ThreadId.make("produced-sender-thread"),
+        role,
+        memberId: "produced-sender",
+        status: "running",
+        sessionId: "produced-sender-session",
+        configuration: { ...f.binding.configuration, toolIds: ["project-work.write"] },
+      });
+      const assigned = yield* readCurrentState(f.sql, projectId);
+      const memberships =
+        assigned.foundationRecords?.filter(
+          (r) =>
+            r.kind === "task-membership" &&
+            (r.taskId === sender.taskId || r.taskId === f.binding.taskId),
+        ) ?? [];
+      expect(memberships).toHaveLength(2);
+      yield* f.repository.execute(
+        decodeCommit({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "produced-message-mission",
+          expectedRevision: assigned.revision,
+          attribution: {
+            actor: { kind: "human", id: "mailbox-human" },
+            source: { kind: "web", id: "mailbox-browser" },
+            recordedAt: at,
+          },
+          committedAt: at,
+          records: [
+            {
+              kind: "mission",
+              projectId,
+              recordId: "produced-message-mission",
+              revision: 0,
+              generation: 0,
+              updatedAt: at,
+              status: "active",
+              title: "Original mailbox coordination",
+              objective: "Inform the actual assigned recipient",
+              requiredTaskIds: [sender.taskId, f.binding.taskId],
+            },
+            ...memberships.map((r) => ({
+              ...r,
+              revision: r.revision + 1,
+              missionId: "produced-message-mission",
+            })),
+          ],
+        }),
+      );
+      const auth = yield* ProjectTeamAuthorization;
+      const issued = yield* auth.issueCredential({
+        providerInstanceId,
+        threadId: sender.threadId,
+        bindingId: sender.recordId,
+      });
+      if (!issued) return yield* Effect.die("Missing produced-message sender credential");
+      const principal = {
+        actor: { kind: "agent" as const, id: managedActorId(issued.credential) },
+        managed: issued.credential,
+      };
+      const state = yield* readCurrentState(f.sql, projectId);
+      const task = state.tasks.find((t) => t.taskId === sender.taskId)!;
+      const membership = state.foundationRecords?.find(
+        (r) => r.kind === "task-membership" && r.taskId === f.binding.taskId,
+      );
+      if (membership?.kind !== "task-membership")
+        return yield* Effect.die("Missing actual mailbox recipient membership");
+      const request = {
+        type: "project-team.message.send" as const,
+        commandId: CommandId.make("produced-assignment-message"),
+        projectId,
+        taskId: sender.taskId,
+        expectedRevision: state.revision,
+        expectedTaskRevision: task.revision,
+        specRevision: task.specRevision,
+        planRevision: sender.planRevision,
+        messageId: "produced-assignment-message",
+        recipientId: f.binding.memberId,
+        recipientTaskId: f.binding.taskId,
+        expectedRecipientMembershipRevision: membership.revision,
+        body: "Actual authenticated sender findings",
+        evidenceIds: [],
+      };
+      const gateway = yield* ProjectWorkGateway;
+      const source = { kind: "mcp" as const, id: "produced-mailbox-tool" };
+      const receipt = yield* gateway.write(request, principal.actor, source, principal);
+      expect((yield* f.messages)[0]).toMatchObject({
+        senderId: sender.memberId,
+        taskId: f.binding.taskId,
+        status: "queued",
+        deliveryCursor: 0,
+      });
+      const sealed = yield* f.mailbox.sealInitialAssignment({
+        operationId: f.request.assignmentOperationId,
+        baseSystemText: "Original required assignment",
+      });
+      expect(sealed.systemText).toContain(request.body);
+      const input = yield* f.reserveInput;
+      yield* f.mailbox.bindRequestInput({
+        operationId: f.request.assignmentOperationId,
+        reservationId: input.reservationId,
+        encodedRequestSha256: "b".repeat(64),
+      });
+      yield* f.complete(f.prompt, { ...native, leafId: "produced-message-leaf" }, "success", [
+        yield* input.settle,
+      ]);
+      expect((yield* f.mailbox.reflectAssignment(f.snapshot)).status).toBe("delivered");
+      expect((yield* f.messages)[0]).toMatchObject({
+        status: "delivered",
+        revision: 1,
+        deliveryCursor: 1,
+      });
+      const delivered = yield* readCurrentState(f.sql, projectId);
+      expect(yield* gateway.write(request, principal.actor, source, principal)).toEqual(receipt);
+      const restarted = yield* makeProjectTeamMailboxConsumption({ environmentId: "environment" });
+      expect((yield* restarted.reflectAssignment(f.snapshot)).status).toBe("unchanged");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(delivered);
+      expect(originalRole.tools).toEqual([]);
+      expect(f.binding.configuration.toolIds).toEqual([]);
+    }).pipe(Effect.provide(ProjectWorkProjectionLive.pipe(Layer.provideMerge(gatewayRuntime)))),
+);
 
 it.effect(
   "seals only original queued messages before assignment transport without marking delivery",

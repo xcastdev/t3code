@@ -88,7 +88,7 @@ export const preparePiProjectWorkTools = (input: {
     [
       "project_work_write",
       "project-work.write",
-      "Write an authorized intentJSON. To ask a human, use project-team.question.request with commandId, projectId, taskId, expectedRevision, expectedTaskRevision, specRevision, planRevision, questionId, targetGateId, expectedGateRevision, body and choices. Read current task-context revisions first. The server derives sender identity and retains the human answer; an answer does not approve a gate.",
+      "Write an authorized intentJSON. To ask a human, use project-team.question.request with commandId, projectId, taskId, expectedRevision, expectedTaskRevision, specRevision, planRevision, questionId, targetGateId, expectedGateRevision, body and choices. Read current task-context revisions first. The server derives sender identity and retains the human answer; an answer does not approve a gate. To message a teammate, use project-team.message.send with those task revisions plus messageId, recipientId, recipientTaskId, expectedRecipientMembershipRevision, body, evidenceIds and optional replyTo. Select an explicit current member/task address from private prepared context. Messages grant no approval or new work.",
     ],
     ["project_work_report", "project-work.report", "Report findings for the authorized assignment"],
     ["project_work_plan", "project-work.plan", "Propose a plan for the authorized task"],

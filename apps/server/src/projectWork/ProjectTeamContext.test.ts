@@ -70,6 +70,7 @@ const makeFixture = (
   readonlyKind?: "planning" | "review" | "investigation",
   verified = false,
   memoryAccess: "none" | "project" | "shared" = "none",
+  messageAddresses = false,
 ) =>
   Effect.gen(function* () {
     const repository = yield* ProjectWorkRepository;
@@ -177,8 +178,14 @@ const makeFixture = (
     const result = parentVerification
       ? { _tag: "Failure" as const }
       : yield* seed(role, "reserved", {
-          roleTools: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
-          toolIds: role === "integrator" || readonlyKind ? ["pi.read"] : ["pi.read", "pi.write"],
+          roleTools:
+            role === "integrator" || readonlyKind
+              ? ["pi.read"]
+              : ["pi.read", "pi.write", ...(messageAddresses ? ["project-work.write"] : [])],
+          toolIds:
+            role === "integrator" || readonlyKind
+              ? ["pi.read"]
+              : ["pi.read", "pi.write", ...(messageAddresses ? ["project-work.write"] : [])],
           issueCredential: false,
         }).pipe(
           Effect.provideService(ProjectWorkRepository, {
@@ -651,6 +658,127 @@ const retainedWriter = Effect.fn("contextFixture.retainedWriter")(function* (dec
 });
 const withRetainedGateway = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
+
+it.effect(
+  "private communication addresses survive memory none and degrade without hiding required context",
+  () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeFixture("implementer", 2, undefined, false, "none", true);
+        const before = yield* readCurrentState(f.sql, projectId);
+        const own =
+          f.snapshot.intent.request.claim.transition?.kind === "claim"
+            ? f.snapshot.intent.request.claim.transition.binding
+            : undefined;
+        const role = before.foundationRecords?.find(
+          (r) => r.kind === "role-revision" && r.recordId === own?.roleRevisionId,
+        );
+        const member = before.foundationRecords?.find(
+          (r) => r.kind === "member" && r.recordId === own?.memberId,
+        );
+        if (!own || role?.kind !== "role-revision" || member?.kind !== "member")
+          return yield* Effect.die("Missing original communication owner");
+        yield* f.change({ ...member, recordId: "context-message-peer", coordinator: false });
+        const peer = yield* createManagedAssignment({
+          taskId: ProjectWorkTaskId.make("context-message-task"),
+          recordId: "context-message-binding",
+          attemptId: "context-message-attempt",
+          commandId: "context-message-claim",
+          providerInstanceId: own.providerInstanceId,
+          threadId: ThreadId.make("context-message-thread"),
+          role,
+          status: "running",
+          configuration: own.configuration,
+          memberId: "context-message-peer",
+          sessionId: "context-message-session",
+        });
+        const issued = yield* readCurrentState(f.sql, projectId);
+        const memberships =
+          issued.foundationRecords?.filter(
+            (r) =>
+              r.kind === "task-membership" && (r.taskId === own.taskId || r.taskId === peer.taskId),
+          ) ?? [];
+        expect(memberships).toHaveLength(2);
+        yield* f.repository.execute(
+          yield* decodeCommit({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "context-message-mission",
+            expectedRevision: issued.revision,
+            committedAt: at,
+            attribution: {
+              actor: { kind: "human", id: "context-message-human" },
+              source: { kind: "web", id: "context-message-browser" },
+              recordedAt: at,
+            },
+            records: [
+              {
+                kind: "mission",
+                recordId: "context-message-mission",
+                projectId,
+                revision: 0,
+                generation: 0,
+                updatedAt: at,
+                status: "active",
+                title: "Communication",
+                objective: "Bounded coordination",
+                requiredTaskIds: [own.taskId, peer.taskId],
+              },
+              ...memberships.map((r) => ({
+                ...r,
+                missionId: "context-message-mission",
+                revision: r.revision + 1,
+              })),
+            ],
+          }),
+        );
+        const available = yield* f.reader.readRequired(f.snapshot);
+        expect(available.retainedKnowledge).toEqual({
+          status: "disabled",
+          records: [],
+          omitted: [],
+        });
+        expect(available.communication.recipients).toEqual([
+          expect.objectContaining({
+            memberId: peer.memberId,
+            taskId: peer.taskId,
+            relation: "active-mission",
+          }),
+        ]);
+        expect(available.text).toContain("context-message-peer");
+        expect(available.required).not.toHaveProperty("communication");
+        const protectedText =
+          "Required context from retained T3 authority. This read snapshot grants no new approval.\n" +
+          canonicalProjectWorkPayload(available.required);
+        const limited = yield* f.reader.readRequired(f.snapshot, {
+          optionalTextBudgetBytes: Buffer.byteLength(protectedText, "utf8"),
+        });
+        expect(limited.required).toEqual(available.required);
+        expect(limited.communication).toEqual({ recipients: [], omitted: 1, degraded: true });
+        expect(limited.text).toBe(protectedText);
+        expect(limited.provenance).not.toEqual(available.provenance);
+        const current = yield* readCurrentState(f.sql, projectId);
+        const membership = current.foundationRecords?.find(
+          (r) => r.kind === "task-membership" && r.taskId === peer.taskId,
+        );
+        if (membership?.kind !== "task-membership")
+          return yield* Effect.die("Missing current peer membership");
+        yield* f.change({
+          ...membership,
+          revision: membership.revision + 1,
+          controlState: "paused",
+        });
+        const paused = yield* readCurrentState(f.sql, projectId);
+        const omitted = yield* f.reader.readRequired(f.snapshot);
+        expect(omitted.required).toEqual({
+          ...available.required,
+          sourceRevision: paused.revision,
+        });
+        expect(omitted.communication).toEqual({ recipients: [], omitted: 1, degraded: true });
+        expect(omitted.provenance).not.toEqual(available.provenance);
+      }),
+    ),
+);
 
 it.effect(
   "retained context includes only accepted decisions and observes an accepted replacement",
