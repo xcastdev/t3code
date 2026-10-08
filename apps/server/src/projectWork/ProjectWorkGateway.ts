@@ -414,6 +414,28 @@ const makeProjectWorkGateway = Effect.gen(function* () {
   const teamAuthorization = yield* Effect.serviceOption(
     ProjectTeamAuthorization.ProjectTeamAuthorization,
   );
+  const usageServices = <A, E, R>(effect: Effect.Effect<A, E, R>) => {
+    const base = effect.pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, repository),
+    );
+    const authorized = Option.isSome(teamAuthorization)
+      ? base.pipe(
+          Effect.provideService(
+            ProjectTeamAuthorization.ProjectTeamAuthorization,
+            teamAuthorization.value,
+          ),
+        )
+      : base;
+    return Option.isSome(environmentIdentity)
+      ? authorized.pipe(
+          Effect.provideService(
+            ServerEnvironment.ServerEnvironmentIdentity,
+            environmentIdentity.value,
+          ),
+        )
+      : authorized;
+  };
 
   const verificationGate = (environmentId: string) =>
     Effect.gen(function* () {
@@ -512,7 +534,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             );
             if (!settings.projectWorkEnabled)
               return { ...base, availability: "unsupported" as const };
-            return yield* readProjectTeamSupervision(sql, base);
+            return yield* usageServices(readProjectTeamSupervision(sql, base));
           });
         case "issue-comments":
           return Effect.fail(
@@ -521,12 +543,16 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             ),
           );
         case "foundation-records":
-          return query.listFoundationRecords({
-            ...base,
-            ...(boundedInput.cursor === undefined ? {} : { cursor: boundedInput.cursor }),
-            ...(boundedInput.limit === undefined ? {} : { limit: boundedInput.limit }),
-            ...(boundedInput.recordKinds === undefined ? {} : { kinds: boundedInput.recordKinds }),
-          });
+          return usageServices(
+            query.listFoundationRecords({
+              ...base,
+              ...(boundedInput.cursor === undefined ? {} : { cursor: boundedInput.cursor }),
+              ...(boundedInput.limit === undefined ? {} : { limit: boundedInput.limit }),
+              ...(boundedInput.recordKinds === undefined
+                ? {}
+                : { kinds: boundedInput.recordKinds }),
+            }),
+          );
         case "snapshot":
           return query.snapshot(base.projectId);
         case "task":

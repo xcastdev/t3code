@@ -14,16 +14,20 @@ import type {
   ProjectWorkTaskId,
   ProjectWorkTaskContext,
   ProjectWorkWriteResult,
+  ProjectTeamBindingAccounting as BindingAccounting,
 } from "@t3tools/contracts";
 import {
   canonicalProjectWorkPayload,
   ProjectWorkVerificationJobRead,
   ProjectWorkReadIntent as ProjectWorkReadIntentSchema,
   ProjectTeamRecordPage,
+  ProjectTeamRunBinding,
   ProjectTeamSupervisionSummary,
+  ProjectTeamBindingAccounting,
   WS_METHODS,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
@@ -196,6 +200,91 @@ export function asProjectWorkVerificationJob(
 }
 
 const decodeFoundationPage = Schema.decodeUnknownOption(ProjectTeamRecordPage);
+const knownAccountingBinding = Schema.is(ProjectTeamRunBinding);
+const decodeBindingAccounting = Schema.decodeUnknownOption(ProjectTeamBindingAccounting, {
+  onExcessProperty: "error",
+});
+const decodeBindingAccountingPage = Schema.decodeUnknownOption(
+  Schema.Array(ProjectTeamBindingAccounting).check(Schema.isMaxLength(128)),
+);
+type AccountingOwner = {
+  readonly projectId: ProjectId;
+  readonly recordId: string;
+  readonly generation: number;
+  readonly taskId: string;
+  readonly attemptId: string;
+  readonly environmentId?: EnvironmentId;
+};
+
+/** Observations can change without changing the foundation's action revision. */
+export function asProjectTeamBindingAccounting(
+  value: unknown,
+  owner: AccountingOwner,
+): BindingAccounting | undefined {
+  const decoded = decodeBindingAccounting(value);
+  if (Option.isNone(decoded)) return undefined;
+  const accounting = decoded.value;
+  if (
+    accounting.projectId !== owner.projectId ||
+    accounting.bindingId !== owner.recordId ||
+    accounting.generation !== owner.generation ||
+    accounting.taskId !== owner.taskId ||
+    accounting.attemptId !== owner.attemptId ||
+    (owner.environmentId !== undefined && accounting.environmentId !== owner.environmentId)
+  )
+    return undefined;
+  if (accounting.availability !== "available") return accounting;
+  const coherent = (scope: typeof accounting.attempt) =>
+    Number.isSafeInteger(scope.chargedTokens + scope.reservedTokens) &&
+    scope.chargedTokens + scope.reservedTokens + scope.remainingTokens === scope.maximumTokens &&
+    scope.unknownChargedTokens <= scope.chargedTokens;
+  const { root, attempt, operation } = accounting;
+  const within = (scope: typeof attempt, parent: typeof attempt) =>
+    scope.maximumTokens <= parent.maximumTokens &&
+    scope.deadlineAtMs <= parent.deadlineAtMs &&
+    scope.chargedTokens <= parent.chargedTokens &&
+    scope.reservedTokens <= parent.reservedTokens &&
+    scope.unknownChargedTokens <= parent.unknownChargedTokens &&
+    scope.heldCalls <= parent.heldCalls &&
+    scope.quarantinedCalls <= parent.quarantinedCalls;
+  if (
+    !coherent(root) ||
+    !coherent(attempt) ||
+    !within(attempt, root) ||
+    (operation !== undefined && (!coherent(operation) || !within(operation, attempt)))
+  )
+    return undefined;
+  return accounting;
+}
+
+export function projectTeamAccountingCaptions(
+  accounting: BindingAccounting | undefined,
+): readonly string[] {
+  if (accounting === undefined || accounting.availability === "unavailable")
+    return ["Recorded token usage unavailable."];
+  if (accounting.availability === "not-admitted")
+    return ["No admitted execution or recorded token usage."];
+  const caption = (label: string, scope: typeof accounting.attempt) => {
+    const date = DateTime.make(scope.deadlineAtMs);
+    const deadline = Option.isSome(date)
+      ? DateTime.formatLocal(date.value, {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : "unavailable";
+    return `${label}: ${scope.chargedTokens} charged${scope.unknownChargedTokens > 0 ? ` (${scope.unknownChargedTokens} unknown)` : ""}, ${scope.reservedTokens} held; ${scope.remainingTokens}/${scope.maximumTokens} tokens remaining. Original deadline ${deadline}.${scope.quarantinedCalls > 0 ? ` ${scope.quarantinedCalls} quarantined calls.` : ""}`;
+  };
+  return [
+    caption("Shared root", accounting.root),
+    caption("This attempt", accounting.attempt),
+    ...(accounting.operation === undefined
+      ? []
+      : [caption("This operation", accounting.operation)]),
+  ];
+}
 // The shared Text codec trims strings; pagination tokens must remain opaque.
 const decodeFoundationCursor = Schema.decodeUnknownOption(
   Schema.Struct({
@@ -208,7 +297,11 @@ export function asProjectWorkFoundationPage(
   value: unknown,
   projectId: ProjectId,
 ): typeof ProjectTeamRecordPage.Type | null {
-  const decoded = decodeFoundationPage(value);
+  const separated =
+    value !== null && typeof value === "object" && "accounting" in value
+      ? (({ accounting, ...base }) => ({ base, accounting }))(value)
+      : { base: value, accounting: undefined };
+  const decoded = decodeFoundationPage(separated.base);
   if (Option.isNone(decoded)) return null;
   const page = decoded.value;
   if (
@@ -225,7 +318,24 @@ export function asProjectWorkFoundationPage(
   }
   const cursor = decodeFoundationCursor(value);
   if (Option.isNone(cursor)) return null;
-  return { ...page, ...cursor.value };
+  const accountingPage = decodeBindingAccountingPage(separated.accounting);
+  const accounting = Option.isNone(accountingPage)
+    ? []
+    : accountingPage.value.flatMap((observation) => {
+        const owners = page.items.filter(
+          (record) => record.kind === "run-binding" && record.recordId === observation.bindingId,
+        );
+        const owner = owners[0];
+        if (owners.length !== 1 || !knownAccountingBinding(owner)) return [];
+        const current = asProjectTeamBindingAccounting(observation, owner);
+        return current === undefined ? [] : [current];
+      });
+  const unique = new Set(accounting.map((item) => item.bindingId)).size === accounting.length;
+  return {
+    ...page,
+    ...cursor.value,
+    ...(accounting.length === 0 || !unique ? {} : { accounting }),
+  };
 }
 
 const decodeSupervisionSummary = Schema.decodeUnknownOption(ProjectTeamSupervisionSummary);
@@ -234,6 +344,7 @@ const decodeSupervisionSummary = Schema.decodeUnknownOption(ProjectTeamSupervisi
 export function asProjectTeamSupervisionSummary(
   value: unknown,
   projectId: ProjectId,
+  environmentId?: EnvironmentId,
 ): ProjectTeamSupervisionSummary | null {
   if (
     value === null ||
@@ -242,7 +353,31 @@ export function asProjectTeamSupervisionSummary(
     value.projectId !== projectId
   )
     return null;
-  const decoded = decodeSupervisionSummary(value);
+  const observations = new Map<string, unknown>();
+  const separated =
+    "bindings" in value &&
+    value.bindings !== null &&
+    typeof value.bindings === "object" &&
+    "items" in value.bindings &&
+    Array.isArray(value.bindings.items) &&
+    value.bindings.items.length <= 8
+      ? {
+          ...value,
+          bindings: {
+            ...value.bindings,
+            items: value.bindings.items.map((item: unknown) => {
+              if (item !== null && typeof item === "object" && "accounting" in item) {
+                const { accounting, ...base } = item;
+                if ("recordId" in item && typeof item.recordId === "string")
+                  observations.set(item.recordId, accounting);
+                return base;
+              }
+              return item;
+            }),
+          },
+        }
+      : value;
+  const decoded = decodeSupervisionSummary(separated);
   if (Option.isNone(decoded)) return null;
   const summary = decoded.value;
   if (summary.availability !== "available") return summary;
@@ -265,7 +400,30 @@ export function asProjectTeamSupervisionSummary(
     )
       return null;
   }
-  return summary;
+  return {
+    ...summary,
+    bindings: {
+      ...summary.bindings,
+      items: summary.bindings.items.map((binding) => {
+        if (
+          !binding.supported ||
+          !("taskId" in binding) ||
+          !("attemptId" in binding) ||
+          !("generation" in binding)
+        )
+          return binding;
+        const accounting = asProjectTeamBindingAccounting(observations.get(binding.recordId), {
+          projectId,
+          recordId: binding.recordId,
+          generation: binding.generation,
+          taskId: binding.taskId,
+          attemptId: binding.attemptId,
+          ...(environmentId === undefined ? {} : { environmentId }),
+        });
+        return accounting === undefined ? binding : { ...binding, accounting };
+      }),
+    },
+  };
 }
 
 /** Never probe an older server or start work reads for an unavailable environment. */
@@ -290,6 +448,7 @@ export interface ProjectWorkFoundationSnapshot {
   readonly complete: boolean;
   readonly nextCursor: string | null;
   readonly error: ProjectWorkFoundationPageError | null;
+  readonly accounting?: ReadonlyArray<BindingAccounting>;
 }
 
 /** Only a complete, coherent cursor chain is eligible for guided write decisions. */
@@ -306,6 +465,7 @@ export function combineProjectWorkFoundationPages(input: {
   });
   if (input.pages.length > 16) return fail("limit-exceeded");
   const records: ProjectTeamRecordRead[] = [];
+  const accounting: BindingAccounting[] = [];
   const recordIds = new Set<string>();
   const cursors = new Set<string>();
   let revision: number | null = null;
@@ -322,6 +482,7 @@ export function combineProjectWorkFoundationPages(input: {
     if (page === null) return fail("invalid-page");
     if (revision !== null && revision !== page.revision) return fail("revision-changed");
     revision = page.revision;
+    accounting.push(...(page.accounting ?? []));
     if (records.length + page.items.length > 2048) return fail("limit-exceeded");
     for (const record of page.items) {
       if (recordIds.has(record.recordId)) return fail("duplicate-record");
@@ -340,6 +501,7 @@ export function combineProjectWorkFoundationPages(input: {
     complete: revision !== null && nextCursor === null,
     nextCursor,
     error: null,
+    ...(accounting.length === 0 ? {} : { accounting }),
   };
 }
 

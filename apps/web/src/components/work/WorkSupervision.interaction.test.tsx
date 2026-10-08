@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   ProjectId,
   ProjectTeamSupervisionSummary,
+  type ProjectTeamBindingAccounting,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -49,7 +50,39 @@ const profile = {
   role: "implementer",
   model: "profile-model",
 };
+const accounting = {
+  availability: "available",
+  projectId,
+  environmentId,
+  bindingId: "binding-1",
+  generation: 1,
+  taskId: "task-1",
+  attemptId: "attempt-1",
+  observedAt: "2026-10-01T00:00:00.000Z",
+  root: {
+    taskId: "root",
+    maximumTokens: 1000,
+    deadlineAtMs: 2000,
+    chargedTokens: 200,
+    reservedTokens: 50,
+    unknownChargedTokens: 40,
+    remainingTokens: 750,
+    heldCalls: 1,
+    quarantinedCalls: 1,
+  },
+  attempt: {
+    maximumTokens: 400,
+    deadlineAtMs: 1500,
+    chargedTokens: 150,
+    reservedTokens: 10,
+    unknownChargedTokens: 40,
+    remainingTokens: 240,
+    heldCalls: 1,
+    quarantinedCalls: 1,
+  },
+} satisfies ProjectTeamBindingAccounting;
 const binding = {
+  accounting,
   ...metadata,
   recordId: "binding-1",
   status: "running",
@@ -221,6 +254,10 @@ describe("mounted web recorded supervision", () => {
     expect(host.textContent?.indexOf("Zeta mission")).toBeLessThan(
       host.textContent?.indexOf("Alpha mission") ?? 0,
     );
+    expect(host.textContent).toContain(
+      "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+    );
+    expect(host.textContent).toContain("Original deadline");
     expect(host.querySelectorAll("h3")).toHaveLength(6);
   });
   it("inspects each assignment and worker with the exact environment/project owner", async () => {

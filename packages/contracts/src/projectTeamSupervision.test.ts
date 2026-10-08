@@ -58,6 +58,54 @@ const binding = {
 };
 
 describe("bounded team supervision contract", () => {
+  it("keeps original accounting optional and rejects unsafe recorded totals", () => {
+    const accounting = {
+      availability: "available",
+      projectId: "project",
+      environmentId: "environment",
+      bindingId: "binding",
+      generation: 1,
+      taskId: "task",
+      attemptId: "attempt",
+      observedAt: "2026-10-01T00:00:00.000Z",
+      root: {
+        taskId: "root",
+        maximumTokens: 1000,
+        deadlineAtMs: 2000,
+        chargedTokens: 200,
+        reservedTokens: 50,
+        unknownChargedTokens: 40,
+        remainingTokens: 750,
+        heldCalls: 1,
+        quarantinedCalls: 1,
+      },
+      attempt: {
+        maximumTokens: 400,
+        deadlineAtMs: 1500,
+        chargedTokens: 150,
+        reservedTokens: 10,
+        unknownChargedTokens: 40,
+        remainingTokens: 240,
+        heldCalls: 1,
+        quarantinedCalls: 1,
+      },
+    };
+    const withAccounting = (value: unknown) => ({
+      ...summary,
+      bindings: { items: [{ ...binding, accounting: value }], hasMore: false },
+    });
+    expect(decode(withAccounting(accounting))).toMatchObject({
+      bindings: { items: [{ accounting }] },
+    });
+    expect(decode({ ...summary, bindings: { items: [binding], hasMore: false } })).toMatchObject({
+      revision: 7,
+    });
+    for (const chargedTokens of [-1, Number.MAX_SAFE_INTEGER + 1, "200"])
+      expect(() =>
+        decode(withAccounting({ ...accounting, root: { ...accounting.root, chargedTokens } })),
+      ).toThrow();
+  });
+
   it("keeps the frozen binding model separate from the inspected role model", () => {
     const result = decode({ ...summary, bindings: { items: [binding], hasMore: false } });
     expect(result).toMatchObject({

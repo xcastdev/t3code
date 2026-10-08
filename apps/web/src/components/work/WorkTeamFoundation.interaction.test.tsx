@@ -51,6 +51,7 @@ vi.mock("./WorkOverview", () => ({ WorkOverview: () => <div>Current overview</di
 import { WorkPage } from "./WorkPage";
 import { WorkTasks } from "./WorkTasks";
 import { WorkTeamFoundation } from "./WorkTeamFoundation";
+import { Team } from "../../features/projectTeams/Team";
 
 class TestConnectionError extends Data.TaggedError("TestConnectionError") {
   override readonly message = "connection lost";
@@ -339,7 +340,12 @@ describe("Work task entrypoint through mounted environment atoms", () => {
       if (settled) dispose();
     });
   }
-  async function render(connected = true, supported = true, target = projectId) {
+  async function render(
+    connected = true,
+    supported = true,
+    target = projectId,
+    targetTaskId?: typeof task.taskId,
+  ) {
     await act(async () => {
       root.render(
         <RegistryContext.Provider value={registry}>
@@ -350,6 +356,7 @@ describe("Work task entrypoint through mounted environment atoms", () => {
             enabled
             teamReadSupported
             guidedWritesSupported={supported}
+            {...(targetTaskId === undefined ? {} : { targetTaskId })}
           />
         </RegistryContext.Provider>,
       );
@@ -366,6 +373,119 @@ describe("Work task entrypoint through mounted environment atoms", () => {
   async function click(text: string) {
     await act(async () => button(text)?.click());
   }
+
+  interaction(
+    "shows paged accounting in Team and guided detail without changing task eligibility",
+    async () => {
+      const run = {
+        kind: "run-binding",
+        recordId: "binding-1",
+        projectId,
+        revision: 2,
+        generation: 0,
+        updatedAt: at,
+        status: "settled",
+        taskId: task.taskId,
+        attemptId: "attempt-1",
+        memberId: "member-1",
+        roleRevisionId: "role-1",
+        providerInstanceId: "pi",
+        threadId: "worker-1",
+        environmentId,
+        model: "frozen",
+        configuration: {
+          instructionsHash: "hash",
+          toolIds: [],
+          skillIds: [],
+          runtimeVersion: "1",
+          maxTokens: 1000,
+          maxDurationMs: 1000,
+          paidFallback: false,
+        },
+        worktree: "/workspace",
+        branch: "task",
+        leaseGeneration: 0,
+        specRevision: 0,
+        planRevision: 0,
+      };
+      const usage = {
+        availability: "available",
+        projectId,
+        environmentId,
+        bindingId: run.recordId,
+        generation: 0,
+        taskId: task.taskId,
+        attemptId: run.attemptId,
+        observedAt: at,
+        root: {
+          taskId: "root",
+          maximumTokens: 1000,
+          deadlineAtMs: 2000,
+          chargedTokens: 200,
+          reservedTokens: 50,
+          unknownChargedTokens: 40,
+          remainingTokens: 750,
+          heldCalls: 1,
+          quarantinedCalls: 1,
+        },
+        attempt: {
+          maximumTokens: 400,
+          deadlineAtMs: 1500,
+          chargedTokens: 150,
+          reservedTokens: 10,
+          unknownChargedTokens: 40,
+          remainingTokens: 240,
+          heldCalls: 1,
+          quarantinedCalls: 1,
+        },
+      };
+      foundations.set("", { projectId, revision, items: [...records, run], accounting: [usage] });
+      await render(true, true, projectId, task.taskId);
+      await act(async () =>
+        settle(atoms.taskContext({ environmentId, projectId, taskId: task.taskId })),
+      );
+      expect(host.textContent).toContain(
+        "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+      );
+      expect(button("Refine issue")?.disabled).toBe(false);
+      expect(writes).toEqual([]);
+      // Team is not the eight-row Portfolio preview: the ninth binding is retained
+      // by the complete foundation page and carries the same shared root observation.
+      const runs = Array.from({ length: 9 }, (_, index) => ({
+        ...run,
+        recordId: `binding-${index + 1}`,
+      }));
+      foundations.set("", {
+        projectId,
+        revision,
+        items: runs,
+        accounting: runs.map((item) => ({ ...usage, bindingId: item.recordId })),
+      });
+      await act(async () => {
+        registry.refresh(atoms.foundationPage({ environmentId, projectId }));
+        await settle(atoms.foundationPage({ environmentId, projectId }));
+      });
+      const readsBefore = reads.length;
+      await act(async () =>
+        root.render(
+          <RegistryContext.Provider value={registry}>
+            <Team
+              environmentId={environmentId}
+              projectId={projectId}
+              connected
+              enabled
+              supported
+              onOpenTask={() => {}}
+            />
+          </RegistryContext.Provider>,
+        ),
+      );
+      expect(host.textContent).toContain("binding-9");
+      expect(host.textContent?.match(/Shared root: 200 charged/gu)).toHaveLength(9);
+      expect(reads).toHaveLength(readsBefore);
+      expect(writes).toEqual([]);
+    },
+  );
 
   interaction(
     "places canonical intake above managed tasks and removes legacy bypass controls",

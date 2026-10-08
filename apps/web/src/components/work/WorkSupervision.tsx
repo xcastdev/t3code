@@ -1,4 +1,7 @@
-import { asProjectTeamSupervisionSummary } from "@t3tools/client-runtime/project-work";
+import {
+  asProjectTeamSupervisionSummary,
+  projectTeamAccountingCaptions,
+} from "@t3tools/client-runtime/project-work";
 import type {
   EnvironmentId,
   ProjectId,
@@ -125,7 +128,7 @@ function SupervisionSession(props: WorkSupervisionProps) {
   const ownerMatches =
     snapshot?.environmentId === props.environmentId && snapshot.data?.projectId === props.projectId;
   const decoded = ownerMatches
-    ? asProjectTeamSupervisionSummary(snapshot.data, props.projectId)
+    ? asProjectTeamSupervisionSummary(snapshot.data, props.projectId, props.environmentId)
     : null;
   const data = decoded?.availability === "available" ? decoded : null;
   const age = snapshot ? receiveAge(props.now, snapshot.receivedAt) : null;
@@ -339,6 +342,9 @@ function SupervisionSession(props: WorkSupervisionProps) {
                       Task {binding.taskId} · Attempt {binding.attemptId} · Member{" "}
                       {binding.memberId}
                     </Notice>
+                    {projectTeamAccountingCaptions(binding.accounting).map((caption) => (
+                      <Notice key={caption}>{caption}</Notice>
+                    ))}
                     <Notice>
                       Binding model: {binding.model} · Provider {binding.providerInstanceId} · Role
                       revision {binding.roleRevisionId}

@@ -112,7 +112,39 @@ const profile = {
   role: "implementer",
   model: "profile-model",
 };
+const accounting = {
+  availability: "available",
+  projectId,
+  environmentId,
+  bindingId: "binding-1",
+  generation: 1,
+  taskId: "task-1",
+  attemptId: "attempt-1",
+  observedAt: "2026-10-01T00:00:00.000Z",
+  root: {
+    taskId: "root",
+    maximumTokens: 1000,
+    deadlineAtMs: 2000,
+    chargedTokens: 200,
+    reservedTokens: 50,
+    unknownChargedTokens: 40,
+    remainingTokens: 750,
+    heldCalls: 1,
+    quarantinedCalls: 1,
+  },
+  attempt: {
+    maximumTokens: 400,
+    deadlineAtMs: 1500,
+    chargedTokens: 150,
+    reservedTokens: 10,
+    unknownChargedTokens: 40,
+    remainingTokens: 240,
+    heldCalls: 1,
+    quarantinedCalls: 1,
+  },
+};
 const binding = {
+  accounting,
   ...metadata,
   recordId: "binding-1",
   status: "running",
@@ -257,6 +289,54 @@ async function click(label: string) {
 }
 
 describe("actual project screen supervision read", () => {
+  it("renders assignment accounting from the existing complete Team read", async () => {
+    const run = {
+      kind: "run-binding",
+      projectId,
+      recordId: "binding-1",
+      revision: 1,
+      generation: 1,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      status: "settled",
+      taskId: "task-1",
+      attemptId: "attempt-1",
+      memberId: "member-1",
+      roleRevisionId: "role-1",
+      providerInstanceId: "pi",
+      threadId: "worker-1",
+      environmentId,
+      model: "frozen",
+      configuration: {
+        instructionsHash: "hash",
+        toolIds: [],
+        skillIds: [],
+        runtimeVersion: "1",
+        maxTokens: 1000,
+        maxDurationMs: 1000,
+        paidFallback: false,
+      },
+      worktree: "/workspace",
+      branch: "task",
+      leaseGeneration: 1,
+      specRevision: 1,
+      planRevision: 1,
+    };
+    fixture.foundationPage.mockReturnValue(
+      Atom.make(
+        AsyncResult.success({ projectId, revision: 10, items: [run], accounting: [accounting] }),
+      ),
+    );
+    await render();
+    expect(host.textContent).toContain("Task task-1 · attempt attempt-1");
+    expect(host.textContent).toContain(
+      "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+    );
+    expect(host.textContent).toContain("Original deadline");
+    expect(fixture.supervision).not.toHaveBeenCalled();
+    expect(fixture.command).not.toHaveBeenCalled();
+    expect(fixture.navigate).not.toHaveBeenCalled();
+  });
+
   it("withholds navigation for a non-finite receive timestamp without a render loop", async () => {
     first = Atom.make<AsyncResult.AsyncResult<unknown, unknown>>(
       AsyncResult.success(available, { timestamp: Number.NaN }),
@@ -280,12 +360,55 @@ describe("actual project screen supervision read", () => {
     expect(host.textContent).toContain("Current recorded summary");
     expect(host.textContent).toContain("Received 60 seconds ago.");
     expect(host.textContent).toContain("Binding model: frozen-model");
+    expect(host.textContent).toContain(
+      "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+    );
+    expect(host.textContent).toContain(
+      "This attempt: 150 charged (40 unknown), 10 held; 240/400 tokens remaining.",
+    );
     expect(host.textContent).not.toContain("Issue intake");
     expect(fixture.command).not.toHaveBeenCalled();
     await click("Show project work");
     expect(host.textContent).toContain("Issue intake");
     expect(host.textContent).not.toContain("Coordinator Alpha");
   });
+  it("refreshes scalar usage at the same revision without issuing work or per-worker reads", async () => {
+    await render();
+    await click("Show supervision");
+    await act(async () =>
+      registry.set(
+        first,
+        AsyncResult.success(
+          {
+            ...available,
+            bindings: {
+              ...available.bindings,
+              items: [
+                {
+                  ...binding,
+                  accounting: {
+                    ...accounting,
+                    root: { ...accounting.root, chargedTokens: 210, remainingTokens: 740 },
+                  },
+                },
+              ],
+            },
+          },
+          { timestamp: 1_000_000 },
+        ),
+      ),
+    );
+    expect(host.textContent).toContain("Shared root: 210 charged");
+    expect(host.textContent).not.toContain("Shared root: 200 charged");
+    fixture.connected = false;
+    await render();
+    expect(host.textContent).toContain("Shared root: 210 charged");
+    expect(host.textContent).toContain("Cached or unavailable summary");
+    expect(host.textContent).not.toContain("Inspect worker worker-1");
+    expect(fixture.command).not.toHaveBeenCalled();
+    expect(fixture.navigate).not.toHaveBeenCalled();
+  });
+
   it("keeps the actual receive time during waiting refresh and unrelated rerender", async () => {
     await render();
     await click("Show supervision");

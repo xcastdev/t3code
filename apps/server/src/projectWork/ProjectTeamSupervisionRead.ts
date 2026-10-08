@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import { toPersistenceDecodeError, toPersistenceSqlError } from "../persistence/Errors.ts";
+import { readProjectTeamBindingAccountingInTransaction } from "./ProjectTeamUsageRead.ts";
 
 const operation = "readProjectTeamSupervision";
 const Integer = Schema.Int.check(
@@ -375,6 +376,22 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
             };
           }),
         );
+        const accounting = yield* readProjectTeamBindingAccountingInTransaction(
+          sql,
+          projectId,
+          bindings.flatMap((binding) =>
+            "taskId" in binding && "attemptId" in binding && "generation" in binding
+              ? [
+                  {
+                    recordId: binding.recordId,
+                    taskId: binding.taskId,
+                    attemptId: binding.attemptId,
+                    generation: binding.generation,
+                  },
+                ]
+              : [],
+          ),
+        );
         const blockerRows =
           yield* sql`SELECT blocker.blocker_id AS recordId, blocker.task_id AS taskId,
       blocker.revision, substr(blocker.reason, 1, 240) AS reason, blocker.resolver
@@ -424,7 +441,13 @@ export const readProjectTeamSupervision = Effect.fn(operation)(function* (
           taskCounts,
           ...(coordinator === undefined ? {} : { coordinator }),
           missions: page(missions, missionRows.length > 5),
-          bindings: page(bindings, bindingRows.length > 8),
+          bindings: page(
+            bindings.map((binding) => {
+              const observation = accounting.find((item) => item.bindingId === binding.recordId);
+              return observation === undefined ? binding : { ...binding, accounting: observation };
+            }),
+            bindingRows.length > 8,
+          ),
           blockers: page(blockers, blockerRows.length > 5),
           questions: page(questions, questionRows.length > 5),
         };

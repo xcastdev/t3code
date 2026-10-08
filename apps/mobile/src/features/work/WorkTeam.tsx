@@ -7,6 +7,10 @@ import {
   type ProjectWorkWriteIntent,
 } from "@t3tools/contracts";
 import type { ProjectWorkFoundationSnapshot } from "@t3tools/client-runtime/project-work";
+import {
+  asProjectTeamBindingAccounting,
+  projectTeamAccountingCaptions,
+} from "@t3tools/client-runtime/project-work";
 import { useLayoutEffect, useMemo, useState, type ReactNode } from "react";
 import { View } from "react-native";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/AppText";
@@ -129,6 +133,14 @@ export function WorkTeam({
               <Notice>
                 Task {run.taskId} · attempt {run.attemptId}
               </Notice>
+              {projectTeamAccountingCaptions(
+                asProjectTeamBindingAccounting(
+                  foundation.accounting?.find((item) => item.bindingId === run.recordId),
+                  run,
+                ),
+              ).map((caption) => (
+                <Notice key={caption}>{caption}</Notice>
+              ))}
               <Notice>
                 Specification {run.specRevision} · plan {run.planRevision}
               </Notice>

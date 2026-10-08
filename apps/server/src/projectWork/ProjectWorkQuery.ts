@@ -1,9 +1,11 @@
 import { readProjectTeamPage } from "./ProjectTeamsPersistence.ts";
+import { readProjectTeamBindingAccountingInTransaction } from "./ProjectTeamUsageRead.ts";
 import {
   ProjectTeamRunBinding,
   ProjectTeamRecordRead,
   ProjectWorkKnowledge,
   ProjectWorkAttribution,
+  type ProjectTeamBindingAccounting,
 } from "@t3tools/contracts";
 import { PROJECT_WORK_KNOWLEDGE_CLOSURE_LIMIT } from "./ProjectWorkKnowledgeSelection.ts";
 import * as Context from "effect/Context";
@@ -124,6 +126,7 @@ export interface ProjectWorkQueryShape {
       nextCursor?: string;
       revision: number;
       projectId: string;
+      accounting?: ReadonlyArray<ProjectTeamBindingAccounting>;
     },
     ProjectionRepositoryError
   >;
@@ -1042,10 +1045,38 @@ const makeProjectWorkQuery = Effect.gen(function* () {
         Effect.gen(function* () {
           const revision = yield* getProjectRevision(input.projectId);
           const page = yield* readProjectTeamPage(sql, input);
-          return { ...page, projectId: input.projectId, revision };
+          const bindings = page.items.flatMap((record) =>
+            record.kind === "run-binding" &&
+            "taskId" in record &&
+            "attemptId" in record &&
+            "generation" in record
+              ? [
+                  {
+                    recordId: record.recordId,
+                    taskId: record.taskId,
+                    attemptId: record.attemptId,
+                    generation: record.generation,
+                  },
+                ]
+              : [],
+          );
+          const accounting = yield* readProjectTeamBindingAccountingInTransaction(
+            sql,
+            input.projectId,
+            bindings,
+          );
+          return {
+            ...page,
+            projectId: input.projectId,
+            revision,
+            ...(accounting.length === 0 ? {} : { accounting }),
+          };
         }),
       )
-      .pipe(Effect.mapError(toPersistenceSqlError("ProjectWorkQuery.listFoundationRecords")));
+      .pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.mapError(toPersistenceSqlError("ProjectWorkQuery.listFoundationRecords")),
+      );
   const getRunBindingForSession: ProjectWorkQueryShape["getRunBindingForSession"] = (input) =>
     Effect.gen(function* () {
       const rows = yield* sql<{

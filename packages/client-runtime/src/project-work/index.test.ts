@@ -241,6 +241,117 @@ const foundationPage = (items = [foundationRecord()], nextCursor?: string) => ({
 });
 
 describe("foundation snapshot validation", () => {
+  it("merges independent accounting at the same revision without changing foundation eligibility", () => {
+    const binding = {
+      projectId,
+      recordId: "binding",
+      revision: 2,
+      generation: 0,
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      kind: "run-binding",
+      status: "settled",
+      taskId: "task",
+      attemptId: "attempt",
+      memberId: "member",
+      roleRevisionId: "role",
+      providerInstanceId: "pi",
+      threadId: "thread",
+      environmentId: "environment",
+      model: "frozen",
+      configuration: {
+        instructionsHash: "hash",
+        toolIds: [],
+        skillIds: [],
+        runtimeVersion: "1",
+        maxTokens: 1000,
+        maxDurationMs: 1000,
+        paidFallback: false,
+      },
+      worktree: "/workspace",
+      branch: "task",
+      leaseGeneration: 0,
+      specRevision: 1,
+      planRevision: 1,
+    };
+    const usage = {
+      availability: "available",
+      projectId,
+      environmentId: "environment",
+      bindingId: "binding",
+      generation: 0,
+      taskId: "task",
+      attemptId: "attempt",
+      observedAt: "2026-10-01T00:00:00.000Z",
+      root: {
+        taskId: "root",
+        maximumTokens: 1000,
+        deadlineAtMs: 2000,
+        chargedTokens: 200,
+        reservedTokens: 50,
+        unknownChargedTokens: 40,
+        remainingTokens: 750,
+        heldCalls: 1,
+        quarantinedCalls: 1,
+      },
+      attempt: {
+        maximumTokens: 400,
+        deadlineAtMs: 1500,
+        chargedTokens: 150,
+        reservedTokens: 10,
+        unknownChargedTokens: 40,
+        remainingTokens: 240,
+        heldCalls: 1,
+        quarantinedCalls: 1,
+      },
+    };
+    const value = {
+      projectId,
+      revision: 3,
+      items: [{ ...binding, payload: "future data" }],
+      accounting: [usage],
+    };
+    const read = (accounting: unknown) =>
+      combineProjectWorkFoundationPages({
+        projectId,
+        pages: [{ value: { ...value, accounting } }],
+      });
+    expect(read([usage])).toMatchObject({
+      complete: true,
+      revision: 3,
+      error: null,
+      records: [binding],
+      accounting: [usage],
+    });
+    expect(read([usage]).records[0]).not.toHaveProperty("payload");
+    const changed = {
+      ...usage,
+      observedAt: "2026-10-01T00:01:00.000Z",
+      root: { ...usage.root, chargedTokens: 210, remainingTokens: 740 },
+    };
+    expect(read([changed])).toMatchObject({
+      complete: true,
+      revision: 3,
+      records: [binding],
+      accounting: [changed],
+    });
+    for (const accounting of [
+      "malformed",
+      [{ ...usage, generation: 1 }],
+      [{ ...usage, projectId: "foreign" }],
+      [{ ...usage, environmentId: "foreign" }],
+      [{ ...usage, attempt: { ...usage.attempt, unknownChargedTokens: 151 } }],
+    ]) {
+      const result = read(accounting);
+      expect(result).toMatchObject({
+        complete: true,
+        revision: 3,
+        error: null,
+        records: [binding],
+      });
+      expect(result.accounting).toBeUndefined();
+    }
+  });
+
   it("retains bounded future record kinds and states", () => {
     expect(asProjectWorkFoundationPage(foundationPage(), projectId)).toEqual(foundationPage());
   });

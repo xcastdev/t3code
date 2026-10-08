@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { ProjectId, ThreadId } from "./baseSchemas.ts";
+import { EnvironmentId, IsoDateTime, ProjectId, ThreadId } from "./baseSchemas.ts";
 
 const Integer = Schema.Int.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
@@ -7,6 +7,59 @@ const Integer = Schema.Int.check(
 const Text = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4_000));
 const Id = Text.check(Schema.isMaxLength(256));
 const Caption = Schema.String.check(Schema.isMaxLength(240));
+const AccountingIdentity = {
+  projectId: ProjectId,
+  environmentId: Schema.optionalKey(EnvironmentId),
+  bindingId: Id,
+  generation: Integer,
+  taskId: Id,
+  attemptId: Id,
+  observedAt: IsoDateTime,
+};
+const TokenAccounting = {
+  maximumTokens: Integer.check(Schema.isGreaterThan(0)),
+  deadlineAtMs: Integer.check(Schema.isGreaterThan(0)),
+  chargedTokens: Integer,
+  reservedTokens: Integer,
+  unknownChargedTokens: Integer,
+  remainingTokens: Integer,
+  heldCalls: Integer,
+  quarantinedCalls: Integer,
+};
+/** Recorded accounting is an observation, separate from task and binding authority. */
+export const ProjectTeamBindingAccounting = Schema.Union([
+  Schema.Struct({ ...AccountingIdentity, availability: Schema.Literal("not-admitted") }),
+  Schema.Struct({
+    ...AccountingIdentity,
+    availability: Schema.Literal("unavailable"),
+    reason: Schema.Literals([
+      "host-unavailable",
+      "owner-invalid",
+      "journal-unavailable",
+      "budget-invalid",
+      "ledger-invalid",
+      "overflow",
+      "limit-exceeded",
+      "legacy-capacity",
+      "read-bound",
+    ]),
+  }),
+  Schema.Struct({
+    ...AccountingIdentity,
+    environmentId: EnvironmentId,
+    availability: Schema.Literal("available"),
+    root: Schema.Struct({ ...TokenAccounting, taskId: Id }),
+    attempt: Schema.Struct(TokenAccounting),
+    operation: Schema.optionalKey(
+      Schema.Struct({
+        ...TokenAccounting,
+        operationId: Id,
+        workerId: Id,
+      }),
+    ),
+  }),
+]);
+export type ProjectTeamBindingAccounting = typeof ProjectTeamBindingAccounting.Type;
 const Metadata = {
   recordId: Id,
   revision: Integer,
@@ -55,6 +108,7 @@ const Binding = Schema.Union([
     model: Text,
     workerThreadId: Schema.optionalKey(ThreadId.check(Schema.isMaxLength(256))),
     profile: Schema.optionalKey(Profile),
+    accounting: Schema.optionalKey(ProjectTeamBindingAccounting),
   }),
 ]);
 const Blocker = Schema.Struct({

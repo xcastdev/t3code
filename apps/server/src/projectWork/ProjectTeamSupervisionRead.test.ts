@@ -4,14 +4,23 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import { ProjectTeamRecord } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectTeamRecord,
+  ProjectTeamSupervisionSummary,
+} from "@t3tools/contracts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import { persistProjectTeamProjections } from "./ProjectTeamsPersistence.ts";
 import { readProjectTeamSupervision } from "./ProjectTeamSupervisionRead.ts";
+import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
+import { readProjectTeamBindingAccountingInTransaction } from "./ProjectTeamUsageRead.ts";
 
 const at = "2026-01-01T00:00:00.000Z";
 const decodeRecord = Schema.decodeUnknownEffect(ProjectTeamRecord);
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeSummaryJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectTeamSupervisionSummary),
+);
 const fixture = Effect.fn("supervisionFixture")(function* () {
   yield* runMigrations();
   const sql = yield* SqlClient.SqlClient;
@@ -142,6 +151,96 @@ const summary = Effect.fn("supervisionSummary")(function* (
 });
 const isolated = <E>(name: string, body: () => Effect.Effect<void, E, SqlClient.SqlClient>) =>
   it.effect(name, () => body().pipe(Effect.provide(NodeSqliteClient.layerMemory())));
+
+isolated(
+  "reports an unadmitted assignment without inventing recorded usage from configuration",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* fixture();
+      yield* ownedRun(sql);
+      const before = yield* sql`SELECT * FROM project_team_run_binding WHERE record_id='run'`;
+      expect(yield* sql`SELECT * FROM project_team_dispatch`).toEqual([]);
+      expect(yield* sql`SELECT * FROM project_team_pi_operation`).toEqual([]);
+      expect(yield* sql`SELECT * FROM project_team_model_budget`).toEqual([]);
+      expect(yield* sql`SELECT * FROM project_team_model_request`).toEqual([]);
+      const result = yield* readProjectTeamSupervision(sql, { projectId: "project-a" }).pipe(
+        Effect.provideService(ServerEnvironmentIdentity, {
+          getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+        }),
+      );
+      const publicResult = yield* decodeSummaryJson(yield* encodeJson(result));
+      expect(publicResult).toMatchObject({
+        availability: "available",
+        revision: 20,
+        bindings: {
+          items: [
+            {
+              recordId: "run",
+              taskId: "task",
+              attemptId: "attempt",
+              accounting: {
+                availability: "not-admitted",
+                environmentId: "environment",
+                projectId: "project-a",
+                bindingId: "run",
+                generation: 0,
+                taskId: "task",
+                attemptId: "attempt",
+                observedAt: expect.any(String),
+              },
+            },
+          ],
+        },
+      });
+      expect(yield* sql`SELECT * FROM project_team_run_binding WHERE record_id='run'`).toEqual(
+        before,
+      );
+      expect(yield* sql`SELECT * FROM project_team_model_budget`).toEqual([]);
+      expect(yield* sql`SELECT * FROM project_team_model_request`).toEqual([]);
+    }),
+);
+
+isolated(
+  "degrades accounting for oversized physical binding identity without inventing zero usage",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* fixture();
+      yield* ownedRun(sql);
+      const before =
+        yield* sql`SELECT payload_json FROM project_team_run_binding WHERE record_id='run'`;
+      for (const column of ["generation", "task_id", "attempt_id"]) {
+        yield* sql`UPDATE project_team_run_binding SET ${sql(column)}=${"x".repeat(1100000)} WHERE record_id='run'`;
+        const observation = yield* sql
+          .withTransaction(
+            readProjectTeamBindingAccountingInTransaction(sql, "project-a", [
+              {
+                recordId: "run",
+                taskId: "task",
+                attemptId: "attempt",
+                generation: 0,
+              },
+            ]),
+          )
+          .pipe(
+            Effect.provideService(ServerEnvironmentIdentity, {
+              getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+            }),
+          );
+        expect(observation, column).toMatchObject([
+          {
+            availability: "unavailable",
+            reason: "read-bound",
+            bindingId: "run",
+          },
+        ]);
+        expect(
+          yield* sql`SELECT payload_json FROM project_team_run_binding WHERE record_id='run'`,
+        ).toEqual(before);
+        yield* sql`UPDATE project_team_run_binding SET generation=0,task_id='task',attempt_id='attempt' WHERE record_id='run'`;
+      }
+      expect(yield* sql`SELECT * FROM project_team_model_request`).toEqual([]);
+    }),
+);
 
 for (const [label, caption, expected] of [
   ["240 ASCII units", "A".repeat(240), "A".repeat(240)],

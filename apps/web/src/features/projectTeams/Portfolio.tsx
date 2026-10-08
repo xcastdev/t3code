@@ -11,6 +11,10 @@ import { useEffectEvent, useLayoutEffect, useRef } from "react";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { WorkCard } from "../../components/work/WorkDataNotice";
+import {
+  asProjectTeamBindingAccounting,
+  projectTeamAccountingCaptions,
+} from "@t3tools/client-runtime/project-work";
 
 export interface PortfolioProps {
   readonly entries: ReadonlyArray<{
@@ -383,6 +387,20 @@ function PortfolioEntry({
                       Task {binding.taskId} · Attempt {binding.attemptId} · Member{" "}
                       {binding.memberId}
                     </p>
+                    {projectTeamAccountingCaptions(
+                      asProjectTeamBindingAccounting(binding.accounting, {
+                        projectId: entry.projectId,
+                        environmentId: entry.environmentId,
+                        recordId: binding.recordId,
+                        generation: binding.generation,
+                        taskId: binding.taskId,
+                        attemptId: binding.attemptId,
+                      }),
+                    ).map((caption) => (
+                      <p key={caption} className="break-words text-xs text-muted-foreground">
+                        {caption}
+                      </p>
+                    ))}
                     <p>
                       Binding model: {binding.model} · Provider {binding.providerInstanceId} · Role
                       revision {binding.roleRevisionId}

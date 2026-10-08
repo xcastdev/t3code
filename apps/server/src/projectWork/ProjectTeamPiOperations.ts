@@ -420,6 +420,10 @@ const validRetainedAllocation = (allocation: PiManagedProcessAllocation) => {
   }
   return true;
 };
+const immutableRole = (value: typeof ProjectTeamRoleRevision.Type) => {
+  const { revision: _, status: _status, updatedAt: _at, ...immutable } = value;
+  return encode(immutable);
+};
 const immutableBinding = (binding: typeof ProjectTeamRunBinding.Type) => {
   const {
     revision: _,
@@ -495,6 +499,26 @@ export interface PiDurableOperation {
   readonly allocation: PiManagedProcessAllocation;
 }
 
+export interface ProjectTeamPiUsageHistory {
+  readonly bindingId: string;
+  readonly generation: number;
+  readonly taskId: string;
+  readonly attemptId: string;
+  readonly rootTaskId: string;
+  readonly rootMaximumTokens: number;
+  readonly rootDeadlineAtMs: number;
+  readonly attemptMaximumTokens: number;
+  readonly attemptDeadlineAtMs: number;
+  readonly operations: ReadonlyArray<{
+    readonly operationId: string;
+    readonly workerId: string;
+    readonly maximumTokens: number;
+    readonly deadlineAtMs: number;
+    readonly ordinal: number;
+    readonly terminalAccounting?: PiSessionTerminal["accountingReceipts"];
+  }>;
+}
+
 export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperations")(
   function* (options: { readonly environmentId: string }) {
     const sql = yield* SqlClient.SqlClient;
@@ -503,10 +527,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     const repository = yield* ProjectWorkRepository;
     // These retained reads validate intent, claim receipts and stage history only.
     // The schema maximum is unused by them and grants no model-call capacity.
-    const { readRetained, readStageReceipts } = yield* makeProjectTeamDispatchJournal({
-      environmentId: options.environmentId,
-      maximumEnvironmentModelCalls: 128,
-    });
+    const { readRetained, readStageReceipts, readHistoricalInTransaction } =
+      yield* makeProjectTeamDispatchJournal({
+        environmentId: options.environmentId,
+        maximumEnvironmentModelCalls: 128,
+      });
     const ownTransaction = Effect.fn("ProjectTeamPiOperations.ownTransaction")(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(supplied) && supplied.value !== sql)
@@ -672,7 +697,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       }
     });
     const standaloneBudget = Effect.fn("ProjectTeamPiOperations.standaloneBudget")(function* (
-      authority: ProjectTeamAuthority,
+      authority: Pick<ProjectTeamAuthority, "binding" | "state">,
       rootTaskId: string,
     ) {
       const rows =
@@ -711,10 +736,6 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         (r) => r.kind === "role-revision" && r.recordId === original.roleRevisionId,
       );
       const role = roles?.[0];
-      const immutableRole = (value: typeof ProjectTeamRoleRevision.Type) => {
-        const { revision: _, status: _status, updatedAt: _at, ...immutable } = value;
-        return encode(immutable);
-      };
       const started = Date.parse(original.updatedAt);
       const durationDeadline = started + original.configuration.maxDurationMs;
       // The first standalone operation captured the effective lease/duration cap.
@@ -772,6 +793,231 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       )
         return yield* deny("Original standalone Pi budget proof changed");
       return intent.rootBudget;
+    });
+    // Historical display reads do not resolve current execution authority or extend a lease.
+    const readUsageHistoryInTransaction = Effect.fn(
+      "ProjectTeamPiOperations.readUsageHistoryInTransaction",
+    )(function* (bindingId: string, generation: number, snapshot?: ProjectTeamAuthority["state"]) {
+      const suppliedSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(suppliedSql) ||
+        suppliedSql.value !== sql ||
+        Option.isNone(suppliedRepository) ||
+        suppliedRepository.value !== repository ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny("Historical Pi usage requires its captured transaction");
+      const bindingRows = yield* sql<{ projectId: string | null }>`SELECT
+          CASE WHEN length(CAST(project_id AS BLOB))<=1024 THEN project_id END AS projectId
+          FROM project_team_run_binding WHERE record_id=${bindingId} LIMIT 2`;
+      const projectId = bindingRows[0]?.projectId;
+      if (bindingRows.length !== 1 || !projectId)
+        return yield* deny("Historical binding unavailable");
+      const state = snapshot ?? (yield* readCurrentState(sql, projectId));
+      if (
+        state.projectId !== projectId ||
+        !Array.isArray(state.foundationRecords) ||
+        !Array.isArray(state.tasks) ||
+        !Array.isArray(state.attempts)
+      )
+        return yield* deny("Historical project authority unavailable");
+      const bindings = (state.foundationRecords ?? []).filter(
+        (record) => record.kind === "run-binding" && record.recordId === bindingId,
+      );
+      const binding = bindings[0];
+      if (
+        bindings.length !== 1 ||
+        binding?.kind !== "run-binding" ||
+        binding.environmentId !== options.environmentId ||
+        binding.generation !== generation ||
+        state.tasks.filter((task) => task.taskId === binding.taskId && task.projectId === projectId)
+          .length !== 1 ||
+        state.attempts.filter(
+          (attempt) => attempt.attemptId === binding.attemptId && attempt.taskId === binding.taskId,
+        ).length !== 1
+      )
+        return yield* deny("Historical task owner differs");
+      const metadata = yield* sql<{ bytes: number }>`SELECT
+          length(CAST(operation_id AS BLOB))+length(CAST(environment_id AS BLOB))+
+          length(CAST(project_id AS BLOB))+length(CAST(binding_id AS BLOB))+
+          length(CAST(generation AS BLOB))+length(CAST(provider_instance_id AS BLOB))+
+          length(CAST(thread_id AS BLOB))+length(CAST(worker_id AS BLOB))+
+          length(CAST(operation_ordinal AS BLOB))+length(CAST(operation_kind AS BLOB))+
+          length(CAST(request_hash AS BLOB))+length(CAST(root_binding_id AS BLOB))+
+          length(CAST(root_task_id AS BLOB))+length(CAST(maximum_tokens AS BLOB))+
+          length(CAST(deadline_at_ms AS BLOB))+length(CAST(status AS BLOB))+
+          COALESCE(length(CAST(native_json AS BLOB)),0)+COALESCE(length(CAST(terminal_json AS BLOB)),0)+
+          length(CAST(intent_json AS BLOB)) AS bytes FROM project_team_pi_operation
+          WHERE binding_id=${bindingId} AND generation=${generation} ORDER BY operation_ordinal LIMIT 131`;
+      if (
+        metadata.length > 130 ||
+        metadata.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > 1048576) ||
+        metadata.reduce((total, row) => total + row.bytes, 0) > 4194304
+      )
+        return yield* deny("Historical Pi usage exceeds its retained bound");
+      const rows = yield* sql<Row>`SELECT * FROM project_team_pi_operation
+          WHERE binding_id=${bindingId} AND generation=${generation} ORDER BY operation_ordinal LIMIT 131`;
+      if (rows.length !== metadata.length)
+        return yield* deny("Historical Pi operations unavailable");
+      const first = rows[0];
+      const dispatches = yield* sql<{ dispatchId: string | null }>`SELECT
+          CASE WHEN length(CAST(dispatch_id AS BLOB))<=1024 THEN dispatch_id END AS dispatchId
+          FROM project_team_dispatch WHERE binding_id=${bindingId} AND generation=${generation} LIMIT 2`;
+      if (dispatches.length > 1) return yield* deny("Historical dispatch is ambiguous");
+      const dispatchId = dispatches[0]?.dispatchId;
+      if (dispatches.length && !dispatchId)
+        return yield* deny("Historical dispatch identity unavailable");
+      const dispatch = dispatchId
+        ? (yield* readHistoricalInTransaction(dispatchId, state)).snapshot
+        : undefined;
+      const transition = dispatch?.intent.compiledClaim.transition;
+      if (
+        dispatch &&
+        (transition?.kind !== "claim" ||
+          immutableBinding(transition.binding) !== immutableBinding(binding))
+      )
+        return yield* deny("Historical dispatch binding differs");
+      if (!dispatch && !first) return yield* deny("Historical Pi operation unavailable");
+      const budget = dispatch
+        ? {
+            rootTaskId: dispatch.intent.limits.rootTaskId,
+            maximumTokens: dispatch.intent.limits.maximumTokens,
+            deadlineAtMs: dispatch.intent.limits.rootDeadlineAtMs,
+          }
+        : first
+          ? yield* standaloneBudget({ binding, state }, first.root_task_id)
+          : undefined;
+      if (!budget) return yield* deny("Historical original budget unavailable");
+      const firstIntent = first ? yield* decodeBudgetIntent(first.intent_json) : undefined;
+      const attemptMaximumTokens =
+        dispatch?.intent.limits.attemptMaximumTokens ??
+        firstIntent?.binding.configuration.maxTokens;
+      const attemptDeadlineAtMs =
+        dispatch?.intent.limits.deadlineAtMs ?? firstIntent?.operationLimits.deadlineAtMs;
+      if (attemptMaximumTokens === undefined || attemptDeadlineAtMs === undefined)
+        return yield* deny("Historical original attempt unavailable");
+      const operations: Array<ProjectTeamPiUsageHistory["operations"][number]> = [];
+      for (const row of rows) {
+        const intent = yield* decodeBudgetIntent(row.intent_json);
+        const processes = yield* sql<{
+          unit: string;
+          allocation: string;
+        }>`SELECT unit,allocation_json AS allocation
+            FROM project_team_pi_process WHERE operation_id=${row.operation_id} LIMIT 2`;
+        const process = processes[0];
+        if (
+          processes.length !== 1 ||
+          !process ||
+          process.unit !== intent.allocation.unit ||
+          encode(yield* decodeReplayAllocation(process.allocation)) !== encode(intent.allocation)
+        )
+          return yield* deny("Historical original allocation differs");
+        const roles = (state.foundationRecords ?? []).filter(
+          (record) => record.kind === "role-revision" && record.recordId === intent.role.recordId,
+        );
+        const role = roles[0];
+        const rootBinding = state.foundationRecords.find(
+          (record) => record.kind === "run-binding" && record.recordId === row.root_binding_id,
+        );
+        if (
+          row.environment_id !== options.environmentId ||
+          row.project_id !== projectId ||
+          row.binding_id !== bindingId ||
+          row.generation !== generation ||
+          row.provider_instance_id !== binding.providerInstanceId ||
+          row.thread_id !== binding.threadId ||
+          rootBinding?.kind !== "run-binding" ||
+          rootBinding.taskId !== budget.rootTaskId ||
+          rootBinding.projectId !== projectId ||
+          rootBinding.environmentId !== options.environmentId ||
+          rootBinding.parentRunId !== undefined ||
+          immutableBinding(intent.binding) !== immutableBinding(binding) ||
+          roles.length !== 1 ||
+          role?.kind !== "role-revision" ||
+          immutableRole(role) !== immutableRole(intent.role) ||
+          !validRetainedAllocation(intent.allocation) ||
+          intent.allocation.launch.workspaceRoot !== binding.worktree ||
+          !isWorkerIdentity({ workerId: row.worker_id, generation: row.generation }) ||
+          !isWorkerOperation({
+            operationId: row.operation_id,
+            operationKind: row.operation_kind,
+          }) ||
+          !Number.isSafeInteger(row.operation_ordinal) ||
+          row.operation_ordinal < 0 ||
+          intent.request.kind !== row.operation_kind ||
+          intent.request.threadId !== binding.threadId ||
+          (intent.request.operationId !== undefined &&
+            (intent.request.operationId !== row.operation_id ||
+              digest(intent.request) !== row.request_hash)) ||
+          encode(intent.rootBudget) !== encode(budget) ||
+          row.root_task_id !== budget.rootTaskId ||
+          intent.operationLimits.maximumTokens !== row.maximum_tokens ||
+          intent.operationLimits.deadlineAtMs !== row.deadline_at_ms ||
+          !Number.isSafeInteger(row.maximum_tokens) ||
+          row.maximum_tokens < 1 ||
+          row.maximum_tokens > Math.min(budget.maximumTokens, attemptMaximumTokens) ||
+          !Number.isSafeInteger(row.deadline_at_ms) ||
+          row.deadline_at_ms < 1 ||
+          row.deadline_at_ms > Math.min(budget.deadlineAtMs, attemptDeadlineAtMs)
+        )
+          return yield* deny("Historical Pi intent or original ceilings differ");
+        let terminalAccounting: ProjectTeamPiUsageHistory["operations"][number]["terminalAccounting"];
+        if (row.terminal_json) {
+          const terminal = yield* decodeTerminal(row.terminal_json);
+          if (
+            terminal.identity.workerId !== row.worker_id ||
+            terminal.identity.generation !== generation ||
+            terminal.operation.operationId !== row.operation_id ||
+            terminal.operation.operationKind !== row.operation_kind
+          )
+            return yield* deny("Historical terminal owner differs");
+          terminalAccounting = terminal.accountingReceipts;
+        }
+        operations.push({
+          operationId: row.operation_id,
+          workerId: row.worker_id,
+          maximumTokens: row.maximum_tokens,
+          deadlineAtMs: row.deadline_at_ms,
+          ordinal: row.operation_ordinal,
+          ...(terminalAccounting === undefined ? {} : { terminalAccounting }),
+        });
+      }
+      return {
+        bindingId,
+        generation,
+        taskId: binding.taskId,
+        attemptId: binding.attemptId,
+        rootTaskId: budget.rootTaskId,
+        rootMaximumTokens: budget.maximumTokens,
+        rootDeadlineAtMs: budget.deadlineAtMs,
+        attemptMaximumTokens,
+        attemptDeadlineAtMs,
+        operations,
+      } satisfies ProjectTeamPiUsageHistory;
+    });
+    const readUsageHistoryBatchInTransaction = Effect.fn(
+      "ProjectTeamPiOperations.readUsageHistoryBatchInTransaction",
+    )(function* (projectId: string, owners: readonly { bindingId: string; generation: number }[]) {
+      if (owners.length === 0 || owners.length > 128)
+        return yield* deny("Historical usage owner batch exceeds its bound");
+      const suppliedSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(suppliedSql) ||
+        suppliedSql.value !== sql ||
+        Option.isNone(suppliedRepository) ||
+        suppliedRepository.value !== repository ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny("Historical usage batch requires its captured transaction");
+      const state = yield* readCurrentState(sql, projectId);
+      const histories: ProjectTeamPiUsageHistory[] = [];
+      for (const owner of owners)
+        histories.push(
+          yield* readUsageHistoryInTransaction(owner.bindingId, owner.generation, state),
+        );
+      return histories;
     });
     const rootBudget = Effect.fn("ProjectTeamPiOperations.rootBudget")(function* (
       authority: ProjectTeamAuthority,
@@ -2415,6 +2661,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         guard(persistTerminal(...args)),
       nativeFor: (...args: Parameters<typeof nativeFor>) => guard(nativeFor(...args)),
       resolveOperation,
+      readUsageHistoryInTransaction: (bindingId: string, generation: number) =>
+        guard(readUsageHistoryInTransaction(bindingId, generation)),
+      readUsageHistoryBatchInTransaction: (
+        ...args: Parameters<typeof readUsageHistoryBatchInTransaction>
+      ) => guard(readUsageHistoryBatchInTransaction(...args)),
       readMemoryOperationOwnerInTransaction: (
         ...args: Parameters<typeof readMemoryOperationOwnerInTransaction>
       ) => guard(readMemoryOperationOwnerInTransaction(...args)),

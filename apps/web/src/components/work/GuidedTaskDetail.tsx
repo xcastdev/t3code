@@ -16,6 +16,7 @@ import {
   type ProjectTeamWriteIntent,
   type ProjectTeamRecordRead,
   type ProjectWorkTaskContext,
+  type ProjectTeamBindingAccounting,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -40,12 +41,17 @@ import {
   type GuidedTaskDraftSubmission,
 } from "./guidedTaskDraft";
 import { projectWorkCommandFailure } from "./workCommandFailure";
+import {
+  asProjectTeamBindingAccounting,
+  projectTeamAccountingCaptions,
+} from "@t3tools/client-runtime/project-work";
 
 interface GuidedTaskDetailProps {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly taskContext: ProjectWorkTaskContext | null;
   readonly foundationRecords: ReadonlyArray<ProjectTeamRecordRead>;
+  readonly accounting?: ReadonlyArray<ProjectTeamBindingAccounting>;
   readonly foundationRevision: number | null;
   readonly foundationComplete: boolean;
   readonly connected: boolean;
@@ -876,6 +882,16 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               <p className="text-xs text-muted-foreground">
                 Run {run.recordId} · Attempt {run.attemptId}
               </p>
+              {projectTeamAccountingCaptions(
+                asProjectTeamBindingAccounting(
+                  props.accounting?.find((item) => item.bindingId === run.recordId),
+                  run,
+                ),
+              ).map((caption) => (
+                <p key={caption} className="break-words text-xs text-muted-foreground">
+                  {caption}
+                </p>
+              ))}
               <p className="text-xs text-muted-foreground">
                 Specification {run.specRevision} · plan {run.planRevision}
               </p>

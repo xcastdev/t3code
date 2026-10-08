@@ -5,6 +5,7 @@ import {
   EnvironmentId,
   ProjectId,
   ProjectTeamSupervisionSummary,
+  type ProjectTeamBindingAccounting,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -31,7 +32,39 @@ const profile = {
   role: "Implementer",
   model: "profile-model",
 };
+const accounting = {
+  availability: "available",
+  projectId,
+  environmentId,
+  bindingId: "binding-1",
+  generation: 1,
+  taskId: "task-1",
+  attemptId: "attempt-1",
+  observedAt: "2026-10-01T00:00:00.000Z",
+  root: {
+    taskId: "root",
+    maximumTokens: 1000,
+    deadlineAtMs: 2000,
+    chargedTokens: 200,
+    reservedTokens: 50,
+    unknownChargedTokens: 40,
+    remainingTokens: 750,
+    heldCalls: 1,
+    quarantinedCalls: 1,
+  },
+  attempt: {
+    maximumTokens: 400,
+    deadlineAtMs: 1500,
+    chargedTokens: 150,
+    reservedTokens: 10,
+    unknownChargedTokens: 40,
+    remainingTokens: 240,
+    heldCalls: 1,
+    quarantinedCalls: 1,
+  },
+} satisfies ProjectTeamBindingAccounting;
 const binding = {
+  accounting,
   ...metadata,
   recordId: "binding-1",
   status: "running",
@@ -181,6 +214,12 @@ describe("Portfolio mounted read-only presentation", () => {
     expect(host.textContent).toContain("Coordinator Alpha");
     expect(host.textContent).toContain("Coordinator · coordinator-model");
     expect(host.textContent).toContain("Binding model: frozen-model");
+    expect(host.textContent).toContain(
+      "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+    );
+    expect(host.textContent).toContain(
+      "This attempt: 150 charged (40 unknown), 10 held; 240/400 tokens remaining.",
+    );
     expect(host.textContent).toContain("Profile: Implementer · profile-model");
     expect(host.textContent).toContain("Waiting for a decision · Resolver human");
     expect(host.textContent).toContain("Gate gate-1 · Target revision 4");
@@ -194,6 +233,47 @@ describe("Portfolio mounted read-only presentation", () => {
     expect(props.onOpenTask).toHaveBeenCalledWith({ environmentId, projectId, taskId: "task-1" });
     expect(props.onOpenWorker).toHaveBeenCalledWith({ environmentId, projectId, threadId });
     expect(props.onOpenProject).toHaveBeenCalledWith({ environmentId, projectId });
+  });
+
+  it("updates accounting without a project revision and withholds foreign observations", async () => {
+    await render();
+    const changed = {
+      ...available,
+      bindings: {
+        ...available.bindings,
+        items: [
+          {
+            ...binding,
+            accounting: {
+              ...accounting,
+              root: { ...accounting.root, chargedTokens: 210, remainingTokens: 740 },
+            },
+          },
+        ],
+      },
+    };
+    await render({ entries: changeEntry({ snapshot: { ...entry.snapshot, data: changed } }) });
+    expect(host.textContent).toContain("Shared root: 210 charged");
+    expect(host.textContent).not.toContain("Shared root: 200 charged");
+    await render({
+      entries: changeEntry({
+        snapshot: {
+          ...entry.snapshot,
+          data: {
+            ...changed,
+            bindings: {
+              ...changed.bindings,
+              items: [
+                { ...binding, accounting: { ...accounting, environmentId: otherEnvironmentId } },
+              ],
+            },
+          },
+        },
+      }),
+    });
+    expect(host.textContent).toContain("Recorded token usage unavailable.");
+    expect(props.onRefresh).not.toHaveBeenCalled();
+    expect(props.onOpenTask).not.toHaveBeenCalled();
   });
 
   it("displays only named recorded count buckets from metadata with extra fields", async () => {

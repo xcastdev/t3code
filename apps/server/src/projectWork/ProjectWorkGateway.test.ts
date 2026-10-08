@@ -3,6 +3,7 @@ import { ProjectLifecycle, ProjectLifecycleLive } from "../project/ProjectLifecy
 import {
   ProjectTeamRecord,
   ProjectTeamRecordRead,
+  ProjectTeamRecordPage,
   ProjectWorkFoundationCommitCommand,
   ProjectWorkWriteResult,
   ProjectWorkWriteIntent,
@@ -63,6 +64,9 @@ import { bindIssueRepositoryProject } from "./ProjectIssueRepositoryState.ts";
 
 const isTeamAuthorizationError = Schema.is(TeamAuthorization.ProjectTeamAuthorizationError);
 const decodeWriteResult = Schema.decodeUnknownEffect(ProjectWorkWriteResult);
+const decodeAccountingPage = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectTeamRecordPage),
+);
 const decodePublicWrite = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
 const decodeMemoryRetraction = Schema.decodeUnknownEffect(ProjectTeamMemoryRetractIntent);
 const decodeFoundationCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
@@ -128,6 +132,45 @@ const gatewayLayer = makeGatewayLayer();
 const layer = it.layer(NodeServices.layer);
 
 layer("ProjectWorkGateway", (it) => {
+  it.effect(
+    "returns bounded foundation accounting without changing the project revision or record authority",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const f = yield* seedTeam("implementer", "reserved", { issueCredential: false });
+        const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+        const before = yield* ProjectWorkRepository.readCurrentState(f.sql, f.binding.projectId);
+        const page = yield* decodeAccountingPage(
+          encodeUnknownJson(
+            yield* gateway.read({
+              projectId: f.binding.projectId,
+              operation: "foundation-records",
+              recordKinds: ["run-binding"],
+              limit: 128,
+            }),
+          ),
+        );
+        expect(page.revision).toBe(before.revision);
+        expect(page.items).toMatchObject([
+          { recordId: f.binding.recordId, generation: f.binding.generation },
+        ]);
+        // This host differs from the retained assignment. Its records still load,
+        // while optional accounting refuses to report an invented zero balance.
+        expect(page.accounting).toMatchObject([
+          {
+            availability: "unavailable",
+            reason: "owner-invalid",
+            bindingId: f.binding.recordId,
+            environmentId: "gateway-environment",
+          },
+        ]);
+        expect(yield* ProjectWorkRepository.readCurrentState(f.sql, f.binding.projectId)).toEqual(
+          before,
+        );
+        expect(yield* f.sql`SELECT 1 FROM project_team_model_request`).toEqual([]);
+      }).pipe(Effect.provide(gatewayLayer)),
+  );
+
   for (const scenario of [
     { name: "quoted", secret: 'retained"needle', register: true },
     { name: "backslash", secret: "retained\\needle", register: true },

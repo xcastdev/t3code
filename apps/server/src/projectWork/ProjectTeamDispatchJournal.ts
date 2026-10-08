@@ -393,6 +393,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       row: Row,
       intent: typeof Intent.Type,
       forward = false,
+      historicalState?: Effect.Success<ReturnType<typeof readCurrentState>>,
     ) {
       // Deletion purges foundation proof. Retained history then carries cleanup knowledge only.
       if (yield* isProjectWorkTombstoned(sql, row.project_id)) {
@@ -423,7 +424,9 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           })
       )
         return yield* deny("Original dispatch effect identity is invalid");
-      const state = yield* readCurrentState(sql, row.project_id);
+      const state = historicalState ?? (yield* readCurrentState(sql, row.project_id));
+      if (historicalState !== undefined && state.projectId !== row.project_id)
+        return yield* deny("Historical dispatch project differs");
       const effects = (state.foundationRecords ?? []).filter(
         (record) =>
           record.kind === "effect" &&
@@ -1352,12 +1355,13 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     const readStageHistory = Effect.fn("ProjectTeamDispatchJournal.readStageHistory")(function* (
       dispatch: Row,
       intent: typeof Intent.Type,
+      historicalState?: Effect.Success<ReturnType<typeof readCurrentState>>,
     ) {
       const rows = yield* sql`SELECT * FROM project_team_dispatch_receipt
         WHERE dispatch_id=${dispatch.dispatch_id} ORDER BY revision LIMIT 129`;
       if (rows.length > 128) return yield* deny("Retained stage history exceeds its bound");
       let stage: ProjectTeamDispatchStage = "reserved";
-      let revision = yield* readClaimBaseline(dispatch, intent);
+      let revision = yield* readClaimBaseline(dispatch, intent, false, historicalState);
       let recordedAt = deadline(dispatch.created_at)!;
       const updatedAt = deadline(dispatch.updated_at)!;
       const receipts = [];
@@ -1497,7 +1501,10 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     });
     const readHistoricalInTransaction = Effect.fn(
       "ProjectTeamDispatchJournal.readHistoricalInTransaction",
-    )(function* (dispatchId: string) {
+    )(function* (
+      dispatchId: string,
+      historicalState?: Effect.Success<ReturnType<typeof readCurrentState>>,
+    ) {
       const suppliedSql = yield* Effect.serviceOption(SqlClient.SqlClient);
       const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
       if (
@@ -1509,7 +1516,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       )
         return yield* deny("Dispatch history requires its original caller transaction");
       const value = yield* read(yield* decodeId(dispatchId));
-      const receipts = yield* readStageHistory(value.row, value.intent);
+      const receipts = yield* readStageHistory(value.row, value.intent, historicalState);
       return { snapshot: { fence: fence(value.row), intent: value.intent }, receipts };
     });
     const readStageReceipts = Effect.fn("ProjectTeamDispatchJournal.readStageReceipts")(function* (

@@ -6,7 +6,9 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { canonicalProjectWorkPayload } from "@t3tools/contracts";
 import type {
+  PiModelAccountingReceipt,
   PiModelRequestReservation,
   PiModelRequestSettlement,
 } from "../provider/pi/PiModelBroker.ts";
@@ -161,6 +163,116 @@ const matchesReservation = (row: Row, reservation: PiModelRequestReservation) =>
   row.maximum_input_tokens === reservation.maxInputTokens &&
   row.maximum_output_tokens === reservation.maxOutputTokens &&
   row.deadline_at_ms === reservation.deadlineAtMs;
+
+const RecordedRow = Schema.Struct({
+  reservation_id: Id,
+  environment_id: Id,
+  project_id: Id,
+  root_task_id: Id,
+  run_id: Id,
+  attempt_id: Id,
+  worker_id: Id,
+  generation: Safe,
+  operation_id: Id,
+  request_lane: Schema.Literals(["pi", "memory"]),
+  request_scope: Schema.String.check(Schema.isMaxLength(256)),
+  request_id: Positive,
+  route_id: Id,
+  provider: Schema.Literals(["command-code", "openrouter"]),
+  model: Id,
+  maximum_input_tokens: Positive,
+  maximum_output_tokens: Positive,
+  deadline_at_ms: Positive,
+  status: Schema.Literals(["held", "reported", "failed", "unknown"]),
+  capacity_state: Schema.Literals(["held", "released", "quarantine", "legacy"]),
+  charged_input_tokens: Safe,
+  charged_output_tokens: Safe,
+  accounting_receipt_id: Schema.NullOr(Id),
+  reservation_json: Schema.String.check(
+    Schema.makeFilter((value) => Buffer.byteLength(value) <= 8192),
+  ),
+  settlement_json: Schema.NullOr(
+    Schema.String.check(Schema.makeFilter((value) => Buffer.byteLength(value) <= 16384)),
+  ),
+});
+export const decodeProjectTeamRecordedModelRow = Schema.decodeUnknownEffect(RecordedRow, strict);
+
+/** Display reads reuse the native reservation/settlement protocol without admitting requests. */
+export const auditProjectTeamRecordedPiModelRow = Effect.fn(
+  "ProjectTeamModelAccounting.auditRecordedPiRow",
+)(function* (
+  row: typeof RecordedRow.Type,
+  terminalAccounting?: readonly PiModelAccountingReceipt[],
+) {
+  const reservation = yield* storedReservation(row.reservation_json);
+  if (!matchesReservation(row, reservation))
+    return yield* deny("Recorded native reservation differs");
+  if (row.status === "held") {
+    if (
+      row.capacity_state !== "held" ||
+      row.settlement_json !== null ||
+      row.accounting_receipt_id !== null ||
+      row.charged_input_tokens !== 0 ||
+      row.charged_output_tokens !== 0
+    )
+      return yield* deny("Recorded held native request differs");
+    return;
+  }
+  if (!row.settlement_json || !row.accounting_receipt_id)
+    return yield* deny("Recorded native settlement missing");
+  const settlement = yield* storedSettlement(row.settlement_json);
+  const {
+    reservationId,
+    outcome,
+    failureCode: _failure,
+    chargedInputTokens,
+    chargedOutputTokens,
+    reportedModel,
+    reportedUsage,
+    transportDrained,
+    ...settledReservation
+  } = settlement;
+  if (terminalAccounting !== undefined) {
+    const receipts = terminalAccounting.filter(
+      (receipt) => receipt.reservationId === row.reservation_id,
+    );
+    const receipt = receipts[0];
+    if (receipts.length > 1 || (outcome === "reported" && receipt === undefined))
+      return yield* deny("Recorded native settlement lacks its terminal receipt");
+    if (
+      receipt !== undefined &&
+      (receipt.accountingReceiptId !== row.accounting_receipt_id ||
+        receipt.requestId !== row.request_id ||
+        receipt.routeId !== row.route_id ||
+        receipt.provider !== row.provider ||
+        receipt.model !== row.model ||
+        receipt.reportedModel !== reportedModel ||
+        reportedUsage === undefined ||
+        canonicalProjectWorkPayload(receipt.usage) !== canonicalProjectWorkPayload(reportedUsage))
+    )
+      return yield* deny("Recorded native settlement differs from its terminal receipt");
+  }
+  if (
+    encodeReservation(settledReservation) !== encodeReservation(reservation) ||
+    reservationId !== row.reservation_id ||
+    outcome !== row.status ||
+    chargedInputTokens !== row.charged_input_tokens ||
+    chargedOutputTokens !== row.charged_output_tokens ||
+    row.capacity_state !== (transportDrained === true ? "released" : "quarantine") ||
+    (outcome === "reported"
+      ? reportedUsage === undefined ||
+        reportedModel === undefined ||
+        (terminalAccounting === undefined && reportedModel !== row.model) ||
+        reportedUsage.prompt_tokens !== chargedInputTokens ||
+        reportedUsage.completion_tokens !== chargedOutputTokens ||
+        reportedUsage.total_tokens !== chargedInputTokens + chargedOutputTokens ||
+        chargedInputTokens > reservation.maxInputTokens ||
+        chargedOutputTokens > reservation.maxOutputTokens
+      : chargedInputTokens !== reservation.maxInputTokens ||
+        chargedOutputTokens !== reservation.maxOutputTokens)
+  )
+    return yield* deny("Recorded native settlement differs");
+});
 export interface ProjectTeamModelAccountingOptions {
   readonly environmentId: string;
   readonly maximumConcurrentCalls?: number;

@@ -1,4 +1,5 @@
 import { ProjectVerificationCommandSelection } from "./projectVerification.ts";
+import { ProjectTeamBindingAccounting } from "./projectTeamSupervision.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import * as Schema from "effect/Schema";
 import {
@@ -610,6 +611,9 @@ export const ProjectTeamRecordPage = Schema.Struct({
     Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4_000)),
   ),
   items: Schema.Array(ProjectTeamRecordRead).check(Schema.isMaxLength(128)),
+  accounting: Schema.optionalKey(
+    Schema.Array(ProjectTeamBindingAccounting).check(Schema.isMaxLength(128)),
+  ),
 });
 export const PROJECT_TEAM_DEFAULT_LIMITS = {
   environmentModelCalls: 2,

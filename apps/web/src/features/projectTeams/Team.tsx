@@ -7,6 +7,10 @@ import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { WorkCard } from "../../components/work/WorkDataNotice";
 import { WorkTeamFoundation } from "../../components/work/WorkTeamFoundation";
+import {
+  asProjectTeamBindingAccounting,
+  projectTeamAccountingCaptions,
+} from "@t3tools/client-runtime/project-work";
 
 const knownRecord = Schema.is(ProjectTeamRecord);
 const PAGE_SIZE = 128;
@@ -137,6 +141,16 @@ function TeamSession(props: TeamViewProps) {
                         Assignment {run.taskId} · Run {run.recordId} · Recorded state {run.status}
                       </p>
                       {run.parentRunId ? <p>Parent run {run.parentRunId}</p> : null}
+                      {projectTeamAccountingCaptions(
+                        asProjectTeamBindingAccounting(
+                          snapshot.accounting?.find((item) => item.bindingId === run.recordId),
+                          run,
+                        ),
+                      ).map((caption) => (
+                        <p key={caption} className="break-words text-xs text-muted-foreground">
+                          {caption}
+                        </p>
+                      ))}
                       <p className="break-all">
                         {run.worktree} · {run.branch}
                       </p>

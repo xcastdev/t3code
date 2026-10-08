@@ -1116,6 +1116,9 @@ function ManagedTaskDetail({
         projectId={projectId}
         taskContext={context}
         foundationRecords={foundation.snapshot.records}
+        {...(foundation.snapshot.accounting === undefined
+          ? {}
+          : { accounting: foundation.snapshot.accounting })}
         foundationRevision={foundation.snapshot.revision}
         foundationComplete={
           foundation.current &&

@@ -79,6 +79,7 @@ import {
   ProjectWorkVerificationRequestError,
 } from "../../projectWork/ProjectWorkVerificationRequest.ts";
 import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.ts";
+import { readProjectTeamBindingAccountingInTransaction } from "../../projectWork/ProjectTeamUsageRead.ts";
 import { ProjectLifecycle, ProjectLifecycleLive } from "../../project/ProjectLifecycle.ts";
 import { readProjectMemoryProjectionSyncInTransaction } from "../../projectWork/memory/ProjectMemoryProjectDeletion.ts";
 import {
@@ -5866,6 +5867,7 @@ for (const compactProof of [
   "successorReplay",
   "memoryAdmission",
   "memoryAccounting",
+  "memorySharedRoot",
   "memoryPipeline",
   "memoryFailure",
   "memorySecret",
@@ -5891,49 +5893,53 @@ for (const compactProof of [
         ? "retains exact memory selection against the executing operation before processing and replays after terminal"
         : compactProof === "memoryAccounting"
           ? "accounts memory and ordinary stages against the same executing operation and shared capacity"
-          : compactProof === "memoryPipeline"
-            ? "processes an exact admitted source through shared model accounting and the configured index consumer"
-            : compactProof === "memoryFailure"
-              ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
-              : compactProof === "memorySecret"
-                ? "rejects a newly learned escaped source secret before memory extraction reservation"
-                : compactProof === "memoryEmbeddingSecret"
-                  ? "rejects newly learned escaped embedding text before its memory reservation"
-                  : compactProof === "memoryCleanup"
-                    ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
-                    : compactProof === "memoryHumanRetraction"
-                      ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
-                      : compactProof === "memoryCleanupGuards"
-                        ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
-                        : compactProof === "memoryQuery"
-                          ? "admits an explicit semantic query through the executing task bridge before forward stages"
-                          : compactProof === "memoryQueryPipeline"
-                            ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
-                            : compactProof === "memoryQueryMixed"
-                              ? "retains current semantic context when completed search also returns a genuinely superseded observation"
-                              : compactProof === "memoryQueryGuards"
-                                ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
-                                : compactProof === "memoryQueryNoGrant"
-                                  ? "denies semantic query admission without the original frozen write intersection"
-                                  : compactProof === "memoryQueryNoAccess"
-                                    ? "denies semantic query admission for an original no-memory role"
-                                    : compactProof === "memoryQueryBudget"
-                                      ? "retains authenticated query failure when the original operation budget cannot fund embedding"
-                                      : compactProof === "memoryQuerySecret"
-                                        ? "rejects a newly learned escaped query credential before embedding reservation"
-                                        : compactProof === "memoryQueryModelUnknown"
-                                          ? "retains an unknown query embedding charge until authenticated drain without resend"
-                                          : compactProof === "memoryQuerySearchUnknown"
-                                            ? "settles an uncertain query search only after its exact authenticated late drain"
-                                            : compactProof === "successorReplay"
-                                              ? "retained compact replay preserves the latest successful native head without another execution"
-                                              : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+          : compactProof === "memorySharedRoot"
+            ? "reads shared root usage outside the charged child binding page without assigning parent charges"
+            : compactProof === "memoryPipeline"
+              ? "processes an exact admitted source through shared model accounting and the configured index consumer"
+              : compactProof === "memoryFailure"
+                ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
+                : compactProof === "memorySecret"
+                  ? "rejects a newly learned escaped source secret before memory extraction reservation"
+                  : compactProof === "memoryEmbeddingSecret"
+                    ? "rejects newly learned escaped embedding text before its memory reservation"
+                    : compactProof === "memoryCleanup"
+                      ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
+                      : compactProof === "memoryHumanRetraction"
+                        ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
+                        : compactProof === "memoryCleanupGuards"
+                          ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
+                          : compactProof === "memoryQuery"
+                            ? "admits an explicit semantic query through the executing task bridge before forward stages"
+                            : compactProof === "memoryQueryPipeline"
+                              ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
+                              : compactProof === "memoryQueryMixed"
+                                ? "retains current semantic context when completed search also returns a genuinely superseded observation"
+                                : compactProof === "memoryQueryGuards"
+                                  ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
+                                  : compactProof === "memoryQueryNoGrant"
+                                    ? "denies semantic query admission without the original frozen write intersection"
+                                    : compactProof === "memoryQueryNoAccess"
+                                      ? "denies semantic query admission for an original no-memory role"
+                                      : compactProof === "memoryQueryBudget"
+                                        ? "retains authenticated query failure when the original operation budget cannot fund embedding"
+                                        : compactProof === "memoryQuerySecret"
+                                          ? "rejects a newly learned escaped query credential before embedding reservation"
+                                          : compactProof === "memoryQueryModelUnknown"
+                                            ? "retains an unknown query embedding charge until authenticated drain without resend"
+                                            : compactProof === "memoryQuerySearchUnknown"
+                                              ? "settles an uncertain query search only after its exact authenticated late drain"
+                                              : compactProof === "successorReplay"
+                                                ? "retained compact replay preserves the latest successful native head without another execution"
+                                                : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
           let memoryReady = false;
           const lateSecret = 'controlled-memory-"key\\tail';
           const memoryProof = compactProof?.startsWith("memory") === true;
+          const accountingProof =
+            compactProof === "memoryAccounting" || compactProof === "memorySharedRoot";
           const cleanupProof =
             compactProof === "memoryCleanup" ||
             compactProof === "memoryCleanupGuards" ||
@@ -5974,6 +5980,7 @@ for (const compactProof of [
           const queryCache = compactProof === "memoryQueryPipeline" || queryMixed;
           const queryForward = queryCache || queryRecovery || queryNoForward;
           let activeQuery = false;
+          let failedUsageOperationId: string | undefined;
           const queryDrains = new Set<string>();
           let memoryPipelineFailure = "";
           let memoryPipelineError: ProjectMemoryServiceError | undefined;
@@ -6010,7 +6017,7 @@ for (const compactProof of [
             | undefined;
           const f = yield* requiredTransferFixture(
             false,
-            false,
+            compactProof === "memorySharedRoot",
             undefined,
             memoryProof,
             compactProof === "memoryQueryNoGrant"
@@ -6074,6 +6081,57 @@ for (const compactProof of [
                 : Effect.fail(
                     new ProjectTeamDispatchJournalError({ reason: "Foreign controlled stage" }),
                   ),
+            verifySettlement: () =>
+              Effect.gen(function* () {
+                const owners = yield* f.sql<{
+                  status: string;
+                }>`SELECT process.status FROM project_team_pi_process process
+                JOIN project_team_pi_operation operation ON operation.operation_id=process.operation_id
+                WHERE operation.binding_id=${f.binding.recordId} AND operation.generation=${f.binding.generation}`;
+                if (owners.length !== 3 || owners.some((owner) => owner.status !== "drained"))
+                  return yield* new ProjectTeamDispatchJournalError({
+                    reason: "Controlled owners are not drained",
+                  });
+                const requests = yield* f.sql`SELECT 1 FROM project_team_model_request
+                WHERE run_id=${f.binding.recordId} AND capacity_state<>'released' LIMIT 1`;
+                if (requests.length)
+                  return yield* new ProjectTeamDispatchJournalError({
+                    reason: "Controlled accounting is not drained",
+                  });
+              }).pipe(
+                Effect.catchTag("SqlError", () =>
+                  Effect.fail(
+                    new ProjectTeamDispatchJournalError({
+                      reason: "Controlled settlement accounting could not be read",
+                    }),
+                  ),
+                ),
+              ),
+          });
+          const readRecordedUsage = Effect.fn("controlledUsage.read")(function* () {
+            const allocationsBefore = f.allocations;
+            const callsBefore = { exchanges: memoryExchanges, backend: memoryBackendCalls };
+            const result = yield* f.sql
+              .withTransaction(
+                readProjectTeamBindingAccountingInTransaction(f.sql, String(projectId), [
+                  {
+                    recordId: f.binding.recordId,
+                    taskId: f.binding.taskId,
+                    attemptId: f.binding.attemptId,
+                    generation: f.binding.generation,
+                  },
+                ]),
+              )
+              .pipe(
+                Effect.provideService(ServerEnvironmentIdentity, {
+                  getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+                }),
+              );
+            expect(f.allocations).toBe(allocationsBefore);
+            expect({ exchanges: memoryExchanges, backend: memoryBackendCalls }).toEqual(
+              callsBefore,
+            );
+            return result;
           });
           let snapshot = f.snapshot;
           const stage = Effect.fn("compactLive.controlledStage")(function* (
@@ -6251,6 +6309,8 @@ for (const compactProof of [
                       const accountingReceipts: Array<
                         SessionRuntime.PiSessionTerminal["accountingReceipts"][number]
                       > = [];
+                      const failedUsage =
+                        accountingProof && input.operation.operationId === failedUsageOperationId;
                       if (input.operation.operationKind !== "initialize") {
                         const fields = {
                           workerId: input.identity.workerId,
@@ -6285,25 +6345,31 @@ for (const compactProof of [
                             ...fields,
                             reservationId: reserved.reservationId,
                             transportDrained: true,
-                            outcome: "reported",
-                            chargedInputTokens: 10,
-                            chargedOutputTokens: 2,
-                            reportedModel: input.broker.model,
-                            reportedUsage: usage,
+                            outcome: failedUsage ? "unknown" : "reported",
+                            chargedInputTokens: failedUsage ? fields.maxInputTokens : 10,
+                            chargedOutputTokens: failedUsage ? fields.maxOutputTokens : 2,
+                            ...(failedUsage
+                              ? {}
+                              : { reportedModel: input.broker.model, reportedUsage: usage }),
                           }),
                         );
-                        accountingReceipts.push({
-                          requestId: 1,
-                          reservationId: reserved.reservationId,
-                          accountingReceiptId: settled.accountingReceiptId,
-                          routeId: fields.routeId,
-                          provider: fields.provider,
-                          model: fields.model,
-                          reportedModel: fields.model,
-                          usage,
-                        });
+                        if (!failedUsage)
+                          accountingReceipts.push({
+                            requestId: 1,
+                            reservationId: reserved.reservationId,
+                            accountingReceiptId: settled.accountingReceiptId,
+                            routeId: fields.routeId,
+                            provider: fields.provider,
+                            model: fields.model,
+                            reportedModel: fields.model,
+                            usage,
+                          });
                       }
-                      if (memoryProof && input.operation.operationKind === "prompt") {
+                      if (
+                        memoryProof &&
+                        input.operation.operationKind === "prompt" &&
+                        !failedUsage
+                      ) {
                         const gateway = yield* ProjectWorkGateway;
                         const authorization = yield* Authorization.ProjectTeamAuthorization;
                         const credential = yield* authorization.issueCredential({
@@ -8119,7 +8185,7 @@ for (const compactProof of [
                               yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='memory'`,
                             ).toEqual([]);
                           }
-                          if (compactProof === "memoryAccounting") {
+                          if (accountingProof) {
                             const admitted = yield* decodeMemoryLedgerOwner(
                               jobs[0]?.owner ?? "null",
                             );
@@ -8302,12 +8368,106 @@ for (const compactProof of [
                               yield* f.sql`SELECT status,capacity_state FROM project_team_model_request
                             WHERE reservation_id=${embedding.reservationId}`,
                             ).toEqual([{ status: "unknown", capacity_state: "quarantine" }]);
+                            expect(yield* readRecordedUsage()).toMatchObject([
+                              {
+                                availability: "available",
+                                root: {
+                                  maximumTokens: 1000,
+                                  chargedTokens: 175,
+                                  reservedTokens: 0,
+                                  unknownChargedTokens: 41,
+                                  remainingTokens: 825,
+                                  quarantinedCalls: 1,
+                                },
+                                attempt: {
+                                  maximumTokens: 1000,
+                                  chargedTokens: 175,
+                                  unknownChargedTokens: 41,
+                                },
+                                operation: {
+                                  operationId: input.operation.operationId,
+                                  chargedTokens: 175,
+                                },
+                              },
+                            ]);
+                            if (compactProof === "memoryAccounting") {
+                              const originalJobs =
+                                yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
+                              const originalModels =
+                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+                              const paddedOwner = json({
+                                ...admitted,
+                                padding: "x".repeat(240000),
+                              });
+                              expect(Buffer.byteLength(paddedOwner, "utf8")).toBeLessThanOrEqual(
+                                262144,
+                              );
+                              // Legal SQL metadata clones are not admitted owners. Rollback
+                              // preserves the genuine job, and no immutable trigger is bypassed.
+                              const bounded = yield* f.sql
+                                .withTransaction(
+                                  Effect.gen(function* () {
+                                    for (let index = 0; index < 18; index++)
+                                      yield* f.sql`INSERT INTO project_team_memory_job
+                                    (effect_id,environment_id,project_id,input_json,claim_generation,status,receipt_json,owner_json)
+                                    SELECT ${`usage-bound-${index}`},environment_id,project_id,input_json,0,'pending',NULL,${paddedOwner}
+                                    FROM project_team_memory_job WHERE effect_id=${selection.effectId}`;
+                                    expect(
+                                      yield* f.sql`SELECT COUNT(*) AS count FROM project_team_memory_job
+                                  WHERE effect_id LIKE 'usage-bound-%'`,
+                                    ).toEqual([{ count: 18 }]);
+                                    expect(yield* readRecordedUsage()).toMatchObject([
+                                      {
+                                        availability: "unavailable",
+                                        reason: "read-bound",
+                                      },
+                                    ]);
+                                    return yield* Effect.fail(
+                                      "controlled-memory-metadata-rollback",
+                                    );
+                                  }),
+                                )
+                                .pipe(Effect.result);
+                              expect(bounded).toMatchObject({
+                                _tag: "Failure",
+                                failure: "controlled-memory-metadata-rollback",
+                              });
+                              expect(
+                                yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`,
+                              ).toEqual(originalJobs);
+                              expect(
+                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+                              ).toEqual(originalModels);
+                              expect(yield* readRecordedUsage()).toMatchObject([
+                                {
+                                  availability: "available",
+                                  root: {
+                                    chargedTokens: 175,
+                                    unknownChargedTokens: 41,
+                                    remainingTokens: 825,
+                                  },
+                                },
+                              ]);
+                            }
                             const awaitingDrain = yield* ledger.reserve(admitted, {
                               ...stage,
                               requestId: 3,
                               maxInputTokens: 1,
                               maxOutputTokens: 1,
                             });
+                            expect(yield* readRecordedUsage()).toMatchObject([
+                              {
+                                availability: "available",
+                                root: {
+                                  chargedTokens: 175,
+                                  reservedTokens: 2,
+                                  remainingTokens: 823,
+                                  heldCalls: 1,
+                                  quarantinedCalls: 1,
+                                  unknownChargedTokens: 41,
+                                },
+                              },
+                            ]);
                             const afterDrainRequest = {
                               ...stage,
                               phase: "embed" as const,
@@ -8361,6 +8521,52 @@ for (const compactProof of [
                                 transportDrained: true,
                               });
                             }
+                            // This is a genuinely accepted broker alias. Its durable
+                            // terminal, rather than today's policy, proves it on replay.
+                            const aliasRequest = {
+                              ...nativeFields,
+                              requestId: 3,
+                              maxInputTokens: 1,
+                              maxOutputTokens: 1,
+                            };
+                            const aliasHeld = yield* Effect.tryPromise(() =>
+                              input.broker.reserveRequest(aliasRequest, signal),
+                            );
+                            const reportedAlias = nativeFields.model.replace(/:free$/u, "");
+                            expect(reportedAlias).not.toBe(nativeFields.model);
+                            const aliasUsage = {
+                              prompt_tokens: 0,
+                              completion_tokens: 0,
+                              total_tokens: 0,
+                            };
+                            const aliasSettled = yield* Effect.tryPromise(() =>
+                              input.broker.settleRequest({
+                                ...aliasRequest,
+                                reservationId: aliasHeld.reservationId,
+                                outcome: "reported",
+                                chargedInputTokens: 0,
+                                chargedOutputTokens: 0,
+                                reportedModel: reportedAlias,
+                                reportedUsage: aliasUsage,
+                                transportDrained: true,
+                              }),
+                            );
+                            accountingReceipts.push({
+                              requestId: 3,
+                              reservationId: aliasHeld.reservationId,
+                              accountingReceiptId: aliasSettled.accountingReceiptId,
+                              routeId: aliasRequest.routeId,
+                              provider: aliasRequest.provider,
+                              model: aliasRequest.model,
+                              reportedModel: reportedAlias,
+                              usage: aliasUsage,
+                            });
+                            expect(yield* readRecordedUsage()).toMatchObject([
+                              {
+                                availability: "unavailable",
+                                reason: "ledger-invalid",
+                              },
+                            ]);
                             const physical = yield* f.sql<{
                               lane: string;
                               operation: string;
@@ -8384,7 +8590,7 @@ for (const compactProof of [
                       const terminal: SessionRuntime.PiSessionTerminal = {
                         identity: input.identity,
                         operation: input.operation,
-                        outcome: "success",
+                        outcome: failedUsage ? "failed" : "success",
                         ownerCaptured: true,
                         native,
                         accountingReceipts,
@@ -8424,6 +8630,21 @@ for (const compactProof of [
             ),
           );
           yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+          if (compactProof === "memoryAccounting") {
+            // Dispatch admission retains the original budget before the first model request.
+            expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+            expect(yield* readRecordedUsage()).toMatchObject([
+              {
+                availability: "available",
+                root: {
+                  maximumTokens: 1000,
+                  chargedTokens: 0,
+                  reservedTokens: 0,
+                  remainingTokens: 1000,
+                },
+              },
+            ]);
+          }
           const initialized = yield* f.instance.prepareOperation(
             { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
             () => Effect.void,
@@ -8446,6 +8667,20 @@ for (const compactProof of [
           });
           yield* stage("session-bound");
           yield* stage("assignment-intent");
+          if (accountingProof) {
+            expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+            expect(yield* readRecordedUsage()).toMatchObject([
+              {
+                availability: "available",
+                root: {
+                  maximumTokens: 1000,
+                  chargedTokens: 0,
+                  reservedTokens: 0,
+                  remainingTokens: 1000,
+                },
+              },
+            ]);
+          }
           const assigned = yield* f.instance.prepareOperation(
             {
               threadId,
@@ -8559,6 +8794,178 @@ for (const compactProof of [
             if (compactProof === "memoryPipeline") {
               expect(memoryExchanges).toBe(2);
               expect(memoryBackendCalls).toBe(3);
+            } else if (accountingProof) {
+              expect(runs).toBe(2);
+              const failedContext = yield* f.reader.readRequired(snapshot);
+              expectedContext = failedContext.text;
+              expectedProvenance = NodeCrypto.createHash("sha256")
+                .update(json(failedContext.provenance))
+                .digest("hex");
+              expectedRequestId = "recorded-usage-failed";
+              const failedRequest = {
+                threadId,
+                kind: "compact" as const,
+                requestId: MessageId.make(expectedRequestId),
+              };
+              const failedOperations = yield* makeProjectTeamPiOperations({
+                environmentId: "environment",
+              });
+              const failedBoundary = yield* failedOperations.readCompaction(
+                { providerInstanceId, threadId },
+                failedRequest,
+              );
+              failedUsageOperationId = failedBoundary.operationId;
+              const failedPreparation = yield* f.instance
+                .prepareOperation(
+                  {
+                    ...failedRequest,
+                    operationId: failedUsageOperationId,
+                  },
+                  () => Effect.void,
+                )
+                .pipe(Effect.result);
+              if (failedPreparation._tag === "Failure")
+                yield* Effect.logError("controlled-accounting-prepare", {
+                  failure: failedPreparation.failure,
+                });
+              expect(failedPreparation._tag).toBe("Success");
+              if (failedPreparation._tag !== "Success") return yield* failedPreparation.failure;
+              const failed = failedPreparation.success;
+              expect((yield* failed.run.pipe(Effect.result))._tag).toBe("Failure");
+              expect(
+                yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+                FROM project_team_model_request WHERE operation_id=${failedUsageOperationId}`,
+              ).toEqual([
+                {
+                  status: "unknown",
+                  capacity_state: "released",
+                  charged_input_tokens: 100,
+                  charged_output_tokens: 100,
+                },
+              ]);
+              expect(
+                yield* f.sql`SELECT json_extract(terminal_json,'$.outcome') AS outcome,
+                json_array_length(terminal_json,'$.accountingReceipts') AS receipts
+                FROM project_team_pi_operation WHERE operation_id=${failedUsageOperationId}`,
+              ).toEqual([
+                {
+                  outcome: "failed",
+                  receipts: 0,
+                },
+              ]);
+              const settled = yield* journal.settleAfterJoined(snapshot.fence, {
+                receiptId: "recorded-usage-joined",
+                stage: "settled",
+                evidence: { bindingId: f.binding.recordId, worker: "joined", transport: "drained" },
+              });
+              expect(settled.fence.stage).toBe("settled");
+              const historical = yield* readCurrentState(f.sql, projectId);
+              expect(
+                historical.foundationRecords?.find(
+                  (record) => record.recordId === f.binding.recordId,
+                )?.status,
+              ).toBe("settled");
+              expect(
+                historical.attempts.find((attempt) => attempt.attemptId === f.binding.attemptId)
+                  ?.state,
+              ).toBe("canceled");
+              const beforeUsage =
+                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+              expect(yield* readRecordedUsage()).toMatchObject([
+                {
+                  availability: "available",
+                  root: {
+                    maximumTokens: 1000,
+                    chargedTokens: 375,
+                    reservedTokens: 0,
+                    unknownChargedTokens: 241,
+                    remainingTokens: 625,
+                    heldCalls: 0,
+                    quarantinedCalls: 0,
+                  },
+                  attempt: { maximumTokens: 1000, chargedTokens: 375, unknownChargedTokens: 241 },
+                },
+              ]);
+              if (compactProof === "memorySharedRoot") {
+                const parent = historical.foundationRecords?.find(
+                  (record) =>
+                    record.kind === "run-binding" && record.recordId === f.binding.parentRunId,
+                );
+                if (parent?.kind !== "run-binding")
+                  return yield* Effect.die("Genuine original parent binding missing");
+                expect(parent.taskId).not.toBe(f.binding.taskId);
+                const parentUsage = yield* f.sql
+                  .withTransaction(
+                    readProjectTeamBindingAccountingInTransaction(f.sql, String(projectId), [
+                      parent,
+                    ]),
+                  )
+                  .pipe(
+                    Effect.provideService(ServerEnvironmentIdentity, {
+                      getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+                    }),
+                  );
+                // The selected page contains only the parent; its root still includes
+                // the charged child. Parent status is synthetic, not native proof.
+                expect(parentUsage).toMatchObject([
+                  {
+                    availability: "available",
+                    bindingId: parent.recordId,
+                    root: {
+                      taskId: parent.taskId,
+                      chargedTokens: 375,
+                      unknownChargedTokens: 241,
+                      remainingTokens: 625,
+                    },
+                    attempt: { chargedTokens: 0, reservedTokens: 0, unknownChargedTokens: 0 },
+                    operation: { chargedTokens: 0, reservedTokens: 0, unknownChargedTokens: 0 },
+                  },
+                ]);
+              }
+              const terminals = yield* f.sql<{ terminal: string }>`SELECT terminal_json AS terminal
+                FROM project_team_pi_operation WHERE operation_id=${f.request.assignmentOperationId}`;
+              const originalTerminal = terminals[0]?.terminal;
+              if (terminals.length !== 1 || originalTerminal === undefined)
+                return yield* Effect.die("Original accounted terminal missing");
+              yield* f.sql`UPDATE project_team_pi_operation
+                SET terminal_json=json_set(terminal_json,'$.accountingReceipts[0].reportedModel','foreign-reported-model')
+                WHERE operation_id=${f.request.assignmentOperationId}`;
+              expect(yield* readRecordedUsage()).toMatchObject([
+                {
+                  availability: "unavailable",
+                  reason: "ledger-invalid",
+                },
+              ]);
+              yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${originalTerminal}
+                WHERE operation_id=${f.request.assignmentOperationId}`;
+              const modelRows = yield* f.sql<{
+                id: string;
+                runId: string;
+              }>`SELECT reservation_id AS id,run_id AS runId
+                FROM project_team_model_request WHERE operation_id=${f.request.assignmentOperationId}
+                AND request_lane='pi' ORDER BY request_id LIMIT 1`;
+              const modelRow = modelRows[0];
+              if (modelRow === undefined)
+                return yield* Effect.die("Original recorded native reservation missing");
+              yield* f.sql`UPDATE project_team_model_request SET run_id='foreign-usage-binding'
+                WHERE reservation_id=${modelRow.id}`;
+              expect(yield* readRecordedUsage()).toMatchObject([
+                { availability: "unavailable", reason: "ledger-invalid" },
+              ]);
+              yield* f.sql`UPDATE project_team_model_request SET run_id=${modelRow.runId}
+                WHERE reservation_id=${modelRow.id}`;
+              yield* f.sql`UPDATE project_team_model_request SET capacity_state='legacy'
+                WHERE reservation_id=${modelRow.id}`;
+              expect(yield* readRecordedUsage()).toMatchObject([
+                { availability: "unavailable", reason: "legacy-capacity" },
+              ]);
+              yield* f.sql`UPDATE project_team_model_request SET capacity_state='released'
+                WHERE reservation_id=${modelRow.id}`;
+              expect(
+                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+              ).toEqual(beforeUsage);
+              expect(runs).toBe(3);
+              expect(f.transports).toBe(0);
             } else if (queryCache) {
               if (
                 queryRequest === undefined ||
