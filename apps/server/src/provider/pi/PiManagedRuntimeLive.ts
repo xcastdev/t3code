@@ -1127,6 +1127,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     : { _tag: "NotLaterTurn" as const };
                 if (laterTurn._tag === "LaterTurn")
                   request = structuredClone(laterTurn.decision.request);
+                const compactBoundary =
+                  request.kind === "compact"
+                    ? yield* operations.readCompaction(identity(request.threadId), request)
+                    : undefined;
                 if (
                   (request.cwd !== undefined && request.cwd !== binding.worktree) ||
                   (request.runtimeMode !== undefined &&
@@ -1164,6 +1168,15 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 yield* preparationCurrent;
                 const resourceHash = piManagedSkillResourceIdentity(selection);
                 const requestHash = digest(canonicalProjectWorkPayload(request));
+                if (compactBoundary?.association) {
+                  const prefix = contextFor(authority);
+                  yield* requiredContext.readRequired(compactBoundary.original, {
+                    optionalTextBudgetBytes: Math.max(
+                      0,
+                      65536 - Buffer.byteLength(prefix + "\n\n", "utf8"),
+                    ),
+                  });
+                }
                 const replay = yield* operations.lookup(
                   identity(request.threadId),
                   request,
@@ -1406,8 +1419,6 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   return yield* deny("Pi resume hint differs from durable native identity");
                 const context = contextFor(authority);
                 let authorityContext = context;
-                if (request.kind !== "initialize" && request.kind !== "prompt")
-                  return yield* deny("Required context is unavailable for this operation");
                 const contextOperation = {
                   projectId: binding.projectId,
                   bindingId: binding.recordId,
@@ -1415,16 +1426,19 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   providerInstanceId: binding.providerInstanceId,
                   threadId: binding.threadId,
                   operationId: request.operationId ?? "",
-                  operationKind: request.kind,
+                  operationKind: request.kind === "compact" ? ("prompt" as const) : request.kind,
                 };
                 const readOperationContext = Effect.gen(function* () {
-                  const currentTurn = yield* mailboxTurns.readForOperation({
-                    projectId: binding.projectId,
-                    bindingId: binding.recordId,
-                    generation: binding.generation,
-                    providerInstanceId: binding.providerInstanceId,
-                    request,
-                  });
+                  const currentTurn =
+                    compactBoundary === undefined
+                      ? yield* mailboxTurns.readForOperation({
+                          projectId: binding.projectId,
+                          bindingId: binding.recordId,
+                          generation: binding.generation,
+                          providerInstanceId: binding.providerInstanceId,
+                          request,
+                        })
+                      : { _tag: "NotLaterTurn" as const };
                   if (encode(currentTurn) !== encode(laterTurn))
                     return yield* deny(
                       "Retained mailbox context changed before allocation",
@@ -1436,9 +1450,11 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       65536 - Buffer.byteLength(context + "\n\n", "utf8"),
                     ),
                   };
-                  return yield* currentTurn._tag === "LaterTurn"
-                    ? requiredContext.readRequired(currentTurn.original, textOptions)
-                    : requiredContext.readForOperation(contextOperation, textOptions);
+                  return yield* compactBoundary !== undefined
+                    ? requiredContext.readRequired(compactBoundary.original, textOptions)
+                    : currentTurn._tag === "LaterTurn"
+                      ? requiredContext.readRequired(currentTurn.original, textOptions)
+                      : requiredContext.readForOperation(contextOperation, textOptions);
                 });
                 const required = yield* readOperationContext;
                 if (
@@ -1654,7 +1670,20 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   identity(request.threadId),
                   request,
                   request.operationId === undefined ? digest(encode(request)) : requestHash,
-                  { allocation, workerId, operationId: operation.operationId, resourceHash },
+                  {
+                    allocation,
+                    workerId,
+                    operationId: operation.operationId,
+                    resourceHash,
+                    ...(compactBoundary === undefined
+                      ? {}
+                      : {
+                          compactContext: {
+                            provenanceSha256: digest(encode(required.provenance)),
+                            textSha256: digest(requiredText),
+                          },
+                        }),
+                  },
                 );
                 if (contextFor(durable.authority) !== context)
                   return yield* deny("Pi assignment changed before durable handoff", "conflict");

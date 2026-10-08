@@ -8,6 +8,7 @@ import {
   SkillCatalogRevision,
   OrchestrationEvent,
   CommandId,
+  MessageId,
   ProjectWorkTaskId,
   ThreadId,
   type OrchestrationCommand,
@@ -56,6 +57,7 @@ import {
 } from "./ProjectTeamExecutionHost.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
+import { makeProjectTeamContext } from "./ProjectTeamContext.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { layerTest, ServerSettingsService } from "../serverSettings.ts";
 import type { PiProductionRuntimeHooks } from "../provider/pi/PiProductionRuntime.ts";
@@ -78,6 +80,7 @@ const native: PiNativeReference = {
 // Disposable SQL and controlled custody receipts only: no worker is started.
 const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   assignment = "Investigate the original approved task",
+  priorHistoryOrdinal?: number,
 ) {
   const repository = yield* ProjectWorkRepository;
   const sql = yield* SqlClient.SqlClient;
@@ -237,6 +240,15 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
     operationId: request.initializeOperationId,
     skillPlan,
   };
+  if (priorHistoryOrdinal !== undefined) {
+    // Older-binding metadata supplies a global ordinal; it grants this fixture no authority.
+    yield* sql`INSERT INTO project_team_pi_operation
+      (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
+      operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json)
+      VALUES('older-binding-operation','environment',${projectId},'older-binding',0,${providerInstanceId},${threadId},
+      'older-binding-worker',${priorHistoryOrdinal},'initialize',${"b".repeat(64)},'older-binding',${binding.taskId},
+      1000,${now + 10000},'settled','{}')`;
+  }
   const init = yield* operations.prepare(identity, initRequest, hash(initRequest), {
     allocation: yield* allocation,
     workerId: "mailbox-init-worker",
@@ -1201,6 +1213,541 @@ it.effect(
       }),
     ),
 );
+
+it.effect(
+  "resolves stable managed compaction at an accounted assignment boundary without renewing limits",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment();
+        const input = yield* f.reserveInput();
+        const accountingReceipt = yield* input.settle;
+        const terminal = yield* f.complete(
+          f.prompt,
+          { ...native, leafId: "compact-assignment-leaf" },
+          "success",
+          [accountingReceipt],
+        );
+        expect(terminal.outcome).toBe("success");
+        expect(terminal.accountingReceipts).toEqual([accountingReceipt]);
+        expect(terminal.drain?.kernel).toBe("populated 0\nfrozen 0");
+        const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+          receiptId: "compact-assignment-observed",
+          stage: "assignment-observed",
+          evidence: { bindingId: f.binding.recordId },
+        });
+        const original = yield* f.journal.readRetained(observed.fence.dispatchId);
+        expect(original.fence.stage).toBe("assignment-observed");
+        const retainedNative = yield* f.operations.nativeFor({ providerInstanceId, threadId });
+        expect(retainedNative.operationId).toBe(f.prompt.operation.operationId);
+        expect(retainedNative.native).toEqual(terminal.native);
+        const budgets = yield* f.sql`SELECT maximum_tokens, deadline_at_ms
+          FROM project_team_model_budget WHERE project_id=${projectId}`;
+        const operationRows =
+          yield* f.sql`SELECT operation_id, maximum_tokens, deadline_at_ms, status
+          FROM project_team_pi_operation WHERE project_id=${projectId} ORDER BY operation_ordinal`;
+        let resolve: NonNullable<PiProductionRuntimeHooks["resolveOperationId"]> | undefined;
+        const pi = Layer.mock(ProjectTeamPiRuntime)({
+          installOperationResolver: (callback) =>
+            Effect.sync(() => {
+              resolve = callback;
+            }),
+        });
+        const runtime = yield* makeProjectTeamRuntime({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+        }).pipe(Effect.provide(pi));
+        if (!resolve) return yield* Effect.die("Resolver was not installed");
+        const compactRequest = {
+          threadId,
+          kind: "compact" as const,
+          requestId: MessageId.make("managed-compact-one"),
+          modelSelection: { instanceId: providerInstanceId, model, options: [] },
+        };
+        const operationId = yield* resolve(providerInstanceId, compactRequest);
+        expect(typeof operationId).toBe("string");
+        expect(operationId).not.toBe(f.prompt.operation.operationId);
+        expect(yield* resolve(providerInstanceId, compactRequest)).toBe(operationId);
+        yield* runtime.stop;
+        yield* makeProjectTeamRuntime({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+        }).pipe(Effect.provide(pi));
+        if (!resolve) return yield* Effect.die("Restarted resolver was not installed");
+        expect(yield* resolve(providerInstanceId, compactRequest)).toBe(operationId);
+        const settings = yield* ServerSettingsService;
+        yield* settings.updateSettings({ projectTeamExecutionEnabled: false });
+        expect((yield* resolve(providerInstanceId, compactRequest).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(
+          yield* f.sql`SELECT maximum_tokens, deadline_at_ms
+          FROM project_team_model_budget WHERE project_id=${projectId}`,
+        ).toEqual(budgets);
+        expect(
+          yield* f.sql`SELECT operation_id, maximum_tokens, deadline_at_ms, status
+          FROM project_team_pi_operation WHERE project_id=${projectId} ORDER BY operation_ordinal`,
+        ).toEqual(operationRows);
+        expect((yield* f.journal.readRetained(original.fence.dispatchId)).intent.limits).toEqual(
+          original.intent.limits,
+        );
+      }).pipe(
+        Effect.provide(layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true })),
+        Effect.scoped,
+      ),
+    ),
+);
+
+it.effect(
+  "accounted compact receipts preserve cumulative limits and resume a new mailbox decision at the compact native anchor",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment();
+        const originalInput = yield* f.reserveInput();
+        yield* f.complete(f.prompt, { ...native, leafId: "compact-original" }, "success", [
+          yield* originalInput.settle,
+        ]);
+        const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+          receiptId: "compact-original-observed",
+          stage: "assignment-observed",
+          evidence: { bindingId: f.binding.recordId },
+        });
+        const original = yield* f.journal.readRetained(observed.fence.dispatchId);
+        const context = yield* makeProjectTeamContext({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+        });
+        const budget =
+          yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`;
+        let latest = { ...native, leafId: "compact-original" };
+        let finalOperationId = "";
+        for (const index of [1, 2]) {
+          const current = yield* context.readRequired(original);
+          const supplied = {
+            threadId,
+            kind: "compact" as const,
+            requestId: MessageId.make(`sql-compact-${index}`),
+            modelSelection: { instanceId: providerInstanceId, model, options: [] },
+          };
+          const boundary = yield* f.operations.readCompaction(
+            { providerInstanceId, threadId },
+            supplied,
+          );
+          const request = { ...supplied, operationId: boundary.operationId };
+          const rowsBefore = yield* f.sql`SELECT operation_id FROM project_team_pi_operation`;
+          expect(
+            (yield* f.operations
+              .prepare({ providerInstanceId, threadId }, request, hash(request), {
+                allocation: yield* f.allocation,
+                workerId: `compact-no-context-${index}`,
+                operationId: request.operationId,
+                resourceHash: "a".repeat(64),
+              })
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual(
+            rowsBefore,
+          );
+          const compact = yield* f.operations.prepare(
+            { providerInstanceId, threadId },
+            request,
+            hash(request),
+            {
+              allocation: yield* f.allocation,
+              workerId: `compact-worker-${index}`,
+              operationId: request.operationId,
+              resourceHash: "a".repeat(64),
+              compactContext: {
+                provenanceSha256: hash(current.provenance),
+                textSha256: NodeCrypto.createHash("sha256").update(current.text).digest("hex"),
+              },
+            },
+          );
+          expect(compact.maximumTokens).toBe(f.prompt.maximumTokens);
+          expect(compact.deadlineAtMs).toBe(f.prompt.deadlineAtMs);
+          const intentRows = yield* f.sql<{
+            intent_json: string;
+          }>`SELECT intent_json FROM project_team_pi_operation WHERE operation_id=${request.operationId}`;
+          expect(intentRows[0]?.intent_json).toContain(hash(current.provenance));
+          const allocated =
+            yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_ordinal`;
+          expect(
+            (yield* f.operations
+              .readCompaction(
+                { providerInstanceId, threadId },
+                {
+                  ...supplied,
+                  requestId: MessageId.make(`compact-while-prepared-${index}`),
+                },
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(
+            yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_ordinal`,
+          ).toEqual(allocated);
+          const input = yield* f.reserveInput(compact);
+          latest = { ...native, leafId: `compact-leaf-${index}` };
+          const terminal = yield* f.complete(compact, latest, "success", [yield* input.settle]);
+          const replay = yield* f.operations.lookup(
+            { providerInstanceId, threadId },
+            request,
+            hash(request),
+            "a".repeat(64),
+          );
+          expect(replay?.terminal).toEqual(terminal);
+          const recreated = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+          expect(
+            (yield* recreated.readCompaction({ providerInstanceId, threadId }, supplied))
+              .operationId,
+          ).toBe(request.operationId);
+          expect(
+            (yield* recreated.lookup(
+              { providerInstanceId, threadId },
+              request,
+              hash(request),
+              "a".repeat(64),
+            ))?.terminal,
+          ).toEqual(terminal);
+          expect(
+            yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`,
+          ).toEqual(budget);
+          finalOperationId = request.operationId;
+        }
+        const consumed = yield* f.sql<{
+          tokens: number;
+        }>`SELECT SUM(charged_input_tokens+charged_output_tokens) AS tokens
+      FROM project_team_model_request WHERE project_id=${projectId} AND status='reported'`;
+        expect(consumed[0]?.tokens).toBe(36);
+        yield* f.addMessage("after-compact", "Continue only within the original task");
+        const turns = yield* makeProjectTeamMailboxTurns({
+          environmentId: "environment",
+          lookupInTransaction: f.operations.lookupInTransaction,
+        });
+        const selected = yield* turns.claim(original);
+        if (selected._tag !== "Selected")
+          return yield* Effect.die("Expected a newly selected mailbox message");
+        expect(selected.decision.request.resumeCursor).toEqual(latest);
+        expect(selected.decision.compactAnchor?.operationId).toBe(finalOperationId);
+        expect(selected.decision.originalAssignmentOperationId).toBe(
+          f.prompt.operation.operationId,
+        );
+        expect(selected.decision.target.deliveryCursor).toBe(1);
+        const later = yield* f.operations.prepare(
+          { providerInstanceId, threadId },
+          selected.decision.request,
+          selected.decision.requestSha256,
+          {
+            allocation: yield* f.allocation,
+            workerId: "post-compact-message-worker",
+            operationId: selected.decision.request.operationId,
+            resourceHash: selected.decision.resourceHash,
+          },
+        );
+        expect(later.maximumTokens).toBe(f.prompt.maximumTokens);
+        expect((yield* f.messages)[0]?.status).toBe("queued");
+        const retained = yield* turns.readForOperation({
+          projectId,
+          bindingId: f.binding.recordId,
+          generation: f.binding.generation,
+          providerInstanceId,
+          request: selected.decision.request,
+        });
+        if (retained._tag !== "LaterTurn")
+          return yield* Effect.die("Expected retained later context");
+        expect(retained.decision).toEqual(selected.decision);
+        expect(retained.original).toEqual(original);
+        yield* turns.seal({
+          operationId: later.operation.operationId,
+          baseSystemText: "Current required context after compaction",
+        });
+        const laterInput = yield* f.reserveInput(later);
+        yield* turns.bindInput({
+          operationId: later.operation.operationId,
+          reservationId: laterInput.reservationId,
+          encodedRequestSha256: "d".repeat(64),
+        });
+        yield* f.complete(later, { ...native, leafId: "post-compact-delivered" }, "success", [
+          yield* laterInput.settle,
+        ]);
+        expect((yield* turns.reflect({ operationId: later.operation.operationId }))._tag).toBe(
+          "Delivered",
+        );
+        expect((yield* f.messages)[0]?.status).toBe("delivered");
+        const supplied = {
+          threadId,
+          kind: "compact" as const,
+          requestId: MessageId.make("compact-after-message"),
+        };
+        const boundary = yield* f.operations.readCompaction(
+          { providerInstanceId, threadId },
+          supplied,
+        );
+        const request = { ...supplied, operationId: boundary.operationId };
+        const compact = yield* f.operations.prepare(
+          { providerInstanceId, threadId },
+          request,
+          hash(request),
+          {
+            allocation: yield* f.allocation,
+            workerId: "successor-compact-worker",
+            operationId: request.operationId,
+            resourceHash: "a".repeat(64),
+            compactContext: { provenanceSha256: "b".repeat(64), textSha256: "c".repeat(64) },
+          },
+        );
+        const compactInput = yield* f.reserveInput(compact);
+        yield* f.complete(compact, { ...native, leafId: "successor-compact-leaf" }, "success", [
+          yield* compactInput.settle,
+        ]);
+        yield* f.addMessage(
+          "second-after-compact",
+          "An ordinary successor still consumes only its selected message",
+        );
+        const next = yield* turns.claim(original, {
+          afterOperationId: later.operation.operationId,
+        });
+        if (next._tag !== "Selected")
+          return yield* Effect.die("Expected ordinary successor after compaction");
+        expect(next.decision.request.resumeCursor).toEqual({
+          ...native,
+          leafId: "successor-compact-leaf",
+        });
+        expect(next.decision.compactAnchor?.operationId).toBe(compact.operation.operationId);
+        expect(next.decision.target.deliveryCursor).toBe(1);
+        expect((yield* f.messages).map((message) => [message.recordId, message.status])).toEqual([
+          ["after-compact", "delivered"],
+          ["second-after-compact", "queued"],
+        ]);
+      }).pipe(
+        Effect.provide(layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true })),
+      ),
+    ),
+);
+
+it.effect(
+  "compact preserves retained replay at the binding cleanup bound and prevents a 131st operation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment(undefined, 1000);
+        const input = yield* f.reserveInput();
+        yield* f.complete(f.prompt, { ...native, leafId: "capacity-original" }, "success", [
+          yield* input.settle,
+        ]);
+        const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+          receiptId: "capacity-original-observed",
+          stage: "assignment-observed",
+          evidence: { bindingId: f.binding.recordId },
+        });
+        const original = yield* f.journal.readRetained(observed.fence.dispatchId);
+        const supplied = {
+          threadId,
+          kind: "compact" as const,
+          requestId: MessageId.make("capacity-retained-compact"),
+        };
+        const before = yield* f.sql<{
+          count: number;
+        }>`SELECT COUNT(*) AS count FROM project_team_pi_operation
+      WHERE environment_id='environment' AND binding_id=${f.binding.recordId} AND generation=${f.binding.generation}`;
+        expect(before[0]?.count).toBe(2);
+        expect(
+          yield* f.sql`SELECT binding_id,operation_ordinal FROM project_team_pi_operation WHERE operation_id='older-binding-operation'`,
+        ).toEqual([{ binding_id: "older-binding", operation_ordinal: 1000 }]);
+        const boundary = yield* f.operations.readCompaction(
+          { providerInstanceId, threadId },
+          supplied,
+        );
+        expect(boundary.predecessor.ordinal).toBeGreaterThan(130);
+        const request = { ...supplied, operationId: boundary.operationId };
+        const compact = yield* f.operations.prepare(
+          { providerInstanceId, threadId },
+          request,
+          hash(request),
+          {
+            allocation: yield* f.allocation,
+            workerId: "capacity-compact-worker",
+            operationId: request.operationId,
+            resourceHash: "a".repeat(64),
+            compactContext: { provenanceSha256: "b".repeat(64), textSha256: "c".repeat(64) },
+          },
+        );
+        const compactInput = yield* f.reserveInput(compact);
+        const terminal = yield* f.complete(
+          compact,
+          { ...native, leafId: "capacity-compact" },
+          "success",
+          [yield* compactInput.settle],
+        );
+        const next = {
+          threadId,
+          kind: "compact" as const,
+          requestId: MessageId.make("capacity-new-compact"),
+        };
+        const nextId = (yield* f.operations.readCompaction({ providerInstanceId, threadId }, next))
+          .operationId;
+        // Metadata occupants test cleanup capacity only; their copied bodies are never execution authority.
+        yield* f.sql`WITH RECURSIVE slots(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM slots WHERE n<127)
+      INSERT INTO project_team_pi_operation
+      (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,
+      operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,
+      intent_json,native_json,terminal_json)
+      SELECT 'capacity-metadata-'||n,environment_id,project_id,binding_id,generation,provider_instance_id,
+      'capacity-metadata-thread-'||n,'capacity-metadata-worker-'||n,0,operation_kind,request_hash,root_binding_id,
+      root_task_id,maximum_tokens,deadline_at_ms,'settled',intent_json,native_json,terminal_json
+      FROM project_team_pi_operation,slots WHERE operation_id=${f.request.initializeOperationId}`;
+        const count = yield* f.sql<{
+          count: number;
+        }>`SELECT COUNT(*) AS count FROM project_team_pi_operation
+      WHERE environment_id='environment' AND binding_id=${f.binding.recordId} AND generation=${f.binding.generation}`;
+        expect(count[0]?.count).toBe(130);
+        expect(
+          (yield* f.operations.readCompaction({ providerInstanceId, threadId }, supplied))
+            .operationId,
+        ).toBe(request.operationId);
+        expect(
+          (yield* f.operations.lookup(
+            { providerInstanceId, threadId },
+            request,
+            hash(request),
+            "a".repeat(64),
+          ))?.terminal,
+        ).toEqual(terminal);
+        const rows =
+          yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_id`;
+        expect(
+          yield* f.operations
+            .readCompaction({ providerInstanceId, threadId }, next)
+            .pipe(Effect.result),
+        ).toMatchObject({
+          _tag: "Failure",
+          failure: { detail: "Pi owned operation history has reached its cleanup bound" },
+        });
+        const nextRequest = { ...next, operationId: nextId };
+        expect(
+          yield* f.operations
+            .prepare({ providerInstanceId, threadId }, nextRequest, hash(nextRequest), {
+              allocation: yield* f.allocation,
+              workerId: "capacity-rejected-worker",
+              operationId: nextId,
+              resourceHash: "a".repeat(64),
+              compactContext: { provenanceSha256: "b".repeat(64), textSha256: "c".repeat(64) },
+            })
+            .pipe(Effect.result),
+        ).toMatchObject({
+          _tag: "Failure",
+          failure: { detail: "Pi owned operation history has reached its cleanup bound" },
+        });
+        yield* f.addMessage(
+          "capacity-later-message",
+          "This message must not acquire a 131st owner",
+        );
+        const turns = yield* makeProjectTeamMailboxTurns({
+          environmentId: "environment",
+          lookupInTransaction: f.operations.lookupInTransaction,
+        });
+        const selected = yield* turns.claim(original);
+        if (selected._tag !== "Selected")
+          return yield* Effect.die("Expected actual selected mailbox decision");
+        expect(
+          yield* f.operations
+            .prepare(
+              { providerInstanceId, threadId },
+              selected.decision.request,
+              selected.decision.requestSha256,
+              {
+                allocation: yield* f.allocation,
+                workerId: "capacity-later-worker",
+                operationId: selected.decision.request.operationId,
+                resourceHash: selected.decision.resourceHash,
+              },
+            )
+            .pipe(Effect.result),
+        ).toMatchObject({
+          _tag: "Failure",
+          failure: { detail: "Pi owned operation history has reached its cleanup bound" },
+        });
+        expect(
+          yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_id`,
+        ).toEqual(rows);
+        expect((yield* f.messages)[0]?.status).toBe("queued");
+      }).pipe(
+        Effect.provide(layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true })),
+      ),
+    ),
+);
+
+it.effect("compact cannot reopen an immutable empty mailbox boundary", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* laterFixture;
+      const empty = yield* f.turns.claim(f.snapshot);
+      expect(empty._tag).toBe("None");
+      const supplied = {
+        threadId,
+        kind: "compact" as const,
+        requestId: MessageId.make("compact-after-empty"),
+      };
+      const boundary = yield* f.operations.readCompaction(
+        { providerInstanceId, threadId },
+        supplied,
+      );
+      const request = { ...supplied, operationId: boundary.operationId };
+      const operation = yield* f.operations.prepare(
+        { providerInstanceId, threadId },
+        request,
+        hash(request),
+        {
+          allocation: yield* f.allocation,
+          workerId: "empty-compact-worker",
+          operationId: request.operationId,
+          resourceHash: "a".repeat(64),
+          compactContext: { provenanceSha256: "b".repeat(64), textSha256: "c".repeat(64) },
+        },
+      );
+      const input = yield* f.reserveInput(operation);
+      yield* f.complete(operation, { ...native, leafId: "compact-after-empty-leaf" }, "success", [
+        yield* input.settle,
+      ]);
+      yield* f.addMessage("still-idle", "This does not gain idle wake authority");
+      expect(yield* f.turns.claim(f.snapshot)).toEqual(empty);
+      expect((yield* f.messages)[0]?.status).toBe("queued");
+    }),
+  ),
+);
+
+for (const outcome of ["failed", "canceled", "quarantine"] as const)
+  it.effect(`compact denies a ${outcome} predecessor without allocating a new operation`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment();
+        yield* f.complete(f.prompt, { ...native, leafId: "non-successful-assignment" }, outcome);
+        const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+          receiptId: "failed-compact-observed",
+          stage: "assignment-observed",
+          evidence: { bindingId: f.binding.recordId },
+        });
+        expect(observed.fence.stage).toBe("assignment-observed");
+        const before =
+          yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_ordinal`;
+        expect(
+          (yield* f.operations
+            .readCompaction(
+              { providerInstanceId, threadId },
+              {
+                kind: "compact",
+                threadId,
+                requestId: MessageId.make(`denied-compact-${outcome}`),
+              },
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_ordinal`,
+        ).toEqual(before);
+      }),
+    ),
+  );
 
 it.effect(
   "actual installed resolver admits one retained later request and revocation or altered input denies it",

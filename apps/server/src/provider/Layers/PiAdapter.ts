@@ -717,6 +717,12 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             type: "turn.completed",
             payload: { state: "completed", tokenUsage: active.tokenUsage },
           });
+        if (active.operation.kind === "compact")
+          yield* emit({
+            ...(yield* eventBase(context, active, "compacted")),
+            type: "thread.state.changed",
+            payload: { state: "compacted" },
+          });
         return session;
       }
       if (outcome === "canceled") {
@@ -1083,6 +1089,45 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     },
     startSession,
     sendTurn,
+    compaction: {
+      type: "native",
+      start: Effect.fn("PiAdapter.compact")(function* (threadId, modelSelection, requestId) {
+        const context = yield* owned(threadId);
+        if (!context.session)
+          return yield* new ProviderAdapterSessionNotFoundError({ provider, threadId });
+        if (
+          !requestId ||
+          (modelSelection !== undefined &&
+            (modelSelection.instanceId !== instanceId ||
+              (modelSelection.options !== undefined &&
+                Object.keys(modelSelection.options).length > 0)))
+        )
+          return yield* invalid(
+            "compact",
+            "Pi compaction requires its durable request identity and configured model.",
+          );
+        yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const active = yield* launch(context, {
+              kind: "compact",
+              threadId,
+              requestId,
+              ...(modelSelection === undefined
+                ? {}
+                : { modelSelection: structuredClone(modelSelection) }),
+              ...(context.skillPlan === undefined
+                ? {}
+                : { skillPlan: structuredClone(context.skillPlan) }),
+            });
+            yield* restore(Deferred.await(active.result)).pipe(
+              Effect.catchCause((cause) =>
+                joinInterrupted(context, cause, restore, snapshotPublication(active.result.effect)),
+              ),
+            );
+          }),
+        );
+      }),
+    },
     interruptTurn,
     respondToRequest: () =>
       Effect.fail(invalid("respondToRequest", "Pi interactive approval replies are unsupported.")),

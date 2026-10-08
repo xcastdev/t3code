@@ -232,17 +232,22 @@ function makeFakeCodexAdapter(
       Effect.void,
   );
 
-  const compactThread = vi.fn((threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
-    Effect.sync(() =>
-      emit({
-        type: "thread.state.changed",
-        eventId: asEventId("evt-native-compact"),
-        provider,
-        createdAt: "2026-01-01T00:00:00.000Z",
-        threadId,
-        payload: { state: "compacted" },
-      }),
-    ),
+  const compactThread = vi.fn(
+    (
+      threadId: ThreadId,
+      _modelSelection?: ProviderSendTurnInput["modelSelection"],
+      _requestId?: MessageId,
+    ): Effect.Effect<void, ProviderAdapterError> =>
+      Effect.sync(() =>
+        emit({
+          type: "thread.state.changed",
+          eventId: asEventId("evt-native-compact"),
+          provider,
+          createdAt: "2026-01-01T00:00:00.000Z",
+          threadId,
+          payload: { state: "compacted" },
+        }),
+      ),
   );
   const respondToRequest = vi.fn(
     (
@@ -1761,6 +1766,7 @@ declaredCompaction.layer("ProviderService declared compaction", (it) => {
       const compacted = Option.getOrThrow(yield* Fiber.join(compactedEventFiber));
       assert.equal(compacted.requestId, String(requestId));
       assert.equal(customNativeCompaction.compactThread.mock.calls.length, 1);
+      assert.equal(customNativeCompaction.compactThread.mock.calls[0]?.[2], requestId);
       assert.equal(customNativeCompaction.sendTurn.mock.calls.length, 0);
       yield* provider.stopSession({ threadId });
     }),

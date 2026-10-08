@@ -12,6 +12,7 @@ import {
 import {
   canonicalProjectWorkPayload,
   CommandId,
+  MessageId,
   ProjectWorkTaskRead,
   ProjectWorkWriteResult,
   ProjectWorkEvidenceRead,
@@ -29,6 +30,7 @@ import * as DateTime from "effect/DateTime";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
@@ -69,6 +71,7 @@ import {
 import { ProjectWorkPolicyError } from "../../projectWork/ProjectWorkPolicy.ts";
 import {
   makeProjectTeamDispatchJournal,
+  ProjectTeamDispatchJournalError,
   type ProjectTeamDispatchRequest,
 } from "../../projectWork/ProjectTeamDispatchJournal.ts";
 import { makeProjectTeamContext } from "../../projectWork/ProjectTeamContext.ts";
@@ -5740,6 +5743,478 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
     },
   };
 });
+
+it.effect(
+  "managed compact transfers current required context after durable association and replays without another execution",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredTransferFixture(false, false);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          // These stage receipts sequence the disposable SQL/Git fixture, not a native worker.
+          verifyStage: (receipt, original) =>
+            receipt.evidence.bindingId === original.intent.request.git.runId
+              ? Effect.void
+              : Effect.fail(
+                  new ProjectTeamDispatchJournalError({ reason: "Foreign controlled stage" }),
+                ),
+        });
+        let snapshot = f.snapshot;
+        const stage = Effect.fn("compactLive.controlledStage")(function* (
+          value:
+            | "workspace-ready"
+            | "setup-complete"
+            | "session-bound"
+            | "assignment-intent"
+            | "assignment-observed",
+        ) {
+          snapshot = yield* journal.readRetained(
+            (yield* journal.advanceStage(snapshot.fence, {
+              receiptId: `compact-live-${value}`,
+              stage: value,
+              evidence: { bindingId: f.binding.recordId },
+            })).fence.dispatchId,
+          );
+        });
+        yield* stage("workspace-ready");
+        yield* stage("setup-complete");
+        let runs = 0;
+        let constructed = 0;
+        let runEntries = 0;
+        let diagnostic = "";
+        let compactText = "";
+        let expectedContext = "";
+        let expectedProvenance = "";
+        const entries: Array<{
+          type: string;
+          id: string;
+          parentId: string | null;
+          timestamp: string;
+          message: {
+            role: string;
+            content: Array<{ type: string; text: string }>;
+            timestamp: number;
+          };
+        }> = [];
+        const original = SessionRuntime.makePiSessionRuntime;
+        const spy = vi.spyOn(SessionRuntime, "makePiSessionRuntime").mockImplementation((input) =>
+          original(input).pipe(
+            Effect.tapCause((cause) =>
+              Effect.sync(() => {
+                diagnostic = "construction: " + Cause.pretty(cause);
+              }),
+            ),
+            Effect.map((session) => {
+              constructed++;
+              return {
+                ...session,
+                run: () => {
+                  runEntries++;
+                  return Effect.gen(function* () {
+                    runs++;
+                    const rows = yield* f.sql<{
+                      status: string;
+                      intent_json: string;
+                      deadline_at_ms: number;
+                    }>`SELECT status,intent_json,deadline_at_ms
+          FROM project_team_pi_operation WHERE operation_id=${input.operation.operationId}`;
+                    const row = rows[0];
+                    if (rows.length !== 1 || !row)
+                      return yield* Effect.die(
+                        "Missing durable operation before controlled execution",
+                      );
+                    expect(row.status).toBe("prepared");
+                    if (input.operation.operationKind === "compact") {
+                      compactText =
+                        input.transferTexts.find((entry) => entry.transferId === "context")?.text ??
+                        "";
+                      expect(input.bootstrap.prompt).toBeNull();
+                      expect(input.bootstrap.native?.leafId).toBe("required-prompt");
+                      expect(compactText).toContain(expectedContext);
+                      expect(row.intent_json).toContain(expectedProvenance);
+                      expect(row.intent_json).toContain(
+                        NodeCrypto.createHash("sha256").update(compactText).digest("hex"),
+                      );
+                      expect(decodeRequiredJson(row.intent_json)).toMatchObject({
+                        compaction: {
+                          dispatchId: snapshot.fence.dispatchId,
+                          predecessorOperationId: f.request.assignmentOperationId,
+                          requestId: "live-compact-original",
+                          contextProvenanceSha256: expectedProvenance,
+                        },
+                      });
+                    }
+                    const allocation = input.persistence.allocation;
+                    // Synthetic owner/drain and accounted ports; no managed worker, SDK or model is launched.
+                    const owner = {
+                      type: "owner" as const,
+                      unit: allocation.unit,
+                      nonce: allocation.nonce,
+                      invocation: "a".repeat(32),
+                      cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+                      pid: 99999999,
+                      memoryBytes: allocation.policy.memoryBytes,
+                      swapBytes: 0,
+                      oomGroup: 1,
+                    };
+                    yield* input.persistence.claimActivation(allocation);
+                    yield* input.persistence.beforeStart(owner);
+                    const native = {
+                      sessionId: "required-compact-session",
+                      sessionReference: "sessions/required-compact.jsonl",
+                      leafId: `required-${input.operation.operationKind}`,
+                      persisted: true,
+                    };
+                    entries.push({
+                      type: "message",
+                      id: native.leafId,
+                      parentId: entries.at(-1)?.id ?? null,
+                      timestamp: at,
+                      message: {
+                        role: "user",
+                        content: [
+                          {
+                            type: "text",
+                            text:
+                              input.transferTexts.find((entry) => entry.transferId === "context")
+                                ?.text ?? "",
+                          },
+                        ],
+                        timestamp: Date.parse(at),
+                      },
+                    });
+                    yield* f.fs.makeDirectory(allocation.launch.nativeStateRoot + "/sessions", {
+                      recursive: true,
+                    });
+                    yield* f.fs.writeFileString(
+                      allocation.launch.nativeStateRoot + "/" + native.sessionReference,
+                      [
+                        {
+                          type: "session",
+                          version: 3,
+                          id: native.sessionId,
+                          timestamp: at,
+                          cwd: "/workspace",
+                        },
+                        ...entries,
+                      ]
+                        .map((entry) => json(entry))
+                        .join("\n") + "\n",
+                    );
+                    const signal = yield* Effect.abortSignal;
+                    yield* Effect.tryPromise(() =>
+                      input.persistNative(
+                        {
+                          version: 1,
+                          ...input.identity,
+                          ...input.operation,
+                          sequence: 0,
+                          message:
+                            input.operation.operationKind === "initialize"
+                              ? { type: "initialized", native }
+                              : {
+                                  type: "native",
+                                  lifecycleId: 1,
+                                  native,
+                                },
+                        },
+                        signal,
+                      ),
+                    );
+                    const accountingReceipts: Array<
+                      SessionRuntime.PiSessionTerminal["accountingReceipts"][number]
+                    > = [];
+                    if (input.operation.operationKind !== "initialize") {
+                      const fields = {
+                        workerId: input.identity.workerId,
+                        generation: input.identity.generation,
+                        operationId: input.operation.operationId,
+                        requestId: 1,
+                        routeId: input.broker.routeId,
+                        provider: input.broker.provider,
+                        model: input.broker.model,
+                        maxInputTokens: input.broker.maxInputTokens,
+                        maxOutputTokens: input.broker.maxOutputTokens,
+                        callCount: 1 as const,
+                        deadlineAtMs: row.deadline_at_ms,
+                      };
+                      const reserved = yield* Effect.tryPromise(() =>
+                        input.broker.reserveRequest(fields, signal),
+                      );
+                      const bindRequestInput = input.broker.bindRequestInput;
+                      if (bindRequestInput)
+                        yield* Effect.tryPromise(() =>
+                          bindRequestInput(
+                            {
+                              reservationId: reserved.reservationId,
+                              encodedRequestSha256: "d".repeat(64),
+                            },
+                            signal,
+                          ),
+                        );
+                      const usage = { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 };
+                      const settled = yield* Effect.tryPromise(() =>
+                        input.broker.settleRequest({
+                          ...fields,
+                          reservationId: reserved.reservationId,
+                          transportDrained: true,
+                          outcome: "reported",
+                          chargedInputTokens: 10,
+                          chargedOutputTokens: 2,
+                          reportedModel: input.broker.model,
+                          reportedUsage: usage,
+                        }),
+                      );
+                      accountingReceipts.push({
+                        requestId: 1,
+                        reservationId: reserved.reservationId,
+                        accountingReceiptId: settled.accountingReceiptId,
+                        routeId: fields.routeId,
+                        provider: fields.provider,
+                        model: fields.model,
+                        reportedModel: fields.model,
+                        usage,
+                      });
+                    }
+                    const terminal: SessionRuntime.PiSessionTerminal = {
+                      identity: input.identity,
+                      operation: input.operation,
+                      outcome: "success",
+                      ownerCaptured: true,
+                      native,
+                      accountingReceipts,
+                      drain: {
+                        unit: owner.unit,
+                        invocation: owner.invocation,
+                        cgroup: owner.cgroup,
+                        ownerPid: owner.pid,
+                        memoryBytes: owner.memoryBytes,
+                        swapBytes: 0,
+                        oomGroup: 1,
+                        launcherPid: 99999998,
+                        childPid: 99999997,
+                        childExitCode: 0,
+                        kernel: "removed",
+                      },
+                    };
+                    yield* Effect.tryPromise(() => input.persistTerminal(terminal, signal));
+                    return terminal;
+                  }).pipe(
+                    Effect.tapCause((cause) =>
+                      Effect.sync(() => {
+                        diagnostic = input.operation.operationKind + ": " + Cause.pretty(cause);
+                      }),
+                    ),
+                    Effect.mapError(
+                      () =>
+                        new SessionRuntime.PiSessionRuntimeError({
+                          code: "CONTROLLED_COMPACT_FAILURE",
+                        }),
+                    ),
+                  );
+                },
+              };
+            }),
+          ),
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const initialized = yield* f.instance.prepareOperation(
+          { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
+          () => Effect.void,
+        );
+        expect(spy.mock.calls).toHaveLength(1);
+        expect(constructed).toBe(1);
+        const initializeResult = yield* initialized.run.pipe(Effect.result);
+        expect({
+          result: initializeResult,
+          constructed,
+          runEntries,
+          runs,
+          diagnostic,
+        }).toMatchObject({
+          diagnostic: "",
+          constructed: 1,
+          runEntries: 1,
+          runs: 1,
+          result: { _tag: "Success", success: { terminal: { outcome: "success" } } },
+        });
+        yield* stage("session-bound");
+        yield* stage("assignment-intent");
+        const assigned = yield* f.instance.prepareOperation(
+          {
+            threadId,
+            kind: "prompt",
+            operationId: f.request.assignmentOperationId,
+            prompt: f.request.assignment,
+          },
+          () => Effect.void,
+        );
+        const assignmentResult = yield* assigned.run.pipe(Effect.result);
+        expect({
+          result: assignmentResult,
+          constructed,
+          runEntries,
+          runs,
+          diagnostic,
+        }).toMatchObject({
+          diagnostic: "",
+          constructed: 2,
+          runEntries: 2,
+          runs: 2,
+          result: { _tag: "Success", success: { terminal: { outcome: "success" } } },
+        });
+        yield* stage("assignment-observed");
+        const current = yield* f.reader.readRequired(snapshot);
+        expectedContext = current.text;
+        expectedProvenance = NodeCrypto.createHash("sha256")
+          .update(json(current.provenance))
+          .digest("hex");
+        const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+        const supplied = {
+          threadId,
+          kind: "compact" as const,
+          requestId: MessageId.make("live-compact-original"),
+        };
+        const boundary = yield* operations.readCompaction(
+          { providerInstanceId, threadId },
+          supplied,
+        );
+        const request = { ...supplied, operationId: boundary.operationId };
+        const compact = yield* f.instance.prepareOperation(request, () => Effect.void);
+        const compactResult = yield* compact.run.pipe(Effect.result);
+        expect({ result: compactResult, constructed, runEntries, runs, diagnostic }).toMatchObject({
+          diagnostic: "",
+          constructed: 3,
+          runEntries: 3,
+          runs: 3,
+          result: { _tag: "Success" },
+        });
+        if (compactResult._tag !== "Success") return yield* Effect.die("Controlled compact failed");
+        const terminal = compactResult.success.terminal;
+        expect(terminal.outcome).toBe("success");
+        expect(compactText).toContain(current.text);
+        expect(runs).toBe(3);
+        const allocations = f.allocations;
+        const rows =
+          yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`;
+        const budget =
+          yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`;
+        const replay = yield* f.instance.prepareOperation(request, () => Effect.void);
+        expect((yield* replay.run).terminal).toEqual(terminal);
+        expect(runs).toBe(3);
+        expect(f.allocations).toBe(allocations);
+        expect(
+          yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`,
+        ).toEqual(rows);
+        expect(
+          yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`,
+        ).toEqual(budget);
+        expect(f.transports).toBe(0);
+        let processAllocations = 0;
+        const originalAllocate = ManagedProcess.preallocatePiManagedProcess;
+        const allocationSpy = vi
+          .spyOn(ManagedProcess, "preallocatePiManagedProcess")
+          .mockImplementation((launch) => {
+            processAllocations++;
+            return originalAllocate(launch);
+          });
+        yield* Effect.addFinalizer(() => Effect.sync(() => allocationSpy.mockRestore()));
+        const beforeRace = yield* readCurrentState(f.sql, projectId);
+        const questionGate = beforeRace.foundationRecords?.find(
+          (record) =>
+            record.kind === "gate" &&
+            record.taskId === f.binding.taskId &&
+            record.gate === "specification",
+        );
+        if (questionGate?.kind !== "gate")
+          return yield* Effect.die("Missing compact context target");
+        const changed = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          revalidateRuntime: Effect.gen(function* () {
+            const state = yield* readCurrentState(f.sql, projectId);
+            yield* f.repository.execute(
+              yield* decodeRequiredFoundation({
+                type: "project-work.foundation.commit",
+                projectId,
+                commandId: "compact-live-context-race",
+                expectedRevision: state.revision,
+                attribution,
+                committedAt: at,
+                records: [
+                  {
+                    kind: "question",
+                    projectId,
+                    recordId: "compact-live-context-race",
+                    revision: 0,
+                    generation: 0,
+                    updatedAt: at,
+                    status: "pending",
+                    taskId: f.binding.taskId,
+                    senderId: f.binding.memberId,
+                    targetGateId: questionGate.recordId,
+                    targetRevision: questionGate.revision,
+                    body: "Retained context changed before compaction allocation",
+                    choices: [],
+                  },
+                ],
+              }),
+            );
+          }).pipe(Effect.mapError(controlledCallbackError)),
+        });
+        const changedInstance = yield* changed.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const race = yield* changedInstance
+          .prepareOperation(
+            { threadId, kind: "compact", requestId: MessageId.make("live-compact-context-race") },
+            () => Effect.void,
+          )
+          .pipe(Effect.result);
+        expect(race).toMatchObject({
+          _tag: "Failure",
+          failure: { detail: "Required context provenance changed before allocation" },
+        });
+        expect(processAllocations).toBe(0);
+        expect(runs).toBe(3);
+        expect(spy.mock.calls).toHaveLength(3);
+        expect(f.transports).toBe(0);
+        expect(
+          yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`,
+        ).toEqual(rows);
+        const argumentsAfterRace = f.allocations;
+        const state = yield* readCurrentState(f.sql, projectId);
+        const role = state.foundationRecords?.find(
+          (record) =>
+            record.kind === "role-revision" && record.recordId === f.binding.roleRevisionId,
+        );
+        if (role?.kind !== "role-revision") return yield* Effect.die("Missing compact role");
+        yield* restoreHistoricalBinding({
+          ...role,
+          revision: role.revision + 1,
+          instructions: role.instructions + " changed",
+        });
+        expect(
+          (yield* f.instance
+            .prepareOperation(
+              { ...request, requestId: MessageId.make("live-compact-drift") },
+              () => Effect.void,
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(runs).toBe(3);
+        expect(f.allocations).toBe(argumentsAfterRace);
+        expect(processAllocations).toBe(0);
+        expect(f.transports).toBe(0);
+        expect(
+          yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`,
+        ).toEqual(rows);
+      }),
+    ),
+);
 
 for (const readonlyKind of [undefined, "planning", "investigation", "review"] as const)
   for (const kind of readonlyKind === "review"

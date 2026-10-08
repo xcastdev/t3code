@@ -3,6 +3,7 @@ import {
   ApprovalRequestId,
   EventId,
   ManagedSkillKey,
+  MessageId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
@@ -567,6 +568,44 @@ const makeFake = Effect.fn("PiAdapter.test.makeFake")(function* (instance = inst
     output,
   };
 });
+
+it.effect(
+  "native compact retains its request identity and publishes only a joined successful terminal",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      const compaction = adapter.compaction;
+      if (compaction?.type !== "native")
+        return yield* Effect.die("Missing native compaction capability");
+      yield* adapter.startSession(startInput);
+      const eager = getProviderTurnEventSubscription(adapter);
+      if (!eager) return yield* Effect.die("Missing native compaction event source");
+      const subscription = yield* eager;
+      const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
+      yield* Stream.fromSubscription(subscription).pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkChild,
+      );
+      const requestId = MessageId.make("adapter-compact-one");
+      const running = yield* compaction
+        .start(threadId, undefined, requestId)
+        .pipe(Effect.forkChild);
+      yield* Queue.take(fake.preparedQueue);
+      const operation = yield* Queue.take(fake.preparedQueue);
+      expect(fake.requests.at(-1)).toMatchObject({ kind: "compact", threadId, requestId });
+      expect(yield* Deferred.isDone(operation.result)).toBe(false);
+      yield* fake.settle(operation, "success");
+      yield* Fiber.join(running);
+      const compacted = yield* Queue.take(events);
+      expect(compacted).toMatchObject({
+        type: "thread.state.changed",
+        payload: { state: "compacted" },
+      });
+      expect(Exit.isFailure(yield* Effect.exit(compaction.start(threadId)))).toBe(true);
+      expect(fake.requests).toHaveLength(2);
+    }).pipe(Effect.scoped),
+);
 const subscribe = Effect.fn("PiAdapter.test.subscribe")(function* (
   stream: Stream.Stream<ProviderRuntimeEvent>,
 ) {
@@ -833,7 +872,7 @@ it.effect("rejects unsupported input and interactive methods before acquisition"
     ).toBe(true);
     expect(Exit.isFailure(yield* Effect.exit(adapter.rollbackThread(threadId, 1)))).toBe(true);
     expect(fake.requests).toHaveLength(0);
-    expect(adapter.compaction).toBeUndefined();
+    expect(adapter.compaction).toMatchObject({ type: "native" });
     expect(adapter.forkThread).toBeUndefined();
     expect(adapter.capabilities.sessionModelSwitch).toBe("unsupported");
   }),

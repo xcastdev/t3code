@@ -3312,7 +3312,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
       const terminal = yield* (
         compaction.type === "native"
-          ? awaitNativeCompaction(compaction.start(routed.threadId, modelSelection))
+          ? awaitNativeCompaction(compaction.start(routed.threadId, modelSelection, requestId))
           : Effect.gen(function* () {
               const turn = yield* sendTurn({
                 threadId,

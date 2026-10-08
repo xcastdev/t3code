@@ -9,6 +9,7 @@
  */
 import type {
   ApprovalRequestId,
+  MessageId,
   ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderUserInputAnswers,
@@ -69,6 +70,7 @@ export type ProviderCompaction<TError> =
       readonly start: (
         threadId: ThreadId,
         modelSelection?: ProviderSendTurnInput["modelSelection"],
+        requestId?: MessageId,
       ) => Effect.Effect<void, TError>;
     }
   | { readonly type: "slash-command"; readonly command: `/${string}` };

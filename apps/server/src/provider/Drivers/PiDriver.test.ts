@@ -152,6 +152,37 @@ const decodeConfig = Schema.decodeUnknownSync(driver.configSchema);
 const encodeManifest = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeBriefing = Schema.decodeUnknownEffect(ProjectWorkBriefing);
 
+it.effect("advertises compact only from an installed native compaction adapter", () =>
+  Effect.gen(function* () {
+    const capable = makePiDriver({
+      makeAdapter: () =>
+        Effect.succeed({
+          ...adapter,
+          compaction: { type: "native" as const, start: () => Effect.void },
+        }),
+    });
+    const instance = yield* capable.create(createInput()).pipe(
+      Effect.provideService(PiManagedRuntime, {
+        forInstance: () => Effect.succeed(runtimeFake()),
+      }),
+      Effect.provideService(Materialization.SkillMaterializationService, noMaterialization),
+    );
+    expect(
+      (yield* instance.snapshot.getSnapshot).slashCommands.map((command) => command.name),
+    ).toEqual(["compact"]);
+    expect((yield* instance.snapshot.refresh).slashCommands.map((command) => command.name)).toEqual(
+      ["compact"],
+    );
+    const ordinary = yield* driver.create(createInput()).pipe(
+      Effect.provideService(PiManagedRuntime, {
+        forInstance: () => Effect.succeed(runtimeFake()),
+      }),
+      Effect.provideService(Materialization.SkillMaterializationService, noMaterialization),
+    );
+    expect((yield* ordinary.snapshot.getSnapshot).slashCommands).toEqual([]);
+  }).pipe(Effect.scoped),
+);
+
 it.effect(
   "uses canonical piAgent identity for the injected adapter, snapshots and continuation",
   () =>

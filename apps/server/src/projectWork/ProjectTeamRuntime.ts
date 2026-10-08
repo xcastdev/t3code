@@ -106,7 +106,16 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
         operationId = later.decision.request.operationId;
       }
     } else {
-      return yield* denied("Managed compaction requires a separately retained context operation");
+      const compact = yield* operations.readCompaction(
+        { providerInstanceId, threadId: request.threadId },
+        request,
+      );
+      if (
+        compact.original.fence.dispatchId !== original.fence.dispatchId ||
+        compact.original.fence.revision !== original.fence.revision
+      )
+        return yield* denied("Compaction differs from the current original dispatch");
+      operationId = compact.operationId;
     }
     const currentSettings = yield* settings.getSettings;
     const fresh = yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });

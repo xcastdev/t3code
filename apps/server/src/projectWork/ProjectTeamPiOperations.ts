@@ -4,8 +4,13 @@ import {
   ProjectTeamRunBinding,
   ProjectTeamRoleRevision,
   CommandId,
-  type ProviderInstanceId,
-  type ThreadId,
+  MessageId,
+  ThreadId,
+  ModelSelection,
+  ProviderInstanceId,
+  SkillCatalogRevision,
+  SkillApplicationMode,
+  ManagedSkillKey,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -40,7 +45,10 @@ import {
   type ProjectTeamPrincipal,
 } from "./ProjectTeamAuthorization.ts";
 import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
-import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
+import {
+  makeProjectTeamDispatchJournal,
+  type ProjectTeamDispatchSnapshot,
+} from "./ProjectTeamDispatchJournal.ts";
 
 const encode = canonicalProjectWorkPayload;
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
@@ -64,6 +72,64 @@ const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX
 const Positive = Safe.check(Schema.isGreaterThan(0));
 const OperationLimits = Schema.Struct({ maximumTokens: Positive, deadlineAtMs: Positive });
 const RootBudget = Schema.Struct({ rootTaskId: Schema.String, ...OperationLimits.fields });
+const CompactAssociation = Schema.Struct({
+  version: Schema.Literal(1),
+  requestId: MessageId,
+  dispatchId: Schema.String,
+  dispatchIntentSha256: ResourceIdentity,
+  claimGeneration: Positive,
+  fenceRevision: Safe,
+  predecessorOperationId: Schema.String,
+  predecessorOrdinal: Safe,
+  predecessorReceiptSha256: ResourceIdentity,
+  contextProvenanceSha256: ResourceIdentity,
+  contextTextSha256: ResourceIdentity,
+});
+const decodeCompactAssociation = Schema.decodeUnknownEffect(CompactAssociation);
+const decodeCompactMessageId = Schema.decodeUnknownEffect(MessageId);
+const decodeCompactIdentity = Schema.decodeUnknownEffect(
+  Schema.Struct({ kind: Schema.Literal("compact"), requestId: MessageId }),
+);
+const CompactAnchor = Schema.Struct({
+  operationId: Schema.String,
+  operationOrdinal: Safe,
+  receiptSha256: ResourceIdentity,
+  native: PiNativeReference,
+});
+export type PiCompactionAnchor = typeof CompactAnchor.Type;
+const StoredRequestFields = {
+  threadId: ThreadId,
+  operationId: Schema.String,
+  runtimeMode: Schema.optionalKey(Schema.Literal("approval-required")),
+  cwd: Schema.optionalKey(Schema.String),
+  modelSelection: Schema.optionalKey(ModelSelection),
+  resumeCursor: Schema.optionalKey(Schema.Unknown),
+  skillPlan: Schema.optionalKey(
+    Schema.Struct({
+      providerInstanceId: ProviderInstanceId,
+      desiredRevision: SkillCatalogRevision,
+      applicationMode: SkillApplicationMode,
+      skillKeys: Schema.Array(ManagedSkillKey),
+      payload: Schema.Unknown,
+    }),
+  ),
+};
+const decodeStoredRequest = Schema.decodeUnknownEffect(
+  Schema.Union([
+    Schema.Struct({ ...StoredRequestFields, kind: Schema.Literal("initialize") }),
+    Schema.Struct({
+      ...StoredRequestFields,
+      kind: Schema.Literal("prompt"),
+      prompt: Schema.String,
+    }),
+    Schema.Struct({
+      ...StoredRequestFields,
+      kind: Schema.Literal("compact"),
+      requestId: MessageId,
+    }),
+  ]),
+  { onExcessProperty: "error" },
+);
 const decodeIntent = Schema.decodeEffect(
   Schema.fromJsonString(
     Schema.Struct({
@@ -80,6 +146,7 @@ const decodeIntent = Schema.decodeEffect(
       resourceHash: Schema.optional(ResourceIdentity),
       rootBudget: Schema.optional(RootBudget),
       operationLimits: Schema.optional(OperationLimits),
+      compaction: Schema.optional(CompactAssociation),
     }),
   ),
 );
@@ -176,6 +243,7 @@ const decodeReplayIntent = Schema.decodeEffect(
       resourceHash: ResourceIdentity,
       rootBudget: RootBudget,
       operationLimits: OperationLimits,
+      compaction: Schema.optional(CompactAssociation),
     }),
   ),
   { onExcessProperty: "error" },
@@ -190,6 +258,7 @@ const decodeBudgetIntent = Schema.decodeEffect(
       resourceHash: Schema.optional(ResourceIdentity),
       rootBudget: RootBudget,
       operationLimits: OperationLimits,
+      compaction: Schema.optional(CompactAssociation),
     }),
   ),
   { onExcessProperty: "error" },
@@ -325,6 +394,23 @@ const immutableBinding = (binding: typeof ProjectTeamRunBinding.Type) => {
 };
 const requestDigest = (request: PiManagedOperationRequest) =>
   NodeCrypto.createHash("sha256").update(encode(request)).digest("hex");
+const digest = (value: unknown) =>
+  NodeCrypto.createHash("sha256").update(encode(value)).digest("hex");
+const compactOperationId = (
+  snapshot: ProjectTeamDispatchSnapshot,
+  binding: typeof ProjectTeamRunBinding.Type,
+  requestId: MessageId,
+) =>
+  "compact_" +
+  digest({
+    environmentId: binding.environmentId,
+    dispatchId: snapshot.fence.dispatchId,
+    bindingId: binding.recordId,
+    generation: binding.generation,
+    providerInstanceId: binding.providerInstanceId,
+    threadId: binding.threadId,
+    requestId,
+  });
 const decodeOperation = Schema.decodeUnknownEffect(PiWorkerOperation, {
   onExcessProperty: "error",
 });
@@ -375,9 +461,6 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
   function* (options: { readonly environmentId: string }) {
     const sql = yield* SqlClient.SqlClient;
     const clock = yield* Clock.Clock;
-    const mailboxDecisions = yield* makeProjectTeamMailboxTurnDecisionReader({
-      environmentId: options.environmentId,
-    });
     const authorization = yield* ProjectTeamAuthorization;
     const repository = yield* ProjectWorkRepository;
     // These retained reads validate intent, claim receipts and stage history only.
@@ -659,6 +742,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       frozen?: typeof RootBudget.Type,
       request?: unknown,
       resourceHash?: string,
+      compaction?: typeof CompactAssociation.Type,
     ) {
       const binding = authority.binding;
       const budgets = yield* sql<{
@@ -709,7 +793,45 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           operation.operationKind === "initialize"
             ? snapshot.intent.request.initializeOperationId
             : snapshot.intent.request.assignmentOperationId;
-        if (operation.operationId !== originalOperationId) {
+        if (operation.operationKind === "compact") {
+          const requested = yield* decodeCompactIdentity(request);
+          if (
+            !compaction ||
+            compaction.requestId !== requested.requestId ||
+            compaction.dispatchId !== snapshot.fence.dispatchId ||
+            compaction.dispatchIntentSha256 !== digest(snapshot.intent) ||
+            compaction.claimGeneration !== snapshot.fence.claimGeneration ||
+            compaction.fenceRevision !== snapshot.fence.revision ||
+            snapshot.fence.stage !== "assignment-observed" ||
+            operation.operationId !== compactOperationId(snapshot, binding, requested.requestId)
+          )
+            return yield* deny("Compaction has no original retained assignment association");
+          const predecessor = yield* getRow(compaction.predecessorOperationId);
+          const terminal = predecessor.terminal_json
+            ? yield* decodeTerminal(predecessor.terminal_json)
+            : undefined;
+          const native = predecessor.native_json
+            ? yield* decodeNative(predecessor.native_json)
+            : undefined;
+          const ordinals = yield* sql<{ ordinal: number }>`SELECT operation_ordinal AS ordinal
+            FROM project_team_pi_operation WHERE operation_id=${operation.operationId}`;
+          if (
+            predecessor.binding_id !== binding.recordId ||
+            predecessor.generation !== binding.generation ||
+            predecessor.operation_ordinal !== compaction.predecessorOrdinal ||
+            predecessor.status !== "settled" ||
+            !terminal ||
+            !native ||
+            terminal.outcome !== "success" ||
+            !terminal.ownerCaptured ||
+            !terminal.drain ||
+            terminal.failureCode !== undefined ||
+            digest({ operation: terminal.operation, terminal, native }) !==
+              compaction.predecessorReceiptSha256 ||
+            (ordinals[0] !== undefined && ordinals[0].ordinal !== compaction.predecessorOrdinal + 1)
+          )
+            return yield* deny("Compaction predecessor receipt changed");
+        } else if (operation.operationId !== originalOperationId) {
           const validateMailbox = Effect.gen(function* () {
             const decision = yield* mailboxDecisions
               .readInTransaction({ operationId: operation.operationId })
@@ -799,6 +921,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         intent.rootBudget,
         intent.request,
         intent.resourceHash,
+        intent.compaction,
       );
       if (row.maximum_tokens > limits.maximumTokens || row.deadline_at_ms > limits.deadlineAtMs)
         return yield* deny("Frozen Pi operation policy changed");
@@ -943,6 +1066,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       request: PiManagedOperationRequest,
       requestHash: string,
       resourceHash: string,
+      historical = false,
     ) {
       if (request.operationId === undefined) return undefined;
       const operation = yield* decodeOperation({
@@ -1211,7 +1335,18 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       const latest = yield* sql<{
         ordinal: number;
       }>`SELECT MAX(operation_ordinal) AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
-      if (active.length || latest[0]?.ordinal !== row.operation_ordinal)
+      let compactionAnchor: PiCompactionAnchor | undefined;
+      if (
+        !historical &&
+        !active.length &&
+        latest[0]?.ordinal !== row.operation_ordinal &&
+        request.kind === "prompt"
+      )
+        compactionAnchor = yield* compactBridge(identity, row.operation_id);
+      if (
+        !historical &&
+        (active.length || (latest[0]?.ordinal !== row.operation_ordinal && !compactionAnchor))
+      )
         return yield* deny("Stable Pi native receipt has a successor", "conflict");
       yield* current(identity);
       yield* clockCheck(row.deadline_at_ms);
@@ -1223,14 +1358,208 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         workspace: allocation.launch.workspace,
         nativeState,
         deadlineAtMs: row.deadline_at_ms,
+        ...(compactionAnchor === undefined ? {} : { compactionAnchor }),
       };
     });
-    const lookup = Effect.fn("ProjectTeamPiOperations.lookup")(function* (
-      ...args: Parameters<typeof lookupInside>
+    const compactBridge: (
+      identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
+      afterOperationId: string,
+      throughOperationId?: string,
+    ) => Effect.Effect<PiCompactionAnchor | undefined, PiManagedRuntimeError> = (
+      identity,
+      afterOperationId,
+      throughOperationId,
+    ) =>
+      guard(
+        Effect.gen(function* () {
+          const first = yield* getRow(afterOperationId);
+          const last =
+            throughOperationId === undefined ? undefined : yield* getRow(throughOperationId);
+          const rows = yield* sql<{
+            operation_id: string;
+            operation_ordinal: number;
+            operation_kind: string;
+          }>`
+          SELECT operation_id,operation_ordinal,operation_kind FROM project_team_pi_operation
+          WHERE environment_id=${options.environmentId} AND binding_id=${first.binding_id}
+          AND generation=${first.generation} AND operation_ordinal>${first.operation_ordinal}
+          ${last === undefined ? sql`` : sql`AND operation_ordinal<=${last.operation_ordinal}`}
+          ORDER BY operation_ordinal LIMIT 129`;
+          if (
+            rows.length > 128 ||
+            (last &&
+              (last.operation_ordinal <= first.operation_ordinal ||
+                rows.at(-1)?.operation_id !== last.operation_id))
+          )
+            return yield* deny("Compaction chain exceeds its retained boundary", "uncertain");
+          if (rows.length === 0) return undefined;
+          const firstIntent = yield* decodeReplayIntent(first.intent_json);
+          const firstRequest = yield* decodeStoredRequest(firstIntent.request);
+          const firstReceipt = yield* lookupInside(
+            identity,
+            firstRequest,
+            first.request_hash,
+            firstIntent.resourceHash,
+            true,
+          );
+          if (!firstReceipt || firstRequest.kind !== "prompt")
+            return yield* deny(
+              "Compaction bridge requires an original successful prompt",
+              "uncertain",
+            );
+          let previous = first;
+          let anchor: PiCompactionAnchor | undefined;
+          for (const metadata of rows) {
+            if (
+              metadata.operation_kind !== "compact" ||
+              metadata.operation_ordinal !== previous.operation_ordinal + 1
+            )
+              return yield* deny(
+                "A non-compaction operation superseded the native boundary",
+                "conflict",
+              );
+            const row = yield* getRow(metadata.operation_id);
+            const intent = yield* decodeReplayIntent(row.intent_json);
+            const request = yield* decodeStoredRequest(intent.request);
+            if (
+              !intent.compaction ||
+              intent.compaction.predecessorOperationId !== previous.operation_id ||
+              intent.compaction.predecessorOrdinal !== previous.operation_ordinal ||
+              request.kind !== "compact"
+            )
+              return yield* deny("Compaction chain association differs", "uncertain");
+            const checked = yield* lookupInside(
+              identity,
+              request,
+              row.request_hash,
+              intent.resourceHash,
+              true,
+            );
+            if (!checked) return yield* deny("Compaction chain receipt missing", "uncertain");
+            anchor = {
+              operationId: row.operation_id,
+              operationOrdinal: row.operation_ordinal,
+              receiptSha256: digest({
+                operation: checked.operation,
+                terminal: checked.terminal,
+                native: checked.native,
+              }),
+              native: checked.native,
+            };
+            previous = row;
+          }
+          if (throughOperationId === undefined) {
+            const active = yield* sql`SELECT operation_id FROM project_team_pi_operation
+            WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId}
+            AND thread_id=${identity.threadId} AND status IN ('prepared','starting','running','quarantine') LIMIT 1`;
+            if (active.length)
+              return yield* deny("Compaction chain has an active or uncertain owner", "uncertain");
+          }
+          return anchor;
+        }),
+      );
+    const assertHistoryCapacity = Effect.fn("ProjectTeamPiOperations.historyCapacity")(function* (
+      bindingId: string,
+      generation: number,
+    ) {
+      // ExecutionHost can reconcile at most 130 owners for this binding, including compacts.
+      const occupied = yield* sql`SELECT 1 AS occupied FROM project_team_pi_operation
+        WHERE environment_id=${options.environmentId} AND binding_id=${bindingId} AND generation=${generation}
+        LIMIT 130`;
+      if (occupied.length >= 130)
+        return yield* deny(
+          "Pi owned operation history has reached its cleanup bound",
+          "unavailable",
+        );
+    });
+    const compactInside = Effect.fn("ProjectTeamPiOperations.compactInside")(function* (
+      identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
+      request: PiManagedOperationRequest,
+    ) {
+      if (request.kind !== "compact" || request.requestId === undefined)
+        return yield* deny("Compaction requires its original durable request identity");
+      yield* decodeCompactMessageId(request.requestId);
+      const authority = yield* current(identity);
+      const dispatches = yield* sql<{
+        dispatch_id: string;
+      }>`SELECT dispatch_id FROM project_team_dispatch
+        WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
+        AND generation=${authority.binding.generation} LIMIT 2`;
+      if (dispatches.length !== 1 || !dispatches[0])
+        return yield* deny("Compaction requires one original dispatch");
+      const original = yield* readRetained(dispatches[0].dispatch_id);
+      yield* readStageReceipts(original.fence.dispatchId);
+      const claim = original.intent.compiledClaim.transition;
+      if (
+        claim?.kind !== "claim" ||
+        immutableBinding(claim.binding) !== immutableBinding(authority.binding) ||
+        original.fence.stage !== "assignment-observed" ||
+        original.fence.claimGeneration <= 0
+      )
+        return yield* deny("Compaction requires its approved successful assignment boundary");
+      const operationId = compactOperationId(original, authority.binding, request.requestId);
+      if (request.operationId !== undefined && request.operationId !== operationId)
+        return yield* deny("Compaction operation identity differs", "conflict");
+      const saved = yield* sql<{
+        operation_id: string;
+      }>`SELECT operation_id FROM project_team_pi_operation WHERE operation_id=${operationId}`;
+      if (saved.length === 0)
+        yield* assertHistoryCapacity(authority.binding.recordId, authority.binding.generation);
+      const rows = yield* sql<{
+        operation_id: string;
+      }>`SELECT operation_id FROM project_team_pi_operation
+        WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
+        AND generation=${authority.binding.generation} ORDER BY operation_ordinal DESC LIMIT 1`;
+      const selectedId = saved[0]?.operation_id ?? rows[0]?.operation_id;
+      if (!selectedId) return yield* deny("Compaction predecessor unavailable");
+      const row = yield* getRow(selectedId);
+      const intent = yield* decodeReplayIntent(row.intent_json);
+      const storedRequest = yield* decodeStoredRequest(intent.request);
+      if (storedRequest.kind !== "prompt" && storedRequest.kind !== "compact")
+        return yield* deny("Compaction requires a successful task operation");
+      const checked = yield* lookupInside(
+        identity,
+        storedRequest,
+        row.request_hash,
+        intent.resourceHash,
+      );
+      if (!checked) return yield* deny("Compaction predecessor receipt unavailable");
+      if (saved.length && (!intent.compaction || intent.compaction.requestId !== request.requestId))
+        return yield* deny("Original compaction association unavailable", "uncertain");
+      if (saved.length && requestDigest({ ...request, operationId }) !== row.request_hash)
+        return yield* deny("Original compaction request changed", "conflict");
+      return {
+        operationId,
+        original,
+        predecessor: {
+          operationId: row.operation_id,
+          ordinal: row.operation_ordinal,
+          receiptSha256: digest({
+            operation: checked.operation,
+            terminal: checked.terminal,
+            native: checked.native,
+          }),
+          resourceHash: intent.resourceHash,
+        },
+        ...(saved.length && intent.compaction ? { association: intent.compaction } : {}),
+      };
+    });
+    const readCompaction = Effect.fn("ProjectTeamPiOperations.readCompaction")(function* (
+      identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
+      request: PiManagedOperationRequest,
     ) {
       yield* ownTransaction();
-      if (args[1].operationId === undefined) return undefined;
-      return yield* sql.withTransaction(lookupInside(...args));
+      return yield* sql.withTransaction(compactInside(identity, request));
+    });
+    const lookup = Effect.fn("ProjectTeamPiOperations.lookup")(function* (
+      identity: Parameters<typeof lookupInside>[0],
+      request: PiManagedOperationRequest,
+      requestHash: string,
+      resourceHash: string,
+    ) {
+      yield* ownTransaction();
+      if (request.operationId === undefined) return undefined;
+      return yield* sql.withTransaction(lookupInside(identity, request, requestHash, resourceHash));
     });
     const lookupTransaction = Effect.gen(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
@@ -1241,7 +1570,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       )
         return yield* deny("Pi receipt lookup requires its captured SQL transaction");
     });
-    const lookupInTransaction = (...args: Parameters<typeof lookupInside>) => {
+    const lookupInTransaction = (...args: Parameters<typeof lookup>) => {
       const captured = structuredClone(args);
       return guard(lookupTransaction.pipe(Effect.andThen(lookupInside(...captured))));
     };
@@ -1254,6 +1583,10 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         readonly workerId: string;
         readonly operationId: string;
         readonly resourceHash?: string;
+        readonly compactContext?: {
+          readonly provenanceSha256: string;
+          readonly textSha256: string;
+        };
       },
     ) {
       const { allocation, workerId, operationId } = allocated;
@@ -1282,6 +1615,30 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             return yield* deny("Allocated workspace differs from durable assignment");
           const root = yield* roots(authority);
           yield* clockCheck(root.deadlineAtMs);
+          let compaction: typeof CompactAssociation.Type | undefined;
+          if (request.kind === "compact") {
+            const boundary = yield* compactInside(identity, request);
+            if (
+              !allocated.compactContext ||
+              boundary.association ||
+              boundary.operationId !== operationId ||
+              resourceHash !== boundary.predecessor.resourceHash
+            )
+              return yield* deny("Compaction requires its frozen current context and predecessor");
+            compaction = yield* decodeCompactAssociation({
+              version: 1,
+              requestId: request.requestId,
+              dispatchId: boundary.original.fence.dispatchId,
+              dispatchIntentSha256: digest(boundary.original.intent),
+              claimGeneration: boundary.original.fence.claimGeneration,
+              fenceRevision: boundary.original.fence.revision,
+              predecessorOperationId: boundary.predecessor.operationId,
+              predecessorOrdinal: boundary.predecessor.ordinal,
+              predecessorReceiptSha256: boundary.predecessor.receiptSha256,
+              contextProvenanceSha256: allocated.compactContext.provenanceSha256,
+              contextTextSha256: allocated.compactContext.textSha256,
+            });
+          }
           if (request.operationId !== undefined) {
             const existing =
               yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE operation_id=${operationId}`;
@@ -1300,6 +1657,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
                 : "Pi thread already has an owner",
               active[0]?.status === "quarantine" ? "uncertain" : "conflict",
             );
+          yield* assertHistoryCapacity(authority.binding.recordId, authority.binding.generation);
           const previous = yield* sql<{
             ordinal: number;
           }>`SELECT COALESCE(MAX(operation_ordinal),-1)+1 AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
@@ -1314,6 +1672,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             undefined,
             request,
             resourceHash,
+            compaction,
           );
           const { maximumTokens, deadlineAtMs } = limits;
           yield* clockCheck(deadlineAtMs);
@@ -1330,6 +1689,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             allocation,
             rootBudget: limits.rootBudget,
             operationLimits: { maximumTokens, deadlineAtMs },
+            ...(compaction === undefined ? {} : { compaction }),
             ...(resourceHash === undefined ? {} : { resourceHash }),
           });
           yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json) VALUES (${operationId},${options.environmentId},${authority.binding.projectId},${authority.binding.recordId},${authority.binding.generation},${identity.providerInstanceId},${identity.threadId},${workerId},${ordinal},${request.kind},${requestHash},${root.root.recordId},${root.root.taskId},${maximumTokens},${deadlineAtMs},'prepared',${intent})`;
@@ -1764,6 +2124,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         operationDeadlineAtMs: row.deadline_at_ms,
       };
     });
+    const mailboxDecisions = yield* makeProjectTeamMailboxTurnDecisionReader({
+      environmentId: options.environmentId,
+    });
     return {
       assertIndependent: () => guard(ownTransaction()),
       current: (...args: Parameters<typeof current>) =>
@@ -1771,6 +2134,18 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       admitCurrent,
       lookup: (...args: Parameters<typeof lookup>) => guard(lookup(...args)),
       lookupInTransaction,
+      readCompaction: (...args: Parameters<typeof readCompaction>) =>
+        guard(readCompaction(...args)),
+      readCompactionAnchorInTransaction: (
+        identity: Parameters<typeof compactBridge>[0],
+        afterOperationId: string,
+        throughOperationId?: string,
+      ) =>
+        guard(
+          lookupTransaction.pipe(
+            Effect.andThen(compactBridge(identity, afterOperationId, throughOperationId)),
+          ),
+        ),
       prepare: (...args: Parameters<typeof prepare>) => guard(prepare(...args)),
       authorize: (operation: PiDurableOperation) => guard(authorize(operation)),
       persistence,

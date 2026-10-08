@@ -24,7 +24,10 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
-import { type PiManagedOperationRequest } from "../provider/pi/PiManagedRuntime.ts";
+import {
+  type PiManagedOperationRequest,
+  type PiManagedRuntimeError,
+} from "../provider/pi/PiManagedRuntime.ts";
 import { PiManagedProcessAllocationSchema } from "../provider/pi/PiManagedProcess.ts";
 import {
   PiNativeReference,
@@ -44,7 +47,7 @@ import {
 import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { planMessageDelivery, applyMessageReceipt } from "./ProjectTeamMailboxPolicy.ts";
-import type { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
+import type { makeProjectTeamPiOperations, PiCompactionAnchor } from "./ProjectTeamPiOperations.ts";
 
 export class ProjectTeamMailboxTurnsError extends Schema.TaggedError<ProjectTeamMailboxTurnsError>()(
   "ProjectTeamMailboxTurnsError",
@@ -132,6 +135,12 @@ const Target = Schema.Struct({
   deliveryGeneration: Safe,
   deliveryCursor: Positive,
 });
+const CompactAnchor = Schema.Struct({
+  operationId: Id,
+  operationOrdinal: Safe,
+  receiptSha256: Digest,
+  native: PiNativeReference,
+});
 const Common = {
   environmentId: Id,
   projectId: ProjectId,
@@ -147,6 +156,7 @@ const Common = {
   binding: ProjectTeamRunBinding,
   rootBudget: RootBudget,
   attemptLimits: Limits,
+  compactAnchor: Schema.optional(CompactAnchor),
 };
 const None = Schema.Struct({ kind: Schema.Literal("none"), ...Common });
 const One = Schema.Struct({
@@ -903,6 +913,63 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
       };
     },
   );
+  // Construct the receipt reader only at use; its own mailbox reader does not recursively
+  // construct an operation service. Historical reads never reopen a stored boundary.
+  const compactClock = yield* Effect.serviceOption(Clock.Clock);
+  const compactAuthorization = yield* Effect.serviceOption(ProjectTeamAuthorization);
+  const compactRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+  const loadCompactOperations: () => Effect.Effect<
+    {
+      readCompactionAnchorInTransaction: (
+        identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
+        afterOperationId: string,
+        throughOperationId?: string,
+      ) => Effect.Effect<PiCompactionAnchor | undefined, PiManagedRuntimeError>;
+    },
+    ProjectTeamMailboxTurnsError
+  > = Effect.fn("mailboxTurn.loadCompactOperations")(
+    function* () {
+      const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
+      if (
+        Option.isNone(supplied) ||
+        supplied.value !== sql ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService)) ||
+        Option.isNone(compactClock) ||
+        Option.isNone(compactAuthorization) ||
+        Option.isNone(compactRepository)
+      )
+        return yield* deny("Mailbox compaction anchor is unavailable");
+      const { makeProjectTeamPiOperations } = yield* Effect.promise(
+        () => import("./ProjectTeamPiOperations.ts"),
+      );
+      return yield* makeProjectTeamPiOperations({ environmentId }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.provideService(Clock.Clock, compactClock.value),
+        Effect.provideService(ProjectTeamAuthorization, compactAuthorization.value),
+        Effect.provideService(ProjectWorkRepository, compactRepository.value),
+      );
+    },
+    Effect.mapError(() => deny("Mailbox compaction anchor is unavailable")),
+  );
+  const compactOperations = yield* Effect.cached(loadCompactOperations());
+  const verifyCompactAnchor: (
+    decision: ProjectTeamMailboxTurnDecision,
+    afterOperationId: string,
+  ) => Effect.Effect<void, ProjectTeamMailboxTurnsError> = (decision, afterOperationId) =>
+    Effect.gen(function* () {
+      if (!decision.compactAnchor) return;
+      const operations = yield* compactOperations;
+      const anchor = yield* operations.readCompactionAnchorInTransaction(
+        {
+          providerInstanceId: decision.binding.providerInstanceId,
+          threadId: decision.binding.threadId,
+        },
+        afterOperationId,
+        decision.compactAnchor.operationId,
+      );
+      if (canonical(anchor) !== canonical(decision.compactAnchor))
+        return yield* deny("Mailbox compaction anchor receipt differs");
+    }).pipe(Effect.mapError(() => deny("Mailbox compaction anchor is unavailable")));
   const verifyOriginalInTransaction = Effect.fn("mailboxTurn.verifyOriginalInTransaction")(
     function* (snapshot: ProjectTeamDispatchSnapshot, decision: ProjectTeamMailboxTurnDecision) {
       const receipt = yield* receipts.readAssignment(snapshot);
@@ -943,14 +1010,17 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
         )
           return yield* deny("Original mailbox fence, scope or budget differs");
         if (!isSuccessor(checked)) {
+          yield* verifyCompactAnchor(checked, receipt.operation.operationId);
           if (
             checked.kind === "one" &&
-            canonical(checked.request.resumeCursor) !== canonical(receipt.native)
+            canonical(checked.request.resumeCursor) !==
+              canonical(checked.compactAnchor?.native ?? receipt.native)
           )
             return yield* deny("Original mailbox native reference differs");
           return;
         }
         const previous = yield* readPredecessorInTransaction(checked.predecessor.operationId);
+        yield* verifyCompactAnchor(checked, previous.decision.request.operationId);
         if (
           checked.turnIndex !==
             (isSuccessor(previous.decision) ? previous.decision.turnIndex + 1 : 1) ||
@@ -960,7 +1030,8 @@ export const makeProjectTeamMailboxTurnDecisionReader = Effect.fn(
           checked.predecessor.operationOrdinal !== previous.operationOrdinal ||
           canonical(checked.predecessor.native) !== canonical(previous.native) ||
           (checked.kind === "one" &&
-            canonical(checked.request.resumeCursor) !== canonical(previous.native))
+            canonical(checked.request.resumeCursor) !==
+              canonical(checked.compactAnchor?.native ?? previous.native))
         )
           return yield* deny("Mailbox predecessor receipt differs");
         checked = previous.decision;
@@ -1137,6 +1208,7 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         boundary === undefined
           ? undefined
           : yield* reader.readPredecessorInTransaction(boundary.afterOperationId);
+      let compactAnchor: typeof CompactAnchor.Type | undefined;
       if (predecessor) {
         const head = yield* reader.readHeadInTransaction({ dispatchId: original.fence.dispatchId });
         if (canonical(head) !== canonical(predecessor.decision))
@@ -1157,6 +1229,28 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
             predecessor.operationReceiptSha256
         )
           return yield* deny("Predecessor is not the current qualified successful operation");
+        compactAnchor = fresh.compactionAnchor;
+      } else {
+        const newer = yield* sql`SELECT operation_id FROM project_team_pi_operation
+          WHERE environment_id=${environmentId} AND binding_id=${receipt.bindingId}
+          AND generation=${receipt.generation} AND operation_ordinal>${receipt.ordinal} LIMIT 1`;
+        if (newer.length) {
+          const { makeProjectTeamPiOperations } = yield* Effect.promise(
+            () => import("./ProjectTeamPiOperations.ts"),
+          );
+          const operations = yield* makeProjectTeamPiOperations({ environmentId }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectTeamAuthorization, authorization),
+            Effect.provideService(ProjectWorkRepository, repository),
+          );
+          compactAnchor = yield* operations.readCompactionAnchorInTransaction(
+            {
+              providerInstanceId: receipt.providerInstanceId,
+              threadId: receipt.threadId,
+            },
+            receipt.operation.operationId,
+          );
+        }
       }
       const owner = yield* current(original);
       const common = {
@@ -1181,6 +1275,7 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
           maximumTokens: original.intent.limits.attemptMaximumTokens,
           deadlineAtMs: original.intent.limits.deadlineAtMs,
         },
+        ...(compactAnchor === undefined ? {} : { compactAnchor }),
       };
       const turnIndex =
         predecessor === undefined
@@ -1276,7 +1371,7 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
             instanceId: common.binding.providerInstanceId,
             model: common.binding.model,
           },
-          resumeCursor: predecessor?.native ?? receipt.native,
+          resumeCursor: compactAnchor?.native ?? predecessor?.native ?? receipt.native,
         };
         const suppliedDecision = {
           kind: "one",

@@ -102,6 +102,19 @@ export function makePiDriver(input: {
       const runtime = yield* parent
         .forInstance({ instanceId, enabled, configuration })
         .pipe(Effect.mapError(toDriverError));
+      const adapter = yield* input.makeAdapter({
+        instanceId,
+        runtime,
+        ...(runtime.resolveOperationId === undefined
+          ? {}
+          : { resolveOperationId: runtime.resolveOperationId }),
+      });
+      if (adapter.provider !== DRIVER)
+        return yield* new ProviderDriverError({
+          driver: DRIVER,
+          instanceId,
+          detail: "The injected Pi Agent adapter does not match the piAgent driver kind.",
+        });
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER,
         instanceId,
@@ -160,7 +173,15 @@ export function makePiDriver(input: {
           supportsConversationRollback: false,
           requiresNewThreadForModelChange: true,
           setup: { canAuthenticate: false, canInstall: false },
-          slashCommands: [],
+          slashCommands:
+            enabled && adapter.compaction?.type === "native"
+              ? [
+                  {
+                    name: "compact",
+                    description: "Compact the current managed task within its remaining limits.",
+                  },
+                ]
+              : [],
           versionAdvisory: createProviderVersionAdvisory({
             driver: DRIVER,
             currentVersion: draft.version,
@@ -213,20 +234,6 @@ export function makePiDriver(input: {
             ),
           ),
       });
-      const adapter = yield* input.makeAdapter({
-        instanceId,
-        runtime,
-        ...(runtime.resolveOperationId === undefined
-          ? {}
-          : { resolveOperationId: runtime.resolveOperationId }),
-      });
-      if (adapter.provider !== DRIVER) {
-        return yield* new ProviderDriverError({
-          driver: DRIVER,
-          instanceId,
-          detail: "The injected Pi Agent adapter does not match the piAgent driver kind.",
-        });
-      }
       return {
         instanceId,
         driverKind: DRIVER,

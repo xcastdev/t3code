@@ -1,5 +1,6 @@
 import type {
   ManagedSkillKey,
+  MessageId,
   ModelSelection,
   ProviderInstanceId,
   ProviderRuntimeEvent,
@@ -51,7 +52,7 @@ export type PiManagedOperationRequest = Assertions &
   (
     | { readonly threadId: ThreadId; readonly kind: "initialize" }
     | { readonly threadId: ThreadId; readonly kind: "prompt"; readonly prompt: string }
-    | { readonly threadId: ThreadId; readonly kind: "compact" }
+    | { readonly threadId: ThreadId; readonly kind: "compact"; readonly requestId?: MessageId }
   );
 
 export interface PiManagedControlReceipt {
