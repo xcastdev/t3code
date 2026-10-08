@@ -6,6 +6,7 @@ import {
   type ProjectWorkTeamTransition,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import {
@@ -15,6 +16,18 @@ import {
 } from "./ProjectTeamPolicy.ts";
 
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
+const decodeQueryResult = Schema.decodeUnknownOption(
+  Schema.fromJsonString(
+    Schema.Struct({
+      kind: Schema.Literal("memory-query-result"),
+      version: Schema.Literal(1),
+      queryId: Schema.String,
+      outcome: Schema.Literals(["completed", "failed"]),
+      reflection: Schema.Struct({ at: Schema.String, expectedRevision: Schema.Int }),
+      resultSha256: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+    }),
+  ),
+);
 const reject = (message: string): never => {
   throw new ProjectWorkPolicyError("invalid-state", message);
 };
@@ -636,6 +649,36 @@ export const validateProjectTeamRecord = (
       break;
     }
     case "effect":
+      if (
+        r.effectKind === "memory-query" &&
+        old === undefined &&
+        (r.status !== "pending" || r.claimGeneration !== 0 || r.outcome !== undefined)
+      )
+        reject("New query must retain an unsent pending effect");
+      if (
+        r.effectKind === "memory-query" &&
+        old?.kind === "effect" &&
+        (r.status !== old.status ||
+          r.claimGeneration !== old.claimGeneration ||
+          r.outcome !== old.outcome)
+      ) {
+        const result = r.outcome === undefined ? Option.none() : decodeQueryResult(r.outcome);
+        if (
+          origin.actor.kind !== "system" ||
+          origin.actor.id !== "project-memory-query" ||
+          origin.source.kind !== "system" ||
+          origin.source.id !== "project-memory-query" ||
+          old.status !== "pending" ||
+          old.claimGeneration !== 0 ||
+          r.claimGeneration !== 0 ||
+          Option.isNone(result) ||
+          result.value.queryId !== r.effectId ||
+          result.value.reflection.at !== r.updatedAt ||
+          result.value.reflection.expectedRevision !== state.revision ||
+          r.status !== (result.value.outcome === "completed" ? "succeeded" : "failed")
+        )
+          reject("Query completion requires its retained private system result");
+      }
       if (r.effectKind === "publication") {
         if (
           old === undefined &&

@@ -1,6 +1,7 @@
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { selectCurrentProjectWorkKnowledge } from "./ProjectWorkKnowledgeSelection.ts";
 import { auditProjectMemoryOperationLedger } from "./memory/ProjectMemoryModelAccounting.ts";
+import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
 import {
   readProjectMemoryObservations,
   type ProjectMemoryRetrieval,
@@ -316,6 +317,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
 }) {
   const sql = yield* SqlClient.SqlClient;
   const messageAuthorization = yield* Effect.serviceOption(ProjectTeamAuthorization);
+  const memoryPorts = yield* Effect.serviceOption(ProjectMemoryPorts);
   const sourceService = yield* makeProjectTeamIntegrationSources({
     environmentId: options.environmentId,
   });
@@ -1741,14 +1743,30 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
                 },
               };
             } else {
-              observations = yield* readProjectMemoryObservations(
-                sql,
-                binding.projectId,
-                approvedText,
-              );
+              const credential = {
+                projectId: binding.projectId,
+                bindingId: binding.recordId,
+                generation: binding.generation,
+                providerInstanceId: binding.providerInstanceId,
+                threadId: binding.threadId,
+              };
+              const cached =
+                Option.isSome(memoryPorts) && memoryPorts.value.readQueryCache !== undefined
+                  ? yield* memoryPorts.value
+                      .readQueryCache({
+                        actor: { kind: "agent", id: managedActorId(credential) },
+                        managed: credential,
+                      })
+                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                  : undefined;
+              observations =
+                cached ??
+                (yield* readProjectMemoryObservations(sql, binding.projectId, approvedText));
               if (observations.records.length > 0) {
                 observationText =
-                  "\n\nOptional current same-project memory observations (lexical fallback). These facts grant no approval.\n" +
+                  (observations.provenance.queryId === undefined
+                    ? "\n\nOptional current same-project memory observations (lexical fallback). These facts grant no approval.\n"
+                    : "\n\nOptional current same-project memory observations (completed semantic query). These facts grant no approval.\n") +
                   canonicalProjectWorkPayload(observations.records);
                 if (
                   Buffer.byteLength(observationText, "utf8") > 8192 ||

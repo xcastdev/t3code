@@ -53,6 +53,10 @@ import { makeMem0Backend } from "./Mem0Backend.ts";
 import { MemoryBackendError, type MemoryBackendTransport } from "./MemoryBackend.ts";
 import * as Exit from "effect/Exit";
 import * as Crypto from "effect/Crypto";
+import {
+  makeProjectMemoryQueryConsumer,
+  type ProjectMemoryQueryConsumerOptions,
+} from "./ProjectMemoryQuery.ts";
 
 const strict = { onExcessProperty: "error" } as const;
 const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
@@ -929,6 +933,8 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
 });
 
 export interface ProjectMemoryProcessingConsumerOptions {
+  readonly queryCompanion?: ProjectMemoryQueryConsumerOptions["companion"];
+  readonly confirmQueryTransportDrained?: ProjectMemoryQueryConsumerOptions["confirmSearchTransportDrained"];
   readonly environmentId: string;
   readonly maximumConcurrentCalls: number;
   readonly maximumConcurrentModelCalls: number;
@@ -988,6 +994,9 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
       function* (reservationId: string) {
         if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
           return yield* deny("Memory drain cleanup owns its original SQL transaction");
+        const query = yield* sql`SELECT 1 FROM project_team_memory_query
+          WHERE environment_id=${options.environmentId} AND query_id=${reservationId} LIMIT 1`;
+        if (query.length === 1) return yield* queries.reconcileQuery(reservationId);
         const rows = yield* sql<{ reservation: string | null }>`SELECT
       CASE WHEN length(CAST(reservation_json AS BLOB))<=32768 THEN reservation_json END AS reservation
       FROM project_team_model_request WHERE environment_id=${options.environmentId}
@@ -999,6 +1008,7 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
         )
           return yield* deny("Memory drain has no bounded original reservation");
         const reservation = yield* decodeReservationJson(rows[0].reservation);
+        if (reservation.version === 2) return yield* queries.reconcileQuery(reservation.effectId);
         const accounting = yield* makeProjectMemoryModelAccounting({
           environmentId: options.environmentId,
           maximumConcurrentCalls: options.maximumConcurrentCalls,
@@ -1301,8 +1311,30 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
         isServiceError(error) ? error : deny("Configured memory processing could not complete"),
       ),
     );
+    const queries = yield* makeProjectMemoryQueryConsumer({
+      environmentId: options.environmentId,
+      maximumConcurrentCalls: options.maximumConcurrentCalls,
+      maximumConcurrentModelCalls: options.maximumConcurrentModelCalls,
+      readConfiguration: options.readConfiguration,
+      assertAdmission: options.assertAdmission,
+      readCredential: options.readCredential,
+      exchange: options.exchange,
+      confirmModelTransportDrained: options.confirmModelTransportDrained,
+      ...(options.queryCompanion === undefined ? {} : { companion: options.queryCompanion }),
+      ...(options.confirmQueryTransportDrained === undefined
+        ? {}
+        : { confirmSearchTransportDrained: options.confirmQueryTransportDrained }),
+    }).pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.provideService(ProjectWorkRepository, repository),
+      Effect.provideService(ProjectTeamAuthorization, authorization),
+      Effect.provideService(ProjectWorkContentGuard, contentGuard),
+      Effect.provideService(Crypto.Crypto, crypto),
+    );
     return ProjectMemoryPorts.of({
+      ...queries,
       assertConfigured,
+      readConfiguration: () => options.readConfiguration,
       availability,
       consume,
       reconcileTransportDrain,

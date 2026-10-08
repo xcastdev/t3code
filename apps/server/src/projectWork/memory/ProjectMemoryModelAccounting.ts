@@ -5,6 +5,7 @@ import {
   ThreadId,
   ProjectTeamMemorySelection,
   ProjectTeamMemoryProcessIntent,
+  ProjectTeamMemoryQueryIntent,
   ProjectTeamEffect,
   canonicalProjectWorkPayload,
   EventId,
@@ -16,6 +17,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import type * as SqlError from "effect/unstable/sql/SqlError";
 import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
@@ -90,7 +92,22 @@ export const ProjectMemoryJobOwner = Schema.Struct({
   admittedAt: Schema.String,
 });
 export type ProjectMemoryJobOwner = typeof ProjectMemoryJobOwner.Type;
-export const ProjectMemoryReservation = Schema.Struct({
+export const ProjectMemoryQueryOwner = Schema.Struct({
+  version: Schema.Literal(2),
+  kind: Schema.Literal("query"),
+  operation: ProjectMemoryTaskOwner,
+  request: ProjectTeamMemoryQueryIntent,
+  configurationSha256: Hash,
+  taskScopeSha256: Hash,
+  intentFingerprint: Schema.String.check(Schema.isMaxLength(256)),
+  actorId: Id,
+  sourceKind: Schema.Literal("mcp"),
+  sourceId: Id,
+  admittedAt: Schema.String,
+  admittedEffect: ProjectTeamEffect,
+});
+export type ProjectMemoryQueryOwner = typeof ProjectMemoryQueryOwner.Type;
+const SourceReservation = Schema.Struct({
   version: Schema.Literal(1),
   lane: Schema.Literal("memory"),
   scope: Hash,
@@ -109,8 +126,13 @@ export const ProjectMemoryReservation = Schema.Struct({
   callCount: Schema.Literal(1),
   deadlineAtMs: Positive,
 });
-export const ProjectMemorySettlement = Schema.Struct({
-  ...ProjectMemoryReservation.fields,
+const QueryReservation = Schema.Struct({
+  ...SourceReservation.fields,
+  version: Schema.Literal(2),
+  phase: Schema.Literal("query-embed"),
+});
+export const ProjectMemoryReservation = Schema.Union([SourceReservation, QueryReservation]);
+const SettlementFields = {
   reservationId: Id,
   outcome: Schema.Literals(["reported", "failed", "unknown"]),
   chargedInputTokens: Safe,
@@ -119,7 +141,11 @@ export const ProjectMemorySettlement = Schema.Struct({
   reportedModel: Schema.optionalKey(Id),
   reportedInputTokens: Schema.optionalKey(Safe),
   reportedOutputTokens: Schema.optionalKey(Safe),
-});
+};
+export const ProjectMemorySettlement = Schema.Union([
+  Schema.Struct({ ...SourceReservation.fields, ...SettlementFields }),
+  Schema.Struct({ ...QueryReservation.fields, ...SettlementFields }),
+]);
 export type ProjectMemoryReservation = typeof ProjectMemoryReservation.Type;
 export type ProjectMemorySettlement = typeof ProjectMemorySettlement.Type;
 const decodeOwner = Schema.decodeUnknownEffect(
@@ -137,6 +163,7 @@ const decodeSettlement = Schema.decodeUnknownEffect(
 const decodeReservationInput = Schema.decodeUnknownEffect(ProjectMemoryReservation, strict);
 const decodeSettlementInput = Schema.decodeUnknownEffect(ProjectMemorySettlement, strict);
 const decodeOwnerInput = Schema.decodeUnknownEffect(ProjectMemoryJobOwner, strict);
+const decodeQueryOwnerInput = Schema.decodeUnknownEffect(ProjectMemoryQueryOwner, strict);
 const decodePolicy = Schema.decodeUnknownEffect(
   Schema.Struct({
     environmentId: Id,
@@ -325,6 +352,14 @@ export const auditProjectMemoryAdmission = Effect.fn("auditProjectMemoryAdmissio
     !same(event.record, owner.admittedEffect)
   )
     return yield* deny("Original memory admission event changed");
+  yield* auditProjectMemoryTaskOwner(sql, operation);
+});
+
+/** Source and query admissions retain the same actual operation and original ceilings. */
+export const auditProjectMemoryTaskOwner = Effect.fn("auditProjectMemoryTaskOwner")(function* (
+  sql: SqlClient.SqlClient,
+  operation: ProjectMemoryTaskOwner,
+) {
   const operations = yield* sql<{
     id: string;
     worker: string;
@@ -410,6 +445,37 @@ export const auditProjectMemoryAdmission = Effect.fn("auditProjectMemoryAdmissio
 
 /** Historical ledger reads audit both lanes while native terminal receipts list
  * only native reservations. Source correction never erases an original charge. */
+type QueryAuditError = ProjectMemoryServiceError | Schema.SchemaError | SqlError.SqlError;
+type QueryAudit = {
+  readonly readProjectMemoryQueryOwnerById: (
+    sql: SqlClient.SqlClient,
+    queryId: string,
+  ) => Effect.Effect<ProjectMemoryQueryOwner, QueryAuditError>;
+  readonly auditProjectMemoryQueryAdmission: (
+    sql: SqlClient.SqlClient,
+    owner: ProjectMemoryQueryOwner,
+  ) => Effect.Effect<void, QueryAuditError>;
+  readonly auditProjectMemoryQueryStages: (
+    sql: SqlClient.SqlClient,
+    owner: ProjectMemoryQueryOwner,
+    ledger: readonly {
+      readonly reservation_id: string;
+      readonly reservation_json: string;
+      readonly settlement_json: string | null;
+      readonly accounting_receipt_id: string | null;
+      readonly status: string;
+      readonly capacity_state: string;
+    }[],
+  ) => Effect.Effect<boolean, QueryAuditError>;
+};
+// The lazy audit seam excludes the query consumer constructor, which itself
+// captures this accounting service. Its actual SQL and decoder errors remain explicit.
+const loadQueryAudit: () => Effect.Effect<QueryAudit> = Effect.fn(
+  "ProjectMemoryModelAccounting.loadQueryAudit",
+)(function* () {
+  return yield* Effect.promise(() => import("./ProjectMemoryQuery.ts"));
+});
+
 export const auditProjectMemoryOperationLedger = Effect.fn("auditProjectMemoryOperationLedger")(
   function* (
     sql: SqlClient.SqlClient,
@@ -421,6 +487,22 @@ export const auditProjectMemoryOperationLedger = Effect.fn("auditProjectMemoryOp
       readonly operationId: string;
     },
   ) {
+    const queries = yield* sql<{ queryId: string; bytes: number }>`SELECT query_id AS queryId,
+      length(CAST(owner_json AS BLOB))+COALESCE(length(CAST(embedding_json AS BLOB)),0)+
+      COALESCE(length(CAST(search_json AS BLOB)),0)+COALESCE(length(CAST(result_json AS BLOB)),0)+
+      COALESCE(length(CAST(embedding_result_json AS BLOB)),0)+COALESCE(length(CAST(search_result_json AS BLOB)),0)+
+      COALESCE(length(CAST(search_drain_json AS BLOB)),0) AS bytes
+      FROM project_team_memory_query WHERE environment_id=${identity.environmentId}
+      AND project_id=${identity.projectId} AND binding_id=${identity.bindingId}
+      AND generation=${identity.generation} AND operation_id=${identity.operationId}
+      ORDER BY query_id LIMIT 257`;
+    if (
+      queries.length > 256 ||
+      queries.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > 1048576) ||
+      queries.reduce((total, row) => total + row.bytes, 0) > 4194304
+    )
+      return yield* deny("Memory queries exceed their operation bound");
+    const queryAudit = queries.length === 0 ? undefined : yield* loadQueryAudit();
     const metadata = yield* sql<{ reservationId: string; bytes: number }>`SELECT
       reservation_id AS reservationId,
       length(CAST(reservation_json AS BLOB))+COALESCE(length(CAST(settlement_json AS BLOB)),0) +
@@ -485,38 +567,48 @@ export const auditProjectMemoryOperationLedger = Effect.fn("auditProjectMemoryOp
       return yield* deny("Memory operation ledger changed during its retained read");
     let settled = true;
     let retainedBytes = metadata.reduce((total, row) => total + row.bytes, 0);
-    const auditedOwners = new Map<string, ProjectMemoryJobOwner>();
+    const auditedOwners = new Map<string, ProjectMemoryJobOwner | ProjectMemoryQueryOwner>();
     for (const row of rows) {
       const reservation = yield* decodeReservation(row.reservation_json);
       let owner = auditedOwners.get(reservation.effectId);
       if (owner === undefined) {
-        const ownerMetadata = yield* sql<{
-          bytes: number | null;
-        }>`SELECT length(CAST(owner_json AS BLOB)) AS bytes
+        if (reservation.version === 2) {
+          if (queryAudit === undefined)
+            return yield* deny("Memory query reservation has no retained query");
+          owner = yield* queryAudit.readProjectMemoryQueryOwnerById(sql, reservation.effectId);
+          yield* queryAudit.auditProjectMemoryQueryAdmission(sql, owner);
+          auditedOwners.set(reservation.effectId, owner);
+        } else {
+          const ownerMetadata = yield* sql<{
+            bytes: number | null;
+          }>`SELECT length(CAST(owner_json AS BLOB)) AS bytes
           FROM project_team_memory_job WHERE effect_id=${reservation.effectId}
           AND environment_id=${identity.environmentId} AND project_id=${identity.projectId} LIMIT 2`;
-        const ownerBytes = ownerMetadata[0]?.bytes;
-        if (
-          ownerMetadata.length !== 1 ||
-          ownerBytes === null ||
-          ownerBytes === undefined ||
-          !Number.isSafeInteger(ownerBytes) ||
-          ownerBytes > 262144 ||
-          (retainedBytes += ownerBytes) > 4194304
-        )
-          return yield* deny("Memory ledger owner exceeds its retained aggregate bound");
-        const owners = yield* sql<{ owner: string | null }>`SELECT
+          const ownerBytes = ownerMetadata[0]?.bytes;
+          if (
+            ownerMetadata.length !== 1 ||
+            ownerBytes === null ||
+            ownerBytes === undefined ||
+            !Number.isSafeInteger(ownerBytes) ||
+            ownerBytes > 262144 ||
+            (retainedBytes += ownerBytes) > 4194304
+          )
+            return yield* deny("Memory ledger owner exceeds its retained aggregate bound");
+          const owners = yield* sql<{ owner: string | null }>`SELECT
           CASE WHEN length(CAST(owner_json AS BLOB))<=262144 THEN owner_json END AS owner
           FROM project_team_memory_job WHERE effect_id=${reservation.effectId}
           AND environment_id=${identity.environmentId} AND project_id=${identity.projectId} LIMIT 2`;
-        if (owners.length !== 1 || owners[0]?.owner === null || owners[0]?.owner === undefined)
-          return yield* deny("Memory reservation has no original admitted job owner");
-        owner = yield* decodeOwner(owners[0].owner);
-        yield* auditProjectMemoryAdmission(sql, owner);
-        auditedOwners.set(reservation.effectId, owner);
+          if (owners.length !== 1 || owners[0]?.owner === null || owners[0]?.owner === undefined)
+            return yield* deny("Memory reservation has no original admitted job owner");
+          owner = yield* decodeOwner(owners[0].owner);
+          yield* auditProjectMemoryAdmission(sql, owner);
+          auditedOwners.set(reservation.effectId, owner);
+        }
       }
+      if (owner === undefined) return yield* deny("Memory reservation owner is unavailable");
       const operation = owner.operation;
       if (
+        owner.version !== reservation.version ||
         projectMemoryHash(owner) !== reservation.ownerSha256 ||
         operation.environmentId !== row.environment_id ||
         operation.projectId !== row.project_id ||
@@ -598,6 +690,21 @@ export const auditProjectMemoryOperationLedger = Effect.fn("auditProjectMemoryOp
         return yield* deny("Memory accounting settlement is corrupt");
       if (!settlement.transportDrained) settled = false;
     }
+    if (queryAudit !== undefined) {
+      for (const query of queries) {
+        const owner = yield* queryAudit.readProjectMemoryQueryOwnerById(sql, query.queryId);
+        if (
+          owner.operation.environmentId !== identity.environmentId ||
+          owner.operation.projectId !== identity.projectId ||
+          owner.operation.bindingId !== identity.bindingId ||
+          owner.operation.generation !== identity.generation ||
+          owner.operation.operationId !== identity.operationId
+        )
+          return yield* deny("Query ledger owner differs from its physical operation");
+        yield* queryAudit.auditProjectMemoryQueryAdmission(sql, owner);
+        if (!(yield* queryAudit.auditProjectMemoryQueryStages(sql, owner, rows))) settled = false;
+      }
+    }
     return { rows, settled };
   },
 );
@@ -610,6 +717,9 @@ export interface ProjectMemoryModelAccountingOptions {
    * the captured transaction. This port cannot derive authority from owner_json. */
   readonly assertCurrentInTransaction: (
     owner: ProjectMemoryJobOwner,
+  ) => Effect.Effect<void, ProjectMemoryServiceError>;
+  readonly assertQueryCurrentInTransaction?: (
+    owner: ProjectMemoryQueryOwner,
   ) => Effect.Effect<void, ProjectMemoryServiceError>;
   readonly assertTransportDrainedInTransaction: (
     reservationId: string,
@@ -645,7 +755,16 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
     });
     const savedOwner = Effect.fn("ProjectMemoryModelAccounting.savedOwner")(function* (
       effectId: string,
+      version = 1,
     ) {
+      if (version === 2) {
+        const query = yield* loadQueryAudit();
+        const owner = yield* query.readProjectMemoryQueryOwnerById(sql, effectId);
+        if (owner.operation.environmentId !== policy.environmentId)
+          return yield* deny("Foreign query model owner");
+        yield* query.auditProjectMemoryQueryAdmission(sql, owner);
+        return owner;
+      }
       const rows = yield* sql<{ owner: string | null }>`SELECT
       CASE WHEN length(CAST(owner_json AS BLOB))<=262144 THEN owner_json END AS owner
       FROM project_team_memory_job WHERE effect_id=${effectId}
@@ -657,11 +776,16 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
       yield* auditProjectMemoryAdmission(sql, owner);
       return owner;
     });
+    const assertCurrent = (owner: ProjectMemoryJobOwner | ProjectMemoryQueryOwner) =>
+      owner.version === 1
+        ? options.assertCurrentInTransaction(owner)
+        : (options.assertQueryCurrentInTransaction?.(owner) ??
+          Effect.fail(deny("Query model authority unavailable")));
     const reserve = Effect.fn("ProjectMemoryModelAccounting.reserve")(
       function* (
-        suppliedOwner: ProjectMemoryJobOwner,
+        suppliedOwner: ProjectMemoryJobOwner | ProjectMemoryQueryOwner,
         stage: {
-          readonly phase: "extract" | "embed";
+          readonly phase: "extract" | "embed" | "query-embed";
           readonly routeId: string;
           readonly requestId: number;
           readonly maxInputTokens: number;
@@ -670,12 +794,21 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
         },
       ) {
         yield* owning();
-        const supplied = yield* decodeOwnerInput(suppliedOwner);
+        const supplied = yield* suppliedOwner.version === 1
+          ? decodeOwnerInput(suppliedOwner)
+          : decodeQueryOwnerInput(suppliedOwner);
         return yield* sql.withTransaction(
           Effect.gen(function* () {
-            const owner = yield* savedOwner(supplied.selection.effectId);
+            const owner = yield* savedOwner(
+              supplied.version === 1
+                ? supplied.selection.effectId
+                : supplied.admittedEffect.effectId,
+              supplied.version,
+            );
             if (!same(owner, supplied)) return yield* deny("Original memory owner changed");
-            yield* options.assertCurrentInTransaction(owner);
+            yield* assertCurrent(owner);
+            if ((owner.version === 2) !== (stage.phase === "query-embed"))
+              return yield* deny("Memory stage kind differs from its admitted owner");
             const operation = owner.operation;
             const provider = stage.phase === "extract" ? "command-code" : "openrouter";
             const model =
@@ -683,7 +816,7 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
                 ? "inclusionai/ling-3.1-flash:free"
                 : "nvidia/nemotron-3-embed-1b:free";
             const scope = projectMemoryHash({
-              version: 1,
+              version: owner.version,
               ownerSha256: projectMemoryHash(owner),
               phase: stage.phase,
               routeId: stage.routeId,
@@ -692,10 +825,11 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
             });
             const reservation = yield* decodeReservationInput({
               ...stage,
-              version: 1,
+              version: owner.version,
               lane: "memory",
               scope,
-              effectId: owner.selection.effectId,
+              effectId:
+                owner.version === 1 ? owner.selection.effectId : owner.admittedEffect.effectId,
               ownerSha256: projectMemoryHash(owner),
               workerId: operation.workerId,
               generation: operation.generation,
@@ -810,7 +944,7 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
           ${provider},${model},${environmentSlot},${modelSlot},${reservation.maxInputTokens},
           ${reservation.maxOutputTokens},${reservation.deadlineAtMs},'held','held',0,0,
           ${canonicalProjectWorkPayload(reservation)})`;
-            yield* options.assertCurrentInTransaction(owner);
+            yield* assertCurrent(owner);
             yield* clockCheck(reservation.deadlineAtMs);
             return { reservationId, reservation, status: "reserved" as const };
           }).pipe(Effect.provideService(ProjectWorkRepository, repository)),
@@ -848,7 +982,7 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
           return yield* deny("Memory settlement charge is not proved");
         return yield* sql.withTransaction(
           Effect.gen(function* () {
-            const owner = yield* savedOwner(reservation.effectId);
+            const owner = yield* savedOwner(reservation.effectId, reservation.version);
             const ledger = yield* auditProjectMemoryOperationLedger(sql, owner.operation);
             const row = ledger.rows.find((entry) => entry.reservation_id === reservationId);
             if (
@@ -889,7 +1023,19 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
         yield* owning();
         return yield* sql.withTransaction(
           Effect.gen(function* () {
-            const owner = yield* savedOwner(effectId);
+            const saved = yield* sql<{ reservation: string | null }>`SELECT
+              CASE WHEN length(CAST(reservation_json AS BLOB))<=32768 THEN reservation_json END AS reservation
+              FROM project_team_model_request WHERE reservation_id=${reservationId} AND request_lane='memory' LIMIT 2`;
+            if (
+              saved.length !== 1 ||
+              saved[0]?.reservation === null ||
+              saved[0]?.reservation === undefined
+            )
+              return yield* deny("Memory drain has no original reservation");
+            const originalReservation = yield* decodeReservation(saved[0].reservation);
+            if (originalReservation.effectId !== effectId)
+              return yield* deny("Memory drain query identity changed");
+            const owner = yield* savedOwner(effectId, originalReservation.version);
             const ledger = yield* auditProjectMemoryOperationLedger(sql, owner.operation);
             const row = ledger.rows.find((entry) => entry.reservation_id === reservationId);
             if (

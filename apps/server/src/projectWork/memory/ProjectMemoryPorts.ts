@@ -10,12 +10,24 @@ import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import type { ProjectTeamPrincipal } from "../ProjectTeamAuthorization.ts";
 import { canonicalProjectWorkPayload } from "@t3tools/contracts";
 import { ProjectMemoryServiceError } from "./ProjectMemoryService.ts";
+import type { ProjectMemoryRetrieval } from "./ProjectMemoryRetrieval.ts";
 
 /** Readiness checks never activate a companion or make a model request. */
 export class ProjectMemoryPorts extends Context.Service<
   ProjectMemoryPorts,
   {
     readonly assertConfigured: () => Effect.Effect<void, ProjectMemoryServiceError>;
+    readonly readConfiguration?: () => Effect.Effect<
+      ProjectMemoryProcessingConfiguration | undefined,
+      ProjectMemoryServiceError
+    >;
+    readonly consumeQuery?: (
+      principal: ProjectTeamPrincipal,
+      queryId: string,
+    ) => Effect.Effect<void, ProjectMemoryServiceError>;
+    readonly readQueryCache?: (
+      principal: ProjectTeamPrincipal,
+    ) => Effect.Effect<ProjectMemoryRetrieval | undefined, ProjectMemoryServiceError>;
     readonly consume?: (
       principal: ProjectTeamPrincipal,
       effectId: string,

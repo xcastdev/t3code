@@ -453,6 +453,7 @@ export const ProjectTeamEffect = Schema.Struct({
     "mailbox-wake",
     "memory-index",
     "memory-delete",
+    "memory-query",
     "stop",
   ]),
   taskId: Schema.optionalKey(ProjectWorkTaskId),
@@ -760,6 +761,17 @@ export const ProjectTeamMemoryProcessIntent = Schema.Struct({
   selection: ProjectTeamMemorySelection,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamMemoryProcessIntent = typeof ProjectTeamMemoryProcessIntent.Type;
+export const ProjectTeamMemoryQueryIntent = Schema.Struct({
+  ...IntentFields,
+  type: Schema.Literal("project-team.memory.query"),
+  query: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isTrimmed(),
+    Schema.isMaxLength(8192),
+    Schema.makeFilter((query) => new TextEncoder().encode(query).byteLength <= 8192),
+  ),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamMemoryQueryIntent = typeof ProjectTeamMemoryQueryIntent.Type;
 export const ProjectTeamMemorySourcesRead = Schema.Struct({
   projectId: ProjectId,
   taskId: ProjectWorkTaskId,
@@ -777,6 +789,7 @@ export const ProjectTeamMemorySourcesRead = Schema.Struct({
 export type ProjectTeamMemorySourcesRead = typeof ProjectTeamMemorySourcesRead.Type;
 
 export const ProjectTeamWriteIntent = Schema.Union([
+  ProjectTeamMemoryQueryIntent,
   ProjectTeamMemoryProcessIntent,
   ProjectTeamReviewFindingIntent,
   ProjectTeamVerificationProposal,

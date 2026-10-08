@@ -1431,6 +1431,31 @@ export const layer = Layer.effect(
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) {
+      if (input.type === "project-team.memory.query") {
+        const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+        const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+        if (
+          Option.isNone(currentSql) ||
+          currentSql.value !== sql ||
+          Option.isNone(repository) ||
+          Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+        )
+          return yield* deny("Semantic query requires its original gateway transaction");
+        const { makeProjectMemoryQuery } = yield* Effect.promise(
+          () => import("./memory/ProjectMemoryQuery.ts"),
+        );
+        const query = yield* makeProjectMemoryQuery().pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.provideService(ProjectWorkRepository, repository.value),
+        );
+        return yield* query
+          .compileInTransaction(input, principal, attribution, resolve, duplicate)
+          .pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository.value),
+            Effect.mapError((error) => deny(error.reason)),
+          );
+      }
       if (input.type === "project-team.memory.process") {
         const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
         const repository = yield* Effect.serviceOption(ProjectWorkRepository);

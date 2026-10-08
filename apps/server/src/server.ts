@@ -892,6 +892,20 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
               "Memory companion awaits shared task resource ownership and engineering verdicts",
           }),
         ),
+      queryCompanion: () =>
+        Effect.fail(
+          new MemoryBackendError({
+            code: "unavailable",
+            message:
+              "Query companion awaits shared task resource ownership and engineering verdicts",
+          }),
+        ),
+      confirmQueryTransportDrained: () =>
+        Effect.fail(
+          new ProjectMemoryServiceError({
+            reason: "Original query companion drain is not observed",
+          }),
+        ),
     });
     yield* Effect.gen(function* () {
       for (;;) {

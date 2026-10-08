@@ -39,6 +39,44 @@ const member = {
   roleRevisionId: "role",
 };
 describe("team contracts", () => {
+  it("accepts bounded semantic queries without caller vectors, owners or renewed limits", () => {
+    const request = {
+      type: "project-team.memory.query",
+      commandId: "query-one",
+      projectId: "project",
+      taskId: "task",
+      expectedRevision: 3,
+      expectedTaskRevision: 1,
+      specRevision: 1,
+      planRevision: 1,
+      query: "Which retained facts explain parser provenance?",
+    };
+    expect(decodeIntent(request)).toEqual(request);
+    expect(decodePublicWrite(request)).toEqual(request);
+    for (const [label, query] of [
+      ["exact ASCII byte limit", "x".repeat(8192)],
+      ["exact UTF-8 byte limit", "é".repeat(4096)],
+    ]) {
+      const bounded = { ...request, query };
+      expect(decodeIntent(bounded), label).toEqual(bounded);
+      expect(decodePublicWrite(bounded), label).toEqual(bounded);
+    }
+    for (const { label, change } of [
+      { label: "empty", change: { query: "" } },
+      { label: "whitespace only", change: { query: " " } },
+      { label: "untrimmed original", change: { query: " query " } },
+      { label: "ASCII byte overflow", change: { query: "x".repeat(8193) } },
+      { label: "UTF-8 byte overflow", change: { query: "é".repeat(4097) } },
+      { label: "caller vector", change: { vector: Array.from({ length: 2048 }, () => 0.25) } },
+      { label: "caller owner", change: { owner: { operationId: "caller-operation" } } },
+      { label: "caller model", change: { model: "caller-model" } },
+      { label: "renewed limits", change: { maximumTokens: 1000 } },
+      { label: "foreign environment", change: { environmentId: "foreign" } },
+    ]) {
+      expect(() => decodeIntent({ ...request, ...change }), label).toThrow();
+      expect(() => decodePublicWrite({ ...request, ...change }), label).toThrow();
+    }
+  });
   it("accepts explicit recipient task messages without caller identity or delivery authority", () => {
     const request = {
       type: "project-team.message.send",

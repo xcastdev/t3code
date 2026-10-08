@@ -30,6 +30,9 @@ export type ProjectMemoryRetrieval = {
   readonly provenance: {
     readonly snapshotSha256: string;
     readonly querySha256: string;
+    readonly queryId?: string;
+    readonly configurationSha256?: string;
+    readonly admissionEventId?: string;
   };
 };
 const degraded = (reason: string, query: string): ProjectMemoryRetrieval => ({
@@ -42,12 +45,22 @@ const degraded = (reason: string, query: string): ProjectMemoryRetrieval => ({
 // Enumerate a complete bounded candidate set before hydration; neither lexical
 // order nor a newer timestamp may hide a correction or retained tombstone.
 export const readProjectMemoryObservations = Effect.fn("ProjectMemoryRetrieval.read")(
-  function* (sql: SqlClient.SqlClient, projectId: ProjectId, query: string) {
+  function* (
+    sql: SqlClient.SqlClient,
+    projectId: ProjectId,
+    query: string,
+    exactHitIds?: readonly string[],
+  ) {
     if (Buffer.byteLength(query, "utf8") > 65_536)
       return degraded("Observation query exceeds the lexical bound", query);
-    const rows = yield* sql`SELECT CASE WHEN length(CAST(record_id AS BLOB))<=1024
+    if (exactHitIds !== undefined && exactHitIds.length > 12)
+      return degraded("Dense candidates exceed their bound", query);
+    const rows =
+      exactHitIds === undefined
+        ? yield* sql`SELECT CASE WHEN length(CAST(record_id AS BLOB))<=1024
       THEN record_id END AS recordId FROM project_team_memory_observation
-      WHERE project_id=${projectId} ORDER BY record_id LIMIT 129`;
+      WHERE project_id=${projectId} ORDER BY record_id LIMIT 129`
+        : exactHitIds.map((recordId) => ({ recordId }));
     if (rows.length > 128)
       return degraded("Observation candidates exceed the complete lexical bound", query);
     const ids = decodeIds(rows);
@@ -112,13 +125,22 @@ export const readProjectMemoryObservations = Effect.fn("ProjectMemoryRetrieval.r
           .filter((term) => term.length >= 2 && Buffer.byteLength(term, "utf8") <= 64),
       ),
     ].slice(0, 32);
-    const scored = hydrated.selected
-      .map((record) => {
-        const words = new Set(record.body.toLowerCase().split(/[^\p{L}\p{N}_]+/u));
-        return { record, score: terms.reduce((total, term) => total + Number(words.has(term)), 0) };
-      })
-      .filter((entry) => entry.score > 0)
-      .sort((a, b) => b.score - a.score || a.record.recordId.localeCompare(b.record.recordId));
+    const scored =
+      exactHitIds === undefined
+        ? hydrated.selected
+            .map((record) => {
+              const words = new Set(record.body.toLowerCase().split(/[^\p{L}\p{N}_]+/u));
+              return {
+                record,
+                score: terms.reduce((total, term) => total + Number(words.has(term)), 0),
+              };
+            })
+            .filter((entry) => entry.score > 0)
+            .sort((a, b) => b.score - a.score || a.record.recordId.localeCompare(b.record.recordId))
+        : exactHitIds.flatMap((id) => {
+            const record = hydrated.selected.find((entry) => entry.recordId === id);
+            return record === undefined ? [] : [{ record, score: 1 }];
+          });
     const omitted: string[] = [];
     if (Object.values(hydrated.rejectionCounts).some((count) => count > 0))
       omitted.push("Observation candidates excluded by current source or correction policy");

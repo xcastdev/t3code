@@ -38,6 +38,10 @@ import { ProjectWorkVerificationPreparationSelection } from "./ProjectWorkVerifi
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { makeProjectMemoryProcessing } from "./memory/ProjectMemoryProcessing.ts";
 import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
+import {
+  makeProjectMemoryQuery,
+  ProjectMemoryQueryQualification,
+} from "./memory/ProjectMemoryQuery.ts";
 import * as ProjectTeamAuthorization from "./ProjectTeamAuthorization.ts";
 import * as ProjectWorkBriefing from "./ProjectWorkBriefing.ts";
 import * as IssueComments from "./ProjectIssueComments.ts";
@@ -1303,6 +1307,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         return yield* new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
           reason: "Team authorization unavailable",
         });
+      const authorization = teamAuthorization.value;
       const caller = principal ?? { actor };
       if (caller.actor.kind !== actor.kind || caller.actor.id !== actor.id)
         return yield* new ProjectWorkAuthorizationError({ reason: "spoofed-attribution" });
@@ -1315,18 +1320,45 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         return yield* new ProjectWorkAuthorizationError({ reason: "project-work-disabled" });
       const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
       const attribution = attributionFor(actor, source, now);
+      const queryQualification =
+        input.type === "project-team.memory.query"
+          ? yield* sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  const query = yield* makeProjectMemoryQuery();
+                  return yield* query.qualify(input, caller, attribution, authorization.resolve);
+                }).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sql),
+                  Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, repository),
+                  Effect.mapError(
+                    (error) =>
+                      new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+                        reason: error.reason,
+                      }),
+                  ),
+                ),
+              )
+              .pipe(
+                Effect.mapError((cause) =>
+                  isTeamAuthorizationError(cause)
+                    ? cause
+                    : toPersistenceSqlError("ProjectWorkGateway.queryQualification")(cause),
+                ),
+              )
+          : undefined;
       const fingerprint =
+        queryQualification?.intentFingerprint ??
         "project-team-intent:" +
-        NodeCrypto.createHash("sha256")
-          .update(
-            canonicalProjectWorkPayload({
-              intent: input,
-              actor: { kind: actor.kind, id: actor.id },
-              source: { kind: source.kind, id: source.id },
-              managed: caller.managed ?? null,
-            }),
-          )
-          .digest("hex");
+          NodeCrypto.createHash("sha256")
+            .update(
+              canonicalProjectWorkPayload({
+                intent: input,
+                actor: { kind: actor.kind, id: actor.id },
+                source: { kind: source.kind, id: source.id },
+                managed: caller.managed ?? null,
+              }),
+            )
+            .digest("hex");
       const approval = yield* Effect.gen(function* () {
         // Agent decisions are denied by authorization inside the command transaction.
         // Do not acquire an unrelated read connection before that boundary.
@@ -1487,10 +1519,15 @@ const makeProjectWorkGateway = Effect.gen(function* () {
           ).pipe(Effect.asVoid);
         },
         fingerprint,
-      ).pipe((effect) =>
-        Option.isSome(approval)
-          ? Effect.provideService(effect, ProjectWorkVerificationApproval, approval.value)
-          : effect,
+      ).pipe(
+        (effect) =>
+          Option.isSome(approval)
+            ? Effect.provideService(effect, ProjectWorkVerificationApproval, approval.value)
+            : effect,
+        (effect) =>
+          queryQualification === undefined
+            ? effect
+            : Effect.provideService(effect, ProjectMemoryQueryQualification, queryQualification),
       );
       if (input.type === "project-team.memory.process" && !retainedMemorySelection) {
         const ports = yield* Effect.serviceOption(ProjectMemoryPorts);
@@ -1502,6 +1539,34 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             .pipe(
               Effect.catch(() =>
                 Effect.logWarning("Selected memory work remains retained for reconciliation."),
+              ),
+            );
+        }
+      }
+      if (input.type === "project-team.memory.query" && !retainedMemorySelection) {
+        const ports = yield* Effect.serviceOption(ProjectMemoryPorts);
+        if (
+          Option.isSome(ports) &&
+          ports.value.consumeQuery !== undefined &&
+          queryQualification !== undefined
+        ) {
+          const queryId =
+            "memory-query-" +
+            NodeCrypto.createHash("sha256")
+              .update(
+                canonicalProjectWorkPayload({
+                  projectId: input.projectId,
+                  commandId: input.commandId,
+                }),
+              )
+              .digest("hex");
+          // Admission is already committed. A failed forward stage is retained;
+          // the receipt remains authoritative and its retry cannot forward again.
+          yield* ports.value
+            .consumeQuery(caller, queryId)
+            .pipe(
+              Effect.catch(() =>
+                Effect.logWarning("Semantic query remains retained for reconciliation."),
               ),
             );
         }
