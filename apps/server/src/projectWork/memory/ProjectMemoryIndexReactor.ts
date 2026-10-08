@@ -53,6 +53,7 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
   readonly backend: MemoryBackend;
   readonly environmentId: string;
   readonly outcomes?: ProjectMemoryOutcomePort;
+  readonly assertProcessingInTransaction?: Effect.Effect<void, ProjectMemoryServiceError>;
 }) => {
   const { sql, repository, service, backend, environmentId } = dependencies;
   const load = Effect.fn("ProjectMemoryIndexReactor.load")(function* (effectId: string) {
@@ -216,6 +217,7 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
         WHERE effect_id=${effectId} AND claim_generation=${job.claimGeneration} AND status=${job.status} AND receipt_json IS NULL`;
         return [];
       }),
+      dependencies.assertProcessingInTransaction ?? Effect.void,
     );
     return owner;
   });
@@ -235,6 +237,7 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
       return { status: "pending-reflection" as const, receipt: job.receipt };
     const expected = canonicalProjectWorkPayload(job.receipt);
     const verifyFinal = Effect.gen(function* () {
+      yield* dependencies.assertProcessingInTransaction ?? Effect.void;
       const fresh = yield* load(effectId);
       if (fresh?.status !== "settled" || canonicalProjectWorkPayload(fresh.receipt) !== expected)
         return yield* fail("Memory receipt changed before reflection");
@@ -296,6 +299,7 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
           return yield* fail("Memory receipt ownership changed");
         return [];
       }),
+      dependencies.assertProcessingInTransaction ?? Effect.void,
     );
     return yield* reflect(effectId);
   });

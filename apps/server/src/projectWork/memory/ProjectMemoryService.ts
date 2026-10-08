@@ -158,6 +158,7 @@ export interface ProjectMemoryServiceDependencies {
   ) => Effect.Effect<void, ProjectMemoryServiceError | ServerSettingsError | SqlError>;
   readonly manifests?: ProjectMemoryManifestStore;
   readonly models?: ProjectMemoryModelPorts;
+  readonly assertProcessingInTransaction?: Effect.Effect<void, ProjectMemoryServiceError>;
 }
 const RetainedSourceBody = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("comment"), record: ProjectWorkComment }),
@@ -900,6 +901,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
           );
         return yield* commit(fresh.state, changed, at);
       }),
+      dependencies.assertProcessingInTransaction ?? Effect.void,
     );
   });
   const prepareManifest = Effect.fn("ProjectMemoryService.prepareManifest")(function* (
@@ -988,6 +990,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
         yield* manifests.save(manifest);
         return [];
       }),
+      dependencies.assertProcessingInTransaction ?? Effect.void,
     );
     return manifest;
   });

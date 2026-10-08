@@ -1,4 +1,6 @@
 import { ProjectTeamReviewReportOperation } from "../../projectWork/ProjectTeamReviewCompletionProposals.ts";
+import { ProjectMemoryOperation } from "../../projectWork/memory/ProjectMemoryModelAccounting.ts";
+import { ProjectMemoryServiceError } from "../../projectWork/memory/ProjectMemoryService.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   IsoDateTime,
@@ -1942,26 +1944,71 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                             arguments: input.arguments,
                             principal: durable.principal,
                             source: { kind: "mcp", id: workerId },
-                          }).pipe(Effect.provideService(ProjectWorkGateway, gateway), (effect) =>
-                            durable.operation.operationKind === "prompt"
-                              ? Effect.provideService(
-                                  effect,
-                                  ProjectTeamReviewReportOperation,
-                                  Object.freeze({
-                                    environmentId: binding.environmentId,
-                                    projectId: binding.projectId,
-                                    reviewTaskId: binding.taskId,
-                                    bindingId: binding.recordId,
-                                    generation: binding.generation,
-                                    providerInstanceId: binding.providerInstanceId,
-                                    threadId: binding.threadId,
-                                    operationId: durable.operation.operationId,
-                                    operationKind: "prompt" as const,
-                                    workerId: durable.workerId,
-                                    ordinal: durable.ordinal,
-                                  }),
-                                )
-                              : effect,
+                          }).pipe(
+                            Effect.provideService(ProjectWorkGateway, gateway),
+                            (effect) =>
+                              durable.operation.operationKind === "prompt"
+                                ? Effect.provideService(
+                                    effect,
+                                    ProjectTeamReviewReportOperation,
+                                    Object.freeze({
+                                      environmentId: binding.environmentId,
+                                      projectId: binding.projectId,
+                                      reviewTaskId: binding.taskId,
+                                      bindingId: binding.recordId,
+                                      generation: binding.generation,
+                                      providerInstanceId: binding.providerInstanceId,
+                                      threadId: binding.threadId,
+                                      operationId: durable.operation.operationId,
+                                      operationKind: "prompt" as const,
+                                      workerId: durable.workerId,
+                                      ordinal: durable.ordinal,
+                                    }),
+                                  )
+                                : effect,
+                            (effect) =>
+                              durable.operation.operationKind === "prompt"
+                                ? Effect.provideService(effect, ProjectMemoryOperation, {
+                                    identity: {
+                                      environmentId: binding.environmentId,
+                                      projectId: binding.projectId,
+                                      taskId: binding.taskId,
+                                      bindingId: binding.recordId,
+                                      generation: binding.generation,
+                                      providerInstanceId: binding.providerInstanceId,
+                                      threadId: binding.threadId,
+                                      operationId: durable.operation.operationId,
+                                      workerId: durable.workerId,
+                                      ordinal: durable.ordinal,
+                                    },
+                                    readCurrentInTransaction: (principal) =>
+                                      operations
+                                        .readMemoryOperationOwnerInTransaction(
+                                          {
+                                            environmentId: binding.environmentId,
+                                            projectId: binding.projectId,
+                                            taskId: binding.taskId,
+                                            bindingId: binding.recordId,
+                                            generation: binding.generation,
+                                            providerInstanceId: binding.providerInstanceId,
+                                            threadId: binding.threadId,
+                                            operationId: durable.operation.operationId,
+                                            workerId: durable.workerId,
+                                            ordinal: durable.ordinal,
+                                          },
+                                          principal,
+                                        )
+                                        .pipe(
+                                          Effect.mapError(
+                                            () =>
+                                              new ProjectMemoryServiceError({
+                                                reason:
+                                                  "Original memory operation owner is unavailable",
+                                              }),
+                                          ),
+                                        ),
+                                  })
+                                : effect,
                           );
                           yield* check(signal);
                           return { kind: "text" as const, text: encode(result) };

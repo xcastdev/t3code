@@ -48,6 +48,7 @@ import { makeProjectTeamSessionReceipts } from "./ProjectTeamSessionReceipts.ts"
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { planMessageDelivery, applyMessageReceipt } from "./ProjectTeamMailboxPolicy.ts";
 import type { makeProjectTeamPiOperations, PiCompactionAnchor } from "./ProjectTeamPiOperations.ts";
+import { auditProjectMemoryOperationLedger } from "./memory/ProjectMemoryModelAccounting.ts";
 
 export class ProjectTeamMailboxTurnsError extends Schema.TaggedError<ProjectTeamMailboxTurnsError>()(
   "ProjectTeamMailboxTurnsError",
@@ -594,6 +595,15 @@ function makeMailboxTurnHistory(sql: SqlClient.SqlClient, environmentId: string)
     const processes =
       yield* sql`SELECT operation_id,unit,allocation_json,status,owner_json,drain_json FROM project_team_pi_process WHERE operation_id=${decision.request.operationId} LIMIT 2`;
     if (processes.length !== 1) return yield* deny("Later physical process is ambiguous");
+    const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
+      environmentId: decision.environmentId,
+      projectId: decision.projectId,
+      bindingId: decision.bindingId,
+      generation: decision.generation,
+      operationId: decision.request.operationId,
+    });
+    if (!memoryLedger.settled)
+      return yield* deny("Later memory model transport is not settled and drained");
     const accounting =
       yield* sql`SELECT reservation_id,status,capacity_state,settlement_json,accounting_receipt_id FROM project_team_model_request WHERE operation_id=${decision.request.operationId} ORDER BY request_id LIMIT 257`;
     if (accounting.length > 256) return yield* deny("Later accounting exceeds its bound");
@@ -1682,7 +1692,8 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
       const rows =
         yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,
       CASE WHEN length(CAST(reservation_json AS BLOB)) <= 8192 THEN reservation_json ELSE NULL END AS reservation_json
-      FROM project_team_model_request WHERE reservation_id=${input.reservationId} LIMIT 2`;
+      FROM project_team_model_request WHERE reservation_id=${input.reservationId}
+        AND request_lane='pi' AND request_scope='' LIMIT 2`;
       if (rows.length !== 1) return yield* deny("Later model reservation is missing or ambiguous");
       const reservation = yield* decodeReservationRow(rows[0]).pipe(
         Effect.mapError(() => deny("Later model reservation is malformed")),

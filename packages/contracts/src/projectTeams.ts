@@ -738,7 +738,46 @@ export const ProjectTeamReviewFindingIntent = Schema.Struct({
   .annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamReviewFindingIntent = typeof ProjectTeamReviewFindingIntent.Type;
 
+const MemoryId = Text.check(Schema.isMaxLength(256));
+const MemoryRevision = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+export const ProjectTeamMemorySelection = Schema.Struct({
+  kind: Schema.Literals(["comment", "evidence", "decision"]),
+  retainedId: MemoryId,
+  retainedRevision: MemoryRevision,
+  sourceRecordId: MemoryId,
+  expectedSourceRecordRevision: MemoryRevision,
+  sourceRevision: MemoryRevision,
+  sourceGeneration: MemoryRevision,
+  contentHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+  effectId: MemoryId,
+  expectedEffectRevision: MemoryRevision,
+  expectedClaimGeneration: MemoryRevision,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamMemorySelection = typeof ProjectTeamMemorySelection.Type;
+export const ProjectTeamMemoryProcessIntent = Schema.Struct({
+  ...IntentFields,
+  type: Schema.Literal("project-team.memory.process"),
+  selection: ProjectTeamMemorySelection,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamMemoryProcessIntent = typeof ProjectTeamMemoryProcessIntent.Type;
+export const ProjectTeamMemorySourcesRead = Schema.Struct({
+  projectId: ProjectId,
+  taskId: ProjectWorkTaskId,
+  revision: MemoryRevision,
+  status: Schema.Literals(["available", "disabled", "degraded"]),
+  items: Schema.Array(
+    Schema.Struct({
+      selection: ProjectTeamMemorySelection,
+      status: Schema.Literals(["waiting", "processing", "uncertain", "indexed", "no-facts"]),
+      reason: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+    }),
+  ).check(Schema.isMaxLength(32)),
+  nextCursor: Schema.optionalKey(MemoryId),
+});
+export type ProjectTeamMemorySourcesRead = typeof ProjectTeamMemorySourcesRead.Type;
+
 export const ProjectTeamWriteIntent = Schema.Union([
+  ProjectTeamMemoryProcessIntent,
   ProjectTeamReviewFindingIntent,
   ProjectTeamVerificationProposal,
   ProjectTeamConfigurationIntent,

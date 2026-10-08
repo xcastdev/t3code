@@ -1,5 +1,6 @@
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { selectCurrentProjectWorkKnowledge } from "./ProjectWorkKnowledgeSelection.ts";
+import { auditProjectMemoryOperationLedger } from "./memory/ProjectMemoryModelAccounting.ts";
 import {
   ProjectTeamAuthorization,
   managedActorId,
@@ -281,9 +282,11 @@ const ModelRow = Schema.Struct({
   worker_id: Id,
   generation: Safe,
   operation_id: Id,
+  request_lane: Schema.Literals(["pi", "memory"]),
+  request_scope: Schema.String.check(Schema.isMaxLength(64)),
   request_id: Positive,
   route_id: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openrouter"]),
   model: Id,
   environment_slot: Safe,
   model_slot: Safe,
@@ -1035,6 +1038,10 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       chargedTokens: number;
       accountingReceiptId: string | null;
     }> = [];
+    const memoryLedgers = new Map<
+      string,
+      Effect.Success<ReturnType<typeof auditProjectMemoryOperationLedger>>
+    >();
     for (const [index, input] of rows.entries()) {
       const row = yield* decodeModelRow(input);
       const owner = owners.get(row.run_id);
@@ -1048,13 +1055,58 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         row.root_task_id !== limits.rootTaskId ||
         row.attempt_id !== claim.binding.attemptId ||
         row.generation !== claim.binding.generation ||
-        row.model !== claim.binding.model ||
+        (row.request_lane === "pi" &&
+          (row.model !== claim.binding.model ||
+            row.provider !== "command-code" ||
+            row.request_scope !== "")) ||
         row.deadline_at_ms > owner.intent.limits.deadlineAtMs ||
         metadata[index]?.reservation_id !== row.reservation_id ||
         Buffer.byteLength(row.reservation_json) > 8192 ||
         Buffer.byteLength(row.settlement_json ?? "") > 16384
       )
         return yield* deny("Remaining budget owner identity is invalid");
+      if (row.request_lane === "memory") {
+        let ledger = memoryLedgers.get(row.operation_id);
+        if (ledger === undefined) {
+          ledger = yield* auditProjectMemoryOperationLedger(sql, {
+            environmentId: options.environmentId,
+            projectId: binding.projectId,
+            bindingId: row.run_id,
+            generation: row.generation,
+            operationId: row.operation_id,
+          });
+          memoryLedgers.set(row.operation_id, ledger);
+        }
+        const audited = ledger.rows.find((entry) => entry.reservation_id === row.reservation_id);
+        if (
+          audited === undefined ||
+          audited.reservation_json !== row.reservation_json ||
+          audited.settlement_json !== row.settlement_json ||
+          audited.charged_input_tokens !== row.charged_input_tokens ||
+          audited.charged_output_tokens !== row.charged_output_tokens ||
+          audited.status !== row.status ||
+          audited.capacity_state !== row.capacity_state
+        )
+          return yield* deny("Remaining memory ledger disagrees with its original accounting");
+        const charged =
+          row.status === "held"
+            ? add(row.maximum_input_tokens, row.maximum_output_tokens)
+            : add(row.charged_input_tokens, row.charged_output_tokens);
+        rootUsedTokens = add(rootUsedTokens, charged);
+        if (row.attempt_id === binding.attemptId)
+          attemptUsedTokens = add(attemptUsedTokens, charged);
+        if (row.capacity_state !== "released") outstandingRequests++;
+        receipts.push({
+          reservationId: row.reservation_id,
+          runId: row.run_id,
+          generation: row.generation,
+          status: row.status,
+          capacityState: row.capacity_state,
+          chargedTokens: charged,
+          accountingReceiptId: row.accounting_receipt_id,
+        });
+        continue;
+      }
       const reservation = yield* decodeReservation(row.reservation_json);
       const expected = {
         workerId: row.worker_id,

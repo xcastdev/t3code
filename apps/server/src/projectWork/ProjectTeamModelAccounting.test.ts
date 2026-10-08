@@ -147,6 +147,59 @@ it.effect("denies ordinary, stale and revoked authority without reserving", () =
 );
 
 it.effect(
+  "preserves the original cumulative attempt ceiling across separate operation budgets",
+  () =>
+    fileTest((path) =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        // These are the fixture's trusted operation port records. Root and each
+        // operation allow 1600; the genuinely issued binding/attempt allows 1000.
+        expect(f.binding.configuration.maxTokens).toBe(1000);
+        yield* f.sql`UPDATE model_operation_fixture SET maximum_tokens=1600`;
+        yield* f.sql`INSERT INTO model_operation_fixture VALUES(
+      ${f.binding.recordId},'successor-worker','successor-operation','root',1600,10000)`;
+        const firstRequest = { ...request(), maxInputTokens: 600, maxOutputTokens: 100 };
+        const first = yield* f.accounting.reserve(f.principal, firstRequest);
+        yield* f.accounting.settle(unknown(first.reservationId, firstRequest));
+        const successor = {
+          ...request(),
+          workerId: "successor-worker",
+          operationId: "successor-operation",
+          maxInputTokens: 200,
+          maxOutputTokens: 200,
+        };
+        const before = yield* f.sql`SELECT * FROM project_team_model_request`;
+        expect((yield* f.accounting.reserve(f.principal, successor).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(before);
+        expect(yield* f.sql`SELECT maximum_tokens FROM project_team_model_budget`).toEqual([
+          { maximum_tokens: 1600 },
+        ]);
+        const boundary = { ...successor, maxInputTokens: 150, maxOutputTokens: 150 };
+        const next = yield* f.accounting.reserve(f.principal, boundary);
+        expect(next.status).toBe("reserved");
+        yield* f.accounting.settle(unknown(next.reservationId, boundary));
+        expect(
+          yield* f.sql`SELECT operation_id,SUM(charged_input_tokens+charged_output_tokens) AS charged
+      FROM project_team_model_request GROUP BY operation_id ORDER BY operation_id`,
+        ).toEqual([
+          { operation_id: "prompt", charged: 700 },
+          { operation_id: "successor-operation", charged: 300 },
+        ]);
+        yield* denied(
+          f.accounting.reserve(f.principal, {
+            ...boundary,
+            requestId: 2,
+            maxInputTokens: 1,
+            maxOutputTokens: 1,
+          }),
+        );
+      }).pipe(Effect.provide(runtime(path))),
+    ),
+);
+
+it.effect(
   "intersects effective operation caps with the immutable root budget and current binding",
   () =>
     fileTest((path) =>
@@ -172,9 +225,15 @@ it.effect(
           accounting.reserve(f.principal, { ...bounded, requestId: 2, deadlineAtMs: 5001 }),
         );
         yield* accounting.settle(unknown(first.reservationId, bounded));
-        expect((yield* accounting.reserve(f.principal, { ...bounded, requestId: 2 })).status).toBe(
-          "reserved",
-        );
+        yield* denied(accounting.reserve(f.principal, { ...bounded, requestId: 2 }));
+        expect(
+          (yield* accounting.reserve(f.principal, {
+            ...bounded,
+            requestId: 2,
+            maxInputTokens: 25,
+            maxOutputTokens: 25,
+          })).status,
+        ).toBe("reserved");
         yield* denied(accounting.reserve(f.principal, { ...bounded, requestId: 3 }));
         expect(
           yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget`,

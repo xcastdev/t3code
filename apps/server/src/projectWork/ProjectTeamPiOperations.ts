@@ -39,6 +39,11 @@ import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 import type { PiModelRequestReservation } from "../provider/pi/PiModelBroker.ts";
 import { ModelAccountingError } from "./ProjectTeamModelAccounting.ts";
 import {
+  ProjectMemoryOperationIdentity,
+  ProjectMemoryTaskOwner,
+  auditProjectMemoryOperationLedger,
+} from "./memory/ProjectMemoryModelAccounting.ts";
+import {
   ProjectTeamAuthorization,
   managedActorId,
   type ProjectTeamAuthority,
@@ -68,6 +73,32 @@ const decodeOwner = Schema.decodeSync(
 );
 const ResourceIdentity = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
 const decodeResourceIdentity = Schema.decodeUnknownEffect(ResourceIdentity);
+const decodeMemoryIdentity = Schema.decodeUnknownEffect(ProjectMemoryOperationIdentity, {
+  onExcessProperty: "error",
+});
+const decodeMemoryTaskOwner = Schema.decodeUnknownEffect(ProjectMemoryTaskOwner, {
+  onExcessProperty: "error",
+});
+const decodeMemoryAllocation = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(PiManagedProcessAllocationSchema),
+  { onExcessProperty: "error" },
+);
+const decodeMemoryProcessOwner = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("owner"),
+      unit: Schema.String,
+      nonce: Schema.String,
+      invocation: Schema.String,
+      cgroup: Schema.String,
+      pid: Schema.Int,
+      memoryBytes: Schema.Int,
+      swapBytes: Schema.Literal(0),
+      oomGroup: Schema.Literal(1),
+    }),
+  ),
+  { onExcessProperty: "error" },
+);
 const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
 const Positive = Safe.check(Schema.isGreaterThan(0));
 const OperationLimits = Schema.Struct({ maximumTokens: Positive, deadlineAtMs: Positive });
@@ -1233,7 +1264,20 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         deadline_at_ms: number;
         charged_input_tokens: number;
         charged_output_tokens: number;
-      }>`SELECT * FROM project_team_model_request WHERE operation_id=${row.operation_id} LIMIT 257`;
+      }>`SELECT * FROM project_team_model_request WHERE operation_id=${row.operation_id}
+        AND request_lane='pi' AND request_scope='' LIMIT 257`;
+      const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
+        environmentId: row.environment_id,
+        projectId: row.project_id,
+        bindingId: row.binding_id,
+        generation: row.generation,
+        operationId: row.operation_id,
+      });
+      if (!memoryLedger.settled)
+        return yield* deny(
+          "Stable Pi operation has active or quarantined memory transport",
+          "uncertain",
+        );
       if (requests.length !== terminal.accountingReceipts.length || requests.length > 256)
         return yield* deny("Stable Pi accounting receipt incomplete", "uncertain");
       const reservations = new Set<string>();
@@ -2046,7 +2090,15 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             route_id: string;
             provider: string;
             model: string;
-          }>`SELECT request_id,reservation_id,accounting_receipt_id,status,route_id,provider,model FROM project_team_model_request WHERE worker_id=${captured.workerId} AND operation_id=${row.operation_id} AND generation=${row.generation}`;
+          }>`SELECT request_id,reservation_id,accounting_receipt_id,status,route_id,provider,model FROM project_team_model_request WHERE worker_id=${captured.workerId} AND operation_id=${row.operation_id} AND generation=${row.generation}
+            AND request_lane='pi' AND request_scope=''`;
+          const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
+            environmentId: row.environment_id,
+            projectId: row.project_id,
+            bindingId: row.binding_id,
+            generation: row.generation,
+            operationId: row.operation_id,
+          });
           const receipts = new Set<string>();
           for (const receipt of terminal.accountingReceipts) {
             const request = requests.find(
@@ -2065,9 +2117,10 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               return yield* deny("Pi accounting receipt mismatch", "uncertain");
             receipts.add(receipt.reservationId);
           }
-          const pendingAccounting = requests.some(
-            (request) => request.status === "reserved" || !request.accounting_receipt_id,
-          );
+          const pendingAccounting =
+            requests.some(
+              (request) => request.status === "reserved" || !request.accounting_receipt_id,
+            ) || !memoryLedger.settled;
           const uncertain =
             pendingAccounting ||
             terminal.outcome === "quarantine" ||
@@ -2145,6 +2198,123 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       );
       yield* current(identity);
       return result;
+    });
+    const readMemoryOperationOwnerInTransaction = Effect.fn(
+      "ProjectTeamPiOperations.readMemoryOperationOwnerInTransaction",
+    )(function* (
+      supplied: typeof ProjectMemoryOperationIdentity.Type,
+      principal: ProjectTeamPrincipal,
+    ) {
+      const client = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(client) ||
+        client.value !== sql ||
+        Option.isNone(suppliedRepository) ||
+        suppliedRepository.value !== repository ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny("Memory owner requires the captured SQL, repository and transaction");
+      const identity = yield* decodeMemoryIdentity(supplied);
+      const authority = yield* authorization.resolve(principal);
+      if (
+        authority === undefined ||
+        authority.role.memoryAccess === "none" ||
+        authority.binding.status !== "running" ||
+        !authority.binding.sessionId ||
+        !authority.role.tools.includes("project-work.write") ||
+        !authority.binding.configuration.toolIds.includes("project-work.write") ||
+        authority.binding.environmentId !== identity.environmentId ||
+        authority.binding.projectId !== identity.projectId ||
+        authority.binding.taskId !== identity.taskId ||
+        authority.binding.recordId !== identity.bindingId ||
+        authority.binding.generation !== identity.generation ||
+        authority.binding.providerInstanceId !== identity.providerInstanceId ||
+        authority.binding.threadId !== identity.threadId
+      )
+        return yield* deny("Memory processing requires its original running task owner");
+      const row = yield* getRow(identity.operationId);
+      if (
+        row.status !== "running" ||
+        row.worker_id !== identity.workerId ||
+        row.operation_ordinal !== identity.ordinal ||
+        row.operation_kind !== "prompt"
+      )
+        return yield* deny("Memory processing cannot inherit an inactive or different operation");
+      const root = yield* roots(authority);
+      const budget = yield* operationBudget(authority, root, row);
+      const dispatches = yield* sql<{ dispatchId: string }>`SELECT dispatch_id AS dispatchId
+        FROM project_team_dispatch WHERE environment_id=${options.environmentId}
+        AND binding_id=${identity.bindingId} AND generation=${identity.generation} LIMIT 2`;
+      if (dispatches.length > 1) return yield* deny("Memory owner dispatch is ambiguous");
+      const dispatch =
+        dispatches[0] === undefined ? undefined : yield* readRetained(dispatches[0].dispatchId);
+      const processes = yield* sql<{
+        allocation: string | null;
+        owner: string | null;
+        unit: string;
+      }>`SELECT unit,
+        CASE WHEN length(CAST(allocation_json AS BLOB))<=262144 THEN allocation_json END AS allocation,
+        CASE WHEN length(CAST(owner_json AS BLOB))<=262144 THEN owner_json END AS owner
+        FROM project_team_pi_process WHERE operation_id=${identity.operationId}
+        AND status='captured' LIMIT 2`;
+      const process = processes[0];
+      if (
+        processes.length !== 1 ||
+        process === undefined ||
+        process.allocation === null ||
+        process.owner === null
+      )
+        return yield* deny("Memory processing requires the original captured process");
+      const allocation = yield* decodeMemoryAllocation(process.allocation);
+      const capturedOwner = yield* decodeMemoryProcessOwner(process.owner);
+      if (
+        allocation.unit !== process.unit ||
+        capturedOwner.pid < 1 ||
+        capturedOwner.unit !== allocation.unit ||
+        capturedOwner.nonce !== allocation.nonce ||
+        capturedOwner.memoryBytes !== allocation.policy.memoryBytes ||
+        !capturedOwner.cgroup.startsWith("/sys/fs/cgroup/") ||
+        capturedOwner.cgroup.split("/").some((part) => part === "." || part === "..") ||
+        !capturedOwner.cgroup.endsWith("/" + allocation.unit) ||
+        !/^[a-f0-9]{32}$/u.test(capturedOwner.invocation)
+      )
+        return yield* deny("Memory original process ownership is inconsistent");
+      const attempt = authority.state.attempts.find(
+        (entry) => entry.attemptId === authority.binding.attemptId,
+      );
+      const currentLeaseDeadlineAtMs = Option.getOrElse(
+        DateTime.make(attempt?.leasedUntil ?? "").pipe(Option.map(DateTime.toEpochMillis)),
+        () => 0,
+      );
+      const originalClaim = dispatch?.intent.compiledClaim.transition;
+      if (originalClaim !== undefined && originalClaim.kind !== "claim")
+        return yield* deny("Memory original dispatch has no task claim");
+      const originalLeaseDeadlineAtMs =
+        originalClaim?.kind === "claim"
+          ? Date.parse(originalClaim.claim.leasedUntil)
+          : row.deadline_at_ms;
+      const leaseDeadlineAtMs = Math.min(currentLeaseDeadlineAtMs, originalLeaseDeadlineAtMs);
+      yield* clockCheck(Math.min(row.deadline_at_ms, leaseDeadlineAtMs));
+      return yield* decodeMemoryTaskOwner({
+        ...identity,
+        version: 1,
+        attemptId: authority.binding.attemptId,
+        rootBindingId: row.root_binding_id,
+        rootTaskId: budget.rootTaskId,
+        rootMaximumTokens: budget.maximumTokens,
+        rootDeadlineAtMs: budget.deadlineAtMs,
+        attemptMaximumTokens:
+          dispatch?.intent.limits.attemptMaximumTokens ?? authority.binding.configuration.maxTokens,
+        attemptDeadlineAtMs: dispatch?.intent.limits.deadlineAtMs ?? row.deadline_at_ms,
+        operationMaximumTokens: row.maximum_tokens,
+        operationDeadlineAtMs: row.deadline_at_ms,
+        leaseDeadlineAtMs,
+        roleSha256: digest(authority.role),
+        configurationSha256: digest(authority.binding.configuration),
+        requestSha256: row.request_hash,
+        allocation,
+      });
     });
     const resolveOperation = Effect.fn("ProjectTeamPiOperations.resolveOperation")(function* (
       authority: ProjectTeamAuthority,
@@ -2245,6 +2415,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         guard(persistTerminal(...args)),
       nativeFor: (...args: Parameters<typeof nativeFor>) => guard(nativeFor(...args)),
       resolveOperation,
+      readMemoryOperationOwnerInTransaction: (
+        ...args: Parameters<typeof readMemoryOperationOwnerInTransaction>
+      ) => guard(readMemoryOperationOwnerInTransaction(...args)),
     };
   },
 );

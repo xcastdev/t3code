@@ -1702,6 +1702,7 @@ it.effect(
             [39, "ProjectTeamMailboxTurns"],
             [40, "ProjectTeamMailboxSuccessors"],
             [41, "ProjectWorkManagedMerge"],
+            [42, "ProjectMemoryProcessing"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(
