@@ -1429,7 +1429,8 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
               embeddingSha256: projectMemoryHash(embedded),
               searchSha256: projectMemoryHash(searched),
               snapshotSha256: hydrated.provenance.snapshotSha256,
-              hitIds: hydrated.records.map((record) => record.recordId),
+              // Cache hydration must audit the same candidates and rejections.
+              hitIds,
             };
           }).pipe(
             Effect.mapError((error) =>

@@ -5859,6 +5859,7 @@ for (const compactProof of [
   "memoryQueryNoAccess",
   "memoryQueryBudget",
   "memoryQuerySecret",
+  "memoryQueryMixed",
 ] as const)
   it.effect(
     compactProof === undefined
@@ -5883,23 +5884,25 @@ for (const compactProof of [
                         ? "admits an explicit semantic query through the executing task bridge before forward stages"
                         : compactProof === "memoryQueryPipeline"
                           ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
-                          : compactProof === "memoryQueryGuards"
-                            ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
-                            : compactProof === "memoryQueryNoGrant"
-                              ? "denies semantic query admission without the original frozen write intersection"
-                              : compactProof === "memoryQueryNoAccess"
-                                ? "denies semantic query admission for an original no-memory role"
-                                : compactProof === "memoryQueryBudget"
-                                  ? "retains authenticated query failure when the original operation budget cannot fund embedding"
-                                  : compactProof === "memoryQuerySecret"
-                                    ? "rejects a newly learned escaped query credential before embedding reservation"
-                                    : compactProof === "memoryQueryModelUnknown"
-                                      ? "retains an unknown query embedding charge until authenticated drain without resend"
-                                      : compactProof === "memoryQuerySearchUnknown"
-                                        ? "settles an uncertain query search only after its exact authenticated late drain"
-                                        : compactProof === "successorReplay"
-                                          ? "retained compact replay preserves the latest successful native head without another execution"
-                                          : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+                          : compactProof === "memoryQueryMixed"
+                            ? "retains current semantic context when completed search also returns a genuinely superseded observation"
+                            : compactProof === "memoryQueryGuards"
+                              ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
+                              : compactProof === "memoryQueryNoGrant"
+                                ? "denies semantic query admission without the original frozen write intersection"
+                                : compactProof === "memoryQueryNoAccess"
+                                  ? "denies semantic query admission for an original no-memory role"
+                                  : compactProof === "memoryQueryBudget"
+                                    ? "retains authenticated query failure when the original operation budget cannot fund embedding"
+                                    : compactProof === "memoryQuerySecret"
+                                      ? "rejects a newly learned escaped query credential before embedding reservation"
+                                      : compactProof === "memoryQueryModelUnknown"
+                                        ? "retains an unknown query embedding charge until authenticated drain without resend"
+                                        : compactProof === "memoryQuerySearchUnknown"
+                                          ? "settles an uncertain query search only after its exact authenticated late drain"
+                                          : compactProof === "successorReplay"
+                                            ? "retained compact replay preserves the latest successful native head without another execution"
+                                            : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
@@ -5940,8 +5943,9 @@ for (const compactProof of [
             compactProof === "memoryQueryNoGrant" || compactProof === "memoryQueryNoAccess";
           const queryAdmissionOnly =
             compactProof === "memoryQuery" || compactProof === "memoryQueryGuards" || queryDenied;
-          const queryForward =
-            compactProof === "memoryQueryPipeline" || queryRecovery || queryNoForward;
+          const queryMixed = compactProof === "memoryQueryMixed";
+          const queryCache = compactProof === "memoryQueryPipeline" || queryMixed;
+          const queryForward = queryCache || queryRecovery || queryNoForward;
           let activeQuery = false;
           const queryDrains = new Set<string>();
           let memoryPipelineFailure = "";
@@ -6443,7 +6447,7 @@ for (const compactProof of [
                                 record.taskId === task.taskId,
                             ),
                           ).toBe(true);
-                          if (compactProof === "memoryQueryPipeline")
+                          if (queryCache)
                             expect({
                               error: memoryPipelineError,
                               failure: memoryPipelineFailure,
@@ -6465,9 +6469,7 @@ for (const compactProof of [
                             generation: f.binding.generation,
                             operationId: input.operation.operationId,
                           });
-                          expect(ledger.settled).toBe(
-                            compactProof === "memoryQueryPipeline" || queryNoForward,
-                          );
+                          expect(ledger.settled).toBe(queryCache || queryNoForward);
                           if (queryAdmissionOnly) memoryReady = false;
                         });
                         if (queryAdmissionOnly) yield* issueQuery();
@@ -6960,8 +6962,19 @@ for (const compactProof of [
                                                   : ""),
                                               quote: "exact parser provenance",
                                             },
+                                            ...(queryMixed
+                                              ? [
+                                                  {
+                                                    key: "obsolete-parser",
+                                                    body: "Obsolete parser fact must not enter context.",
+                                                    quote: "exact parser provenance",
+                                                  },
+                                                ]
+                                              : []),
                                           ]
-                                        : [Array.from({ length: 2048 }, () => 0.125)],
+                                        : Array.from({ length: queryMixed ? 2 : 1 }, () =>
+                                            Array.from({ length: 2048 }, () => 0.125),
+                                          ),
                                   };
                                 }).pipe(
                                   Effect.mapError((error) =>
@@ -7059,11 +7072,24 @@ for (const compactProof of [
                                   const observation = state.foundationRecords?.find(
                                     (record) =>
                                       record.kind === "memory-observation" &&
-                                      record.sourceId === selection.sourceRecordId,
+                                      record.sourceId === selection.sourceRecordId &&
+                                      (!queryMixed || record.status === "current"),
                                   );
                                   if (observation?.kind !== "memory-observation")
                                     return yield* Effect.die(
                                       "Query fixture has no indexed observation",
+                                    );
+                                  const obsolete = queryMixed
+                                    ? state.foundationRecords?.find(
+                                        (record) =>
+                                          record.kind === "memory-observation" &&
+                                          record.observationKey === "obsolete-parser" &&
+                                          record.status === "superseded",
+                                      )
+                                    : undefined;
+                                  if (queryMixed && obsolete?.kind !== "memory-observation")
+                                    return yield* Effect.die(
+                                      "Mixed backend has no genuinely superseded candidate",
                                     );
                                   memoryBackendCalls++;
                                   if (compactProof === "memoryQuerySearchUnknown")
@@ -7089,6 +7115,20 @@ for (const compactProof of [
                                             observationId: observation.recordId,
                                             score: 0.9,
                                           },
+                                          ...(obsolete?.kind === "memory-observation"
+                                            ? [
+                                                {
+                                                  environmentId: owner.operation.environmentId,
+                                                  projectId,
+                                                  sourceRecordId: obsolete.sourceId,
+                                                  sourceRevision: obsolete.sourceRevision,
+                                                  sourceGeneration: obsolete.sourceGeneration,
+                                                  extractionId: obsolete.extractionId,
+                                                  observationId: obsolete.recordId,
+                                                  score: 0.8,
+                                                },
+                                              ]
+                                            : []),
                                         ],
                                       },
                                     }),
@@ -7224,7 +7264,49 @@ for (const compactProof of [
                               (yield* readCurrentState(f.sql, projectId)).foundationRecords ?? [];
                             expect(
                               observed.filter((row) => row.kind === "memory-observation"),
-                            ).toHaveLength(1);
+                            ).toHaveLength(queryMixed ? 2 : 1);
+                            if (queryMixed) {
+                              const obsolete = observed.find(
+                                (record) =>
+                                  record.kind === "memory-observation" &&
+                                  record.observationKey === "obsolete-parser",
+                              );
+                              if (obsolete?.kind !== "memory-observation")
+                                return yield* Effect.die(
+                                  "Mixed query fixture has no original obsolete observation",
+                                );
+                              const before = yield* readCurrentState(f.sql, projectId);
+                              yield* f.repository.execute(
+                                yield* decodeRequiredFoundation({
+                                  type: "project-work.foundation.commit",
+                                  commandId: "live-query-observation-superseded",
+                                  projectId,
+                                  expectedRevision: before.revision,
+                                  attribution,
+                                  committedAt: at,
+                                  records: [
+                                    {
+                                      ...obsolete,
+                                      revision: obsolete.revision + 1,
+                                      status: "superseded",
+                                      updatedAt: at,
+                                    },
+                                  ],
+                                }),
+                              );
+                              expect(
+                                (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+                                  (record) => record.recordId === obsolete.recordId,
+                                ),
+                              ).toMatchObject({
+                                kind: "memory-observation",
+                                status: "superseded",
+                                revision: obsolete.revision + 1,
+                              });
+                              expect(
+                                yield* f.sql`SELECT status FROM project_team_memory_observation WHERE record_id=${obsolete.recordId}`,
+                              ).toEqual([{ status: "superseded" }]);
+                            }
                             if (queryNoForward) {
                               if (queryBudget)
                                 queryConfiguration = {
@@ -7287,7 +7369,7 @@ for (const compactProof of [
                                   .queryId,
                               ).toBeUndefined();
                             }
-                            if (compactProof === "memoryQueryPipeline") {
+                            if (queryCache) {
                               const beforeCommit = yield* readCurrentState(f.sql, projectId);
                               const task = beforeCommit.tasks.find(
                                 (entry) => entry.taskId === f.binding.taskId,
@@ -7371,6 +7453,18 @@ for (const compactProof of [
                               expect(context.text).toContain(
                                 "The approved parser retains exact provenance.",
                               );
+                              if (queryMixed) {
+                                expect(context.observations.records).toHaveLength(1);
+                                expect(context.observations.records[0]?.body).toBe(
+                                  "The approved parser retains exact provenance.",
+                                );
+                                expect(context.text).not.toContain(
+                                  "Obsolete parser fact must not enter context.",
+                                );
+                                expect(context.observations.omitted).toContain(
+                                  "Observation candidates excluded by current source or correction policy",
+                                );
+                              }
                               expect({
                                 exchanges: memoryExchanges,
                                 backend: memoryBackendCalls,
@@ -8200,7 +8294,7 @@ for (const compactProof of [
             if (compactProof === "memoryPipeline") {
               expect(memoryExchanges).toBe(2);
               expect(memoryBackendCalls).toBe(3);
-            } else if (compactProof === "memoryQueryPipeline") {
+            } else if (queryCache) {
               if (
                 queryRequest === undefined ||
                 queryReceipt === undefined ||
