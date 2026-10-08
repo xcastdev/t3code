@@ -125,6 +125,49 @@ layer("NodeSqliteClient", (it) => {
         ]);
       }),
   );
+  it.effect(
+    "preserves both COMMIT and rescue ROLLBACK errors through the public transaction finalizer",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE closed_transaction_entries(id INTEGER PRIMARY KEY)`;
+        let bodyCompleted = false;
+        const failed = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* sql`INSERT INTO closed_transaction_entries(id) VALUES(1)`;
+              // Deliberately close the body transaction so COMMIT and its rescue
+              // both fail. No cleanup follows the public transaction result.
+              yield* sql.unsafe("ROLLBACK").unprepared;
+              bodyCompleted = true;
+            }),
+          )
+          .pipe(Effect.exit);
+        assert.equal(bodyCompleted, true);
+        assert.equal(failed._tag, "Failure");
+        if (failed._tag === "Failure") {
+          assert.equal(failed.cause.reasons.length, 2, Cause.pretty(failed.cause));
+          const messages: Array<string> = [];
+          for (const reason of failed.cause.reasons) {
+            assert.equal(reason._tag, "Die");
+            if (reason._tag !== "Die") continue;
+            assert.equal(SqlError.isSqlError(reason.defect), true);
+            if (!SqlError.isSqlError(reason.defect)) continue;
+            assert.equal(reason.defect.reason.operation, "execute");
+            const nativeCause = reason.defect.reason.cause;
+            assert.equal(nativeCause instanceof Error, true);
+            if (nativeCause instanceof Error) messages.push(nativeCause.message);
+          }
+          assert.deepEqual(messages, [
+            "cannot commit - no transaction is active",
+            "cannot rollback - no transaction is active",
+          ]);
+        }
+        assert.deepEqual(yield* sql`SELECT id FROM closed_transaction_entries`, []);
+        yield* sql.withTransaction(sql`INSERT INTO closed_transaction_entries(id) VALUES(2)`);
+        assert.deepEqual(yield* sql`SELECT id FROM closed_transaction_entries`, [{ id: 2 }]);
+      }),
+  );
 });
 
 it.effect("returns a typed failure when the database cannot be opened", () =>

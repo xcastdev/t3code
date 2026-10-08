@@ -128,6 +128,146 @@ const gatewayLayer = makeGatewayLayer();
 const layer = it.layer(NodeServices.layer);
 
 layer("ProjectWorkGateway", (it) => {
+  for (const scenario of [
+    { name: "quoted", secret: 'retained"needle', register: true },
+    { name: "backslash", secret: "retained\\needle", register: true },
+    { name: "plain", secret: "retained-plain-needle", register: true },
+    { name: "healthy", secret: 'retained"needle', register: false },
+  ]) {
+    it.effect(
+      `rechecks ${scenario.name} cached memory content after final retraction permission`,
+      () =>
+        Effect.gen(function* () {
+          yield* runMigrations();
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+          VALUES (${projectId},'Memory','/workspace/memory','[]',${at},${at})`;
+          const repository = yield* ProjectWorkRepository.ProjectWorkRepository;
+          const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+          const authorization = yield* TeamAuthorization.ProjectTeamAuthorization;
+          const contentGuard = yield* ContentGuard.ProjectWorkContentGuard;
+          const human = { kind: "human", id: "retention-human" } as const;
+          const web = { kind: "web", id: "memory-panel" } as const;
+          yield* repository.execute({
+            type: "project-work.task.create",
+            projectId,
+            taskId,
+            commandId: CommandId.make("late-secret-task"),
+            title: "Retained finding",
+            createdAt: at,
+          });
+          yield* gateway.write(
+            yield* decodePublicWrite({
+              type: "project-work.comment.add",
+              projectId,
+              commandId: "late-secret-comment",
+              addedAt: at,
+              comment: {
+                commentId: "late-secret-comment",
+                projectId,
+                taskId,
+                body: `The retained marker is ${scenario.secret}.`,
+                revision: 0,
+                createdAt: at,
+              },
+            }),
+            human,
+            web,
+          );
+          const service = makeProjectMemoryService({
+            sql,
+            repository,
+            contentGuard,
+            authorization,
+            environmentId: "gateway-environment",
+          });
+          const selected = yield* service.captureRetained(projectId, {
+            kind: "comment",
+            retainedId: "late-secret-comment",
+          });
+          const before = yield* ProjectWorkRepository.readCurrentState(sql, projectId);
+          const beforeJobs = yield* sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
+          expect(yield* contentGuard.knownSecrets).toEqual([]);
+          const input = yield* decodeMemoryRetraction({
+            type: "project-team.memory.retract",
+            commandId: "late-secret-retract",
+            projectId,
+            expectedRevision: before.revision,
+            sourceRecordId: selected.recordId,
+            expectedSourceRecordRevision: selected.revision,
+            sourceRevision: selected.sourceRevision,
+            sourceGeneration: selected.generation,
+            contentHash: selected.contentHash,
+          });
+          let observedPendingDelete = false;
+          let observedRawRejection = false;
+          const permission = ProjectWorkVerificationRequest.of({
+            assertCurrent: () =>
+              Effect.gen(function* () {
+                const pending = yield* sql`SELECT effect_id FROM project_team_memory_job
+              WHERE json_extract(input_json,'$.source.recordId')=${selected.recordId}
+              AND json_extract(input_json,'$.effect.effectKind')='memory-delete'`.pipe(
+                  Effect.mapError(
+                    () =>
+                      new ProjectWorkVerificationRequestError({
+                        reason: "Late-secret permission observation unavailable",
+                      }),
+                  ),
+                );
+                if (pending.length === 0) return;
+                observedPendingDelete = true;
+                if (scenario.register) {
+                  yield* contentGuard.registerKnownSecrets([scenario.secret]);
+                  observedRawRejection =
+                    (yield* contentGuard
+                      .assertSafe(decodeUnknownJson(selected.content))
+                      .pipe(Effect.result))._tag === "Failure";
+                }
+              }),
+          });
+          const result = yield* gateway
+            .write(input, human, web)
+            .pipe(Effect.provideService(ProjectWorkVerificationRequest, permission), Effect.result);
+          expect(observedPendingDelete).toBe(true);
+          expect(observedRawRejection).toBe(scenario.register);
+          if (scenario.register) {
+            expect(result._tag).toBe("Failure");
+            if (result._tag === "Failure") {
+              expect(isTeamAuthorizationError(result.failure)).toBe(true);
+              expect(result.failure).toMatchObject({
+                reason: "Selected memory source is no longer safe to retain",
+              });
+            }
+            expect(yield* ProjectWorkRepository.readCurrentState(sql, projectId)).toEqual(before);
+            expect(yield* sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`).toEqual(
+              beforeJobs,
+            );
+            expect(
+              yield* sql`SELECT command_id FROM project_work_command_receipts
+            WHERE command_id=${input.commandId}`,
+            ).toEqual([]);
+          } else {
+            expect(result._tag).toBe("Success");
+            if (result._tag === "Success")
+              expect(result.success.receipt).toMatchObject({
+                commandId: input.commandId,
+                status: "accepted",
+                eventCount: 2,
+              });
+            const after = yield* ProjectWorkRepository.readCurrentState(sql, projectId);
+            expect(after.comments).toEqual(before.comments);
+            expect(
+              after.foundationRecords?.find((record) => record.recordId === selected.recordId),
+            ).toMatchObject({
+              status: "retracted",
+              content: selected.content,
+              contentHash: selected.contentHash,
+              generation: selected.generation + 1,
+            });
+          }
+        }).pipe(Effect.provide(gatewayLayer.pipe(Layer.provideMerge(ContentGuard.layer)))),
+    );
+  }
   it.effect(
     "retracts the exact current memory source through an authenticated human receipt without processing configuration",
     () =>

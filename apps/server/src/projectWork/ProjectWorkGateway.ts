@@ -352,6 +352,7 @@ const decodeVerificationPreview = Schema.decodeUnknownEffect(ProjectWorkVerifica
 });
 const decodeIntegrationSourcePage = Schema.decodeUnknownEffect(ProjectTeamIntegrationSourcePage);
 const decodeSupervision = Schema.decodeUnknownEffect(ProjectTeamSupervisionSummary);
+const decodeMemorySourceContent = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 const SUPERVISION_CAPTIONS = new Set(["name", "title", "reason"]);
 const SUPERVISION_IDENTITY = /\.(?:[A-Za-z]*Id|availability)$/u;
 
@@ -1388,6 +1389,20 @@ const makeProjectWorkGateway = Effect.gen(function* () {
               ),
             );
           yield* authorize;
+          for (const record of records) {
+            if (record.kind !== "memory-source") continue;
+            // Permission checks can discover credentials after tombstone preparation.
+            // Recheck decoded content so JSON escaping cannot hide a newly known secret.
+            const content = Option.getOrElse(
+              decodeMemorySourceContent(record.content),
+              () => record.content,
+            );
+            yield* guard
+              .assertSafe(content)
+              .pipe(
+                Effect.mapError(() => denied("Selected memory source is no longer safe to retain")),
+              );
+          }
           return { ...envelope, records };
         }),
       () => authorize,

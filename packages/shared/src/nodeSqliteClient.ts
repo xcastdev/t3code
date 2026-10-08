@@ -260,7 +260,19 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
                     Effect.matchCauseEffect({
                       onSuccess: () => Effect.failCause(commitCause),
                       onFailure: (rollbackCause) =>
-                        Effect.failCause(Cause.combine(commitCause, rollbackCause)),
+                        // The public transaction finalizer uses orDie, which selects
+                        // only one Fail. Preserve every rescue error as a defect first.
+                        Effect.failCause(
+                          Cause.fromReasons<never>(
+                            Cause.combine(commitCause, rollbackCause).reasons.map((reason) =>
+                              reason._tag === "Fail"
+                                ? Cause.makeDieReason(reason.error).annotate(
+                                    Context.makeUnsafe(reason.annotations),
+                                  )
+                                : reason,
+                            ),
+                          ),
+                        ),
                     }),
                   ),
                 ),
