@@ -551,6 +551,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
             return yield* deny("Current managed memory scope does not include this source");
         }
         yield* authorizeCapture(projectId);
+        yield* contentGuard.assertSafe(current.record);
       }),
     );
     if (captured === undefined) return yield* deny("Source capture did not commit");

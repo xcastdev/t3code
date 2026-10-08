@@ -648,3 +648,87 @@ it.effect("a settings read failure inside capture remains retryable", () =>
     yield* capture.stop;
   }).pipe(Effect.scoped, Effect.provide(captureDatabase)),
 );
+
+for (const duplicate of [false, true]) {
+  it.effect(
+    `late known secrets deny ${duplicate ? "duplicate" : "first"} capture after final authorization`,
+    () =>
+      Effect.gen(function* () {
+        const dependencies = yield* fixture;
+        const secret = 'retained boundary\n"private phrase"';
+        const comment = yield* decodeComment({
+          commentId: "late-secret-comment",
+          projectId,
+          taskId,
+          body: `A captured finding includes ${secret}.`,
+          revision: 0,
+          createdAt: at,
+          attribution,
+        });
+        yield* dependencies.repository.execute({
+          type: "project-work.comment.add",
+          projectId,
+          commandId: CommandId.make("late-secret-comment-add"),
+          comment,
+          attribution,
+          addedAt: at,
+        });
+        const selector = { kind: "comment", retainedId: comment.commentId };
+        if (duplicate) {
+          const original = yield* makeProjectMemoryService(dependencies).captureRetained(
+            projectId,
+            selector,
+          );
+          expect(original.content).not.toContain(secret);
+        }
+        const before = yield* readCurrentState(dependencies.sql, projectId);
+        const sources = yield* dependencies.sql`SELECT * FROM project_team_memory_source`;
+        const extractions = yield* dependencies.sql`SELECT * FROM project_team_memory_extraction`;
+        const jobs = yield* dependencies.sql`SELECT * FROM project_team_memory_job`;
+        const events = yield* dependencies.sql`SELECT * FROM project_work_events ORDER BY sequence`;
+        expect(sources).toHaveLength(duplicate ? 1 : 0);
+        let calls = 0;
+        let observedWrites = false;
+        const service = makeProjectMemoryService({
+          ...dependencies,
+          authorizeCapture: () =>
+            Effect.gen(function* () {
+              expect((yield* Effect.serviceOption(dependencies.sql.transactionService))._tag).toBe(
+                "Some",
+              );
+              calls += 1;
+              if (calls === 2) {
+                const rows = yield* dependencies.sql<{ payload_json: string }>`
+                  SELECT payload_json FROM project_team_memory_source`;
+                observedWrites = rows.length === 1;
+                expect(rows).toHaveLength(1);
+                expect(rows[0]?.payload_json).not.toContain(secret);
+                expect(
+                  yield* dependencies.sql`SELECT * FROM project_team_memory_extraction`,
+                ).toHaveLength(1);
+                expect(yield* dependencies.sql`SELECT * FROM project_team_memory_job`).toHaveLength(
+                  1,
+                );
+                yield* dependencies.contentGuard.registerKnownSecrets([secret]);
+              }
+            }),
+        });
+        const outcome = yield* service.captureRetained(projectId, selector).pipe(Effect.result);
+        expect(calls).toBe(2);
+        expect(observedWrites).toBe(true);
+        expect(
+          (yield* dependencies.contentGuard.assertSafe(comment).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(outcome._tag).toBe("Failure");
+        expect(yield* dependencies.sql`SELECT * FROM project_team_memory_source`).toEqual(sources);
+        expect(yield* dependencies.sql`SELECT * FROM project_team_memory_extraction`).toEqual(
+          extractions,
+        );
+        expect(yield* dependencies.sql`SELECT * FROM project_team_memory_job`).toEqual(jobs);
+        expect(
+          yield* dependencies.sql`SELECT * FROM project_work_events ORDER BY sequence`,
+        ).toEqual(events);
+        expect(yield* readCurrentState(dependencies.sql, projectId)).toEqual(before);
+      }).pipe(Effect.provide(database)),
+  );
+}
