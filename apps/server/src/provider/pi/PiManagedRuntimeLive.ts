@@ -1380,10 +1380,12 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       : {
                           kind: request.kind,
                           operation: replay.operation,
-                          ...(replay.replayHead === undefined
+                          ...(request.kind !== "compact"
                             ? {}
                             : {
-                                replayHeadOperationId: replay.replayHead.operation.operationId,
+                                replayHeadOperationId:
+                                  replay.replayHead?.operation.operationId ??
+                                  replay.operation.operationId,
                               }),
                           run,
                           steer,

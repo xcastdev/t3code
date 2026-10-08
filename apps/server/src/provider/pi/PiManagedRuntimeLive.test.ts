@@ -6268,6 +6268,7 @@ for (const compactProof of [
           const budget =
             yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`;
           const replay = yield* f.instance.prepareOperation(request, () => Effect.void);
+          expect(replay.replayHeadOperationId).toBe(terminal.operation.operationId);
           expect((yield* replay.run).terminal).toEqual(terminal);
           expect(runs).toBe(3);
           expect(f.allocations).toBe(allocations);
