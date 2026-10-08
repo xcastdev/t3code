@@ -3233,3 +3233,301 @@ it.effect("cancellation rolls back authorization work without a definite public 
     Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer))),
   ),
 );
+
+it.effect("pages persisted future records without granting projected gate authority", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+    const owner = ProjectId.make("compatibility-future");
+    const foreign = ProjectId.make("compatibility-future-foreign");
+    const human = { kind: "human", id: "compatibility-maintainer" } as const;
+    const source = { kind: "web", id: "compatibility-work" } as const;
+    for (const project of [owner, foreign]) {
+      yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES(${project},${project},'/disposable-compatibility','[]',${at},${at})`;
+      yield* gateway.write(
+        yield* decodePublicWrite({
+          type: "project-work.task.create",
+          commandId: `${project}-create`,
+          projectId: project,
+          taskId: `${project}-task`,
+          title: "Inspect compatibility",
+          createdAt: at,
+        }),
+        human,
+        source,
+      );
+    }
+    const healthy = yield* decodeTeamRecord({
+      kind: "gate",
+      recordId: "compatibility-c-healthy",
+      projectId: owner,
+      status: "pending",
+      revision: 0,
+      generation: 0,
+      updatedAt: at,
+      taskId: `${owner}-task`,
+      gate: "execution",
+      specRevision: 0,
+      planRevision: 0,
+      contentHash: "compatibility-only",
+      evidenceIds: [],
+      attribution: { actor: human, source, recordedAt: at },
+    });
+    // These are derived read fixtures, not accepted gates or future SQL table discovery.
+    const future = {
+      ...healthy,
+      recordId: "compatibility-a-future",
+      status: "awaiting-future",
+      credentials: { password: "private-future-password" },
+    };
+    const unknown = {
+      recordId: "compatibility-b-unknown",
+      projectId: owner,
+      revision: 0,
+      generation: 0,
+      updatedAt: at,
+      kind: "future-gate-record",
+      status: "future-state",
+      payload: "Safe future summary",
+      credentials: { apiKey: "private-future-key" },
+    };
+    const foreignRecord = {
+      ...healthy,
+      recordId: "compatibility-foreign-gate",
+      projectId: foreign,
+      taskId: `${foreign}-task`,
+    };
+    for (const record of [future, unknown, healthy, foreignRecord])
+      yield* sql`INSERT INTO project_team_gate(record_id,project_id,status,revision,generation,updated_at,payload_json)
+        VALUES(${record.recordId},${record.projectId},${record.status},0,0,${at},${encodeUnknownJson(record)})`;
+    const ledgers = Effect.forEach(
+      [
+        "project_work_events",
+        "project_work_command_receipts",
+        "project_team_pi_operation",
+        "project_team_model_request",
+        "project_team_memory_job",
+      ],
+      (table) => sql`SELECT * FROM ${sql(table)}`,
+    );
+    const before = yield* ledgers;
+    const records: ProjectTeamRecordRead[] = [];
+    let cursor: string | undefined;
+    for (let index = 0; index < 3; index++) {
+      const page = yield* decodeAccountingPage(
+        encodeUnknownJson(
+          yield* gateway.read({
+            projectId: owner,
+            operation: "foundation-records",
+            recordKinds: ["gate"],
+            limit: 1,
+            ...(cursor === undefined ? {} : { cursor }),
+          }),
+        ),
+      );
+      expect(page).toMatchObject({ projectId: owner, revision: 1 });
+      expect(page.items).toHaveLength(1);
+      expect(page.items[0]?.projectId).toBe(owner);
+      expect(containsObjectKey(page, "credentials")).toBe(false);
+      expect(encodeUnknownJson(page)).not.toContain("private-future");
+      records.push(...page.items);
+      cursor = page.nextCursor;
+      expect(cursor).toBe(index < 2 ? `gate:${page.items[0]!.recordId}` : undefined);
+    }
+    expect(records).toMatchObject([
+      { recordId: future.recordId, kind: "gate", status: "awaiting-future", gate: "execution" },
+      {
+        recordId: unknown.recordId,
+        kind: "future-gate-record",
+        status: "future-state",
+        payload: "Safe future summary",
+      },
+      healthy,
+    ]);
+    const foreignPage = yield* decodeAccountingPage(
+      encodeUnknownJson(
+        yield* gateway.read({
+          projectId: foreign,
+          operation: "foundation-records",
+          recordKinds: ["gate"],
+          limit: 1,
+        }),
+      ),
+    );
+    expect(foreignPage).toMatchObject({ projectId: foreign, revision: 1, items: [foreignRecord] });
+    expect(foreignPage.nextCursor).toBeUndefined();
+    const rejected = yield* gateway
+      .write(
+        yield* decodePublicWrite({
+          type: "project-team.gate.respond",
+          commandId: "compatibility-future-response",
+          projectId: owner,
+          taskId: `${owner}-task`,
+          expectedRevision: 1,
+          expectedTaskRevision: 0,
+          specRevision: 0,
+          planRevision: 0,
+          gateId: future.recordId,
+          expectedGateRevision: 0,
+          response: "rejected",
+        }),
+        human,
+        source,
+      )
+      .pipe(Effect.result);
+    expect(rejected._tag).toBe("Failure");
+    if (rejected._tag === "Failure")
+      expect(rejected.failure).toMatchObject({
+        _tag: "ProjectTeamAuthorizationError",
+        reason: "Gate target changed",
+      });
+    expect(yield* ledgers).toEqual(before);
+    expect(
+      yield* decodeAccountingPage(
+        encodeUnknownJson(
+          yield* gateway.read({
+            projectId: foreign,
+            operation: "foundation-records",
+            recordKinds: ["gate"],
+            limit: 1,
+          }),
+        ),
+      ),
+    ).toEqual(foreignPage);
+  }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+it.effect("rejects persisted malformed metadata without effects and restores healthy pages", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+    const owner = ProjectId.make("compatibility-malformed");
+    const foreign = ProjectId.make("compatibility-malformed-foreign");
+    const human = { kind: "human", id: "compatibility-maintainer" } as const;
+    const source = { kind: "web", id: "compatibility-work" } as const;
+    for (const project of [owner, foreign]) {
+      yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES(${project},${project},'/disposable-compatibility','[]',${at},${at})`;
+      yield* gateway.write(
+        yield* decodePublicWrite({
+          type: "project-work.task.create",
+          commandId: `${project}-create`,
+          projectId: project,
+          taskId: `${project}-task`,
+          title: "Inspect compatibility",
+          createdAt: at,
+        }),
+        human,
+        source,
+      );
+      const record = yield* decodeTeamRecord({
+        kind: "mission",
+        recordId: `${project}-healthy`,
+        projectId: project,
+        status: "active",
+        revision: 0,
+        generation: 0,
+        updatedAt: at,
+        title: "Healthy retained projection",
+        objective: "Inspect safely",
+        requiredTaskIds: [],
+      });
+      yield* sql`INSERT INTO project_team_mission(record_id,project_id,status,revision,generation,updated_at,payload_json)
+        VALUES(${record.recordId},${project},${record.status},0,0,${at},${encodeUnknownJson(record)})`;
+    }
+    const foreignPage = yield* decodeAccountingPage(
+      encodeUnknownJson(
+        yield* gateway.read({
+          projectId: foreign,
+          operation: "foundation-records",
+          recordKinds: ["mission"],
+          limit: 1,
+        }),
+      ),
+    );
+    const badId = "compatibility-a-malformed";
+    const payload = encodeUnknownJson({
+      kind: "mission",
+      recordId: badId,
+      projectId: owner,
+      status: "active",
+      revision: 0,
+      generation: "not-an-integer",
+      updatedAt: at,
+      title: "Malformed projection",
+      objective: "Read must fail",
+      requiredTaskIds: [],
+    });
+    expect(yield* sql`SELECT json_valid(${payload}) AS valid`).toEqual([{ valid: 1 }]);
+    yield* sql`INSERT INTO project_team_mission(record_id,project_id,status,revision,generation,updated_at,payload_json)
+      VALUES(${badId},${owner},'active',0,0,${at},${payload})`;
+    const stored = yield* sql`SELECT * FROM project_team_mission WHERE record_id=${badId}`;
+    expect(stored).toHaveLength(1);
+    expect(
+      yield* sql`SELECT json_extract(payload_json,'$.generation') AS generation
+      FROM project_team_mission WHERE record_id=${badId}`,
+    ).toEqual([{ generation: "not-an-integer" }]);
+    const ledgers = Effect.forEach(
+      [
+        "project_work_events",
+        "project_work_command_receipts",
+        "project_team_pi_operation",
+        "project_team_model_request",
+        "project_team_memory_job",
+      ],
+      (table) => sql`SELECT * FROM ${sql(table)}`,
+    );
+    const before = yield* ledgers;
+    const failure = yield* gateway
+      .read({
+        projectId: owner,
+        operation: "foundation-records",
+        recordKinds: ["mission"],
+        limit: 1,
+      })
+      .pipe(Effect.result);
+    expect(failure._tag).toBe("Failure");
+    if (failure._tag === "Failure")
+      expect(failure.failure).toMatchObject({
+        _tag: "PersistenceSqlError",
+        operation: "ProjectWorkGateway.read",
+      });
+    expect(yield* sql`SELECT * FROM project_team_mission WHERE record_id=${badId}`).toEqual(stored);
+    expect(yield* ledgers).toEqual(before);
+    yield* sql`DELETE FROM project_team_mission WHERE record_id=${badId} AND project_id=${owner}`;
+    const restored = yield* decodeAccountingPage(
+      encodeUnknownJson(
+        yield* gateway.read({
+          projectId: owner,
+          operation: "foundation-records",
+          recordKinds: ["mission"],
+          limit: 1,
+        }),
+      ),
+    );
+    expect(restored).toMatchObject({
+      projectId: owner,
+      revision: 1,
+      items: [
+        { recordId: `${owner}-healthy`, projectId: owner, kind: "mission", status: "active" },
+      ],
+    });
+    expect(restored.nextCursor).toBeUndefined();
+    expect(
+      yield* decodeAccountingPage(
+        encodeUnknownJson(
+          yield* gateway.read({
+            projectId: foreign,
+            operation: "foundation-records",
+            recordKinds: ["mission"],
+            limit: 1,
+          }),
+        ),
+      ),
+    ).toEqual(foreignPage);
+    expect(yield* ledgers).toEqual(before);
+  }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+);
