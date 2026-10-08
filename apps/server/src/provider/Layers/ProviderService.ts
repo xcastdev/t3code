@@ -3277,9 +3277,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           pendingCompactions.delete(threadId);
         }
       });
-      const awaitNativeCompaction = (start: Effect.Effect<void, ProviderAdapterError>) =>
+      const awaitNativeCompaction = (
+        start: Effect.Effect<void | { readonly kind: "retained" }, ProviderAdapterError>,
+      ) =>
         start.pipe(
-          Effect.andThen(Deferred.await(completion)),
+          Effect.flatMap((result) =>
+            result && result.kind === "retained"
+              ? Effect.succeed("retained")
+              : Deferred.await(completion),
+          ),
           Effect.timeout(COMPACTION_COMPLETION_TIMEOUT),
           Effect.catchTag("TimeoutError", (cause) =>
             Effect.sync(() => {
@@ -3333,6 +3339,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               return yield* awaitFallbackCompaction;
             })
       ).pipe(Effect.ensuring(clearPending));
+      if (terminal === "retained") return;
       if (terminal !== "completed") {
         return yield* new ProviderAdapterRequestError({
           provider: routed.adapter.provider,

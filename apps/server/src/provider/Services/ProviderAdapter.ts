@@ -62,7 +62,8 @@ export const projectMcpTokenEnvironmentKey = (server: Pick<McpIssuedProjectServe
 /**
  * How ProviderService runs manual context compaction for an adapter.
  * Native adapters expose a start call and must emit a compacted thread state
- * when they finish. Slash-command adapters get the command sent as a turn.
+ * when they finish. A retained receipt acknowledges completion without a new
+ * state event. Slash-command adapters get the command sent as a turn.
  */
 export type ProviderCompaction<TError> =
   | {
@@ -71,7 +72,7 @@ export type ProviderCompaction<TError> =
         threadId: ThreadId,
         modelSelection?: ProviderSendTurnInput["modelSelection"],
         requestId?: MessageId,
-      ) => Effect.Effect<void, TError>;
+      ) => Effect.Effect<void | { readonly kind: "retained" }, TError>;
     }
   | { readonly type: "slash-command"; readonly command: `/${string}` };
 

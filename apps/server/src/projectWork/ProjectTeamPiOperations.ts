@@ -97,6 +97,13 @@ const CompactAnchor = Schema.Struct({
   native: PiNativeReference,
 });
 export type PiCompactionAnchor = typeof CompactAnchor.Type;
+type PiCompactReplayHead = {
+  readonly operation: PiWorkerOperation;
+  readonly native: PiNativeReference;
+  readonly nativeState: NonNullable<PiManagedProcessAllocation["launch"]["nativeState"]>;
+  readonly resourceHash: string;
+  readonly deadlineAtMs: number;
+};
 const StoredRequestFields = {
   threadId: ThreadId,
   operationId: Schema.String,
@@ -1336,6 +1343,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         ordinal: number;
       }>`SELECT MAX(operation_ordinal) AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
       let compactionAnchor: PiCompactionAnchor | undefined;
+      let replayHead: PiCompactReplayHead | undefined;
       if (
         !historical &&
         !active.length &&
@@ -1345,7 +1353,15 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         compactionAnchor = yield* compactBridge(identity, row.operation_id);
       if (
         !historical &&
-        (active.length || (latest[0]?.ordinal !== row.operation_ordinal && !compactionAnchor))
+        !active.length &&
+        latest[0]?.ordinal !== row.operation_ordinal &&
+        request.kind === "compact"
+      )
+        replayHead = yield* compactReplayHead(identity, row.operation_id);
+      if (
+        !historical &&
+        (active.length ||
+          (latest[0]?.ordinal !== row.operation_ordinal && !compactionAnchor && !replayHead))
       )
         return yield* deny("Stable Pi native receipt has a successor", "conflict");
       yield* current(identity);
@@ -1359,8 +1375,80 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         nativeState,
         deadlineAtMs: row.deadline_at_ms,
         ...(compactionAnchor === undefined ? {} : { compactionAnchor }),
+        ...(replayHead === undefined ? {} : { replayHead }),
       };
     });
+    const compactReplayHead: (
+      identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
+      afterOperationId: string,
+    ) => Effect.Effect<PiCompactReplayHead, PiManagedRuntimeError> = (identity, afterOperationId) =>
+      guard(
+        Effect.gen(function* () {
+          const first = yield* getRow(afterOperationId);
+          const successors = yield* sql<{
+            operation_id: string;
+            operation_ordinal: number;
+            operation_kind: string;
+          }>`SELECT operation_id,operation_ordinal,operation_kind FROM project_team_pi_operation
+          WHERE environment_id=${options.environmentId} AND binding_id=${first.binding_id}
+          AND generation=${first.generation} AND operation_ordinal>${first.operation_ordinal}
+          ORDER BY operation_ordinal LIMIT 129`;
+          const latest = yield* sql<{ ordinal: number }>`SELECT MAX(operation_ordinal) AS ordinal
+          FROM project_team_pi_operation WHERE environment_id=${options.environmentId}
+          AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
+          if (
+            !successors.length ||
+            successors.length > 128 ||
+            successors.at(-1)?.operation_ordinal !== latest[0]?.ordinal
+          )
+            return yield* deny("Compaction replay successor boundary changed", "conflict");
+          let previous = first;
+          let head: PiCompactReplayHead | undefined;
+          for (const metadata of successors) {
+            if (
+              metadata.operation_ordinal !== previous.operation_ordinal + 1 ||
+              (metadata.operation_kind !== "compact" && metadata.operation_kind !== "prompt")
+            )
+              return yield* deny("Compaction replay has an unrelated successor", "conflict");
+            const row = yield* getRow(metadata.operation_id);
+            const intent = yield* decodeReplayIntent(row.intent_json);
+            const request = yield* decodeStoredRequest(intent.request);
+            if (
+              request.kind === "compact" &&
+              (!intent.compaction ||
+                intent.compaction.predecessorOperationId !== previous.operation_id ||
+                intent.compaction.predecessorOrdinal !== previous.operation_ordinal)
+            )
+              return yield* deny("Compaction replay successor association changed", "uncertain");
+            const checked = yield* lookupInside(
+              identity,
+              request,
+              row.request_hash,
+              intent.resourceHash,
+              true,
+            );
+            if (!checked)
+              return yield* deny("Compaction replay successor receipt missing", "uncertain");
+            head = {
+              operation: checked.operation,
+              native: checked.native,
+              nativeState: checked.nativeState,
+              resourceHash: intent.resourceHash,
+              deadlineAtMs: checked.deadlineAtMs,
+            };
+            previous = row;
+          }
+          const active = yield* sql`SELECT operation_id FROM project_team_pi_operation
+          WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId}
+          AND thread_id=${identity.threadId} AND status IN ('prepared','starting','running','quarantine') LIMIT 1`;
+          if (active.length || !head)
+            return yield* deny(
+              "Compaction replay has an active or uncertain successor",
+              "uncertain",
+            );
+          return head;
+        }),
+      );
     const compactBridge: (
       identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
       afterOperationId: string,

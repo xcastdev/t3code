@@ -1198,7 +1198,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       ]),
                     );
                   const nativeFence = () =>
-                    nativeStateReceipt(replay.nativeState, nativeStateDirectory);
+                    nativeStateReceipt(
+                      (replay.replayHead ?? replay).nativeState,
+                      nativeStateDirectory,
+                    );
                   const validateReplay = guard(
                     Effect.gen(function* () {
                       yield* preparationCurrent;
@@ -1212,9 +1215,18 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         !current ||
                         canonicalProjectWorkPayload(current.terminal) !==
                           canonicalProjectWorkPayload(replay.terminal) ||
+                        encode(current.replayHead ?? null) !== encode(replay.replayHead ?? null) ||
                         contextFor(current.authority) !== context
                       )
                         return yield* deny("Pi replay receipt or authority changed", "conflict");
+                      const head = current.replayHead ?? {
+                        operation: current.operation,
+                        native: current.native,
+                        deadlineAtMs: current.deadlineAtMs,
+                        resourceHash,
+                      };
+                      if (head.resourceHash !== resourceHash)
+                        return yield* deny("Pi replay head resource identity changed", "conflict");
                       if (current.authority.role.role === "reviewer") {
                         const owner = current.authority.binding;
                         const retained =
@@ -1297,7 +1309,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           readPiNativeSession({
                             sessionDirectoryRoot: nativeStateDirectory + "/sessions",
                             expectedCwd: "/workspace",
-                            native: current.native,
+                            native: head.native,
                           }),
                         catch: () => deny("Pi replay native checkpoint unavailable", "uncertain"),
                       }).pipe(Effect.uninterruptible);
@@ -1311,7 +1323,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           assertPreparing();
                           if (
                             contextFor(latest) !== context ||
-                            clock.currentTimeMillisUnsafe() >= current.deadlineAtMs
+                            clock.currentTimeMillisUnsafe() >=
+                              Math.min(current.deadlineAtMs, head.deadlineAtMs)
                           )
                             throw deny("Pi replay authority or deadline changed", "conflict");
                           workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
@@ -1319,12 +1332,12 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           nativeFence();
                           return {
                             terminal: current.terminal,
-                            session: sessionFor(latest, current.native),
+                            session: sessionFor(latest, head.native),
                           };
                         },
                         {
-                          operationId: current.operation.operationId,
-                          native: current.native,
+                          operationId: head.operation.operationId,
+                          native: head.native,
                           resourceHash,
                         },
                       );
@@ -1364,7 +1377,18 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           steer,
                           interrupt,
                         }
-                      : { kind: request.kind, operation: replay.operation, run, steer, interrupt };
+                      : {
+                          kind: request.kind,
+                          operation: replay.operation,
+                          ...(replay.replayHead === undefined
+                            ? {}
+                            : {
+                                replayHeadOperationId: replay.replayHead.operation.operationId,
+                              }),
+                          run,
+                          steer,
+                          interrupt,
+                        };
                   // Successful reads release the work slot; one cancellation handle remains
                   // until stop or the next preparation, without rewriting settled history.
                   const cancelReplay = () => {
@@ -1457,6 +1481,31 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       : requiredContext.readForOperation(contextOperation, textOptions);
                 });
                 const required = yield* readOperationContext;
+                const protectedContext = (snapshot: typeof required) =>
+                  encode({
+                    required: { ...snapshot.required, sourceRevision: 0, remaining: null },
+                    communication: snapshot.communication,
+                    retainedKnowledge: snapshot.retainedKnowledge,
+                    provenance: {
+                      ...snapshot.provenance,
+                      sourceRevision: 0,
+                      ledgerReservationIds: [],
+                    },
+                  });
+                const requiredIdentity = protectedContext(required);
+                const checkRequiredContext = (signal: AbortSignal) =>
+                  guard(
+                    Effect.gen(function* () {
+                      if (signal.aborted) return yield* deny("Pi operation canceled");
+                      const currentContext = yield* readOperationContext;
+                      if (protectedContext(currentContext) !== requiredIdentity)
+                        return yield* deny(
+                          "Required context changed before compaction execution",
+                          "conflict",
+                        );
+                      if (signal.aborted) return yield* deny("Pi operation canceled");
+                    }),
+                  );
                 if (
                   required.required.projectId !== binding.projectId ||
                   required.required.runId !== binding.recordId ||
@@ -1791,6 +1840,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       yield* operations.authorize(durable);
                       if (signal.aborted) return yield* deny("Pi operation canceled");
                       yield* verifySource(sourceFence);
+                      if (request.kind === "compact" && revalidate) {
+                        // Ledger charges and time can advance; protected task context cannot.
+                        yield* checkRequiredContext(signal);
+                      }
                     }),
                   );
                 const runtime = yield* makePiSessionRuntime({
@@ -1867,6 +1920,12 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                             "beforeToolReturn",
                           ].includes(input.phase)
                             ? finalWorkspaceFence(paths, workspace.fence, signal)
+                            : Effect.void,
+                        ),
+                        Effect.andThen(
+                          request.kind === "compact" &&
+                            (input.phase === "beforeAcquire" || input.phase === "beforeStart")
+                            ? checkRequiredContext(signal)
                             : Effect.void,
                         ),
                       ),

@@ -616,6 +616,77 @@ const subscribe = Effect.fn("PiAdapter.test.subscribe")(function* (
   );
   return queue;
 });
+
+it.effect("retained compact receipt keeps the adapter at its audited successor session head", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    let first: FakeOperation | undefined;
+    let successor: FakeOperation | undefined;
+    const runtime: PiManagedRuntimeInstance = {
+      ...fake.runtime,
+      prepareOperation: (request, observe) => {
+        if (
+          request.kind === "compact" &&
+          request.requestId === "adapter-first" &&
+          first &&
+          successor
+        ) {
+          const receipt = first;
+          const head = successor;
+          return Effect.succeed({
+            ...receipt.prepared,
+            replayHeadOperationId: head.prepared.operation.operationId,
+            run: Effect.succeed(fake.output(receipt, "success", fake.state.session)),
+          });
+        }
+        return fake.runtime.prepareOperation(request, observe);
+      },
+    };
+    const adapter = yield* makePiAdapter({ instanceId, runtime });
+    const compaction = adapter.compaction;
+    if (compaction?.type !== "native") return yield* Effect.die("Missing native compact port");
+    yield* adapter.startSession(startInput);
+    yield* Queue.take(fake.preparedQueue);
+    const source = getProviderTurnEventSubscription(adapter);
+    if (!source) return yield* Effect.die("Missing owned event source");
+    const subscription = yield* source;
+    const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
+    yield* Stream.fromSubscription(subscription).pipe(
+      Stream.runForEach((event) => Queue.offer(events, event)),
+      Effect.forkChild,
+    );
+    const one = yield* compaction
+      .start(threadId, undefined, MessageId.make("adapter-first"))
+      .pipe(Effect.forkChild);
+    first = yield* Queue.take(fake.preparedQueue);
+    yield* fake.settle(first, "success", {
+      ...fake.state.session,
+      resumeCursor: { leafId: "first" },
+    });
+    yield* Fiber.join(one);
+    expect((yield* Queue.take(events)).type).toBe("thread.state.changed");
+    const two = yield* compaction
+      .start(threadId, undefined, MessageId.make("adapter-second"))
+      .pipe(Effect.forkChild);
+    successor = yield* Queue.take(fake.preparedQueue);
+    yield* fake.settle(successor, "success", {
+      ...fake.state.session,
+      resumeCursor: { leafId: "successor" },
+    });
+    yield* Fiber.join(two);
+    expect((yield* Queue.take(events)).type).toBe("thread.state.changed");
+    const latest = yield* adapter.listSessions();
+    expect(yield* compaction.start(threadId, undefined, MessageId.make("adapter-first"))).toEqual({
+      kind: "retained",
+    });
+    expect(yield* adapter.listSessions()).toEqual(latest);
+    expect(fake.operations).toHaveLength(3);
+    yield* adapter.stopSession(threadId);
+    const closed = yield* Queue.take(events);
+    expect(closed.type).toBe("session.exited");
+    expect(closed.eventId).toContain(successor.prepared.operation.operationId);
+  }).pipe(Effect.scoped),
+);
 const nextType = Effect.fn("PiAdapter.test.nextType")(function* (
   queue: Queue.Queue<ProviderRuntimeEvent>,
   type: ProviderRuntimeEvent["type"],

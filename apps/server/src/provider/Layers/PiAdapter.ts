@@ -593,7 +593,18 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
         operation: Object.freeze({ ...prepared.operation }),
         interrupt: yield* Effect.cached(prepared.interrupt),
       };
-      context.lastOperationId = active.operation.operation.operationId;
+      if (active.operation.replayHeadOperationId !== undefined) {
+        if (active.operation.kind !== "compact")
+          return yield* invalid(
+            request.kind,
+            "Only a retained compact receipt can publish a successor head.",
+          );
+        yield* decodeOperationId(active.operation.replayHeadOperationId).pipe(
+          Effect.mapError(() => invalid(request.kind, "Retained compact replay head is invalid.")),
+        );
+      }
+      context.lastOperationId =
+        active.operation.replayHeadOperationId ?? active.operation.operation.operationId;
       if (operationId !== undefined && active.operation.operation.operationId !== operationId)
         return yield* Effect.uninterruptible(
           Effect.gen(function* () {
@@ -681,6 +692,8 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
               detail: "Successful Pi operation did not return a ready committed session.",
             }),
           );
+        const expectedHeadOperationId =
+          active.operation.replayHeadOperationId ?? output.terminal.operation.operationId;
         // Validation can auto-yield; final ownership and publication must share one evaluation.
         yield* Effect.suspend(() => {
           if (shuttingDown || context.closing)
@@ -691,7 +704,7 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           if (
             sessions.get(context.threadId) !== context ||
             context.active !== active ||
-            context.lastOperationId !== output.terminal.operation.operationId
+            context.lastOperationId !== expectedHeadOperationId
           )
             return Effect.fail(
               requestError(
@@ -717,7 +730,10 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             type: "turn.completed",
             payload: { state: "completed", tokenUsage: active.tokenUsage },
           });
-        if (active.operation.kind === "compact")
+        if (
+          active.operation.kind === "compact" &&
+          active.operation.replayHeadOperationId === undefined
+        )
           yield* emit({
             ...(yield* eventBase(context, active, "compacted")),
             type: "thread.state.changed",
@@ -1106,7 +1122,7 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             "compact",
             "Pi compaction requires its durable request identity and configured model.",
           );
-        yield* Effect.uninterruptibleMask((restore) =>
+        return yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
             const active = yield* launch(context, {
               kind: "compact",
@@ -1124,6 +1140,8 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
                 joinInterrupted(context, cause, restore, snapshotPublication(active.result.effect)),
               ),
             );
+            if (active.operation?.replayHeadOperationId !== undefined)
+              return { kind: "retained" as const };
           }),
         );
       }),

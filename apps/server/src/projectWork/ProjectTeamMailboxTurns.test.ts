@@ -1322,6 +1322,9 @@ it.effect(
           yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`;
         let latest = { ...native, leafId: "compact-original" };
         let finalOperationId = "";
+        let firstCompact:
+          | { request: Parameters<typeof f.operations.lookup>[1]; terminal: PiSessionTerminal }
+          | undefined;
         for (const index of [1, 2]) {
           const current = yield* context.readRequired(original);
           const supplied = {
@@ -1389,6 +1392,7 @@ it.effect(
           const input = yield* f.reserveInput(compact);
           latest = { ...native, leafId: `compact-leaf-${index}` };
           const terminal = yield* f.complete(compact, latest, "success", [yield* input.settle]);
+          if (index === 1) firstCompact = { request, terminal };
           const replay = yield* f.operations.lookup(
             { providerInstanceId, threadId },
             request,
@@ -1414,6 +1418,23 @@ it.effect(
           ).toEqual(budget);
           finalOperationId = request.operationId;
         }
+        if (!firstCompact) return yield* Effect.die("Missing original compact receipt");
+        const retainedRequest = firstCompact.request;
+        const retainedTerminal = firstCompact.terminal;
+        const oldBoundary = yield* f.operations.readCompaction(
+          { providerInstanceId, threadId },
+          retainedRequest,
+        );
+        expect(oldBoundary.operationId).toBe(retainedRequest.operationId);
+        const oldReplay = yield* f.operations.lookup(
+          { providerInstanceId, threadId },
+          retainedRequest,
+          hash(retainedRequest),
+          "a".repeat(64),
+        );
+        expect(oldReplay?.terminal).toEqual(retainedTerminal);
+        expect(oldReplay?.replayHead?.operation.operationId).toBe(finalOperationId);
+        expect(oldReplay?.replayHead?.native).toEqual(latest);
         const consumed = yield* f.sql<{
           tokens: number;
         }>`SELECT SUM(charged_input_tokens+charged_output_tokens) AS tokens
@@ -1515,6 +1536,38 @@ it.effect(
         });
         expect(next.decision.compactAnchor?.operationId).toBe(compact.operation.operationId);
         expect(next.decision.target.deliveryCursor).toBe(1);
+        const rowsBeforeOldReplay =
+          yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_ordinal`;
+        const chargesBeforeOldReplay = yield* f.sql`SELECT * FROM project_team_model_request`;
+        const recreated = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+        expect(
+          (yield* recreated.readCompaction({ providerInstanceId, threadId }, retainedRequest))
+            .operationId,
+        ).toBe(retainedRequest.operationId);
+        const throughMessage = yield* recreated.lookup(
+          { providerInstanceId, threadId },
+          retainedRequest,
+          hash(retainedRequest),
+          "a".repeat(64),
+        );
+        expect(throughMessage?.terminal).toEqual(retainedTerminal);
+        expect(throughMessage?.replayHead?.operation.operationId).toBe(
+          compact.operation.operationId,
+        );
+        expect(throughMessage?.replayHead?.native.leafId).toBe("successor-compact-leaf");
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_ordinal`,
+        ).toEqual(rowsBeforeOldReplay);
+        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(
+          chargesBeforeOldReplay,
+        );
+        yield* f.sql`UPDATE project_team_pi_operation SET status='quarantine' WHERE operation_id=${compact.operation.operationId}`;
+        expect(
+          (yield* recreated
+            .readCompaction({ providerInstanceId, threadId }, retainedRequest)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${compact.operation.operationId}`;
         expect((yield* f.messages).map((message) => [message.recordId, message.status])).toEqual([
           ["after-compact", "delivered"],
           ["second-after-compact", "queued"],

@@ -1718,6 +1718,73 @@ agentActionsService.layer("ProviderService child actions and transcript routing"
 
 const customCompactionDriver = ProviderDriverKind.make("custom-compaction-provider");
 const nativeCompactionInstanceId = ProviderInstanceId.make("native-compaction");
+const retainedCompactionInstanceId = ProviderInstanceId.make("retained-compaction");
+const retainedNativeCompaction = makeFakeCodexAdapter(CODEX_DRIVER);
+const retainedCompactionAnalytics = makeRecordingAnalytics();
+const retainedCompaction = makeProviderServiceLayer({
+  analyticsLayer: retainedCompactionAnalytics.layer,
+  registry: makeStaticInstanceRegistry([
+    [
+      retainedCompactionInstanceId,
+      {
+        ...retainedNativeCompaction.adapter,
+        compaction: {
+          type: "native",
+          start: (threadId, modelSelection, requestId) =>
+            requestId === "retained-native-request"
+              ? Effect.succeed({ kind: "retained" as const })
+              : retainedNativeCompaction.compactThread(threadId, modelSelection, requestId),
+        },
+      },
+    ],
+  ]),
+});
+retainedCompaction.layer("ProviderService retained native compaction", (it) => {
+  it.effect(
+    "acknowledges retained compaction without a new event and clears pending for fresh compaction",
+    () =>
+      Effect.gen(function* () {
+        retainedCompactionAnalytics.reset();
+        const provider = yield* ProviderService.ProviderService;
+        const threadId = asThreadId("retained-native-compaction");
+        yield* provider.startSession(threadId, {
+          providerInstanceId: retainedCompactionInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const compactedEventFiber = yield* provider.streamEvents.pipe(
+          Stream.filter(
+            (event) => event.threadId === threadId && event.type === "thread.state.changed",
+          ),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* advanceTestClock(50);
+        yield* provider.compactThread(
+          threadId,
+          undefined,
+          MessageId.make("retained-native-request"),
+        );
+        assert.equal(retainedNativeCompaction.compactThread.mock.calls.length, 0);
+        assert.equal(retainedNativeCompaction.sendTurn.mock.calls.length, 0);
+        assert.equal(
+          retainedCompactionAnalytics.eventsByName("provider.thread.compacted").length,
+          0,
+        );
+        const freshRequest = MessageId.make("fresh-native-request");
+        yield* provider.compactThread(threadId, undefined, freshRequest);
+        const compacted = Option.getOrThrow(yield* Fiber.join(compactedEventFiber));
+        assert.equal(compacted.requestId, String(freshRequest));
+        assert.equal(retainedNativeCompaction.compactThread.mock.calls.length, 1);
+        assert.equal(retainedNativeCompaction.sendTurn.mock.calls.length, 0);
+        assert.equal(
+          retainedCompactionAnalytics.eventsByName("provider.thread.compacted").length,
+          1,
+        );
+        yield* provider.stopSession({ threadId });
+      }),
+  );
+});
 const slashCompactionInstanceId = ProviderInstanceId.make("slash-compaction");
 const unsupportedCompactionInstanceId = ProviderInstanceId.make("unsupported-compaction");
 const customNativeCompaction = makeFakeCodexAdapter(customCompactionDriver);

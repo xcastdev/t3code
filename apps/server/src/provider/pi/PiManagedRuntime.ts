@@ -67,6 +67,8 @@ export type PiManagedEventObserver = (
 
 export type PiManagedPreparedOperation = {
   readonly operation: PiWorkerOperation;
+  /** A retained compact receipt publishes the audited current head, never its older checkpoint. */
+  readonly replayHeadOperationId?: string;
   /** Single activation; receipt reads release their slot until stop or a newer preparation. */
   readonly run: Effect.Effect<
     { readonly terminal: PiSessionTerminal; readonly session: ProviderSession },
