@@ -2971,3 +2971,160 @@ it.effect("durable identity fence cleans up an untouched ordinary MCP credential
     }),
   ),
 );
+
+it.effect(
+  "canceled sender rejects new messages after handle recreation and preserves historical receipts",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* messageFixture();
+      const original = yield* f.gateway.write(f.request, f.principal.actor, f.source, f.principal);
+      expect(original.receipt).toMatchObject({
+        commandId: f.request.commandId,
+        projectId,
+        status: "accepted",
+      });
+      const before = yield* readCurrentState(f.sql, projectId);
+      const sender = before.tasks.find((task) => task.taskId === taskId);
+      const attempt = before.attempts.find((entry) => entry.attemptId === f.binding.attemptId);
+      if (sender === undefined || attempt === undefined)
+        return yield* Effect.die("Original sender task and attempt are missing");
+      expect(sender).toMatchObject({
+        state: "in-progress",
+        activeAttemptId: f.binding.attemptId,
+      });
+      expect(attempt?.state === "leased" || attempt?.state === "running").toBe(true);
+      const originalEvents = yield* f.repo.replay(projectId);
+      const decodeControl = Schema.decodeUnknownEffect(ProjectTeamGuidedIntent);
+      const canceledAt = "2026-01-01T00:00:00.000Z";
+      yield* TestClock.setTime(1767225600000);
+      const human = { kind: "human" as const, id: "fixture-human" };
+      const cancellation = yield* f.gateway.write(
+        yield* decodeControl({
+          type: "project-team.task.control",
+          commandId: "cancel-message-sender",
+          projectId,
+          taskId,
+          expectedRevision: before.revision,
+          expectedTaskRevision: sender.revision,
+          control: { action: "cancel", reason: "Stop this original managed sender" },
+        }),
+        human,
+        { kind: "web", id: "fixture-browser" },
+        { actor: human },
+      );
+      expect(cancellation.receipt).toMatchObject({
+        commandId: "cancel-message-sender",
+        projectId,
+        status: "accepted",
+      });
+      const cancellationEvents = (yield* f.repo.replay(projectId)).slice(originalEvents.length);
+      expect(cancellationEvents).toContainEqual(
+        expect.objectContaining({
+          type: "project-work.task.canceled",
+          projectId,
+          taskId,
+          canceledAt,
+        }),
+      );
+      const canceled = yield* readCurrentState(f.sql, projectId);
+      const canceledSender = canceled.tasks.find((task) => task.taskId === taskId);
+      if (canceledSender === undefined) return yield* Effect.die("Canceled sender is missing");
+      expect(canceledSender).toMatchObject({ state: "canceled", canceledAt });
+      expect(canceledSender?.activeAttemptId).toBeUndefined();
+      expect(
+        canceled.attempts.find((entry) => entry.attemptId === f.binding.attemptId),
+      ).toMatchObject({
+        taskId,
+        state: "canceled",
+        endedAt: canceledAt,
+      });
+      expect(
+        canceled.foundationRecords?.find((record) => record.recordId === f.binding.recordId),
+      ).toMatchObject({
+        kind: "run-binding",
+        status: "stopping",
+        generation: f.binding.generation,
+      });
+      expect(
+        canceled.foundationRecords?.find(
+          (record) => record.kind === "task-membership" && record.taskId === taskId,
+        ),
+      ).toMatchObject({ controlState: "canceling" });
+      const stopEffects = canceled.foundationRecords?.filter(
+        (record) =>
+          record.kind === "effect" &&
+          record.effectKind === "stop" &&
+          record.runId === f.binding.recordId,
+      );
+      expect(stopEffects).toHaveLength(1);
+      expect(stopEffects?.[0]).toMatchObject({
+        status: "pending",
+        claimGeneration: f.binding.generation,
+      });
+
+      const rebuiltAuthorization = yield* Authorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(Layer.fresh(Authorization.layer)),
+      );
+      const gatewayModule = yield* Effect.promise(() => import("./ProjectWorkGateway.ts"));
+      const authModule = yield* Effect.promise(() => import("../auth/EnvironmentAuth.ts"));
+      const rebuiltGateway = yield* ProjectWorkGateway.pipe(
+        Effect.provide(
+          Layer.fresh(
+            gatewayModule.ProjectWorkGatewayLive.pipe(
+              Layer.provide(Layer.mock(authModule.EnvironmentAuth)({})),
+            ),
+          ),
+        ),
+        Effect.provideService(Authorization.ProjectTeamAuthorization, rebuiltAuthorization),
+      );
+      expect(rebuiltAuthorization).not.toBe(f.auth);
+      expect(rebuiltGateway).not.toBe(f.gateway);
+      const retained = Effect.gen(function* () {
+        return {
+          events: yield* f.repo.replay(projectId),
+          receipts:
+            yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} ORDER BY command_id`,
+          messages:
+            yield* f.sql`SELECT * FROM project_team_message WHERE project_id=${projectId} ORDER BY record_id`,
+          operations:
+            yield* f.sql`SELECT * FROM project_team_pi_operation WHERE project_id=${projectId} ORDER BY operation_id`,
+          models:
+            yield* f.sql`SELECT * FROM project_team_model_request WHERE project_id=${projectId} ORDER BY reservation_id`,
+          memoryJobs:
+            yield* f.sql`SELECT * FROM project_team_memory_job WHERE project_id=${projectId} ORDER BY effect_id`,
+        };
+      });
+      const afterCancellation = yield* retained;
+      expect(afterCancellation.messages).toHaveLength(1);
+      expect(afterCancellation.events).toEqual(expect.arrayContaining(cancellationEvents));
+      for (const gateway of [f.gateway, rebuiltGateway]) {
+        const denied = yield* gateway
+          .write(
+            {
+              ...f.request,
+              commandId: CommandId.make("new-message-after-cancellation"),
+              messageId: "new-message-after-cancellation",
+              expectedRevision: canceled.revision,
+              expectedTaskRevision: canceledSender.revision,
+            },
+            f.principal.actor,
+            f.source,
+            f.principal,
+          )
+          .pipe(Effect.result);
+        expect(denied).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            _tag: "ProjectTeamAuthorizationError",
+            reason: "Managed binding revoked, replaced or missing",
+          },
+        });
+        expect(yield* retained).toEqual(afterCancellation);
+        expect(yield* gateway.write(f.request, f.principal.actor, f.source, f.principal)).toEqual(
+          original,
+        );
+        expect(yield* retained).toEqual(afterCancellation);
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(canceled);
+      }
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
