@@ -537,7 +537,12 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
     const queries = yield* sql<{ queryId: string; bytes: number }>`SELECT query_id AS queryId,
     length(CAST(owner_json AS BLOB)) AS bytes FROM project_team_memory_query
     WHERE project_id=${projectId} ORDER BY query_id LIMIT 257`;
-    const manifests = yield* sql<{ sourceId: string; bytes: number }>`SELECT source_id AS sourceId,
+    const manifests = yield* sql<{
+      sourceId: string;
+      sourceRevision: number;
+      sourceGeneration: number;
+      bytes: number;
+    }>`SELECT source_id AS sourceId,source_revision AS sourceRevision,source_generation AS sourceGeneration,
     length(CAST(manifest_json AS BLOB)) AS bytes FROM project_team_memory_manifest
     WHERE project_id=${projectId} ORDER BY extraction_id LIMIT 257`;
     const outcomes = yield* sql<{ effectId: string }>`SELECT effect_id AS effectId
@@ -765,7 +770,14 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
       return yield* deny("Completed source deletion does not fence retained index intents");
     if (
       sources.some((source) => !deleteCoverage.has(source.recordId)) ||
-      manifests.some((manifest) => !deleteCoverage.has(manifest.sourceId)) ||
+      manifests.some((manifest) => {
+        const deleted = deletedSources.get(manifest.sourceId);
+        return (
+          deleted === undefined ||
+          deleted.sourceRevision !== manifest.sourceRevision ||
+          deleted.generation <= manifest.sourceGeneration
+        );
+      }) ||
       outcomes.some((outcome) => !jobs.some((job) => job.effectId === outcome.effectId))
     )
       return yield* deny("Retained memory lacks complete authenticated source cleanup");

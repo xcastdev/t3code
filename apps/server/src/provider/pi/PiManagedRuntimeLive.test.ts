@@ -8643,6 +8643,71 @@ for (const compactProof of [
                   yield* f.sql`SELECT deleted_at FROM projection_projects WHERE project_id=${projectId}`,
                 ).toEqual([{ deleted_at: null }]);
                 yield* f.sql`DELETE FROM project_team_memory_job WHERE effect_id='live-unfenced-index'`;
+                const cleanedState = yield* readCurrentState(f.sql, projectId);
+                const deletedSource = cleanedState.foundationRecords?.find(
+                  (record) => record.kind === "memory-source" && record.status === "retracted",
+                );
+                if (deletedSource?.kind !== "memory-source")
+                  return yield* Effect.die("Completed cleanup source missing");
+                const retainedTasks = yield* f.sql`SELECT * FROM project_work_tasks
+                  WHERE project_id=${projectId}`;
+                expect(retainedTasks.length).toBeGreaterThan(0);
+                // These disposable journal rows have no extraction authority.
+                // Each tuple must still be fenced by the exact source deletion.
+                for (const tuple of [
+                  {
+                    name: "equal-generation",
+                    revision: deletedSource.sourceRevision,
+                    generation: deletedSource.generation,
+                  },
+                  {
+                    name: "newer-generation",
+                    revision: deletedSource.sourceRevision,
+                    generation: deletedSource.generation + 1,
+                  },
+                  {
+                    name: "different-revision",
+                    revision: deletedSource.sourceRevision + 1,
+                    generation: 0,
+                  },
+                ]) {
+                  const orphanExtractionId = `live-unfenced-source-manifest-${tuple.name}`;
+                  expect(
+                    yield* f.sql`SELECT extraction_id FROM project_team_memory_manifest
+                    WHERE extraction_id=${orphanExtractionId}`,
+                  ).toEqual([]);
+                  yield* f.sql`INSERT INTO project_team_memory_manifest
+                  (extraction_id,environment_id,project_id,source_id,source_revision,source_generation,manifest_json)
+                  VALUES (${orphanExtractionId},'environment',${projectId},${deletedSource.recordId},
+                    ${tuple.revision},${tuple.generation},'{}')`;
+                  expect(
+                    yield* f.sql`SELECT extraction_id,source_id,source_revision,source_generation
+                    FROM project_team_memory_manifest WHERE extraction_id=${orphanExtractionId}`,
+                  ).toEqual([
+                    {
+                      extraction_id: orphanExtractionId,
+                      source_id: deletedSource.recordId,
+                      source_revision: tuple.revision,
+                      source_generation: tuple.generation,
+                    },
+                  ]);
+                  expect(
+                    yield* deleteRetainedProject().pipe(Effect.result),
+                    tuple.name,
+                  ).toMatchObject({
+                    _tag: "Failure",
+                    failure: { _tag: "ProjectLifecycleError", reason: "memory-cleanup-required" },
+                  });
+                  expect(
+                    yield* f.sql`SELECT deleted_at FROM projection_projects WHERE project_id=${projectId}`,
+                  ).toEqual([{ deleted_at: null }]);
+                  expect(
+                    yield* f.sql`SELECT * FROM project_work_tasks WHERE project_id=${projectId}`,
+                  ).toEqual(retainedTasks);
+                  expect(memoryExchanges).toBe(0);
+                  expect(memoryBackendCalls).toBe(2);
+                  yield* f.sql`DELETE FROM project_team_memory_manifest WHERE extraction_id=${orphanExtractionId}`;
+                }
                 const journals =
                   yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
                 const deleted = yield* deleteRetainedProject();
