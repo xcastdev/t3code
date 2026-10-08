@@ -5,6 +5,7 @@ import {
   ProjectTeamMemorySourcesRead,
   ProjectWorkComment,
   ProjectWorkDecision,
+  ProjectWorkDecisionId,
   ProjectWorkEvidence,
   ProjectWorkWriteResult,
   ProjectTeamMemoryProcessIntent,
@@ -23,6 +24,7 @@ import {
   type ProjectTeamAuthorizationError,
 } from "../ProjectTeamAuthorization.ts";
 import { ProjectWorkRepository, readCurrentState } from "../ProjectWorkRepository.ts";
+import { applyProjectWorkEvents, emptyProjectWorkReducerState } from "../ProjectWorkDecider.ts";
 import {
   ProjectMemoryOperation,
   ProjectMemoryJobOwner,
@@ -70,6 +72,47 @@ const Retained = Schema.Union([
 ]);
 const decodeJob = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectMemoryJobInput), strict);
 const decodeRetained = Schema.decodeUnknownEffect(Schema.fromJsonString(Retained), strict);
+const decodeDecision = Schema.decodeUnknownEffect(ProjectWorkDecision, strict);
+const DecisionEventFields = {
+  eventId: EventId,
+  projectId: Id,
+  revision: Safe,
+  occurredAt: Schema.String,
+  attribution: ProjectWorkAttribution,
+};
+const decodeDecisionEvent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Union([
+      Schema.Struct({
+        ...DecisionEventFields,
+        type: Schema.Literal("project-work.decision.proposed"),
+        decision: ProjectWorkDecision,
+        proposedAt: Schema.String,
+      }),
+      Schema.Struct({
+        ...DecisionEventFields,
+        type: Schema.Literal("project-work.decision.accepted"),
+        decisionId: ProjectWorkDecisionId,
+        acceptedAt: Schema.String,
+      }),
+      Schema.Struct({
+        ...DecisionEventFields,
+        type: Schema.Literal("project-work.decision.rejected"),
+        decisionId: ProjectWorkDecisionId,
+        reason: Schema.String,
+        rejectedAt: Schema.String,
+      }),
+      Schema.Struct({
+        ...DecisionEventFields,
+        type: Schema.Literal("project-work.decision.superseded"),
+        decisionId: ProjectWorkDecisionId,
+        replacement: ProjectWorkDecision,
+        supersededAt: Schema.String,
+      }),
+    ]),
+  ),
+  strict,
+);
 const decodeRecorded = Schema.decodeUnknownEffect(Schema.fromJsonString(Recorded), strict);
 const decodeRecord = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectTeamRecord), strict);
 const decodeResult = Schema.decodeUnknownEffect(
@@ -118,6 +161,7 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
       input: ProjectWorkReadIntent,
       authority: ProjectTeamAuthority,
       exactEffectId?: string,
+      includeCompletedCleanup = false,
     ) {
       yield* caller;
       if (
@@ -268,6 +312,152 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
           return yield* deny("Memory source command receipt membership is corrupt");
       });
       const items: Array<ProjectTeamMemorySourcesRead["items"][number]> = [];
+      // Decisions have no task field. Cleanup is eligible only through the real
+      // accepted replacement history, not a projection's superseded label.
+      let decisionHistory: Array<ProjectWorkDecision> | undefined;
+      const historicalDecisions: Array<ProjectWorkDecision> = [];
+      const auditDecisions = Effect.fn("ProjectMemoryProcessing.auditDecisions")(function* () {
+        if (decisionHistory !== undefined) return decisionHistory;
+        const metadata = yield* sql<{ bytes: number }>`SELECT
+          length(CAST(payload_json AS BLOB)) + length(CAST(event_id AS BLOB)) +
+          length(CAST(command_id AS BLOB)) + length(CAST(occurred_at AS BLOB)) AS bytes
+          FROM project_work_events WHERE project_id=${input.projectId}
+          AND event_type IN ('project-work.decision.proposed','project-work.decision.accepted',
+          'project-work.decision.rejected','project-work.decision.superseded') ORDER BY sequence LIMIT 1025`;
+        if (
+          metadata.length > 1024 ||
+          metadata.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > 263168) ||
+          (auditBytes += metadata.reduce((sum, row) => sum + row.bytes, 0)) > 4194304
+        )
+          return yield* deny("Decision cleanup history exceeds its retained bound");
+        const rows = yield* sql<{
+          id: string;
+          commandId: string;
+          at: string;
+          payload: string;
+        }>`SELECT
+          event_id AS id,command_id AS commandId,occurred_at AS at,payload_json AS payload
+          FROM project_work_events WHERE project_id=${input.projectId}
+          AND event_type IN ('project-work.decision.proposed','project-work.decision.accepted',
+          'project-work.decision.rejected','project-work.decision.superseded') ORDER BY sequence LIMIT 1024`;
+        if (rows.length !== metadata.length) return yield* deny("Decision cleanup history changed");
+        let original = emptyProjectWorkReducerState(input.projectId);
+        for (const row of rows) {
+          const event = yield* decodeDecisionEvent(row.payload);
+          const nested =
+            event.type === "project-work.decision.proposed"
+              ? event.decision
+              : event.type === "project-work.decision.superseded"
+                ? event.replacement
+                : undefined;
+          if (
+            event.eventId !== row.id ||
+            event.projectId !== input.projectId ||
+            event.occurredAt !== row.at ||
+            (event.type !== "project-work.decision.proposed" &&
+              event.attribution.actor.kind !== "human") ||
+            (nested !== undefined &&
+              (nested.projectId !== input.projectId ||
+                nested.attribution === undefined ||
+                !same(
+                  {
+                    actor: { kind: nested.attribution.actor.kind, id: nested.attribution.actor.id },
+                    source: {
+                      kind: nested.attribution.source.kind,
+                      id: nested.attribution.source.id,
+                    },
+                    recordedAt: nested.attribution.recordedAt,
+                  },
+                  {
+                    actor: { kind: event.attribution.actor.kind, id: event.attribution.actor.id },
+                    source: {
+                      kind: event.attribution.source.kind,
+                      id: event.attribution.source.id,
+                    },
+                    recordedAt: event.attribution.recordedAt,
+                  },
+                )))
+          )
+            return yield* deny("Decision cleanup event attribution changed");
+          const sizes = yield* sql<{ bytes: number }>`SELECT length(CAST(result_json AS BLOB)) +
+            length(CAST(event_ids_json AS BLOB)) + length(CAST(actor_kind AS BLOB)) +
+            length(CAST(actor_id AS BLOB)) + length(CAST(source_kind AS BLOB)) +
+            length(CAST(source_id AS BLOB)) AS bytes FROM project_work_command_receipts
+            WHERE project_id=${input.projectId} AND command_id=${row.commandId} LIMIT 2`;
+          if (
+            sizes.length !== 1 ||
+            !Number.isSafeInteger(sizes[0]?.bytes) ||
+            (sizes[0]?.bytes ?? 524289) > 524288 ||
+            (auditBytes += sizes[0]?.bytes ?? 4194305) > 4194304
+          )
+            return yield* deny("Decision cleanup receipt exceeds its bound");
+          const receipts = yield* sql<{
+            result: string;
+            ids: string;
+            actorKind: string;
+            actorId: string | null;
+            sourceKind: string;
+            sourceId: string | null;
+          }>`SELECT
+            result_json AS result,event_ids_json AS ids,actor_kind AS actorKind,actor_id AS actorId,
+            source_kind AS sourceKind,source_id AS sourceId FROM project_work_command_receipts
+            WHERE project_id=${input.projectId} AND command_id=${row.commandId} LIMIT 2`;
+          const receipt = receipts[0];
+          if (
+            receipt === undefined ||
+            receipt.actorKind !== event.attribution.actor.kind ||
+            receipt.actorId !== (event.attribution.actor.id ?? null) ||
+            receipt.sourceKind !== event.attribution.source.kind ||
+            receipt.sourceId !== (event.attribution.source.id ?? null)
+          )
+            return yield* deny("Decision cleanup receipt authority changed");
+          const result = yield* decodeResult(receipt.result);
+          const ids = yield* decodeEventIds(receipt.ids);
+          if (
+            result.projectId !== input.projectId ||
+            result.receipt.projectId !== input.projectId ||
+            result.receipt.commandId !== row.commandId ||
+            result.receipt.status !== "accepted" ||
+            ids.length !== result.receipt.eventCount ||
+            new Set(ids).size !== ids.length ||
+            !same(ids, result.delta.eventIds) ||
+            ids.filter((id) => id === row.id).length !== 1
+          )
+            return yield* deny("Decision cleanup receipt membership changed");
+          if (event.type === "project-work.decision.proposed") {
+            if (
+              event.decision.state !== "proposed" ||
+              original.decisions?.some((record) => record.decisionId === event.decision.decisionId)
+            )
+              return yield* deny("Decision cleanup proposal is not an original proposal");
+          } else {
+            const previous = original.decisions?.find(
+              (record) => record.decisionId === event.decisionId,
+            );
+            if (
+              previous === undefined ||
+              previous.state !==
+                (event.type === "project-work.decision.superseded" ? "accepted" : "proposed")
+            )
+              return yield* deny("Decision cleanup transition lacks its original authority state");
+            if (
+              event.type === "project-work.decision.superseded" &&
+              (event.replacement.state !== "proposed" ||
+                event.replacement.supersedesDecisionId !== event.decisionId ||
+                original.decisions?.some(
+                  (record) => record.decisionId === event.replacement.decisionId,
+                ))
+            )
+              return yield* deny(
+                "Decision cleanup replacement is not an original proposed successor",
+              );
+          }
+          original = applyProjectWorkEvents(original, [event]);
+          historicalDecisions.push(...(original.decisions ?? []));
+        }
+        decisionHistory = original.decisions ?? [];
+        return decisionHistory;
+      });
       for (const row of jobs.slice(0, limit)) {
         if (row.payload === null) {
           degraded = true;
@@ -285,8 +475,13 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
           if (
             source?.kind !== "memory-source" ||
             effect?.kind !== "effect" ||
-            source.status !== "current" ||
-            effect.effectKind !== "memory-index"
+            (effect.effectKind === "memory-index"
+              ? source.status !== "current"
+              : effect.effectKind !== "memory-delete" ||
+                !["superseded", "retracted"].includes(source.status)) ||
+            (effect.effectKind === "memory-delete" &&
+              row.status === "settled" &&
+              !includeCompletedCleanup)
           )
             return;
           const retained = yield* decodeRetained(source.content);
@@ -300,19 +495,82 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
                   );
           if (
             current === undefined ||
-            !same(current, retained.record) ||
-            (retained.kind !== "decision" && retained.record.taskId !== input.taskId) ||
-            (retained.kind === "decision" && retained.record.state !== "accepted")
+            (retained.kind !== "decision" && retained.record.taskId !== input.taskId)
           )
             return;
+          if (effect.effectKind === "memory-index") {
+            if (
+              !same(current, retained.record) ||
+              (retained.kind === "decision" && retained.record.state !== "accepted")
+            )
+              return;
+          } else {
+            // A same-task artifact may change, but must still retain the original
+            // captured identity. Decisions additionally need accepted human lineage.
+            if (retained.kind === "decision") {
+              const currentDecision = yield* decodeDecision(current);
+              const history = yield* auditDecisions();
+              if (
+                !historicalDecisions.some((record) => same(record, retained.record)) ||
+                retained.record.state !== "accepted" ||
+                currentDecision.state !== "superseded" ||
+                !same(
+                  history.find((record) => record.decisionId === retained.record.decisionId),
+                  currentDecision,
+                )
+              )
+                return yield* deny("Cleanup decision lacks its original accepted history");
+              let parentId = retained.record.decisionId;
+              const visited = new Set<string>([parentId]);
+              for (;;) {
+                const children = history.filter(
+                  (record) => record.supersedesDecisionId === parentId,
+                );
+                if (children.length !== 1 || visited.size >= 256)
+                  return yield* deny("Cleanup decision replacement chain is ambiguous");
+                const child = children[0];
+                if (
+                  child === undefined ||
+                  visited.has(child.decisionId) ||
+                  !same(
+                    state.decisions?.find((record) => record.decisionId === child.decisionId),
+                    child,
+                  )
+                )
+                  return yield* deny("Cleanup decision replacement chain changed");
+                visited.add(child.decisionId);
+                if (child.state === "accepted") break;
+                if (child.state !== "superseded")
+                  return yield* deny("Cleanup decision has no current accepted replacement");
+                parentId = child.decisionId;
+              }
+            } else return yield* deny("Cleanup artifact has no approved correction producer");
+            if (
+              job.extraction !== undefined ||
+              effect.payload.recordIds.length !== 1 ||
+              effect.payload.recordIds[0] !== source.recordId
+            )
+              return yield* deny("Cleanup job contains obsolete index work");
+          }
           if (
             job.environmentId !== authority.binding.environmentId ||
             job.projectId !== input.projectId ||
             job.effect.effectId !== effect.effectId ||
+            job.effect.recordId !== effect.recordId ||
+            job.effect.projectId !== effect.projectId ||
+            job.effect.effectKind !== effect.effectKind ||
+            job.effect.targetId !== effect.targetId ||
+            job.effect.taskId !== effect.taskId ||
+            job.effect.runId !== effect.runId ||
+            job.effect.sourceId !== effect.sourceId ||
+            job.effect.sourceGeneration !== effect.sourceGeneration ||
+            job.effect.availableAt !== effect.availableAt ||
+            job.effect.generation !== effect.generation ||
+            !same(job.effect.payload, effect.payload) ||
             effect.targetId !== source.recordId ||
             effect.generation !== source.generation ||
             !same(job.source, source) ||
-            source.sourceRevision !== current.revision ||
+            source.sourceRevision !== retained.record.revision ||
             projectMemoryHash(source.content) !== source.contentHash
           )
             return yield* deny("Memory source selector disagrees with its immutable captured job");
@@ -386,7 +644,12 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
             },
             status,
             ...(status === "waiting"
-              ? { reason: waitingReason }
+              ? {
+                  reason:
+                    effect.effectKind === "memory-delete"
+                      ? "Exact historical-source cleanup; " + waitingReason
+                      : waitingReason,
+                }
               : status === "uncertain"
                 ? {
                     reason: waitingReason.includes("stopped")
@@ -699,6 +962,7 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
     const sql = yield* SqlClient.SqlClient;
     const repository = yield* ProjectWorkRepository;
     const authorization = yield* ProjectTeamAuthorization;
+    const processing = yield* makeProjectMemoryProcessing;
     const contentGuard = yield* ProjectWorkContentGuard;
     const crypto = yield* Crypto.Crypto;
     const configured = Effect.fn("ProjectMemoryProcessing.configured")(function* () {
@@ -794,14 +1058,47 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
             (entry) =>
               entry.kind === "memory-source" && entry.recordId === owner.selection.sourceRecordId,
           );
+          const cleanup = owner.admittedEffect.effectKind === "memory-delete";
           if (
             source?.kind !== "memory-source" ||
-            source.status !== "current" ||
+            (cleanup
+              ? !["superseded", "retracted"].includes(source.status)
+              : source.status !== "current") ||
             source.sourceRevision !== owner.selection.sourceRevision ||
             source.generation !== owner.selection.sourceGeneration ||
             source.contentHash !== owner.selection.contentHash
           )
             return yield* deny("Selected memory source is no longer current");
+          if (cleanup) {
+            const authority = yield* authorization.resolve(principal);
+            if (authority === undefined)
+              return yield* deny("Cleanup task authority is unavailable");
+            const page = yield* processing.readSourcesInTransaction(
+              {
+                operation: "memory-sources",
+                projectId: owner.operation.projectId,
+                taskId: owner.request.taskId,
+                limit: 1,
+              },
+              authority,
+              effectId,
+              true,
+            );
+            const selected = page.items[0]?.selection;
+            if (
+              page.items.length !== 1 ||
+              selected === undefined ||
+              !same(selected, {
+                ...owner.selection,
+                expectedEffectRevision: selected.expectedEffectRevision,
+                expectedClaimGeneration: selected.expectedClaimGeneration,
+              })
+            )
+              return yield* deny("Original historical cleanup source changed");
+            // Cleanup sends only the captured namespace/source tuple. Its raw
+            // body may now be unsafe; it never becomes model or backend text.
+            return;
+          }
           yield* contentGuard
             .assertSafe(source)
             .pipe(Effect.mapError(() => deny("Selected source failed content safety")));
@@ -839,6 +1136,8 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
             },
             bodies?: readonly string[],
           ) {
+            if (owner.admittedEffect.effectKind !== "memory-index")
+              return yield* deny("Historical cleanup cannot authorize a model stage");
             if (
               source.recordId !== owner.selection.sourceRecordId ||
               source.sourceRevision !== owner.selection.sourceRevision ||

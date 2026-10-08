@@ -46,7 +46,7 @@ export type ProjectWorkToolkitError = typeof ProjectWorkToolkitError.Type;
 
 const ProjectWorkReadTool = Tool.make("project_work_read", {
   description:
-    "Read authoritative project-work state. Use task-context for one bounded actionable task view; collection reads can request a revision-bearing envelope. Read memory-sources with the assigned task and cursor for exact retained source selectors.",
+    "Read authoritative project-work state. Use task-context for one bounded actionable task view; collection reads can request a revision-bearing envelope. Read memory-sources with the assigned task and cursor for exact retained source selectors, including historical cleanup identified by its reason.",
   parameters: ProjectWorkReadIntent,
   success: Schema.Unknown,
   failure: ProjectWorkToolkitError,
@@ -60,7 +60,7 @@ const ProjectWorkReadTool = Tool.make("project_work_read", {
 
 const ProjectWorkWriteTool = Tool.make("project_work_write", {
   description:
-    "Append one authorized intent. To ask a human, use project-team.question.request with commandId, projectId, taskId, expectedRevision, expectedTaskRevision, specRevision, planRevision, questionId, targetGateId, expectedGateRevision, body and choices. Read current task-context revisions first. Sender identity is server-derived and the human answer is retained; it does not approve a gate. To message a teammate, use project-team.message.send with those task revisions plus messageId, recipientId, recipientTaskId, expectedRecipientMembershipRevision, body, evidenceIds and optional replyTo. Select an explicit current member/task address from private prepared context. Messages grant no approval or new work. To select memory processing, submit project-team.memory.process with current task revisions and the exact returned selection. Never supply an owner, model or limits. Ownerless, stopped or disabled sources wait; selection grants no new work. Protected revisions require a matching single-use human approval token.",
+    "Append one authorized intent. To ask a human, use project-team.question.request with commandId, projectId, taskId, expectedRevision, expectedTaskRevision, specRevision, planRevision, questionId, targetGateId, expectedGateRevision, body and choices. Read current task-context revisions first. Sender identity is server-derived and the human answer is retained; it does not approve a gate. To message a teammate, use project-team.message.send with those task revisions plus messageId, recipientId, recipientTaskId, expectedRecipientMembershipRevision, body, evidenceIds and optional replyTo. Select an explicit current member/task address from private prepared context. Messages grant no approval or new work. To select memory processing, submit project-team.memory.process with current task revisions and the exact returned selection. Historical cleanup deletes only that captured source and makes no model calls; select it explicitly rather than funding obsolete indexing. Never supply an owner, model or limits. Ownerless, stopped or disabled sources wait; selection grants no new work. Protected revisions require a matching single-use human approval token.",
   parameters: ProjectWorkWriteParameters,
   success: ProjectWorkWriteResult,
   failure: ProjectWorkToolkitError,

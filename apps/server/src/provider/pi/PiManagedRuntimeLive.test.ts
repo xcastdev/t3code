@@ -17,6 +17,7 @@ import {
   ProjectWorkWriteResult,
   ProjectWorkEvidenceRead,
   ProjectWorkComment,
+  ProjectWorkDecision,
   ProjectTeamMemorySourcesRead,
   ProjectTeamMemoryProcessIntent,
   ManagedSkillKey,
@@ -85,7 +86,11 @@ import {
   type ProjectMemoryProcessingConfiguration,
 } from "../../projectWork/memory/ProjectMemoryPorts.ts";
 import { makeProjectMemoryProcessingConsumer } from "../../projectWork/memory/ProjectMemoryProcessing.ts";
-import { MemoryIndexManifest, MemoryBackendError } from "../../projectWork/memory/MemoryBackend.ts";
+import {
+  MemoryIndexManifest,
+  MemoryBackendSource,
+  MemoryBackendError,
+} from "../../projectWork/memory/MemoryBackend.ts";
 import {
   ProjectMemoryJobOwner,
   makeProjectMemoryModelAccounting,
@@ -181,6 +186,7 @@ const decodeReportComments = Schema.decodeUnknownEffect(Schema.Array(ProjectWork
 const decodeMemorySources = Schema.decodeUnknownEffect(ProjectTeamMemorySourcesRead);
 const decodeMemoryOwnerRequest = Schema.decodeUnknownEffect(ProjectTeamMemoryProcessIntent);
 const decodeMemorySourceComment = Schema.decodeUnknownEffect(ProjectWorkComment);
+const decodeMemorySourceDecision = Schema.decodeUnknownEffect(ProjectWorkDecision);
 const isManagedRuntimeError = Schema.is(PiManagedRuntimeError);
 const controlledCallbackError = (cause: unknown) =>
   isManagedRuntimeError(cause)
@@ -5268,12 +5274,20 @@ const decodeMemoryLedgerOwner = Schema.decodeUnknownEffect(
 );
 const decodeMemoryCompanionInput = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
-    Schema.Struct({
-      protocolVersion: Schema.Literal(1),
-      requestId: Schema.String,
-      operation: Schema.Literals(["index", "reconcile"]),
-      input: MemoryIndexManifest,
-    }),
+    Schema.Union([
+      Schema.Struct({
+        protocolVersion: Schema.Literal(1),
+        requestId: Schema.String,
+        operation: Schema.Literals(["index", "reconcile"]),
+        input: MemoryIndexManifest,
+      }),
+      Schema.Struct({
+        protocolVersion: Schema.Literal(1),
+        requestId: Schema.String,
+        operation: Schema.Literal("delete-source"),
+        input: MemoryBackendSource,
+      }),
+    ]),
   ),
   { onExcessProperty: "error" },
 );
@@ -5809,6 +5823,8 @@ for (const compactProof of [
   "memoryFailure",
   "memorySecret",
   "memoryEmbeddingSecret",
+  "memoryCleanup",
+  "memoryCleanupGuards",
 ] as const)
   it.effect(
     compactProof === undefined
@@ -5825,15 +5841,21 @@ for (const compactProof of [
                 ? "rejects a newly learned escaped source secret before memory extraction reservation"
                 : compactProof === "memoryEmbeddingSecret"
                   ? "rejects newly learned escaped embedding text before its memory reservation"
-                  : compactProof === "successorReplay"
-                    ? "retained compact replay preserves the latest successful native head without another execution"
-                    : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+                  : compactProof === "memoryCleanup"
+                    ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
+                    : compactProof === "memoryCleanupGuards"
+                      ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
+                      : compactProof === "successorReplay"
+                        ? "retained compact replay preserves the latest successful native head without another execution"
+                        : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
           let memoryReady = false;
           const lateSecret = 'controlled-memory-"key\\tail';
           const memoryProof = compactProof?.startsWith("memory") === true;
+          const cleanupProof =
+            compactProof === "memoryCleanup" || compactProof === "memoryCleanupGuards";
           let consumeMemory:
             | ((
                 principal: Authorization.ProjectTeamPrincipal,
@@ -6156,6 +6178,122 @@ for (const compactProof of [
                           kind: "comment",
                           retainedId: comment.commentId,
                         });
+                        let cleanupEffectId: string | undefined;
+                        if (cleanupProof) {
+                          const human = { kind: "human" as const, id: "live-memory-human" };
+                          const humanSource = { kind: "web" as const, id: "live-memory-browser" };
+                          const decision = yield* decodeMemorySourceDecision({
+                            decisionId: "live-memory-decision",
+                            projectId,
+                            title: "Approved parser constraint",
+                            body: "The approved parser retains exact parser provenance.",
+                            state: "proposed",
+                            revision: 0,
+                            createdAt: at,
+                            updatedAt: at,
+                          });
+                          yield* gateway.write(
+                            {
+                              type: "project-work.decision.propose",
+                              commandId: CommandId.make("live-memory-decision-propose"),
+                              projectId,
+                              decision,
+                              proposedAt: at,
+                            },
+                            human,
+                            humanSource,
+                            { actor: human },
+                          );
+                          yield* gateway.write(
+                            {
+                              type: "project-work.decision.accept",
+                              commandId: CommandId.make("live-memory-decision-accept"),
+                              projectId,
+                              decisionId: decision.decisionId,
+                              acceptedAt: at,
+                            },
+                            human,
+                            humanSource,
+                            { actor: human },
+                          );
+                          const original = yield* memory.capture(principal, {
+                            kind: "decision",
+                            retainedId: decision.decisionId,
+                          });
+                          const replacement = yield* decodeMemorySourceDecision({
+                            ...decision,
+                            decisionId: "live-memory-decision-replacement",
+                            body: "The approved parser now rejects obsolete input.",
+                          });
+                          yield* gateway.write(
+                            {
+                              type: "project-work.decision.supersede",
+                              commandId: CommandId.make("live-memory-decision-supersede"),
+                              projectId,
+                              decisionId: decision.decisionId,
+                              replacement,
+                              supersededAt: at,
+                              attribution: { actor: human, source: humanSource, recordedAt: at },
+                            },
+                            human,
+                            humanSource,
+                            { actor: human },
+                          );
+                          yield* gateway.write(
+                            {
+                              type: "project-work.decision.accept",
+                              commandId: CommandId.make("live-memory-replacement-accept"),
+                              projectId,
+                              decisionId: replacement.decisionId,
+                              acceptedAt: at,
+                            },
+                            human,
+                            humanSource,
+                            { actor: human },
+                          );
+                          const corrected = yield* memory.capture(principal, {
+                            kind: "decision",
+                            retainedId: replacement.decisionId,
+                          });
+                          expect(corrected).toMatchObject({
+                            sourceId: original.sourceId,
+                            supersedes: original.recordId,
+                            status: "current",
+                          });
+                          const correctedState = yield* readCurrentState(f.sql, projectId);
+                          const oldSource = correctedState.foundationRecords?.find(
+                            (entry) => entry.recordId === original.recordId,
+                          );
+                          expect(oldSource).toMatchObject({
+                            kind: "memory-source",
+                            status: "superseded",
+                          });
+                          const deletion = correctedState.foundationRecords?.find(
+                            (entry) =>
+                              entry.kind === "effect" &&
+                              entry.effectKind === "memory-delete" &&
+                              entry.targetId === original.recordId,
+                          );
+                          if (deletion?.kind !== "effect")
+                            return yield* Effect.die("Correction retained no cleanup intent");
+                          cleanupEffectId = deletion.effectId;
+                          expect(
+                            yield* f.sql`SELECT status,owner_json,receipt_json,
+                            json_extract(input_json,'$.effect.effectKind') AS kind,
+                            json_extract(input_json,'$.source.recordId') AS sourceId
+                            FROM project_team_memory_job WHERE effect_id=${cleanupEffectId}`,
+                          ).toEqual([
+                            {
+                              status: "pending",
+                              owner_json: null,
+                              receipt_json: null,
+                              kind: "memory-delete",
+                              sourceId: original.recordId,
+                            },
+                          ]);
+                          expect(memoryExchanges).toBe(0);
+                          expect(memoryBackendCalls).toBe(0);
+                        }
                         const page = yield* gateway
                           .read(
                             {
@@ -6167,7 +6305,28 @@ for (const compactProof of [
                             principal,
                           )
                           .pipe(Effect.flatMap(decodeMemorySources));
-                        const selection = page.items[0]?.selection;
+                        const selection =
+                          cleanupEffectId === undefined
+                            ? page.items[0]?.selection
+                            : page.items.find(
+                                (entry) => entry.selection.effectId === cleanupEffectId,
+                              )?.selection;
+                        if (cleanupProof) {
+                          expect(selection).toMatchObject({
+                            kind: "decision",
+                            retainedId: "live-memory-decision",
+                            effectId: cleanupEffectId,
+                          });
+                          expect(
+                            page.items.some(
+                              (entry) =>
+                                entry.selection.retainedId === "live-memory-decision-replacement",
+                            ),
+                          ).toBe(true);
+                          expect(
+                            yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='memory'`,
+                          ).toEqual([]);
+                        }
                         const state = yield* readCurrentState(f.sql, projectId);
                         const task = state.tasks.find((entry) => entry.taskId === f.binding.taskId);
                         if (selection === undefined || task === undefined)
@@ -6209,6 +6368,74 @@ for (const compactProof of [
                           state.revision,
                         );
                         memoryReady = true;
+                        if (compactProof === "memoryCleanupGuards") {
+                          const originalEvents = yield* f.sql<{
+                            payload: string;
+                          }>`SELECT payload_json AS payload
+                            FROM project_work_events WHERE project_id=${projectId}
+                            AND command_id='live-memory-decision-supersede'`;
+                          expect(originalEvents).toHaveLength(1);
+                          const originalEvent = originalEvents[0]?.payload;
+                          if (originalEvent === undefined)
+                            return yield* Effect.die("Original replacement event missing");
+                          const originalReceipt =
+                            yield* f.sql`SELECT * FROM project_work_command_receipts
+                            WHERE project_id=${projectId} AND command_id='live-memory-decision-supersede'`;
+                          yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,
+                            '$.attribution.actor.id','forged-memory-human',
+                            '$.replacement.attribution.actor.id','forged-memory-human')
+                            WHERE project_id=${projectId} AND command_id='live-memory-decision-supersede'`;
+                          expect(
+                            yield* f.sql`SELECT json_extract(payload_json,'$.attribution.actor.id') AS actor,
+                            json_extract(payload_json,'$.replacement.attribution.actor.id') AS nested
+                            FROM project_work_events WHERE project_id=${projectId}
+                            AND command_id='live-memory-decision-supersede'`,
+                          ).toEqual([
+                            { actor: "forged-memory-human", nested: "forged-memory-human" },
+                          ]);
+                          expect(
+                            yield* f.sql`SELECT * FROM project_work_command_receipts
+                            WHERE project_id=${projectId} AND command_id='live-memory-decision-supersede'`,
+                          ).toEqual(originalReceipt);
+                          const forgedLineage = yield* Effect.tryPromise({
+                            try: () => input.executeBridgeTool(call, toolInput, signal),
+                            catch: controlledCallbackError,
+                          }).pipe(Effect.result);
+                          expect(forgedLineage._tag).toBe("Failure");
+                          expect(
+                            yield* f.sql`SELECT owner_json,receipt_json FROM project_team_memory_job
+                            WHERE effect_id=${selection.effectId}`,
+                          ).toEqual([{ owner_json: null, receipt_json: null }]);
+                          expect(memoryBackendCalls).toBe(0);
+                          yield* f.sql`UPDATE project_work_events SET payload_json=${originalEvent}
+                            WHERE project_id=${projectId} AND command_id='live-memory-decision-supersede'`;
+                          const jobs = yield* f.sql<{
+                            payload: string;
+                          }>`SELECT input_json AS payload
+                            FROM project_team_memory_job WHERE effect_id=${selection.effectId}`;
+                          const originalJob = jobs[0]?.payload;
+                          if (originalJob === undefined)
+                            return yield* Effect.die("Original cleanup job missing");
+                          const changedJob =
+                            yield* f.sql`UPDATE project_team_memory_job SET input_json=json_set(input_json,
+                            '$.effect.effectKind','memory-index') WHERE effect_id=${selection.effectId}`.pipe(
+                              Effect.result,
+                            );
+                          expect(changedJob._tag).toBe("Failure");
+                          expect(
+                            yield* f.sql`SELECT input_json AS payload FROM project_team_memory_job
+                            WHERE effect_id=${selection.effectId}`,
+                          ).toEqual([{ payload: originalJob }]);
+                          expect(
+                            yield* f.sql`SELECT owner_json,receipt_json FROM project_team_memory_job
+                            WHERE effect_id=${selection.effectId}`,
+                          ).toEqual([{ owner_json: null, receipt_json: null }]);
+                          expect(memoryExchanges).toBe(0);
+                          expect(memoryBackendCalls).toBe(0);
+                          expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(
+                            state.revision,
+                          );
+                        }
                         const changedSelector = yield* Effect.tryPromise({
                           try: () =>
                             input.executeBridgeTool(
@@ -6255,7 +6482,8 @@ for (const compactProof of [
                           compactProof === "memoryPipeline" ||
                           compactProof === "memoryFailure" ||
                           compactProof === "memorySecret" ||
-                          compactProof === "memoryEmbeddingSecret"
+                          compactProof === "memoryEmbeddingSecret" ||
+                          cleanupProof
                         ) {
                           const drained = memoryDrains;
                           const indexed = new Set<string>();
@@ -6374,6 +6602,34 @@ for (const compactProof of [
                                   new TextDecoder().decode(bytes),
                                 );
                                 memoryBackendCalls += 1;
+                                if (envelope.operation === "delete-source") {
+                                  expect(cleanupProof).toBe(true);
+                                  expect(memoryExchanges).toBe(0);
+                                  expect(envelope.input).toEqual({
+                                    environmentId: f.binding.environmentId,
+                                    projectId,
+                                    sourceRecordId: selection.sourceRecordId,
+                                    sourceRevision: selection.sourceRevision,
+                                    sourceGeneration: selection.sourceGeneration,
+                                  });
+                                  expect(
+                                    yield* f.sql`SELECT owner_json,status FROM project_team_memory_job
+                                    WHERE effect_id=${selection.effectId}`,
+                                  ).toMatchObject([
+                                    { owner_json: expect.any(String), status: "claimed" },
+                                  ]);
+                                  expect(
+                                    yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='memory'`,
+                                  ).toEqual([]);
+                                  return new TextEncoder().encode(
+                                    json({
+                                      protocolVersion: 1,
+                                      requestId: envelope.requestId,
+                                      operation: envelope.operation,
+                                      result: { cleanupComplete: true },
+                                    }),
+                                  );
+                                }
                                 expect(memoryExchanges).toBe(2);
                                 expect(envelope.input.projectId).toBe(projectId);
                                 const ids = envelope.input.observations.map(
@@ -6459,7 +6715,39 @@ for (const compactProof of [
                             operationMaximumTokens: operationCaps[0]?.maximum,
                           },
                         });
-                        if (compactProof === "memoryPipeline") {
+                        if (cleanupProof) {
+                          expect({ failure: memoryPipelineFailure }).toEqual({ failure: "" });
+                          expect(jobs[0]?.status).toBe("settled");
+                          expect(decodeRequiredJson(jobs[0]?.receipt ?? "null")).toMatchObject({
+                            kind: "delete-source-complete",
+                            sourceId: selection.sourceRecordId,
+                            sourceRevision: selection.sourceRevision,
+                            sourceGeneration: selection.sourceGeneration,
+                            observationIds: [],
+                          });
+                          expect(memoryExchanges).toBe(0);
+                          expect(memoryBackendCalls).toBe(1);
+                          expect(
+                            yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='memory'`,
+                          ).toEqual([]);
+                          const reflected = yield* readCurrentState(f.sql, projectId);
+                          expect(
+                            reflected.foundationRecords?.find(
+                              (entry) =>
+                                entry.kind === "effect" && entry.effectId === selection.effectId,
+                            ),
+                          ).toMatchObject({ status: "succeeded" });
+                          expect(
+                            reflected.foundationRecords?.find(
+                              (entry) => entry.recordId === selection.sourceRecordId,
+                            ),
+                          ).toMatchObject({ status: "superseded" });
+                          expect(
+                            reflected.decisions?.find(
+                              (entry) => entry.decisionId === "live-memory-decision-replacement",
+                            ),
+                          ).toMatchObject({ state: "accepted" });
+                        } else if (compactProof === "memoryPipeline") {
                           expect({ failure: memoryPipelineFailure }).toEqual({ failure: "" });
                           expect(jobs[0]?.status).toBe("settled");
                           expect(decodeRequiredJson(jobs[0]?.receipt ?? "null")).toMatchObject({
@@ -6573,6 +6861,9 @@ for (const compactProof of [
                         } else if (compactProof === "memoryFailure") {
                           expect(memoryExchanges).toBe(1);
                           expect(memoryBackendCalls).toBe(0);
+                        } else if (cleanupProof) {
+                          expect(memoryExchanges).toBe(0);
+                          expect(memoryBackendCalls).toBe(1);
                         }
                         if (compactProof === "memoryAccounting") {
                           const admitted = yield* decodeMemoryLedgerOwner(jobs[0]?.owner ?? "null");
@@ -6957,6 +7248,9 @@ for (const compactProof of [
                 .pipe(Effect.flatMap(decodeMemorySources));
               expect(waiting.items[0]?.status).toBe("uncertain");
               expect(waiting.items[0]?.reason).toContain("stopped");
+            } else if (cleanupProof) {
+              expect(memoryExchanges).toBe(0);
+              expect(memoryBackendCalls).toBe(1);
             }
             return;
           }

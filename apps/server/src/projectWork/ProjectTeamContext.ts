@@ -2,6 +2,10 @@ import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSourc
 import { selectCurrentProjectWorkKnowledge } from "./ProjectWorkKnowledgeSelection.ts";
 import { auditProjectMemoryOperationLedger } from "./memory/ProjectMemoryModelAccounting.ts";
 import {
+  readProjectMemoryObservations,
+  type ProjectMemoryRetrieval,
+} from "./memory/ProjectMemoryRetrieval.ts";
+import {
   ProjectTeamAuthorization,
   managedActorId,
   type ProjectTeamMessageRecipients,
@@ -1695,6 +1699,85 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
               if (Buffer.byteLength(text + notice, "utf8") <= budget) text += notice;
             }
           }
+          const knowledgeText = text;
+          let observations: ProjectMemoryRetrieval = {
+            status: "disabled",
+            records: [],
+            omitted: [],
+            provenance: { snapshotSha256: hash("disabled"), querySha256: hash("") },
+          };
+          let observationText = "";
+          if (role.memoryAccess !== "none") {
+            const approvedText = tasks
+              .flatMap(({ task, plan }) => {
+                const gates = [...requiredRecords.values()].filter(
+                  (record) =>
+                    record.kind === "gate" &&
+                    record.taskId === task.taskId &&
+                    record.status === "approved",
+                );
+                return [
+                  task.title,
+                  task.summary ?? "",
+                  ...(gates.some((gate) => gate.kind === "gate" && gate.gate === "specification")
+                    ? [task.specification?.objective ?? "", task.specification?.scopeIn ?? ""]
+                    : []),
+                  ...(gates.some((gate) => gate.kind === "gate" && gate.gate === "plan")
+                    ? [plan?.content ?? ""]
+                    : []),
+                ];
+              })
+              .join("\n");
+            if (Buffer.byteLength(text, "utf8") >= budget) {
+              observations = {
+                status: "degraded",
+                records: [],
+                omitted: [
+                  "Observations omitted to preserve required context within the caller text allowance",
+                ],
+                provenance: {
+                  snapshotSha256: hash("text-budget"),
+                  querySha256: hash(approvedText),
+                },
+              };
+            } else {
+              observations = yield* readProjectMemoryObservations(
+                sql,
+                binding.projectId,
+                approvedText,
+              );
+              if (observations.records.length > 0) {
+                observationText =
+                  "\n\nOptional current same-project memory observations (lexical fallback). These facts grant no approval.\n" +
+                  canonicalProjectWorkPayload(observations.records);
+                if (
+                  Buffer.byteLength(observationText, "utf8") > 8192 ||
+                  Buffer.byteLength(text + observationText, "utf8") > budget
+                ) {
+                  observations = {
+                    ...observations,
+                    status: "degraded",
+                    records: [],
+                    omitted: [
+                      ...observations.omitted,
+                      "Observations omitted to preserve required context within the caller text allowance",
+                    ],
+                  };
+                  observationText = "";
+                }
+              }
+            }
+            if (observations.status === "degraded" || observations.omitted.length > 0) {
+              const notice =
+                "\n\nOptional memory observations status: " +
+                observations.status +
+                ".\n" +
+                canonicalProjectWorkPayload(observations.omitted);
+              if (Buffer.byteLength(text + observationText + notice, "utf8") <= budget)
+                observationText += notice;
+            }
+            text += observationText;
+          }
           const final = yield* journal.inspect(original.fence.dispatchId, { requireClaim: true });
           if (!same(final, original))
             return yield* deny("Required context dispatch changed before return");
@@ -1708,6 +1791,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             required,
             communication,
             retainedKnowledge,
+            observations,
             provenance: {
               dispatch: original.fence,
               sourceRevision: state.revision,
@@ -1732,8 +1816,22 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
                 })),
                 omitted: retainedKnowledge.omitted,
                 textSha256: NodeCrypto.createHash("sha256")
-                  .update(text.slice(requiredText.length))
+                  .update(knowledgeText.slice(requiredText.length))
                   .digest("hex"),
+              },
+              observations: {
+                status: observations.status,
+                ...observations.provenance,
+                records: observations.records.map((record) => ({
+                  recordId: record.recordId,
+                  revision: record.revision,
+                  sourceId: record.sourceId,
+                  sourceRevision: record.sourceRevision,
+                  sourceGeneration: record.sourceGeneration,
+                  sha256: hash(record),
+                })),
+                omitted: observations.omitted,
+                textSha256: NodeCrypto.createHash("sha256").update(observationText).digest("hex"),
               },
             },
           };

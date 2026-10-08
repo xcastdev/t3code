@@ -472,6 +472,269 @@ const makeFixture = (
     return { sql, repository, request, journal, snapshot, reader, change, parentVerification };
   });
 
+const addContextObservation = Effect.fn("contextFixture.addObservation")(function* (
+  f: Effect.Success<ReturnType<typeof makeFixture>>,
+) {
+  const content = "The bounded task preserves parser compatibility.";
+  const source = yield* decodeRecord({
+    kind: "memory-source",
+    projectId,
+    recordId: "context-observation-source",
+    revision: 0,
+    generation: 0,
+    updatedAt: at,
+    status: "current",
+    sourceKind: "finding",
+    sourceId: "context-parser-finding",
+    sourceRevision: 1,
+    content,
+    contentHash: NodeCrypto.createHash("sha256").update(content).digest("hex"),
+    attribution,
+    sharedWithProjectIds: [],
+  });
+  const extraction = yield* decodeRecord({
+    kind: "memory-extraction",
+    projectId,
+    recordId: "context-observation-extraction",
+    revision: 0,
+    generation: 0,
+    updatedAt: at,
+    status: "extracted",
+    engine: "mem0",
+    engineVersion: "2.2.1",
+    sourceId: source.recordId,
+    sourceRevision: 1,
+    sourceGeneration: 0,
+    extractionModel: "fixture/extraction",
+    embeddingModel: "fixture/embedding",
+    embeddingDimensions: 2048,
+    expectedObservationIds: ["context-parser-observation"],
+    completedObservationIds: [],
+    extractionHash: "context-extraction-hash",
+  });
+  const observation = yield* decodeRecord({
+    kind: "memory-observation",
+    projectId,
+    recordId: "context-parser-observation",
+    revision: 0,
+    generation: 0,
+    updatedAt: at,
+    status: "current",
+    sourceId: source.recordId,
+    sourceRevision: 1,
+    sourceGeneration: 0,
+    extractionId: extraction.recordId,
+    observationKey: "parser-compatibility",
+    body: content,
+    provenance: attribution,
+  });
+  yield* f.change(source);
+  yield* f.change(extraction);
+  yield* f.change(observation);
+  if (source.kind !== "memory-source" || observation.kind !== "memory-observation")
+    return yield* Effect.die("Observation fixture variants are missing");
+  return { source, observation, content };
+});
+
+it.effect(
+  "provides current same-project observations through the prepared task context without a model query",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+      const before = yield* f.reader.readRequired(f.snapshot);
+      const { observation, content } = yield* addContextObservation(f);
+      expect(
+        yield* f.sql`SELECT record_id,status FROM project_team_memory_observation
+      WHERE project_id=${projectId} AND record_id=${observation.recordId}`,
+      ).toEqual([{ record_id: observation.recordId, status: "current" }]);
+      const after = yield* f.reader.readRequired(f.snapshot);
+      expect(after).toMatchObject({
+        observations: {
+          status: "available",
+          records: [observation],
+          omitted: [],
+        },
+      });
+      expect(before.text).not.toContain(content);
+      expect(after.text).toContain(content);
+      expect(after.required).toEqual({
+        ...before.required,
+        sourceRevision: after.required.sourceRevision,
+      });
+      expect(after.provenance).not.toEqual(before.provenance);
+    }).pipe(Effect.provide(gatewayRuntime)),
+);
+
+it.effect("does not read observation candidates for a frozen memoryAccess none role", () =>
+  Effect.gen(function* () {
+    const f = yield* makeFixture();
+    const { observation, content } = yield* addContextObservation(f);
+    // If the optional reader runs this deliberately missing physical record degrades.
+    yield* f.sql`DELETE FROM project_team_memory_observation WHERE record_id=${observation.recordId}`;
+    const current = yield* f.reader.readRequired(f.snapshot);
+    expect(current.observations).toMatchObject({ status: "disabled", records: [], omitted: [] });
+    expect(current.text).not.toContain(content);
+  }).pipe(Effect.provide(gatewayRuntime)),
+);
+
+it.effect(
+  "omits observations without hiding required context when the caller text budget is exhausted",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+      yield* addContextObservation(f);
+      const available = yield* f.reader.readRequired(f.snapshot);
+      const protectedText =
+        "Required context from retained T3 authority. This read snapshot grants no new approval.\n" +
+        canonicalProjectWorkPayload(available.required);
+      const limited = yield* f.reader.readRequired(f.snapshot, {
+        optionalTextBudgetBytes: Buffer.byteLength(protectedText, "utf8"),
+      });
+      expect(available.observations.records).toHaveLength(1);
+      expect(limited.observations).toMatchObject({ status: "degraded", records: [] });
+      expect(limited.observations.omitted).toHaveLength(1);
+      expect(limited.required).toEqual(available.required);
+      expect(limited.text).toBe(protectedText);
+      expect(limited.provenance.observations).not.toEqual(available.provenance.observations);
+    }).pipe(Effect.provide(gatewayRuntime)),
+);
+
+for (const state of ["superseded", "retracted", "stale"] as const) {
+  it.effect("suppresses observations after their current source becomes " + state, () =>
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+      const { source, content } = yield* addContextObservation(f);
+      const available = yield* f.reader.readRequired(f.snapshot);
+      yield* f.change({
+        ...source,
+        revision: 1,
+        ...(state === "stale" ? { sourceRevision: 2, generation: 1 } : { status: state }),
+        ...(state === "retracted" ? { tombstonedAt: at } : {}),
+      });
+      const current = yield* f.reader.readRequired(f.snapshot);
+      expect(available.observations.records).toHaveLength(1);
+      expect(current.observations.records).toEqual([]);
+      expect(current.observations.omitted).toHaveLength(1);
+      expect(current.text).not.toContain(content);
+      expect(current.provenance.observations).not.toEqual(available.provenance.observations);
+      expect(current.required).toEqual({
+        ...available.required,
+        sourceRevision: current.required.sourceRevision,
+      });
+    }).pipe(Effect.provide(gatewayRuntime)),
+  );
+}
+
+it.effect(
+  "degrades incomplete observation candidates instead of selecting a truncated history",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "shared");
+      const { observation } = yield* addContextObservation(f);
+      const before = yield* f.reader.readRequired(f.snapshot);
+      // Untrusted physical rows exercise the enumeration sentinel before hydration.
+      // The genuine original observation and all required authority remain unchanged.
+      for (let index = 0; index < 128; index++)
+        yield* f.sql`INSERT INTO project_team_memory_observation
+      (record_id,project_id,status,revision,generation,updated_at,payload_json)
+      VALUES (${"context-overflow-" + index},${projectId},'current',0,0,${at},
+        ${canonicalProjectWorkPayload(observation)})`;
+      expect(
+        yield* f.sql`SELECT count(*) AS total FROM project_team_memory_observation
+      WHERE project_id=${projectId}`,
+      ).toEqual([{ total: 129 }]);
+      const current = yield* f.reader.readRequired(f.snapshot);
+      expect(current.observations).toMatchObject({
+        status: "degraded",
+        records: [],
+        omitted: ["Observation candidates exceed the complete lexical bound"],
+      });
+      expect(current.text).toContain("Optional memory observations status: degraded");
+      expect(current.required).toEqual(before.required);
+    }).pipe(Effect.provide(gatewayRuntime)),
+);
+
+it.effect("uses the current corrected observation without reviving superseded source text", () =>
+  Effect.gen(function* () {
+    const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+    const { source, observation, content } = yield* addContextObservation(f);
+    const before = yield* f.reader.readRequired(f.snapshot);
+    const extraction = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+      (record) => record.recordId === observation.extractionId,
+    );
+    if (extraction?.kind !== "memory-extraction")
+      return yield* Effect.die("Missing original extraction");
+    const correctedText = "The bounded task now preserves the corrected parser protocol.";
+    const replacement = {
+      ...source,
+      recordId: "context-corrected-source",
+      revision: 0,
+      generation: 1,
+      sourceRevision: 2,
+      supersedes: source.recordId,
+      content: correctedText,
+      contentHash: NodeCrypto.createHash("sha256").update(correctedText).digest("hex"),
+    };
+    const corrected = {
+      ...observation,
+      recordId: "context-corrected-observation",
+      sourceId: replacement.recordId,
+      sourceRevision: 2,
+      sourceGeneration: 1,
+      extractionId: "context-corrected-extraction",
+      body: correctedText,
+      supersedes: observation.recordId,
+    };
+    yield* f.change({ ...source, revision: 1, status: "superseded" });
+    yield* f.change(replacement);
+    yield* f.change({
+      ...extraction,
+      recordId: corrected.extractionId,
+      sourceId: replacement.recordId,
+      sourceRevision: 2,
+      sourceGeneration: 1,
+      expectedObservationIds: [corrected.recordId],
+      extractionHash: "corrected-extraction-hash",
+    });
+    yield* f.change(corrected);
+    const after = yield* f.reader.readRequired(f.snapshot);
+    expect(after.observations).toMatchObject({ status: "available", records: [corrected] });
+    expect(after.text).toContain(correctedText);
+    expect(after.text).not.toContain(content);
+    expect(after.provenance.observations).not.toEqual(before.provenance.observations);
+  }).pipe(Effect.provide(gatewayRuntime)),
+);
+
+it.effect(
+  "degrades a corrupt observation projection while retaining required assignment context",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+      const { observation, content } = yield* addContextObservation(f);
+      const before = yield* f.reader.readRequired(f.snapshot);
+      yield* f.sql`UPDATE project_team_memory_observation SET payload_json=${canonicalProjectWorkPayload(
+        {
+          ...observation,
+          body: "Substituted bounded task fact",
+        },
+      )} WHERE record_id=${observation.recordId}`;
+      expect(
+        yield* f.sql`SELECT json_extract(payload_json,'$.body') AS body
+      FROM project_team_memory_observation WHERE record_id=${observation.recordId}`,
+      ).toEqual([{ body: "Substituted bounded task fact" }]);
+      const after = yield* f.reader.readRequired(f.snapshot);
+      expect(after.observations).toMatchObject({
+        status: "degraded",
+        records: [],
+        omitted: ["Observation authority is unavailable: corruption"],
+      });
+      expect(after.required).toEqual(before.required);
+      expect(after.text).not.toContain(content);
+      expect(after.text).not.toContain("Substituted bounded task fact");
+      expect(after.text).toContain("Optional memory observations status: degraded");
+    }).pipe(Effect.provide(gatewayRuntime)),
+);
+
 it.effect(
   "provides accepted decisions and current retained knowledge on a later prepared context read",
   () =>
