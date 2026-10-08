@@ -116,7 +116,11 @@ const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.
     length(CAST(run_id AS BLOB))+length(CAST(attempt_id AS BLOB))+length(CAST(worker_id AS BLOB))+
     length(CAST(operation_id AS BLOB))+length(CAST(request_scope AS BLOB))+length(CAST(route_id AS BLOB))+
     length(CAST(provider AS BLOB))+length(CAST(model AS BLOB))+
-    length(CAST(reservation_id AS BLOB))+COALESCE(length(CAST(accounting_receipt_id AS BLOB)),0) AS bytes
+    length(CAST(reservation_id AS BLOB))+COALESCE(length(CAST(accounting_receipt_id AS BLOB)),0)+
+    length(CAST(generation AS BLOB))+length(CAST(request_id AS BLOB))+
+    length(CAST(maximum_input_tokens AS BLOB))+length(CAST(maximum_output_tokens AS BLOB))+
+    length(CAST(deadline_at_ms AS BLOB))+length(CAST(charged_input_tokens AS BLOB))+
+    length(CAST(charged_output_tokens AS BLOB))+length(CAST(status AS BLOB))+length(CAST(capacity_state AS BLOB)) AS bytes
     FROM project_team_model_request WHERE project_id=${projectId} AND request_lane='memory'
     ORDER BY reservation_id LIMIT 257`;
     const outcomes = yield* sql<{ id: string; bytes: number }>`SELECT effect_id AS id,
@@ -133,7 +137,7 @@ const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.
     if (bytes > 4194304)
       return yield* deny("Retained cleanup journals exceed their byte allowance");
     if (
-      (yield* sql`SELECT reservation_id FROM project_team_model_request WHERE project_id=${projectId}
+      (yield* sql`SELECT 1 AS present FROM project_team_model_request WHERE project_id=${projectId}
     AND (environment_id<>${environmentId} OR capacity_state<>'released' OR status='held') LIMIT 1`)
         .length !== 0
     )
@@ -598,7 +602,7 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
       bindingId: string | null;
       attemptId: string | null;
       workerId: string | null;
-      generation: number;
+      generation: number | null;
       operationId: string | null;
       bytes: number;
     }>`SELECT
@@ -607,7 +611,8 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
     CASE WHEN length(CAST(root_task_id AS BLOB))<=1024 THEN root_task_id END AS rootTaskId,
     CASE WHEN length(CAST(run_id AS BLOB))<=1024 THEN run_id END AS bindingId,
     CASE WHEN length(CAST(attempt_id AS BLOB))<=1024 THEN attempt_id END AS attemptId,
-    CASE WHEN length(CAST(worker_id AS BLOB))<=1024 THEN worker_id END AS workerId,generation,
+    CASE WHEN length(CAST(worker_id AS BLOB))<=1024 THEN worker_id END AS workerId,
+    CASE WHEN typeof(generation)='integer' THEN generation END AS generation,
     CASE WHEN length(CAST(operation_id AS BLOB))<=1024 THEN operation_id END AS operationId,
     length(CAST(environment_id AS BLOB))+length(CAST(project_id AS BLOB))+length(CAST(root_task_id AS BLOB))+
     length(CAST(run_id AS BLOB))+length(CAST(attempt_id AS BLOB))+length(CAST(worker_id AS BLOB))+
