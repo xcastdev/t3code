@@ -805,6 +805,10 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
           yield* contentGuard
             .assertSafe(source)
             .pipe(Effect.mapError(() => deny("Selected source failed content safety")));
+          const retained = yield* decodeRetained(source.content);
+          yield* contentGuard
+            .assertSafe(retained.record)
+            .pipe(Effect.mapError(() => deny("Selected source failed content safety")));
         }).pipe(
           Effect.provideService(SqlClient.SqlClient, sql),
           Effect.provideService(ProjectWorkRepository, repository),
@@ -850,7 +854,18 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
               owner.operation.operationDeadlineAtMs,
               owner.operation.leaseDeadlineAtMs,
             );
-            yield* sql.withTransaction(fence);
+            const modelFence = fence.pipe(
+              Effect.andThen(
+                phase === "embed"
+                  ? contentGuard
+                      .assertSafe(bodies ?? [])
+                      .pipe(
+                        Effect.mapError(() => deny("Memory embedding text failed content safety")),
+                      )
+                  : Effect.void,
+              ),
+            );
+            yield* sql.withTransaction(modelFence);
             const reserved = yield* accounting.reserve(owner, {
               phase,
               routeId: port.routeId,
@@ -864,18 +879,22 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
             return yield* Effect.uninterruptibleMask((restore) =>
               Effect.gen(function* () {
                 const result = yield* restore(
-                  options.exchange(
-                    {
-                      phase,
-                      endpoint: port.endpoint,
-                      credential,
-                      model: reserved.reservation.model,
-                      maximumInputTokens: port.maximumInputTokens,
-                      maximumOutputTokens: port.maximumOutputTokens,
-                      deadlineAtMs,
-                      input: phase === "extract" ? source.content : (bodies ?? []),
-                    },
-                    reserved.reservationId,
+                  sql.withTransaction(modelFence).pipe(
+                    Effect.andThen(
+                      options.exchange(
+                        {
+                          phase,
+                          endpoint: port.endpoint,
+                          credential,
+                          model: reserved.reservation.model,
+                          maximumInputTokens: port.maximumInputTokens,
+                          maximumOutputTokens: port.maximumOutputTokens,
+                          deadlineAtMs,
+                          input: phase === "extract" ? source.content : (bodies ?? []),
+                        },
+                        reserved.reservationId,
+                      ),
+                    ),
                   ),
                 ).pipe(Effect.exit);
                 if (Exit.isFailure(result)) {

@@ -5807,6 +5807,8 @@ for (const compactProof of [
   "memoryAccounting",
   "memoryPipeline",
   "memoryFailure",
+  "memorySecret",
+  "memoryEmbeddingSecret",
 ] as const)
   it.effect(
     compactProof === undefined
@@ -5819,13 +5821,19 @@ for (const compactProof of [
             ? "processes an exact admitted source through shared model accounting and the configured index consumer"
             : compactProof === "memoryFailure"
               ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
-              : compactProof === "successorReplay"
-                ? "retained compact replay preserves the latest successful native head without another execution"
-                : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+              : compactProof === "memorySecret"
+                ? "rejects a newly learned escaped source secret before memory extraction reservation"
+                : compactProof === "memoryEmbeddingSecret"
+                  ? "rejects newly learned escaped embedding text before its memory reservation"
+                  : compactProof === "successorReplay"
+                    ? "retained compact replay preserves the latest successful native head without another execution"
+                    : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
           let memoryReady = false;
+          const lateSecret = 'controlled-memory-"key\\tail';
+          const memoryProof = compactProof?.startsWith("memory") === true;
           let consumeMemory:
             | ((
                 principal: Authorization.ProjectTeamPrincipal,
@@ -5840,15 +5848,7 @@ for (const compactProof of [
           let reconcileMemory:
             | ((id: string) => Effect.Effect<void, ProjectMemoryServiceError>)
             | undefined;
-          const f = yield* requiredTransferFixture(
-            false,
-            false,
-            undefined,
-            compactProof === "memoryAdmission" ||
-              compactProof === "memoryAccounting" ||
-              compactProof === "memoryPipeline" ||
-              compactProof === "memoryFailure",
-          ).pipe(
+          const f = yield* requiredTransferFixture(false, false, undefined, memoryProof).pipe(
             Effect.provideService(ProjectMemoryPorts, {
               assertConfigured: () =>
                 memoryReady
@@ -6104,13 +6104,7 @@ for (const compactProof of [
                           usage,
                         });
                       }
-                      if (
-                        (compactProof === "memoryAdmission" ||
-                          compactProof === "memoryAccounting" ||
-                          compactProof === "memoryPipeline" ||
-                          compactProof === "memoryFailure") &&
-                        input.operation.operationKind === "prompt"
-                      ) {
+                      if (memoryProof && input.operation.operationKind === "prompt") {
                         const gateway = yield* ProjectWorkGateway;
                         const authorization = yield* Authorization.ProjectTeamAuthorization;
                         const credential = yield* authorization.issueCredential({
@@ -6130,7 +6124,9 @@ for (const compactProof of [
                           commentId: "live-memory-comment",
                           projectId,
                           taskId: f.binding.taskId,
-                          body: "The approved operation retains exact parser provenance.",
+                          body:
+                            "The approved operation retains exact parser provenance." +
+                            (compactProof === "memorySecret" ? " " + lateSecret : ""),
                           revision: 0,
                           createdAt: at,
                         });
@@ -6255,7 +6251,12 @@ for (const compactProof of [
                         expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(
                           state.revision,
                         );
-                        if (compactProof === "memoryPipeline" || compactProof === "memoryFailure") {
+                        if (
+                          compactProof === "memoryPipeline" ||
+                          compactProof === "memoryFailure" ||
+                          compactProof === "memorySecret" ||
+                          compactProof === "memoryEmbeddingSecret"
+                        ) {
                           const drained = memoryDrains;
                           const indexed = new Set<string>();
                           const configuration: ProjectMemoryProcessingConfiguration = {
@@ -6290,7 +6291,14 @@ for (const compactProof of [
                             maximumConcurrentModelCalls: 2,
                             readConfiguration: Effect.succeed(configuration),
                             assertAdmission: Effect.void,
-                            readCredential: () => Effect.succeed("controlled-memory-credential"),
+                            readCredential: (reference) =>
+                              Effect.succeed(
+                                compactProof === "memorySecret" ||
+                                  (compactProof === "memoryEmbeddingSecret" &&
+                                    reference === "controlled-embedding")
+                                  ? lateSecret
+                                  : "controlled-memory-credential",
+                              ),
                             confirmModelTransportDrained: (id) =>
                               drained.has(id)
                                 ? Effect.void
@@ -6318,7 +6326,13 @@ for (const compactProof of [
                                     operation_id: input.operation.operationId,
                                   },
                                 ]);
-                                expect(exchange.credential).toBe("controlled-memory-credential");
+                                expect(exchange.credential).toBe(
+                                  compactProof === "memorySecret" ||
+                                    (compactProof === "memoryEmbeddingSecret" &&
+                                      exchange.phase === "embed")
+                                    ? lateSecret
+                                    : "controlled-memory-credential",
+                                );
                                 memoryExchanges += 1;
                                 if (compactProof === "memoryFailure")
                                   return yield* new ProjectMemoryServiceError({
@@ -6335,7 +6349,11 @@ for (const compactProof of [
                                       ? [
                                           {
                                             key: "parser-provenance",
-                                            body: "The approved parser retains exact provenance.",
+                                            body:
+                                              "The approved parser retains exact provenance." +
+                                              (compactProof === "memoryEmbeddingSecret"
+                                                ? " " + lateSecret
+                                                : ""),
                                             quote: "exact parser provenance",
                                           },
                                         ]
@@ -6519,6 +6537,25 @@ for (const compactProof of [
                             yield* f.sql`SELECT status,receipt_json FROM project_team_memory_job
                             WHERE effect_id=${selection.effectId}`,
                           ).toEqual([{ status: "uncertain", receipt_json: null }]);
+                        } else if (
+                          compactProof === "memorySecret" ||
+                          compactProof === "memoryEmbeddingSecret"
+                        ) {
+                          expect(jobs[0]).toMatchObject({ status: "uncertain", receipt: null });
+                          expect(memoryReceipt.receipt.status).toBe("accepted");
+                          const expectedStages = compactProof === "memorySecret" ? 0 : 1;
+                          expect(memoryExchanges).toBe(expectedStages);
+                          expect(memoryBackendCalls).toBe(0);
+                          expect(
+                            yield* f.sql`SELECT status,capacity_state,request_scope FROM project_team_model_request
+                            WHERE request_lane='memory'`,
+                          ).toHaveLength(expectedStages);
+                          expect(memoryPipelineError).toMatchObject({
+                            reason:
+                              compactProof === "memorySecret"
+                                ? "Selected source failed content safety"
+                                : "Memory embedding text failed content safety",
+                          });
                         } else expect(jobs[0]).toMatchObject({ status: "pending", receipt: null });
                         memorySourceId = input.identity.workerId;
                         const charges = yield* f.sql`SELECT * FROM project_team_model_request`;
@@ -6875,12 +6912,7 @@ for (const compactProof of [
             result: { _tag: "Success", success: { terminal: { outcome: "success" } } },
           });
           yield* stage("assignment-observed");
-          if (
-            compactProof === "memoryAdmission" ||
-            compactProof === "memoryAccounting" ||
-            compactProof === "memoryPipeline" ||
-            compactProof === "memoryFailure"
-          ) {
+          if (memoryProof) {
             if (
               memoryRequest === undefined ||
               memoryReceipt === undefined ||
