@@ -20,7 +20,10 @@ import {
   ProjectWorkRepositoryLive,
   readCurrentState,
 } from "../ProjectWorkRepository.ts";
-import { PROJECT_TEAM_TABLES } from "../ProjectTeamsPersistence.ts";
+import {
+  PROJECT_TEAM_TABLES,
+  PROJECT_WORK_CHECKPOINT_VERSION,
+} from "../ProjectTeamsPersistence.ts";
 import type { MemoryBackend } from "./MemoryBackend.ts";
 import { makeProjectMemoryIndexReactor } from "./ProjectMemoryIndexReactor.ts";
 import { makeProjectMemoryOutcome } from "./ProjectMemoryOutcome.ts";
@@ -572,7 +575,8 @@ for (const noFacts of [false, true])
           return yield* Effect.die("fixture not settled");
         const state = yield* readCurrentState(f.sql, f.projectId);
         const revision = Number.MAX_SAFE_INTEGER - (noFacts ? 0 : 1);
-        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=${canonicalProjectWorkPayload({ ...state, checkpointVersion: 2, revision })}`;
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=${canonicalProjectWorkPayload({ ...state, checkpointVersion: PROJECT_WORK_CHECKPOINT_VERSION, revision })}`;
+        expect((yield* readCurrentState(f.sql, f.projectId)).revision).toBe(revision);
         const before = yield* f.snapshot;
         expect(
           (yield* f.outcomes.commitVerifiedOutcome(pending.receipt, Effect.void).pipe(Effect.exit))

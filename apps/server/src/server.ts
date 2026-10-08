@@ -18,6 +18,7 @@ import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Layer from "effect/Layer";
 import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
@@ -164,6 +165,15 @@ import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.
 import * as ProjectWorkExport from "./projectWork/ProjectWorkExport.ts";
 import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
 import { makeProjectMemoryCapture } from "./projectWork/memory/ProjectMemoryCapture.ts";
+import { makeProjectMemoryProcessingConsumer } from "./projectWork/memory/ProjectMemoryProcessing.ts";
+import {
+  ProjectMemoryPorts,
+  decodeProjectMemoryProcessingConfiguration,
+  exchangeProjectMemoryModel,
+} from "./projectWork/memory/ProjectMemoryPorts.ts";
+import { ProjectMemoryServiceError } from "./projectWork/memory/ProjectMemoryService.ts";
+import { MemoryBackendError } from "./projectWork/memory/MemoryBackend.ts";
+import * as Queue from "effect/Queue";
 import * as ProjectWorkPublicationGuard from "./projectWork/ProjectWorkPublicationGuard.ts";
 import * as ProjectWorkPullRequestActionGuard from "./projectWork/ProjectWorkPullRequestActionGuard.ts";
 import * as ProjectWorkEvidenceInvalidation from "./projectWork/ProjectWorkEvidenceInvalidation.ts";
@@ -768,7 +778,141 @@ const ProjectWorkVerificationLive = ProjectWorkVerification.layer.pipe(
   Layer.provide(PersistenceLayerLive),
 );
 
+const ProjectMemoryProcessingLayerLive = Layer.effect(
+  ProjectMemoryPorts,
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const environment = yield* ServerEnvironment.ServerEnvironment;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const secrets = yield* ServerSecretStore.ServerSecretStore;
+    const configurationPath = path.join(config.baseDir, "project-memory-processing.json");
+    const readConfiguration = Effect.gen(function* () {
+      if (!(yield* fs.exists(configurationPath))) return undefined;
+      const metadata = yield* fs.stat(configurationPath);
+      if (metadata.type !== "File" || metadata.size > 262144n)
+        return yield* new ProjectMemoryServiceError({
+          reason: "Memory processing configuration exceeds its file bound",
+        });
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const file = yield* fs.open(configurationPath, { flag: "r" });
+          const chunks: Uint8Array[] = [];
+          let bytes = 0;
+          for (;;) {
+            const next = yield* file.readAlloc(Math.min(65536, 262145 - bytes));
+            if (Option.isNone(next)) break;
+            bytes += next.value.byteLength;
+            if (bytes > 262144)
+              return yield* new ProjectMemoryServiceError({
+                reason: "Memory processing configuration changed beyond its file bound",
+              });
+            chunks.push(next.value);
+          }
+          const text = yield* Effect.try({
+            try: () => new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
+            catch: () =>
+              new ProjectMemoryServiceError({
+                reason: "Memory processing configuration is not UTF-8",
+              }),
+          });
+          return yield* decodeProjectMemoryProcessingConfiguration(text);
+        }),
+      );
+    }).pipe(
+      Effect.mapError(
+        () =>
+          new ProjectMemoryServiceError({
+            reason: "Memory processing configuration is unavailable",
+          }),
+      ),
+    );
+    const drained = new Set<string>();
+    const drainObservations = yield* Queue.make<string>({ capacity: 256, strategy: "dropping" });
+    const assertAdmission = Effect.fail(
+      new ProjectMemoryServiceError({
+        reason:
+          "Memory processing awaits the retained engineering verdicts and shared resource ownership",
+      }),
+    );
+    const consumer = yield* makeProjectMemoryProcessingConsumer({
+      environmentId: yield* environment.getEnvironmentId,
+      maximumConcurrentCalls: 2,
+      maximumConcurrentModelCalls: 2,
+      readConfiguration,
+      assertAdmission,
+      readCredential: (reference) =>
+        secrets.get(reference).pipe(
+          Effect.flatMap((secret) =>
+            Option.isNone(secret)
+              ? Effect.fail(
+                  new ProjectMemoryServiceError({ reason: "Memory credential is unavailable" }),
+                )
+              : Effect.try({
+                  try: () => new TextDecoder("utf-8", { fatal: true }).decode(secret.value),
+                  catch: () =>
+                    new ProjectMemoryServiceError({ reason: "Memory credential is invalid" }),
+                }),
+          ),
+          Effect.mapError(
+            () => new ProjectMemoryServiceError({ reason: "Memory credential could not be read" }),
+          ),
+        ),
+      exchange: (request, id) =>
+        assertAdmission.pipe(
+          Effect.andThen(
+            exchangeProjectMemoryModel(request, () => {
+              // Observed promise/stream cleanup is local drain, never abort intent.
+              if (drained.size < 256) {
+                drained.add(id);
+                Queue.offerUnsafe(drainObservations, id);
+              }
+            }),
+          ),
+        ),
+      confirmModelTransportDrained: (id) =>
+        drained.has(id)
+          ? Effect.void
+          : Effect.fail(
+              new ProjectMemoryServiceError({
+                reason: "Original memory transport drain is not observed",
+              }),
+            ),
+      releaseModelTransportObservation: (id) =>
+        Effect.sync(() => {
+          drained.delete(id);
+        }),
+      // Separate bounded units do not prove an aggregate task resource ceiling.
+      // Keep activation held until the captured shared resource seam is available.
+      companion: () =>
+        Effect.fail(
+          new MemoryBackendError({
+            code: "unavailable",
+            message:
+              "Memory companion awaits shared task resource ownership and engineering verdicts",
+          }),
+        ),
+    });
+    yield* Effect.gen(function* () {
+      for (;;) {
+        const id = yield* Queue.take(drainObservations);
+        if (consumer.reconcileTransportDrain !== undefined) {
+          yield* consumer.reconcileTransportDrain(id).pipe(Effect.catch(() => Effect.void));
+        }
+      }
+    }).pipe(Effect.forkScoped);
+    return consumer;
+  }),
+).pipe(
+  Layer.provide(ProjectWorkCoreLive),
+  Layer.provide(ProjectTeamAuthorizationLive),
+  Layer.provide(ProjectWorkContentGuardLive),
+  Layer.provide(ServerEnvironmentLayerLive),
+  Layer.provide(ServerSecretStore.layer),
+);
+
 const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
+  Layer.provideMerge(ProjectMemoryProcessingLayerLive),
   Layer.provideMerge(ProjectTeamAuthorizationLive),
   Layer.provideMerge(ProjectWorkVerificationLive),
   Layer.provideMerge(AuthSessions.layer.pipe(Layer.provide(PersistenceLayerLive))),

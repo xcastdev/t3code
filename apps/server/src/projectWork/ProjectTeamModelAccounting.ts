@@ -131,6 +131,8 @@ type Row = {
   worker_id: string;
   generation: number;
   operation_id: string;
+  request_lane: string;
+  request_scope: string;
   request_id: number;
   route_id: string;
   provider: string;
@@ -147,6 +149,8 @@ type Row = {
   settlement_json: string | null;
 };
 const matchesReservation = (row: Row, reservation: PiModelRequestReservation) =>
+  row.request_lane === "pi" &&
+  row.request_scope === "" &&
   row.worker_id === reservation.workerId &&
   row.generation === reservation.generation &&
   row.operation_id === reservation.operationId &&
@@ -284,7 +288,8 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           )
             return yield* deny("Frozen root budget changed");
           const existing =
-            yield* sql<Row>`SELECT * FROM project_team_model_request WHERE worker_id=${reservation.workerId} AND generation=${reservation.generation} AND operation_id=${reservation.operationId} AND request_id=${reservation.requestId}`;
+            yield* sql<Row>`SELECT * FROM project_team_model_request WHERE worker_id=${reservation.workerId} AND generation=${reservation.generation} AND operation_id=${reservation.operationId} AND request_id=${reservation.requestId}
+              AND request_lane='pi' AND request_scope=''`;
           const previous = existing[0];
           if (previous) {
             const persisted = yield* storedReservation(previous.reservation_json);
@@ -312,6 +317,61 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           const total = used === undefined ? undefined : sum(used, maximum);
           if (total === undefined || total > operation.maximumTokens)
             return yield* deny("Root model budget exhausted");
+          // The root can contain several attempts. Every lane and operation in
+          // this original attempt consumes its admitted attempt ceiling.
+          const attempts = yield* sql<{ maximum: number | null; deadline: number | null }>`SELECT
+            CASE WHEN json_type(intent_json,'$.limits.attemptMaximumTokens')='integer'
+              THEN json_extract(intent_json,'$.limits.attemptMaximumTokens') END AS maximum,
+            CASE WHEN json_type(intent_json,'$.limits.deadlineAtMs')='integer'
+              THEN json_extract(intent_json,'$.limits.deadlineAtMs') END AS deadline
+            FROM project_team_dispatch WHERE environment_id=${policy.environmentId}
+              AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 2`;
+          const originalAttempt = attempts[0];
+          if (
+            attempts.length > 1 ||
+            (originalAttempt !== undefined &&
+              (originalAttempt.maximum === null ||
+                originalAttempt.deadline === null ||
+                !Number.isSafeInteger(originalAttempt.maximum) ||
+                originalAttempt.maximum <= 0 ||
+                !Number.isSafeInteger(originalAttempt.deadline) ||
+                originalAttempt.deadline <= 0))
+          )
+            return yield* deny("Original model attempt limits are unavailable");
+          const attemptMaximum = Math.min(
+            binding.configuration.maxTokens,
+            originalAttempt?.maximum ?? binding.configuration.maxTokens,
+          );
+          yield* clockCheck(Math.min(deadline, originalAttempt?.deadline ?? deadline));
+          const attemptUsage = yield* sql<{ tokens: number }>`SELECT
+            COALESCE(SUM(CASE WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
+              ELSE charged_input_tokens+charged_output_tokens END),0) AS tokens
+            FROM project_team_model_request WHERE environment_id=${policy.environmentId}
+              AND project_id=${binding.projectId} AND run_id=${binding.recordId}
+              AND generation=${binding.generation} AND attempt_id=${binding.attemptId}`;
+          const attemptTotal = sum(attemptUsage[0]?.tokens ?? -1, maximum);
+          if (
+            attemptTotal === undefined ||
+            (attemptUsage[0]?.tokens ?? -1) < 0 ||
+            !Number.isSafeInteger(attemptUsage[0]?.tokens) ||
+            attemptTotal > attemptMaximum
+          )
+            return yield* deny("Original attempt model budget exhausted");
+          const operationUsage = yield* sql<{ tokens: number }>`SELECT
+            COALESCE(SUM(CASE WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
+              ELSE charged_input_tokens+charged_output_tokens END),0) AS tokens
+            FROM project_team_model_request WHERE environment_id=${policy.environmentId}
+            AND project_id=${binding.projectId} AND run_id=${binding.recordId}
+            AND generation=${binding.generation} AND operation_id=${reservation.operationId}`;
+          const usedOperation = operationUsage[0]?.tokens;
+          if (
+            usedOperation === undefined ||
+            !Number.isSafeInteger(usedOperation) ||
+            usedOperation < 0 ||
+            !Number.isSafeInteger(usedOperation + maximum) ||
+            usedOperation + maximum > operation.operationMaximumTokens
+          )
+            return yield* deny("Original operation model budget exhausted");
           const slots = yield* sql<{
             environment_slot: number;
             model_slot: number;
@@ -376,7 +436,8 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           const rows =
-            yield* sql<Row>`SELECT * FROM project_team_model_request WHERE reservation_id=${settlement.reservationId}`;
+            yield* sql<Row>`SELECT * FROM project_team_model_request WHERE reservation_id=${settlement.reservationId}
+              AND request_lane='pi' AND request_scope=''`;
           const row = rows[0];
           if (
             !row ||

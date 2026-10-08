@@ -36,6 +36,8 @@ import {
 } from "./ProjectWorkVerificationGate.ts";
 import { ProjectWorkVerificationPreparationSelection } from "./ProjectWorkVerificationPreparation.ts";
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
+import { makeProjectMemoryProcessing } from "./memory/ProjectMemoryProcessing.ts";
+import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
 import * as ProjectTeamAuthorization from "./ProjectTeamAuthorization.ts";
 import * as ProjectWorkBriefing from "./ProjectWorkBriefing.ts";
 import * as IssueComments from "./ProjectIssueComments.ts";
@@ -484,6 +486,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     };
     const result: Effect.Effect<unknown, ProjectionRepositoryError> = (() => {
       switch (boundedInput.operation) {
+        case "memory-sources":
         case "integration-sources":
         case "verification-job":
           return Effect.fail(
@@ -1057,6 +1060,42 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     });
 
   const read: ProjectWorkGatewayShape["read"] = (input, principal) => {
+    if (input.operation === "memory-sources")
+      return sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const deny = () =>
+              new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+                reason: "Assigned memory source candidates unavailable",
+              });
+            if (
+              principal?.managed === undefined ||
+              Option.isNone(teamAuthorization) ||
+              input.taskId === undefined
+            )
+              return yield* deny();
+            const settings = yield* serverSettings.getSettings;
+            if (!settings.projectWorkEnabled) return yield* deny();
+            yield* teamAuthorization.value.read(principal, input);
+            const authority = yield* teamAuthorization.value.resolve(principal);
+            if (authority === undefined) return yield* deny();
+            const processing = yield* makeProjectMemoryProcessing;
+            const page = yield* processing.readSourcesInTransaction(input, authority);
+            yield* teamAuthorization.value.read(principal, input);
+            if (!(yield* serverSettings.getSettings).projectWorkEnabled) return yield* deny();
+            return page;
+          }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, repository),
+          ),
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            isTeamAuthorizationError(cause)
+              ? cause
+              : toPersistenceSqlError("ProjectWorkGateway.read")(cause),
+          ),
+        );
     if (input.operation === "integration-sources")
       return sql
         .withTransaction(
@@ -1422,6 +1461,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         records: [],
         committedAt: now,
       };
+      let retainedMemorySelection = false;
       const result = yield* executeAuthorized(
         envelope,
         () =>
@@ -1438,17 +1478,34 @@ const makeProjectWorkGateway = Effect.gen(function* () {
               ? teamAuthorization.value.guided(caller, input, attribution, false)
               : teamAuthorization.value.intent(caller, input, attribution, false);
           }),
-        ({ duplicate }) =>
-          (isGuidedIntent(input)
-            ? teamAuthorization.value.guided(caller, input, attribution, duplicate, "validate")
-            : teamAuthorization.value.intent(caller, input, attribution, duplicate)
-          ).pipe(Effect.asVoid),
+        ({ duplicate }) => {
+          retainedMemorySelection = duplicate;
+          return (
+            isGuidedIntent(input)
+              ? teamAuthorization.value.guided(caller, input, attribution, duplicate, "validate")
+              : teamAuthorization.value.intent(caller, input, attribution, duplicate)
+          ).pipe(Effect.asVoid);
+        },
         fingerprint,
       ).pipe((effect) =>
         Option.isSome(approval)
           ? Effect.provideService(effect, ProjectWorkVerificationApproval, approval.value)
           : effect,
       );
+      if (input.type === "project-team.memory.process" && !retainedMemorySelection) {
+        const ports = yield* Effect.serviceOption(ProjectMemoryPorts);
+        if (Option.isSome(ports) && ports.value.consume !== undefined) {
+          // The accepted selection survives a failed or uncertain forward stage.
+          // Exact retries return that receipt without resending model work.
+          yield* ports.value
+            .consume(caller, input.selection.effectId)
+            .pipe(
+              Effect.catch(() =>
+                Effect.logWarning("Selected memory work remains retained for reconciliation."),
+              ),
+            );
+        }
+      }
       return sanitizePublicValue(result.writeResult) as ProjectWorkWriteReceipt;
     });
   };

@@ -1881,6 +1881,7 @@ export const ProjectWorkReadOperation = Schema.Literals([
   "task-context",
   "verification-job",
   "integration-sources",
+  "memory-sources",
   "tasks",
   "attempts",
   "criteria",
@@ -1952,6 +1953,16 @@ export const ProjectWorkReadIntent = Schema.Struct({
         input.cursor === undefined &&
         (input.limit === undefined || input.limit <= 64)),
     { message: "Integration source candidates require an exact task and bounded page" },
+  ),
+  Schema.makeFilter(
+    (input) =>
+      input.operation !== "memory-sources" ||
+      (input.taskId !== undefined &&
+        input.query === undefined &&
+        input.state === undefined &&
+        input.offset === undefined &&
+        (input.limit === undefined || (input.limit > 0 && input.limit <= 32))),
+    { message: "Memory source candidates require an exact task and bounded keyset page" },
   ),
 );
 export type ProjectWorkReadIntent = typeof ProjectWorkReadIntent.Type;

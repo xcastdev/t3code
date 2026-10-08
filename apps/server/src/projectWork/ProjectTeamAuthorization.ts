@@ -1310,6 +1310,21 @@ export const layer = Layer.effect(
       if (!authority) return;
       if (input.projectId !== authority.binding.projectId)
         return yield* deny("Managed project mismatch");
+      if (input.operation === "memory-sources") {
+        if (
+          input.taskId !== authority.binding.taskId ||
+          authority.role.memoryAccess === "none" ||
+          !["project-work.read-task", "project-work.read-project"].some(
+            (tool) =>
+              authority.role.tools.includes(tool) &&
+              authority.binding.configuration.toolIds.includes(tool),
+          )
+        )
+          return yield* deny(
+            "Memory discovery requires the assigned task and frozen memory access",
+          );
+        return;
+      }
       if (
         authority.role.role === "coordinator" &&
         authority.role.tools.includes("project-work.read-project") &&
@@ -1416,6 +1431,31 @@ export const layer = Layer.effect(
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) {
+      if (input.type === "project-team.memory.process") {
+        const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+        const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+        if (
+          Option.isNone(currentSql) ||
+          currentSql.value !== sql ||
+          Option.isNone(repository) ||
+          Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+        )
+          return yield* deny("Memory selection requires its original gateway transaction");
+        const { makeProjectMemoryProcessing } = yield* Effect.promise(
+          () => import("./memory/ProjectMemoryProcessing.ts"),
+        );
+        const processing = yield* makeProjectMemoryProcessing.pipe(
+          Effect.provideService(SqlClient.SqlClient, sql),
+          Effect.provideService(ProjectWorkRepository, repository.value),
+        );
+        return yield* processing
+          .compileInTransaction(input, principal, attribution, resolve, duplicate)
+          .pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository.value),
+            Effect.mapError(() => deny("Memory source selection or original owner is invalid")),
+          );
+      }
       if (input.type === "project-team.message.send") yield* messageLoan();
       if (input.type === "project-team.question.request") {
         const currentSql = yield* Effect.serviceOption(SqlClient.SqlClient);

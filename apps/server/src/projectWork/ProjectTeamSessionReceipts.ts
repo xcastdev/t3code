@@ -24,6 +24,7 @@ import {
 import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
 import type { ProjectTeamDispatchSnapshot } from "./ProjectTeamDispatch.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { auditProjectMemoryOperationLedger } from "./memory/ProjectMemoryModelAccounting.ts";
 
 const strict = { onExcessProperty: "error" } as const;
 const encode = canonicalProjectWorkPayload;
@@ -544,7 +545,17 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         return yield* deny("Original Pi process/native ownership differs");
       const rawRequests = yield* sql<
         Record<string, unknown>
-      >`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,status,capacity_state,accounting_receipt_id,settlement_json,reservation_json,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,charged_input_tokens,charged_output_tokens FROM project_team_model_request WHERE operation_id=${operationId} LIMIT 257`;
+      >`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,status,capacity_state,accounting_receipt_id,settlement_json,reservation_json,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,charged_input_tokens,charged_output_tokens FROM project_team_model_request WHERE operation_id=${operationId}
+        AND request_lane='pi' AND request_scope='' LIMIT 257`;
+      const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
+        environmentId: options.environmentId,
+        projectId: binding.projectId,
+        bindingId: binding.recordId,
+        generation: row.generation,
+        operationId,
+      });
+      if (!memoryLedger.settled)
+        return yield* deny("Original memory model transport is not settled and drained");
       if (
         rawRequests.length > 256 ||
         rawRequests.length !== terminal.accountingReceipts.length ||

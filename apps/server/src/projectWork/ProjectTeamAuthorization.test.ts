@@ -13,6 +13,8 @@ import {
   ThreadId,
   CommandId,
   ProjectWorkEvidenceId,
+  ProjectWorkComment,
+  ProjectTeamMemorySourcesRead,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamGuidedIntent,
   ProviderInstanceId,
@@ -32,6 +34,8 @@ import { ProjectWorkToolkitHandlersLive } from "../mcp/toolkits/projectWork/hand
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
+import * as ContentGuard from "./ProjectWorkContentGuard.ts";
+import { makeProjectMemoryService } from "./memory/ProjectMemoryService.ts";
 import {
   projectTeamSpecificationHash,
   projectTeamScopeHash,
@@ -49,6 +53,205 @@ import {
   providerInstanceId,
   gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+
+const decodeMemoryDiscovery = Schema.decodeUnknownEffect(ProjectTeamMemorySourcesRead);
+const decodeMemoryComment = Schema.decodeUnknownEffect(ProjectWorkComment);
+const encodeMemoryDiscoveryJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
+it.effect(
+  "discovers exact retained memory source selectors through the authenticated task read",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer");
+      const role = decodeRecord({
+        ...f.role,
+        recordId: "memory-implementer-role",
+        roleId: "memory-implementer",
+        memoryAccess: "project",
+        tools: ["project-work.write", "project-work.read-task"],
+      });
+      if (role.kind !== "role-revision") return yield* Effect.die("Missing memory role");
+      yield* f.change(role);
+      yield* f.change(
+        decodeRecord({
+          ...f.member,
+          recordId: "memory-implementer",
+          roleRevisionId: role.recordId,
+        }),
+      );
+      const selectedTaskId = ProjectWorkTaskId.make("memory-approved-task");
+      const binding = yield* createManagedAssignment({
+        taskId: selectedTaskId,
+        recordId: "memory-approved-binding",
+        attemptId: "memory-approved-attempt",
+        commandId: "memory-approved-claim",
+        providerInstanceId,
+        threadId: ThreadId.make("memory-approved-thread"),
+        role,
+        status: "running",
+        configuration: { ...f.binding.configuration, toolIds: [...role.tools] },
+        memberId: "memory-implementer",
+        sessionId: "memory-approved-session",
+      });
+      const issued = yield* f.auth.issueCredential({
+        providerInstanceId: binding.providerInstanceId,
+        threadId: binding.threadId,
+      });
+      if (issued === undefined) return yield* Effect.die("Memory credential was not issued");
+      const principal = {
+        actor: { kind: "agent" as const, id: Authorization.managedActorId(issued.credential) },
+        managed: issued.credential,
+      };
+      const gateway = yield* ProjectWorkGateway;
+      const comment = yield* decodeMemoryComment({
+        commentId: "selected-memory-comment",
+        projectId,
+        taskId: selectedTaskId,
+        body: "The parser retains exact source provenance.",
+        revision: 0,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      yield* gateway.write(
+        {
+          type: "project-work.comment.add",
+          commandId: CommandId.make("selected-memory-comment-add"),
+          projectId,
+          comment,
+          addedAt: comment.createdAt,
+          attribution: {
+            actor: principal.actor,
+            source: { kind: "mcp", id: "memory-tool" },
+            recordedAt: comment.createdAt,
+          },
+        },
+        principal.actor,
+        { kind: "mcp", id: "memory-tool" },
+        principal,
+      );
+      const service = makeProjectMemoryService({
+        sql: f.sql,
+        repository: f.repo,
+        authorization: f.auth,
+        contentGuard: yield* ContentGuard.ProjectWorkContentGuard,
+        environmentId: binding.environmentId,
+      });
+      const source = yield* service.capture(principal, {
+        kind: "comment",
+        retainedId: comment.commentId,
+      });
+      const current = yield* readCurrentState(f.sql, projectId);
+      const effect = current.foundationRecords?.find(
+        (row) =>
+          row.kind === "effect" &&
+          row.effectKind === "memory-index" &&
+          row.targetId === source.recordId,
+      );
+      if (effect?.kind !== "effect") return yield* Effect.die("Captured memory effect absent");
+      expect(
+        yield* f.sql`SELECT status,input_json FROM project_team_memory_job WHERE effect_id=${effect.effectId}`,
+      ).toHaveLength(1);
+      const page = yield* gateway
+        .read(
+          { projectId, taskId: selectedTaskId, operation: "memory-sources", limit: 32 },
+          principal,
+        )
+        .pipe(Effect.flatMap(decodeMemoryDiscovery));
+      expect(page.items).toHaveLength(1);
+      expect(page.items[0]?.selection).toEqual({
+        kind: "comment",
+        retainedId: comment.commentId,
+        retainedRevision: comment.revision,
+        sourceRecordId: source.recordId,
+        expectedSourceRecordRevision: source.revision,
+        sourceRevision: source.sourceRevision,
+        sourceGeneration: source.generation,
+        contentHash: source.contentHash,
+        effectId: effect.effectId,
+        expectedEffectRevision: effect.revision,
+        expectedClaimGeneration: effect.claimGeneration,
+      });
+      expect(page.items[0]?.status).toBe("waiting");
+      expect(page.status).toBe("disabled");
+      const toolkit = yield* ProjectWorkToolkit.pipe(
+        Effect.provide(
+          ProjectWorkToolkitHandlersLive.pipe(
+            Layer.provide(Layer.succeed(ProjectWorkGateway, gateway)),
+          ),
+        ),
+      );
+      const fromMcp = yield* toolkit
+        .handle("project_work_read", {
+          projectId,
+          taskId: selectedTaskId,
+          operation: "memory-sources",
+          limit: 32,
+        })
+        .pipe(
+          Stream.unwrap,
+          Stream.runCollect,
+          Effect.provideService(Invocation.McpInvocationContext, {
+            environmentId: EnvironmentId.make(binding.environmentId),
+            providerInstanceId: binding.providerInstanceId,
+            threadId: binding.threadId,
+            providerSessionId: "memory-discovery-tool",
+            managed: principal.managed,
+            capabilities: new Set(["project" as const]),
+            issuedAt: 0,
+          }),
+        );
+      expect(fromMcp.at(-1)?.result).toEqual(page);
+      expect(
+        yield* gateway
+          .read({ projectId, taskId, operation: "memory-sources", limit: 32 }, principal)
+          .pipe(Effect.result),
+      ).toMatchObject({ _tag: "Failure" });
+      expect(
+        yield* gateway
+          .read({ projectId, taskId, operation: "memory-sources", limit: 32 }, f.principal)
+          .pipe(Effect.result),
+      ).toMatchObject({ _tag: "Failure" });
+      const malformed = encodeMemoryDiscoveryJson({ padding: "x".repeat(4096) });
+      expect(
+        yield* f.sql`SELECT json_valid(${malformed}) AS valid,
+      length(CAST(${malformed} AS BLOB)) AS bytes`,
+      ).toEqual([{ valid: 1, bytes: Buffer.byteLength(malformed) }]);
+      expect(Buffer.byteLength(malformed)).toBeLessThanOrEqual(262144);
+      yield* f.sql`INSERT INTO project_team_memory_job
+      (effect_id,environment_id,project_id,input_json,claim_generation,status,receipt_json)
+      VALUES ('000-corrupt-source',${binding.environmentId},${projectId},${malformed},0,'pending',NULL)`;
+      expect(
+        yield* f.sql`SELECT length(CAST(input_json AS BLOB)) AS bytes FROM project_team_memory_job
+      WHERE effect_id='000-corrupt-source'`,
+      ).toEqual([{ bytes: Buffer.byteLength(malformed) }]);
+      const degraded = yield* gateway
+        .read(
+          { projectId, taskId: selectedTaskId, operation: "memory-sources", limit: 1 },
+          principal,
+        )
+        .pipe(Effect.flatMap(decodeMemoryDiscovery));
+      expect(degraded).toMatchObject({
+        status: "degraded",
+        items: [],
+        nextCursor: "000-corrupt-source",
+      });
+      if (degraded.nextCursor === undefined)
+        return yield* Effect.die("Degraded source page lost its durable cursor");
+      const later = yield* gateway
+        .read(
+          {
+            projectId,
+            taskId: selectedTaskId,
+            operation: "memory-sources",
+            limit: 1,
+            cursor: degraded.nextCursor,
+          },
+          principal,
+        )
+        .pipe(Effect.flatMap(decodeMemoryDiscovery));
+      expect(later.items[0]?.selection).toEqual(page.items[0]?.selection);
+      expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(current.revision);
+    }).pipe(Effect.provide([ContentGuard.layer, gatewayRuntime])),
+);
 
 it.effect(
   "records an authenticated agent human question and retains its exact request after answer",
