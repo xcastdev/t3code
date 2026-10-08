@@ -24,6 +24,7 @@ import {
   ProjectMemorySettlement,
 } from "./ProjectMemoryModelAccounting.ts";
 import { readProjectMemoryCompletedDeletionInTransaction } from "./ProjectMemoryOutcome.ts";
+import { readProjectMemoryQueryOwnerById } from "./ProjectMemoryQuery.ts";
 import {
   ProjectMemoryServiceError,
   ProjectMemoryJobInput,
@@ -769,14 +770,9 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
     )
       return yield* deny("Retained memory lacks complete authenticated source cleanup");
     for (const query of queries) {
-      const rows = yield* sql<{
-        owner: string;
-      }>`SELECT owner_json AS owner FROM project_team_memory_query
-      WHERE query_id=${query.queryId} AND length(CAST(owner_json AS BLOB))<=262144`;
-      const savedQuery = rows[0];
-      if (rows.length !== 1 || savedQuery === undefined)
-        return yield* deny("Memory query owner is unavailable");
-      const owner = yield* decodeQueryOwner(savedQuery.owner);
+      const owner = yield* readProjectMemoryQueryOwnerById(sql, query.queryId);
+      if (owner.request.projectId !== projectId || owner.operation.environmentId !== environmentId)
+        return yield* deny("Memory query belongs to another project or host");
       yield* auditOperation(owner.operation);
     }
     if (
