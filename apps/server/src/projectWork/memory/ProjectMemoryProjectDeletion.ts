@@ -35,7 +35,6 @@ const deny = (reason: string) => new ProjectMemoryServiceError({ reason });
 const isServiceError = Schema.is(ProjectMemoryServiceError);
 const decodeSource = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectMemorySource));
 const decodeOwner = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectMemoryJobOwner));
-const decodeQueryOwner = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectMemoryQueryOwner));
 const equal = (a: unknown, b: unknown) =>
   canonicalProjectWorkPayload(a) === canonicalProjectWorkPayload(b);
 const strict = { onExcessProperty: "error" } as const;
@@ -110,8 +109,14 @@ const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.
     COALESCE(length(CAST(search_result_json AS BLOB)),0)+COALESCE(length(CAST(search_drain_json AS BLOB)),0)+
     COALESCE(length(CAST(result_json AS BLOB)),0) AS bytes FROM project_team_memory_query
     WHERE project_id=${projectId} ORDER BY query_id LIMIT 257`;
-    const models = yield* sql<{ id: string; bytes: number }>`SELECT reservation_id AS id,
-    length(CAST(reservation_json AS BLOB))+COALESCE(length(CAST(settlement_json AS BLOB)),0) AS bytes
+    const models = yield* sql<{ id: string | null; bytes: number }>`SELECT
+    CASE WHEN length(CAST(reservation_id AS BLOB))<=524288 THEN reservation_id END AS id,
+    length(CAST(reservation_json AS BLOB))+COALESCE(length(CAST(settlement_json AS BLOB)),0)+
+    length(CAST(environment_id AS BLOB))+length(CAST(project_id AS BLOB))+length(CAST(root_task_id AS BLOB))+
+    length(CAST(run_id AS BLOB))+length(CAST(attempt_id AS BLOB))+length(CAST(worker_id AS BLOB))+
+    length(CAST(operation_id AS BLOB))+length(CAST(request_scope AS BLOB))+length(CAST(route_id AS BLOB))+
+    length(CAST(provider AS BLOB))+length(CAST(model AS BLOB))+
+    length(CAST(reservation_id AS BLOB))+COALESCE(length(CAST(accounting_receipt_id AS BLOB)),0) AS bytes
     FROM project_team_model_request WHERE project_id=${projectId} AND request_lane='memory'
     ORDER BY reservation_id LIMIT 257`;
     const outcomes = yield* sql<{ id: string; bytes: number }>`SELECT effect_id AS id,
@@ -245,7 +250,7 @@ const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.
         (row.status !== "completed" && row.status !== "failed")
       )
         return yield* deny("Deleted project has an incomplete semantic query");
-      const owner = yield* decodeQueryOwner(row.owner);
+      const owner = yield* readProjectMemoryQueryOwnerById(sql, query.id);
       const result = yield* decodeObject(row.result);
       if (
         owner.operation.projectId !== projectId ||
@@ -314,21 +319,38 @@ const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.
       owners.set(query.id, owner);
     }
     for (const model of models) {
-      if (model.bytes > 524288) return yield* deny("Retained model accounting exceeds its bound");
+      if (model.id === null || model.bytes > 524288)
+        return yield* deny("Retained model accounting exceeds its bound");
       const rows = yield* sql<{
         reservation: string;
         settlement: string | null;
         capacity: string;
         status: string;
         receipt: string | null;
+        environment: string;
+        project: string;
+        root: string;
+        binding: string;
+        attempt: string;
         worker: string;
         generation: number;
         operation: string;
+        request: number;
+        scope: string;
+        route: string;
+        provider: string;
+        model: string;
+        maximumInput: number;
+        maximumOutput: number;
+        deadline: number;
         input: number;
         output: number;
       }>`SELECT
       reservation_json AS reservation,settlement_json AS settlement,capacity_state AS capacity,status,
-      accounting_receipt_id AS receipt,worker_id AS worker,generation,operation_id AS operation,
+      accounting_receipt_id AS receipt,environment_id AS environment,project_id AS project,
+      root_task_id AS root,run_id AS binding,attempt_id AS attempt,worker_id AS worker,generation,
+      operation_id AS operation,request_id AS request,request_scope AS scope,route_id AS route,provider,model,
+      maximum_input_tokens AS maximumInput,maximum_output_tokens AS maximumOutput,deadline_at_ms AS deadline,
       charged_input_tokens AS input,charged_output_tokens AS output FROM project_team_model_request
       WHERE project_id=${projectId} AND reservation_id=${model.id} AND request_lane='memory' LIMIT 2`;
       const row = rows[0];
@@ -352,12 +374,34 @@ const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.
         owner === undefined ||
         owner.version !== reservation.version ||
         reservation.ownerSha256 !== projectMemoryHash(owner) ||
+        owner.operation.environmentId !== row.environment ||
+        owner.operation.projectId !== row.project ||
+        owner.operation.rootTaskId !== row.root ||
+        owner.operation.bindingId !== row.binding ||
+        owner.operation.attemptId !== row.attempt ||
         owner.operation.workerId !== row.worker ||
         owner.operation.operationId !== row.operation ||
         owner.operation.generation !== row.generation ||
         reservation.workerId !== row.worker ||
         reservation.operationId !== row.operation ||
         reservation.generation !== row.generation ||
+        reservation.requestId !== row.request ||
+        reservation.scope !== row.scope ||
+        reservation.routeId !== row.route ||
+        reservation.provider !== row.provider ||
+        reservation.model !== row.model ||
+        reservation.maxInputTokens !== row.maximumInput ||
+        reservation.maxOutputTokens !== row.maximumOutput ||
+        reservation.deadlineAtMs !== row.deadline ||
+        reservation.deadlineAtMs >
+          Math.min(
+            owner.operation.operationDeadlineAtMs,
+            owner.operation.attemptDeadlineAtMs,
+            owner.operation.rootDeadlineAtMs,
+            owner.operation.leaseDeadlineAtMs,
+          ) ||
+        reservation.maxInputTokens + reservation.maxOutputTokens >
+          owner.operation.operationMaximumTokens ||
         reservationId !== model.id ||
         !equal(reservation, original) ||
         outcome !== row.status ||
@@ -548,12 +592,26 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
     const outcomes = yield* sql<{ effectId: string }>`SELECT effect_id AS effectId
     FROM project_team_memory_outcome WHERE project_id=${projectId} ORDER BY effect_id LIMIT 257`;
     const modelRows = yield* sql<{
-      reservationId: string;
-      workerId: string;
+      environmentId: string | null;
+      projectId: string | null;
+      rootTaskId: string | null;
+      bindingId: string | null;
+      attemptId: string | null;
+      workerId: string | null;
       generation: number;
-      operationId: string;
+      operationId: string | null;
+      bytes: number;
     }>`SELECT
-    reservation_id AS reservationId,worker_id AS workerId,generation,operation_id AS operationId
+    CASE WHEN length(CAST(environment_id AS BLOB))<=1024 THEN environment_id END AS environmentId,
+    CASE WHEN length(CAST(project_id AS BLOB))<=1024 THEN project_id END AS projectId,
+    CASE WHEN length(CAST(root_task_id AS BLOB))<=1024 THEN root_task_id END AS rootTaskId,
+    CASE WHEN length(CAST(run_id AS BLOB))<=1024 THEN run_id END AS bindingId,
+    CASE WHEN length(CAST(attempt_id AS BLOB))<=1024 THEN attempt_id END AS attemptId,
+    CASE WHEN length(CAST(worker_id AS BLOB))<=1024 THEN worker_id END AS workerId,generation,
+    CASE WHEN length(CAST(operation_id AS BLOB))<=1024 THEN operation_id END AS operationId,
+    length(CAST(environment_id AS BLOB))+length(CAST(project_id AS BLOB))+length(CAST(root_task_id AS BLOB))+
+    length(CAST(run_id AS BLOB))+length(CAST(attempt_id AS BLOB))+length(CAST(worker_id AS BLOB))+
+    length(CAST(operation_id AS BLOB)) AS bytes
     FROM project_team_model_request WHERE project_id=${projectId} AND request_lane='memory'
     ORDER BY reservation_id LIMIT 257`;
     if (
@@ -562,6 +620,7 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
       manifests.length > 256 ||
       outcomes.length > 256 ||
       modelRows.length > 256 ||
+      modelRows.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > 7168) ||
       jobs.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > 786432) ||
       jobs.some(
         (row) =>
@@ -572,7 +631,10 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
       manifests.some((row) => !Number.isSafeInteger(row.bytes) || row.bytes > 4194304)
     )
       return yield* deny("Memory cleanup history exceeds its bounded deletion audit");
-    bytes += [...jobs, ...queries, ...manifests].reduce((total, row) => total + row.bytes, 0);
+    bytes += [...jobs, ...queries, ...manifests, ...modelRows].reduce(
+      (total, row) => total + row.bytes,
+      0,
+    );
     if (bytes > 4194304) return yield* deny("Memory cleanup history exceeds its byte allowance");
     const sources = records.get("source") ?? [];
     const recordedMemory = yield* sql`SELECT event_id FROM project_work_events
@@ -644,14 +706,18 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
         return yield* deny("Memory foundation and physical storage disagree");
     }
     const auditedOperations = new Set<string>();
-    const auditedWorkers = new Set<string>();
     const auditOperation = Effect.fn("ProjectMemoryProjectDeletion.auditOperation")(function* (
       operation: typeof ProjectMemoryJobOwner.Type.operation,
     ) {
       if (operation.projectId !== projectId || operation.environmentId !== environmentId)
         return yield* deny("Memory cleanup owner belongs to another project or host");
       const key = canonicalProjectWorkPayload([
+        operation.environmentId,
+        operation.projectId,
+        operation.rootTaskId,
         operation.bindingId,
+        operation.attemptId,
+        operation.workerId,
         operation.generation,
         operation.operationId,
       ]);
@@ -660,13 +726,6 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
       if (!ledger.settled)
         return yield* deny("Memory cleanup still has pending or undrained stages");
       auditedOperations.add(key);
-      auditedWorkers.add(
-        canonicalProjectWorkPayload([
-          operation.workerId,
-          operation.generation,
-          operation.operationId,
-        ]),
-      );
     });
     const deleteCoverage = new Set<string>();
     const indexedSources: Array<typeof ProjectMemoryJobInput.Type> = [];
@@ -790,8 +849,17 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
     if (
       modelRows.some(
         (row) =>
-          !auditedWorkers.has(
-            canonicalProjectWorkPayload([row.workerId, row.generation, row.operationId]),
+          !auditedOperations.has(
+            canonicalProjectWorkPayload([
+              row.environmentId,
+              row.projectId,
+              row.rootTaskId,
+              row.bindingId,
+              row.attemptId,
+              row.workerId,
+              row.generation,
+              row.operationId,
+            ]),
           ),
       )
     )

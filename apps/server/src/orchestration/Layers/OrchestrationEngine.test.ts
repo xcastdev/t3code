@@ -20,6 +20,7 @@ import {
   EnvironmentId,
   ProjectWorkTaskId,
   ProjectWorkCommentId,
+  canonicalProjectWorkPayload,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
@@ -29,6 +30,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -70,6 +72,11 @@ import * as ContentGuard from "../../projectWork/ProjectWorkContentGuard.ts";
 import { makeProjectMemoryService } from "../../projectWork/memory/ProjectMemoryService.ts";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import { ProjectLifecycle, ProjectLifecycleLive } from "../../project/ProjectLifecycle.ts";
+import { ProjectMemoryQueryOwner } from "../../projectWork/memory/ProjectMemoryModelAccounting.ts";
+
+const decodeRetainedQueryOwner = Schema.decodeUnknownEffect(ProjectMemoryQueryOwner, {
+  onExcessProperty: "error",
+});
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -236,6 +243,188 @@ effectIt.effect(
       ),
     );
   },
+);
+
+effectIt.effect(
+  "joins retained failed query identity before synchronizing a recorded lifecycle deletion",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const engine = yield* OrchestrationEngineService;
+      const lifecycle = yield* ProjectLifecycle;
+      const sql = yield* SqlClient.SqlClient;
+      for (const physicalDrift of [false, true]) {
+        const suffix = physicalDrift ? "binding-drift" : "matching";
+        const projectId = ProjectId.make(`retained-query-sync-${suffix}`);
+        const workspaceRoot = `/workspace/retained-query-${suffix}`;
+        const queryId = `retained-query-${suffix}`;
+        const commandId = `retained-query-command-${suffix}`;
+        yield* engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make(`retained-query-create-${suffix}`),
+          projectId,
+          title: "Retained query synchronization",
+          workspaceRoot,
+          createdAt: now(),
+        });
+        expect(
+          (yield* lifecycle.permanentDelete({
+            projectId,
+            commandId: CommandId.make(`retained-query-purge-${suffix}`),
+            workspaceRoot,
+            confirmation: "permanent-local-delete",
+          })).project.state,
+        ).toBe("tombstoned");
+        const lifecycleReceipts = yield* sql`SELECT * FROM project_lifecycle_operations
+          WHERE project_id=${projectId}`;
+        // This legal failed-before-stage journal supplies no execution authority.
+        // Synchronization must still join its immutable physical identity.
+        const owner = yield* decodeRetainedQueryOwner({
+          version: 2,
+          kind: "query",
+          operation: {
+            version: 1,
+            environmentId: "deletion-environment",
+            projectId,
+            taskId: "retained-query-task",
+            bindingId: "retained-query-binding",
+            generation: 0,
+            providerInstanceId: "pi",
+            threadId: "retained-query-thread",
+            operationId: "retained-query-operation",
+            workerId: "retained-query-worker",
+            ordinal: 0,
+            attemptId: "retained-query-attempt",
+            rootBindingId: "retained-query-root-binding",
+            rootTaskId: "retained-query-task",
+            rootMaximumTokens: 1,
+            rootDeadlineAtMs: 1,
+            attemptMaximumTokens: 1,
+            attemptDeadlineAtMs: 1,
+            operationMaximumTokens: 1,
+            operationDeadlineAtMs: 1,
+            leaseDeadlineAtMs: 1,
+            roleSha256: "0".repeat(64),
+            configurationSha256: "0".repeat(64),
+            requestSha256: "0".repeat(64),
+            allocation: {
+              version: 1,
+              unit: "retained-query-unexecuted-unit",
+              nonce: "retained-query-unexecuted-nonce",
+              policy: { memoryBytes: 16777216, runtimeSeconds: 1 },
+              launch: {
+                workspaceRoot: "/fixture/unexecuted",
+                workspace: { path: "/fixture/unexecuted", dev: 0, ino: 0 },
+                protectedRoots: [],
+                protectedWorkspaceEntries: [],
+                runtimeFiles: [],
+                argv: [],
+                memoryBytes: 16777216,
+                runtimeSeconds: 1,
+              },
+            },
+          },
+          request: {
+            type: "project-team.memory.query",
+            commandId,
+            projectId,
+            taskId: "retained-query-task",
+            expectedRevision: 0,
+            expectedTaskRevision: 0,
+            specRevision: 0,
+            planRevision: 0,
+            query: "Retained failed query with no model stage",
+          },
+          configurationSha256: "0".repeat(64),
+          taskScopeSha256: "0".repeat(64),
+          intentFingerprint: "unexecuted-retained-query",
+          actorId: "retained-query-worker",
+          sourceKind: "mcp",
+          sourceId: "retained-query-thread",
+          admittedAt: now(),
+          admittedEffect: {
+            kind: "effect",
+            recordId: queryId,
+            effectId: queryId,
+            projectId,
+            revision: 0,
+            generation: 0,
+            updatedAt: now(),
+            status: "pending",
+            effectKind: "memory-query",
+            targetId: commandId,
+            payload: { recordIds: [], expectedRevision: 0 },
+            claimGeneration: 0,
+            availableAt: now(),
+          },
+        });
+        yield* sql`INSERT INTO project_team_memory_query
+          (query_id,environment_id,project_id,task_id,binding_id,generation,operation_id,command_id,
+           owner_json,status,result_json)
+          VALUES (${queryId},${owner.operation.environmentId},${projectId},${owner.operation.taskId},
+            ${physicalDrift ? "foreign-query-binding" : owner.operation.bindingId},
+            ${owner.operation.generation},${owner.operation.operationId},${commandId},
+            ${canonicalProjectWorkPayload(owner)},'failed',${canonicalProjectWorkPayload({
+              kind: "memory-query-result",
+              version: 1,
+              queryId,
+              outcome: "failed",
+            })})`;
+        const journal =
+          yield* sql`SELECT * FROM project_team_memory_query WHERE query_id=${queryId}`;
+        expect(journal).toHaveLength(1);
+        const result = yield* engine
+          .dispatch({
+            type: "project.delete",
+            commandId: CommandId.make(`retained-query-sync-${suffix}`),
+            projectId,
+            force: true,
+          })
+          .pipe(Effect.result);
+        if (physicalDrift) {
+          expect(result).toMatchObject({
+            _tag: "Failure",
+            failure: {
+              _tag: "OrchestrationCommandInvariantError",
+              detail: "memory-cleanup-required",
+            },
+          });
+        } else expect(result._tag).toBe("Success");
+        const projection = yield* sql<{ at: string | null }>`SELECT deleted_at AS at
+          FROM projection_projects WHERE project_id=${projectId}`;
+        expect(projection).toHaveLength(1);
+        if (physicalDrift) expect(projection[0]?.at).toBeNull();
+        else expect(projection[0]?.at).not.toBeNull();
+        expect(
+          yield* sql`SELECT * FROM project_team_memory_query WHERE query_id=${queryId}`,
+        ).toEqual(journal);
+        expect(
+          yield* sql`SELECT * FROM project_lifecycle_operations WHERE project_id=${projectId}`,
+        ).toEqual(lifecycleReceipts);
+        expect(yield* sql`SELECT * FROM project_work_tasks WHERE project_id=${projectId}`).toEqual(
+          [],
+        );
+        expect(yield* sql`SELECT * FROM project_work_events WHERE project_id=${projectId}`).toEqual(
+          [],
+        );
+        expect(
+          yield* sql`SELECT * FROM project_team_model_request WHERE project_id=${projectId}`,
+        ).toEqual([]);
+      }
+    }).pipe(
+      Effect.provide(
+        ProjectLifecycleLive.pipe(
+          Layer.provideMerge(makeOrchestrationLayer()),
+          Layer.provideMerge(SqlitePersistenceMemory),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(
+            Layer.succeed(ServerEnvironmentIdentity, {
+              getEnvironmentId: Effect.succeed(EnvironmentId.make("deletion-environment")),
+            }),
+          ),
+        ),
+      ),
+    ),
 );
 
 effectIt.effect(

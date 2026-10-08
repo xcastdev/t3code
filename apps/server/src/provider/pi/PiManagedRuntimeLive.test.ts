@@ -111,6 +111,7 @@ import type { ProjectMemoryRetrieval } from "../../projectWork/memory/ProjectMem
 import {
   ProjectMemoryServiceError,
   makeProjectMemoryService,
+  projectMemoryHash,
 } from "../../projectWork/memory/ProjectMemoryService.ts";
 import {
   ProjectWorkContentGuard,
@@ -8707,6 +8708,111 @@ for (const compactProof of [
                   expect(memoryExchanges).toBe(0);
                   expect(memoryBackendCalls).toBe(2);
                   yield* f.sql`DELETE FROM project_team_memory_manifest WHERE extraction_id=${orphanExtractionId}`;
+                }
+                const completedOwners = yield* f.sql<{ owner: string }>`SELECT owner_json AS owner
+                  FROM project_team_memory_job WHERE project_id=${projectId} AND status='settled'
+                    AND owner_json IS NOT NULL AND json_extract(input_json,'$.effect.effectKind')='memory-delete'
+                  ORDER BY effect_id LIMIT 1`;
+                const completedOwnerJson = completedOwners[0]?.owner;
+                if (completedOwnerJson === undefined)
+                  return yield* Effect.die("Completed cleanup owner missing");
+                const completedOwner = yield* decodeMemoryLedgerOwner(completedOwnerJson);
+                const originalOperation = completedOwner.operation;
+                for (const drift of ["binding", "attempt"] as const) {
+                  const orphanReservationId = `live-foreign-${drift}-memory-reservation`;
+                  const physicalBinding =
+                    drift === "binding"
+                      ? `${originalOperation.bindingId}-foreign`
+                      : originalOperation.bindingId;
+                  const physicalAttempt =
+                    drift === "attempt"
+                      ? `${originalOperation.attemptId}-foreign`
+                      : originalOperation.attemptId;
+                  const reservation = {
+                    version: 1,
+                    lane: "memory",
+                    scope: "0".repeat(64),
+                    effectId: completedOwner.selection.effectId,
+                    ownerSha256: projectMemoryHash(completedOwner),
+                    phase: "extract",
+                    workerId: originalOperation.workerId,
+                    generation: originalOperation.generation,
+                    operationId: originalOperation.operationId,
+                    requestId: 1,
+                    routeId: "controlled-orphan-memory-route",
+                    provider: "command-code",
+                    model: "inclusionai/ling-3.1-flash:free",
+                    maxInputTokens: 1,
+                    maxOutputTokens: 1,
+                    callCount: 1,
+                    deadlineAtMs: Math.min(
+                      originalOperation.rootDeadlineAtMs,
+                      originalOperation.attemptDeadlineAtMs,
+                      originalOperation.operationDeadlineAtMs,
+                      originalOperation.leaseDeadlineAtMs,
+                    ),
+                  };
+                  const settlement = decodeQueryRecoverySettlement(
+                    json({
+                      ...reservation,
+                      reservationId: orphanReservationId,
+                      outcome: "failed",
+                      chargedInputTokens: 1,
+                      chargedOutputTokens: 1,
+                      transportDrained: true,
+                    }),
+                  );
+                  expect(
+                    yield* f.sql`SELECT reservation_id FROM project_team_model_request
+                  WHERE reservation_id=${orphanReservationId}`,
+                  ).toEqual([]);
+                  // This disposable released row is not an actual model request.
+                  // Matching worker/operation fields cannot cover foreign binding or attempt.
+                  yield* f.sql`INSERT INTO project_team_model_request
+                  (reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,
+                   generation,operation_id,request_id,request_lane,request_scope,route_id,provider,model,
+                   environment_slot,model_slot,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,
+                   status,charged_input_tokens,charged_output_tokens,accounting_receipt_id,
+                   reservation_json,settlement_json,capacity_state)
+                  VALUES (${orphanReservationId},${originalOperation.environmentId},${projectId},
+                    ${originalOperation.rootTaskId},${physicalBinding},${physicalAttempt},
+                    ${originalOperation.workerId},${originalOperation.generation},${originalOperation.operationId},
+                    1,'memory',${reservation.scope},${reservation.routeId},${reservation.provider},${reservation.model},
+                    0,0,1,1,${reservation.deadlineAtMs},'failed',1,1,'controlled-orphan-memory-accounting',
+                    ${json(reservation)},${json(settlement)},'released')`;
+                  const orphanRow = yield* f.sql`SELECT * FROM project_team_model_request
+                  WHERE reservation_id=${orphanReservationId}`;
+                  expect(orphanRow).toHaveLength(1);
+                  expect(orphanRow[0]).toMatchObject({
+                    run_id: physicalBinding,
+                    attempt_id: physicalAttempt,
+                    worker_id: originalOperation.workerId,
+                    generation: originalOperation.generation,
+                    operation_id: originalOperation.operationId,
+                    root_task_id: originalOperation.rootTaskId,
+                    request_lane: "memory",
+                    capacity_state: "released",
+                  });
+                  expect(yield* deleteRetainedProject().pipe(Effect.result), drift).toMatchObject({
+                    _tag: "Failure",
+                    failure: { _tag: "ProjectLifecycleError", reason: "memory-cleanup-required" },
+                  });
+                  expect(
+                    yield* f.sql`SELECT deleted_at FROM projection_projects
+                  WHERE project_id=${projectId}`,
+                  ).toEqual([{ deleted_at: null }]);
+                  expect(
+                    yield* f.sql`SELECT * FROM project_work_tasks
+                  WHERE project_id=${projectId}`,
+                  ).toEqual(retainedTasks);
+                  expect(
+                    yield* f.sql`SELECT * FROM project_team_model_request
+                  WHERE reservation_id=${orphanReservationId}`,
+                  ).toEqual(orphanRow);
+                  expect(memoryExchanges).toBe(0);
+                  expect(memoryBackendCalls).toBe(2);
+                  yield* f.sql`DELETE FROM project_team_model_request
+                  WHERE reservation_id=${orphanReservationId}`;
                 }
                 const journals =
                   yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
