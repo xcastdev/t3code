@@ -220,7 +220,7 @@ function ProjectWorkPage({
               </p>
             </div>
             <nav
-              className="flex min-w-0 gap-1 overflow-x-auto border-b border-border/70"
+              className="flex min-w-0 shrink-0 gap-1 overflow-x-auto border-b border-border/70"
               aria-label="Work sections"
             >
               {TAB_ITEMS.map(({ id, label, icon: Icon }) => (
