@@ -42,6 +42,8 @@ const decodeSelection = Schema.decodeUnknownSync(
 const decodeEvidence = Schema.decodeUnknownEffect(ProjectTeamWorkspaceEvidence, {
   onExcessProperty: "error",
 });
+// Preserve exact schema-encoded workspace receipts alongside retained canonical receipts.
+const encodeWorkspace = Schema.encodeSync(Schema.fromJsonString(ProjectTeamWorkspaceReceipt));
 const decodeWorkspace = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectTeamWorkspaceReceipt),
   { onExcessProperty: "error" },
@@ -312,7 +314,7 @@ export function makeProjectWorkVerificationGate(input: typeof Options.Type) {
         );
         if (
           canonical(original.assignment) !== canonical(snapshot.intent.request.git) ||
-          raw !== canonical(original) ||
+          (raw !== canonical(original) && raw !== encodeWorkspace(original)) ||
           hash(original) !== job.workspaceReceiptHash ||
           original.assignment.primaryRoot !== job.target.repository ||
           original.assignment.worktreePath !== job.target.worktree ||

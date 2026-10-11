@@ -704,8 +704,9 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const { control, managerEnv } = yield* makeManagedControl();
   const version = yield* control("/usr/bin/bwrap", ["--version"]);
-  if (version.code !== 0 || version.stdout.trim() !== "bubblewrap 0.12.0")
-    return yield* fail("unavailable", "Managed execution requires the proven bubblewrap 0.12.0.");
+  const release = version.stdout.trim();
+  if (version.code !== 0 || (release !== "bubblewrap 0.12.0" && release !== "bubblewrap 0.13.0"))
+    return yield* fail("unavailable", "Managed execution requires bubblewrap 0.12.0 or 0.13.0.");
   const helper = yield* path
     .fromFileUrl(new URL("./pi-managed-process-owner.py", import.meta.url))
     .pipe(

@@ -271,6 +271,67 @@ describe("managed runtime mount validation", () => {
   );
 });
 
+describe("managed bubblewrap compatibility", () => {
+  for (const [label, response, code, accepted] of [
+    ["0.12.0", "bubblewrap 0.12.0\n", 0, true],
+    ["0.13.0", "bubblewrap 0.13.0\n", 0, true],
+    ["older version", "bubblewrap 0.11.0\n", 0, false],
+    ["unproven newer version", "bubblewrap 0.14.0\n", 0, false],
+    ["modified version", "bubblewrap 0.13.0-custom\n", 0, false],
+    ["additional output", "bubblewrap 0.13.0\nforeign", 0, false],
+    ["nonzero status", "bubblewrap 0.13.0\n", 1, false],
+  ] as const)
+    check(`fences ${label} before native activation`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const allocation = yield* preallocatePiManagedProcess(input);
+          const original = yield* ChildProcessSpawner.ChildProcessSpawner;
+          let claims = 0;
+          let unitLaunches = 0;
+          const spawner = ChildProcessSpawner.make((command) => {
+            if (command._tag === "StandardCommand" && command.command === "/usr/bin/bwrap") {
+              expect(command.args).toEqual(["--version"]);
+              return original.spawn(
+                ChildProcess.make("/usr/bin/bash", [
+                  "-c",
+                  'printf "%s" "$1"; exit "$2"',
+                  "version-control",
+                  response,
+                  String(code),
+                ]),
+              );
+            }
+            if (command._tag === "StandardCommand" && command.command === "/usr/bin/systemd-run")
+              unitLaunches++;
+            return original.spawn(command);
+          });
+          const error = yield* acquirePiManagedProcess(input, {
+            allocation,
+            claimActivation: (originalAllocation) => {
+              expect(originalAllocation).toEqual(allocation);
+              claims++;
+              return Effect.fail(
+                new PiManagedProcessError({
+                  phase: "startup",
+                  message: "Accepted version stopped before unit activation",
+                }),
+              );
+            },
+            beforeStart: () => Effect.die("Version control must not acquire a native owner"),
+          }).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.flip,
+          );
+          expect(error.phase).toBe(accepted ? "startup" : "unavailable");
+          if (accepted)
+            expect(error.message).toBe("Accepted version stopped before unit activation");
+          expect(claims).toBe(accepted ? 1 : 0);
+          expect(unitLaunches).toBe(0);
+        }),
+      ),
+    );
+});
+
 // Required separately: PI_MANAGED_PROCESS_LINUX_GATE=1 vp test run <this file>.
 // Ordinary discovery never launches systemd or claims a Linux containment proof.
 describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
