@@ -830,11 +830,13 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
-        const prepared = yield* f.instance.prepareOperation(
-          { threadId, kind: "initialize" },
-          () => Effect.void,
-        );
+        const f = yield* dispatchedRuntimeFixture();
+        const request = {
+          threadId,
+          kind: "initialize" as const,
+          operationId: f.request.initializeOperationId,
+        };
+        const prepared = yield* f.instance.prepareOperation(request, () => Effect.void);
         expect(prepared.operation.operationKind).toBe("initialize");
         yield* rejected(f.sql.withTransaction(prepared.run));
         yield* rejected(prepared.run.pipe(Effect.provide(makeSqlitePersistenceLive(":memory:"))));
@@ -845,20 +847,22 @@ it.effect(
           (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_operation`)[0]
             ?.status,
         ).toBe("prepared");
-        yield* rejected(
-          f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
-        );
+        yield* rejected(f.instance.prepareOperation(request, () => Effect.void));
+        const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
         yield* f.instance.requestStop(threadId);
         expect(
           (yield* f.sql<{ status: string }>`SELECT status FROM project_team_pi_operation`)[0]
             ?.status,
         ).toBe("settled");
         yield* rejected(prepared.run);
-        const next = yield* f.instance.prepareOperation(
-          { threadId, kind: "initialize" },
-          () => Effect.void,
-        );
-        expect(next.operation.operationId).not.toBe(prepared.operation.operationId);
+        yield* rejected(f.instance.prepareOperation(request, () => Effect.void));
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([
+          { operation_id: f.request.initializeOperationId },
+        ]);
+        expect(
+          yield* f.sql`SELECT status,owner_json,drain_json FROM project_team_pi_process`,
+        ).toEqual([{ status: "drained", owner_json: null, drain_json: null }]);
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budget);
         yield* f.instance.stopAll;
         expect(
           (yield* f.sql<{
@@ -1636,9 +1640,9 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
 it.effect("derives primary and common Git protection without caller hints", () =>
   scoped(
     Effect.gen(function* () {
-      const f = yield* fixture;
+      const f = yield* dispatchedRuntimeFixture();
       const prepared = yield* f.instance.prepareOperation(
-        { threadId, kind: "initialize" },
+        { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
         () => Effect.void,
       );
       const rows = yield* f.sql<{
@@ -2016,18 +2020,56 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
+        const f = yield* dispatchedRuntimeFixture();
         const custom = f.main + "-credentials";
         const inside = f.worktree + "/credentials";
         yield* f.fs.makeDirectory(custom);
         yield* f.fs.makeDirectory(inside);
+        const insideInstance = yield* f.runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: { agentDirectory: inside },
+        });
+        let overlap: unknown;
+        const preallocate = ManagedProcess.preallocatePiManagedProcess;
+        const overlapSpy = vi
+          .spyOn(ManagedProcess, "preallocatePiManagedProcess")
+          .mockImplementation((input) =>
+            preallocate(input).pipe(
+              Effect.tapError((error) =>
+                Effect.sync(() => {
+                  overlap = error;
+                }),
+              ),
+            ),
+          );
+        expect(
+          yield* insideInstance
+            .prepareOperation(
+              { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
+              () => Effect.void,
+            )
+            .pipe(Effect.result, Effect.ensuring(Effect.sync(() => overlapSpy.mockRestore()))),
+        ).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "PiManagedRuntimeError", code: "unavailable" },
+        });
+        expect(overlap).toMatchObject({
+          _tag: "PiManagedProcessError",
+          phase: "validation",
+          message: "Assigned cwd overlaps protected data.",
+        });
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+        expect(yield* f.sql`SELECT unit FROM project_team_pi_process`).toEqual([]);
+        expect(f.allocations).toBe(1);
+        expect(f.transports).toBe(0);
         const outsideInstance = yield* f.runtime.forInstance({
           instanceId: providerInstanceId,
           enabled: true,
           configuration: { agentDirectory: custom },
         });
         const prepared = yield* outsideInstance.prepareOperation(
-          { threadId, kind: "initialize" },
+          { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
           () => Effect.void,
         );
         const rows = yield* f.sql<{
@@ -2038,14 +2080,6 @@ it.effect(
         ).toContain(custom);
         yield* outsideInstance.requestStop(threadId);
         yield* rejected(prepared.run);
-        const insideInstance = yield* f.runtime.forInstance({
-          instanceId: providerInstanceId,
-          enabled: true,
-          configuration: { agentDirectory: inside },
-        });
-        yield* rejected(
-          insideInstance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
-        );
         expect((yield* f.sql`SELECT * FROM project_team_pi_operation`).length).toBe(1);
       }),
     ),
@@ -2339,21 +2373,30 @@ it.effect(
     ) =>
       scoped(
         Effect.gen(function* () {
-          const f = yield* fixture;
-          yield* restoreHistoricalBinding({
-            ...f.role,
-            revision: f.role.revision + 1,
-            tools: roleTools,
-          });
-          yield* restoreHistoricalBinding({
-            ...f.binding,
-            revision: f.binding.revision + 1,
-            configuration: { ...f.binding.configuration, toolIds },
-          });
+          const profile = {
+            ...basicRuntimeProfile,
+            role: toolIds.some((tool) => ["pi.write", "pi.edit", "pi.bash"].includes(tool))
+              ? ("implementer" as const)
+              : ("investigator" as const),
+            roleTools,
+            toolIds,
+          };
+          if (toolIds.some((tool) => !roleTools.includes(tool))) {
+            expect(available).toBe(false);
+            expect(yield* dispatchedRuntimeFixture(profile).pipe(Effect.result)).toMatchObject({
+              _tag: "Failure",
+              failure: { _tag: "ProjectWorkPolicyError", code: "authority-required" },
+            });
+            const sql = yield* SqlClient.SqlClient;
+            expect(yield* sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+            expect(yield* sql`SELECT unit FROM project_team_pi_process`).toEqual([]);
+            return;
+          }
+          const f = yield* dispatchedRuntimeFixture(profile);
           const before = (yield* f.sql`SELECT * FROM project_team_pi_process`).length;
           if (available) {
             const prepared = yield* f.instance.prepareOperation(
-              { threadId, kind: "initialize" },
+              { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
               () => Effect.void,
             );
             const allocations = yield* f.sql<{
@@ -2367,7 +2410,10 @@ it.effect(
             yield* rejected(prepared.run);
           } else {
             yield* rejected(
-              f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+              f.instance.prepareOperation(
+                { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
+                () => Effect.void,
+              ),
             );
             expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(before);
           }
@@ -3316,78 +3362,95 @@ for (const mode of ["unchanged", "expired", "queued-stop"] as const)
   );
 
 const selectedRuntimeLayer = Materialization.layer.pipe(Layer.provideMerge(skillAuthorityLayer));
-const selectedRuntimeFixture = Effect.fn("PiManagedRuntimeLive.selectedRuntimeFixture")(
-  function* () {
-    const f = yield* fixture;
-    const repository = yield* ManagedSkills.ManagedSkillRepository;
-    const materialization = yield* Materialization.SkillMaterializationService;
-    const skill = yield* repository.createGlobal({
-      expectedRevision: 0,
-      content: {
-        key: ManagedSkillKey.make("selected-runtime"),
-        name: "Selected Runtime",
-        body: "Inert selected package.",
-      },
-    });
+const selectedRuntimeFixture = Effect.fn("PiManagedRuntimeLive.selectedRuntimeFixture")(function* (
+  genuine = false,
+) {
+  const historical = genuine ? undefined : yield* fixture;
+  const repository = yield* ManagedSkills.ManagedSkillRepository;
+  const materialization = yield* Materialization.SkillMaterializationService;
+  const skill = yield* repository.createGlobal({
+    expectedRevision: 0,
+    content: {
+      key: ManagedSkillKey.make("selected-runtime"),
+      name: "Selected Runtime",
+      body: "Inert selected package.",
+    },
+  });
+  const dispatched = genuine
+    ? yield* dispatchedRuntimeFixture({
+        ...basicRuntimeProfile,
+        roleSkillIds: [skill.manifest.id],
+        skillIds: [skill.manifest.id],
+      })
+    : undefined;
+  const f = historical ?? dispatched;
+  if (!f) return yield* Effect.die("Missing selected runtime fixture");
+  if (historical) {
     yield* restoreHistoricalBinding({
-      ...f.role,
-      revision: f.role.revision + 1,
+      ...historical.role,
+      revision: historical.role.revision + 1,
       skills: [skill.manifest.id],
     });
     yield* restoreHistoricalBinding({
-      ...f.binding,
-      revision: f.binding.revision + 1,
-      configuration: { ...f.binding.configuration, skillIds: [skill.manifest.id] },
+      ...historical.binding,
+      revision: historical.binding.revision + 1,
+      configuration: { ...historical.binding.configuration, skillIds: [skill.manifest.id] },
     });
-    const cache = yield* f.fs.makeTempDirectoryScoped();
-    yield* f.fs.chmod(cache, 0o700);
-    const runtime = yield* makePiManagedRuntimeLive({
-      ...f.options,
-      allocateSkillStage: makePiSkillStageLifetime(cache),
-    });
-    const instance = yield* runtime.forInstance({
-      instanceId: providerInstanceId,
-      enabled: true,
-      configuration: {},
-    });
-    const desiredRevision = SkillCatalogRevision.make(1);
-    const materialized = yield* materialization.materialize({
-      sessionId: catalogueRequest(f.worktree).runtime.sessionId,
-      providerInstanceId,
-      desiredRevision,
-      packages: [{ key: skill.manifest.key, sourcePath: skill.packagePath }],
-    });
-    const plan = {
-      providerInstanceId,
-      desiredRevision,
-      applicationMode: "new_session_required" as const,
-      skillKeys: [skill.manifest.key],
-      payload: {
-        kind: "pi-managed-skills" as const,
-        root: materialized.root,
-        skills: [
-          {
-            key: skill.manifest.key,
-            path: materialized.skillPaths.get(skill.manifest.key)! + "/SKILL.md",
-          },
-        ],
-      },
-    };
-    return {
-      ...f,
-      instance,
-      plan,
-      skill,
-      cache,
-      get launches() {
-        return f.launches;
-      },
-      get transports() {
-        return f.transports;
-      },
-    };
-  },
-);
+  }
+  const cache = yield* f.fs.makeTempDirectoryScoped();
+  yield* f.fs.chmod(cache, 0o700);
+  const runtime = yield* makePiManagedRuntimeLive({
+    ...f.options,
+    allocateSkillStage: makePiSkillStageLifetime(cache),
+  });
+  const instance = yield* runtime.forInstance({
+    instanceId: providerInstanceId,
+    enabled: true,
+    configuration: {},
+  });
+  const desiredRevision = SkillCatalogRevision.make(1);
+  const materialized = yield* materialization.materialize({
+    sessionId: catalogueRequest(f.worktree).runtime.sessionId,
+    providerInstanceId,
+    desiredRevision,
+    packages: [{ key: skill.manifest.key, sourcePath: skill.packagePath }],
+  });
+  const plan = {
+    providerInstanceId,
+    desiredRevision,
+    applicationMode: "new_session_required" as const,
+    skillKeys: [skill.manifest.key],
+    payload: {
+      kind: "pi-managed-skills" as const,
+      root: materialized.root,
+      skills: [
+        {
+          key: skill.manifest.key,
+          path: materialized.skillPaths.get(skill.manifest.key)! + "/SKILL.md",
+        },
+      ],
+    },
+  };
+  return {
+    ...f,
+    instance,
+    plan,
+    skill,
+    cache,
+    originalInitializeOperationId: () => {
+      if (!dispatched) throw Error("Historical selected fixture has no original dispatch ID");
+      return dispatched.request.initializeOperationId;
+    },
+    get launches() {
+      if (historical) return historical.launches;
+      if (dispatched) return dispatched.allocations;
+      throw Error("Missing selected runtime fixture");
+    },
+    get transports() {
+      return f.transports;
+    },
+  };
+});
 describe.runIf(process.env.PI_MANAGED_RUNTIME_INITIALIZATION_GATE === "1")(
   "initial native publication",
   () => {
@@ -3545,9 +3608,14 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* selectedRuntimeFixture();
+        const f = yield* selectedRuntimeFixture(true);
         const prepared = yield* f.instance.prepareOperation(
-          { threadId, kind: "initialize", skillPlan: f.plan },
+          {
+            threadId,
+            kind: "initialize",
+            operationId: f.originalInitializeOperationId(),
+            skillPlan: f.plan,
+          },
           () => Effect.void,
         );
         const stages = yield* f.fs.readDirectory(f.cache);
@@ -3577,9 +3645,12 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* selectedRuntimeFixture();
+        const f = yield* selectedRuntimeFixture(true);
         yield* rejected(
-          f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+          f.instance.prepareOperation(
+            { threadId, kind: "initialize", operationId: f.originalInitializeOperationId() },
+            () => Effect.void,
+          ),
         );
         expect(yield* f.fs.readDirectory(f.cache)).toEqual([]);
         expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toHaveLength(0);
@@ -3590,8 +3661,13 @@ it.effect(
 it.effect("captures the selected plan synchronously before caller mutation", () =>
   scoped(
     Effect.gen(function* () {
-      const f = yield* selectedRuntimeFixture();
-      const request = { threadId, kind: "initialize" as const, skillPlan: f.plan };
+      const f = yield* selectedRuntimeFixture(true);
+      const request = {
+        threadId,
+        kind: "initialize" as const,
+        operationId: f.originalInitializeOperationId(),
+        skillPlan: f.plan,
+      };
       const preparation = f.instance.prepareOperation(request, () => Effect.void);
       Object.assign(request.skillPlan, { desiredRevision: -1 });
       const prepared = yield* preparation;
@@ -3605,14 +3681,19 @@ it.effect("captures the selected plan synchronously before caller mutation", () 
 it.effect("rejects changed selected source content before stage allocation", () =>
   scoped(
     Effect.gen(function* () {
-      const f = yield* selectedRuntimeFixture();
+      const f = yield* selectedRuntimeFixture(true);
       yield* f.fs.writeFileString(
         f.skill.packagePath + "/SKILL.md",
         "Changed after actual materialization",
       );
       yield* rejected(
         f.instance.prepareOperation(
-          { threadId, kind: "initialize", skillPlan: f.plan },
+          {
+            threadId,
+            kind: "initialize",
+            operationId: f.originalInitializeOperationId(),
+            skillPlan: f.plan,
+          },
           () => Effect.void,
         ),
       );
@@ -3624,7 +3705,7 @@ it.effect("rejects changed selected source content before stage allocation", () 
 );
 
 const settledNativeForRead = Effect.fn("PiManagedRuntimeLive.settledNativeForRead")(function* (
-  f: Effect.Success<typeof fixture>,
+  f: Pick<Effect.Success<typeof fixture>, "worktree" | "options" | "sql">,
   resourceHash?: string,
 ) {
   const allocation = yield* preallocatePiManagedProcess({
@@ -3664,28 +3745,21 @@ for (const outcome of ["findings", "complete"] as const)
   it.effect(`retains committed ${outcome} reports across the return fence`, () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
-        yield* restoreHistoricalBinding({
-          ...f.role,
-          revision: f.role.revision + 1,
-          tools: ["project-work.report"],
-        });
-        yield* restoreHistoricalBinding({
-          ...f.binding,
-          revision: f.binding.revision + 1,
-          configuration: { ...f.binding.configuration, toolIds: ["project-work.report"] },
-        });
-        const initial = yield* readCurrentState(f.sql, f.binding.projectId);
-        const membership = initial.foundationRecords!.find(
-          (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
+        const f = yield* requiredTransferFixture(
+          false,
+          false,
+          undefined,
+          false,
+          "project",
+          "Retain the assignment report",
+          {
+            ...basicRuntimeProfile,
+            roleTools: ["project-work.report"],
+            toolIds: ["project-work.report"],
+            deliverableKind: "non-code",
+          },
         );
-        if (membership?.kind !== "task-membership") return yield* Effect.die("No membership");
-        yield* restoreHistoricalBinding({
-          ...membership,
-          revision: membership.revision + 1,
-          deliverableKind: "non-code",
-        });
-        yield* settledNativeForRead(f, piManagedSkillResourceIdentity([]));
+        yield* initializeRequiredContext(f);
         // Capture the real Runtime callbacks without acquiring a process or importing the SDK.
         let session: SessionRuntime.PiSessionRuntimeOptions | undefined;
         const original = SessionRuntime.makePiSessionRuntime;
@@ -3697,7 +3771,12 @@ for (const outcome of ["findings", "complete"] as const)
           });
         yield* Effect.addFinalizer(() => Effect.sync(() => capture.mockRestore()));
         yield* f.instance.prepareOperation(
-          { threadId, kind: "prompt", prompt: "Retain the assignment report" },
+          {
+            threadId: f.binding.threadId,
+            kind: "prompt",
+            operationId: f.request.assignmentOperationId,
+            prompt: f.request.assignment,
+          },
           () => Effect.void,
         );
         if (!session) return yield* Effect.die("No controlled session captured");
@@ -3707,6 +3786,7 @@ for (const outcome of ["findings", "complete"] as const)
         const assignment = before.foundationRecords!.find(
           (record) => record.kind === "task-membership" && record.taskId === task.taskId,
         )!;
+        expect(assignment).toMatchObject({ kind: "task-membership", deliverableKind: "non-code" });
         const intent = {
           type: "project-team.assignment.report",
           projectId: task.projectId,
@@ -3877,7 +3957,7 @@ for (const outcome of ["findings", "complete"] as const)
               operations:
                 yield* f.sql`SELECT operation_kind,status,terminal_json FROM project_team_pi_operation`,
               transports: f.transports,
-              launches: f.launches,
+              argvAttempts: f.allocations,
               models: yield* f.sql`SELECT * FROM project_team_model_request`,
               processes:
                 yield* f.sql`SELECT status,owner_json,drain_json FROM project_team_pi_process`,
@@ -3889,7 +3969,7 @@ for (const outcome of ["findings", "complete"] as const)
           owner_json: string | null;
         }>`SELECT owner_json FROM project_team_pi_process`;
         expect(processes).toHaveLength(2);
-        expect(processes.every((entry) => entry.owner_json === null)).toBe(true);
+        expect(processes.filter((entry) => entry.owner_json === null)).toHaveLength(1);
         expect(returned._tag).toBe(outcome === "complete" ? "Failure" : "Success");
         if (returned._tag === "Success")
           expect(returned.success).toEqual({
@@ -3947,11 +4027,9 @@ it.effect(
 it.effect("does not activate role-allowed skills when the frozen selection is empty", () =>
   scoped(
     Effect.gen(function* () {
-      const f = yield* fixture;
-      yield* restoreHistoricalBinding({
-        ...f.role,
-        revision: f.role.revision + 1,
-        skills: ["role-only-uninstalled"],
+      const f = yield* dispatchedRuntimeFixture({
+        ...basicRuntimeProfile,
+        roleSkillIds: ["role-only-uninstalled"],
       });
       const runtime = yield* makePiManagedRuntimeLive({
         ...f.options,
@@ -3963,7 +4041,7 @@ it.effect("does not activate role-allowed skills when the frozen selection is em
         configuration: {},
       });
       const prepared = yield* instance.prepareOperation(
-        { threadId, kind: "initialize" },
+        { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
         () => Effect.void,
       );
       expect(prepared.kind).toBe("initialize");
@@ -3976,9 +4054,14 @@ it.effect("does not activate role-allowed skills when the frozen selection is em
 it.effect("reexecuting a prepared Effect cannot close or replace its selected resource scope", () =>
   scoped(
     Effect.gen(function* () {
-      const f = yield* selectedRuntimeFixture();
+      const f = yield* selectedRuntimeFixture(true);
       const preparation = f.instance.prepareOperation(
-        { threadId, kind: "initialize", skillPlan: f.plan },
+        {
+          threadId,
+          kind: "initialize",
+          operationId: f.originalInitializeOperationId(),
+          skillPlan: f.plan,
+        },
         () => Effect.void,
       );
       const first = yield* preparation;
@@ -4003,7 +4086,7 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* selectedRuntimeFixture();
+        const f = yield* selectedRuntimeFixture(true);
         const repository = yield* ManagedSkills.ManagedSkillRepository;
         const entered = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
@@ -4032,12 +4115,25 @@ it.effect(
           configuration: {},
         });
         const first = yield* instance
-          .prepareOperation({ threadId, kind: "initialize", skillPlan: f.plan }, () => Effect.void)
+          .prepareOperation(
+            {
+              threadId,
+              kind: "initialize",
+              operationId: f.originalInitializeOperationId(),
+              skillPlan: f.plan,
+            },
+            () => Effect.void,
+          )
           .pipe(Effect.forkChild);
         yield* Deferred.await(entered);
         yield* rejected(
           instance.prepareOperation(
-            { threadId, kind: "initialize", skillPlan: f.plan },
+            {
+              threadId,
+              kind: "initialize",
+              operationId: f.originalInitializeOperationId(),
+              skillPlan: f.plan,
+            },
             () => Effect.void,
           ),
         );
@@ -4057,7 +4153,7 @@ for (const mode of ["stop-one", "stop-all"] as const) {
   it.effect("stop held preparation " + mode, () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* selectedRuntimeFixture();
+        const f = yield* selectedRuntimeFixture(true);
         const repository = yield* ManagedSkills.ManagedSkillRepository;
         const entered = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
@@ -4087,7 +4183,15 @@ for (const mode of ["stop-one", "stop-all"] as const) {
           configuration: {},
         });
         const first = yield* actual
-          .prepareOperation({ threadId, kind: "initialize", skillPlan: f.plan }, () => Effect.void)
+          .prepareOperation(
+            {
+              threadId,
+              kind: "initialize",
+              operationId: f.originalInitializeOperationId(),
+              skillPlan: f.plan,
+            },
+            () => Effect.void,
+          )
           .pipe(Effect.result, Effect.forkChild);
         yield* Deferred.await(entered);
         const stopper = yield* Effect.gen(function* () {
@@ -4110,9 +4214,14 @@ for (const mode of ["stop-one", "stop-all"] as const) {
 it.effect("same returned preparation Effect cannot replay after its cancellation", () =>
   scoped(
     Effect.gen(function* () {
-      const f = yield* selectedRuntimeFixture();
+      const f = yield* selectedRuntimeFixture(true);
       const pending = f.instance.prepareOperation(
-        { threadId, kind: "initialize", skillPlan: f.plan },
+        {
+          threadId,
+          kind: "initialize",
+          operationId: f.originalInitializeOperationId(),
+          skillPlan: f.plan,
+        },
         () => Effect.void,
       );
       const first = yield* pending;
@@ -4123,11 +4232,21 @@ it.effect("same returned preparation Effect cannot replay after its cancellation
       yield* f.instance.stopAll;
       expect(replay._tag).toBe("Failure");
       expect(operations).toHaveLength(1);
-      const next = yield* f.instance.prepareOperation(
-        { threadId, kind: "initialize", skillPlan: f.plan },
-        () => Effect.void,
+      const before = yield* f.sql`SELECT * FROM project_team_model_budget`;
+      yield* rejected(
+        f.instance.prepareOperation(
+          {
+            threadId,
+            kind: "initialize",
+            operationId: f.originalInitializeOperationId(),
+            skillPlan: f.plan,
+          },
+          () => Effect.void,
+        ),
       );
-      expect(next.operation.operationId).not.toBe(first.operation.operationId);
+      expect(operations[0]?.operation_id).toBe(first.operation.operationId);
+      expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(before);
+      expect(yield* f.sql`SELECT unit FROM project_team_pi_process`).toHaveLength(1);
       yield* f.instance.stopAll;
     }),
   ).pipe(Effect.provide(selectedRuntimeLayer)),
@@ -4136,7 +4255,7 @@ for (const mode of ["explicit-stop", "scope-close"] as const) {
   it.effect("selected prepared resource cleanup " + mode, () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* selectedRuntimeFixture();
+        const f = yield* selectedRuntimeFixture(true);
         let operationId = "";
         let before: string[] = [];
         yield* Effect.scoped(
@@ -4151,7 +4270,12 @@ for (const mode of ["explicit-stop", "scope-close"] as const) {
               configuration: {},
             });
             const prepared = yield* actual.prepareOperation(
-              { threadId, kind: "initialize", skillPlan: f.plan },
+              {
+                threadId,
+                kind: "initialize",
+                operationId: f.originalInitializeOperationId(),
+                skillPlan: f.plan,
+              },
               () => Effect.void,
             );
             operationId = prepared.operation.operationId;
@@ -4371,8 +4495,8 @@ it.effect(
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* selectedRuntimeFixture();
-        let fail = true;
+        const f = yield* selectedRuntimeFixture(true);
+        let fail = false;
         const observedSql = new Proxy(f.sql, {
           apply(target, _receiver, args) {
             const statement = target(args[0], ...args.slice(1));
@@ -4401,9 +4525,15 @@ it.effect(
               configuration: {},
             });
             yield* actual.prepareOperation(
-              { threadId, kind: "initialize", skillPlan: f.plan },
+              {
+                threadId,
+                kind: "initialize",
+                operationId: f.originalInitializeOperationId(),
+                skillPlan: f.plan,
+              },
               () => Effect.void,
             );
+            fail = true;
             yield* rejected(actual.requestStop(threadId));
             yield* rejected(actual.requestStop(threadId));
           }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql)),
@@ -4464,12 +4594,13 @@ it.effect("admits multiple selected packages above one package byte limit", () =
 it.effect("joins a held durable preparation receipt before canceling its never-started stage", () =>
   scoped(
     Effect.gen(function* () {
-      const f = yield* selectedRuntimeFixture();
+      const f = yield* selectedRuntimeFixture(true);
       const entered = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
       const observedSql = new Proxy(f.sql, {
         apply(target, _receiver, args) {
           const statement = target(args[0], ...args.slice(1));
+          if (!Array.isArray(args[0]) || !Object.hasOwn(args[0], "raw")) return statement;
           if (!statement.compile()[0].includes("INSERT INTO project_team_pi_operation"))
             return statement;
           return statement.pipe(
@@ -4491,7 +4622,12 @@ it.effect("joins a held durable preparation receipt before canceling its never-s
           });
           const first = yield* actual
             .prepareOperation(
-              { threadId, kind: "initialize", skillPlan: f.plan },
+              {
+                threadId,
+                kind: "initialize",
+                operationId: f.originalInitializeOperationId(),
+                skillPlan: f.plan,
+              },
               () => Effect.void,
             )
             .pipe(Effect.result, Effect.forkChild);
@@ -4524,8 +4660,85 @@ it.effect("joins a held durable preparation receipt before canceling its never-s
   ).pipe(Effect.provide(selectedRuntimeLayer)),
 );
 
-// Durable metadata below is synthetic; these cases exercise real SQL and the real
-// nonmutating file reader without starting a Pi process or model transport.
+const genuineReplayFixture = Effect.fn("genuineReplayFixture")(function* (prompt = false) {
+  const f = yield* requiredTransferFixture(
+    false,
+    false,
+    undefined,
+    false,
+    "project",
+    "Investigate current assignment",
+    basicRuntimeProfile,
+  );
+  yield* initializeRequiredContext(f, prompt);
+  const request: PiManagedOperationRequest = prompt
+    ? {
+        threadId: f.binding.threadId,
+        kind: "prompt",
+        operationId: f.request.assignmentOperationId,
+        prompt: f.request.assignment,
+      }
+    : {
+        threadId: f.binding.threadId,
+        kind: "initialize",
+        operationId: f.request.initializeOperationId,
+      };
+  const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+  const op = yield* operations.lookup(
+    { providerInstanceId, threadId: f.binding.threadId },
+    request,
+    NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(request)).digest("hex"),
+    piManagedSkillResourceIdentity([]),
+  );
+  if (!op) return yield* Effect.die("Missing genuine original replay receipt");
+  const nativeFile = op.nativeState.path + "/" + op.native.sessionReference;
+  const bytes = yield* f.fs.readFileString(nativeFile);
+  const argvBaseline = f.allocations;
+  const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
+  const assertUnusedAssignmentAuthority = Effect.gen(function* () {
+    const authority = yield* operations.current({
+      providerInstanceId,
+      threadId: f.binding.threadId,
+    });
+    expect(authority.binding.recordId).toBe(f.binding.recordId);
+    expect(authority.binding.status).toBe("running");
+    expect(authority.state.tasks.find((task) => task.taskId === f.binding.taskId)?.state).not.toBe(
+      "canceled",
+    );
+    expect(
+      authority.state.foundationRecords?.find(
+        (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
+      ),
+    ).toMatchObject({ status: "active", controlState: "active" });
+    expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budget);
+    expect(
+      yield* f.sql`SELECT operation_id FROM project_team_pi_operation WHERE operation_id=${f.request.assignmentOperationId}`,
+    ).toEqual([]);
+  });
+  return {
+    ...f,
+    request,
+    op,
+    terminal: op.terminal,
+    nativeFile,
+    bytes,
+    assertUnusedAssignmentAuthority,
+    assignmentRequest: {
+      threadId: f.binding.threadId,
+      kind: "prompt" as const,
+      operationId: f.request.assignmentOperationId,
+      prompt: f.request.assignment,
+    },
+    get launches() {
+      return f.allocations - argvBaseline;
+    },
+    get transports() {
+      return f.transports;
+    },
+  };
+});
+
+// Historical denial fixtures retain synthetic metadata and use the real SQL/file reader.
 const stableReplayFixtureFor = (prompt = false, reviewer = false) =>
   Effect.gen(function* () {
     const f = yield* reviewer ? reviewerFixture : fixture;
@@ -4722,7 +4935,9 @@ for (const mode of [
   it.effect(`replays stable Pi receipts without allocation or event effects: ${mode}`, () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* stableReplayFixtureFor(mode === "prompt-restart");
+        const f = yield* mode === "prompt-restart"
+          ? genuineReplayFixture(true)
+          : stableReplayFixtureFor();
         const originalOperations = yield* f.sql`SELECT operation_id FROM project_team_pi_operation`;
         let request: PiManagedOperationRequest = f.request;
         if (mode === "changed-request")
@@ -4958,7 +5173,7 @@ for (const mode of [
   it.effect(`replay completion releases only its own lifetime: ${mode}`, () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* stableReplayFixtureFor();
+        const f = yield* genuineReplayFixture();
         const original =
           yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`;
         const originalProcess =
@@ -4988,12 +5203,7 @@ for (const mode of [
         else expect((yield* old.run).terminal).toEqual(f.terminal);
         expect(f.launches).toBe(0);
         expect(f.transports).toBe(0);
-        const nextRequest: PiManagedOperationRequest = {
-          threadId,
-          kind: "prompt",
-          prompt: "Next approved assignment",
-          operationId: "root-stable-next-prompt",
-        };
+        const nextRequest = f.assignmentRequest;
         if (mode === "repeat" || mode === "completed-stop" || mode === "completed-stopAll") {
           expect((yield* old.run).terminal).toEqual(f.terminal);
           expect((yield* old.run).terminal).toEqual(f.terminal);
@@ -5020,6 +5230,7 @@ for (const mode of [
                   return running;
                 })
               : undefined;
+          yield* f.assertUnusedAssignmentAuthority;
           let next: PiManagedPreparedOperation;
           if (mode === "old-new-preparing") {
             hold = true;
@@ -5081,7 +5292,7 @@ for (const api of ["requestStop", "stopAll"] as const) {
   it.effect(`replay completion retains final SQL cancellation: ${api}`, () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* stableReplayFixtureFor();
+        const f = yield* genuineReplayFixture();
         const original =
           yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.op.operation.operationId}`;
         let instance: PiManagedRuntimeInstance | undefined;
@@ -5089,6 +5300,7 @@ for (const api of ["requestStop", "stopAll"] as const) {
         const observedSql = new Proxy(f.sql, {
           apply(target, _receiver, args) {
             const statement = target(args[0], ...args.slice(1));
+            if (!Array.isArray(args[0]) || !Object.hasOwn(args[0], "raw")) return statement;
             if (!statement.compile()[0].includes("ORDER BY operation_ordinal DESC LIMIT 1"))
               return statement;
             return statement.pipe(
@@ -5117,18 +5329,11 @@ for (const api of ["requestStop", "stopAll"] as const) {
         armed = false;
         yield* rejected(old.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql)));
         expect(f.launches).toBe(0);
+        yield* f.assertUnusedAssignmentAuthority;
         const next = yield* instance
-          .prepareOperation(
-            {
-              threadId,
-              kind: "prompt",
-              prompt: "Next approved assignment",
-              operationId: "root-after-final-stop",
-            },
-            () => Effect.void,
-          )
+          .prepareOperation(f.assignmentRequest, () => Effect.void)
           .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
-        expect(next.operation.operationId).toBe("root-after-final-stop");
+        expect(next.operation.operationId).toBe(f.assignmentRequest.operationId);
         expect(f.launches).toBe(1);
         yield* instance
           .requestStop(threadId)
@@ -5180,7 +5385,16 @@ for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as c
   it.effect(`reviewer freshness qualifies only the host briefing before publication: ${mode}`, () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* reviewerFixture;
+        const f = yield* requiredReviewTransferFixture();
+        const originalRequired = yield* f.reader.readForOperation({
+          projectId: f.binding.projectId,
+          bindingId: f.binding.recordId,
+          generation: f.binding.generation,
+          providerInstanceId,
+          threadId: f.binding.threadId,
+          operationId: f.request.initializeOperationId,
+          operationKind: "initialize",
+        });
         const original = SessionRuntime.makePiSessionRuntime;
         let nativeFile = "";
         const capture = vi
@@ -5211,6 +5425,7 @@ for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as c
                       (entry) => entry.transferId === "context",
                     )?.text;
                     if (!briefing) return yield* Effect.die("No original host briefing");
+                    expect(briefing).toContain(originalRequired.text);
                     const native = {
                       sessionId: "fresh-review-session",
                       sessionReference: "sessions/fresh-review.jsonl",
@@ -5313,7 +5528,11 @@ for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as c
           );
         yield* Effect.addFinalizer(() => Effect.sync(() => capture.mockRestore()));
         const prepared = yield* f.instance.prepareOperation(
-          { threadId, kind: "initialize", operationId: "fresh-review-initialize" },
+          {
+            threadId: f.binding.threadId,
+            kind: "initialize",
+            operationId: f.request.initializeOperationId,
+          },
           () => Effect.void,
         );
         const result = yield* prepared.run.pipe(Effect.result);
@@ -5330,17 +5549,48 @@ for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as c
             configuration: {},
           });
           const replay = yield* instance.prepareOperation(
-            { threadId, kind: "initialize", operationId: "fresh-review-initialize" },
+            {
+              threadId: f.binding.threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+            },
             () => Effect.void,
           );
           expect((yield* replay.run).terminal.outcome).toBe("success");
           if (mode === "fresh-prompt") {
+            const journal = yield* makeProjectTeamDispatchJournal({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              verifyStage: (receipt, original) =>
+                receipt.evidence.bindingId === original.intent.request.git.runId &&
+                receipt.evidence.setupId === original.intent.request.setupId
+                  ? Effect.void
+                  : Effect.fail(
+                      new ProjectTeamDispatchJournalError({
+                        reason: "Foreign controlled fresh review stage",
+                      }),
+                    ),
+            });
+            let snapshot = yield* journal.readRetained(f.request.dispatchId);
+            for (const stage of [
+              "workspace-ready",
+              "setup-complete",
+              "session-bound",
+              "assignment-intent",
+            ] as const)
+              snapshot = yield* journal.readRetained(
+                (yield* journal.advanceStage(snapshot.fence, {
+                  receiptId: `fresh-review-${stage}`,
+                  stage,
+                  evidence: { bindingId: f.binding.recordId, setupId: f.request.setupId },
+                })).fence.dispatchId,
+              );
             const assignment = yield* instance.prepareOperation(
               {
-                threadId,
+                threadId: f.binding.threadId,
                 kind: "prompt",
-                operationId: "fresh-review-assignment",
-                prompt: "Review the assigned revision",
+                operationId: f.request.assignmentOperationId,
+                prompt: f.request.assignment,
               },
               () => Effect.void,
             );
@@ -5354,7 +5604,11 @@ for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as c
           expect(
             (yield* instance
               .prepareOperation(
-                { threadId, kind: "initialize", operationId: "fresh-review-initialize" },
+                {
+                  threadId: f.binding.threadId,
+                  kind: "initialize",
+                  operationId: f.request.initializeOperationId,
+                },
                 () => Effect.void,
               )
               .pipe(Effect.result))._tag,
@@ -5837,6 +6091,19 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
   };
 });
 
+type RuntimeFixtureProfile = {
+  readonly role: "investigator" | "implementer";
+  readonly instructions: string;
+  readonly roleTools: ReadonlyArray<string>;
+  readonly toolIds: ReadonlyArray<string>;
+  readonly roleSkillIds: ReadonlyArray<string>;
+  readonly skillIds: ReadonlyArray<string>;
+  readonly maximumTokens: number;
+  readonly durationMs: number;
+  readonly maxInputTokens: number;
+  readonly maxOutputTokens: number;
+  readonly deliverableKind?: "non-code";
+};
 const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   reviewer = false,
   child = !reviewer,
@@ -5844,6 +6111,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   memory = false,
   memoryPolicy: "project" | "none" | "read-only" = "project",
   assignment = "Implement the approved retained context",
+  profile?: RuntimeFixtureProfile,
 ) {
   if (reviewer || readonlyKind === "review") return yield* requiredReviewTransferFixture();
   yield* TestClock.setTime(Date.parse(at) + 1);
@@ -5896,14 +6164,21 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
         pending = command;
         return Effect.fail(new ProjectWorkPolicyError("invalid-state", "Retain new context claim"));
       }
-      if (command.type === "project-work.foundation.commit")
-        return repository.execute({
+      if (command.type === "project-work.foundation.commit") {
+        const configured: typeof ProjectWorkFoundationCommitCommand.Type = {
           ...command,
           records: command.records.map((r) =>
             r.kind === "role-revision"
               ? {
                   ...r,
                   model,
+                  ...(profile
+                    ? {
+                        instructions: profile.instructions,
+                        tools: [...profile.roleTools],
+                        skills: [...profile.roleSkillIds],
+                      }
+                    : {}),
                   ...(memory
                     ? {
                         memoryAccess: memoryPolicy === "none" ? "none" : "project",
@@ -5914,18 +6189,53 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
                       }
                     : {}),
                 }
-              : r,
+              : r.kind === "task-membership" && profile?.deliverableKind !== undefined
+                ? { ...r, deliverableKind: profile.deliverableKind }
+                : r,
           ),
-        });
+        };
+        if (profile?.deliverableKind !== undefined && command.commandId === "setup")
+          return Effect.gen(function* () {
+            const state = yield* readCurrentState(sql, command.projectId);
+            if (state.tasks.length !== 1 || !state.tasks[0])
+              return yield* Effect.die("Missing original report task");
+            return yield* repository.execute(
+              yield* decodeRequiredFoundation({
+                ...configured,
+                records: [
+                  ...configured.records,
+                  {
+                    kind: "task-membership",
+                    projectId: command.projectId,
+                    taskId: state.tasks[0].taskId,
+                    recordId: "runtime-profile-membership",
+                    revision: 0,
+                    generation: 0,
+                    updatedAt: command.committedAt,
+                    status: "active",
+                    executionKind: "managed",
+                    deliverableKind: profile.deliverableKind,
+                    controlState: "active",
+                  },
+                ],
+              }),
+            );
+          });
+        return repository.execute(configured);
+      }
       return repository.execute(command);
     },
   };
-  yield* seed(reviewer && readonlyKind === undefined ? "reviewer" : "implementer", "reserved", {
-    nativeSessionId: null,
-    roleTools: [],
-    toolIds: [],
-    issueCredential: false,
-  }).pipe(Effect.provideService(ProjectWorkRepository, captureClaim), Effect.result);
+  yield* seed(
+    profile?.role ?? (reviewer && readonlyKind === undefined ? "reviewer" : "implementer"),
+    "reserved",
+    {
+      nativeSessionId: null,
+      roleTools: profile?.roleTools ?? [],
+      toolIds: profile?.toolIds ?? [],
+      issueCredential: false,
+    },
+  ).pipe(Effect.provideService(ProjectWorkRepository, captureClaim), Effect.result);
   if (!pending || pending.transition?.kind !== "claim")
     return yield* Effect.die("Missing original context claim");
   yield* repository.execute(
@@ -5951,8 +6261,8 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           delegationDepth: 2,
           repairAllowance: 2,
           model,
-          tokenLimit: 2000,
-          durationLimitMs: 2000,
+          tokenLimit: profile?.maximumTokens ?? 2000,
+          durationLimitMs: profile?.durationMs ?? 2000,
         },
       ],
     }),
@@ -5986,6 +6296,14 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       configuration: {
         ...claim.transition.binding.configuration,
         runtimeVersion: "0.99.1",
+        ...(profile
+          ? {
+              toolIds: [...profile.toolIds],
+              skillIds: [...profile.skillIds],
+              maxTokens: profile.maximumTokens,
+              maxDurationMs: profile.durationMs,
+            }
+          : {}),
         ...(memory ? { toolIds: [...role.tools] } : {}),
         ...(readonlyKind === undefined || id === "required-root"
           ? { instructionsHash: configuration.instructionsHash }
@@ -6317,8 +6635,8 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
     },
     memoryBytes: 33554432,
     cleanupDeadlineMs: 1000,
-    maxInputTokens: 100,
-    maxOutputTokens: 100,
+    maxInputTokens: profile?.maxInputTokens ?? 100,
+    maxOutputTokens: profile?.maxOutputTokens ?? 100,
     readCatalogue: Effect.succeed({
       source: "https://api.commandcode.ai/provider/v1/models",
       fetchedAt: at,
@@ -6361,8 +6679,70 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   };
 });
 
+const basicRuntimeProfile: RuntimeFixtureProfile = {
+  role: "investigator",
+  instructions: "Investigate current assignment",
+  roleTools: [],
+  toolIds: [],
+  roleSkillIds: [],
+  skillIds: [],
+  maximumTokens: 20000,
+  durationMs: 300000,
+  maxInputTokens: 10000,
+  maxOutputTokens: 512,
+};
+const dispatchedRuntimeFixture = Effect.fn("dispatchedRuntimeFixture")(function* (
+  profile: RuntimeFixtureProfile = basicRuntimeProfile,
+) {
+  const f = yield* requiredTransferFixture(
+    false,
+    false,
+    undefined,
+    false,
+    "project",
+    "Investigate current assignment",
+    profile,
+  );
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+    // Existing disposable Git and controlled setup receipts; no setup or initializer runs.
+    verifyStage: (receipt, original) =>
+      receipt.evidence.bindingId === original.intent.request.git.runId &&
+      receipt.evidence.setupId === original.intent.request.setupId
+        ? Effect.void
+        : Effect.fail(
+            new ProjectTeamDispatchJournalError({ reason: "Foreign controlled runtime setup" }),
+          ),
+  });
+  let snapshot = f.snapshot;
+  for (const stage of ["workspace-ready", "setup-complete"] as const)
+    snapshot = yield* journal.readRetained(
+      (yield* journal.advanceStage(snapshot.fence, {
+        receiptId: `runtime-fixture-${stage}`,
+        stage,
+        evidence: { bindingId: f.binding.recordId, setupId: f.request.setupId },
+      })).fence.dispatchId,
+    );
+  const runtime = yield* makePiManagedRuntimeLive(f.options);
+  return {
+    ...f,
+    snapshot,
+    runtime,
+    main: f.request.git.primaryRoot,
+    worktree: f.binding.worktree,
+    get allocations() {
+      return f.allocations;
+    },
+    get transports() {
+      return f.transports;
+    },
+  };
+});
+
 const initializeRequiredContext = Effect.fn("initializeRequiredContext")(function* (
   f: Effect.Success<ReturnType<typeof requiredTransferFixture>>,
+  retainAssignment = false,
 ) {
   const journal = yield* makeProjectTeamDispatchJournal({
     environmentId: "environment",
@@ -6415,39 +6795,58 @@ const initializeRequiredContext = Effect.fn("initializeRequiredContext")(functio
             const native = {
               sessionId: "required-session",
               sessionReference: "sessions/required.jsonl",
-              leafId: "required-initialize",
+              leafId:
+                input.operation.operationKind === "prompt"
+                  ? "required-assignment"
+                  : "required-initialize",
               persisted: true,
             };
             const briefing = input.transferTexts.find(
-              (entry) => entry.transferId === "context",
-            )!.text;
+              (entry) =>
+                entry.transferId ===
+                (input.operation.operationKind === "prompt" ? "prompt" : "context"),
+            )?.text;
+            if (briefing === undefined)
+              return yield* Effect.die("Missing original controlled transfer");
             yield* f.fs.makeDirectory(allocation.launch.nativeStateRoot + "/sessions", {
               recursive: true,
             });
+            const nativeFile = allocation.launch.nativeStateRoot + "/" + native.sessionReference;
+            const records = [
+              {
+                type: "session",
+                version: 3,
+                id: native.sessionId,
+                timestamp: at,
+                cwd: "/workspace",
+              },
+              {
+                type: "message",
+                id: native.leafId,
+                parentId: input.operation.operationKind === "prompt" ? "required-initialize" : null,
+                timestamp: at,
+                message: {
+                  role: "user",
+                  content: [{ type: "text", text: briefing }],
+                  timestamp: Date.parse(at),
+                },
+              },
+            ];
+            const prior =
+              input.operation.operationKind === "prompt"
+                ? yield* f.fs.readFileString(nativeFile)
+                : "";
             yield* f.fs.writeFileString(
-              allocation.launch.nativeStateRoot + "/" + native.sessionReference,
-              [
-                {
-                  type: "session",
-                  version: 3,
-                  id: native.sessionId,
-                  timestamp: at,
-                  cwd: "/workspace",
-                },
-                {
-                  type: "message",
-                  id: native.leafId,
-                  parentId: null,
-                  timestamp: at,
-                  message: {
-                    role: "user",
-                    content: [{ type: "text", text: briefing }],
-                    timestamp: Date.parse(at),
-                  },
-                },
-              ]
-                .map((entry) => json(entry))
-                .join("\n") + "\n",
+              nativeFile,
+              prior +
+                records
+                  .filter(
+                    (entry) =>
+                      input.operation.operationKind === "initialize" || entry.type !== "session",
+                  )
+                  .map((entry) => json(entry))
+                  .join("\n") +
+                "\n",
             );
             const signal = yield* Effect.abortSignal;
             yield* Effect.tryPromise(() =>
@@ -6457,7 +6856,10 @@ const initializeRequiredContext = Effect.fn("initializeRequiredContext")(functio
                   ...input.identity,
                   ...input.operation,
                   sequence: 0,
-                  message: { type: "initialized", native },
+                  message:
+                    input.operation.operationKind === "prompt"
+                      ? { type: "native", lifecycleId: 1, native }
+                      : { type: "initialized", native },
                 },
                 signal,
               ),
@@ -6507,9 +6909,21 @@ const initializeRequiredContext = Effect.fn("initializeRequiredContext")(functio
       () => Effect.void,
     );
     expect((yield* initialized.run).terminal.outcome).toBe("success");
+    yield* stage("session-bound");
+    yield* stage("assignment-intent");
+    if (retainAssignment) {
+      const assigned = yield* f.instance.prepareOperation(
+        {
+          threadId: f.binding.threadId,
+          kind: "prompt",
+          operationId: f.request.assignmentOperationId,
+          prompt: f.request.assignment,
+        },
+        () => Effect.void,
+      );
+      expect((yield* assigned.run).terminal.outcome).toBe("success");
+    }
   }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
-  yield* stage("session-bound");
-  yield* stage("assignment-intent");
   return snapshot;
 });
 
