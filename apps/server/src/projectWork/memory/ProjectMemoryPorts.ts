@@ -37,7 +37,7 @@ export class ProjectMemoryPorts extends Context.Service<
       ProjectMemoryServiceError
     >;
     readonly reconcileTransportDrain?: (
-      reservationId: string,
+      reservationOrEffectId: string,
     ) => Effect.Effect<void, ProjectMemoryServiceError>;
   }
 >()("t3/projectWork/memory/ProjectMemoryPorts") {}

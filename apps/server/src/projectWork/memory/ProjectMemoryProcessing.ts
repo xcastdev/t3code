@@ -1121,6 +1121,8 @@ export const makeProjectMemoryProcessing = Effect.gen(function* () {
   return { readSourcesInTransaction, compileInTransaction };
 });
 
+import type { ProjectMemoryCompanionForwardFence } from "./ProjectMemoryCompanionJournal.ts";
+
 export interface ProjectMemoryProcessingConsumerOptions {
   readonly queryCompanion?: ProjectMemoryQueryConsumerOptions["companion"];
   readonly confirmQueryTransportDrained?: ProjectMemoryQueryConsumerOptions["confirmSearchTransportDrained"];
@@ -1143,10 +1145,15 @@ export interface ProjectMemoryProcessingConsumerOptions {
     reservationId: string,
   ) => Effect.Effect<void, ProjectMemoryServiceError>;
   readonly releaseModelTransportObservation?: (reservationId: string) => Effect.Effect<void>;
+  readonly observeCompanionCleanup?: (effectId: string) => Effect.Effect<void>;
+  readonly confirmCompanionTransportDrained?: (
+    effectId: string,
+  ) => Effect.Effect<void, ProjectMemoryServiceError>;
   readonly companion: (
     owner: ProjectMemoryJobOwner,
     configuration: ProjectMemoryProcessingConfiguration,
     request: Uint8Array,
+    assertForwardInTransaction: ProjectMemoryCompanionForwardFence,
   ) => ReturnType<MemoryBackendTransport>;
 }
 
@@ -1186,6 +1193,62 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
         const query = yield* sql`SELECT 1 FROM project_team_memory_query
           WHERE environment_id=${options.environmentId} AND query_id=${reservationId} LIMIT 1`;
         if (query.length === 1) return yield* queries.reconcileQuery(reservationId);
+        const jobs = yield* sql<{
+          owner: string | null;
+        }>`SELECT CASE WHEN length(CAST(owner_json AS BLOB))<=262144 THEN owner_json END AS owner FROM project_team_memory_job WHERE environment_id=${options.environmentId} AND effect_id=${reservationId} LIMIT 2`;
+        if (jobs.length !== 0) {
+          if (
+            jobs.length !== 1 ||
+            !jobs[0]?.owner ||
+            options.confirmCompanionTransportDrained === undefined
+          )
+            return yield* deny("Original job companion cleanup is unavailable");
+          const owner = yield* decodeOwnerJson(jobs[0].owner);
+          yield* auditProjectMemoryAdmission(sql, owner);
+          yield* options.confirmCompanionTransportDrained(reservationId);
+          const modelRows = yield* sql<{
+            id: string | null;
+            status: string;
+            reservation: string | null;
+          }>`SELECT CASE WHEN length(CAST(reservation_id AS BLOB))<=256 THEN reservation_id END AS id,
+            CASE WHEN length(CAST(status AS BLOB))<=32 THEN status END AS status,
+            CASE WHEN length(CAST(reservation_json AS BLOB))<=32768 THEN reservation_json END AS reservation FROM project_team_model_request
+            WHERE environment_id=${options.environmentId} AND project_id=${owner.operation.projectId} AND operation_id=${owner.operation.operationId}
+            AND request_lane='memory' AND json_extract(reservation_json,'$.effectId')=${reservationId} ORDER BY reservation_id LIMIT 129`;
+          if (modelRows.length > 128)
+            return yield* deny("Original job model cleanup exceeds its bound");
+          const accounting = yield* makeProjectMemoryModelAccounting({
+            environmentId: options.environmentId,
+            maximumConcurrentCalls: options.maximumConcurrentCalls,
+            maximumConcurrentModelCalls: options.maximumConcurrentModelCalls,
+            assertCurrentInTransaction: () =>
+              Effect.fail(deny("Drain cleanup cannot start a source stage")),
+            assertTransportDrainedInTransaction: (id) => options.confirmModelTransportDrained(id),
+          }).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository),
+          );
+          for (const row of modelRows) {
+            if (!row.id || !row.reservation)
+              return yield* deny("Original job model cleanup identity changed");
+            const reservation = yield* decodeReservationJson(row.reservation);
+            if (reservation.version !== 1 || reservation.effectId !== reservationId)
+              return yield* deny("Job cleanup cannot adopt a query reservation");
+            if (row.status === "held")
+              yield* accounting.settle({
+                ...reservation,
+                reservationId: row.id,
+                outcome: "unknown",
+                transportDrained: false,
+                chargedInputTokens: reservation.maxInputTokens,
+                chargedOutputTokens: reservation.maxOutputTokens,
+              });
+            yield* accounting.confirmTransportDrained(reservationId, row.id);
+            yield* options.releaseModelTransportObservation?.(row.id) ?? Effect.void;
+          }
+          return;
+        }
         const rows = yield* sql<{ reservation: string | null }>`SELECT
       CASE WHEN length(CAST(reservation_json AS BLOB))<=32768 THEN reservation_json END AS reservation
       FROM project_team_model_request WHERE environment_id=${options.environmentId}
@@ -1469,7 +1532,7 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
         });
         const guardedBackend = makeMem0Backend((request) =>
           sql.withTransaction(fence).pipe(
-            Effect.andThen(options.companion(owner, configuration, request)),
+            Effect.andThen(options.companion(owner, configuration, request, fence)),
             Effect.tap(() => sql.withTransaction(fence)),
             Effect.mapError(
               () =>
@@ -1492,8 +1555,17 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
           assertProcessingInTransaction: fence,
         });
         const original = yield* guarded.load(effectId);
-        if (original?.status === "uncertain" || original?.status === "claimed")
-          return yield* deny("Memory job waits for original model and companion reconciliation");
+        if (original?.status === "uncertain" || original?.status === "claimed") {
+          // An explicit retry consumes cleanup proof, then the original reactor retains
+          // its new claim generation under the still-current original task fence.
+          yield* reconcileTransportDrain(effectId);
+          yield* sql.withTransaction(fence);
+          yield* guarded.consume(owner.operation.projectId, effectId, {
+            generation: original.claimGeneration,
+            confirmDrained: reconcileTransportDrain(effectId),
+          });
+          return;
+        }
         yield* guarded.consume(owner.operation.projectId, effectId);
       },
       Effect.mapError((error) =>
@@ -1509,6 +1581,9 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
       readCredential: options.readCredential,
       exchange: options.exchange,
       confirmModelTransportDrained: options.confirmModelTransportDrained,
+      ...(options.observeCompanionCleanup === undefined
+        ? {}
+        : { observeCompanionCleanup: options.observeCompanionCleanup }),
       ...(options.queryCompanion === undefined ? {} : { companion: options.queryCompanion }),
       ...(options.confirmQueryTransportDrained === undefined
         ? {}
@@ -1525,7 +1600,10 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
       assertConfigured,
       readConfiguration: () => options.readConfiguration,
       availability,
-      consume,
+      consume: (principal, effectId) =>
+        consume(principal, effectId).pipe(
+          Effect.onExit(() => options.observeCompanionCleanup?.(effectId) ?? Effect.void),
+        ),
       reconcileTransportDrain,
     });
   },

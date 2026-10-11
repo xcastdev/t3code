@@ -233,3 +233,31 @@ it.effect(
       }
     }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
 );
+
+it.effect("refuses held companion custody before the zero-history deletion return", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const projectId = ProjectId.make("held-companion-empty-project");
+    yield* sql.withTransaction(
+      assertProjectMemoryDeletionReadyInTransaction(sql, projectId, undefined),
+    );
+    // Lost authority is not permission to purge a retained, uncaptured child invocation.
+    yield* sql`INSERT INTO project_memory_companion_invocation
+      (invocation_id,environment_id,project_id,task_id,effect_id,request_id,generation,intent_json,phase)
+      VALUES ('held-orphan','actual-host',${projectId},'untrusted-task','untrusted-effect','untrusted-request',0,'{}','activating')`;
+    const before = yield* sql`SELECT * FROM project_memory_companion_invocation`;
+    for (const environment of [undefined, "actual-host", "foreign-host"]) {
+      expect(
+        yield* sql
+          .withTransaction(
+            assertProjectMemoryDeletionReadyInTransaction(sql, projectId, environment),
+          )
+          .pipe(Effect.result),
+      ).toMatchObject({ _tag: "Failure", failure: { _tag: "ProjectMemoryServiceError" } });
+    }
+    expect(yield* sql`SELECT * FROM project_memory_companion_invocation`).toEqual(before);
+    expect(yield* sql`SELECT * FROM project_task_resource_budget`).toEqual([]);
+    expect(yield* sql`SELECT * FROM project_task_resource_child`).toEqual([]);
+  }).pipe(Effect.provide(NodeSqliteClient.layerMemory())),
+);

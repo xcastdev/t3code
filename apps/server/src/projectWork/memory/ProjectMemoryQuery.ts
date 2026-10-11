@@ -1063,6 +1063,8 @@ export const makeProjectMemoryQuery = Effect.fn("makeProjectMemoryQuery")(
   ),
 );
 
+import type { ProjectMemoryCompanionForwardFence } from "./ProjectMemoryCompanionJournal.ts";
+
 export interface ProjectMemoryQueryConsumerOptions {
   readonly environmentId: string;
   readonly maximumConcurrentCalls: number;
@@ -1084,7 +1086,9 @@ export interface ProjectMemoryQueryConsumerOptions {
     owner: ProjectMemoryQueryOwner,
     configuration: ProjectMemoryProcessingConfiguration,
     bytes: Uint8Array,
+    assertForwardInTransaction: ProjectMemoryCompanionForwardFence,
   ) => ReturnType<MemoryBackendTransport>;
+  readonly observeCompanionCleanup?: (effectId: string) => Effect.Effect<void>;
   readonly confirmSearchTransportDrained?: (
     id: string,
   ) => Effect.Effect<void, ProjectMemoryServiceError>;
@@ -1358,7 +1362,7 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
         );
         const backend = makeMem0Backend((bytes) =>
           check().pipe(
-            Effect.flatMap(() => companion(owner, configuration, bytes)),
+            Effect.flatMap(() => companion(owner, configuration, bytes, fence)),
             Effect.mapError(
               () =>
                 new MemoryBackendError({ code: "fenced", message: "Query companion fence denied" }),
@@ -1733,6 +1737,13 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
         isServiceError(error) ? error : deny("Query drain remains retained"),
       ),
     );
-    return { consumeQuery, readQueryCache, reconcileQuery };
+    return {
+      consumeQuery: (principal: ProjectTeamPrincipal, queryId: string) =>
+        consumeQuery(principal, queryId).pipe(
+          Effect.onExit(() => options.observeCompanionCleanup?.(queryId) ?? Effect.void),
+        ),
+      readQueryCache,
+      reconcileQuery,
+    };
   },
 );

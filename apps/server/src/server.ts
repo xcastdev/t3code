@@ -172,7 +172,7 @@ import {
   exchangeProjectMemoryModel,
 } from "./projectWork/memory/ProjectMemoryPorts.ts";
 import { ProjectMemoryServiceError } from "./projectWork/memory/ProjectMemoryService.ts";
-import { MemoryBackendError } from "./projectWork/memory/MemoryBackend.ts";
+import { makeProjectMemoryCompanion } from "./projectWork/memory/ProjectMemoryCompanion.ts";
 import * as Queue from "effect/Queue";
 import * as ProjectWorkPublicationGuard from "./projectWork/ProjectWorkPublicationGuard.ts";
 import * as ProjectWorkPullRequestActionGuard from "./projectWork/ProjectWorkPullRequestActionGuard.ts";
@@ -832,9 +832,14 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
     const assertAdmission = Effect.fail(
       new ProjectMemoryServiceError({
         reason:
-          "Memory processing awaits the retained engineering verdicts and shared resource ownership",
+          "Memory processing awaits authorized runtime activation, companion provisioning and runtime proof",
       }),
     );
+    const companion = yield* makeProjectMemoryCompanion({
+      environmentId: yield* environment.getEnvironmentId,
+      protectedRoots: [config.stateDir, config.secretsDir],
+      assertAdmission,
+    });
     const consumer = yield* makeProjectMemoryProcessingConsumer({
       environmentId: yield* environment.getEnvironmentId,
       maximumConcurrentCalls: 2,
@@ -882,30 +887,12 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
         Effect.sync(() => {
           drained.delete(id);
         }),
-      // Separate bounded units do not prove an aggregate task resource ceiling.
-      // Keep activation held until the captured shared resource seam is available.
-      companion: () =>
-        Effect.fail(
-          new MemoryBackendError({
-            code: "unavailable",
-            message:
-              "Memory companion awaits shared task resource ownership and engineering verdicts",
-          }),
-        ),
-      queryCompanion: () =>
-        Effect.fail(
-          new MemoryBackendError({
-            code: "unavailable",
-            message:
-              "Query companion awaits shared task resource ownership and engineering verdicts",
-          }),
-        ),
-      confirmQueryTransportDrained: () =>
-        Effect.fail(
-          new ProjectMemoryServiceError({
-            reason: "Original query companion drain is not observed",
-          }),
-        ),
+      companion: companion.companion,
+      queryCompanion: companion.companion,
+      confirmQueryTransportDrained: companion.confirmSearchDrain,
+      confirmCompanionTransportDrained: companion.cleanup,
+      // Wakes follow consumer receipt publication; the durable journal supplies proof.
+      observeCompanionCleanup: (id) => Queue.offer(drainObservations, id).pipe(Effect.asVoid),
     });
     yield* Effect.gen(function* () {
       for (;;) {

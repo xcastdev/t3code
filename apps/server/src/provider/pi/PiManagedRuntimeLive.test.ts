@@ -64,6 +64,7 @@ import { makePiSkillStageLifetime } from "./PiSkillStageLifetime.ts";
 import { preallocatePiManagedProcess } from "./PiManagedProcess.ts";
 import { piManagedSkillResourceIdentity } from "./PiManagedSkillResources.ts";
 import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
+import { makeProjectTaskResources } from "../../projectWork/ProjectTaskResources.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentAuth } from "../../auth/EnvironmentAuth.ts";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -95,7 +96,15 @@ import {
   ProjectMemoryPorts,
   type ProjectMemoryProcessingConfiguration,
 } from "../../projectWork/memory/ProjectMemoryPorts.ts";
-import { makeProjectMemoryProcessingConsumer } from "../../projectWork/memory/ProjectMemoryProcessing.ts";
+import {
+  makeProjectMemoryProcessingConsumer,
+  type ProjectMemoryProcessingConsumerOptions,
+} from "../../projectWork/memory/ProjectMemoryProcessing.ts";
+import { makeProjectMemoryCompanion } from "../../projectWork/memory/ProjectMemoryCompanion.ts";
+import {
+  makeProjectMemoryCompanionJournal,
+  decodeProjectMemoryCompanionIntent,
+} from "../../projectWork/memory/ProjectMemoryCompanionJournal.ts";
 import {
   MemoryIndexManifest,
   MemoryBackendSource,
@@ -208,6 +217,9 @@ const controlledCallbackError = (cause: unknown) =>
   isManagedRuntimeError(cause)
     ? cause
     : new PiManagedRuntimeError({ code: "uncertain", detail: "Controlled callback failed" });
+const isControlledProcessError = Schema.is(ManagedProcess.PiManagedProcessError);
+const isControlledBackendError = Schema.is(MemoryBackendError);
+
 const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const parseOwner = Schema.decodeSync(
   Schema.fromJsonString(
@@ -848,6 +860,58 @@ it.effect(
         expect(f.transports).toBe(0);
       }),
     ),
+);
+it.effect("denies managed preparation without original dispatch operation identity", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const reader = yield* makeProjectTeamContext({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 128,
+      });
+      const identity = {
+        projectId: f.binding.projectId,
+        bindingId: f.binding.recordId,
+        generation: f.binding.generation,
+        providerInstanceId,
+        threadId,
+        operationKind: "initialize" as const,
+      };
+      expect(yield* f.sql`SELECT dispatch_id FROM project_team_dispatch`).toEqual([]);
+      expect(
+        yield* reader.readForOperation({ ...identity, operationId: "" }).pipe(Effect.result),
+      ).toMatchObject({
+        _tag: "Failure",
+        failure: {
+          _tag: "ProjectTeamContextError",
+          reason: "Required operation identity is invalid",
+        },
+      });
+      expect(
+        yield* reader
+          .readForOperation({ ...identity, operationId: "absent-dispatch-initialize" })
+          .pipe(Effect.result),
+      ).toMatchObject({
+        _tag: "Failure",
+        failure: {
+          _tag: "ProjectTeamContextError",
+          reason: "Required original dispatch is unavailable",
+        },
+      });
+      yield* rejected(
+        f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+      );
+      yield* rejected(
+        f.instance.prepareOperation(
+          { threadId, kind: "initialize", operationId: "absent-dispatch-initialize" },
+          () => Effect.void,
+        ),
+      );
+      expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+    }),
+  ),
 );
 it.effect(
   "requires current native session for prompt/compact and denies stale frozen instructions",
@@ -5869,6 +5933,12 @@ for (const compactProof of [
   "memoryAccounting",
   "memorySharedRoot",
   "memoryPipeline",
+  "memoryCompanionIndex",
+  "memoryCompanionQuery",
+  "memoryCompanionRecovery",
+  "memoryCompanionCapture",
+  "memoryCompanionExpired",
+  "memoryCompanionDelete",
   "memoryFailure",
   "memorySecret",
   "memoryEmbeddingSecret",
@@ -5937,13 +6007,18 @@ for (const compactProof of [
         Effect.gen(function* () {
           let memoryReady = false;
           const lateSecret = 'controlled-memory-"key\\tail';
+          const companionProof = compactProof?.startsWith("memoryCompanion") === true;
+          const pipelineProof =
+            compactProof === "memoryPipeline" || compactProof === "memoryCompanionIndex";
           const memoryProof = compactProof?.startsWith("memory") === true;
           const accountingProof =
             compactProof === "memoryAccounting" || compactProof === "memorySharedRoot";
+          const humanRetraction =
+            compactProof === "memoryHumanRetraction" || compactProof === "memoryCompanionDelete";
           const cleanupProof =
             compactProof === "memoryCleanup" ||
             compactProof === "memoryCleanupGuards" ||
-            compactProof === "memoryHumanRetraction";
+            humanRetraction;
           let consumeMemory:
             | ((
                 principal: Authorization.ProjectTeamPrincipal,
@@ -5963,9 +6038,14 @@ for (const compactProof of [
                 principal: Authorization.ProjectTeamPrincipal,
               ) => Effect.Effect<ProjectMemoryRetrieval | undefined, ProjectMemoryServiceError>)
             | undefined;
-          const queryRecovery =
-            compactProof === "memoryQueryModelUnknown" ||
-            compactProof === "memoryQuerySearchUnknown";
+          const captureFailure = compactProof === "memoryCompanionCapture";
+          const expiryFailure = compactProof === "memoryCompanionExpired";
+          const startFailure = captureFailure || expiryFailure;
+          const searchUnknown =
+            compactProof === "memoryQuerySearchUnknown" ||
+            compactProof === "memoryCompanionRecovery" ||
+            startFailure;
+          const queryRecovery = compactProof === "memoryQueryModelUnknown" || searchUnknown;
           const queryBudget = compactProof === "memoryQueryBudget";
           const querySecret = compactProof === "memoryQuerySecret";
           const queryNoForward = queryBudget || querySecret;
@@ -5976,8 +6056,12 @@ for (const compactProof of [
             compactProof === "memoryQueryNoGrant" || compactProof === "memoryQueryNoAccess";
           const queryAdmissionOnly =
             compactProof === "memoryQuery" || compactProof === "memoryQueryGuards" || queryDenied;
-          const queryMixed = compactProof === "memoryQueryMixed";
-          const queryCache = compactProof === "memoryQueryPipeline" || queryMixed;
+          const queryMixed =
+            compactProof === "memoryQueryMixed" || compactProof === "memoryCompanionQuery";
+          const queryCache =
+            compactProof === "memoryQueryPipeline" ||
+            compactProof === "memoryCompanionQuery" ||
+            queryMixed;
           const queryForward = queryCache || queryRecovery || queryNoForward;
           let activeQuery = false;
           let failedUsageOperationId: string | undefined;
@@ -6516,19 +6600,25 @@ for (const compactProof of [
                               ),
                             catch: controlledCallbackError,
                           }).pipe(Effect.result);
-                          if (!queryDenied)
+                          if (!queryDenied) {
+                            expect(
+                              queryResult._tag === "Failure"
+                                ? {
+                                    bridgeFailure: queryResult.failure,
+                                    processingCause: memoryPipelineFailure,
+                                  }
+                                : undefined,
+                            ).toBeUndefined();
                             expect({
-                              bridgeFailure:
-                                queryResult._tag === "Failure" ? queryResult.failure : undefined,
                               processingFailure: memoryPipelineError,
                               processingCause: memoryPipelineFailure,
                             }).toEqual({
-                              bridgeFailure: undefined,
                               processingFailure:
                                 queryRecovery || queryNoForward ? memoryPipelineError : undefined,
                               processingCause:
                                 queryRecovery || queryNoForward ? memoryPipelineFailure : "",
                             });
+                          }
                           if (queryDenied) {
                             expect(queryResult._tag).toBe("Failure");
                             expect(yield* f.sql`SELECT * FROM project_team_memory_query`).toEqual(
@@ -6570,7 +6660,9 @@ for (const compactProof of [
                           expect(memoryBackendCalls).toBe(
                             queryNoForward
                               ? 3
-                              : queryForward && compactProof !== "memoryQueryModelUnknown"
+                              : queryForward &&
+                                  compactProof !== "memoryQueryModelUnknown" &&
+                                  !startFailure
                                 ? 4
                                 : queryRecovery
                                   ? 3
@@ -6668,7 +6760,7 @@ for (const compactProof of [
                               kind: "decision",
                               retainedId: decision.decisionId,
                             });
-                            if (compactProof === "memoryHumanRetraction") {
+                            if (humanRetraction) {
                               const before = yield* readCurrentState(f.sql, projectId);
                               yield* gateway
                                 .write(
@@ -6839,7 +6931,7 @@ for (const compactProof of [
                               retainedId: "live-memory-decision",
                               effectId: cleanupEffectId,
                             });
-                            if (compactProof !== "memoryHumanRetraction")
+                            if (!humanRetraction)
                               expect(
                                 page.items.some(
                                   (entry) =>
@@ -6895,7 +6987,7 @@ for (const compactProof of [
                             state.revision,
                           );
                           memoryReady = true;
-                          if (compactProof === "memoryHumanRetraction") {
+                          if (humanRetraction) {
                             const receipts = yield* f.sql<{
                               fingerprint: string;
                             }>`SELECT payload_fingerprint AS fingerprint
@@ -7034,7 +7126,7 @@ for (const compactProof of [
                             state.revision,
                           );
                           if (
-                            compactProof === "memoryPipeline" ||
+                            pipelineProof ||
                             compactProof === "memoryFailure" ||
                             compactProof === "memorySecret" ||
                             compactProof === "memoryEmbeddingSecret" ||
@@ -7043,7 +7135,7 @@ for (const compactProof of [
                           ) {
                             const drained = memoryDrains;
                             const indexed = new Set<string>();
-                            const configuration: ProjectMemoryProcessingConfiguration = {
+                            let configuration: ProjectMemoryProcessingConfiguration = {
                               version: 1,
                               extraction: {
                                 endpoint: "https://api.commandcode.ai/provider/v1/chat/completions",
@@ -7069,7 +7161,7 @@ for (const compactProof of [
                                 ],
                               },
                             };
-                            const consumer = yield* makeProjectMemoryProcessingConsumer({
+                            let consumerOptions: ProjectMemoryProcessingConsumerOptions = {
                               environmentId: "environment",
                               maximumConcurrentCalls: 2,
                               maximumConcurrentModelCalls: 2,
@@ -7311,7 +7403,7 @@ for (const compactProof of [
                                       "Mixed backend has no genuinely superseded candidate",
                                     );
                                   memoryBackendCalls++;
-                                  if (compactProof === "memoryQuerySearchUnknown")
+                                  if (searchUnknown)
                                     return yield* new MemoryBackendError({
                                       code: "unavailable",
                                       message: "Controlled query search is unknown",
@@ -7369,7 +7461,561 @@ for (const compactProof of [
                                         reason: "Controlled query drain absent",
                                       }),
                                     ),
-                            }).pipe(Effect.provideService(ProjectWorkContentGuard, contentGuard));
+                            };
+                            if (companionProof) {
+                              const storeRoot = yield* f.fs.makeTempDirectoryScoped();
+                              const configuredCompanion = {
+                                ...configuration.companion,
+                                storeRoot,
+                                runtimeFiles: [
+                                  {
+                                    source: yield* f.fs.realPath("/usr/bin/true"),
+                                    target: "/runtime/python",
+                                  },
+                                  {
+                                    source: yield* f.fs.realPath(
+                                      new URL(
+                                        "../../projectWork/memory/companion/mem0_backend.py",
+                                        import.meta.url,
+                                      ).pathname,
+                                    ),
+                                    target: "/runtime/mem0.py",
+                                  },
+                                ],
+                              };
+                              configuration = { ...configuration, companion: configuredCompanion };
+                              queryConfiguration = {
+                                ...queryConfiguration,
+                                companion: configuredCompanion,
+                              };
+                              let respond: (
+                                bytes: Uint8Array,
+                              ) => ReturnType<
+                                ProjectMemoryProcessingConsumerOptions["companion"]
+                              > = () => Effect.die("Missing controlled response");
+                              const fixtureProcessError = (error: unknown) =>
+                                isControlledProcessError(error)
+                                  ? error
+                                  : new ManagedProcess.PiManagedProcessError({
+                                      phase: "quarantine",
+                                      message: "Controlled companion journal failed",
+                                    });
+                              let launches = 0;
+                              const observed = new Map<string, ManagedProcess.PiManagedDrain>();
+                              const host = yield* makeProjectMemoryCompanion({
+                                environmentId: "environment",
+                                protectedRoots: f.options.protectedRoots,
+                                assertAdmission: Effect.void,
+                                launch: (_launch, persistence) =>
+                                  Effect.gen(function* () {
+                                    if (!persistence)
+                                      return yield* Effect.die("Companion omitted persistence");
+                                    const allocation = persistence.allocation;
+                                    yield* persistence.claimActivation(allocation);
+                                    const retainedJournal =
+                                      yield* makeProjectMemoryCompanionJournal("environment").pipe(
+                                        Effect.provideService(SqlClient.SqlClient, f.sql),
+                                      );
+                                    yield* rejected(
+                                      f.sql.withTransaction(
+                                        retainedJournal.auditProjectDrained(projectId),
+                                      ),
+                                    );
+                                    if (compactProof === "memoryCompanionIndex" && launches === 0) {
+                                      const originals = yield* f.sql<{
+                                        intent: string;
+                                      }>`SELECT intent_json AS intent FROM project_memory_companion_invocation WHERE json_extract(intent_json,'$.allocation.unit')=${allocation.unit}`;
+                                      expect(originals).toHaveLength(1);
+                                      const original = yield* decodeProjectMemoryCompanionIntent(
+                                        originals[0]!.intent,
+                                      );
+                                      const corrupt = {
+                                        ...original,
+                                        invocationId: "corrupt-companion-header",
+                                        requestId: "corrupt-header-request",
+                                      };
+                                      const held =
+                                        yield* f.sql`SELECT unit,nonce,memory_bytes,drain_json FROM project_task_resource_child ORDER BY unit`;
+                                      let oversizedTransferred = false;
+                                      const observedSql = new Proxy(f.sql, {
+                                        apply(target, _receiver, args) {
+                                          return target(args[0], ...args.slice(1)).pipe(
+                                            Effect.tap((rows) =>
+                                              Effect.sync(() => {
+                                                for (const row of rows)
+                                                  if (
+                                                    typeof row.project_id === "string" &&
+                                                    Buffer.byteLength(row.project_id) > 1024
+                                                  )
+                                                    oversizedTransferred = true;
+                                              }),
+                                            ),
+                                          );
+                                        },
+                                      });
+                                      const resources = yield* makeProjectTaskResources(
+                                        "environment",
+                                      ).pipe(
+                                        Effect.provideService(SqlClient.SqlClient, observedSql),
+                                      );
+                                      const rolledBack = yield* f.sql
+                                        .withTransaction(
+                                          Effect.gen(function* () {
+                                            yield* f.sql`INSERT INTO project_memory_companion_invocation(invocation_id,environment_id,project_id,task_id,effect_id,request_id,generation,intent_json,phase) VALUES(${corrupt.invocationId},'environment',${"x".repeat(1048576)},${original.owner.operation.taskId},${original.owner.admittedEffect.effectId},${corrupt.requestId},${corrupt.generation},${canonicalProjectWorkPayload(corrupt)},'prepared')`;
+                                            yield* rejected(
+                                              resources
+                                                .memoryCompanion(corrupt.invocationId, allocation)
+                                                .reserve.pipe(
+                                                  Effect.provideService(
+                                                    SqlClient.SqlClient,
+                                                    observedSql,
+                                                  ),
+                                                ),
+                                            );
+                                            expect(oversizedTransferred).toBe(false);
+                                            expect(
+                                              yield* f.sql`SELECT unit,nonce,memory_bytes,drain_json FROM project_task_resource_child ORDER BY unit`,
+                                            ).toEqual(held);
+                                            return yield* new ProjectMemoryServiceError({
+                                              reason: "Rollback disposable corrupt header",
+                                            });
+                                          }),
+                                        )
+                                        .pipe(Effect.result);
+                                      expect(rolledBack).toMatchObject({
+                                        _tag: "Failure",
+                                        failure: { reason: "Rollback disposable corrupt header" },
+                                      });
+                                      expect(
+                                        yield* f.sql`SELECT invocation_id FROM project_memory_companion_invocation WHERE invocation_id=${corrupt.invocationId}`,
+                                      ).toEqual([]);
+                                      expect(launches).toBe(0);
+                                    }
+                                    launches++;
+                                    const owner: ManagedProcess.PiManagedProcessOwner = {
+                                      type: "owner",
+                                      unit: allocation.unit,
+                                      nonce: allocation.nonce,
+                                      invocation: "1".repeat(32),
+                                      cgroup: `/sys/fs/cgroup/controlled/${allocation.unit}`,
+                                      pid: 200,
+                                      memoryBytes: allocation.policy.memoryBytes,
+                                      swapBytes: 0,
+                                      oomGroup: 1,
+                                    };
+                                    const receipt: ManagedProcess.PiManagedDrain = {
+                                      unit: owner.unit,
+                                      invocation: owner.invocation,
+                                      cgroup: owner.cgroup,
+                                      ownerPid: owner.pid,
+                                      memoryBytes: owner.memoryBytes,
+                                      swapBytes: 0,
+                                      oomGroup: 1,
+                                      launcherPid: 201,
+                                      childPid: startFailure && activeQuery ? null : 202,
+                                      childExitCode: startFailure && activeQuery ? null : 0,
+                                      kernel: "populated 0\n",
+                                    };
+                                    observed.set(allocation.unit, receipt);
+                                    const output = yield* Deferred.make<
+                                      Uint8Array,
+                                      ManagedProcess.PiManagedProcessError
+                                    >();
+                                    const inputChunks: Uint8Array[] = [];
+                                    const exited = Deferred.await(output).pipe(
+                                      Effect.andThen(
+                                        Effect.gen(function* () {
+                                          if (compactProof === "memoryCompanionDelete") {
+                                            const invocation = (yield* retainedJournal.retained(
+                                              expectedCleanupSelection.effectId,
+                                            )).find(
+                                              (row) =>
+                                                row.intent.allocation.unit === allocation.unit,
+                                            );
+                                            if (!invocation)
+                                              return yield* Effect.die(
+                                                "Controlled cleanup invocation missing",
+                                              );
+                                            const resources = yield* makeProjectTaskResources(
+                                              "environment",
+                                            ).pipe(
+                                              Effect.provideService(SqlClient.SqlClient, f.sql),
+                                            );
+                                            // A genuine matched cleanup port can retain the smaller receipt first.
+                                            yield* f.sql.withTransaction(
+                                              resources
+                                                .memoryCompanion(
+                                                  invocation.intent.invocationId,
+                                                  allocation,
+                                                )
+                                                .drain({
+                                                  state: "drained",
+                                                  unit: owner.unit,
+                                                  invocation: owner.invocation,
+                                                  cgroup: owner.cgroup,
+                                                  kernel: "removed",
+                                                }),
+                                            );
+                                          }
+                                          yield* persistence.afterDrain?.(receipt) ?? Effect.void;
+                                        }).pipe(
+                                          Effect.mapError(
+                                            () =>
+                                              new ManagedProcess.PiManagedProcessError({
+                                                phase: "quarantine",
+                                                message: "Controlled drain persistence failed",
+                                              }),
+                                          ),
+                                        ),
+                                      ),
+                                      Effect.as(receipt),
+                                    );
+                                    yield* Effect.gen(function* () {
+                                      if (expiryFailure && activeQuery) {
+                                        const beforeExpiry = yield* Clock.currentTimeMillis;
+                                        if (persistence.deadlineAtMs === undefined)
+                                          return yield* Effect.die(
+                                            "Original companion deadline missing",
+                                          );
+                                        yield* TestClock.setTime(persistence.deadlineAtMs);
+                                        yield* rejected(persistence.beforeStart(owner));
+                                        expect(
+                                          yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE authority_kind='memory-companion' AND drain_json IS NULL`,
+                                        ).toEqual([{ held: 16777216 }]);
+                                        expect(
+                                          yield* f.sql`SELECT phase,owner_json FROM project_memory_companion_invocation WHERE json_extract(intent_json,'$.allocation.unit')=${allocation.unit}`,
+                                        ).toMatchObject([
+                                          { phase: "owned", owner_json: expect.any(String) },
+                                        ]);
+                                        yield* (
+                                          persistence.afterDrain?.(receipt) ??
+                                            Effect.die("Missing expired cleanup port")
+                                        );
+                                        expect(
+                                          yield* f.sql`SELECT COUNT(*) AS held FROM project_task_resource_child WHERE authority_kind='memory-companion' AND drain_json IS NULL`,
+                                        ).toEqual([{ held: 0 }]);
+                                        // Restore the outer fixture clock; the original invocation limits remain immutable.
+                                        yield* TestClock.setTime(beforeExpiry);
+                                        return yield* new ManagedProcess.PiManagedProcessError({
+                                          phase: "startup",
+                                          message: "Original deadline denied START",
+                                        });
+                                      }
+                                      if (!captureFailure || !activeQuery)
+                                        return yield* persistence
+                                          .beforeStart(owner)
+                                          .pipe(Effect.as(202));
+                                      yield* f.sql`CREATE TABLE companion_capture_parent(id INTEGER PRIMARY KEY)`;
+                                      yield* f.sql`CREATE TABLE companion_capture_child(parent_id INTEGER REFERENCES companion_capture_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+                                      yield* f.sql`CREATE TRIGGER companion_capture_fail AFTER UPDATE OF owner_json ON project_memory_companion_invocation WHEN NEW.owner_json IS NOT NULL BEGIN INSERT INTO companion_capture_child VALUES(1); END`;
+                                      const failed = yield* persistence
+                                        .beforeStart(owner)
+                                        .pipe(Effect.exit);
+                                      expect(failed._tag).toBe("Failure");
+                                      expect(
+                                        yield* f.sql`SELECT owner_json,phase FROM project_memory_companion_invocation WHERE json_extract(intent_json,'$.allocation.unit')=${allocation.unit}`,
+                                      ).toEqual([{ owner_json: null, phase: "activating" }]);
+                                      expect(
+                                        yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child WHERE unit=${allocation.unit}`,
+                                      ).toEqual([{ owner_json: null, drain_json: null }]);
+                                      // Failed cleanup COMMIT retains both original journals and the reservation.
+                                      expect(
+                                        (yield* (
+                                          persistence.afterDrain?.(receipt) ??
+                                          Effect.die("Missing drain port")
+                                        ).pipe(Effect.exit))._tag,
+                                      ).toBe("Failure");
+                                      expect(
+                                        yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child WHERE unit=${allocation.unit}`,
+                                      ).toEqual([{ owner_json: null, drain_json: null }]);
+                                      expect(
+                                        yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE authority_kind='memory-companion' AND drain_json IS NULL`,
+                                      ).toEqual([{ held: 16777216 }]);
+                                      yield* f.sql`DROP TRIGGER companion_capture_fail`;
+                                      yield* rejected(
+                                        persistence.afterDrain?.({
+                                          ...receipt,
+                                          invocation: "2".repeat(32),
+                                        }) ?? Effect.die("Missing drain port"),
+                                      );
+                                      expect(
+                                        yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child WHERE unit=${allocation.unit}`,
+                                      ).toEqual([{ owner_json: null, drain_json: null }]);
+                                      yield* (
+                                        persistence.afterDrain?.(receipt) ??
+                                          Effect.die("Missing drain port")
+                                      );
+                                      expect(
+                                        yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child WHERE unit=${allocation.unit}`,
+                                      ).toMatchObject([
+                                        {
+                                          owner_json: expect.any(String),
+                                          drain_json: expect.any(String),
+                                        },
+                                      ]);
+                                      return yield* new ManagedProcess.PiManagedProcessError({
+                                        phase: "startup",
+                                        message:
+                                          "Original START denied after owner persistence rollback",
+                                      });
+                                    });
+                                    return {
+                                      owner,
+                                      start: Effect.succeed(202),
+                                      send: (bytes) =>
+                                        Effect.sync(() => {
+                                          expect(bytes.byteLength).toBeLessThanOrEqual(8192);
+                                          inputChunks.push(bytes);
+                                        }),
+                                      endInput: Effect.gen(function* () {
+                                        const requestBytes = new Uint8Array(
+                                          Buffer.concat(inputChunks),
+                                        );
+                                        // The real Mem0 adapter encodes these insertion-ordered wire bytes.
+                                        expect(
+                                          new TextDecoder()
+                                            .decode(requestBytes)
+                                            .startsWith('{"protocolVersion":1,"requestId":'),
+                                        ).toBe(true);
+                                        const returned = yield* respond(requestBytes).pipe(
+                                          Effect.mapError(
+                                            (error) =>
+                                              new ManagedProcess.PiManagedProcessError({
+                                                phase: "transport",
+                                                message: error.message,
+                                              }),
+                                          ),
+                                        );
+                                        const text = new TextDecoder()
+                                          .decode(returned)
+                                          .replace('"score":0.9', '"score":1.0')
+                                          .replace('"score":0.8', '"score":1e-06');
+                                        yield* Deferred.succeed(
+                                          output,
+                                          new TextEncoder().encode(text + "\n"),
+                                        );
+                                      }),
+                                      stdout: Stream.fromEffect(Deferred.await(output)),
+                                      stderr: Stream.empty,
+                                      awaitExit: exited,
+                                      stop: exited,
+                                    } satisfies ManagedProcess.PiManagedProcess;
+                                  }).pipe(Effect.mapError(fixtureProcessError)),
+                                reconcile: (recovery) =>
+                                  Effect.gen(function* () {
+                                    if (compactProof !== "memoryCompanionRecovery")
+                                      return yield* Effect.die(
+                                        "Completed controlled invocation must not probe native controls",
+                                      );
+                                    if (!queryDrains.size)
+                                      return yield* new ManagedProcess.PiManagedProcessError({
+                                        phase: "quarantine",
+                                        message: "Controlled kernel remains populated",
+                                      });
+                                    const receipt = observed.get(recovery.allocation.unit);
+                                    if (!receipt)
+                                      return yield* Effect.die(
+                                        "Controlled recovery has no observed physical owner",
+                                      );
+                                    expect(recovery.owner).toMatchObject({
+                                      unit: receipt.unit,
+                                      invocation: receipt.invocation,
+                                      cgroup: receipt.cgroup,
+                                    });
+                                    expect(
+                                      yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE authority_kind='memory-companion' AND drain_json IS NULL`,
+                                    ).toEqual([{ held: 16777216 }]);
+                                    return {
+                                      state: "drained" as const,
+                                      unit: receipt.unit,
+                                      invocation: receipt.invocation,
+                                      cgroup: receipt.cgroup,
+                                      kernel: receipt.kernel,
+                                    };
+                                  }).pipe(Effect.mapError(fixtureProcessError)),
+                              });
+                              const controlled = consumerOptions.companion;
+                              const controlledQuery = consumerOptions.queryCompanion;
+                              const invoke: typeof host.companion = (owner, config, bytes, fence) =>
+                                Effect.gen(function* () {
+                                  respond = (chunk) =>
+                                    owner.version === 1
+                                      ? controlled(owner, config, chunk, fence)
+                                      : controlledQuery === undefined
+                                        ? Effect.die("Missing query responder")
+                                        : controlledQuery(owner, config, chunk, fence);
+                                  if (launches === 0) {
+                                    yield* rejected(
+                                      host.companion(
+                                        owner,
+                                        {
+                                          ...config,
+                                          companion: { ...config.companion, runtimeFiles: [] },
+                                        },
+                                        bytes,
+                                        fence,
+                                      ),
+                                    );
+                                    yield* rejected(
+                                      host.companion(
+                                        owner,
+                                        {
+                                          ...config,
+                                          companion: {
+                                            ...config.companion,
+                                            storeRoot:
+                                              owner.operation.allocation.launch.workspace.path,
+                                          },
+                                        },
+                                        bytes,
+                                        fence,
+                                      ),
+                                    );
+                                    expect(launches).toBe(0);
+                                  }
+                                  const returned = yield* host.companion(
+                                    owner,
+                                    config,
+                                    bytes,
+                                    fence,
+                                  );
+                                  const originalLaunches = launches;
+                                  const journal = yield* makeProjectMemoryCompanionJournal(
+                                    "environment",
+                                  ).pipe(Effect.provideService(SqlClient.SqlClient, f.sql));
+                                  const retained = yield* journal.retained(
+                                    owner.admittedEffect.effectId,
+                                  );
+                                  expect(
+                                    retained.every(
+                                      (row) =>
+                                        row.phase === "drained" &&
+                                        row.owner !== undefined &&
+                                        row.drain !== null,
+                                    ),
+                                  ).toBe(true);
+                                  const requestId =
+                                    owner.version === 1
+                                      ? (yield* decodeMemoryCompanionInput(
+                                          new TextDecoder().decode(bytes),
+                                        )).requestId
+                                      : (yield* decodeQueryCompanionInput(
+                                          new TextDecoder().decode(bytes),
+                                        )).requestId;
+                                  const latest = retained.find(
+                                    (row) => row.intent.requestId === requestId,
+                                  );
+                                  if (!latest?.owner)
+                                    return yield* Effect.die("Controlled host lost original owner");
+                                  const observedReceipt = observed.get(
+                                    latest.intent.allocation.unit,
+                                  );
+                                  if (!observedReceipt)
+                                    return yield* Effect.die(
+                                      "Controlled host lost original receipt",
+                                    );
+                                  yield* rejected(
+                                    journal.drain(latest.intent, {
+                                      ...observedReceipt,
+                                      invocation: "2".repeat(32),
+                                    }),
+                                  );
+                                  yield* rejected(
+                                    journal.drain(latest.intent, {
+                                      ...observedReceipt,
+                                      kernel: "populated 1\npopulated 0\n",
+                                    }),
+                                  );
+                                  yield* rejected(
+                                    host.companion(
+                                      owner,
+                                      {
+                                        ...config,
+                                        companion: {
+                                          ...config.companion,
+                                          memoryBytes: config.companion.memoryBytes * 2,
+                                        },
+                                      },
+                                      bytes,
+                                      fence,
+                                    ),
+                                  );
+                                  expect(
+                                    yield* f.sql`SELECT unit FROM project_task_resource_child WHERE authority_kind='memory-companion' AND drain_json IS NULL`,
+                                  ).toEqual([]);
+                                  // Exact bytes replay, while changed bytes, owner and current-fence failure deny.
+                                  expect(
+                                    yield* host.companion(owner, config, bytes, fence),
+                                  ).toEqual(returned);
+                                  yield* rejected(
+                                    host.companion(
+                                      owner,
+                                      config,
+                                      new Uint8Array(Buffer.concat([bytes, Buffer.from(" ")])),
+                                      fence,
+                                    ),
+                                  );
+                                  yield* rejected(
+                                    host.companion(
+                                      {
+                                        ...owner,
+                                        operation: { ...owner.operation, environmentId: "foreign" },
+                                      },
+                                      config,
+                                      bytes,
+                                      fence,
+                                    ),
+                                  );
+                                  yield* rejected(
+                                    host.companion(
+                                      owner,
+                                      config,
+                                      bytes,
+                                      fence.pipe(
+                                        Effect.andThen(
+                                          Effect.fail(
+                                            new ProjectMemoryServiceError({
+                                              reason: "Revoked controlled forward fence",
+                                            }),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                  expect(launches).toBe(originalLaunches);
+                                  yield* host.cleanup(owner.admittedEffect.effectId);
+                                  expect(
+                                    yield* f.sql.withTransaction(
+                                      journal.auditProjectDrained(projectId),
+                                    ),
+                                  ).toBeGreaterThan(0);
+                                  yield* rejected(
+                                    f.sql.withTransaction(
+                                      journal.auditProjectDrained(projectId, 0),
+                                    ),
+                                  );
+                                  return returned;
+                                }).pipe(
+                                  Effect.mapError((error) =>
+                                    isControlledBackendError(error)
+                                      ? error
+                                      : new MemoryBackendError({
+                                          code: "unavailable",
+                                          message: "Controlled companion observation failed",
+                                        }),
+                                  ),
+                                );
+                              consumerOptions = {
+                                ...consumerOptions,
+                                companion: invoke,
+                                queryCompanion: invoke,
+                                confirmCompanionTransportDrained: host.cleanup,
+                                confirmQueryTransportDrained: host.confirmSearchDrain,
+                              };
+                            }
+                            const consumer = yield* makeProjectMemoryProcessingConsumer(
+                              consumerOptions,
+                            ).pipe(Effect.provideService(ProjectWorkContentGuard, contentGuard));
                             consumeMemory = (principal, effectId) =>
                               consumer.consume === undefined
                                 ? Effect.die("Configured consumer missing")
@@ -7466,21 +8112,18 @@ for (const compactProof of [
                                 (entry) => entry.recordId === selection.sourceRecordId,
                               ),
                             ).toMatchObject({
-                              status:
-                                compactProof === "memoryHumanRetraction"
-                                  ? "retracted"
-                                  : "superseded",
+                              status: humanRetraction ? "retracted" : "superseded",
                             });
                             expect(
                               reflected.decisions?.find(
                                 (entry) =>
                                   entry.decisionId ===
-                                  (compactProof === "memoryHumanRetraction"
+                                  (humanRetraction
                                     ? "live-memory-decision"
                                     : "live-memory-decision-replacement"),
                               ),
                             ).toMatchObject({ state: "accepted" });
-                          } else if (compactProof === "memoryPipeline" || queryForward) {
+                          } else if (pipelineProof || queryForward) {
                             expect({ failure: memoryPipelineFailure }).toEqual({ failure: "" });
                             expect(jobs[0]?.status).toBe("settled");
                             expect(decodeRequiredJson(jobs[0]?.receipt ?? "null")).toMatchObject({
@@ -7875,9 +8518,11 @@ for (const compactProof of [
                               ).toEqual(queryReceipt);
                               const cleanupId =
                                 compactProof === "memoryQueryModelUnknown" ? model.id : retained.id;
-                              expect(
-                                (yield* reconcileMemory(cleanupId).pipe(Effect.result))._tag,
-                              ).toBe("Failure");
+                              if (!startFailure) {
+                                expect(
+                                  (yield* reconcileMemory(cleanupId).pipe(Effect.result))._tag,
+                                ).toBe("Failure");
+                              }
                               expect(
                                 yield* f.sql`SELECT result_json,search_drain_json FROM project_team_memory_query`,
                               ).toEqual([{ result_json: null, search_drain_json: null }]);
@@ -7920,7 +8565,7 @@ for (const compactProof of [
                                 outcome: "failed",
                                 hitIds: [],
                               });
-                              if (compactProof === "memoryQuerySearchUnknown")
+                              if (searchUnknown)
                                 expect(
                                   decodeRequiredJson(finalRows[0]?.drain ?? "null"),
                                 ).toMatchObject({
@@ -8072,7 +8717,7 @@ for (const compactProof of [
                           expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(
                             charges,
                           );
-                          if (compactProof === "memoryPipeline") {
+                          if (pipelineProof) {
                             expect(memoryExchanges).toBe(2);
                             expect(memoryBackendCalls).toBe(3);
                           } else if (compactProof === "memoryFailure") {
@@ -8082,7 +8727,7 @@ for (const compactProof of [
                             expect(memoryExchanges).toBe(0);
                             expect(memoryBackendCalls).toBe(1);
                           }
-                          if (compactProof === "memoryHumanRetraction") {
+                          if (humanRetraction) {
                             // Project deletion also requires the independently captured
                             // current comment. Select it explicitly on the same running owner.
                             const beforeComment = yield* readCurrentState(f.sql, projectId);
@@ -8791,7 +9436,7 @@ for (const compactProof of [
             expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(charges);
             expect(runs).toBe(2);
             expect(f.transports).toBe(0);
-            if (compactProof === "memoryPipeline") {
+            if (pipelineProof) {
               expect(memoryExchanges).toBe(2);
               expect(memoryBackendCalls).toBe(3);
             } else if (accountingProof) {
@@ -9005,7 +9650,9 @@ for (const compactProof of [
               ).toEqual(queryReceipt);
               expect(memoryExchanges).toBe(queryNoForward ? 2 : 3);
               expect(memoryBackendCalls).toBe(
-                queryNoForward || compactProof === "memoryQueryModelUnknown" ? 3 : 4,
+                queryNoForward || compactProof === "memoryQueryModelUnknown" || startFailure
+                  ? 3
+                  : 4,
               );
               expect(
                 (yield* f.reader.readRequired(snapshot)).observations.provenance.queryId,
@@ -9023,8 +9670,8 @@ for (const compactProof of [
               expect(waiting.items[0]?.reason).toContain("stopped");
             } else if (cleanupProof) {
               expect(memoryExchanges).toBe(0);
-              expect(memoryBackendCalls).toBe(compactProof === "memoryHumanRetraction" ? 2 : 1);
-              if (compactProof === "memoryHumanRetraction") {
+              expect(memoryBackendCalls).toBe(humanRetraction ? 2 : 1);
+              if (humanRetraction) {
                 // A legal, immutable journal insert simulates a late index intent
                 // at the deleted generation; it confers no new owner authority.
                 yield* f.sql`INSERT INTO project_team_memory_job
@@ -9593,7 +10240,7 @@ for (const compactProof of [
             yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`,
           ).toEqual(rows);
         }),
-        compactProof === "memoryHumanRetraction",
+        compactProof === "memoryHumanRetraction" || compactProof === "memoryCompanionDelete",
       ),
   );
 

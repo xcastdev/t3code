@@ -87,6 +87,8 @@ const domainTables = [
   "project_work_events",
 ] as const;
 
+import { makeProjectMemoryCompanionJournal } from "./ProjectMemoryCompanionJournal.ts";
+
 const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.retainedJournals")(
   function* (sql: SqlClient.SqlClient, projectId: string, environmentId: string) {
     let bytes = 0;
@@ -134,6 +136,10 @@ const auditRetainedProjectionJournals = Effect.fn("ProjectMemoryProjectDeletion.
         return yield* deny("Retained cleanup journals exceed their synchronization bound");
       bytes += rows.reduce((total, row) => total + row.bytes, 0);
     }
+    const companion = yield* makeProjectMemoryCompanionJournal(environmentId).pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+    );
+    bytes += yield* companion.auditRetainedProjectDrained(projectId, 4194304 - bytes);
     if (bytes > 4194304)
       return yield* deny("Retained cleanup journals exceed their byte allowance");
     if (
@@ -641,6 +647,18 @@ export const assertProjectMemoryDeletionReadyInTransaction = Effect.fn(
       0,
     );
     if (bytes > 4194304) return yield* deny("Memory cleanup history exceeds its byte allowance");
+    if (environmentId === undefined) {
+      if (
+        (yield* sql`SELECT 1 AS present FROM project_memory_companion_invocation WHERE project_id=${projectId} LIMIT 1`)
+          .length !== 0
+      )
+        return yield* deny("Companion custody requires its original environment");
+    } else {
+      const companion = yield* makeProjectMemoryCompanionJournal(environmentId).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      bytes += yield* companion.auditProjectDrained(projectId, 4194304 - bytes);
+    }
     const sources = records.get("source") ?? [];
     const recordedMemory = yield* sql`SELECT event_id FROM project_work_events
     WHERE project_id=${projectId} AND event_type='project-work.foundation.recorded'

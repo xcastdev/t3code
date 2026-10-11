@@ -120,7 +120,7 @@ type Child = {
   environment_id: string;
   project_id: string;
   task_id: string;
-  authority_kind: "pi" | "verification" | "setup";
+  authority_kind: "pi" | "verification" | "setup" | "memory-companion";
   authority_id: string;
   allocation_json: string;
   memory_bytes: number;
@@ -141,13 +141,69 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
       return yield* deny("Task resource ownership requires the journal transaction");
   });
   const bind = (
-    kind: "pi" | "verification" | "setup",
+    kind: "pi" | "verification" | "setup" | "memory-companion",
     id: string,
     supplied: PiManagedProcessAllocation,
   ) => {
     const allocation = structuredClone(supplied);
     const identity = Effect.gen(function* () {
       yield* transaction;
+      if (kind === "memory-companion") {
+        const rows = yield* sql<{
+          project_id: string;
+          task_id: string;
+          effect_id: string;
+          request_id: string;
+          generation: number;
+          phase: string;
+          intent: string | null;
+        }>`SELECT CASE WHEN length(CAST(project_id AS BLOB))<=1024 THEN project_id END AS project_id,
+          CASE WHEN length(CAST(task_id AS BLOB))<=1024 THEN task_id END AS task_id,
+          CASE WHEN length(CAST(effect_id AS BLOB))<=1024 THEN effect_id END AS effect_id,
+          CASE WHEN length(CAST(request_id AS BLOB))<=1024 THEN request_id END AS request_id,
+          CASE WHEN typeof(generation)='integer' THEN generation END AS generation,
+          CASE WHEN length(CAST(phase AS BLOB))<=32 THEN phase END AS phase,
+          CASE WHEN length(CAST(intent_json AS BLOB))<=1048576 THEN intent_json END AS intent
+          FROM project_memory_companion_invocation WHERE environment_id=${environmentId} AND invocation_id=${id} LIMIT 2`;
+        const row = rows[0];
+        if (rows.length !== 1 || !row?.intent)
+          return yield* deny("Original companion resource authority unavailable");
+        const { decodeProjectMemoryCompanionIntent } = yield* Effect.promise(
+          () => import("./memory/ProjectMemoryCompanionJournal.ts"),
+        );
+        const { auditProjectMemoryTaskOwner, auditProjectMemoryAdmission } = yield* Effect.promise(
+          () => import("./memory/ProjectMemoryModelAccounting.ts"),
+        );
+        const intent = yield* decodeProjectMemoryCompanionIntent(row.intent);
+        const owner = intent.owner;
+        const operation = owner.operation;
+        if (
+          intent.invocationId !== id ||
+          operation.environmentId !== environmentId ||
+          operation.projectId !== row.project_id ||
+          operation.taskId !== row.task_id ||
+          owner.admittedEffect.effectId !== row.effect_id ||
+          intent.requestId !== row.request_id ||
+          intent.generation !== row.generation ||
+          encode(intent.allocation) !== encode(allocation)
+        )
+          return yield* deny("Original companion resource identity changed");
+        yield* auditProjectMemoryTaskOwner(sql, operation);
+        if (owner.version === 1) yield* auditProjectMemoryAdmission(sql, owner);
+        else {
+          const { auditProjectMemoryQueryAdmission } = yield* Effect.promise(
+            () => import("./memory/ProjectMemoryQuery.ts"),
+          );
+          yield* auditProjectMemoryQueryAdmission(sql, owner);
+        }
+        return {
+          projectId: row.project_id,
+          taskId: row.task_id,
+          taskDeadline: operation.rootDeadlineAtMs,
+          deadline: intent.deadlineAtMs,
+          active: ["prepared", "activating", "owned"].includes(row.phase),
+        };
+      }
       if (kind === "pi") {
         const rows = yield* sql<{
           project_id: string;
@@ -318,6 +374,13 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
         budgets[0].memory_bytes !== PROJECT_TASK_MEMORY_BYTES
       )
         return yield* deny("Original task resource budget cannot change or renew");
+      const unaccountedMemory = yield* sql`SELECT 1 FROM project_memory_companion_invocation m
+        WHERE m.environment_id=${environmentId} AND m.project_id=${authority.projectId} AND m.task_id=${authority.taskId}
+        AND m.phase IN ('activating','owned','uncertain') AND m.drain_json IS NULL AND NOT EXISTS
+          (SELECT 1 FROM project_task_resource_child c WHERE c.unit=json_extract(m.intent_json,'$.allocation.unit')
+           AND c.environment_id=m.environment_id AND c.project_id=m.project_id AND c.task_id=m.task_id
+           AND c.authority_kind='memory-companion' AND c.authority_id=m.invocation_id
+           AND c.nonce=json_extract(m.intent_json,'$.allocation.nonce') AND c.allocation_json=json_extract(m.intent_json,'$.allocation')) LIMIT 1`;
       const unaccountedPi = yield* sql`SELECT 1 FROM project_team_pi_process p
         JOIN project_team_pi_operation o ON o.operation_id=p.operation_id
         WHERE o.environment_id=${environmentId} AND o.project_id=${authority.projectId}
@@ -340,7 +403,12 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
         AND NOT EXISTS (SELECT 1 FROM project_task_resource_child c WHERE c.unit=s.unit
           AND c.environment_id=d.environment_id AND c.project_id=d.project_id AND c.task_id=${authority.taskId}
           AND c.authority_kind='setup' AND c.authority_id=s.setup_id AND c.allocation_json=s.allocation_json) LIMIT 1`;
-      if (unaccountedPi.length || unaccountedVerification.length || unaccountedSetup.length)
+      if (
+        unaccountedPi.length ||
+        unaccountedVerification.length ||
+        unaccountedSetup.length ||
+        unaccountedMemory.length
+      )
         return yield* deny("Original task contains an unaccounted native child");
       const exists =
         yield* sql`SELECT 1 FROM project_task_resource_child WHERE unit=${allocation.unit} OR nonce=${allocation.nonce} LIMIT 2`;
@@ -353,15 +421,16 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
         VALUES(${allocation.unit},${allocation.nonce},${environmentId},${authority.projectId},${authority.taskId},${kind},${id},${encode(allocation)},${allocation.policy.memoryBytes},${deadline})`;
       return (yield* retained).row.deadline_at_ms;
     });
-    const capture = (owner: PiManagedProcessOwner) =>
+    const capture = (owner: PiManagedProcessOwner, cleanup = false) =>
       Effect.gen(function* () {
         const { row, authority } = yield* retained;
         const deleted =
           yield* sql`SELECT 1 FROM project_lifecycle WHERE project_id=${authority.projectId} AND state='tombstoned' LIMIT 1`;
-        if (kind !== "setup" && deleted.length)
+        if (kind !== "setup" && !cleanup && deleted.length)
           return yield* deny("Deleted project cannot activate task resources");
         if (
           (kind !== "setup" &&
+            !cleanup &&
             (!authority.active || (yield* Clock.currentTimeMillis) >= row.deadline_at_ms)) ||
           row.drain_json !== null ||
           owner.unit !== row.unit ||
@@ -405,7 +474,16 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
     const cleanupOwner = Effect.gen(function* () {
       yield* transaction;
       let original: string | null | undefined;
-      if (kind === "verification") {
+      if (kind === "memory-companion") {
+        yield* identity;
+        const rows = yield* sql<{
+          owner: string | null;
+        }>`SELECT CASE WHEN length(CAST(owner_json AS BLOB))<=16384 THEN owner_json END AS owner
+          FROM project_memory_companion_invocation WHERE environment_id=${environmentId} AND invocation_id=${id} LIMIT 2`;
+        if (rows.length !== 1 || !rows[0]?.owner)
+          return yield* deny("Original companion cleanup owner unavailable");
+        original = rows[0].owner;
+      } else if (kind === "verification") {
         // Legacy verification has no aggregate budget. Cleanup audits its original journal directly.
         const rows = yield* sql<{
           project_id: string;
@@ -524,11 +602,15 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
           return yield* deny("Cleanup capture differs from original retained owner");
         const child = yield* cleanupChild;
         // An authenticated historical owner can be cleaned without inventing aggregate authority.
-        if (!child) return;
+        if (!child) {
+          if (kind === "memory-companion")
+            return yield* deny("Companion cleanup lacks its reserved child");
+          return;
+        }
         if (child.row.owner_json === encode(original)) return;
-        if (kind !== "setup" || child.row.owner_json !== null)
+        if ((kind !== "setup" && kind !== "memory-companion") || child.row.owner_json !== null)
           return yield* deny("Native cleanup cannot replace resource ownership");
-        yield* capture(original);
+        yield* capture(original, true);
       });
     const cleanupDrain = (receipt: PiManagedDrain | PiManagedProcessReconciliation) =>
       Effect.gen(function* () {
@@ -578,6 +660,8 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
     };
   };
   return {
+    memoryCompanion: (invocationId: string, allocation: PiManagedProcessAllocation) =>
+      bind("memory-companion", invocationId, allocation),
     setup: (setupId: string, allocation: PiManagedProcessAllocation) =>
       bind("setup", setupId, allocation),
     pi: (operationId: string, allocation: PiManagedProcessAllocation) =>
