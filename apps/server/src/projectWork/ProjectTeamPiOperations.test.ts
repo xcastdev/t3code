@@ -44,6 +44,7 @@ import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
 import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts";
 import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
+import { makeProjectTaskResources } from "./ProjectTaskResources.ts";
 import { make as makeAccounting } from "./ProjectTeamModelAccounting.ts";
 import { PiManagedRuntimeError } from "../provider/pi/PiManagedRuntime.ts";
 import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
@@ -2604,8 +2605,8 @@ for (const tampered of [false, true]) {
           .prepare(f.identity, { threadId, kind: "initialize" }, "more", {
             allocation: {
               ...f.allocation,
-              unit: "t3-pi-managed-anchor-more.service",
-              nonce: "more",
+              unit: "t3-pi-managed-22222222-2222-4222-8222-222222222222.service",
+              nonce: "22222222-2222-4222-8222-222222222222",
             },
             operationId: "more",
             workerId: "more",
@@ -2684,6 +2685,104 @@ it.effect("standalone root anchor validates existing-operation authorization and
       expect(
         yield* f.sql`SELECT status,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
       ).toEqual([{ status: "unknown", charged_input_tokens: 19900, charged_output_tokens: 100 }]);
+    }),
+  ),
+);
+
+it.effect(
+  "task resources consume worker activation and preserve original root and operation deadlines",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* journalFixture;
+        const op = yield* f.operations.prepare(
+          f.identity,
+          { threadId, kind: "initialize" },
+          "resource-worker",
+          {
+            allocation: f.allocation,
+            workerId: "resource-worker",
+            operationId: "journal-initialize",
+          },
+        );
+        yield* f.operations.persistence(op).claimActivation(f.allocation);
+        expect(
+          yield* f.sql`SELECT task_id,deadline_at_ms,memory_bytes FROM project_task_resource_budget`,
+        ).toEqual([
+          {
+            task_id: f.binding.taskId,
+            deadline_at_ms: f.admitted.intent.limits.rootDeadlineAtMs,
+            memory_bytes: 2147483648,
+          },
+        ]);
+        expect(
+          yield* f.sql`SELECT deadline_at_ms,memory_bytes,owner_json,drain_json FROM project_task_resource_child`,
+        ).toEqual([
+          {
+            deadline_at_ms: op.deadlineAtMs,
+            memory_bytes: f.allocation.policy.memoryBytes,
+            owner_json: null,
+            drain_json: null,
+          },
+        ]);
+        const owner = {
+          type: "owner" as const,
+          unit: f.allocation.unit,
+          nonce: f.allocation.nonce,
+          invocation: "a".repeat(32),
+          cgroup: `/sys/fs/cgroup/controlled/${f.allocation.unit}`,
+          pid: 123,
+          memoryBytes: f.allocation.policy.memoryBytes,
+          swapBytes: 0,
+          oomGroup: 1,
+        };
+        yield* f.operations.persistence(op).beforeStart(owner);
+        const drain = {
+          unit: owner.unit,
+          invocation: owner.invocation,
+          cgroup: owner.cgroup,
+          ownerPid: owner.pid,
+          memoryBytes: owner.memoryBytes,
+          swapBytes: 0,
+          oomGroup: 1,
+          launcherPid: 124,
+          childPid: 125,
+          childExitCode: 0,
+          kernel: "removed",
+        };
+        const persistence = f.operations.persistence(op);
+        if (!persistence.afterDrain) return yield* Effect.die("Missing consumed resource drain");
+        yield* rejected(persistence.afterDrain({ ...drain, kernel: "populated 1" }));
+        yield* TestClock.setTime(op.deadlineAtMs + 1);
+        yield* persistence.afterDrain(drain);
+        const resumed = yield* makeProjectTaskResources("environment");
+        yield* f.sql.withTransaction(
+          resumed.pi(op.operation.operationId, op.allocation).drain({
+            state: "drained",
+            unit: owner.unit,
+            invocation: owner.invocation,
+            cgroup: owner.cgroup,
+            kernel: "removed",
+          }),
+        );
+        expect(yield* f.sql`SELECT drain_json FROM project_task_resource_child`).toEqual([
+          { drain_json: canonicalProjectWorkPayload(drain) },
+        ]);
+        yield* rejected(f.operations.persistence(op).claimActivation(f.allocation));
+      }),
+    ),
+);
+
+it.effect("task resources deny worker activation after its current task authority is deleted", () =>
+  fileTest(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const op = yield* f.prepare();
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`INSERT INTO project_lifecycle(project_id,state,workspace_root,revision,changed_at,tombstone_json)
+      VALUES(${projectId},'tombstoned',${f.binding.worktree},1,${at},'{}')`;
+      yield* rejected(f.operations.persistence(op).claimActivation(f.allocation));
+      expect(yield* sql`SELECT unit FROM project_task_resource_child`).toEqual([]);
     }),
   ),
 );

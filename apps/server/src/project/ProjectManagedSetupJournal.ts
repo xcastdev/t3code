@@ -1,3 +1,4 @@
+import { makeProjectTaskResources } from "../projectWork/ProjectTaskResources.ts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -268,6 +269,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
     readonly validateSelection: ProjectManagedSetupPorts["validateCurrent"];
   }) {
     const sql = yield* SqlClient.SqlClient;
+    const taskResources = yield* makeProjectTaskResources(options.environmentId);
     const clock = yield* Clock.Clock;
     const dispatch = yield* makeProjectTeamDispatchJournal(options);
     const read = Effect.fn("ProjectManagedSetupJournal.read")(function* (
@@ -450,6 +452,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
             if (old.retained.activation !== "unlaunched") return "already-claimed" as const;
             if (old.retained.uncertain || old.retained.receipt || old.row.status !== "allocated")
               return yield* failure("Setup activation is fenced for reconciliation");
+            yield* taskResources.setup(input.setupId, allocation).reserve;
             const changed =
               yield* sql`UPDATE project_team_setup_process SET activation='claimed',status='claimed'
         WHERE setup_id=${input.setupId} AND activation='unlaunched' AND status='allocated' RETURNING setup_id`;
@@ -473,7 +476,8 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
         const ownerJson = yield* bounded(owner);
         yield* sql.withTransaction(
           Effect.gen(function* () {
-            // Ownership is recorded even if authority was revoked after native allocation.
+            // Capture an already-reserved physical owner for cleanup even after approval expires.
+            // START still requires the original current dispatch authority.
             const old = yield* read(input);
             if (
               !old ||
@@ -488,6 +492,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
             }
             if (old.retained.receipt || old.retained.uncertain)
               return yield* failure("Setup owner capture requires reconciliation");
+            yield* taskResources.setup(input.setupId, allocation).capture(owner);
             yield* sql`UPDATE project_team_setup_process SET owner_json=${ownerJson},activation='owned',status='captured'
         WHERE setup_id=${input.setupId} AND activation='claimed' AND owner_json IS NULL`;
             if (!same((yield* read(input))?.retained.owner, owner))
@@ -554,6 +559,10 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
             if (old.retained.uncertain)
               return yield* failure("Successful setup requires certain retained ownership");
           }
+          if (receipt.allocation && receipt.owner && (receipt.drain || receipt.reconciliation))
+            yield* taskResources
+              .setup(input.setupId, receipt.allocation)
+              .drain(receipt.drain ?? receipt.reconciliation!);
           const status = receiptStatus(receipt);
           yield* sql`UPDATE project_team_setup_process SET receipt_json=${receiptJson},drain_json=${drainJson},status=${status}
         WHERE setup_id=${input.setupId} AND receipt_json IS NULL`;
@@ -632,6 +641,18 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
         freezeAllocation(...args).pipe(Effect.mapError(setupError)),
       claimActivation,
       persistOwner,
+      persistDrain: (
+        input: ProjectManagedSetupInput,
+        allocation: PiManagedProcessAllocation,
+        drain: import("../provider/pi/PiManagedProcess.ts").PiManagedDrain,
+      ) =>
+        sql
+          .withTransaction(taskResources.setup(input.setupId, allocation).drain(drain))
+          .pipe(
+            Effect.mapError(
+              (cause) => new PiManagedProcessError({ phase: "quarantine", message: String(cause) }),
+            ),
+          ),
       persistStarted: (...args: Parameters<typeof persistStarted>) =>
         persistStarted(...args).pipe(Effect.mapError(setupError)),
       persistReceipt: (...args: Parameters<typeof persistReceipt>) =>

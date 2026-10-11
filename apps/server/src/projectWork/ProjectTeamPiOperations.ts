@@ -466,6 +466,7 @@ const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   );
 
 import { makeProjectTeamMailboxTurnDecisionReader } from "./ProjectTeamMailboxTurns.ts";
+import { makeProjectTaskResources } from "./ProjectTaskResources.ts";
 
 type Row = {
   operation_id: string;
@@ -522,6 +523,7 @@ export interface ProjectTeamPiUsageHistory {
 export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperations")(
   function* (options: { readonly environmentId: string }) {
     const sql = yield* SqlClient.SqlClient;
+    const taskResources = yield* makeProjectTaskResources(options.environmentId);
     const clock = yield* Clock.Clock;
     const authorization = yield* ProjectTeamAuthorization;
     const repository = yield* ProjectWorkRepository;
@@ -2091,6 +2093,17 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     });
     const persistence = (captured: PiDurableOperation) => ({
       allocation: captured.allocation,
+      deadlineAtMs: captured.deadlineAtMs,
+      afterDrain: (drain: import("../provider/pi/PiManagedProcess.ts").PiManagedDrain) =>
+        sql
+          .withTransaction(
+            taskResources.pi(captured.operation.operationId, captured.allocation).drain(drain),
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) => new PiManagedProcessError({ phase: "quarantine", message: String(cause) }),
+            ),
+          ),
       claimActivation: (allocation: PiManagedProcessAllocation) =>
         guard(
           Effect.gen(function* () {
@@ -2109,6 +2122,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
                   rows[0].allocation_json !== encode(allocation)
                 )
                   return yield* deny("Pi allocation already consumed", "conflict");
+                yield* taskResources.pi(captured.operation.operationId, allocation).reserve;
                 yield* sql`UPDATE project_team_pi_process SET status='claimed' WHERE unit=${allocation.unit}`;
                 yield* sql`UPDATE project_team_pi_operation SET status='starting' WHERE operation_id=${captured.operation.operationId}`;
                 yield* authorize(captured);
@@ -2151,6 +2165,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
                 }>`SELECT status FROM project_team_pi_process WHERE unit=${owner.unit} AND operation_id=${captured.operation.operationId}`;
                 if (rows[0]?.status !== "claimed")
                   return yield* deny("Pi owner already captured", "conflict");
+                yield* taskResources
+                  .pi(captured.operation.operationId, captured.allocation)
+                  .capture(owner);
                 yield* sql`UPDATE project_team_pi_process SET status='captured',owner_json=${encode(owner)} WHERE unit=${owner.unit}`;
                 yield* sql`UPDATE project_team_pi_operation SET status='running' WHERE operation_id=${captured.operation.operationId}`;
                 yield* authorize(captured);
@@ -2381,6 +2398,10 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             (!drain || !terminal.native || row.native_json !== encode(terminal.native))
           )
             return yield* deny("Pi success requires durable native and drained owner", "uncertain");
+          if (drain)
+            yield* taskResources
+              .pi(captured.operation.operationId, captured.allocation)
+              .drain(drain);
           yield* sql`UPDATE project_team_pi_process SET status=${uncertain ? "quarantine" : "drained"},drain_json=${drain ? encode(drain) : null} WHERE operation_id=${row.operation_id}`;
           // Clock and authority are sampled after the final SQL write receipt while still in the transaction.
           yield* sql`UPDATE project_team_pi_operation SET terminal_json=${encode(terminal)} WHERE operation_id=${row.operation_id}`;

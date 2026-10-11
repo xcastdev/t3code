@@ -172,6 +172,9 @@ const makeFixture = Effect.fn("makeExecutionFixture")(function* (
       ]),
     verifyResult: () => Effect.void,
   };
+  // Controlled execution tests retain an already-established original task budget.
+  // Production standalone budget bootstrap is deliberately still unavailable.
+  yield* f.sql`INSERT INTO project_task_resource_budget VALUES('environment',${f.selection.projectId},${f.selection.taskId},${intent.deadlineAtMs + 300000},2147483648)`;
   const journal = yield* makeProjectWorkVerificationExecutionJournal(options);
   const owner = {
     type: "owner" as const,
@@ -368,8 +371,8 @@ const controlled = (
           const result = {
             state: "drained" as const,
             unit: snapshot.intent.allocation.unit,
-            invocation: null,
-            cgroup: null,
+            invocation: snapshot.owner?.invocation ?? null,
+            cgroup: snapshot.owner?.cgroup ?? null,
             kernel: "removed",
           };
           observations.add(
@@ -850,6 +853,36 @@ it.effect(
           expect((yield* f.journal.claim(f.intent))._tag).toBe("Uncertain");
           yield* execution.sweep;
           expect(f.counters().starts).toBe(1);
+        }),
+      ),
+    ),
+);
+
+it.effect(
+  "task resources verification recovery consumes actual matched owner drain without extending expiry",
+  () =>
+    scoped(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* controlled();
+          const claimed = yield* f.journal.claim(f.intent);
+          if (claimed._tag !== "Claimed")
+            return yield* Effect.die("Missing original verification claim");
+          const persistence = f.journal.persistence(claimed.claim);
+          yield* persistence.claimActivation(f.intent.allocation);
+          yield* persistence.beforeStart(f.owner);
+          yield* TestClock.setTime(f.intent.deadlineAtMs + 1);
+          const execution = yield* makeProjectWorkVerificationExecution(f.options);
+          yield* execution.ready;
+          expect(yield* f.journal.readResult(f.selection.jobId)).toMatchObject({
+            outcome: "abandoned",
+            drain: null,
+          });
+          expect(
+            yield* f.sql`SELECT COUNT(*) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+          ).toEqual([{ held: 0 }]);
+          expect(f.commands).toEqual([]);
+          expect(f.counters().reconciles).toBe(1);
         }),
       ),
     ),

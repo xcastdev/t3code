@@ -1,5 +1,9 @@
 import { expect, it } from "@effect/vitest";
-import { ProjectWorkFoundationCommitCommand } from "@t3tools/contracts";
+import {
+  ProjectWorkFoundationCommitCommand,
+  canonicalProjectWorkPayload,
+} from "@t3tools/contracts";
+import { makeProjectTaskResources } from "../projectWork/ProjectTaskResources.ts";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -216,7 +220,16 @@ const setup = Effect.gen(function* () {
     reason: null,
   };
   // Native owner/drain values are controlled SQL fixtures, not physical proof.
-  return { ...f, input, journal, selection, allocation, owner, receipt };
+  return {
+    ...f,
+    input,
+    journal,
+    selection,
+    allocation,
+    owner,
+    receipt,
+    taskDeadline: snapshot.intent.limits.rootDeadlineAtMs,
+  };
 });
 const allocated = Effect.gen(function* () {
   const f = yield* setup;
@@ -686,4 +699,91 @@ it.effect("an exact receipt remains cleanup knowledge after explicit uncertainty
       expect((yield* f.journal.read(f.input))?.uncertain).toBe(true);
     }),
   ),
+);
+
+it.effect(
+  "task resources consume exact approved setup and retain capacity through canceled uncertain drain",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* allocated;
+        yield* f.journal.claimActivation(f.input, f.selection, f.allocation);
+        expect(
+          yield* f.sql`SELECT task_id,memory_bytes,deadline_at_ms FROM project_task_resource_budget`,
+        ).toEqual([
+          {
+            task_id:
+              f.request.claim.transition?.kind === "claim"
+                ? f.request.claim.transition.binding.taskId
+                : "missing",
+            memory_bytes: 2147483648,
+            deadline_at_ms: f.taskDeadline,
+          },
+        ]);
+        yield* TestClock.setTime(f.input.deadlineAtMs + 1);
+        yield* f.journal.persistOwner(f.input, f.allocation, f.owner);
+        expect(
+          (yield* f.journal.validateCurrent(f.input, f.selection, "start").pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.journal
+            .persistDrain(f.input, f.allocation, { ...f.receipt.drain!, kernel: "populated 1" })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+        ).toEqual([{ held: 16777216 }]);
+        yield* f.journal.persistDrain(f.input, f.allocation, f.receipt.drain!);
+        expect(yield* f.sql`SELECT drain_json FROM project_task_resource_child`).toEqual([
+          { drain_json: canonicalProjectWorkPayload(f.receipt.drain) },
+        ]);
+        expect(
+          (yield* f.journal.claimActivation(f.input, f.selection, f.allocation).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect(
+  "task resources reject foreign setup authority and aggregate overlapping verification",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* allocated;
+        expect(
+          (yield* f.journal
+            .claimActivation({ ...f.input, bindingId: "foreign" }, f.selection, f.allocation)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        yield* f.journal.claimActivation(f.input, f.selection, f.allocation);
+        const snapshot = yield* f.journal.read(f.input);
+        expect(snapshot?.activation).toBe("claimed");
+        const resources = yield* makeProjectTaskResources("environment");
+        const nonce = "87654321-1234-4123-8123-123456789012";
+        const allocation = {
+          ...f.allocation,
+          unit: `t3-pi-managed-${nonce}.service`,
+          nonce,
+          policy: { ...f.allocation.policy, memoryBytes: 2147483648 },
+          launch: { ...f.allocation.launch, memoryBytes: 2147483648 },
+        };
+        const task =
+          f.request.claim.transition?.kind === "claim"
+            ? f.request.claim.transition.binding.taskId
+            : "missing";
+        // A retained controlled verification authority isolates the aggregate SQL gate.
+        yield* f.sql`INSERT INTO project_work_verification_execution(environment_id,job_id,project_id,task_id,attempt_id,manifest_hash,gate_id,gate_revision,intent_json,intent_hash,allocation_hash,deadline_at_ms,phase,revision)
+      VALUES('environment','verification',${projectId},${task},'verification',${"a".repeat(64)},'gate',0,${canonicalProjectWorkPayload({ allocation })},${"a".repeat(64)},${"a".repeat(64)},${f.input.deadlineAtMs},'claimed',0)`;
+        expect(
+          (yield* f.sql
+            .withTransaction(resources.verification("verification", allocation).reserve)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+        ).toEqual([{ held: 16777216 }]);
+      }),
+    ),
 );

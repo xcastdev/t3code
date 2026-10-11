@@ -1,3 +1,4 @@
+import { makeProjectTaskResources } from "./ProjectTaskResources.ts";
 import {
   canonicalProjectWorkPayload,
   CommandId,
@@ -263,6 +264,7 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
     readonly assertEnabled: Effect.Effect<void, ProjectTeamDispatchJournalError>;
   }) {
     const sql = yield* SqlClient.SqlClient;
+    const taskResources = yield* makeProjectTaskResources(options.environmentId);
     const repository = yield* ProjectWorkRepository;
     const provider = yield* ProviderService;
     const pi = yield* ProjectTeamPiRuntime;
@@ -510,6 +512,10 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
           ).pipe(Effect.provide(services));
           if (result.state === "owned")
             return yield* denied("Original native writer has not drained");
+          if (result.state === "drained")
+            yield* sql
+              .withTransaction(taskResources.pi(row.operation_id, allocation).drain(result))
+              .pipe(Effect.mapError(() => denied("Original task resource drain remains unproved")));
           return {
             operationId: row.operation_id,
             allocation,

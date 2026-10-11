@@ -1,5 +1,6 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import type * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -255,6 +256,9 @@ export const PiManagedProcessAllocationSchema = AllocationSchema;
 export type PiManagedProcessAllocation = typeof AllocationSchema.Type;
 export interface PiManagedProcessPersistence {
   readonly allocation: PiManagedProcessAllocation;
+  /** Original operation deadline, never a fresh duration from activation. */
+  readonly deadlineAtMs?: number;
+  readonly afterDrain?: (drain: PiManagedDrain) => Effect.Effect<void, PiManagedProcessError>;
   // Root must atomically consume the persisted descriptor once; this leaf has no durable database.
   readonly claimActivation: (
     allocation: PiManagedProcessAllocation,
@@ -512,15 +516,22 @@ const readManagedUnit = Effect.fn("PiManagedProcess.readUnit")(function* (unit: 
     ),
   );
 });
-const matchesPolicy = (policy: typeof ShowSchema.Type, allocation: PiManagedProcessAllocation) =>
-  policy.Description === `T3 Pi managed ${allocation.nonce}` &&
-  policy.KillMode === "control-group" &&
-  policy.Restart === "no" &&
-  durationUsec(policy.RuntimeMaxUSec) === allocation.policy.runtimeSeconds * 1000000 &&
-  durationUsec(policy.TimeoutStopUSec) === 2000000 &&
-  policy.UnsetEnvironment.split(" ").filter(Boolean).sort().join(" ") === unsetPolicy &&
-  policy.Environment.split(" ").includes("LC_ALL=C") &&
-  policy.Environment.split(" ").includes("LANG=C");
+// Recovery accepts a deadline-shortened runtime, but never a longer allocation.
+const matchesPolicy = (policy: typeof ShowSchema.Type, allocation: PiManagedProcessAllocation) => {
+  const runtime = durationUsec(policy.RuntimeMaxUSec);
+  return (
+    runtime !== undefined &&
+    policy.Description === `T3 Pi managed ${allocation.nonce}` &&
+    policy.KillMode === "control-group" &&
+    policy.Restart === "no" &&
+    runtime > 0 &&
+    runtime <= allocation.policy.runtimeSeconds * 1000000 &&
+    durationUsec(policy.TimeoutStopUSec) === 2000000 &&
+    policy.UnsetEnvironment.split(" ").filter(Boolean).sort().join(" ") === unsetPolicy &&
+    policy.Environment.split(" ").includes("LC_ALL=C") &&
+    policy.Environment.split(" ").includes("LANG=C")
+  );
+};
 const absentUnit = (policy: typeof ShowSchema.Type) =>
   policy.LoadState === "not-found" &&
   policy.ActiveState === "inactive" &&
@@ -746,6 +757,15 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
   if (persistence) yield* persistence.claimActivation(allocation);
+  const runtimeSeconds =
+    persistence?.deadlineAtMs === undefined
+      ? launch.runtimeSeconds
+      : Math.min(
+          launch.runtimeSeconds,
+          Math.floor((persistence.deadlineAtMs - (yield* Clock.currentTimeMillis)) / 1000),
+        );
+  if (!Number.isSafeInteger(runtimeSeconds) || runtimeSeconds < 1)
+    return yield* fail("startup", "Original operation deadline cannot accommodate activation.");
   return yield* Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       const child = yield* spawner
@@ -770,7 +790,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
               "-p",
               "Restart=no",
               "-p",
-              `RuntimeMaxSec=${launch.runtimeSeconds}s`,
+              `RuntimeMaxSec=${runtimeSeconds}s`,
               "-p",
               "TimeoutStopSec=2s",
               "-p",
@@ -877,7 +897,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
           });
           yield* Deferred.fail(started, stoppedError);
           yield* Deferred.fail(exited, stoppedError);
-          return {
+          const drain = {
             unit,
             invocation: capturedOwner.invocation,
             cgroup: group,
@@ -890,6 +910,8 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             childExitCode,
             kernel,
           };
+          if (persistence?.afterDrain) yield* persistence.afterDrain(drain);
+          return drain;
         }).pipe(
           Effect.mapError(
             (cause) =>
@@ -1076,7 +1098,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         `/sys/fs/cgroup${policy.ControlGroup}` !== verified.cgroup ||
         policy.KillMode !== "control-group" ||
         policy.Restart !== "no" ||
-        durationUsec(policy.RuntimeMaxUSec) !== launch.runtimeSeconds * 1000000 ||
+        durationUsec(policy.RuntimeMaxUSec) !== runtimeSeconds * 1000000 ||
         durationUsec(policy.TimeoutStopUSec) !== 2000000 ||
         policy.UnsetEnvironment.split(" ").filter(Boolean).sort().join(" ") !== unsetPolicy ||
         !policy.Environment.split(" ").includes("LC_ALL=C") ||

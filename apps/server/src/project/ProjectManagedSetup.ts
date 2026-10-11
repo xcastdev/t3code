@@ -100,6 +100,11 @@ export interface ProjectManagedSetupPorts<R = never> {
     allocation: PiManagedProcessAllocation,
     owner: PiManagedProcessOwner,
   ) => Effect.Effect<void, PiManagedProcessError, R>;
+  readonly persistDrain?: (
+    input: ProjectManagedSetupInput,
+    allocation: PiManagedProcessAllocation,
+    drain: PiManagedDrain,
+  ) => Effect.Effect<void, PiManagedProcessError, R>;
   readonly persistStarted: (
     input: ProjectManagedSetupInput,
     allocation: PiManagedProcessAllocation,
@@ -444,6 +449,15 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
             const process = yield* restore(
               ports.acquire(selection.launch, {
                 allocation,
+                deadlineAtMs: input.deadlineAtMs,
+                ...(ports.persistDrain === undefined
+                  ? {}
+                  : {
+                      afterDrain: (drain: PiManagedDrain) =>
+                        ports.persistDrain!(input, allocation, drain).pipe(
+                          Effect.provideContext(context),
+                        ),
+                    }),
                 claimActivation: (actual) =>
                   Effect.gen(function* () {
                     yield* current(selection, "activation").pipe(

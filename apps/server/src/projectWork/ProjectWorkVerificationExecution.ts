@@ -263,6 +263,18 @@ export const makeProjectWorkVerificationExecution = Effect.fn(
             return;
           }
           const observed = recovered.success;
+          const released = yield* provide(journal.persistReconciliation(snapshot, observed)).pipe(
+            Effect.result,
+          );
+          if (released._tag === "Failure") {
+            yield* provide(
+              journal.quarantineRecovery(
+                snapshot,
+                "Original verification task resource drain remains uncertain",
+              ),
+            );
+            return;
+          }
           const result = yield* provide(
             retain(snapshot, {
               outcome: "abandoned",

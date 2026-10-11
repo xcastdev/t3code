@@ -14,8 +14,10 @@ import {
   PiManagedProcessAllocationSchema,
   PiManagedProcessError,
   type PiManagedProcessPersistence,
+  type PiManagedProcessReconciliation,
 } from "../provider/pi/PiManagedProcess.ts";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
+import { makeProjectTaskResources } from "./ProjectTaskResources.ts";
 import { ProjectWorkArtifactApplicability } from "./ProjectWorkArtifacts.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import {
@@ -512,6 +514,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
   const options = { ...input, environmentId: decodeId(input.environmentId) };
   return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const taskResources = yield* makeProjectTaskResources(options.environmentId);
     const repository = yield* ProjectWorkRepository;
     const claims = new WeakMap<VerificationClaim, VerificationExecutionIntent>();
     const recovery = new WeakSet<VerificationExecutionSnapshot>();
@@ -692,6 +695,17 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
       Effect.andThen(own, work.pipe(Effect.provideService(SqlClient.SqlClient, sql)));
     const persistence = (claim: VerificationClaim): PiManagedProcessPersistence => ({
       allocation: claim.intent.allocation,
+      deadlineAtMs: claim.intent.deadlineAtMs,
+      afterDrain: (drain) =>
+        sql
+          .withTransaction(
+            taskResources.verification(claim.attemptId, claim.intent.allocation).drain(drain),
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) => new PiManagedProcessError({ phase: "quarantine", message: String(cause) }),
+            ),
+          ),
       claimActivation: (allocation) => {
         let captured: typeof PiManagedProcessAllocationSchema.Type;
         try {
@@ -712,6 +726,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
           yield* sql.withTransaction(
             Effect.gen(function* () {
               const value = yield* get(claim);
+              yield* taskResources.verification(claim.attemptId, captured).reserve;
               if (value.row.phase !== "claimed" || !same(captured, claim.intent.allocation))
                 return yield* deny("Verification allocation already activated or changed");
               if ((yield* Clock.currentTimeMillis) >= claim.intent.deadlineAtMs)
@@ -771,6 +786,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
               yield* current(claim.intent, claim.attemptId, "consumed");
               if ((yield* Clock.currentTimeMillis) >= claim.intent.deadlineAtMs)
                 return yield* deny("Verification deadline expired");
+              yield* taskResources.verification(claim.attemptId, allocation).capture(owner);
               const changed =
                 yield* sql`UPDATE project_work_verification_execution SET phase='owner-captured',owner_json=${canonicalProjectWorkPayload(owner)},revision=revision+1 WHERE environment_id=${options.environmentId} AND job_id=${claim.intent.receipt.manifest.jobId} AND phase='activating' AND revision=${value.row.revision} RETURNING job_id`;
               if (changed.length !== 1) return yield* deny("Verification owner was not persisted");
@@ -879,6 +895,10 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
               return [];
             }
             yield* options.verifyResult(claim.intent, result);
+            if (retained.snapshot.owner && result.drain)
+              yield* taskResources
+                .verification(claim.attemptId, claim.intent.allocation)
+                .drain(result.drain);
             if (result.outcome === "success") {
               const state = yield* current(claim.intent, claim.attemptId, "consumed");
               evidence = yield* Effect.try({
@@ -946,6 +966,26 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
       }
       return quarantine(claim, reason);
     };
+    const persistReconciliation = (
+      snapshot: VerificationExecutionSnapshot,
+      observed: PiManagedProcessReconciliation,
+    ) =>
+      Effect.gen(function* () {
+        if (!recovery.has(snapshot))
+          return yield* deny("Verification recovery belongs to another journal");
+        yield* own;
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const retained = yield* read(snapshot.intent.receipt.manifest.jobId);
+            if (!retained || !same(retained.snapshot, snapshot))
+              return yield* deny("Verification recovery snapshot changed");
+            if (snapshot.owner)
+              yield* taskResources
+                .verification(snapshot.attemptId, snapshot.intent.allocation)
+                .drain(observed);
+          }),
+        );
+      });
     const finishRecovery = (
       snapshot: VerificationExecutionSnapshot,
       input: RetainedVerificationResult,
@@ -978,6 +1018,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
       complete,
       recordUncertain,
       finishRecovery,
+      persistReconciliation,
       quarantineRecovery,
     };
   });

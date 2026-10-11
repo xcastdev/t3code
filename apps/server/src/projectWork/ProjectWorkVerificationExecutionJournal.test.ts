@@ -11,6 +11,7 @@ import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -49,6 +50,7 @@ const attribution = {
 } as const;
 const makeFixture = Effect.fn("makeExecutionJournalFixture")(function* (
   role: "implementer" | "integrator" = "implementer",
+  retainTaskBudget = true,
 ) {
   const f = yield* makeVerificationFixture(role);
   const repository = yield* ProjectWorkRepository;
@@ -104,6 +106,10 @@ const makeFixture = Effect.fn("makeExecutionJournalFixture")(function* (
     allocation,
     deadlineAtMs: (yield* Clock.currentTimeMillis) + 1000,
   };
+  // Controlled custody fixture supplies the prior frozen task budget. Production
+  // verification cannot originate or renew this budget when no Pi owner retained it.
+  if (retainTaskBudget)
+    yield* f.sql`INSERT INTO project_task_resource_budget VALUES('environment',${f.selection.projectId},${f.selection.taskId},${intent.deadlineAtMs + 300000},2147483648)`;
   const approval = yield* makeProjectWorkVerificationGate({
     environmentId: "environment",
     maximumEnvironmentModelCalls: 4,
@@ -599,17 +605,11 @@ it.effect("a borrowed historical result cannot escape the owning repository's fa
       expect(failed._tag).toBe("Failure");
       if (failed._tag === "Failure")
         expect(Cause.pretty(failed.cause)).toContain("FOREIGN KEY constraint failed");
-      const blocked = yield* f.sql
-        .withTransaction(reader.readInTransaction(input))
-        .pipe(Effect.exit);
-      expect(blocked._tag).toBe("Failure");
-      if (blocked._tag === "Failure")
-        expect(Cause.pretty(blocked.cause)).toContain(
-          "cannot start a transaction within a transaction",
-        );
-      // Clean only this disposable connection's hidden failed physical transaction.
-      yield* f.sql`ROLLBACK`;
+      // The owning connection rescues its failed COMMIT before releasing it.
       expect((yield* f.sql.withTransaction(reader.readInTransaction(input)))._tag).toBe("Terminal");
+      expect(yield* f.sql`SELECT COUNT(*) AS escaped FROM controlled_historical_child`).toEqual([
+        { escaped: 0 },
+      ]);
       expect(yield* f.journal.readResult(f.selection.jobId)).toEqual(result);
     }),
   ),
@@ -931,41 +931,28 @@ for (const role of ["implementer", "integrator"] as const)
           if (completed._tag === "Failure")
             expect(Cause.pretty(completed.cause)).toContain("FOREIGN KEY constraint failed");
           expect(yield* f.sql`SELECT phase FROM project_work_verification_execution`).toEqual([
-            { phase: "terminal" },
+            { phase: "owner-captured" },
           ]);
-          const reading = yield* f.journal.readResult(f.selection.jobId).pipe(Effect.exit);
-          const recovery = yield* f.journal.readRecoveryPage({ limit: 1 }).pipe(Effect.exit);
+          expect(
+            yield* f.sql`SELECT COUNT(*) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+          ).toEqual([{ held: 1 }]);
+          expect((yield* f.journal.readRecoveryPage({ limit: 1 })).items[0]?.phase).toBe(
+            "owner-captured",
+          );
           const query = yield* ProjectWorkQuery;
-          const snapshot = yield* query.snapshot(f.selection.projectId).pipe(Effect.exit);
-          const exported = yield* query
-            .exportSnapshot(f.selection.projectId, false, true)
-            .pipe(Effect.exit);
-          const evidencePage = yield* query
-            .withProjectRevision(
+          expect(
+            (yield* query.exportSnapshot(f.selection.projectId, false, true)).snapshot.evidence,
+          ).toEqual(before.evidence);
+          expect(
+            (yield* query.withProjectRevision(
               f.selection.projectId,
               query.listEvidence({
                 projectId: f.selection.projectId,
                 taskId: f.selection.taskId,
                 limit: 50,
               }),
-            )
-            .pipe(Effect.exit);
-          // Test-only cleanup of this disposable connection's failed physical transaction.
-          yield* f.sql`ROLLBACK`;
-          const errors = [
-            ...[reading, recovery].map((read) =>
-              read._tag === "Failure"
-                ? Cause.pretty(read.cause)
-                : "Unexpected successful journal read",
-            ),
-            ...[snapshot, exported, evidencePage].map((read) =>
-              read._tag === "Failure"
-                ? Cause.pretty(read.cause)
-                : "Unexpected successful public read",
-            ),
-          ];
-          for (const error of errors)
-            expect(error).toContain("cannot start a transaction within a transaction");
+            )).value,
+          ).toEqual([]);
           expect(yield* f.journal.readResult(f.selection.jobId)).toBeUndefined();
           expect((yield* query.snapshot(f.selection.projectId)).evidence).toEqual(before.evidence);
           expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(before);
@@ -1305,6 +1292,91 @@ it.effect(
           yield* f.sql`UPDATE project_work_artifacts SET manifest_json=${original} WHERE artifact_id=${output.artifactId}`;
         }
         expect(yield* f.journal.readResult(f.selection.jobId)).toEqual(result);
+      }),
+    ),
+);
+
+it.effect(
+  "task resources consume approved verification and retain failed drain before matching recovery",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claim = yield* claimed(f);
+        const persistence = f.journal.persistence(claim);
+        yield* persistence.claimActivation(f.intent.allocation);
+        yield* persistence.beforeStart(f.owner);
+        if (!persistence.afterDrain)
+          return yield* Effect.die("Missing verification resource drain");
+        expect(
+          (yield* persistence
+            .afterDrain({ ...f.drain, invocation: "b".repeat(32) })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+        ).toEqual([{ held: f.intent.allocation.policy.memoryBytes }]);
+        yield* persistence.afterDrain(f.drain);
+        expect(yield* f.sql`SELECT drain_json FROM project_task_resource_child`).toEqual([
+          { drain_json: canonicalProjectWorkPayload(f.drain) },
+        ]);
+        expect(
+          (yield* persistence.claimActivation(f.intent.allocation).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+
+it.effect("task resources deny approved verification without an original same-task budget", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", false);
+      const claim = yield* claimed(f);
+      expect(
+        (yield* f.journal
+          .persistence(claim)
+          .claimActivation(f.intent.allocation)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.sql`SELECT unit FROM project_task_resource_child`).toEqual([]);
+      expect((yield* f.journal.readRecoveryPage({ limit: 1 })).items[0]?.phase).toBe("claimed");
+    }),
+  ),
+);
+
+it.effect(
+  "task resources release only exact actual verification recovery observations after expiry",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const claim = yield* claimed(f);
+        const process = f.journal.persistence(claim);
+        yield* process.claimActivation(f.intent.allocation);
+        yield* process.beforeStart(f.owner);
+        yield* TestClock.setTime(f.intent.deadlineAtMs + 1);
+        const snapshot = (yield* f.journal.readRecoveryPage({ limit: 1 })).items[0];
+        if (!snapshot) return yield* Effect.die("Missing original verification recovery");
+        const actual = {
+          state: "drained" as const,
+          unit: f.owner.unit,
+          invocation: f.owner.invocation,
+          cgroup: f.owner.cgroup,
+          kernel: "removed",
+        };
+        expect(
+          (yield* f.journal
+            .persistReconciliation(snapshot, { ...actual, invocation: "b".repeat(32) })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+        ).toEqual([{ held: f.intent.allocation.policy.memoryBytes }]);
+        yield* f.journal.persistReconciliation(snapshot, actual);
+        expect(yield* f.sql`SELECT drain_json FROM project_task_resource_child`).toEqual([
+          { drain_json: canonicalProjectWorkPayload(actual) },
+        ]);
+        yield* f.journal.persistReconciliation(snapshot, actual);
       }),
     ),
 );
