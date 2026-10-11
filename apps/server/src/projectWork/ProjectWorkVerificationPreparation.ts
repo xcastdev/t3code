@@ -125,6 +125,8 @@ const decodePrincipal = Schema.decodeUnknownSync(
   strict,
 );
 const decodeManifest = Schema.decodeUnknownSync(ProjectVerificationJobManifest, strict);
+// Preserve exact schema-encoded workspace receipts alongside retained canonical receipts.
+const encodeWorkspace = Schema.encodeSync(Schema.fromJsonString(ProjectTeamWorkspaceReceipt));
 const decodeWorkspace = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectTeamWorkspaceReceipt),
   strict,
@@ -337,7 +339,8 @@ export function makeProjectWorkVerificationPreparation(supplied: Options) {
           const receipt = yield* decodeWorkspace(row.receipt_json);
           if (
             !same(receipt.assignment, assignment) ||
-            row.receipt_json !== canonicalProjectWorkPayload(receipt)
+            (row.receipt_json !== canonicalProjectWorkPayload(receipt) &&
+              row.receipt_json !== encodeWorkspace(receipt))
           )
             return yield* deny("Original workspace receipt contradicts the retained assignment");
           let combination: ProjectTeamIntegrationCombinationReceipt | undefined;

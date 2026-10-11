@@ -11,6 +11,7 @@ import {
 } from "./PiManagedRuntime.ts";
 import {
   canonicalProjectWorkPayload,
+  OrchestrationProjectShell,
   CommandId,
   EnvironmentId,
   MessageId,
@@ -28,7 +29,7 @@ import {
   ProjectTeamWriteIntent,
   ProjectWorkTaskId,
   ThreadId,
-  type ProjectWorkCommand,
+  ProjectWorkCommand,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
@@ -40,6 +41,25 @@ import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
+import * as Semaphore from "effect/Semaphore";
+import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import { GitRepositoryPermits } from "../../git/GitRepositoryPermits.ts";
+import * as ManagedGit from "../../git/ManagedGitExecution.ts";
+import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { makeProjectTeamWorkspace } from "../../projectWork/ProjectTeamWorkspace.ts";
+import {
+  makeProjectTeamPiRuntime,
+  ProjectTeamPiRuntime,
+} from "../../projectWork/ProjectTeamPiRuntime.ts";
+import {
+  makeProjectWorkVerificationPreparationRoot,
+  ProjectWorkVerificationPreparationSelection,
+  ProjectWorkVerificationPreparationError,
+} from "../../projectWork/ProjectWorkVerificationPreparation.ts";
+import { makeProjectWorkVerificationExecutionHost } from "../../projectWork/ProjectWorkVerificationExecutionHost.ts";
+import { makeProjectWorkVerificationExecution } from "../../projectWork/ProjectWorkVerificationExecution.ts";
+import { ProjectWorkEventBusLive } from "../../projectWork/ProjectWorkEventBus.ts";
+import { makeProjectWorkArtifacts } from "../../projectWork/ProjectWorkArtifacts.ts";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
@@ -66,6 +86,7 @@ import { preallocatePiManagedProcess } from "./PiManagedProcess.ts";
 import { piManagedSkillResourceIdentity } from "./PiManagedSkillResources.ts";
 import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
 import { makeProjectTaskResources } from "../../projectWork/ProjectTaskResources.ts";
+import { makeProjectTeamSessionReceipts } from "../../projectWork/ProjectTeamSessionReceipts.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentAuth } from "../../auth/EnvironmentAuth.ts";
 import * as ServerSettings from "../../serverSettings.ts";
@@ -214,6 +235,12 @@ const decodeLocalTerminal = Schema.decodeEffect(
 );
 const decodeReportReceipt = Schema.decodeEffect(Schema.fromJsonString(ProjectWorkWriteResult));
 const decodeReportTask = Schema.decodeUnknownEffect(ProjectWorkTaskRead);
+const decodeNativeSmokeCommand = Schema.decodeUnknownEffect(ProjectWorkCommand);
+const decodeNativeJsonEvidence = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.JsonObject));
+const decodeNativeSmokeShell = Schema.decodeUnknownSync(OrchestrationProjectShell);
+const decodeNativeVerificationSelection = Schema.decodeUnknownEffect(
+  ProjectWorkVerificationPreparationSelection,
+);
 const decodeReportEvidence = Schema.decodeUnknownEffect(Schema.Array(ProjectWorkEvidenceRead));
 const decodeReportComments = Schema.decodeUnknownEffect(Schema.Array(ProjectWorkComment));
 const decodeMemorySources = Schema.decodeUnknownEffect(ProjectTeamMemorySourcesRead);
@@ -6103,6 +6130,9 @@ type RuntimeFixtureProfile = {
   readonly maxInputTokens: number;
   readonly maxOutputTokens: number;
   readonly deliverableKind?: "non-code";
+  readonly originalClockAtMs?: number;
+  readonly ownedScratchDirectory?: string;
+  readonly physicalWorkspace?: boolean;
 };
 const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   reviewer = false,
@@ -6114,11 +6144,16 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   profile?: RuntimeFixtureProfile,
 ) {
   if (reviewer || readonlyKind === "review") return yield* requiredReviewTransferFixture();
-  yield* TestClock.setTime(Date.parse(at) + 1);
+  const fixtureAt =
+    profile?.originalClockAtMs === undefined
+      ? at
+      : DateTime.formatIso(DateTime.makeUnsafe(profile.originalClockAtMs));
+  if (profile?.originalClockAtMs === undefined) yield* TestClock.setTime(Date.parse(at) + 1);
+  else expect(yield* Clock.currentTimeMillis).toBeGreaterThanOrEqual(profile.originalClockAtMs);
   const sql = yield* SqlClient.SqlClient;
   const repository = yield* ProjectWorkRepository;
   const fs = yield* FileSystem.FileSystem;
-  const scratch = yield* fs.makeTempDirectoryScoped();
+  const scratch = yield* fs.makeTempDirectoryScoped({ directory: profile?.ownedScratchDirectory });
   const main = scratch + "/main";
   const assigned = scratch + "/assigned";
   const agentDirectory = scratch + "/agent";
@@ -6152,7 +6187,8 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
     "initial",
   ]);
   const baseOid = yield* git(["-C", main, "rev-parse", "HEAD"]);
-  yield* git(["-C", main, "worktree", "add", "-qb", "required-root", assigned]);
+  if (!profile?.physicalWorkspace)
+    yield* git(["-C", main, "worktree", "add", "-qb", "required-root", assigned]);
   let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
   const captureClaim = {
     ...repository,
@@ -6226,6 +6262,27 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       return repository.execute(command);
     },
   };
+  const seedRepository = {
+    ...captureClaim,
+    execute: (command: ProjectWorkCommand) => {
+      if (profile?.originalClockAtMs === undefined) return captureClaim.execute(command);
+      // Original seed inputs only; stored authority and semantic content stay exact.
+      const timestamps = new Set([
+        "createdAt",
+        "updatedAt",
+        "recordedAt",
+        "committedAt",
+        "claimedAt",
+      ]);
+      return decodeNativeSmokeCommand(
+        JSON.parse(
+          JSON.stringify(command, (key, value) =>
+            timestamps.has(key) && value === at ? fixtureAt : value,
+          ),
+        ),
+      ).pipe(Effect.flatMap((original) => captureClaim.execute(original)));
+    },
+  };
   yield* seed(
     profile?.role ?? (reviewer && readonlyKind === undefined ? "reviewer" : "implementer"),
     "reserved",
@@ -6235,7 +6292,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       toolIds: profile?.toolIds ?? [],
       issueCredential: false,
     },
-  ).pipe(Effect.provideService(ProjectWorkRepository, captureClaim), Effect.result);
+  ).pipe(Effect.provideService(ProjectWorkRepository, seedRepository), Effect.result);
   if (!pending || pending.transition?.kind !== "claim")
     return yield* Effect.die("Missing original context claim");
   yield* repository.execute(
@@ -6245,7 +6302,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       commandId: "required-limits",
       expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
       attribution,
-      committedAt: at,
+      committedAt: fixtureAt,
       records: [
         {
           kind: "limits",
@@ -6253,7 +6310,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           recordId: "required-limits",
           revision: 0,
           generation: 0,
-          updatedAt: at,
+          updatedAt: fixtureAt,
           status: "configured",
           environmentModelCalls: 4,
           projectWritableWorkers: 2,
@@ -6338,7 +6395,21 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       assignmentOperationId: id + "-assignment",
       assignment,
     };
-    const snapshot = yield* journal.claimEffect((yield* journal.reserve(request)).fence);
+    const reserveStartedAtMs = yield* Clock.currentTimeMillis;
+    const reserved = yield* journal.reserve(request);
+    const reserveFinishedAtMs = yield* Clock.currentTimeMillis;
+    const snapshot = yield* journal.claimEffect(reserved.fence);
+    if (profile?.originalClockAtMs !== undefined && id === "required-root") {
+      expect(snapshot.intent.limits.rootDeadlineAtMs).toBeGreaterThanOrEqual(
+        reserveStartedAtMs + profile.durationMs,
+      );
+      expect(snapshot.intent.limits.rootDeadlineAtMs).toBeLessThanOrEqual(
+        reserveFinishedAtMs + profile.durationMs,
+      );
+      expect(snapshot.intent.limits.deadlineAtMs).toBeLessThanOrEqual(
+        snapshot.intent.limits.rootDeadlineAtMs,
+      );
+    }
     yield* journal.readStageReceipts(snapshot.fence.dispatchId);
     return { request, snapshot, binding };
   });
@@ -6406,7 +6477,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       const human = {
         actor: { kind: "human", id: "readonly-runtime-human" },
         source: { kind: "web", id: "readonly-runtime-browser" },
-        recordedAt: at,
+        recordedAt: fixtureAt,
       } as const;
       const envelope = {
         projectId,
@@ -6422,7 +6493,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           commandId: envelope.commandId,
           expectedRevision: state.revision,
           attribution: human,
-          committedAt: at,
+          committedAt: fixtureAt,
           records: [],
           guided: {
             intent:
@@ -6490,7 +6561,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           commandId: "readonly-runtime-configure",
           expectedRevision: state.revision,
           attribution: human,
-          committedAt: at,
+          committedAt: fixtureAt,
           records: [
             roleRecord,
             {
@@ -6499,7 +6570,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
               recordId: "readonly-runtime-member",
               revision: 0,
               generation: 0,
-              updatedAt: at,
+              updatedAt: fixtureAt,
               status: "active",
               name: "Readonly context worker",
               coordinator: false,
@@ -6515,7 +6586,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
         recordId: "required-child-binding",
         revision: 0,
         generation: 0,
-        updatedAt: at,
+        updatedAt: fixtureAt,
         status: "reserved",
         taskId: task.taskId,
         attemptId: "required-child-attempt",
@@ -6546,7 +6617,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
         commandId: "readonly-runtime-claim",
         expectedRevision: state.revision,
         attribution,
-        committedAt: at,
+        committedAt: fixtureAt,
         records: [],
         transition: {
           kind: "claim",
@@ -6563,7 +6634,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
             attemptId: binding.attemptId,
             leaseToken: "readonly-runtime-lease",
             leasedUntil: "2030-01-01T00:00:00.000Z",
-            claimedAt: at,
+            claimedAt: fixtureAt,
           },
         },
       });
@@ -6574,7 +6645,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
         taskId: ProjectWorkTaskId.make("required-child"),
         commandId: CommandId.make("required-child-create"),
         title: "Child task",
-        createdAt: at,
+        createdAt: fixtureAt,
       });
       yield* repository.execute(
         yield* decodeRequiredFoundation({
@@ -6583,7 +6654,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           commandId: "required-child-membership",
           expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
           attribution,
-          committedAt: at,
+          committedAt: fixtureAt,
           records: [
             {
               kind: "task-membership",
@@ -6591,7 +6662,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
               recordId: "required-child-membership",
               revision: 0,
               generation: 0,
-              updatedAt: at,
+              updatedAt: fixtureAt,
               status: "active",
               taskId: "required-child",
               parentTaskId: retained.binding.taskId,
@@ -6639,7 +6710,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
     maxOutputTokens: profile?.maxOutputTokens ?? 100,
     readCatalogue: Effect.succeed({
       source: "https://api.commandcode.ai/provider/v1/models",
-      fetchedAt: at,
+      fetchedAt: fixtureAt,
       selectedEntry: {
         id: model,
         owned_by: "command-code",
@@ -6716,7 +6787,9 @@ const dispatchedRuntimeFixture = Effect.fn("dispatchedRuntimeFixture")(function*
           ),
   });
   let snapshot = f.snapshot;
-  for (const stage of ["workspace-ready", "setup-complete"] as const)
+  for (const stage of profile.physicalWorkspace
+    ? []
+    : (["workspace-ready", "setup-complete"] as const))
     snapshot = yield* journal.readRetained(
       (yield* journal.advanceStage(snapshot.fence, {
         receiptId: `runtime-fixture-${stage}`,
@@ -6926,6 +6999,820 @@ const initializeRequiredContext = Effect.fn("initializeRequiredContext")(functio
   }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
   return snapshot;
 });
+
+const decodeActivationFrame = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literals(["owner", "started", "stdout", "stderr", "exited", "failed"]),
+      pid: Schema.optional(Schema.Int),
+    }),
+  ),
+);
+describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
+  "genuine approved native SDK activation",
+  () => {
+    it.live(
+      "runs original initialization, assignment and approved verification under the retained task cap",
+      () =>
+        scoped(
+          Effect.gen(function* () {
+            const distributionDirectory = process.env.PI_MANAGED_RUNTIME_INITIALIZATION_DIST;
+            const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+            if (!distributionDirectory || !evidence)
+              return yield* Effect.die(
+                "Owned current distribution and native evidence are required",
+              );
+            const fs = yield* FileSystem.FileSystem;
+            yield* fs.makeDirectory(evidence, { recursive: true });
+            const ownedScratchDirectory = distributionDirectory + "-owned-runtime";
+            yield* fs.makeDirectory(ownedScratchDirectory, { recursive: true, mode: 0o700 });
+            const stage = yield* fs.makeTempDirectoryScoped({
+              directory: ownedScratchDirectory,
+              prefix: "assets-",
+            });
+            yield* fs.chmod(stage, 0o700);
+            yield* Effect.addFinalizer(() => fs.chmod(stage, 0o700).pipe(Effect.orDie));
+            const assets = yield* preparePiRuntimeAssets({
+              distributionDirectory,
+              stagingDirectory: stage,
+              protectedRoots: [evidence],
+            });
+            const closure = yield* Effect.forEach(assets.runtimeFiles, (file) =>
+              fs.readFile(file.source).pipe(
+                Effect.map((bytes) => ({
+                  ...file,
+                  bytes: bytes.length,
+                  sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+                })),
+              ),
+            );
+            yield* fs.writeFileString(evidence + "/closure.json", json(closure));
+            const settings = yield* ServerSettings.ServerSettingsService;
+            yield* settings.updateSettings({ projectTeamExecutionEnabled: true });
+            const approvedAtMs = yield* Clock.currentTimeMillis;
+            const f = yield* dispatchedRuntimeFixture({
+              ...basicRuntimeProfile,
+              role: "implementer",
+              durationMs: 60000,
+              maxInputTokens: 12000,
+              originalClockAtMs: approvedAtMs,
+              ownedScratchDirectory,
+              physicalWorkspace: true,
+            });
+            expect(f.request.claim.committedAt).toBe(
+              DateTime.formatIso(DateTime.makeUnsafe(approvedAtMs)),
+            );
+            const originalDeadlineAtMs = f.snapshot.intent.limits.rootDeadlineAtMs;
+            expect(originalDeadlineAtMs).toBeGreaterThanOrEqual(approvedAtMs + 60000);
+            expect(yield* Clock.currentTimeMillis).toBeLessThan(
+              f.snapshot.intent.limits.deadlineAtMs,
+            );
+            yield* Effect.addFinalizer(() =>
+              Effect.gen(function* () {
+                const budgets =
+                  yield* f.sql`SELECT environment_id,project_id,task_id,deadline_at_ms,memory_bytes FROM project_task_resource_budget LIMIT 2`;
+                const children =
+                  yield* f.sql`SELECT unit,nonce,authority_id,memory_bytes,deadline_at_ms,allocation_json,owner_json,drain_json FROM project_task_resource_child LIMIT 3`;
+                const operations =
+                  yield* f.sql`SELECT operation_id,status,terminal_json FROM project_team_pi_operation ORDER BY operation_ordinal LIMIT 3`;
+                yield* fs.writeFileString(
+                  evidence + "/retained-sql.json",
+                  json({ budgets, children, operations }),
+                );
+                const sessions: Array<{ path: string; content: string }> = [];
+                for (const namespace of yield* fs.readDirectory(f.options.nativeStateRoot)) {
+                  const directory = f.options.nativeStateRoot + "/" + namespace + "/sessions";
+                  if (!(yield* fs.exists(directory))) continue;
+                  for (const name of yield* fs.readDirectory(directory)) {
+                    if (!name.endsWith(".jsonl")) continue;
+                    if (sessions.length >= 2)
+                      return yield* Effect.die("Native session evidence count exceeded");
+                    const path = directory + "/" + name;
+                    const stat = yield* fs.stat(path);
+                    if (Number(stat.size) > 1048576)
+                      return yield* Effect.die("Native session evidence bytes exceeded");
+                    sessions.push({ path, content: yield* fs.readFileString(path) });
+                  }
+                }
+                yield* fs.writeFileString(evidence + "/sessions.json", json(sessions));
+              }).pipe(Effect.orDie),
+            );
+            yield* fs.writeFileString(
+              f.options.agentDirectory + "/auth.json",
+              json({ "command-code": { type: "api_key", key: "synthetic-parent-key" } }),
+            );
+            const captured: Array<{
+              unit: string;
+              kind: string;
+              pid: number;
+              startTime: string;
+            }> = [];
+            const capture = Effect.fn("nativeSmoke.capture")(function* (
+              unit: string,
+              kind: string,
+              pid: number,
+            ) {
+              const stat = yield* fs.readFileString(`/proc/${pid}/stat`);
+              const startTime = stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[19];
+              if (!startTime || !/^\d+$/.test(startTime))
+                return yield* Effect.die("Captured native PID has no original start identity");
+              captured.push({ unit, kind, pid, startTime });
+              yield* fs.writeFileString(evidence + "/captured-pids.json", json(captured));
+            });
+            const originalSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const observed = ChildProcessSpawner.make((command) => {
+              if (command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run")
+                return originalSpawner.spawn(command);
+              const unit = command.args.find((arg) => arg.startsWith("--unit="))?.slice(7);
+              if (!unit) return originalSpawner.spawn(command);
+              let pending = Buffer.alloc(0);
+              let transcript = Buffer.alloc(0);
+              const args = [...command.args];
+              const helperIndex = args.indexOf("/usr/bin/python3");
+              if (helperIndex < 0) return Effect.die("Native owner helper command absent");
+              args.splice(
+                helperIndex,
+                0,
+                "-p",
+                "TasksMax=128",
+                "-p",
+                "CPUQuota=200%",
+                "-p",
+                "AllowedCPUs=0,1",
+              );
+              return originalSpawner
+                .spawn(ChildProcess.make(command.command, args, command.options))
+                .pipe(
+                  Effect.tap((handle) => capture(unit, "launcher", Number(handle.pid))),
+                  Effect.tap((handle) =>
+                    fs.writeFileString(
+                      evidence + "/" + unit + ".launch.json",
+                      json({
+                        command: command.command,
+                        args,
+                        launcherPid: Number(handle.pid),
+                        qualification:
+                          "Stricter native test envelope; original memory/deadline/allocation unchanged",
+                      }),
+                    ),
+                  ),
+                  Effect.map((handle) =>
+                    ChildProcessSpawner.makeHandle({
+                      ...handle,
+                      stdout: handle.stdout.pipe(
+                        Stream.tap((chunk) =>
+                          Effect.gen(function* () {
+                            transcript = Buffer.concat([transcript, chunk]);
+                            if (transcript.byteLength > 1048576)
+                              return yield* Effect.die(
+                                "Native diagnostic transcript exceeded its bound",
+                              );
+                            yield* fs.writeFile(
+                              evidence + "/" + unit + ".frames.jsonl",
+                              transcript,
+                            );
+                            pending = Buffer.concat([pending, chunk]);
+                            for (;;) {
+                              const newline = pending.indexOf(10);
+                              if (newline < 0) break;
+                              if (newline > 65536)
+                                return yield* Effect.die(
+                                  "Native ownership frame exceeded its bound",
+                                );
+                              const frame = yield* decodeActivationFrame(
+                                pending.subarray(0, newline).toString("utf8"),
+                              ).pipe(Effect.orDie);
+                              pending = pending.subarray(newline + 1);
+                              if (frame.type === "owner" || frame.type === "started") {
+                                if (frame.pid === undefined)
+                                  return yield* Effect.die("Native ownership frame omitted PID");
+                                yield* capture(unit, frame.type, frame.pid);
+                              }
+                            }
+                            if (pending.byteLength > 65536)
+                              return yield* Effect.die("Native ownership frame exceeded its bound");
+                          }),
+                        ),
+                      ),
+                    }),
+                  ),
+                );
+            });
+            let calls = 0;
+            const runtime = yield* makePiManagedRuntimeLive({
+              ...f.options,
+              ...assets,
+              memoryBytes: 536870912,
+              maxInputTokens: 12000,
+              maxOutputTokens: 512,
+              cleanupDeadlineMs: 5000,
+              revalidateRuntime: assets.revalidate.pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new PiManagedRuntimeError({ code: "unavailable", detail: cause.message }),
+                ),
+              ),
+              workerArgv: (identity, operation) =>
+                assets.workerArgv(identity, operation, "/state/sessions"),
+              readCatalogue: Effect.succeed({
+                source: "https://api.commandcode.ai/provider/v1/models",
+                fetchedAt: DateTime.formatIso(DateTime.makeUnsafe(approvedAtMs)),
+                selectedEntry: {
+                  id: model,
+                  owned_by: "command-code",
+                  context_length: 20000,
+                  supported_endpoints: ["/chat/completions"],
+                },
+              }),
+              transport: async (_url, init) => {
+                calls++;
+                await process
+                  .getBuiltinModule("fs")
+                  .promises.writeFile(
+                    evidence + "/model-request.json",
+                    json({ calls, headers: init.headers, body: init.body }),
+                    "utf8",
+                  );
+                expect(calls).toBe(1);
+                expect(init.headers).toEqual({
+                  "Content-Type": "application/json",
+                  Authorization: "Bearer synthetic-parent-key",
+                });
+                const data = [
+                  {
+                    model,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { role: "assistant", content: "Native smoke complete" },
+                        finish_reason: null,
+                      },
+                    ],
+                  },
+                  { model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+                  {
+                    model,
+                    choices: [],
+                    usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+                  },
+                ];
+                return new Response(
+                  data.map((entry) => `data: ${json(entry)}\n\n`).join("") + "data: [DONE]\n\n",
+                  { headers: { "content-type": "text/event-stream" } },
+                );
+              },
+            }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed));
+            const instance = yield* runtime.forInstance({
+              instanceId: providerInstanceId,
+              enabled: true,
+              configuration: {},
+            });
+            const pi = yield* makeProjectTeamPiRuntime();
+            const revalidateAssets = assets.revalidate.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new PiManagedRuntimeError({ code: "unavailable", detail: cause.message }),
+              ),
+            );
+            const ownedAssets = {
+              runtimeFiles: assets.runtimeFiles,
+              revalidate: revalidateAssets,
+              borrow: <A, E, R>(use: Effect.Effect<A, E, R>) =>
+                revalidateAssets.pipe(
+                  Effect.andThen(use),
+                  Effect.tap(() => revalidateAssets),
+                ),
+            };
+            yield* pi.publishAssets(providerInstanceId, ownedAssets, instance);
+            const permit = yield* Semaphore.make(1);
+            const withRepositoryPermit = <A, E, R>(
+              _operation: string,
+              cwd: string,
+              use: Effect.Effect<A, E, R>,
+            ) =>
+              ManagedGit.canonicalGitMutationKey(f.request.git.commonGitDirectory, cwd).pipe(
+                Effect.flatMap((key) => {
+                  expect(key).toBe(`git\0${f.request.git.commonGitDirectory}`);
+                  return permit.withPermits(1)(use);
+                }),
+              );
+            const physicalServices = Layer.mergeAll(
+              Layer.succeed(ProjectTeamPiRuntime, pi),
+              Layer.mock(GitRepositoryPermits, { withRepositoryPermit }),
+              Layer.mock(GitWorkflowService, {
+                withRepositoryPermit,
+                createWorktree: (input, options) => {
+                  if (!options?.managed)
+                    return Effect.die("Native fixture requires original managed Git context");
+                  return permit.withPermits(1)(
+                    ManagedGit.createManagedWorktree(options.managed, input),
+                  );
+                },
+              }),
+              Layer.mock(ProjectionSnapshotQuery, {
+                getProjectShellById: (selected) =>
+                  selected === projectId
+                    ? Effect.succeed(
+                        Option.some(
+                          decodeNativeSmokeShell({
+                            id: projectId,
+                            title: "Native smoke",
+                            workspaceRoot: f.main,
+                            defaultModelSelection: null,
+                            scripts: [],
+                            createdAt: DateTime.formatIso(DateTime.makeUnsafe(approvedAtMs)),
+                            updatedAt: DateTime.formatIso(DateTime.makeUnsafe(approvedAtMs)),
+                          }),
+                        ),
+                      )
+                    : Effect.succeed(Option.none()),
+              }),
+            );
+            const originalDispatch = yield* makeProjectTeamDispatchJournal({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+            });
+            const workspace = yield* makeProjectTeamWorkspace({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              launchPolicy: { memoryBytes: 536870912, runtimeSeconds: 30 },
+              protectedRoots: [evidence],
+              assertCurrent: (original) =>
+                originalDispatch.inspect(original.fence.dispatchId).pipe(
+                  Effect.flatMap((current) =>
+                    canonicalProjectWorkPayload(current) === canonicalProjectWorkPayload(original)
+                      ? Effect.void
+                      : Effect.fail(
+                          new ProjectTeamDispatchJournalError({
+                            reason: "Native dispatch changed",
+                          }),
+                        ),
+                  ),
+                  Effect.mapError(
+                    () =>
+                      new ProjectTeamDispatchJournalError({
+                        reason: "Native original dispatch audit failed",
+                      }),
+                  ),
+                ),
+            }).pipe(Effect.provide(physicalServices));
+            let snapshot = f.snapshot;
+            const { workspace: physical } = yield* workspace.workspace(snapshot);
+            const stages = yield* makeProjectTeamDispatchJournal({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              verifyStage: (receipt, original) =>
+                receipt.stage === "workspace-ready"
+                  ? workspace.verifyRetained(original, physical).pipe(
+                      Effect.scoped,
+                      Effect.mapError(
+                        () =>
+                          new ProjectTeamDispatchJournalError({
+                            reason: "Native physical workspace changed",
+                          }),
+                      ),
+                    )
+                  : workspace.verifyRetained(original, physical, setup).pipe(
+                      Effect.scoped,
+                      Effect.mapError(
+                        () =>
+                          new ProjectTeamDispatchJournalError({
+                            reason: "Native setup completion changed",
+                          }),
+                      ),
+                    ),
+            });
+            snapshot = yield* stages.readRetained(
+              (yield* stages.advanceStage(snapshot.fence, {
+                receiptId: "native-physical-workspace-ready",
+                stage: "workspace-ready",
+                evidence: { workspace: physical },
+              })).fence.dispatchId,
+            );
+            const setup = yield* workspace.setup(snapshot, physical);
+            expect(setup.outcome).toBe("skipped");
+            snapshot = yield* stages.readRetained(
+              (yield* stages.advanceStage(snapshot.fence, {
+                receiptId: "native-physical-setup-complete",
+                stage: "setup-complete",
+                evidence: { workspace: physical, setup: decodeNativeJsonEvidence(json(setup)) },
+              })).fence.dispatchId,
+            );
+            yield* fs.writeFileString(
+              evidence + "/workspace-setup.json",
+              json({
+                physical,
+                setup,
+                snapshot,
+                qualification:
+                  "Actual ManagedGit and no-script SetupRuntime; test-local project shell and canonical repository permit",
+              }),
+            );
+            const initialized = yield* instance.prepareOperation(
+              {
+                threadId: f.binding.threadId,
+                kind: "initialize",
+                operationId: f.request.initializeOperationId,
+              },
+              () => Effect.void,
+            );
+            const first = yield* initialized.run;
+            expect(first.terminal.outcome).toBe("success");
+            expect(calls).toBe(0);
+            const budget =
+              yield* f.sql`SELECT deadline_at_ms,memory_bytes FROM project_task_resource_budget LIMIT 2`;
+            expect(budget).toEqual([
+              { deadline_at_ms: f.snapshot.intent.limits.deadlineAtMs, memory_bytes: 2147483648 },
+            ]);
+            const sessionReceipts = yield* makeProjectTeamSessionReceipts({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+            });
+            const journal = yield* makeProjectTeamDispatchJournal({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              verifyStage: (receipt, original) =>
+                Effect.gen(function* () {
+                  expect(receipt.evidence.bindingId).toBe(original.intent.request.git.runId);
+                  expect(receipt.evidence.initializeOperationId).toBe(
+                    original.intent.request.initializeOperationId,
+                  );
+                  const retained = yield* sessionReceipts.readInitialization(original);
+                  if (!retained)
+                    return yield* new ProjectTeamDispatchJournalError({
+                      reason: "Native initialization receipt absent",
+                    });
+                  expect(retained).toBeDefined();
+                }).pipe(
+                  Effect.mapError(
+                    () =>
+                      new ProjectTeamDispatchJournalError({
+                        reason: "Native initialization receipt audit failed",
+                      }),
+                  ),
+                ),
+            });
+            for (const stage of ["session-bound", "assignment-intent"] as const)
+              snapshot = yield* journal.readRetained(
+                (yield* journal.advanceStage(snapshot.fence, {
+                  receiptId: `native-smoke-${stage}`,
+                  stage,
+                  evidence: {
+                    bindingId: f.binding.recordId,
+                    initializeOperationId: f.request.initializeOperationId,
+                  },
+                })).fence.dispatchId,
+              );
+            const assignment = yield* instance.prepareOperation(
+              {
+                threadId: f.binding.threadId,
+                kind: "prompt",
+                operationId: f.request.assignmentOperationId,
+                prompt: f.request.assignment,
+              },
+              () => Effect.void,
+            );
+            const second = yield* assignment.run;
+            expect(second.terminal.outcome).toBe("success");
+            expect(calls).toBe(1);
+            const children = yield* f.sql<{
+              unit: string;
+              owner_json: string;
+              drain_json: string;
+            }>`SELECT unit,owner_json,drain_json FROM project_task_resource_child LIMIT 3`;
+            expect(children).toHaveLength(2);
+            expect(
+              yield* f.sql`SELECT deadline_at_ms,memory_bytes FROM project_task_resource_budget LIMIT 2`,
+            ).toEqual(budget);
+            expect(
+              yield* f.sql`SELECT unit FROM project_task_resource_child WHERE drain_json IS NULL LIMIT 1`,
+            ).toEqual([]);
+            yield* fs.writeFileString(
+              evidence + "/native-results.json",
+              json({
+                approvedAtMs,
+                originalDeadlineAtMs,
+                originalDispatch: f.request,
+                originalBudget: budget,
+                initialized: first,
+                assignment: second,
+                children,
+                calls,
+                captured,
+              }),
+            );
+            for (const child of children) {
+              const owner = parseOwner(child.owner_json);
+              const drain = parseFullDrain(child.drain_json);
+              expect(owner.unit).toBe(child.unit);
+              expect(drain.unit).toBe(child.unit);
+              expect(drain.invocation).toBe(owner.invocation);
+              expect(drain.memoryBytes).toBe(536870912);
+              expect(drain.swapBytes).toBe(0);
+              expect(drain.oomGroup).toBe(1);
+              expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(true);
+              const identities = captured.filter((item) => item.unit === child.unit);
+              expect(identities.map((item) => item.kind)).toEqual(["launcher", "owner", "started"]);
+              expect(identities.map((item) => item.pid)).toEqual([
+                drain.launcherPid,
+                drain.ownerPid,
+                drain.childPid,
+              ]);
+              for (const item of identities) {
+                const stat = yield* fs.readFileString(`/proc/${item.pid}/stat`).pipe(Effect.option);
+                if (Option.isSome(stat))
+                  expect(
+                    stat.value.slice(stat.value.lastIndexOf(") ") + 2).split(" ")[19],
+                  ).not.toBe(item.startTime);
+              }
+              if (yield* fs.exists(drain.cgroup + "/cgroup.events"))
+                expect(yield* fs.readFileString(drain.cgroup + "/cgroup.events")).toContain(
+                  "populated 0",
+                );
+            }
+            yield* workspace.verifyRetained(snapshot, physical, setup);
+            const verifyJoined = (
+              _receipt: DispatchJournal.ProjectTeamDispatchStageReceipt,
+              original: typeof snapshot,
+            ) =>
+              Effect.gen(function* () {
+                expect(original.intent).toEqual(snapshot.intent);
+                const retained = yield* f.sql<{
+                  operation_id: string;
+                  status: string;
+                  terminal_json: string;
+                }>`SELECT operation_id,status,
+                CASE WHEN length(CAST(terminal_json AS BLOB))<=262144 THEN terminal_json ELSE NULL END AS terminal_json
+                FROM project_team_pi_operation WHERE binding_id=${f.binding.recordId} ORDER BY operation_ordinal LIMIT 3`;
+                expect(retained.map((row) => [row.operation_id, row.status])).toEqual([
+                  [f.request.initializeOperationId, "settled"],
+                  [f.request.assignmentOperationId, "settled"],
+                ]);
+                expect(
+                  retained.map((row) => canonicalProjectWorkPayload(JSON.parse(row.terminal_json))),
+                ).toEqual([
+                  canonicalProjectWorkPayload(first.terminal),
+                  canonicalProjectWorkPayload(second.terminal),
+                ]);
+                expect(
+                  yield* f.sql`SELECT unit FROM project_task_resource_child WHERE drain_json IS NULL LIMIT 1`,
+                ).toEqual([]);
+                const ownedWorkspace = yield* f.sql<{
+                  receipt_json: string;
+                }>`SELECT CASE WHEN length(CAST(receipt_json AS BLOB))<=262144 THEN receipt_json ELSE NULL END AS receipt_json
+                FROM project_team_workspace_receipt WHERE dispatch_id=${f.request.dispatchId} LIMIT 2`;
+                expect(ownedWorkspace).toHaveLength(1);
+                expect(
+                  ownedWorkspace.map((row) =>
+                    canonicalProjectWorkPayload(JSON.parse(row.receipt_json)),
+                  ),
+                ).toEqual([canonicalProjectWorkPayload(physical)]);
+                const ownedSetup = yield* f.sql<{
+                  receipt_json: string;
+                }>`SELECT CASE WHEN length(CAST(receipt_json AS BLOB))<=262144 THEN receipt_json ELSE NULL END AS receipt_json
+                FROM project_team_setup_process WHERE setup_id=${f.request.setupId} LIMIT 2`;
+                expect(
+                  ownedSetup.map((row) =>
+                    canonicalProjectWorkPayload(JSON.parse(row.receipt_json)),
+                  ),
+                ).toEqual([canonicalProjectWorkPayload(setup)]);
+              }).pipe(
+                Effect.mapError(
+                  () =>
+                    new ProjectTeamDispatchJournalError({
+                      reason: "Native joined evidence changed",
+                    }),
+                ),
+              );
+            const settling = yield* makeProjectTeamDispatchJournal({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              verifyStage: verifyJoined,
+              verifySettlement: verifyJoined,
+            });
+            snapshot = yield* settling.readRetained(
+              (yield* settling.settleAfterJoined(snapshot.fence, {
+                receiptId: "native-smoke-joined",
+                stage: "settled",
+                evidence: { worker: "joined", setup: "skipped", transport: "drained" },
+              })).fence.dispatchId,
+            );
+            const state = yield* readCurrentState(f.sql, projectId);
+            const binding = state.foundationRecords?.find(
+              (row) => row.kind === "run-binding" && row.recordId === f.binding.recordId,
+            );
+            const task = state.tasks.find((row) => row.taskId === f.binding.taskId);
+            if (binding?.kind !== "run-binding" || !task)
+              return yield* Effect.die("Original verification target missing");
+            expect(binding.status).toBe("settled");
+            const principal = { actor: { kind: "human" as const, id: "fixture-human" } };
+            const selection = yield* decodeNativeVerificationSelection({
+              jobId: "native-node-version-smoke",
+              projectId,
+              taskId: task.taskId,
+              expectedRevision: state.revision,
+              expectedTaskRevision: task.revision,
+              specRevision: task.specRevision,
+              planRevision: binding.planRevision,
+              bindingId: binding.recordId,
+              expectedBindingRevision: binding.revision,
+              generation: binding.generation,
+              criterionIds: state.criteria
+                .filter((row) => row.taskId === task.taskId)
+                .map((row) => row.criterionId),
+              command: {
+                executable: "/runtime/node",
+                argv: ["--version"],
+                environment: "clean",
+                limits: { maxDurationMs: 20000, maxOutputBytes: 4096 },
+              },
+            });
+            const preparation = yield* makeProjectWorkVerificationPreparationRoot({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              assertHumanCurrent: (actual, selectedProject) =>
+                canonicalProjectWorkPayload(actual) === canonicalProjectWorkPayload(principal) &&
+                selectedProject === projectId
+                  ? Effect.void
+                  : Effect.fail(
+                      new ProjectWorkVerificationPreparationError({
+                        reason: "Native human request changed",
+                      }),
+                    ),
+            }).pipe(Effect.provide(physicalServices));
+            const prepared = yield* preparation.prepare(selection, principal);
+            const auth = yield* Authorization.ProjectTeamAuthorization;
+            const gates = yield* makeProjectWorkVerificationGate({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+            });
+            const trust = (selected: typeof selection) =>
+              ProjectWorkVerificationApproval.of({
+                selection: selected,
+                receipt: prepared,
+                assertCurrent: (current, duplicate) =>
+                  gates
+                    .assertCurrent(current, prepared, selected, duplicate)
+                    .pipe(
+                      Effect.mapError(
+                        () =>
+                          new ProjectWorkVerificationGateError({
+                            reason: "Native original approval target audit failed",
+                          }),
+                      ),
+                    ),
+              });
+            const human = {
+              actor: principal.actor,
+              source: { kind: "web" as const, id: "fixture-browser" },
+              recordedAt: DateTime.formatIso(yield* DateTime.now),
+            };
+            const decodeIntent = Schema.decodeUnknownEffect(ProjectTeamWriteIntent);
+            yield* f.repository.execute(
+              yield* auth
+                .intent(
+                  principal,
+                  yield* decodeIntent({
+                    ...selection,
+                    type: "project-team.verification.propose",
+                    commandId: "native-verification-propose",
+                  }),
+                  human,
+                  false,
+                )
+                .pipe(Effect.provideService(ProjectWorkVerificationApproval, trust(selection))),
+            );
+            const proposed = yield* readCurrentState(f.sql, projectId);
+            const gate = proposed.foundationRecords?.find(
+              (row) => row.kind === "gate" && row.verificationJobId === selection.jobId,
+            );
+            if (gate?.kind !== "gate")
+              return yield* Effect.die("Native verification proposal absent");
+            yield* f.repository.execute(
+              yield* auth
+                .intent(
+                  principal,
+                  yield* decodeIntent({
+                    type: "project-team.gate.respond",
+                    commandId: "native-verification-approve",
+                    projectId,
+                    taskId: task.taskId,
+                    expectedRevision: proposed.revision,
+                    expectedTaskRevision: task.revision,
+                    specRevision: selection.specRevision,
+                    planRevision: selection.planRevision,
+                    gateId: gate.recordId,
+                    expectedGateRevision: gate.revision,
+                    response: "approved",
+                  }),
+                  human,
+                  false,
+                )
+                .pipe(
+                  Effect.provideService(
+                    ProjectWorkVerificationApproval,
+                    trust({ ...selection, expectedRevision: proposed.revision }),
+                  ),
+                  Effect.provideService(
+                    ProjectWorkVerificationRequest,
+                    ProjectWorkVerificationRequest.of({
+                      assertCurrent: (actual, selectedProject, purpose) =>
+                        canonicalProjectWorkPayload(actual) ===
+                          canonicalProjectWorkPayload(principal) &&
+                        selectedProject === projectId &&
+                        purpose === "write"
+                          ? Effect.void
+                          : Effect.fail(
+                              new ProjectWorkVerificationRequestError({
+                                reason: "Native fixture permission changed",
+                              }),
+                            ),
+                    }),
+                  ),
+                ),
+            );
+            const host = yield* makeProjectWorkVerificationExecutionHost({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              protectedRoots: [evidence],
+              nativeAdmission: Effect.void,
+            }).pipe(
+              Effect.provide(Layer.merge(physicalServices, ProjectWorkEventBusLive)),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
+            );
+            const verification = yield* makeProjectWorkVerificationExecution({
+              ...host,
+              environmentId: "environment",
+            });
+            yield* verification.sweep;
+            const result = yield* host.journal.readResult(selection.jobId);
+            expect(result).toMatchObject({ outcome: "success", exitCode: 0, outputComplete: true });
+            if (!result?.drain) return yield* Effect.die("Actual verifier drain absent");
+            expect(result.drain.memoryBytes).toBe(2147483648);
+            expect(result.drain.childExitCode).toBe(0);
+            expect(result.drain.kernel).toBe("removed");
+            expect(result.drain.swapBytes).toBe(0);
+            expect(result.drain.oomGroup).toBe(1);
+            expect(
+              yield* f.sql`SELECT unit FROM project_task_resource_child WHERE drain_json IS NULL LIMIT 1`,
+            ).toEqual([]);
+            expect(
+              yield* f.sql`SELECT deadline_at_ms,memory_bytes FROM project_task_resource_budget LIMIT 2`,
+            ).toEqual(budget);
+            const verifierOwners = captured.filter((item) => item.unit === result.drain?.unit);
+            expect(verifierOwners.map((item) => item.kind)).toEqual([
+              "launcher",
+              "owner",
+              "started",
+            ]);
+            expect(verifierOwners.map((item) => item.pid)).toEqual([
+              result.drain.launcherPid,
+              result.drain.ownerPid,
+              result.drain.childPid,
+            ]);
+            for (const item of verifierOwners) {
+              const stat = yield* fs.readFileString(`/proc/${item.pid}/stat`).pipe(Effect.option);
+              if (Option.isSome(stat))
+                expect(stat.value.slice(stat.value.lastIndexOf(") ") + 2).split(" ")[19]).not.toBe(
+                  item.startTime,
+                );
+            }
+            expect(yield* fs.exists(result.drain.cgroup)).toBe(false);
+            const artifacts = yield* makeProjectWorkArtifacts({
+              environmentId: "environment",
+              maximumArtifactBytes: 4096,
+            });
+            const stdout = yield* artifacts.readRetained(result.stdout.artifactId);
+            const stderr = yield* artifacts.readRetained(result.stderr.artifactId);
+            if (!stdout || !stderr)
+              return yield* Effect.die("Native verification output artifacts absent");
+            const { bytes: stdoutBytes, ...stdoutReceipt } = stdout;
+            const { bytes: stderrBytes, ...stderrReceipt } = stderr;
+            expect(stdoutReceipt).toEqual(result.stdout);
+            expect(stderrReceipt).toEqual(result.stderr);
+            const stdoutText = new TextDecoder().decode(stdoutBytes);
+            expect(stdoutText).toBe(process.version + "\n");
+            expect(stderrBytes.byteLength).toBe(0);
+            yield* fs.writeFileString(
+              evidence + "/verification-results.json",
+              json({
+                selection,
+                prepared,
+                result,
+                stdoutText,
+                captured: verifierOwners,
+                originalBudget: budget,
+                originalDeadlineAtMs,
+                qualification:
+                  "Actual clean target/executable/human-approved node --version launch, accounting and drain smoke; not implementation validation. Test-local human permission and repository permit.",
+              }),
+            );
+          }),
+        ),
+      45000,
+    );
+  },
+);
 
 for (const compactProof of [
   undefined,

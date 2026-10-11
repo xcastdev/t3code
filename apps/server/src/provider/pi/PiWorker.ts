@@ -356,7 +356,29 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
           },
         });
         const resourceLoader: ResourceLoader = {
-          getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+          getExtensions: () => ({
+            extensions: [
+              {
+                path: "builtin:t3-approved-context",
+                resolvedPath: "builtin:t3-approved-context",
+                sourceInfo: createSyntheticSourceInfo("builtin:t3-approved-context", {
+                  source: "t3-frozen",
+                  scope: "temporary",
+                }),
+                // The public SDK hook preserves declarations/history while replacing added prompt sections.
+                handlers: new Map([
+                  ["before_agent_start", [async () => ({ systemPrompt: context.text })]],
+                ]),
+                tools: new Map(),
+                commands: new Map(),
+                flags: new Map(),
+                shortcuts: new Map(),
+                messageRenderers: new Map(),
+              },
+            ],
+            errors: [],
+            runtime: createExtensionRuntime(),
+          }),
           getSkills: () => ({
             skills: (bootstrap.resources?.skills ?? []).map((skill) => ({
               name: skill.key,
@@ -574,14 +596,21 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
         await controlTask;
         if (canceled) throw Error("CANCELED");
         if (options.operation.operationKind === "initialize") {
-          // The SDK flushes fresh files only once a conversation exists. The briefing is a
-          // real supplied user message; initialization never submits it for inference.
-          if (!bootstrap.native)
+          // Retain the exact briefing as provenance; prompts supply it as system context.
+          // The short user marker makes the SDK flush a fresh session without duplicating it.
+          if (!bootstrap.native) {
+            manager.appendCustomEntry("t3-approved-initial-context", { text: context.text });
             manager.appendMessage({
               role: "user",
-              content: [{ type: "text", text: context.text }],
+              content: [
+                {
+                  type: "text",
+                  text: "Session initialized. Approved context is supplied separately.",
+                },
+              ],
               timestamp: Effect.runSync(Clock.currentTimeMillis),
             });
+          }
           await session.waitForIdle();
           if (!session.isIdle || canceled) throw Error("CANCELED");
           await emit({ type: "initialized", native: await persist() });

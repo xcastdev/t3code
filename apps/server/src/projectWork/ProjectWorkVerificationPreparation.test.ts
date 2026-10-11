@@ -4,6 +4,7 @@ import {
   ProjectWorkFoundationCommitCommand,
 } from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
+import { makeProjectWorkVerificationGate } from "./ProjectWorkVerificationGate.ts";
 import { makeProjectWorkVerificationJobs } from "./ProjectWorkVerificationJobs.ts";
 import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
@@ -135,6 +136,9 @@ const makeFixture = (role: "implementer" | "integrator" = "implementer") =>
   });
 const makePreparedFixture = Effect.fn("makePreparedFixture")(function* (
   role: "implementer" | "integrator" = "implementer",
+  receiptText: (
+    receipt: typeof ProjectTeamWorkspaceReceipt.Type,
+  ) => string = canonicalProjectWorkPayload,
 ) {
   const f = yield* makeFixture(role);
   const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
@@ -160,7 +164,7 @@ const makePreparedFixture = Effect.fn("makePreparedFixture")(function* (
     pointerAndConfigurationHash: "b".repeat(64),
   });
   yield* f.sql`INSERT INTO project_team_workspace_receipt VALUES
-    (${f.request.dispatchId},'environment','binding',0,${snapshot.fence.claimGeneration},${canonicalProjectWorkPayload(receipt.assignment)},${canonicalProjectWorkPayload(receipt)})`;
+    (${f.request.dispatchId},'environment','binding',0,${snapshot.fence.claimGeneration},${canonicalProjectWorkPayload(receipt.assignment)},${receiptText(receipt)})`;
   const state = yield* readCurrentState(f.sql, projectId);
   const binding = state.foundationRecords?.find((r) => r.kind === "run-binding");
   if (binding?.kind !== "run-binding") return yield* Effect.die("Missing settled binding");
@@ -280,6 +284,83 @@ const makePreparedFixture = Effect.fn("makePreparedFixture")(function* (
 });
 const preparedFixture = makePreparedFixture();
 const human = { actor: { kind: "human" as const, id: "maintainer" } };
+
+const schemaWorkspaceText = Schema.encodeSync(Schema.fromJsonString(ProjectTeamWorkspaceReceipt));
+for (const encoding of [
+  "canonical",
+  "schema",
+  "spacing",
+  "reordered",
+  "duplicate",
+  "excess",
+  "foreign-assignment",
+] as const) {
+  it.effect(`consumes only original workspace receipt encoding ${encoding}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makePreparedFixture("implementer", (receipt) => {
+          const encoded = schemaWorkspaceText(receipt);
+          switch (encoding) {
+            case "canonical":
+              return canonicalProjectWorkPayload(receipt);
+            case "schema":
+              return encoded;
+            case "spacing":
+              return encoded + " ";
+            case "reordered":
+              return JSON.stringify(Object.fromEntries(Object.entries(receipt).toReversed()));
+            case "duplicate":
+              return encoded.replace(
+                '{"assignment":',
+                '{"assignment":' + JSON.stringify(receipt.assignment) + ',"assignment":',
+              );
+            case "excess":
+              return encoded.slice(0, -1) + ',"excess":true}';
+            case "foreign-assignment":
+              return schemaWorkspaceText({
+                ...receipt,
+                assignment: { ...receipt.assignment, effectId: "foreign-original" },
+              });
+          }
+        });
+        const before =
+          yield* f.sql`SELECT receipt_json FROM project_team_workspace_receipt WHERE dispatch_id=${f.request.dispatchId}`;
+        const outcome = yield* f.preparation.prepare(f.selection, human).pipe(Effect.result);
+        if (encoding === "canonical" || encoding === "schema") {
+          expect(outcome._tag).toBe("Success");
+          if (outcome._tag !== "Success")
+            return yield* Effect.die("Original receipt encoding was refused");
+          const prepared = outcome.success;
+          expect(yield* f.jobs.readPrepared(f.selection.jobId)).toEqual(prepared);
+          const state = yield* readCurrentState(f.sql, projectId);
+          const gate = yield* makeProjectWorkVerificationGate({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 4,
+          });
+          yield* f.sql.withTransaction(gate.assertCurrent(state, prepared, f.selection));
+          expect(f.counts()).toEqual({
+            hostCaptures: 1,
+            retained: 1,
+            activeTarget: false,
+            activeExecutable: false,
+          });
+        } else {
+          expect(outcome._tag).toBe("Failure");
+          expect(f.counts()).toEqual({
+            hostCaptures: 0,
+            retained: 0,
+            activeTarget: false,
+            activeExecutable: false,
+          });
+          expect(yield* f.jobs.readPrepared(f.selection.jobId)).toBeUndefined();
+        }
+        expect(
+          yield* f.sql`SELECT receipt_json FROM project_team_workspace_receipt WHERE dispatch_id=${f.request.dispatchId}`,
+        ).toEqual(before);
+      }),
+    ),
+  );
+}
 
 it.effect(
   "prepares the selected settled original implementation without restarting its worker",
