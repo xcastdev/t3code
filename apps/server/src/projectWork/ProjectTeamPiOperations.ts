@@ -529,11 +529,15 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     const repository = yield* ProjectWorkRepository;
     // These retained reads validate intent, claim receipts and stage history only.
     // The schema maximum is unused by them and grants no model-call capacity.
-    const { readRetained, readStageReceipts, readHistoricalInTransaction } =
-      yield* makeProjectTeamDispatchJournal({
-        environmentId: options.environmentId,
-        maximumEnvironmentModelCalls: 128,
-      });
+    const {
+      inspect: inspectDispatch,
+      readRetained,
+      readStageReceipts,
+      readHistoricalInTransaction,
+    } = yield* makeProjectTeamDispatchJournal({
+      environmentId: options.environmentId,
+      maximumEnvironmentModelCalls: 128,
+    });
     const ownTransaction = Effect.fn("ProjectTeamPiOperations.ownTransaction")(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(supplied) && supplied.value !== sql)
@@ -564,6 +568,161 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       if (!initialize && (found.binding.status !== "running" || !found.binding.sessionId))
         return yield* deny("Running native Pi session required");
       return found;
+    });
+    const inheritedHumanRoot = Effect.fn("ProjectTeamPiOperations.inheritedHumanRoot")(function* (
+      authority: ProjectTeamAuthority,
+      rootTaskId: string,
+      maximumTokens: number,
+      deadlineAtMs: number,
+    ) {
+      const binding = authority.binding;
+      const records = authority.state.foundationRecords ?? [];
+      const membership = records.find(
+        (record) => record.kind === "task-membership" && record.taskId === binding.taskId,
+      );
+      const grant = records.find(
+        (record) => record.kind === "gate" && record.recordId === binding.authorizationGateId,
+      );
+      if (
+        binding.parentRunId !== undefined ||
+        binding.taskId === rootTaskId ||
+        membership?.kind !== "task-membership" ||
+        membership.parentTaskId === undefined ||
+        membership.assignment?.authorizationGateId !== binding.authorizationGateId ||
+        grant?.kind !== "gate" ||
+        grant.gate !== "assignment" ||
+        grant.status !== "consumed" ||
+        grant.consumedByRunId !== binding.recordId ||
+        grant.attribution?.actor.kind !== "human" ||
+        grant.assignmentAuthorization?.parentTaskId !== membership.parentTaskId ||
+        (grant.assignmentAuthorization.assignmentKind !== "planning" &&
+          grant.assignmentAuthorization.assignmentKind !== "review")
+      )
+        return yield* deny("Pi root run is orphaned");
+      // This retained root is budget evidence. Current forward authority belongs to the human-approved child.
+      const children = yield* sql<{
+        dispatch_id: string | null;
+      }>`SELECT CASE WHEN typeof(dispatch_id)='text' AND length(CAST(dispatch_id AS BLOB))<=256 THEN dispatch_id ELSE NULL END AS dispatch_id
+        FROM project_team_dispatch WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 2`;
+      if (children.length !== 1 || !children[0]?.dispatch_id)
+        return yield* deny("Pi human child requires its original dispatch");
+      const child = yield* inspectDispatch(children[0].dispatch_id, { requireClaim: true });
+      yield* readStageReceipts(child.fence.dispatchId);
+      const childClaim = child.intent.compiledClaim.transition;
+      if (
+        childClaim?.kind !== "claim" ||
+        immutableBinding(childClaim.binding) !== immutableBinding(binding) ||
+        child.intent.limits.rootTaskId !== rootTaskId ||
+        child.fence.stage === "stopping" ||
+        child.fence.stage === "quarantine" ||
+        child.fence.stage === "settled"
+      )
+        return yield* deny("Pi human child dispatch changed");
+      const budgets = yield* sql<{
+        maximum_tokens: number | null;
+        deadline_at_ms: number | null;
+      }>`SELECT
+        CASE WHEN typeof(maximum_tokens)='integer' THEN maximum_tokens ELSE NULL END AS maximum_tokens,
+        CASE WHEN typeof(deadline_at_ms)='integer' THEN deadline_at_ms ELSE NULL END AS deadline_at_ms
+        FROM project_team_model_budget WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId}`;
+      const anchors = yield* sql<{
+        dispatch_id: string | null;
+      }>`SELECT CASE WHEN typeof(dispatch_id)='text' AND length(CAST(dispatch_id AS BLOB))<=256 THEN dispatch_id ELSE NULL END AS dispatch_id
+        FROM project_team_dispatch WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId} ORDER BY created_at,dispatch_id LIMIT 1`;
+      if (budgets.length !== 1 || !anchors[0]?.dispatch_id)
+        return yield* deny("Pi human child has no retained root budget");
+      const original = yield* readRetained(anchors[0].dispatch_id);
+      yield* readStageReceipts(original.fence.dispatchId);
+      const claim = original.intent.compiledClaim.transition;
+      const root = claim?.kind === "claim" ? claim.binding : undefined;
+      const retained = records.filter(
+        (record) => record.kind === "run-binding" && record.recordId === root?.recordId,
+      );
+      const currentRoot = retained[0];
+      const rootRole = records.find(
+        (record) => record.kind === "role-revision" && record.recordId === root?.roleRevisionId,
+      );
+      const rootGrant = records.find(
+        (record) => record.kind === "gate" && record.recordId === root?.authorizationGateId,
+      );
+      const rootTask = authority.state.tasks.find((task) => task.taskId === rootTaskId);
+      const rootMembership = records.find(
+        (record) => record.kind === "task-membership" && record.taskId === rootTaskId,
+      );
+      if (
+        !root ||
+        root.taskId !== rootTaskId ||
+        root.parentRunId !== undefined ||
+        root.projectId !== binding.projectId ||
+        root.environmentId !== options.environmentId ||
+        original.intent.limits.rootTaskId !== rootTaskId ||
+        original.fence.claimGeneration <= 0 ||
+        original.fence.stage === "stopping" ||
+        original.fence.stage === "quarantine" ||
+        ![
+          "setup-complete",
+          "session-bound",
+          "assignment-intent",
+          "assignment-observed",
+          "settled",
+        ].includes(original.fence.stage) ||
+        retained.length !== 1 ||
+        currentRoot?.kind !== "run-binding" ||
+        immutableBinding(currentRoot) !== immutableBinding(root) ||
+        currentRoot.status === "revoked" ||
+        currentRoot.status === "stopping" ||
+        currentRoot.status === "quarantined" ||
+        rootRole?.kind !== "role-revision" ||
+        rootRole.projectId !== binding.projectId ||
+        rootRole.model !== root.model ||
+        root.configuration.instructionsHash !==
+          NodeCrypto.createHash("sha256").update(rootRole.instructions).digest("hex") ||
+        rootGrant?.kind !== "gate" ||
+        rootGrant.taskId !== rootTaskId ||
+        rootGrant.status !== "consumed" ||
+        rootGrant.consumedByRunId !== root.recordId ||
+        records.some(
+          (record) =>
+            record.kind === "effect" &&
+            record.effectKind === "setup" &&
+            record.runId === root.recordId &&
+            record.status !== "succeeded",
+        ) ||
+        !rootTask ||
+        rootTask.state === "canceled" ||
+        rootMembership?.kind !== "task-membership" ||
+        rootTask.specRevision !== root.specRevision ||
+        rootMembership.parentTaskId !== undefined ||
+        rootMembership.status !== "active" ||
+        (rootMembership.controlState !== undefined && rootMembership.controlState !== "active") ||
+        budgets[0]?.maximum_tokens !== original.intent.limits.maximumTokens ||
+        budgets[0]?.deadline_at_ms !== original.intent.limits.rootDeadlineAtMs ||
+        child.intent.limits.maximumTokens !== original.intent.limits.maximumTokens ||
+        child.intent.limits.rootDeadlineAtMs !== original.intent.limits.rootDeadlineAtMs ||
+        encode(child.intent.rootCaps) !== encode(original.intent.rootCaps) ||
+        (yield* Clock.currentTimeMillis) >= original.intent.limits.rootDeadlineAtMs
+      )
+        return yield* deny("Pi human child retained root changed");
+      const caps = original.intent.rootCaps;
+      const changed = yield* sql`SELECT 1 FROM project_team_dispatch
+        WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId}
+        AND (root_maximum_tokens <> ${original.intent.limits.maximumTokens} OR root_deadline_at_ms <> ${original.intent.limits.rootDeadlineAtMs}
+          OR json_extract(intent_json,'$.rootCaps.maximumDelegationDepth') IS NOT ${caps.maximumDelegationDepth}
+          OR json_extract(intent_json,'$.rootCaps.repairAllowance') IS NOT ${caps.repairAllowance}
+          OR json_extract(intent_json,'$.rootCaps.environmentModelCalls') IS NOT ${caps.environmentModelCalls}
+          OR json_extract(intent_json,'$.rootCaps.projectWritableWorkers') IS NOT ${caps.projectWritableWorkers}
+          OR json_extract(intent_json,'$.rootCaps.modelCalls') IS NOT ${caps.modelCalls}) LIMIT 1`;
+      if (changed.length) return yield* deny("Pi human child original root caps changed");
+      return {
+        root,
+        rootTaskId,
+        maximumTokens: Math.min(maximumTokens, original.intent.limits.maximumTokens),
+        deadlineAtMs: Math.min(
+          deadlineAtMs,
+          original.intent.limits.rootDeadlineAtMs,
+          child.intent.limits.deadlineAtMs,
+        ),
+      };
     });
     const roots = Effect.fn("ProjectTeamPiOperations.roots")(function* (
       initial: ProjectTeamAuthority,
@@ -664,7 +823,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         deadline = Math.min(deadline, lease, started + duration);
         if (!tasks.has(binding.taskId)) return yield* deny("Pi run and task ancestry differ");
         if (!binding.parentRunId) {
-          if (binding.taskId !== rootTaskId) return yield* deny("Pi root run is orphaned");
+          if (binding.taskId !== rootTaskId)
+            return yield* inheritedHumanRoot(initial, rootTaskId, maximumTokens, deadline);
           return { root: binding, rootTaskId, maximumTokens, deadlineAtMs: deadline };
         }
         const parents = authority.state.foundationRecords?.filter(

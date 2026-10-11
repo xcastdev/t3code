@@ -390,6 +390,41 @@ const journalChild = Effect.gen(function* () {
   return { ...f, child: { admitted, allocation, identity, op } };
 });
 
+it.effect("retained root budget and caps cannot be removed or rewritten through SQL", () =>
+  fileTest(
+    Effect.gen(function* () {
+      const f = yield* journalChild;
+      const budget =
+        yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget`;
+      const intents =
+        yield* f.sql`SELECT dispatch_id,intent_json FROM project_team_dispatch ORDER BY dispatch_id`;
+      expect(
+        (yield* f.sql
+          .withTransaction(
+            f.sql`UPDATE project_team_dispatch SET intent_json=json_set(intent_json,'$.rootCaps.modelCalls',128) WHERE dispatch_id=${f.request.dispatchId}`,
+          )
+          .pipe(Effect.exit))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* f.sql
+          .withTransaction(f.sql`DELETE FROM project_team_model_budget`)
+          .pipe(Effect.exit))._tag,
+      ).toBe("Failure");
+      expect(
+        yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget`,
+      ).toEqual(budget);
+      expect(
+        yield* f.sql`SELECT dispatch_id,intent_json FROM project_team_dispatch ORDER BY dispatch_id`,
+      ).toEqual(intents);
+      yield* f.operations.authorize(f.child.op);
+      expect(
+        yield* f.sql`SELECT operation_id FROM project_team_pi_operation ORDER BY operation_id`,
+      ).toEqual([{ operation_id: "child-initialize" }, { operation_id: "journal-initialize" }]);
+      expect(yield* f.sql`SELECT reservation_id FROM project_team_model_request`).toEqual([]);
+    }),
+  ),
+);
+
 it.effect(
   "charges a smaller actual journal child to the immutable root and enforces its operation caps",
   () =>
@@ -485,6 +520,8 @@ for (const mode of [
   "role-changed",
   "journal-intent",
   "journal-history",
+  "root-revoked",
+  "root-settled",
 ] as const)
   it.effect(`denies changed actual journal budget or ancestry without resetting it: ${mode}`, () =>
     fileTest(
@@ -493,6 +530,14 @@ for (const mode of [
         const op = f.child.op;
         const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
         switch (mode) {
+          case "root-revoked":
+          case "root-settled":
+            yield* restoreHistoricalBinding({
+              ...f.binding,
+              revision: f.binding.revision + 1,
+              status: mode === "root-revoked" ? "revoked" : "settled",
+            });
+            break;
           case "root-tokens":
             yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=maximum_tokens+1`;
             break;
@@ -2830,15 +2875,13 @@ it.effect(
         yield* persistence.afterDrain(drain);
         const resources = yield* makeProjectTaskResources("environment");
         yield* sql.withTransaction(
-          resources
-            .pi(op.operation.operationId, op.allocation)
-            .cleanupDrain({
-              state: "drained",
-              unit: owner.unit,
-              invocation: owner.invocation,
-              cgroup: owner.cgroup,
-              kernel: "removed",
-            }),
+          resources.pi(op.operation.operationId, op.allocation).cleanupDrain({
+            state: "drained",
+            unit: owner.unit,
+            invocation: owner.invocation,
+            cgroup: owner.cgroup,
+            kernel: "removed",
+          }),
         );
         yield* f.operations.persistTerminal(op, {
           identity: { workerId: op.workerId, generation: op.authority.binding.generation },

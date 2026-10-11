@@ -1,4 +1,5 @@
 import * as NodeCrypto from "node:crypto";
+import { projectTeamDerivedRecordId } from "../../projectWork/ProjectTeamPolicy.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1263,5 +1264,58 @@ describe("sealed assignment input", () => {
       failureCode: "REQUEST_INPUT_BINDING_FAILED",
       transportDrained: true,
     });
+  });
+});
+
+describe("retained dispatch broker operation IDs", () => {
+  it("preserves guided and legacy operation IDs through reservation and settlement", async () => {
+    for (const operationId of [
+      projectTeamDerivedRecordId("approved-dispatch", "initialize"),
+      "legacy_operation-1",
+    ]) {
+      const f = fixture({ operationId });
+      await f.invoke();
+      expect(f.reservations).toHaveLength(1);
+      expect(f.settlements).toHaveLength(1);
+      expect(f.reservations[0]).toMatchObject({
+        operationId,
+        workerId: "worker",
+        generation: 7,
+        requestId: 1,
+      });
+      expect(f.settlements[0]).toMatchObject({
+        ...f.reservations[0],
+        reservationId: "reserved-1",
+        outcome: "reported",
+        transportDrained: true,
+      });
+      expect(f.transports).toHaveLength(1);
+    }
+  });
+  it("refuses malformed operation IDs and guided generic identities before transport", () => {
+    const guided = projectTeamDerivedRecordId("approved-dispatch", "initialize");
+    const f = fixture();
+    for (const operationId of [
+      "guided:" + "a".repeat(63),
+      "guided:" + "a".repeat(65),
+      "guided:" + "A".repeat(64),
+      "guided:" + "g".repeat(64),
+      "other:" + "a".repeat(64),
+      "../operation",
+      "a".repeat(129),
+      guided + "\n",
+      guided + "\r",
+      "legacy\n",
+      "legacy\r",
+    ]) {
+      expect(() => makePiModelBroker({ ...f.cfg, operationId })).toThrow("CONFIG_LIMITS_INVALID");
+    }
+    for (const field of ["workerId", "routeId"] as const)
+      expect(() => makePiModelBroker({ ...f.cfg, [field]: guided })).toThrow(
+        "CONFIG_LIMITS_INVALID",
+      );
+    expect(f.reservations).toEqual([]);
+    expect(f.settlements).toEqual([]);
+    expect(f.transports).toEqual([]);
   });
 });

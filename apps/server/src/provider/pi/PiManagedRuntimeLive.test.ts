@@ -25,6 +25,7 @@ import {
   ManagedSkillKey,
   SkillCatalogRevision,
   ProjectWorkFoundationCommitCommand,
+  ProjectTeamWriteIntent,
   ProjectWorkTaskId,
   ThreadId,
   type ProjectWorkCommand,
@@ -75,6 +76,13 @@ import {
   ProjectWorkRepositoryLive,
 } from "../../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkPolicyError } from "../../projectWork/ProjectWorkPolicy.ts";
+import { verificationFixture } from "../../projectWork/ProjectWorkVerification.testFixtures.ts";
+import {
+  makeProjectWorkVerificationGate,
+  ProjectWorkVerificationApproval,
+  ProjectWorkVerificationGateError,
+} from "../../projectWork/ProjectWorkVerificationGate.ts";
+import { prepareProjectTeamConfiguredAdmission } from "../../projectWork/ProjectTeamConfiguredAdmission.ts";
 import {
   ProjectWorkVerificationRequest,
   ProjectWorkVerificationRequestError,
@@ -83,6 +91,7 @@ import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.t
 import { readProjectTeamBindingAccountingInTransaction } from "../../projectWork/ProjectTeamUsageRead.ts";
 import { ProjectLifecycle, ProjectLifecycleLive } from "../../project/ProjectLifecycle.ts";
 import { readProjectMemoryProjectionSyncInTransaction } from "../../projectWork/memory/ProjectMemoryProjectDeletion.ts";
+import * as DispatchJournal from "../../projectWork/ProjectTeamDispatchJournal.ts";
 import {
   makeProjectTeamDispatchJournal,
   ProjectTeamDispatchJournalError,
@@ -5401,13 +5410,442 @@ const decodeQueryCompanionInput = Schema.decodeUnknownEffect(
 );
 
 // Required-context cases intercept only session execution; no managed worker or model is run.
+const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")(function* () {
+  const capturedSql = yield* SqlClient.SqlClient;
+  const originalJournal = DispatchJournal.makeProjectTeamDispatchJournal;
+  // Correct the historical fixture producer before its first durable claim, then sequence
+  // controlled setup receipts before settlement. No native setup worker is launched.
+  const fixtureSpy = vi
+    .spyOn(DispatchJournal, "makeProjectTeamDispatchJournal")
+    .mockImplementation((options) => {
+      const { prepareReviewCompletion, verifyReviewTarget, ...fixtureOptions } = options;
+      if (prepareReviewCompletion !== undefined || verifyReviewTarget !== undefined)
+        throw Error("Original root fixture unexpectedly supplied review callbacks");
+      return originalJournal(fixtureOptions).pipe(
+        Effect.map((journal) => ({
+          ...journal,
+          reserve: (request) =>
+            Effect.gen(function* () {
+              const transition = request.claim.transition;
+              if (transition?.kind !== "claim")
+                return yield* Effect.die("Missing original root claim");
+              const state = yield* readCurrentState(capturedSql, request.claim.projectId);
+              const role = state.foundationRecords?.find(
+                (record) =>
+                  record.kind === "role-revision" &&
+                  record.recordId === transition.binding.roleRevisionId,
+              );
+              if (role?.kind !== "role-revision")
+                return yield* Effect.die("Missing original root role");
+              return yield* journal.reserve({
+                ...request,
+                claim: {
+                  ...request.claim,
+                  transition: {
+                    ...transition,
+                    binding: {
+                      ...transition.binding,
+                      configuration: {
+                        ...transition.binding.configuration,
+                        instructionsHash: NodeCrypto.createHash("sha256")
+                          .update(role.instructions)
+                          .digest("hex"),
+                      },
+                    },
+                  },
+                },
+              });
+            }),
+          settleAfterJoined: (expected, receipt) =>
+            Effect.gen(function* () {
+              let snapshot = yield* journal.readRetained(expected.dispatchId);
+              const state = yield* readCurrentState(
+                capturedSql,
+                snapshot.intent.compiledClaim.projectId,
+              );
+              expect(
+                state.foundationRecords?.filter(
+                  (record) =>
+                    record.kind === "effect" &&
+                    record.effectKind === "setup" &&
+                    record.runId === snapshot.intent.request.git.runId,
+                ),
+              ).toEqual([]);
+              const sequenced = yield* originalJournal({
+                ...fixtureOptions,
+                verifyStage: (stage, original) =>
+                  stage.evidence.bindingId === original.intent.request.git.runId &&
+                  stage.evidence.setupId === original.intent.request.setupId
+                    ? Effect.void
+                    : Effect.fail(
+                        new ProjectTeamDispatchJournalError({
+                          reason: "Foreign controlled root setup",
+                        }),
+                      ),
+              });
+              for (const stage of ["workspace-ready", "setup-complete"] as const) {
+                snapshot = yield* sequenced.readRetained(
+                  (yield* sequenced.advanceStage(snapshot.fence, {
+                    receiptId: `required-root-${stage}`,
+                    stage,
+                    evidence: {
+                      bindingId: snapshot.intent.request.git.runId,
+                      setupId: snapshot.intent.request.setupId,
+                    },
+                  })).fence.dispatchId,
+                );
+              }
+              return yield* journal.settleAfterJoined(snapshot.fence, receipt);
+            }),
+        })),
+      );
+    });
+  const f = yield* verificationFixture.pipe(
+    Effect.ensuring(Effect.sync(() => fixtureSpy.mockRestore())),
+  );
+  const rootClaim = f.snapshot.intent.compiledClaim.transition;
+  if (rootClaim?.kind !== "claim") return yield* Effect.die("Missing captured root claim");
+  const rootRole = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+    (record) =>
+      record.kind === "role-revision" && record.recordId === rootClaim.binding.roleRevisionId,
+  );
+  if (rootRole?.kind !== "role-revision") return yield* Effect.die("Missing captured root role");
+  expect(rootClaim.binding.configuration.instructionsHash).toBe(
+    NodeCrypto.createHash("sha256").update(rootRole.instructions).digest("hex"),
+  );
+  expect(
+    (yield* f.journal.readStageReceipts(f.request.dispatchId)).map((receipt) => receipt.stage),
+  ).toEqual(["workspace-ready", "setup-complete", "settled"]);
+  const { sql, repository } = f;
+  const auth = yield* Authorization.ProjectTeamAuthorization;
+  const gates = yield* makeProjectWorkVerificationGate({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+  });
+  const human = {
+    actor: f.principal.actor,
+    source: { kind: "web" as const, id: "required-review-human" },
+    recordedAt: at,
+  };
+  const decodeIntent = Schema.decodeUnknownEffect(ProjectTeamWriteIntent);
+  const trust = (selection: typeof f.selection) =>
+    ProjectWorkVerificationApproval.of({
+      selection,
+      receipt: f.prepared,
+      assertCurrent: (state, duplicate) =>
+        gates
+          .assertCurrent(state, f.prepared, selection, duplicate)
+          .pipe(
+            Effect.mapError(
+              () =>
+                new ProjectWorkVerificationGateError({ reason: "Required review target changed" }),
+            ),
+          ),
+    });
+  yield* repository.execute(
+    yield* auth
+      .intent(
+        f.principal,
+        yield* decodeIntent({
+          ...f.selection,
+          type: "project-team.verification.propose",
+          commandId: "required-verification-propose",
+        }),
+        human,
+        false,
+      )
+      .pipe(Effect.provideService(ProjectWorkVerificationApproval, trust(f.selection))),
+  );
+  let state = yield* readCurrentState(sql, projectId);
+  const approval = state.foundationRecords?.find(
+    (r) => r.kind === "gate" && r.verificationJobId === f.selection.jobId,
+  );
+  if (approval?.kind !== "gate")
+    return yield* Effect.die("Missing required parent verification proposal");
+  yield* repository.execute(
+    yield* auth
+      .intent(
+        f.principal,
+        yield* decodeIntent({
+          type: "project-team.gate.respond",
+          commandId: "required-verification-approve",
+          projectId,
+          taskId: f.selection.taskId,
+          expectedRevision: state.revision,
+          expectedTaskRevision: f.selection.expectedTaskRevision,
+          specRevision: f.selection.specRevision,
+          planRevision: f.selection.planRevision,
+          gateId: approval.recordId,
+          expectedGateRevision: approval.revision,
+          response: "approved",
+        }),
+        human,
+        false,
+      )
+      .pipe(
+        Effect.provideService(
+          ProjectWorkVerificationApproval,
+          trust({ ...f.selection, expectedRevision: state.revision }),
+        ),
+        Effect.provideService(
+          ProjectWorkVerificationRequest,
+          ProjectWorkVerificationRequest.of({ assertCurrent: () => Effect.void }),
+        ),
+      ),
+  );
+  state = yield* readCurrentState(sql, projectId);
+  const parent = state.tasks.find((task) => task.taskId === f.selection.taskId);
+  const specGate = state.foundationRecords?.find(
+    (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "specification",
+  );
+  const planGate = state.foundationRecords?.find(
+    (r) => r.kind === "gate" && r.taskId === parent?.taskId && r.gate === "plan",
+  );
+  const plan = state.foundationRecords?.find(
+    (r) => r.kind === "plan-revision" && r.taskId === parent?.taskId,
+  );
+  if (
+    !parent ||
+    specGate?.kind !== "gate" ||
+    planGate?.kind !== "gate" ||
+    plan?.kind !== "plan-revision"
+  )
+    return yield* Effect.die("Missing approved review parent scope");
+  yield* repository.execute(
+    yield* decodeRequiredFoundation({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "required-human-review",
+      expectedRevision: state.revision,
+      attribution: human,
+      committedAt: at,
+      records: [],
+      guided: {
+        intent: {
+          type: "project-team.assignment.start",
+          assignmentKind: "review",
+          projectId,
+          taskId: parent.taskId,
+          commandId: "required-human-review",
+          expectedRevision: state.revision,
+          expectedTaskRevision: parent.revision,
+          objective: "Review the original approved scope",
+          outputDescriptions: ["Independent review findings"],
+          specRevision: parent.specRevision,
+          specificationGateId: specGate.recordId,
+          expectedSpecificationGateRevision: specGate.revision,
+          parentPlan: {
+            recordId: plan.recordId,
+            expectedRecordRevision: plan.revision,
+            planRevision: plan.planRevision,
+            gateId: planGate.recordId,
+            expectedGateRevision: planGate.revision,
+          },
+        },
+      },
+    }),
+  );
+  state = yield* readCurrentState(sql, projectId);
+  const task = state.tasks.find((task) => task.taskId !== parent.taskId);
+  if (!task) return yield* Effect.die("Missing human review task");
+  const gateway = yield* ProjectWorkGateway;
+  yield* gateway.write(
+    {
+      type: "project-team.configure",
+      commandId: CommandId.make("required-review-configure"),
+      projectId,
+      expectedRevision: state.revision,
+      expectedConfigurationGeneration: 0,
+      enabled: true,
+      providerInstanceId,
+      projectPriority: 1,
+      taskPriorities: [],
+      profiles: (
+        ["coordinator", "investigator", "planner", "implementer", "reviewer", "integrator"] as const
+      ).map((role) => ({
+        role,
+        instructions: `Required context for ${role}`,
+        skills: [],
+        tools:
+          role === "implementer" || role === "integrator" ? ["pi.read", "pi.write"] : ["pi.read"],
+        model,
+        memoryAccess: "none",
+        delegationDepth: 2,
+      })),
+      modelPolicies: [{ model, tokenLimit: 2000, durationLimitMs: 2000, modelCalls: 2 }],
+      environmentModelCalls: 4,
+      projectWritableWorkers: 2,
+      delegationDepth: 2,
+      repairAllowance: 2,
+    },
+    human.actor,
+    human.source,
+    f.principal,
+  );
+  const fs = yield* FileSystem.FileSystem;
+  const scratch = yield* fs.makeTempDirectoryScoped();
+  const main = scratch + "/main";
+  const assigned = scratch + "/assigned";
+  const agentDirectory = scratch + "/agent";
+  const nativeStateRoot = scratch + "/state";
+  yield* fs.makeDirectory(agentDirectory);
+  yield* fs.makeDirectory(nativeStateRoot);
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const git = (args: ReadonlyArray<string>) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const process = yield* spawner.spawn(ChildProcess.make("/usr/bin/git", args));
+        const [stdout, code] = yield* Effect.all(
+          [collectUint8StreamText({ stream: process.stdout, maxBytes: 8192 }), process.exitCode],
+          { concurrency: "unbounded" },
+        );
+        expect(Number(code)).toBe(0);
+        return stdout.text.trim();
+      }),
+    );
+  yield* git(["init", "-q", main]);
+  yield* git([
+    "-C",
+    main,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "--allow-empty",
+    "-qm",
+    "initial",
+  ]);
+  const baseOid = yield* git(["-C", main, "rev-parse", "HEAD"]);
+  yield* git(["-C", main, "worktree", "add", "-qb", "required-review", assigned]);
+  const catalogue = {
+    source: "https://api.commandcode.ai/provider/v1/models" as const,
+    fetchedAt: at,
+    selectedEntry: {
+      id: "inclusionai/ling-3.1-flash:free" as const,
+      owned_by: "command-code" as const,
+      context_length: 20000,
+      supported_endpoints: ["/chat/completions"],
+    },
+  };
+  const prepared = prepareProjectTeamConfiguredAdmission({
+    state: yield* readCurrentState(sql, projectId),
+    taskId: task.taskId,
+    nowMs: Date.parse(at) + 1,
+    facts: {
+      environmentId: EnvironmentId.make("environment"),
+      provider: {
+        instanceId: providerInstanceId,
+        driverKind: "piAgent",
+        enabled: true,
+        runtimeVersion: "0.99.1",
+        maxInputTokens: 100,
+        maxOutputTokens: 100,
+        catalogue,
+      },
+      supportedToolIds: ["pi.read", "pi.write"],
+      ownedSkillIds: [],
+      git: {
+        primaryRoot: main,
+        commonGitDirectory: main + "/.git",
+        worktreePath: assigned,
+        branchRef: "refs/heads/required-review",
+        baseRef: "refs/heads/main",
+        baseOid,
+        policyHash: "b".repeat(64),
+        writable: false,
+      },
+      rootAnchor: {
+        _tag: "RetainedRoot",
+        budget: {
+          rootTaskId: f.snapshot.intent.limits.rootTaskId,
+          maximumTokens: f.snapshot.intent.limits.maximumTokens,
+          deadlineAtMs: f.snapshot.intent.limits.rootDeadlineAtMs,
+        },
+        caps: f.snapshot.intent.rootCaps,
+      },
+    },
+  });
+  if (prepared._tag !== "Prepared") return yield* Effect.die(prepared.reason);
+  const request = prepared.request;
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+  });
+  const snapshot = yield* journal.claimEffect((yield* journal.reserve(request)).fence);
+  const claim = snapshot.intent.compiledClaim.transition;
+  if (claim?.kind !== "claim") return yield* Effect.die("Missing configured review claim");
+  const binding = claim.binding;
+  let allocations = 0;
+  let transports = 0;
+  const options: PiManagedRuntimeLiveOptions = {
+    environmentId: "environment",
+    agentDirectory,
+    nativeStateRoot,
+    protectedRoots: [main],
+    runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+    workerArgv: () => {
+      allocations++;
+      return ["/bin/true"];
+    },
+    memoryBytes: 33554432,
+    cleanupDeadlineMs: 1000,
+    maxInputTokens: 100,
+    maxOutputTokens: 100,
+    readCatalogue: Effect.succeed(catalogue),
+    transport: async () => {
+      transports++;
+      throw Error("Required review transport forbidden");
+    },
+  };
+  const runtime = yield* makePiManagedRuntimeLive(options);
+  const instance = yield* runtime.forInstance({
+    instanceId: providerInstanceId,
+    enabled: true,
+    configuration: {},
+  });
+  const reader = yield* makeProjectTeamContext({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 128,
+  });
+  yield* reader.readForOperation({
+    projectId,
+    bindingId: binding.recordId,
+    generation: binding.generation,
+    providerInstanceId,
+    threadId: binding.threadId,
+    operationId: request.initializeOperationId,
+    operationKind: "initialize",
+  });
+  return {
+    sql,
+    repository,
+    fs,
+    options,
+    instance,
+    reader,
+    request,
+    snapshot,
+    binding,
+    root: { snapshot: f.snapshot, bindingId: f.selection.bindingId, taskId: f.selection.taskId },
+    get allocations() {
+      return allocations;
+    },
+    get transports() {
+      return transports;
+    },
+  };
+});
+
 const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   reviewer = false,
   child = !reviewer,
   readonlyKind?: "planning" | "review" | "investigation",
   memory = false,
   memoryPolicy: "project" | "none" | "read-only" = "project",
+  assignment = "Implement the approved retained context",
 ) {
+  if (reviewer || readonlyKind === "review") return yield* requiredReviewTransferFixture();
   yield* TestClock.setTime(Date.parse(at) + 1);
   const sql = yield* SqlClient.SqlClient;
   const repository = yield* ProjectWorkRepository;
@@ -5580,7 +6018,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       setupId: id + "-setup",
       initializeOperationId: id + "-initialize",
       assignmentOperationId: id + "-assignment",
-      assignment: "Implement the approved retained context",
+      assignment,
     };
     const snapshot = yield* journal.claimEffect((yield* journal.reserve(request)).fence);
     yield* journal.readStageReceipts(snapshot.fence.dispatchId);
@@ -5921,6 +6359,158 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       return transports;
     },
   };
+});
+
+const initializeRequiredContext = Effect.fn("initializeRequiredContext")(function* (
+  f: Effect.Success<ReturnType<typeof requiredTransferFixture>>,
+) {
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+    // These receipts sequence controlled SQL/Git setup, without a native setup process.
+    verifyStage: (receipt, original) =>
+      receipt.evidence.bindingId === original.intent.request.git.runId
+        ? Effect.void
+        : Effect.fail(new ProjectTeamDispatchJournalError({ reason: "Foreign controlled stage" })),
+  });
+  let snapshot = f.snapshot;
+  const stage = Effect.fn("initializeRequiredContext.stage")(function* (
+    value: "workspace-ready" | "setup-complete" | "session-bound" | "assignment-intent",
+  ) {
+    snapshot = yield* journal.readRetained(
+      (yield* journal.advanceStage(snapshot.fence, {
+        receiptId: `required-context-${value}`,
+        stage: value,
+        evidence: { bindingId: f.binding.recordId },
+      })).fence.dispatchId,
+    );
+  });
+  yield* stage("workspace-ready");
+  yield* stage("setup-complete");
+  const services = yield* Effect.context<
+    SqlClient.SqlClient | ProjectWorkRepository | Authorization.ProjectTeamAuthorization
+  >();
+  const original = SessionRuntime.makePiSessionRuntime;
+  const spy = vi.spyOn(SessionRuntime, "makePiSessionRuntime").mockImplementation((input) =>
+    original(input).pipe(
+      Effect.map((session) => ({
+        ...session,
+        run: () =>
+          Effect.gen(function* () {
+            // The real parent callbacks retain controlled ownership; no native process runs.
+            const allocation = input.persistence.allocation;
+            const owner = {
+              type: "owner" as const,
+              unit: allocation.unit,
+              nonce: allocation.nonce,
+              invocation: "a".repeat(32),
+              cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+              pid: 99999999,
+              memoryBytes: allocation.policy.memoryBytes,
+              swapBytes: 0,
+              oomGroup: 1,
+            };
+            yield* input.persistence.claimActivation(allocation);
+            yield* input.persistence.beforeStart(owner);
+            const native = {
+              sessionId: "required-session",
+              sessionReference: "sessions/required.jsonl",
+              leafId: "required-initialize",
+              persisted: true,
+            };
+            const briefing = input.transferTexts.find(
+              (entry) => entry.transferId === "context",
+            )!.text;
+            yield* f.fs.makeDirectory(allocation.launch.nativeStateRoot + "/sessions", {
+              recursive: true,
+            });
+            yield* f.fs.writeFileString(
+              allocation.launch.nativeStateRoot + "/" + native.sessionReference,
+              [
+                {
+                  type: "session",
+                  version: 3,
+                  id: native.sessionId,
+                  timestamp: at,
+                  cwd: "/workspace",
+                },
+                {
+                  type: "message",
+                  id: native.leafId,
+                  parentId: null,
+                  timestamp: at,
+                  message: {
+                    role: "user",
+                    content: [{ type: "text", text: briefing }],
+                    timestamp: Date.parse(at),
+                  },
+                },
+              ]
+                .map((entry) => json(entry))
+                .join("\n") + "\n",
+            );
+            const signal = yield* Effect.abortSignal;
+            yield* Effect.tryPromise(() =>
+              input.persistNative(
+                {
+                  version: 1,
+                  ...input.identity,
+                  ...input.operation,
+                  sequence: 0,
+                  message: { type: "initialized", native },
+                },
+                signal,
+              ),
+            );
+            const terminal: SessionRuntime.PiSessionTerminal = {
+              identity: input.identity,
+              operation: input.operation,
+              outcome: "success",
+              ownerCaptured: true,
+              native,
+              accountingReceipts: [],
+              drain: {
+                unit: owner.unit,
+                invocation: owner.invocation,
+                cgroup: owner.cgroup,
+                ownerPid: owner.pid,
+                memoryBytes: owner.memoryBytes,
+                swapBytes: 0,
+                oomGroup: 1,
+                launcherPid: 99999998,
+                childPid: 99999997,
+                childExitCode: 0,
+                kernel: "removed",
+              },
+            };
+            yield* Effect.tryPromise(() => input.persistTerminal(terminal, signal));
+            return terminal;
+          }).pipe(
+            Effect.mapError(
+              () =>
+                new SessionRuntime.PiSessionRuntimeError({
+                  code: "CONTROLLED_REQUIRED_INITIALIZE",
+                }),
+            ),
+            Effect.provide(services),
+          ),
+      })),
+    ),
+  );
+  yield* Effect.gen(function* () {
+    const initialized = yield* f.instance.prepareOperation(
+      {
+        threadId: f.binding.threadId,
+        kind: "initialize",
+        operationId: f.request.initializeOperationId,
+      },
+      () => Effect.void,
+    );
+    expect((yield* initialized.run).terminal.outcome).toBe("success");
+  }).pipe(Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+  yield* stage("session-bound");
+  yield* stage("assignment-intent");
+  return snapshot;
 });
 
 for (const compactProof of [
@@ -10261,48 +10851,8 @@ for (const readonlyKind of [undefined, "planning", "investigation", "review"] as
                   (r) => r.kind === "plan-revision" && r.taskId === f.binding.taskId,
                 ),
               ).toEqual([]);
-            if (kind === "prompt") {
-              const operations = yield* makeProjectTeamPiOperations({
-                environmentId: "environment",
-              });
-              const allocation = yield* preallocatePiManagedProcess({
-                workspaceRoot: f.binding.worktree,
-                workspaceAccess: "readonly",
-                nativeStateRoot: f.options.nativeStateRoot,
-                protectedRoots: f.options.protectedRoots,
-                runtimeFiles: f.options.runtimeFiles,
-                argv: ["/bin/true"],
-                memoryBytes: f.options.memoryBytes,
-                runtimeSeconds: 10,
-              });
-              const previous = yield* operations.prepare(
-                { providerInstanceId, threadId },
-                { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
-                NodeCrypto.createHash("sha256")
-                  .update(
-                    canonicalProjectWorkPayload({
-                      threadId,
-                      kind: "initialize",
-                      operationId: f.request.initializeOperationId,
-                    }),
-                  )
-                  .digest("hex"),
-                {
-                  allocation,
-                  workerId: "required-previous",
-                  operationId: f.request.initializeOperationId,
-                  resourceHash: piManagedSkillResourceIdentity([]),
-                },
-              );
-              yield* operations.persistNative(previous, {
-                sessionId: "required-session",
-                sessionReference: "sessions/required.jsonl",
-                leafId: null,
-                persisted: false,
-              });
-              yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${previous.operation.operationId}`;
-            }
-            const current = yield* f.reader.readRequired(f.snapshot);
+            const snapshot = kind === "prompt" ? yield* initializeRequiredContext(f) : f.snapshot;
+            const current = yield* f.reader.readRequired(snapshot);
             let transferred: SessionRuntime.PiSessionRuntimeOptions | undefined;
             const original = SessionRuntime.makePiSessionRuntime;
             const spy = vi
@@ -10329,9 +10879,13 @@ for (const readonlyKind of [undefined, "planning", "investigation", "review"] as
             yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
             const prepared = yield* f.instance.prepareOperation(
               kind === "initialize"
-                ? { threadId, kind, operationId: f.request.initializeOperationId }
+                ? {
+                    threadId: f.binding.threadId,
+                    kind,
+                    operationId: f.request.initializeOperationId,
+                  }
                 : {
-                    threadId,
+                    threadId: f.binding.threadId,
                     kind,
                     operationId: f.request.assignmentOperationId,
                     prompt: f.request.assignment,
@@ -10363,7 +10917,7 @@ for (const readonlyKind of [undefined, "planning", "investigation", "review"] as
             expect(f.transports).toBe(0);
             expect(
               yield* f.sql`SELECT owner_json FROM project_team_pi_process WHERE owner_json IS NOT NULL`,
-            ).toEqual([]);
+            ).toHaveLength(kind === "prompt" ? 1 : 0);
           }),
         ),
     );
@@ -10376,172 +10930,305 @@ for (const mode of [
   "prompt-budget",
   "changed-provenance",
 ] as const)
-  it.effect(`required context transfer rejects ${mode} before managed allocation`, () =>
-    scoped(
-      Effect.gen(function* () {
-        const f = yield* requiredTransferFixture(false, false);
-        const addQuestions = Effect.fn("requiredTransferFixture.addQuestions")(function* (
-          count: number,
-        ) {
-          const state = yield* readCurrentState(f.sql, projectId);
-          const gate = state.foundationRecords?.find((r) => r.kind === "gate" && r.gate === "plan");
-          if (gate?.kind !== "gate") return yield* Effect.die("Missing current question target");
-          yield* f.repository.execute(
-            yield* decodeRequiredFoundation({
-              type: "project-work.foundation.commit",
-              projectId,
-              commandId: "required-questions",
-              expectedRevision: state.revision,
-              attribution,
-              committedAt: at,
-              records: Array.from({ length: count }, (_, i) => ({
-                kind: "question",
+  it.effect(
+    `required context transfer rejects ${mode === "prompt-budget" ? "original-assignment context overflow at initialization" : mode} before managed allocation`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* requiredTransferFixture(
+            false,
+            false,
+            undefined,
+            false,
+            "project",
+            mode === "prompt-budget" ? "é".repeat(32769) : undefined,
+          );
+          const addQuestions = Effect.fn("requiredTransferFixture.addQuestions")(function* (
+            count: number,
+          ) {
+            const state = yield* readCurrentState(f.sql, projectId);
+            const gate = state.foundationRecords?.find(
+              (r) => r.kind === "gate" && r.gate === "plan",
+            );
+            if (gate?.kind !== "gate") return yield* Effect.die("Missing current question target");
+            yield* f.repository.execute(
+              yield* decodeRequiredFoundation({
+                type: "project-work.foundation.commit",
                 projectId,
-                recordId: "required-question-" + i,
-                revision: 0,
-                generation: 0,
-                updatedAt: at,
-                status: "pending",
-                taskId: f.binding.taskId,
-                senderId: f.binding.memberId,
-                targetGateId: gate.recordId,
-                targetRevision: gate.revision,
-                body: "é".repeat(2000),
-                choices: [],
-              })),
+                commandId: "required-questions",
+                expectedRevision: state.revision,
+                attribution,
+                committedAt: at,
+                records: Array.from({ length: count }, (_, i) => ({
+                  kind: "question",
+                  projectId,
+                  recordId: "required-question-" + i,
+                  revision: 0,
+                  generation: 0,
+                  updatedAt: at,
+                  status: "pending",
+                  taskId: f.binding.taskId,
+                  senderId: f.binding.memberId,
+                  targetGateId: gate.recordId,
+                  targetRevision: gate.revision,
+                  body: "é".repeat(2000),
+                  choices: [],
+                })),
+              }),
+            );
+          });
+          if (mode === "missing") yield* f.sql`DELETE FROM project_team_dispatch`;
+          if (mode === "corrupt") {
+            yield* f.sql`DROP TRIGGER project_team_dispatch_immutable`;
+            yield* f.sql`UPDATE project_team_dispatch SET intent_json='{}'`;
+          }
+          if (mode === "oversize") {
+            yield* addQuestions(16);
+            const context = yield* f.reader.readForOperation({
+              projectId,
+              bindingId: f.binding.recordId,
+              generation: 0,
+              providerInstanceId,
+              threadId,
+              operationId: f.request.initializeOperationId,
+              operationKind: "initialize",
+            });
+            expect(Buffer.byteLength(context.text)).toBeGreaterThan(65536);
+            expect(Buffer.byteLength(context.text)).toBeLessThan(262144);
+          }
+          const retainedBefore =
+            mode === "prompt-budget"
+              ? yield* f.sql`SELECT intent_json FROM project_team_dispatch`
+              : undefined;
+          const budgetBefore =
+            mode === "prompt-budget"
+              ? yield* f.sql`SELECT * FROM project_team_model_budget`
+              : undefined;
+          let allocations = 0;
+          let sessions = 0;
+          const originalAllocate = ManagedProcess.preallocatePiManagedProcess;
+          const allocationSpy = vi
+            .spyOn(ManagedProcess, "preallocatePiManagedProcess")
+            .mockImplementation((launch) => {
+              allocations++;
+              return originalAllocate(launch);
+            });
+          const sessionSpy = vi
+            .spyOn(SessionRuntime, "makePiSessionRuntime")
+            .mockImplementation(() => {
+              sessions++;
+              return Effect.die("Unexpected session after rejected required context");
+            });
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              allocationSpy.mockRestore();
+              sessionSpy.mockRestore();
             }),
           );
-        });
-        if (mode === "missing") yield* f.sql`DELETE FROM project_team_dispatch`;
-        if (mode === "corrupt") {
-          yield* f.sql`DROP TRIGGER project_team_dispatch_immutable`;
-          yield* f.sql`UPDATE project_team_dispatch SET intent_json='{}'`;
-        }
-        if (mode === "oversize") {
-          yield* addQuestions(16);
-          const context = yield* f.reader.readForOperation({
+          const runtime = yield* makePiManagedRuntimeLive({
+            ...f.options,
+            ...(mode === "changed-provenance"
+              ? {
+                  revalidateRuntime: addQuestions(1).pipe(Effect.mapError(controlledCallbackError)),
+                }
+              : {}),
+          });
+          const instance = yield* runtime.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          const request: PiManagedOperationRequest =
+            mode === "prompt-budget"
+              ? {
+                  threadId,
+                  kind: "initialize",
+                  operationId: f.request.initializeOperationId,
+                }
+              : {
+                  threadId,
+                  kind: "initialize",
+                  operationId:
+                    mode === "wrong-operation"
+                      ? "unrelated-initialize"
+                      : f.request.initializeOperationId,
+                };
+          const result = yield* instance
+            .prepareOperation(request, () => Effect.void)
+            .pipe(Effect.result);
+          expect(result._tag).toBe("Failure");
+          if (mode === "oversize" || mode === "prompt-budget")
+            expect(result).toMatchObject({
+              failure: { detail: "Pi required context exceeds transfer bounds" },
+            });
+          if (mode === "changed-provenance")
+            expect(result).toMatchObject({
+              failure: { detail: "Required context provenance changed before allocation" },
+            });
+          expect(allocations).toBe(0);
+          expect(sessions).toBe(0);
+          expect(f.transports).toBe(0);
+          if (mode === "prompt-budget") {
+            expect(f.allocations).toBe(0);
+            expect(yield* f.sql`SELECT intent_json FROM project_team_dispatch`).toEqual(
+              retainedBefore,
+            );
+            expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budgetBefore);
+          }
+          expect(
+            yield* f.sql`SELECT operation_id FROM project_team_pi_operation WHERE operation_id=${f.request.initializeOperationId}`,
+          ).toEqual([]);
+        }),
+      ),
+  );
+
+for (const change of [
+  "tokens",
+  "deadline",
+  "expired",
+  "paused",
+  "canceled",
+  "revoked",
+  "quarantined",
+  "partial-setup",
+  "unfinished-setup",
+  "source-config",
+  "foreign-root",
+  "child-grant",
+  "parent-spec",
+  "parent-plan",
+  "missing-source",
+] as const)
+  it.effect(`human child root budget refuses ${change} before allocation`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture();
+        const state = yield* readCurrentState(f.sql, projectId);
+        const root = state.foundationRecords?.find(
+          (record) => record.kind === "run-binding" && record.recordId === f.root.bindingId,
+        );
+        const membership = state.foundationRecords?.find(
+          (record) => record.kind === "task-membership" && record.taskId === f.root.taskId,
+        );
+        const role = state.foundationRecords?.find(
+          (record) =>
+            record.kind === "role-revision" &&
+            record.recordId === (root?.kind === "run-binding" ? root.roleRevisionId : undefined),
+        );
+        const gate = state.foundationRecords?.find(
+          (record) =>
+            record.kind === "gate" &&
+            (change === "child-grant"
+              ? record.recordId === f.binding.authorizationGateId
+              : record.taskId === f.root.taskId &&
+                record.gate === (change === "parent-plan" ? "plan" : "specification")),
+        );
+        if (
+          root?.kind !== "run-binding" ||
+          membership?.kind !== "task-membership" ||
+          role?.kind !== "role-revision" ||
+          gate?.kind !== "gate"
+        )
+          return yield* Effect.die("Missing original human child budget fixture owner");
+        if (change === "tokens")
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=maximum_tokens+1`;
+        if (change === "deadline")
+          yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=deadline_at_ms+1`;
+        if (change === "expired")
+          yield* TestClock.setTime(f.root.snapshot.intent.limits.rootDeadlineAtMs);
+        if (change === "paused" || change === "canceled")
+          yield* restoreHistoricalBinding({
+            ...membership,
+            revision: membership.revision + 1,
+            controlState: change === "paused" ? "paused" : "canceled",
+          });
+        if (change === "revoked" || change === "quarantined")
+          yield* restoreHistoricalBinding({ ...root, revision: root.revision + 1, status: change });
+        if (change === "partial-setup")
+          yield* f.sql`UPDATE project_team_dispatch SET stage='reserved' WHERE dispatch_id=${f.root.snapshot.fence.dispatchId}`;
+        if (change === "unfinished-setup")
+          yield* restoreHistoricalBinding({
+            recordId: "required-root-setup",
             projectId,
-            bindingId: f.binding.recordId,
+            revision: 0,
             generation: 0,
-            providerInstanceId,
-            threadId,
-            operationId: f.request.initializeOperationId,
-            operationKind: "initialize",
+            updatedAt: at,
+            kind: "effect",
+            status: "uncertain",
+            effectId: "required-root-setup",
+            effectKind: "setup",
+            runId: root.recordId,
+            targetId: root.recordId,
+            payload: { recordIds: [root.recordId], expectedRevision: 0 },
+            claimGeneration: 0,
+            availableAt: at,
           });
-          expect(Buffer.byteLength(context.text)).toBeGreaterThan(65536);
-          expect(Buffer.byteLength(context.text)).toBeLessThan(262144);
-        }
-        if (mode === "prompt-budget") {
-          const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
-          const request = {
-            threadId,
-            kind: "initialize" as const,
-            operationId: f.request.initializeOperationId,
-          };
-          const allocation = yield* preallocatePiManagedProcess({
-            workspaceRoot: f.binding.worktree,
-            workspaceAccess: "readonly",
-            nativeStateRoot: f.options.nativeStateRoot,
-            protectedRoots: f.options.protectedRoots,
-            runtimeFiles: f.options.runtimeFiles,
-            argv: ["/bin/true"],
-            memoryBytes: f.options.memoryBytes,
-            runtimeSeconds: 10,
+        if (change === "foreign-root")
+          yield* restoreHistoricalBinding({
+            ...root,
+            revision: root.revision + 1,
+            environmentId: EnvironmentId.make("foreign-environment"),
           });
-          const previous = yield* operations.prepare(
-            { providerInstanceId, threadId },
-            request,
-            NodeCrypto.createHash("sha256")
-              .update(canonicalProjectWorkPayload(request))
-              .digest("hex"),
-            {
-              allocation,
-              workerId: "required-budget-previous",
-              operationId: request.operationId,
-              resourceHash: piManagedSkillResourceIdentity([]),
-            },
-          );
-          yield* operations.persistNative(previous, {
-            sessionId: "required-budget-session",
-            sessionReference: "sessions/budget.jsonl",
-            leafId: null,
-            persisted: false,
+        if (change === "source-config")
+          yield* restoreHistoricalBinding({
+            ...role,
+            revision: role.revision + 1,
+            instructions: role.instructions + " changed",
           });
-          yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${previous.operation.operationId}`;
-        }
+        if (change === "child-grant" || change === "parent-spec" || change === "parent-plan")
+          yield* restoreHistoricalBinding({
+            ...gate,
+            revision: gate.revision + 1,
+            status: "rejected",
+          });
+        if (change === "missing-source")
+          yield* f.sql`DELETE FROM project_team_workspace_receipt WHERE dispatch_id=${f.root.snapshot.fence.dispatchId}`;
+        const budget =
+          yield* f.sql`SELECT environment_id,project_id,root_task_id,maximum_tokens,deadline_at_ms FROM project_team_model_budget`;
+        const intents =
+          yield* f.sql`SELECT dispatch_id,intent_json FROM project_team_dispatch ORDER BY dispatch_id`;
         let allocations = 0;
-        let sessions = 0;
-        const originalAllocate = ManagedProcess.preallocatePiManagedProcess;
-        const allocationSpy = vi
+        const original = ManagedProcess.preallocatePiManagedProcess;
+        const spy = vi
           .spyOn(ManagedProcess, "preallocatePiManagedProcess")
           .mockImplementation((launch) => {
             allocations++;
-            return originalAllocate(launch);
+            return original(launch);
           });
-        const sessionSpy = vi
-          .spyOn(SessionRuntime, "makePiSessionRuntime")
-          .mockImplementation(() => {
-            sessions++;
-            return Effect.die("Unexpected session after rejected required context");
-          });
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            allocationSpy.mockRestore();
-            sessionSpy.mockRestore();
-          }),
-        );
-        const runtime = yield* makePiManagedRuntimeLive({
-          ...f.options,
-          ...(mode === "changed-provenance"
-            ? { revalidateRuntime: addQuestions(1).pipe(Effect.mapError(controlledCallbackError)) }
-            : {}),
-        });
-        const instance = yield* runtime.forInstance({
-          instanceId: providerInstanceId,
-          enabled: true,
-          configuration: {},
-        });
-        const request: PiManagedOperationRequest =
-          mode === "prompt-budget"
-            ? {
-                threadId,
-                kind: "prompt",
-                operationId: f.request.assignmentOperationId,
-                prompt: "é".repeat(32769),
-              }
-            : {
-                threadId,
-                kind: "initialize",
-                operationId:
-                  mode === "wrong-operation"
-                    ? "unrelated-initialize"
-                    : f.request.initializeOperationId,
-              };
-        const result = yield* instance
-          .prepareOperation(request, () => Effect.void)
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const result = yield* f.instance
+          .prepareOperation(
+            {
+              threadId: f.binding.threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+            },
+            () => Effect.void,
+          )
           .pipe(Effect.result);
         expect(result._tag).toBe("Failure");
-        if (mode === "oversize" || mode === "prompt-budget")
-          expect(result).toMatchObject({
-            failure: { detail: "Pi required context exceeds transfer bounds" },
-          });
-        if (mode === "changed-provenance")
-          expect(result).toMatchObject({
-            failure: { detail: "Required context provenance changed before allocation" },
-          });
         expect(allocations).toBe(0);
-        expect(sessions).toBe(0);
+        expect(f.allocations).toBe(0);
         expect(f.transports).toBe(0);
         expect(
-          yield* f.sql`SELECT operation_id FROM project_team_pi_operation WHERE operation_id=${mode === "prompt-budget" ? f.request.assignmentOperationId : f.request.initializeOperationId}`,
+          yield* f.sql`SELECT operation_id FROM project_team_pi_operation WHERE binding_id=${f.binding.recordId}`,
         ).toEqual([]);
+        expect(
+          yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE run_id=${f.binding.recordId}`,
+        ).toEqual([]);
+        expect(
+          yield* f.sql`SELECT environment_id,project_id,root_task_id,maximum_tokens,deadline_at_ms FROM project_team_model_budget`,
+        ).toEqual(budget);
+        expect(
+          yield* f.sql`SELECT dispatch_id,intent_json FROM project_team_dispatch ORDER BY dispatch_id`,
+        ).toEqual(intents);
       }),
     ),
   );
 
 for (const readonlyKind of [undefined, "review"] as const)
   it.effect(
-    `required context transfer qualifies the exact ${readonlyKind === undefined ? "planned" : "planless"} reviewer text and preserves terminal replay`,
+    `required context transfer qualifies the exact ${readonlyKind === undefined ? "approved-parent-plan" : "planless human-child"} reviewer text and preserves terminal replay`,
     () =>
       scoped(
         Effect.gen(function* () {
@@ -10670,12 +11357,13 @@ for (const readonlyKind of [undefined, "review"] as const)
             );
           yield* Effect.addFinalizer(() => Effect.sync(() => sessionSpy.mockRestore()));
           const request = {
-            threadId,
+            threadId: f.binding.threadId,
             kind: "initialize" as const,
             operationId: f.request.initializeOperationId,
           };
           const prepared = yield* f.instance.prepareOperation(request, () => Effect.void);
-          expect((yield* prepared.run).terminal.outcome).toBe("success");
+          const initialized = yield* prepared.run;
+          expect(initialized.terminal.outcome).toBe("success");
           const freshness = yield* f.sql<{
             manifest_json: string;
             native_jsonl: string;
@@ -10688,11 +11376,7 @@ for (const readonlyKind of [undefined, "review"] as const)
           expect(freshness[0]?.native_jsonl).toContain(json(briefing));
           const state = yield* readCurrentState(f.sql, projectId);
           const gate = state.foundationRecords?.find(
-            (record) =>
-              record.kind === "gate" &&
-              (readonlyKind === undefined
-                ? record.gate === "plan"
-                : record.recordId === f.binding.authorizationGateId),
+            (record) => record.kind === "gate" && record.recordId === f.binding.authorizationGateId,
           );
           if (gate?.kind !== "gate") return yield* Effect.die("Missing review question target");
           yield* f.repository.execute(
@@ -10728,7 +11412,7 @@ for (const readonlyKind of [undefined, "review"] as const)
               bindingId: f.binding.recordId,
               generation: 0,
               providerInstanceId,
-              threadId,
+              threadId: f.binding.threadId,
               operationId: request.operationId,
               operationKind: "initialize",
             })).text,
@@ -10766,19 +11450,73 @@ for (const readonlyKind of [undefined, "review"] as const)
           ).toEqual(freshness);
           expect(f.transports).toBe(0);
           if (readonlyKind === "review") {
+            const drain = initialized.terminal.drain;
+            if (!drain)
+              return yield* Effect.die("Missing original controlled initialization drain");
+            const journal = yield* makeProjectTeamDispatchJournal({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+              verifyStage: (receipt, original) =>
+                Effect.gen(function* () {
+                  if (
+                    receipt.evidence.bindingId !== original.intent.request.git.runId ||
+                    receipt.evidence.setupId !== original.intent.request.setupId
+                  )
+                    return yield* new ProjectTeamDispatchJournalError({
+                      reason: "Foreign controlled review stage",
+                    });
+                  // The real callbacks already retained this exact controlled native owner and drain.
+                  const joined = yield* f.sql`SELECT 1 FROM project_team_pi_operation AS operation
+                  JOIN project_team_pi_process AS process ON process.operation_id=operation.operation_id
+                  WHERE operation.operation_id=${f.request.initializeOperationId} AND operation.binding_id=${f.binding.recordId}
+                    AND operation.status='settled' AND json_extract(operation.terminal_json,'$.outcome')='success'
+                    AND json_extract(process.owner_json,'$.unit')=${drain.unit}
+                    AND json_extract(process.owner_json,'$.invocation')=${drain.invocation}
+                    AND json_extract(process.owner_json,'$.cgroup')=${drain.cgroup}
+                    AND json_extract(process.drain_json,'$.unit')=${drain.unit}
+                    AND json_extract(process.drain_json,'$.invocation')=${drain.invocation}
+                    AND json_extract(process.drain_json,'$.cgroup')=${drain.cgroup}
+                    AND json_extract(process.drain_json,'$.kernel')=${drain.kernel}`.pipe(
+                    Effect.mapError(
+                      () =>
+                        new ProjectTeamDispatchJournalError({
+                          reason: "Original controlled review initialization audit failed",
+                        }),
+                    ),
+                  );
+                  if (joined.length !== 1)
+                    return yield* new ProjectTeamDispatchJournalError({
+                      reason: "Original controlled review initialization is not joined",
+                    });
+                }),
+            });
+            let snapshot = yield* journal.readRetained(f.request.dispatchId);
+            for (const stage of [
+              "workspace-ready",
+              "setup-complete",
+              "session-bound",
+              "assignment-intent",
+            ] as const)
+              snapshot = yield* journal.readRetained(
+                (yield* journal.advanceStage(snapshot.fence, {
+                  receiptId: `required-review-${stage}`,
+                  stage,
+                  evidence: { bindingId: f.binding.recordId, setupId: f.request.setupId },
+                })).fence.dispatchId,
+              );
             const current = yield* f.reader.readForOperation({
               projectId,
               bindingId: f.binding.recordId,
               generation: 0,
               providerInstanceId,
-              threadId,
+              threadId: f.binding.threadId,
               operationId: f.request.assignmentOperationId,
               operationKind: "prompt",
             });
             expect(current.required.tasks[0]?.plan).toBeUndefined();
             const prompt = yield* instance.prepareOperation(
               {
-                threadId,
+                threadId: f.binding.threadId,
                 kind: "prompt",
                 operationId: f.request.assignmentOperationId,
                 prompt: f.request.assignment,

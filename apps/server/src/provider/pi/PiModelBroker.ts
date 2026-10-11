@@ -6,6 +6,7 @@ import {
   PI_WORKER_MAX_CHUNK_BYTES,
   PI_WORKER_MAX_REQUEST_BYTES,
   PI_WORKER_MAX_RESPONSE_BYTES,
+  PiWorkerOperation,
 } from "./PiWorkerProtocol.ts";
 
 const strict = { onExcessProperty: "error" } as const;
@@ -130,6 +131,7 @@ const decodeArguments = Schema.decodeSync(Schema.fromJsonString(Schema.JsonObjec
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Json));
 const decodeTools = Schema.decodeUnknownSync(Schema.Array(FunctionTool), strict);
 const decodeName = Schema.decodeSync(Name);
+const decodeOperationId = Schema.decodeSync(PiWorkerOperation.fields.operationId);
 const decodeInteger = Schema.decodeSync(Integer);
 const decodePositive = Schema.decodeSync(Positive);
 export type PiModelUsage = typeof Usage.Type;
@@ -313,7 +315,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
     fail("CONFIG_ROUTE_INVALID");
   try {
     decodeName(cfg.workerId);
-    decodeName(cfg.operationId);
+    decodeOperationId(cfg.operationId);
     decodeName(cfg.routeId);
     decodeInteger(cfg.generation);
     decodePositive(cfg.maxInputTokens);

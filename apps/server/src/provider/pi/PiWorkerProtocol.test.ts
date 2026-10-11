@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import * as Protocol from "./PiWorkerProtocol.ts";
+import { projectTeamDerivedRecordId } from "../../projectWork/ProjectTeamPolicy.ts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -19,6 +20,9 @@ import {
 } from "./PiWorkerProtocol.ts";
 
 const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeOperation = Schema.decodeUnknownSync(Protocol.PiWorkerOperation);
+const decodeIdentity = Schema.decodeUnknownSync(Protocol.PiWorkerIdentity);
+const decodeNative = Schema.decodeUnknownSync(Protocol.PiNativeReference);
 const identity = { workerId: "owned-worker", generation: 3 };
 const workerFrame = (message: PiWorkerFrame["message"], sequence = 0): PiWorkerFrame => ({
   version: 1,
@@ -57,6 +61,79 @@ const runtimeBootstrap = {
   },
   allowedTools: [{ name: "read", execution: "local" as const, description: "read text" }],
 };
+
+describe("retained dispatch operation IDs", () => {
+  it("preserves producer IDs through parent and worker frames and initialization", () => {
+    for (const operationId of [
+      projectTeamDerivedRecordId("approved-dispatch", "initialize"),
+      "legacy_operation-1",
+    ]) {
+      const operation = { operationId, operationKind: "initialize" as const };
+      expect(decodeOperation(operation)).toEqual(operation);
+      const protocol = makePiWorkerProtocol(identity, operation);
+      const bootstrap = { ...parentFrame({ ...runtimeBootstrap, prompt: null }), ...operation };
+      const decodedParent = decodePiParentFrame(
+        encodePiParentFrame(bootstrap).toString().trimEnd(),
+      );
+      expect(decodedParent).toEqual(bootstrap);
+      protocol.acceptParent(decodedParent);
+      protocol.acceptParent({
+        ...parentFrame({ type: "transfer-end", transferId: "context" }, 1),
+        ...operation,
+      });
+      protocol.acceptWorker({
+        ...workerFrame({ type: "ready", actualCwd: "/workspace", native }),
+        ...operation,
+      });
+      const initialized = { ...workerFrame({ type: "initialized", native }, 1), ...operation };
+      const decodedWorker = decodePiWorkerFrame(
+        encodePiWorkerFrame(initialized).toString().trimEnd(),
+      );
+      expect(decodedWorker).toEqual(initialized);
+      protocol.acceptWorker(decodedWorker);
+      expect(protocol.successful).toBe(true);
+    }
+  });
+
+  it("rejects malformed operation IDs and keeps other identity tokens restricted", () => {
+    const valid = projectTeamDerivedRecordId("approved-dispatch", "initialize");
+    for (const operationId of [
+      valid + "\n",
+      valid + "\r",
+      "guided:",
+      "guided:" + "a".repeat(63),
+      "guided:" + "a".repeat(65),
+      "guided:" + "A".repeat(64),
+      "guided:" + "g".repeat(64),
+      "other:" + "a".repeat(64),
+      "../operation",
+      "a".repeat(129),
+    ]) {
+      expect(() =>
+        decodeOperation({
+          operationId,
+          operationKind: "initialize",
+        }),
+      ).toThrow();
+      expect(() =>
+        decodePiWorkerFrame(
+          json({
+            ...workerFrame({ type: "initialized", native }),
+            operationId,
+            operationKind: "initialize",
+          }),
+        ),
+      ).toThrow();
+      expect(() =>
+        decodePiParentFrame(
+          json({ ...parentFrame(runtimeBootstrap), operationId, operationKind: "initialize" }),
+        ),
+      ).toThrow();
+    }
+    expect(() => decodeIdentity({ ...identity, workerId: valid })).toThrow();
+    expect(() => decodeNative({ ...native, sessionId: valid })).toThrow();
+  });
+});
 
 function runtimePeers(operationKind: PiWorkerOperation["operationKind"] = "prompt") {
   const operation = { operationId: "operation-1", operationKind };

@@ -20,6 +20,9 @@ const SafeInteger = Schema.Int.check(
 );
 const RequestId = SafeInteger.check(Schema.isGreaterThan(0));
 const Token = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,128}$/));
+const OperationId = Schema.String.check(
+  Schema.isPattern(/^(?:[a-zA-Z0-9_-]{1,128}|guided:[a-f0-9]{64})(?![\s\S])/),
+);
 const RequestBody = Schema.String.check(
   Schema.makeFilter((value) => Buffer.byteLength(value, "utf8") <= PI_WORKER_MAX_REQUEST_BYTES),
 );
@@ -53,7 +56,7 @@ const RelativeReference = boundedText(512).check(
   Schema.makeFilter((value) => !value.split("/").some((part) => part === "." || part === "..")),
 );
 export const PiWorkerOperation = Schema.Struct({
-  operationId: Token,
+  operationId: OperationId,
   operationKind: Schema.Literals(["initialize", "prompt", "compact"]),
 });
 export type PiWorkerOperation = typeof PiWorkerOperation.Type;
@@ -214,7 +217,7 @@ const envelope = {
   version: Schema.Literal(PI_WORKER_PROTOCOL_VERSION),
   ...PiWorkerIdentity.fields,
   sequence: SafeInteger,
-  operationId: Schema.optional(Token),
+  operationId: Schema.optional(OperationId),
   operationKind: Schema.optional(PiWorkerOperation.fields.operationKind),
 };
 export const PiWorkerFrame = Schema.Struct({
