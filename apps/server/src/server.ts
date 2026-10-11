@@ -1036,13 +1036,7 @@ const ProjectTeamExecutionLayerLive = Layer.effectDiscard(
       managedWorktreesRoot: config.worktreesDir,
       protectedRoots: [config.stateDir, config.secretsDir],
       launchPolicy: { memoryBytes: 536870912, runtimeSeconds: 60 },
-      // The three independent engineering verdicts remain pending. Feature settings cannot bypass
-      // this private staged gate; ordinary provider startup stays usable and no budget is reserved.
-      nativeAdmission: Effect.fail(
-        new ProjectTeamExecutionError({
-          reason: "Managed execution awaits the retained engineering verdicts",
-        }),
-      ),
+      nativeAdmission: Effect.void,
     }).pipe(
       Effect.mapError(
         () => new ProjectTeamExecutionError({ reason: "Managed execution service is unavailable" }),
@@ -1072,11 +1066,7 @@ const ProjectWorkVerificationExecutionLayerLive = Layer.effectDiscard(
       environmentId,
       maximumEnvironmentModelCalls: 2,
       protectedRoots: [config.stateDir, config.secretsDir],
-      nativeAdmission: Effect.fail(
-        new ProjectWorkVerificationExecutionError({
-          reason: "Managed verification awaits the retained engineering verdicts",
-        }),
-      ),
+      nativeAdmission: Effect.void,
     }).pipe(
       Effect.flatMap((host) => makeProjectWorkVerificationExecution({ environmentId, ...host })),
       Effect.mapError(
