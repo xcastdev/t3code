@@ -21,6 +21,7 @@ import {
   makeProjectManagedSetup,
   ProjectManagedSetupError,
   type ProjectManagedSetupInput,
+  type ProjectManagedSetupReceipt,
   type ProjectManagedSetupSelection,
 } from "./ProjectManagedSetup.ts";
 import { makeProjectManagedSetupJournal } from "./ProjectManagedSetupJournal.ts";
@@ -160,6 +161,23 @@ export const makeProjectManagedSetupRuntime = Effect.fn("makeProjectManagedSetup
         reconcilePiManagedProcess(recovery, options).pipe(Effect.provide(services)),
     });
     return {
+      verify: (input: ProjectManagedSetupInput, receipt: ProjectManagedSetupReceipt) =>
+        Effect.gen(function* () {
+          const retained = yield* journal.read(input);
+          if (
+            !retained ||
+            retained.uncertain ||
+            !retained.receipt ||
+            (receipt.outcome !== "skipped" && receipt.outcome !== "succeeded") ||
+            canonicalProjectWorkPayload(retained.receipt) !== canonicalProjectWorkPayload(receipt)
+          )
+            return yield* failure("Setup evidence is not certain retained completion");
+          const current = yield* resolveSelection(input);
+          if (
+            canonicalProjectWorkPayload(current) !== canonicalProjectWorkPayload(receipt.selection)
+          )
+            return yield* failure("Frozen setup selection no longer matches current configuration");
+        }).pipe(Effect.provide(services)),
       execute: (input: ProjectManagedSetupInput) =>
         setup.execute(input).pipe(Effect.provide(services)),
       reconcile: (input: ProjectManagedSetupInput) =>

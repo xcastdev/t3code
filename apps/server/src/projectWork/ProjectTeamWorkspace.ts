@@ -186,12 +186,12 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
     );
     yield* assertCurrent(snapshot);
   });
-  const physicalWorkspace = Effect.fn("ProjectTeamWorkspace.physicalWorkspace")(function* (
+  const managedContext = Effect.fn("ProjectTeamWorkspace.managedContext")(function* (
     snapshot: ProjectTeamDispatchSnapshot,
     prior?: ManagedGit.ManagedWorkspaceReceipt,
   ) {
     const git = snapshot.intent.request.git;
-    const context = yield* ManagedGit.make({
+    return yield* ManagedGit.make({
       assignment: git,
       ...(prior ? { priorReceipt: prior } : {}),
       revalidate: assertCurrent(snapshot).pipe(
@@ -224,6 +224,13 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
           ),
         ),
     });
+  });
+  const physicalWorkspace = Effect.fn("ProjectTeamWorkspace.physicalWorkspace")(function* (
+    snapshot: ProjectTeamDispatchSnapshot,
+    prior?: ManagedGit.ManagedWorkspaceReceipt,
+  ) {
+    const git = snapshot.intent.request.git;
+    const context = yield* managedContext(snapshot, prior);
     yield* workflow.createWorktree(
       {
         cwd: git.primaryRoot,
@@ -576,6 +583,23 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
       }),
     );
   });
+  const verifyRetainedWorkspace = Effect.fn("ProjectTeamWorkspace.verifyRetainedWorkspace")(
+    function* (snapshot: ProjectTeamDispatchSnapshot, receipt: ManagedGit.ManagedWorkspaceReceipt) {
+      yield* assertCurrent(snapshot);
+      const retained = yield* readWorkspace(snapshot);
+      if (!retained || !same(retained, receipt))
+        return yield* denied("Workspace evidence does not match its original retained receipt");
+      const git = snapshot.intent.request.git;
+      const context = yield* managedContext(snapshot, retained);
+      yield* ManagedGit.verifyManagedWorkspace(context, {
+        cwd: git.primaryRoot,
+        path: git.worktreePath,
+        refName: git.baseRef,
+        newRefName: git.branchRef.slice(11),
+      });
+      yield* assertCurrent(snapshot);
+    },
+  );
   const setupJournal = yield* makeProjectManagedSetupJournal({
     ...options,
     validateSelection: () =>
@@ -595,8 +619,10 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
     snapshot: ProjectTeamDispatchSnapshot,
     workspace: ManagedGit.ManagedWorkspaceReceipt,
     prior?: ProjectManagedSetupReceipt,
+    readOnly = false,
   ) {
-    yield* verifyWorkspace(snapshot, workspace);
+    const checkWorkspace = readOnly ? verifyRetainedWorkspace : verifyWorkspace;
+    yield* checkWorkspace(snapshot, workspace);
     const envelope = yield* retainedEnvelope(snapshot);
     if (snapshot.intent.integration !== undefined) {
       if (!envelope?.integration)
@@ -620,7 +646,7 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
             Effect.gen(function* () {
               if (!same(input, actualInput) || !same(snapshot, actualSnapshot))
                 return yield* denied("Setup input or dispatch snapshot changed");
-              yield* verifyWorkspace(snapshot, workspace);
+              yield* checkWorkspace(snapshot, workspace);
               yield* instance.assertCurrent;
             }).pipe(
               Effect.scoped,
@@ -632,9 +658,17 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
         });
         // Execute also validates current script/configuration on exact durable receipt replay.
         if (prior) yield* verifyRetainedSetup(input, prior);
+        if (readOnly) {
+          if (!prior)
+            return yield* denied("Retained setup verification requires its original receipt");
+          yield* runtime.verify(input, prior);
+          yield* checkWorkspace(snapshot, workspace);
+          yield* instance.assertCurrent;
+          return copy(prior);
+        }
         const receipt = yield* runtime.execute(input);
         yield* verifyRetainedSetup(input, receipt);
-        yield* verifyWorkspace(snapshot, workspace);
+        yield* checkWorkspace(snapshot, workspace);
         yield* instance.assertCurrent;
         return copy(receipt);
       }),
@@ -665,6 +699,46 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.provideService(SqlClient.SqlClient, sql), Effect.provide(services));
   return {
+    readWorkspace: (snapshot: ProjectTeamDispatchSnapshot) =>
+      provide(
+        Effect.suspend(() => {
+          const original = captureSnapshot(snapshot);
+          return assertCurrent(original).pipe(
+            Effect.andThen(readWorkspace(original)),
+            Effect.tap(() => assertCurrent(original)),
+          );
+        }),
+      ),
+    readSetup: (snapshot: ProjectTeamDispatchSnapshot) =>
+      provide(
+        Effect.suspend(() => {
+          const original = captureSnapshot(snapshot);
+          return Effect.gen(function* () {
+            yield* assertCurrent(original);
+            const retained = yield* setupJournal.read(setupInput(original));
+            if (!retained) return null;
+            if (retained.uncertain || !retained.receipt)
+              return yield* denied("Setup has no certain retained completion");
+            yield* verifyRetainedSetup(setupInput(original), retained.receipt);
+            yield* assertCurrent(original);
+            return copy(retained.receipt);
+          });
+        }),
+      ),
+    verifyRetained: (
+      snapshot: ProjectTeamDispatchSnapshot,
+      workspace: ManagedGit.ManagedWorkspaceReceipt,
+      setup?: ProjectManagedSetupReceipt,
+    ) =>
+      provide(
+        Effect.suspend(() => {
+          const original = captureSnapshot(snapshot);
+          const receipt = copy(workspace);
+          return setup === undefined
+            ? verifyRetainedWorkspace(original, receipt)
+            : withSetup(original, receipt, copy(setup), true).pipe(Effect.asVoid);
+        }),
+      ),
     withWorkspace,
     workspace: (snapshot: ProjectTeamDispatchSnapshot) => withWorkspace(snapshot, Effect.succeed),
     verifyIntegration: (

@@ -84,6 +84,7 @@ interface Execution {
     use: (target: ManagedVerificationTarget) => Effect.Effect<A, E, R>,
   ) => Effect.Effect<A, E | GitCommandError, R>;
   readonly prepare: (input: VcsCreateWorktreeInput) => Effect.Effect<string, GitCommandError>;
+  readonly verifyRetained: (input: VcsCreateWorktreeInput) => Effect.Effect<void, GitCommandError>;
   readonly create: (
     input: VcsCreateWorktreeInput,
   ) => Effect.Effect<VcsCreateWorktreeResult, GitCommandError>;
@@ -220,6 +221,15 @@ export const withManagedVerificationAncestry = <A, E, R>(
     return yield* execution.withVerificationAncestry(selection, use);
   });
 };
+
+/** Checks an existing owned workspace without creating it or persisting another receipt. */
+export const verifyManagedWorkspace = (
+  context: ManagedGitExecution,
+  input: VcsCreateWorktreeInput,
+) =>
+  getExecution(context, input.cwd).pipe(
+    Effect.flatMap((execution) => execution.verifyRetained(input)),
+  );
 
 /** Canonical common metadata is also the permit key for ordinary linked-worktree mutations. */
 export const canonicalGitMutationKey = (common: string, cwd: string) =>
@@ -693,6 +703,37 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
   });
   const prepare = (input: VcsCreateWorktreeInput) =>
     Effect.scoped(validate(input).pipe(Effect.as(a.commonGitDirectory)));
+  const verifyRetained = Effect.fn("ManagedGitExecution.verifyRetained")(function* (
+    input: VcsCreateWorktreeInput,
+  ) {
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        if (!prior)
+          return yield* deny("Retained workspace verification requires its original receipt.");
+        yield* validate(input);
+        const current = yield* acquireSnapshot(true);
+        if (!current.workspace || encodeReceipt(current.workspace) !== priorText)
+          return yield* deny("Retained workspace metadata no longer matches its original receipt.");
+        const base = yield* command(["rev-parse", "--verify", `${a.baseRef}^{commit}`], current);
+        if (base.code !== 0 || base.stdout.trim() !== a.baseOid)
+          return yield* deny("Approved local base ref moved or is unavailable.");
+        const registration = yield* command(["worktree", "list", "--porcelain", "-z"], current);
+        if (
+          registration.code !== 0 ||
+          !registration.stdout.split("\0\0").some((entry) => {
+            const fields = entry.split("\0");
+            return (
+              fields.includes(`worktree ${a.worktreePath}`) &&
+              fields.includes(`branch ${a.branchRef}`)
+            );
+          })
+        )
+          return yield* deny("Retained workspace is no longer registered at its approved branch.");
+        yield* options.revalidate;
+        yield* verify(current);
+      }),
+    );
+  });
   const create = Effect.fn("ManagedGitExecution.create")(function* (input: VcsCreateWorktreeInput) {
     return yield* Effect.scoped(
       Effect.gen(function* () {
@@ -1097,6 +1138,7 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
     assignment: a,
     prepare,
     create,
+    verifyRetained,
     withVerificationTarget,
     withIntegrationTarget,
     withVerificationAncestry,
