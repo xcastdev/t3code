@@ -98,6 +98,7 @@ import {
   getProviderTurnEventSubscription,
   makeProviderTurnPublications,
 } from "../ProviderTurnPublications.ts";
+import { makeProviderManagedSessions } from "../ProviderManagedSessions.ts";
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
@@ -115,6 +116,15 @@ import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import type { ProjectWorkRuntimeContext } from "../RuntimeInstructions.ts";
 import { SkillApplicationReactor } from "../../orchestration/Services/SkillApplicationReactor.ts";
 import { SkillCatalogService } from "../../skills/SkillCatalogService.ts";
+const ManagedAssignmentInput = Schema.Struct({
+  ...ProviderSendTurnInput.fields,
+  input: Schema.optional(
+    Schema.String.check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS),
+    ),
+  ),
+});
 const isModelSelection = Schema.is(ModelSelection);
 const encodePromptJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -579,6 +589,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const pathService = yield* Path.Path;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const turnPublications = yield* makeProviderTurnPublications();
+  const managedSessions = yield* makeProviderManagedSessions((id) =>
+    Effect.gen(function* () {
+      const info = yield* registry.getInstanceInfo(id);
+      const adapter = yield* registry.getByInstance(id);
+      if (!info.enabled || info.driverKind !== "piAgent" || adapter.provider !== "piAgent")
+        return yield* new ProviderValidationError({
+          operation: "ProviderService.managedSession",
+          issue: "Managed session requires its enabled Pi adapter",
+        });
+      return adapter;
+    }),
+  );
   const projectMcpLeaseScopes = yield* Ref.make(new Map<ThreadId, ProjectMcpLeaseOwner>());
   const pendingSessionReplacements = yield* Ref.make(
     new Map<ThreadId, PendingSessionReplacement>(),
@@ -2107,6 +2129,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           owner.catalogResolveSecret = leased.resolveSecret;
           owner.catalogSecretResolvers = [leased.resolveSecret];
           owner.catalogOauthStateLeases = leased.oauthStateLeases;
+          yield* managedSessions.current(
+            "start",
+            threadId,
+            input.providerInstanceId,
+            input.adapter,
+          );
           const started = yield* input.adapter.startSession({
             ...input.sessionInput,
             ...(projectWork ? { projectWork } : {}),
@@ -2467,6 +2495,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const startSession: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
     function* (threadId, rawInput) {
+      const managed = yield* managedSessions.enter("start", rawInput);
       const parsed = yield* decodeInputOrValidationError({
         operation: "ProviderService.startSession",
         schema: ProviderSessionStartInput,
@@ -2477,6 +2506,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "ProviderService.startSession",
         parsed,
       );
+      if (managed !== undefined) {
+        yield* managedSessions.current("start", threadId, resolvedInstanceId);
+        if (parsed.threadId !== threadId || parsed.runtimeMode !== "approval-required")
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Managed initialization identity changed",
+          );
+      }
       let metricProvider = parsed.provider ?? String(resolvedInstanceId);
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "start-session",
@@ -2528,7 +2565,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }
         const effectiveResumeCursor =
           input.resumeCursor ??
-          (persistedBinding?.providerInstanceId === resolvedInstanceId
+          (managed === undefined && persistedBinding?.providerInstanceId === resolvedInstanceId
             ? persistedBinding.resumeCursor
             : undefined);
         const effectiveCwd =
@@ -2573,6 +2610,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }
         }
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
+        if (
+          managed !== undefined &&
+          (effectiveCwd === undefined ||
+            Option.isNone(skillCatalog) ||
+            Option.isNone(projectionQuery) ||
+            Option.isNone(orchestrationEngine))
+        )
+          return yield* toValidationError(
+            "ProviderService.startSession",
+            "Managed skill preparation is unavailable",
+          );
         const skillPreparation =
           effectiveCwd === undefined ||
           Option.isNone(skillCatalog) ||
@@ -2580,6 +2628,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           Option.isNone(orchestrationEngine)
             ? undefined
             : yield* Effect.gen(function* () {
+                const skillProjectRoot = managed?.primaryProjectRoot ?? effectiveCwd;
                 const readModel = yield* projectionQuery.value.getCommandReadModel().pipe(
                   Effect.mapError(
                     (cause) =>
@@ -2596,7 +2645,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                     entry.threadId === threadId && entry.providerInstanceId === resolvedInstanceId,
                 );
                 const desiredRevision = SkillCatalogRevision.make(
-                  (current?.desiredRevision ?? 0) + 1,
+                  managed === undefined
+                    ? (current?.desiredRevision ?? 0) + 1
+                    : Math.max(current?.desiredRevision ?? 0, 1),
                 );
                 const appliedRevision = current?.appliedRevision ?? SkillCatalogRevision.make(0);
                 const projectId = readModel.threads.find(
@@ -2605,23 +2656,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 const desired = yield* skillCatalog.value.describeSession({
                   threadId,
                   providerInstanceId: resolvedInstanceId,
-                  projectRoot: effectiveCwd,
+                  projectRoot: skillProjectRoot,
                   ...(projectId === undefined ? {} : { projectId }),
                   cwd: effectiveCwd,
                   desiredRevision,
                   appliedRevision,
                 });
                 {
+                  if (managed !== undefined) yield* managed.assertCurrent;
                   const updatedAt = yield* nowIso;
-                  yield* orchestrationEngine.value.dispatch({
-                    type: "thread.skill-application.desire",
-                    commandId: CommandId.make(
-                      `server:skill-application-desire:${threadId}:${resolvedInstanceId}:${desiredRevision}`,
-                    ),
-                    threadId,
-                    application: desired,
-                    updatedAt,
-                  });
+                  if (
+                    managed === undefined ||
+                    current === undefined ||
+                    current.desiredRevision === 0
+                  ) {
+                    yield* orchestrationEngine.value.dispatch({
+                      type: "thread.skill-application.desire",
+                      commandId: CommandId.make(
+                        `server:skill-application-desire:${threadId}:${resolvedInstanceId}:${desiredRevision}`,
+                      ),
+                      threadId,
+                      application: desired,
+                      updatedAt,
+                    });
+                  }
                   if (Option.isSome(skillApplicationReactor)) {
                     yield* skillApplicationReactor.value.drain;
                   }
@@ -2630,7 +2688,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   .prepareSession({
                     threadId,
                     providerInstanceId: resolvedInstanceId,
-                    projectRoot: effectiveCwd,
+                    projectRoot: skillProjectRoot,
                     ...(projectId === undefined ? {} : { projectId }),
                     cwd: effectiveCwd,
                     desiredRevision,
@@ -2716,36 +2774,52 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             });
           }).pipe(Effect.ignore);
         };
-        const session = yield* startAdapterSession({
-          adapter,
-          providerInstanceId: resolvedInstanceId,
-          operation: "ProviderService.startSession",
-          sessionInput: {
-            ...input,
-            providerInstanceId: resolvedInstanceId,
-            ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
-            ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-            ...(skillPreparation?.plan === undefined ? {} : { skillPlan: skillPreparation.plan }),
-          },
-        }).pipe(
-          Effect.tapError(() =>
-            Effect.all(
-              [
-                failedApplicationReceipt(),
-                Option.isSome(skillCatalog) && effectiveCwd !== undefined
-                  ? skillCatalog.value
-                      .disposeSession({
-                        threadId,
-                        providerInstanceId: resolvedInstanceId,
-                        cwd: effectiveCwd,
-                      })
-                      .pipe(Effect.ignore)
-                  : Effect.void,
-              ],
-              { discard: true },
+        const session = yield* (
+          managed === undefined
+            ? Effect.void
+            : managedSessions
+                .current("start", threadId, resolvedInstanceId, adapter)
+                .pipe(Effect.asVoid)
+        )
+          .pipe(
+            Effect.andThen(
+              startAdapterSession({
+                adapter,
+                providerInstanceId: resolvedInstanceId,
+                operation: "ProviderService.startSession",
+                sessionInput: {
+                  ...input,
+                  providerInstanceId: resolvedInstanceId,
+                  ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
+                  ...(effectiveResumeCursor !== undefined
+                    ? { resumeCursor: effectiveResumeCursor }
+                    : {}),
+                  ...(skillPreparation?.plan === undefined
+                    ? {}
+                    : { skillPlan: skillPreparation.plan }),
+                },
+              }),
             ),
-          ),
-        );
+          )
+          .pipe(
+            Effect.tapError(() =>
+              Effect.all(
+                [
+                  failedApplicationReceipt(),
+                  Option.isSome(skillCatalog) && effectiveCwd !== undefined
+                    ? skillCatalog.value
+                        .disposeSession({
+                          threadId,
+                          providerInstanceId: resolvedInstanceId,
+                          cwd: effectiveCwd,
+                        })
+                        .pipe(Effect.ignore)
+                    : Effect.void,
+                ],
+                { discard: true },
+              ),
+            ),
+          );
 
         if (session.provider !== adapter.provider) {
           yield* failedApplicationReceipt();
@@ -2844,11 +2918,25 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   );
 
   const sendTurn: ProviderServiceMethod<"sendTurn"> = Effect.fn("sendTurn")(function* (rawInput) {
+    const managed = yield* managedSessions.enter("assignment", rawInput);
     const parsed = yield* decodeInputOrValidationError({
       operation: "ProviderService.sendTurn",
-      schema: ProviderSendTurnInput,
+      schema: managed === undefined ? ProviderSendTurnInput : ManagedAssignmentInput,
       payload: rawInput,
     });
+    if (managed !== undefined) {
+      yield* managedSessions.current("assignment", parsed.threadId);
+      if (
+        parsed.input !== managed.assignment ||
+        parsed.continuation === true ||
+        (parsed.attachments?.length ?? 0) !== 0 ||
+        parsed.modelSelection?.instanceId !== managed.instanceId
+      )
+        return yield* toValidationError(
+          "ProviderService.sendTurn",
+          "Managed assignment identity changed",
+        );
+    }
 
     const attachments = parsed.attachments ?? [];
     if (!parsed.input && attachments.length === 0 && parsed.continuation !== true) {
@@ -2859,7 +2947,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     }
 
     const inputTextWithCitations =
-      parsed.input === undefined ? undefined : expandAssistantCitationsForProvider(parsed.input);
+      managed === undefined && parsed.input !== undefined
+        ? expandAssistantCitationsForProvider(parsed.input)
+        : parsed.input;
     if (inputTextWithCitations !== parsed.input) {
       yield* decodeInputOrValidationError({
         operation: "ProviderService.sendTurn",
@@ -2978,6 +3068,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         );
       }
       if (!routed.isActive) {
+        if (managed !== undefined)
+          return yield* toValidationError(
+            "ProviderService.sendTurn",
+            "Managed assignment requires its original active session; recovery is separate",
+          );
         routed = yield* resolveRoutableSession({
           threadId: input.threadId,
           operation: "ProviderService.sendTurn",
@@ -3009,6 +3104,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }),
         (turnMetadata) =>
           Effect.gen(function* () {
+            if (managed !== undefined)
+              yield* managedSessions.current(
+                "assignment",
+                input.threadId,
+                routed.instanceId,
+                routed.adapter,
+              );
             const turn = yield* routed.adapter.sendTurn(input);
             yield* associateTurnAnalytics({
               providerInstanceId: routed.instanceId,
@@ -3990,6 +4092,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return Stream.fromPubSub(runtimeEventPubSub);
     },
   } satisfies ProviderService.ProviderService["Service"];
+  managedSessions.bind(service);
   turnPublications.bind(service, (id) =>
     registry.getByInstance(id).pipe(
       Effect.mapError(

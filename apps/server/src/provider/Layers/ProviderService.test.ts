@@ -77,6 +77,10 @@ import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "./ProviderService.ts";
 import {
+  sendManagedProviderAssignment,
+  startManagedProviderSession,
+} from "../ProviderManagedSessions.ts";
+import {
   acquireProviderTurnPublications,
   registerProviderTurnEventSubscription,
 } from "../ProviderTurnPublications.ts";
@@ -463,8 +467,15 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeManagedSkillLifecycleFixture(databasePath?: string) {
+function makeManagedSkillLifecycleFixture(
+  databasePath?: string,
+  input: { readonly pi?: ReturnType<typeof makeFakeCodexAdapter> } = {},
+) {
   const codex = makeFakeCodexAdapter();
+  const registry = makeAdapterRegistryMock({
+    [CODEX_DRIVER]: codex.adapter,
+    ...(input.pi === undefined ? {} : { piAgent: input.pi.adapter }),
+  });
   const dispose = vi.fn(
     (_input: Parameters<SkillCatalogServiceShape["disposeSession"]>[0]) => Effect.void,
   );
@@ -534,12 +545,7 @@ function makeManagedSkillLifecycleFixture(databasePath?: string) {
     Layer.provide(RepositoryIdentityResolver.layer),
   );
   const provider = makeProviderServiceLive().pipe(
-    Layer.provide(
-      Layer.succeed(
-        ProviderAdapterRegistry.ProviderAdapterRegistry,
-        makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
-      ),
-    ),
+    Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
     Layer.provide(ProviderSessionDirectoryLive.pipe(Layer.provide(ProviderSessionRuntime.layer))),
     Layer.provide(Layer.succeed(SkillCatalogService, skills)),
     Layer.provide(defaultServerSettingsLayer),
@@ -555,7 +561,7 @@ function makeManagedSkillLifecycleFixture(databasePath?: string) {
     Layer.provide(serverConfigTestLayer),
     Layer.provide(NodeServices.layer),
   );
-  return { codex, dispose, prepare, layer: provider };
+  return { codex, dispose, prepare, registry, layer: provider };
 }
 
 const createManagedSkillThread = Effect.gen(function* () {
@@ -699,6 +705,796 @@ describe("ProviderService managed skill lifecycle", () => {
       assert.equal(application?.status, "pending_new_session");
     }).pipe(Effect.provide(fixture.layer));
   });
+});
+
+const PI_DRIVER = ProviderDriverKind.make("piAgent");
+const piInstanceId = ProviderInstanceId.make("piAgent");
+
+const createManagedPiThread = Effect.gen(function* () {
+  const engine = yield* OrchestrationEngineService;
+  const threadId = asThreadId("managed-pi-thread");
+  const projectId = ProjectId.make("managed-pi-project");
+  const primaryProjectRoot = fixtureCwd("managed-pi-primary");
+  const cwd = fixtureCwd("managed-pi-worktree");
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  yield* engine.dispatch({
+    type: "project.create",
+    commandId: CommandId.make("managed-pi-project-create"),
+    projectId,
+    title: "Managed Pi",
+    workspaceRoot: primaryProjectRoot,
+    createdAt,
+  });
+  yield* engine.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make("managed-pi-thread-create"),
+    threadId,
+    projectId,
+    title: "Managed Pi",
+    modelSelection: { instanceId: piInstanceId, model: "fixture-model" },
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+    branch: "fixture-branch",
+    worktreePath: cwd,
+    createdAt,
+  });
+  return {
+    primaryProjectRoot,
+    input: {
+      threadId,
+      provider: PI_DRIVER,
+      providerInstanceId: piInstanceId,
+      cwd,
+      modelSelection: {
+        instanceId: piInstanceId,
+        model: "fixture-model",
+        options: [{ id: "thinkingLevel", value: "low" }],
+      },
+      runtimeMode: "approval-required" as const,
+    },
+    assertCurrent: Effect.void,
+  };
+});
+
+const managedAssignment = (input: ProviderSessionStartInput, text = "original assignment") => ({
+  input: {
+    threadId: input.threadId,
+    modelSelection: { instanceId: piInstanceId, model: "fixture-model" },
+    input: text,
+  },
+  instanceId: piInstanceId,
+  assertCurrent: Effect.void,
+});
+
+const expiredManagedAuthority = new ProviderValidationError({
+  operation: "fixture.currentManagedAuthority",
+  issue: "Original managed authority expired",
+});
+
+const assertManagedDenial = <A, E>(exit: Exit.Exit<A, E>, issue?: string) => {
+  assert.isTrue(Exit.isFailure(exit));
+  if (Exit.isFailure(exit)) {
+    const error = Cause.squash(exit.cause);
+    assert.instanceOf(error, ProviderValidationError);
+    if (issue !== undefined) assert.include(String(error), issue);
+  }
+};
+
+describe("ProviderService private managed sessions", () => {
+  it.effect(
+    "uses original primary skills, assigned cwd, and stable revision across restart initialization",
+    () =>
+      Effect.gen(function* () {
+        const databasePath = NodePath.join(fixtureCwd("managed-pi-restart"), "state.sqlite");
+        const firstPi = makeFakeCodexAdapter(PI_DRIVER);
+        const first = makeManagedSkillLifecycleFixture(databasePath, { pi: firstPi });
+        const request = yield* Effect.gen(function* () {
+          const request = yield* createManagedPiThread;
+          const service = yield* ProviderService.ProviderService;
+          yield* startManagedProviderSession(service, request);
+          const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+          const originalApplication = (yield* query.getCommandReadModel()).skillApplications![0]!;
+          const engine = yield* OrchestrationEngineService;
+          yield* engine.dispatch({
+            type: "thread.skill-application.desire",
+            commandId: CommandId.make("managed-pi-new-desired-revision"),
+            threadId: request.input.threadId,
+            application: {
+              ...originalApplication,
+              desiredRevision: SkillCatalogRevision.make(2),
+              status: "pending_new_session",
+            },
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          });
+          yield* startManagedProviderSession(service, request);
+          yield* startManagedProviderSession(service, request);
+          const application = (yield* query.getCommandReadModel()).skillApplications?.[0];
+          assert.equal(application?.desiredRevision, 2);
+          assert.equal(application?.appliedRevision, 2);
+          assert.equal(application?.status, "applied");
+          return request;
+        }).pipe(Effect.provide(first.layer));
+        const secondPi = makeFakeCodexAdapter(PI_DRIVER);
+        const second = makeManagedSkillLifecycleFixture(databasePath, { pi: secondPi });
+        yield* Effect.gen(function* () {
+          const service = yield* ProviderService.ProviderService;
+          yield* startManagedProviderSession(service, request);
+          const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+          const application = (yield* query.getCommandReadModel()).skillApplications?.[0];
+          assert.equal(application?.desiredRevision, 2);
+          assert.equal(application?.appliedRevision, 2);
+          assert.equal(application?.status, "applied");
+        }).pipe(Effect.provide(second.layer));
+        assert.equal(firstPi.startSession.mock.calls.length, 3);
+        assert.equal(secondPi.startSession.mock.calls.length, 1);
+        for (const fixture of [first, second]) {
+          for (const [prepared] of fixture.prepare.mock.calls) {
+            assert.equal(prepared.projectRoot, request.primaryProjectRoot);
+            assert.equal(prepared.cwd, request.input.cwd);
+          }
+        }
+        for (const pi of [firstPi, secondPi]) {
+          for (const [started] of pi.startSession.mock.calls) {
+            assert.equal(started.cwd, request.input.cwd);
+          }
+        }
+        assert.deepStrictEqual(
+          first.prepare.mock.calls.map(([input]) => input.desiredRevision),
+          [
+            SkillCatalogRevision.make(1),
+            SkillCatalogRevision.make(2),
+            SkillCatalogRevision.make(2),
+          ],
+        );
+        assert.deepStrictEqual(
+          second.prepare.mock.calls.map(([input]) => input.desiredRevision),
+          [SkillCatalogRevision.make(2)],
+        );
+        assert.deepStrictEqual(
+          firstPi.startSession.mock.calls.map(([input]) => input.skillPlan?.desiredRevision),
+          [
+            SkillCatalogRevision.make(1),
+            SkillCatalogRevision.make(2),
+            SkillCatalogRevision.make(2),
+          ],
+        );
+        assert.equal(
+          secondPi.startSession.mock.calls[0]?.[0].skillPlan?.desiredRevision,
+          SkillCatalogRevision.make(2),
+        );
+        assert.isUndefined(firstPi.startSession.mock.calls[0]?.[0].resumeCursor);
+        assert.isUndefined(firstPi.startSession.mock.calls[1]?.[0].resumeCursor);
+        assert.isUndefined(firstPi.startSession.mock.calls[2]?.[0].resumeCursor);
+        assert.isUndefined(secondPi.startSession.mock.calls[0]?.[0].resumeCursor);
+      }),
+  );
+
+  it.effect(
+    "dispatches exact whitespace and serialized citations while ordinary calls trim and expand",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        yield* startManagedProviderSession(service, request);
+        const text = ` \t\nExplain ${serializeAssistantCitation(assistantCitation)}\r\n  `;
+        yield* sendManagedProviderAssignment(service, managedAssignment(request.input, text));
+        assert.deepStrictEqual(
+          Buffer.from(pi.sendTurn.mock.calls[0]![0].input!),
+          Buffer.from(text),
+        );
+        yield* service.sendTurn({ threadId: request.input.threadId, input: text });
+        assert.equal(
+          pi.sendTurn.mock.calls[1]?.[0].input,
+          expandAssistantCitationsForProvider(text.trim()),
+        );
+        const codexInput = yield* createManagedSkillThread;
+        yield* service.startSession(codexInput.threadId, codexInput);
+        yield* service.sendTurn({ threadId: codexInput.threadId, input: text });
+        assert.equal(
+          fixture.codex.sendTurn.mock.calls[0]?.[0].input,
+          expandAssistantCitationsForProvider(text.trim()),
+        );
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  it.effect(
+    "snapshots initialization and assignment requests including nested model options at Effect creation",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        const originalInput = structuredClone(request.input);
+        const start = startManagedProviderSession(service, request);
+        request.input.threadId = asThreadId("mutated-start-thread");
+        request.input.cwd = fixtureCwd("mutated-start-cwd");
+        request.input.modelSelection.model = "mutated-start-model";
+        request.input.modelSelection.options[0]!.value = "high";
+        yield* start;
+        const started = pi.startSession.mock.calls[0]![0];
+        assert.equal(started.threadId, originalInput.threadId);
+        assert.equal(started.cwd, originalInput.cwd);
+        assert.deepStrictEqual(started.modelSelection, originalInput.modelSelection);
+        const assignment = {
+          ...managedAssignment(originalInput, " \noriginal bytes\t "),
+          input: {
+            ...managedAssignment(originalInput, " \noriginal bytes\t ").input,
+            modelSelection: structuredClone(originalInput.modelSelection),
+          },
+        };
+        const originalAssignment = structuredClone(assignment.input);
+        const send = sendManagedProviderAssignment(service, assignment);
+        assignment.input.threadId = asThreadId("mutated-assignment-thread");
+        assignment.input.input = "mutated assignment";
+        assignment.input.modelSelection.model = "mutated-assignment-model";
+        assignment.input.modelSelection.options[0]!.value = "high";
+        assignment.instanceId = codexInstanceId;
+        yield* send;
+        assert.deepStrictEqual(pi.sendTurn.mock.calls[0]?.[0], originalAssignment);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  for (const failFirst of [false, true]) {
+    it.effect(
+      `rejects duplicate execution of the same assignment Effect after ${failFirst ? "failure" : "success"}`,
+      () => {
+        const pi = makeFakeCodexAdapter(PI_DRIVER);
+        const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+        return Effect.gen(function* () {
+          const request = yield* createManagedPiThread;
+          const service = yield* ProviderService.ProviderService;
+          yield* startManagedProviderSession(service, request);
+          if (failFirst)
+            pi.sendTurn.mockImplementationOnce(() =>
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: PI_DRIVER,
+                  method: "sendTurn",
+                  detail: "Fixture dispatch failed after entry",
+                }),
+              ),
+            );
+          const send = sendManagedProviderAssignment(service, managedAssignment(request.input));
+          const first = yield* send.pipe(Effect.exit);
+          assert.equal(Exit.isFailure(first), failFirst);
+          assertManagedDenial(yield* send.pipe(Effect.exit), "already entered");
+          assert.equal(pi.sendTurn.mock.calls.length, 1);
+        }).pipe(Effect.provide(fixture.layer));
+      },
+    );
+  }
+
+  it.effect(
+    "rechecks expired authority after asynchronous skill preparation and disposes without initialization",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let current = true;
+        const originalPrepare = fixture.prepare.getMockImplementation()!;
+        fixture.prepare.mockImplementationOnce((input) =>
+          Effect.gen(function* () {
+            const prepared = yield* originalPrepare(input);
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return prepared;
+          }),
+        );
+        const startup = yield* startManagedProviderSession(service, {
+          ...request,
+          assertCurrent: Effect.suspend(() =>
+            current ? Effect.void : Effect.fail(expiredManagedAuthority),
+          ),
+        }).pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        current = false;
+        yield* Deferred.succeed(release, undefined);
+        assertManagedDenial(yield* Fiber.join(startup), "expired");
+        assert.equal(pi.startSession.mock.calls.length, 0);
+        assert.deepStrictEqual(
+          fixture.dispose.mock.calls.map(([input]) => input),
+          [
+            {
+              threadId: request.input.threadId,
+              providerInstanceId: piInstanceId,
+              cwd: request.input.cwd,
+            },
+          ],
+        );
+        const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+        assert.equal((yield* query.getCommandReadModel()).skillApplications?.[0]?.status, "failed");
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  it.effect(
+    "rechecks expired authority after the actual project lookup before adapter initialization",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const originalLookup = query.getThreadShellById;
+        vi.spyOn(query, "getThreadShellById").mockImplementationOnce((threadId) =>
+          Effect.gen(function* () {
+            const shell = yield* originalLookup(threadId);
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return shell;
+          }),
+        );
+        let current = true;
+        const startup = yield* startManagedProviderSession(service, {
+          ...request,
+          assertCurrent: Effect.suspend(() =>
+            current ? Effect.void : Effect.fail(expiredManagedAuthority),
+          ),
+        }).pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        current = false;
+        yield* Deferred.succeed(release, undefined);
+        assertManagedDenial(yield* Fiber.join(startup), "expired");
+        assert.equal(pi.startSession.mock.calls.length, 0);
+        assert.equal(fixture.dispose.mock.calls.length, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  for (const change of ["disabled", "replaced"] as const) {
+    it.effect(`rejects an adapter ${change} during skill preparation without dispatch`, () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const replacement = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const originalPrepare = fixture.prepare.getMockImplementation()!;
+        fixture.prepare.mockImplementationOnce((input) =>
+          Effect.gen(function* () {
+            const prepared = yield* originalPrepare(input);
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return prepared;
+          }),
+        );
+        const startup = yield* startManagedProviderSession(service, request).pipe(
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(entered);
+        if (change === "disabled") {
+          const originalInfo = fixture.registry.getInstanceInfo;
+          vi.spyOn(fixture.registry, "getInstanceInfo").mockImplementation((id) =>
+            originalInfo(id).pipe(Effect.map((info) => ({ ...info, enabled: false }))),
+          );
+        } else {
+          vi.spyOn(fixture.registry, "getByInstance").mockImplementation(() =>
+            Effect.succeed(replacement.adapter),
+          );
+        }
+        yield* Deferred.succeed(release, undefined);
+        assertManagedDenial(yield* Fiber.join(startup));
+        assert.equal(pi.startSession.mock.calls.length, 0);
+        assert.equal(replacement.startSession.mock.calls.length, 0);
+        assert.equal(fixture.dispose.mock.calls.length, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    });
+  }
+
+  it.effect(
+    "rejects wrong instance routing, disabled Pi, and an ordinary Codex managed request",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        yield* startManagedProviderSession(service, request);
+        assertManagedDenial(
+          yield* sendManagedProviderAssignment(service, {
+            ...managedAssignment(request.input),
+            instanceId: codexInstanceId,
+          }).pipe(Effect.exit),
+        );
+        assertManagedDenial(
+          yield* startManagedProviderSession(service, {
+            ...request,
+            input: {
+              ...request.input,
+              provider: CODEX_DRIVER,
+              providerInstanceId: codexInstanceId,
+              modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+            },
+          }).pipe(Effect.exit),
+        );
+        const originalInfo = fixture.registry.getInstanceInfo;
+        vi.spyOn(fixture.registry, "getInstanceInfo").mockImplementation((id) =>
+          originalInfo(id).pipe(Effect.map((info) => ({ ...info, enabled: false }))),
+        );
+        assertManagedDenial(
+          yield* sendManagedProviderAssignment(service, managedAssignment(request.input)).pipe(
+            Effect.exit,
+          ),
+        );
+        assert.equal(pi.sendTurn.mock.calls.length, 0);
+        assert.equal(fixture.codex.startSession.mock.calls.length, 0);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  it.effect("rejects an assignment whose persisted thread now routes to another instance", () => {
+    const pi = makeFakeCodexAdapter(PI_DRIVER);
+    const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+    return Effect.gen(function* () {
+      const request = yield* createManagedPiThread;
+      const service = yield* ProviderService.ProviderService;
+      yield* startManagedProviderSession(service, request);
+      yield* service.startSession(request.input.threadId, {
+        threadId: request.input.threadId,
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        cwd: request.input.cwd,
+        modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+        runtimeMode: "full-access",
+      });
+      assert.equal(fixture.codex.startSession.mock.calls.length, 1);
+      assertManagedDenial(
+        yield* sendManagedProviderAssignment(service, managedAssignment(request.input)).pipe(
+          Effect.exit,
+        ),
+        "original factory or assignment",
+      );
+      assert.equal(pi.sendTurn.mock.calls.length, 0);
+      assert.equal(fixture.codex.sendTurn.mock.calls.length, 0);
+    }).pipe(Effect.provide(fixture.layer));
+  });
+
+  for (const state of ["inactive", "stopped"] as const) {
+    it.effect(
+      `rejects assignment recovery for an ${state} session while ordinary recovery still works`,
+      () => {
+        const pi = makeFakeCodexAdapter(PI_DRIVER);
+        const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+        return Effect.gen(function* () {
+          const request = yield* createManagedPiThread;
+          const service = yield* ProviderService.ProviderService;
+          yield* startManagedProviderSession(service, request);
+          if (state === "stopped") yield* service.stopSession({ threadId: request.input.threadId });
+          else yield* pi.stopSession(request.input.threadId);
+          pi.startSession.mockClear();
+          assertManagedDenial(
+            yield* sendManagedProviderAssignment(service, managedAssignment(request.input)).pipe(
+              Effect.exit,
+            ),
+            "recovery is separate",
+          );
+          assert.equal(pi.startSession.mock.calls.length, 0);
+          assert.equal(pi.sendTurn.mock.calls.length, 0);
+          yield* service.sendTurn({ threadId: request.input.threadId, input: "ordinary recovery" });
+          assert.equal(pi.startSession.mock.calls.length, 1);
+          assert.equal(pi.sendTurn.mock.calls.length, 1);
+        }).pipe(Effect.provide(fixture.layer));
+      },
+    );
+  }
+
+  it.effect("rejects an old factory after scope closure while a fresh factory can initialize", () =>
+    Effect.gen(function* () {
+      const databasePath = NodePath.join(fixtureCwd("managed-pi-closed-factory"), "state.sqlite");
+      const firstPi = makeFakeCodexAdapter(PI_DRIVER);
+      const first = makeManagedSkillLifecycleFixture(databasePath, { pi: firstPi });
+      const retained = yield* Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        yield* startManagedProviderSession(service, request);
+        return {
+          service,
+          request,
+          send: sendManagedProviderAssignment(service, managedAssignment(request.input)),
+        };
+      }).pipe(Effect.provide(first.layer));
+      firstPi.startSession.mockClear();
+      const secondPi = makeFakeCodexAdapter(PI_DRIVER);
+      const second = makeManagedSkillLifecycleFixture(databasePath, { pi: secondPi });
+      yield* Effect.gen(function* () {
+        const service = yield* ProviderService.ProviderService;
+        assertManagedDenial(
+          yield* startManagedProviderSession(retained.service, retained.request).pipe(Effect.exit),
+          "loan has ended",
+        );
+        assertManagedDenial(yield* retained.send.pipe(Effect.exit), "loan has ended");
+        assert.equal(firstPi.startSession.mock.calls.length, 0);
+        assert.equal(firstPi.sendTurn.mock.calls.length, 0);
+        yield* startManagedProviderSession(service, retained.request);
+        assert.equal(secondPi.startSession.mock.calls.length, 1);
+      }).pipe(Effect.provide(second.layer));
+    }),
+  );
+  it.effect(
+    "requires explicit Pi initialization model, instance, mode, and absolute assigned cwd",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        const { modelSelection: _model, ...withoutModel } = request.input;
+        const { providerInstanceId: _instance, ...withoutInstance } = request.input;
+        const { cwd: _cwd, ...withoutCwd } = request.input;
+        for (const input of [
+          withoutModel,
+          withoutInstance,
+          withoutCwd,
+          { ...request.input, runtimeMode: "full-access" as const },
+          { ...request.input, cwd: "relative-worktree" },
+          { ...request.input, modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" } },
+        ]) {
+          assertManagedDenial(
+            yield* startManagedProviderSession(service, { ...request, input }).pipe(Effect.exit),
+          );
+        }
+        assert.equal(fixture.prepare.mock.calls.length, 0);
+        assert.equal(pi.startSession.mock.calls.length, 0);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  it.effect(
+    "rejects managed attachments, empty text, continuation, and changed model routing before dispatch",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        yield* startManagedProviderSession(service, request);
+        const original = managedAssignment(request.input);
+        for (const input of [
+          { ...original.input, input: "" },
+          { ...original.input, continuation: true },
+          { ...original.input, modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" } },
+          {
+            ...original.input,
+            attachments: [
+              {
+                type: "image" as const,
+                id: "managed-fixture-image",
+                name: "fixture.png",
+                mimeType: "image/png",
+                sizeBytes: 123,
+              },
+            ],
+          },
+        ]) {
+          assertManagedDenial(
+            yield* sendManagedProviderAssignment(service, { ...original, input }).pipe(Effect.exit),
+          );
+        }
+        assert.equal(pi.sendTurn.mock.calls.length, 0);
+        const whitespace = " \t\r\n ";
+        yield* sendManagedProviderAssignment(service, managedAssignment(request.input, whitespace));
+        assert.equal(pi.sendTurn.mock.calls[0]?.[0].input, whitespace);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  for (const change of ["expired", "replaced"] as const) {
+    it.effect(
+      `rejects authority ${change} after async routing immediately before assignment dispatch`,
+      () => {
+        const pi = makeFakeCodexAdapter(PI_DRIVER);
+        const replacement = makeFakeCodexAdapter(PI_DRIVER);
+        const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+        return Effect.gen(function* () {
+          const request = yield* createManagedPiThread;
+          const service = yield* ProviderService.ProviderService;
+          yield* startManagedProviderSession(service, request);
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const originalHasSession = pi.hasSession.getMockImplementation()!;
+          pi.hasSession.mockImplementationOnce((threadId) =>
+            Effect.gen(function* () {
+              const active = yield* originalHasSession(threadId);
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              return active;
+            }),
+          );
+          let current = true;
+          const send = yield* sendManagedProviderAssignment(service, {
+            ...managedAssignment(request.input),
+            assertCurrent: Effect.suspend(() =>
+              current ? Effect.void : Effect.fail(expiredManagedAuthority),
+            ),
+          }).pipe(Effect.exit, Effect.forkScoped);
+          yield* Deferred.await(entered);
+          if (change === "expired") current = false;
+          else
+            vi.spyOn(fixture.registry, "getByInstance").mockImplementation(() =>
+              Effect.succeed(replacement.adapter),
+            );
+          yield* Deferred.succeed(release, undefined);
+          assertManagedDenial(yield* Fiber.join(send));
+          assert.equal(pi.sendTurn.mock.calls.length, 0);
+          assert.equal(replacement.sendTurn.mock.calls.length, 0);
+        }).pipe(Effect.provide(fixture.layer));
+      },
+    );
+  }
+
+  it.effect(
+    "rejects a reentrant public start before the held thread lock while completing initialization",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        const originalPrepare = fixture.prepare.getMockImplementation()!;
+        fixture.prepare.mockImplementationOnce((input) =>
+          Effect.gen(function* () {
+            assertManagedDenial(
+              yield* service.startSession(request.input.threadId, request.input).pipe(Effect.exit),
+              "already entered",
+            );
+            assert.equal(pi.startSession.mock.calls.length, 0);
+            return yield* originalPrepare(input);
+          }),
+        );
+        const session = yield* startManagedProviderSession(service, request);
+        assert.equal(session.threadId, request.input.threadId);
+        assert.equal(fixture.prepare.mock.calls.length, 1);
+        assert.equal(pi.startSession.mock.calls.length, 1);
+        assert.deepStrictEqual(
+          pi.startSession.mock.calls[0]?.[0].modelSelection,
+          request.input.modelSelection,
+        );
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  for (const changeModel of [false, true]) {
+    it.effect(
+      `rejects a same-loan public send with ${changeModel ? "changed" : "original"} model while dispatching the original assignment once`,
+      () => {
+        const pi = makeFakeCodexAdapter(PI_DRIVER);
+        const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+        return Effect.gen(function* () {
+          const request = yield* createManagedPiThread;
+          const service = yield* ProviderService.ProviderService;
+          yield* startManagedProviderSession(service, request);
+          const assignment = managedAssignment(request.input, " \noriginal assignment\t ");
+          const originalSend = pi.sendTurn.getMockImplementation()!;
+          pi.sendTurn.mockImplementationOnce((input) =>
+            Effect.gen(function* () {
+              const reentrantInput = {
+                ...input,
+                modelSelection: {
+                  ...assignment.input.modelSelection,
+                  model: changeModel
+                    ? "fixture-other-model"
+                    : assignment.input.modelSelection.model,
+                },
+              };
+              assertManagedDenial(
+                yield* service.sendTurn(reentrantInput).pipe(Effect.exit),
+                "already entered",
+              );
+              assert.equal(pi.sendTurn.mock.calls.length, 1);
+              return yield* originalSend(input);
+            }),
+          );
+          const result = yield* sendManagedProviderAssignment(service, assignment);
+          assert.equal(result.threadId, request.input.threadId);
+          assert.equal(pi.startSession.mock.calls.length, 1);
+          assert.equal(pi.sendTurn.mock.calls.length, 1);
+          assert.deepStrictEqual(pi.sendTurn.mock.calls[0]?.[0], assignment.input);
+        }).pipe(Effect.provide(fixture.layer));
+      },
+    );
+  }
+
+  it.effect("allows ordinary public sends to change the model outside a managed loan", () => {
+    const pi = makeFakeCodexAdapter(PI_DRIVER);
+    const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+    return Effect.gen(function* () {
+      const request = yield* createManagedPiThread;
+      const service = yield* ProviderService.ProviderService;
+      yield* service.startSession(request.input.threadId, request.input);
+      const modelSelection = {
+        ...request.input.modelSelection,
+        model: "fixture-other-model",
+        options: [{ id: "thinkingLevel", value: "high" }],
+      };
+      const result = yield* service.sendTurn({
+        threadId: request.input.threadId,
+        modelSelection,
+        input: "ordinary model change",
+      });
+      assert.equal(result.threadId, request.input.threadId);
+      assert.equal(pi.startSession.mock.calls.length, 1);
+      assert.equal(pi.sendTurn.mock.calls.length, 1);
+      assert.deepStrictEqual(pi.sendTurn.mock.calls[0]?.[0].modelSelection, modelSelection);
+      assert.equal(pi.sendTurn.mock.calls[0]?.[0].input, "ordinary model change");
+    }).pipe(Effect.provide(fixture.layer));
+  });
+
+  it.effect("prevents borrowing one factory's managed assignment inside another factory", () => {
+    const pi = makeFakeCodexAdapter(PI_DRIVER);
+    const otherPi = makeFakeCodexAdapter(PI_DRIVER);
+    const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+    const other = makeManagedSkillLifecycleFixture(undefined, { pi: otherPi });
+    return Effect.gen(function* () {
+      const request = yield* createManagedPiThread;
+      const service = yield* ProviderService.ProviderService;
+      yield* startManagedProviderSession(service, request);
+      const originalSend = pi.sendTurn.getMockImplementation()!;
+      pi.sendTurn.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          const otherService = yield* ProviderService.ProviderService;
+          assertManagedDenial(
+            yield* otherService.sendTurn(input).pipe(Effect.exit),
+            "original factory or assignment",
+          );
+          return yield* originalSend(input);
+        }).pipe(Effect.provide(other.layer), Effect.orDie),
+      );
+      yield* sendManagedProviderAssignment(service, managedAssignment(request.input));
+      assert.equal(pi.sendTurn.mock.calls.length, 1);
+      assert.equal(otherPi.startSession.mock.calls.length, 0);
+      assert.equal(otherPi.sendTurn.mock.calls.length, 0);
+    }).pipe(Effect.provide(fixture.layer));
+  });
+
+  it.effect(
+    "rejects another thread under the borrowed assignment and rejects the captured loan after return",
+    () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        const service = yield* ProviderService.ProviderService;
+        yield* startManagedProviderSession(service, request);
+        const escaped = yield* Deferred.make<ReturnType<typeof service.sendTurn>>();
+        const originalSend = pi.sendTurn.getMockImplementation()!;
+        pi.sendTurn.mockImplementationOnce((input) =>
+          Effect.gen(function* () {
+            assertManagedDenial(
+              yield* service
+                .sendTurn({ ...input, threadId: asThreadId("unrelated-managed-thread") })
+                .pipe(Effect.exit),
+              "already entered",
+            );
+            const borrowedContext = yield* Effect.context<never>();
+            yield* Deferred.succeed(
+              escaped,
+              service.sendTurn(input).pipe(Effect.provide(borrowedContext)),
+            );
+            return yield* originalSend(input);
+          }),
+        );
+        yield* sendManagedProviderAssignment(service, managedAssignment(request.input));
+        const escapedSend = yield* Deferred.await(escaped);
+        assertManagedDenial(yield* escapedSend.pipe(Effect.exit), "loan has ended");
+        assert.equal(pi.sendTurn.mock.calls.length, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
 });
 
 function makeProviderServiceLayer(
