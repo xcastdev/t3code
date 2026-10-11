@@ -3,8 +3,6 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
-import * as Ref from "effect/Ref";
-import * as Semaphore from "effect/Semaphore";
 
 import {
   GitManagerError,
@@ -53,9 +51,10 @@ import {
 } from "@t3tools/contracts";
 
 import * as GitManager from "./GitManager.ts";
+import * as GitRepositoryPermits from "./GitRepositoryPermits.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
-import { canonicalGitMutationKey, prepareManagedGitExecution } from "./ManagedGitExecution.ts";
+import { prepareManagedGitExecution } from "./ManagedGitExecution.ts";
 
 export function pullStrategyArgs(strategy: "merge" | "rebase" | "ff-only" | undefined): string[] {
   if (strategy === "rebase") return ["pull", "--rebase"];
@@ -283,7 +282,7 @@ export const make = Effect.gen(function* () {
   const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
-  const mutationSemaphores = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map());
+  const permits = yield* GitRepositoryPermits.GitRepositoryPermits;
 
   const ensureGit = Effect.fn("GitWorkflowService.ensureGit")(function* (
     operation: string,
@@ -310,39 +309,8 @@ export const make = Effect.gen(function* () {
     return handle;
   });
 
-  const mutationKey = (handle: VcsDriverRegistry.VcsDriverHandle, cwd: string) =>
-    handle.repository.metadataPath
-      ? canonicalGitMutationKey(handle.repository.metadataPath, cwd)
-      : Effect.succeed(`${handle.kind}\0${handle.repository.rootPath}`);
-
-  const getMutationSemaphore = Effect.fn("GitWorkflowService.getMutationSemaphore")(function* (
-    key: string,
-  ) {
-    const existing = (yield* Ref.get(mutationSemaphores)).get(key);
-    if (existing) return existing;
-    const candidate = yield* Semaphore.make(1);
-    return yield* Ref.modify(mutationSemaphores, (semaphores) => {
-      const current = semaphores.get(key);
-      if (current) return [current, semaphores] as const;
-      const next = new Map(semaphores);
-      next.set(key, candidate);
-      return [candidate, next] as const;
-    });
-  });
-
-  const serializedMutation = <A, E, R>(
-    operation: string,
-    cwd: string,
-    mutation: Effect.Effect<A, E, R>,
-  ): Effect.Effect<A, E | GitCommandError, R> =>
-    ensureGitCommand(operation, cwd).pipe(
-      Effect.flatMap((handle) =>
-        mutationKey(handle, cwd).pipe(
-          Effect.flatMap(getMutationSemaphore),
-          Effect.flatMap((semaphore) => semaphore.withPermit(mutation)),
-        ),
-      ),
-    );
+  const serializedMutation = permits.withRepositoryPermit;
+  const getMutationSemaphore = permits.getMutationSemaphore;
 
   const ensureGitCommand = Effect.fn("GitWorkflowService.ensureGitCommand")(function* (
     operation: string,
@@ -1244,4 +1212,6 @@ export const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(GitWorkflowService, make);
+export const layer = Layer.effect(GitWorkflowService, make).pipe(
+  Layer.provideMerge(GitRepositoryPermits.layer),
+);

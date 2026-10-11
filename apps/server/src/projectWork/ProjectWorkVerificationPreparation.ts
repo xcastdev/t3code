@@ -19,7 +19,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
-import { GitWorkflowService } from "../git/GitWorkflowService.ts";
+import { GitRepositoryPermits } from "../git/GitRepositoryPermits.ts";
 import * as ManagedGit from "../git/ManagedGitExecution.ts";
 import type { ProjectTeamPrincipal } from "./ProjectTeamAuthorization.ts";
 import {
@@ -506,7 +506,7 @@ export const makeProjectWorkVerificationPreparationRoot = Effect.fn(
   "makeProjectWorkVerificationPreparationRoot",
 )(function* (options: Omit<Options, "captureWorkspace" | "captureExecutable" | "retainPrepared">) {
   const jobs = yield* makeProjectWorkVerificationJobs({ environmentId: options.environmentId });
-  const workflow = yield* GitWorkflowService;
+  const permits = yield* GitRepositoryPermits;
   const pi = yield* ProjectTeamPiRuntime;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -528,7 +528,7 @@ export const makeProjectWorkVerificationPreparationRoot = Effect.fn(
         .retainPrepared(manifest)
         .pipe(Effect.mapError(translate("Prepared verification retention failed"))),
     captureWorkspace: (original, use, revalidate) =>
-      workflow
+      permits
         .withRepositoryPermit(
           "verification.capture",
           original.receipt.assignment.primaryRoot,

@@ -448,11 +448,16 @@ it.effect("physically uncommitted SQL state after a failed commit cannot reach h
       yield* f.sql`PRAGMA foreign_keys=ON`;
       yield* f.sql`CREATE TABLE preparation_parent(id INTEGER PRIMARY KEY)`;
       yield* f.sql`CREATE TABLE preparation_child(parent_id INTEGER REFERENCES preparation_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
-      expect(
-        (yield* f.sql
-          .withTransaction(f.sql`INSERT INTO preparation_child VALUES (1)`)
-          .pipe(Effect.exit))._tag,
-      ).toBe("Failure");
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const loan = yield* f.sql.reserve;
+          yield* loan.executeUnprepared("BEGIN", [], undefined);
+          yield* loan.executeUnprepared("INSERT INTO preparation_child VALUES (1)", [], undefined);
+          // Leave an externally owned transaction open; Effect's exact COMMIT now rescues rollback.
+          const commit = yield* loan.executeUnprepared("COMMIT;", [], undefined).pipe(Effect.exit);
+          expect(commit._tag).toBe("Failure");
+        }),
+      );
       const result = yield* f.preparation.prepare(f.selection, human).pipe(Effect.exit);
       yield* Effect.scoped(
         Effect.gen(function* () {

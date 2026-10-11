@@ -109,6 +109,7 @@ import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import * as GitManager from "./git/GitManager.ts";
+import * as GitRepositoryPermits from "./git/GitRepositoryPermits.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -672,6 +673,7 @@ const ProjectWorkManagedMergeServicesLive = ProjectWorkRuntime.managedMergeServi
   Layer.provide(ServerEnvironmentLayerLive),
 );
 const PullRequestServiceLive = PullRequestService.layer.pipe(
+  Layer.provide(OrchestrationLayerLive),
   Layer.provide(ProjectWorkManagedMergeServicesLive),
   Layer.provide(
     ProjectWorkEvidenceInvalidation.layer.pipe(
@@ -772,7 +774,7 @@ const ProjectTeamPiRuntimeLayerLive = Layer.effect(
 
 const ProjectWorkVerificationLive = ProjectWorkVerification.layer.pipe(
   Layer.provide(ProjectTeamPiRuntimeLayerLive),
-  Layer.provide(GitWorkflowLayerLive),
+  Layer.provide(GitRepositoryPermits.layer.pipe(Layer.provide(VcsDriverRegistryLayerLive))),
   Layer.provide(ServerEnvironmentLayerLive),
   Layer.provide(ServerSettingsLayerLive),
   Layer.provide(PersistenceLayerLive),

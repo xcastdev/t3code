@@ -24,6 +24,8 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import * as GitManager from "./GitManager.ts";
 import * as GitWorkflowService from "./GitWorkflowService.ts";
+import { GitRepositoryPermits } from "./GitRepositoryPermits.ts";
+import { canonicalGitMutationKey } from "./ManagedGitExecution.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
@@ -206,6 +208,41 @@ function makeLayer(input: {
 }
 
 describe("GitWorkflowService", () => {
+  it.effect("shares verification permits with mutations through the canonical Git directory", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const vcsDriver = yield* GitVcsDriver.makeVcsDriver;
+        const cwd = yield* makeRealGitDir();
+        yield* initRealGitRepo(driver, cwd);
+        const files = yield* FileSystem.FileSystem;
+        yield* files.makeDirectory(`${cwd}/nested`);
+        const repository = yield* vcsDriver.detectRepository(cwd);
+        if (!repository?.metadataPath) return yield* Effect.die("Missing Git metadata");
+        const key = yield* canonicalGitMutationKey(repository.metadataPath, cwd);
+        yield* Effect.gen(function* () {
+          const workflow = yield* GitWorkflowService.GitWorkflowService;
+          const permits = yield* GitRepositoryPermits;
+          const semaphore = yield* permits.getMutationSemaphore(key);
+          yield* workflow.withRepositoryPermit(
+            "test.mutation",
+            `${cwd}/nested`,
+            Effect.gen(function* () {
+              const concurrent = yield* semaphore.withPermitsIfAvailable(1)(
+                Effect.succeed("verification entered"),
+              );
+              expect(Option.isNone(concurrent)).toBe(true);
+            }),
+          );
+          const released = yield* semaphore.withPermitsIfAvailable(1)(
+            Effect.succeed("verification entered"),
+          );
+          expect(released).toEqual(Option.some("verification entered"));
+        }).pipe(Effect.provide(makeRealGitWorkflowLayer(driver, vcsDriver)));
+      }).pipe(Effect.provide(RealGitLayer)),
+    ),
+  );
+
   it.effect("rejects a stale reviewed pull-request checkout before it reaches GitManager", () =>
     Effect.scoped(
       Effect.gen(function* () {
