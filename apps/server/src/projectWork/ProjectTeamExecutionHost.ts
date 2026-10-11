@@ -514,7 +514,7 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
             return yield* denied("Original native writer has not drained");
           if (result.state === "drained")
             yield* sql
-              .withTransaction(taskResources.pi(row.operation_id, allocation).drain(result))
+              .withTransaction(taskResources.pi(row.operation_id, allocation).cleanupDrain(result))
               .pipe(Effect.mapError(() => denied("Original task resource drain remains unproved")));
           return {
             operationId: row.operation_id,

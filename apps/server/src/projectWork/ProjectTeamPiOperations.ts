@@ -2097,7 +2097,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       afterDrain: (drain: import("../provider/pi/PiManagedProcess.ts").PiManagedDrain) =>
         sql
           .withTransaction(
-            taskResources.pi(captured.operation.operationId, captured.allocation).drain(drain),
+            taskResources
+              .pi(captured.operation.operationId, captured.allocation)
+              .cleanupDrain(drain),
           )
           .pipe(
             Effect.mapError(
@@ -2401,7 +2403,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           if (drain)
             yield* taskResources
               .pi(captured.operation.operationId, captured.allocation)
-              .drain(drain);
+              .cleanupDrain(drain);
           yield* sql`UPDATE project_team_pi_process SET status=${uncertain ? "quarantine" : "drained"},drain_json=${drain ? encode(drain) : null} WHERE operation_id=${row.operation_id}`;
           // Clock and authority are sampled after the final SQL write receipt while still in the transaction.
           yield* sql`UPDATE project_team_pi_operation SET terminal_json=${encode(terminal)} WHERE operation_id=${row.operation_id}`;

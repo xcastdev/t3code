@@ -1380,3 +1380,53 @@ it.effect(
       }),
     ),
 );
+
+it.effect("legacy native cleanup completes exact verification without a task resource budget", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", false);
+      const claim = yield* claimed(f);
+      // Exact original approved/consumed job with upgraded physical ownership, no new ledger.
+      yield* f.sql`UPDATE project_work_verification_execution SET phase='activating',revision=revision+1 WHERE attempt_id=${claim.attemptId}`;
+      yield* f.sql`UPDATE project_work_verification_execution SET phase='owner-captured',owner_json=${canonicalProjectWorkPayload(f.owner)},revision=revision+1 WHERE attempt_id=${claim.attemptId}`;
+      const process = f.journal.persistence(claim);
+      if (!process.afterDrain) return yield* Effect.die("Missing verification cleanup callback");
+      f.revoke();
+      yield* TestClock.setTime(f.intent.deadlineAtMs + 1);
+      expect((yield* process.beforeStart(f.owner).pipe(Effect.result))._tag).toBe("Failure");
+      expect((yield* process.claimActivation(f.intent.allocation).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect(
+        (yield* process
+          .afterDrain({ ...f.drain, cgroup: "/sys/fs/cgroup/foreign" })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* process.afterDrain(f.drain);
+      const snapshot = (yield* f.journal.readRecoveryPage({ limit: 1 })).items[0];
+      if (!snapshot) return yield* Effect.die("Missing legacy verification snapshot");
+      const observed = {
+        state: "drained" as const,
+        unit: f.owner.unit,
+        invocation: f.owner.invocation,
+        cgroup: f.owner.cgroup,
+        kernel: "removed",
+      };
+      expect(
+        (yield* f.journal.persistReconciliation({ ...snapshot }, observed).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* f.journal
+          .persistReconciliation(snapshot, { ...observed, invocation: "b".repeat(32) })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.journal.persistReconciliation(snapshot, observed);
+      const { result } = yield* retainedResult(f, claim, "failed");
+      yield* f.journal.finishRecovery(snapshot, result);
+      expect((yield* f.journal.readRecoveryPage({ limit: 1 })).items).toEqual([]);
+      expect(yield* f.sql`SELECT task_id FROM project_task_resource_budget`).toEqual([]);
+      expect(yield* f.sql`SELECT unit FROM project_task_resource_child`).toEqual([]);
+    }),
+  ),
+);

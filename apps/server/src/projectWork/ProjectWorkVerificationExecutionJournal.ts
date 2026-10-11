@@ -699,7 +699,9 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
       afterDrain: (drain) =>
         sql
           .withTransaction(
-            taskResources.verification(claim.attemptId, claim.intent.allocation).drain(drain),
+            taskResources
+              .verification(claim.attemptId, claim.intent.allocation)
+              .cleanupDrain(drain),
           )
           .pipe(
             Effect.mapError(
@@ -898,7 +900,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
             if (retained.snapshot.owner && result.drain)
               yield* taskResources
                 .verification(claim.attemptId, claim.intent.allocation)
-                .drain(result.drain);
+                .cleanupDrain(result.drain);
             if (result.outcome === "success") {
               const state = yield* current(claim.intent, claim.attemptId, "consumed");
               evidence = yield* Effect.try({
@@ -982,7 +984,7 @@ export function makeProjectWorkVerificationExecutionJournal(input: Options) {
             if (snapshot.owner)
               yield* taskResources
                 .verification(snapshot.attemptId, snapshot.intent.allocation)
-                .drain(observed);
+                .cleanupDrain(observed);
           }),
         );
       });

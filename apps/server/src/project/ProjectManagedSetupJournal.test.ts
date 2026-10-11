@@ -787,3 +787,295 @@ it.effect(
       }),
     ),
 );
+
+it.effect(
+  "task resource cleanup rescues capture COMMIT failure atomically after expiry and revocation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* allocated;
+        yield* f.journal.claimActivation(f.input, f.selection, f.allocation);
+        const before = yield* f.journal.read(f.input);
+        if (!before) return yield* Effect.die("Missing original setup claim");
+        const { uncertain: _uncertain, ...expected } = before;
+        yield* f.sql`CREATE TABLE capture_parent(id INTEGER PRIMARY KEY)`;
+        yield* f.sql`CREATE TABLE capture_child(parent_id INTEGER REFERENCES capture_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+        yield* f.sql`CREATE TRIGGER fail_capture_commit AFTER UPDATE OF owner_json ON project_team_setup_process
+        WHEN OLD.owner_json IS NULL AND NEW.owner_json IS NOT NULL
+        BEGIN INSERT INTO capture_child VALUES(999); END`;
+        expect(
+          (yield* f.journal.persistOwner(f.input, f.allocation, f.owner).pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* f.sql`SELECT owner_json,uncertainty_json FROM project_team_setup_process`,
+        ).toEqual([{ owner_json: null, uncertainty_json: null }]);
+        expect(yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child`).toEqual(
+          [{ owner_json: null, drain_json: null }],
+        );
+        const knowledge = {
+          expected,
+          selection: f.selection,
+          allocation: f.allocation,
+          owner: f.owner,
+          drain: null,
+          reconciliation: null,
+          reason: "Original capture COMMIT failed after observing the physical owner",
+        };
+        // The same deferred FK also forces adoption to roll back both journals at COMMIT.
+        expect((yield* f.journal.markUncertain(f.input, knowledge).pipe(Effect.exit))._tag).toBe(
+          "Failure",
+        );
+        expect(
+          yield* f.sql`SELECT owner_json,uncertainty_json FROM project_team_setup_process`,
+        ).toEqual([{ owner_json: null, uncertainty_json: null }]);
+        expect(yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child`).toEqual(
+          [{ owner_json: null, drain_json: null }],
+        );
+        expect(
+          yield* f.sql`SELECT SUM(memory_bytes) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+        ).toEqual([{ held: 16777216 }]);
+        yield* f.sql`DROP TRIGGER fail_capture_commit`;
+        yield* TestClock.setTime(f.input.deadlineAtMs + 1);
+        yield* f.sql`DELETE FROM project_team_run_binding WHERE record_id='binding'`;
+        yield* f.journal.markUncertain(f.input, knowledge);
+        expect((yield* f.journal.readOwnership(f.input))?.retained.owner).toEqual(f.owner);
+        expect(yield* f.sql`SELECT owner_json FROM project_task_resource_child`).toEqual([
+          { owner_json: canonicalProjectWorkPayload(f.owner) },
+        ]);
+        expect(
+          (yield* f.journal.validateCurrent(f.input, f.selection, "start").pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+        expect((yield* f.journal.persistReceipt(f.input, f.receipt).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        const cleanup: ProjectManagedSetupReceipt = {
+          ...f.receipt,
+          outcome: "failed",
+          reason: "Original owner reconciled without repeating setup",
+          drain: null,
+          reconciliation: {
+            state: "drained",
+            unit: f.owner.unit,
+            invocation: f.owner.invocation,
+            cgroup: f.owner.cgroup,
+            kernel: "removed",
+          },
+          stdout: null,
+          stderr: null,
+        };
+        yield* f.journal.persistReceipt(f.input, cleanup);
+        expect(
+          yield* f.sql`SELECT COUNT(*) AS held FROM project_task_resource_child WHERE drain_json IS NULL`,
+        ).toEqual([{ held: 0 }]);
+        expect((yield* f.journal.read(f.input))?.receipt).toEqual(cleanup);
+        expect(
+          yield* f.sql`SELECT deadline_at_ms,memory_bytes FROM project_task_resource_budget`,
+        ).toEqual([{ deadline_at_ms: f.taskDeadline, memory_bytes: 2147483648 }]);
+      }),
+    ),
+);
+
+it.effect(
+  "task resource cleanup adopts an older retained uncertainty owner only with its matched receipt",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* allocated;
+        yield* f.journal.claimActivation(f.input, f.selection, f.allocation);
+        const before = yield* f.journal.read(f.input);
+        if (!before) return yield* Effect.die("Missing original setup claim");
+        const { uncertain: _uncertain, ...expected } = before;
+        // Exact prior journal representation: rescued owner, reservation still uncaptured.
+        const knowledge = {
+          expected,
+          selection: f.selection,
+          allocation: f.allocation,
+          owner: f.owner,
+          drain: null,
+          reconciliation: null,
+          reason: "Retained older uncertainty record",
+        };
+        yield* f.sql`UPDATE project_team_setup_process SET owner_json=${canonicalProjectWorkPayload(f.owner)},
+        uncertainty_json=${canonicalProjectWorkPayload(knowledge)},activation='owned',status='uncertain'`;
+        const journal = yield* makeProjectManagedSetupJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          validateSelection: () => Effect.void,
+        });
+        yield* TestClock.setTime(f.input.deadlineAtMs + 1);
+        const cleanup: ProjectManagedSetupReceipt = {
+          ...f.receipt,
+          outcome: "canceled",
+          reason: "Older retained owner drained without repeating setup",
+          drain: null,
+          reconciliation: {
+            state: "drained",
+            unit: f.owner.unit,
+            invocation: f.owner.invocation,
+            cgroup: f.owner.cgroup,
+            kernel: "removed",
+          },
+          stdout: null,
+          stderr: null,
+        };
+        for (const changed of [
+          { ...cleanup, owner: { ...f.owner, nonce: "87654321-1234-4123-8123-123456789012" } },
+          {
+            ...cleanup,
+            reconciliation: { ...cleanup.reconciliation!, invocation: "b".repeat(32) },
+          },
+          { ...cleanup, reconciliation: { ...cleanup.reconciliation!, unit: "foreign.service" } },
+          {
+            ...cleanup,
+            reconciliation: { ...cleanup.reconciliation!, cgroup: "/sys/fs/cgroup/foreign" },
+          },
+        ]) {
+          expect((yield* journal.persistReceipt(f.input, changed).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          expect(
+            yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child`,
+          ).toEqual([{ owner_json: null, drain_json: null }]);
+        }
+        expect(
+          (yield* journal
+            .persistReceipt({ ...f.input, bindingId: "foreign" }, cleanup)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* journal.validateCurrent(f.input, f.selection, "start").pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        yield* journal.persistReceipt(f.input, cleanup);
+        expect(yield* f.sql`SELECT owner_json,drain_json FROM project_task_resource_child`).toEqual(
+          [
+            {
+              owner_json: canonicalProjectWorkPayload(f.owner),
+              drain_json: canonicalProjectWorkPayload(cleanup.reconciliation),
+            },
+          ],
+        );
+        yield* journal.persistReceipt(f.input, cleanup);
+        const resources = yield* makeProjectTaskResources("environment");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              resources
+                .setup(f.input.setupId, f.allocation)
+                .capture({ ...f.owner, invocation: "b".repeat(32) }),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* f.sql`SELECT drain_json FROM project_task_resource_child`).toEqual([
+          { drain_json: canonicalProjectWorkPayload(cleanup.reconciliation) },
+        ]);
+      }),
+    ),
+);
+
+it.effect(
+  "task resource cleanup preserves the first live drain when completion adopts its same owner",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* captured;
+        yield* f.journal.persistDrain(f.input, f.allocation, f.receipt.drain!);
+        yield* f.journal.persistReceipt(f.input, f.receipt);
+        expect((yield* f.journal.read(f.input))?.receipt).toEqual(f.receipt);
+        expect(yield* f.sql`SELECT drain_json FROM project_task_resource_child`).toEqual([
+          { drain_json: canonicalProjectWorkPayload(f.receipt.drain) },
+        ]);
+      }),
+    ),
+);
+
+it.effect("legacy native cleanup preserves captured setup history without a resource grant", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* allocated;
+      // This is the upgraded pre-044 owned journal; no resource rows are fabricated.
+      yield* f.sql`UPDATE project_team_setup_process SET status='captured',activation='owned',owner_json=${canonicalProjectWorkPayload(f.owner)} WHERE setup_id=${f.input.setupId}`;
+      expect((yield* f.journal.readOwnership(f.input))?.retained.owner).toEqual(f.owner);
+      yield* TestClock.setTime(f.input.deadlineAtMs + 1);
+      expect(
+        (yield* f.journal.validateCurrent(f.input, f.selection, "start").pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* f.journal.claimActivation(f.input, f.selection, f.allocation).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      const cleanup: ProjectManagedSetupReceipt = {
+        ...f.receipt,
+        outcome: "failed",
+        reason: "Historical owner drained without repeating setup",
+        drain: null,
+        reconciliation: {
+          state: "drained",
+          unit: f.owner.unit,
+          invocation: f.owner.invocation,
+          cgroup: f.owner.cgroup,
+          kernel: "removed",
+        },
+        stdout: null,
+        stderr: null,
+      };
+      expect(
+        (yield* f.journal
+          .persistReceipt(f.input, {
+            ...cleanup,
+            reconciliation: { ...cleanup.reconciliation!, invocation: "b".repeat(32) },
+          })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.journal.persistDrain(f.input, f.allocation, f.receipt.drain!);
+      yield* f.journal.persistReceipt(f.input, cleanup);
+      expect((yield* f.journal.readOwnership(f.input))?.retained.receipt).toEqual(cleanup);
+      expect(yield* f.sql`SELECT task_id FROM project_task_resource_budget`).toEqual([]);
+      expect(yield* f.sql`SELECT unit FROM project_task_resource_child`).toEqual([]);
+    }),
+  ),
+);
+
+it.effect(
+  "legacy native cleanup denies missing ownership and a conflicting present resource child",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* allocated;
+        const resources = yield* makeProjectTaskResources("environment");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              resources.setup(f.input.setupId, f.allocation).cleanupDrain(f.receipt.drain!),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        yield* f.sql`UPDATE project_team_setup_process SET status='captured',activation='owned',owner_json=${canonicalProjectWorkPayload(f.owner)} WHERE setup_id=${f.input.setupId}`;
+        const foreign = yield* makeProjectTaskResources("foreign-environment");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              foreign.setup(f.input.setupId, f.allocation).cleanupDrain(f.receipt.drain!),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(resources.setup(f.input.setupId, f.allocation).capture(f.owner))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        // A present child in another task cannot be mistaken for legacy absence.
+        yield* f.sql`INSERT INTO project_task_resource_budget VALUES('environment',${projectId},'foreign-task',${f.taskDeadline},2147483648)`;
+        yield* f.sql`INSERT INTO project_task_resource_child(unit,nonce,environment_id,project_id,task_id,authority_kind,authority_id,allocation_json,memory_bytes,deadline_at_ms)
+        VALUES(${f.allocation.unit},${f.allocation.nonce},'environment',${projectId},'foreign-task','setup','foreign-setup',${canonicalProjectWorkPayload(f.allocation)},${f.owner.memoryBytes},${f.input.deadlineAtMs})`;
+        const cleanup = { ...f.receipt, outcome: "failed" as const, reason: "Historical cleanup" };
+        expect((yield* f.journal.persistReceipt(f.input, cleanup).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect((yield* f.journal.read(f.input))?.receipt).toBe(null);
+        expect(
+          yield* f.sql`SELECT task_id,owner_json,drain_json FROM project_task_resource_child`,
+        ).toEqual([{ task_id: "foreign-task", owner_json: null, drain_json: null }]);
+      }),
+    ),
+);

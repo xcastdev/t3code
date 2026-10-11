@@ -559,10 +559,12 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
             if (old.retained.uncertain)
               return yield* failure("Successful setup requires certain retained ownership");
           }
-          if (receipt.allocation && receipt.owner && (receipt.drain || receipt.reconciliation))
-            yield* taskResources
-              .setup(input.setupId, receipt.allocation)
-              .drain(receipt.drain ?? receipt.reconciliation!);
+          if (receipt.allocation && receipt.owner && (receipt.drain || receipt.reconciliation)) {
+            const resources = taskResources.setup(input.setupId, receipt.allocation);
+            // Older uncertainty records rescued the physical owner only into the setup journal.
+            // The complete matched receipt above permits cleanup adoption, never another START.
+            yield* resources.cleanupDrain(receipt.drain ?? receipt.reconciliation!);
+          }
           const status = receiptStatus(receipt);
           yield* sql`UPDATE project_team_setup_process SET receipt_json=${receiptJson},drain_json=${drainJson},status=${status}
         WHERE setup_id=${input.setupId} AND receipt_json IS NULL`;
@@ -623,6 +625,8 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
           yield* sql`UPDATE project_team_setup_process SET status='uncertain',uncertainty_json=${knowledge},
         owner_json=${ownerJson},activation=${captureMissingOwner ? "owned" : old.row.activation}
         WHERE setup_id=${input.setupId} AND uncertainty_json IS NULL`;
+          if (captureMissingOwner && actual.allocation && captured)
+            yield* taskResources.setup(input.setupId, actual.allocation).captureCleanup(captured);
         }),
       );
     });
@@ -647,7 +651,14 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
         drain: import("../provider/pi/PiManagedProcess.ts").PiManagedDrain,
       ) =>
         sql
-          .withTransaction(taskResources.setup(input.setupId, allocation).drain(drain))
+          .withTransaction(
+            Effect.gen(function* () {
+              const retained = yield* read(input);
+              if (!retained || !same(retained.retained.allocation, allocation))
+                return yield* failure("Setup cleanup has no original allocation");
+              yield* taskResources.setup(input.setupId, allocation).cleanupDrain(drain);
+            }),
+          )
           .pipe(
             Effect.mapError(
               (cause) => new PiManagedProcessError({ phase: "quarantine", message: String(cause) }),

@@ -2786,3 +2786,74 @@ it.effect("task resources deny worker activation after its current task authorit
     }),
   ),
 );
+
+it.effect(
+  "legacy native cleanup settles exact captured Pi ownership without a resource grant",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const sql = yield* SqlClient.SqlClient;
+        const op = yield* f.prepare();
+        const owner = {
+          type: "owner" as const,
+          unit: op.allocation.unit,
+          nonce: op.allocation.nonce,
+          invocation: "a".repeat(32),
+          cgroup: `/sys/fs/cgroup/${op.allocation.unit}`,
+          pid: 123,
+          memoryBytes: op.allocation.policy.memoryBytes,
+          swapBytes: 0,
+          oomGroup: 1,
+        };
+        const drain = {
+          unit: owner.unit,
+          invocation: owner.invocation,
+          cgroup: owner.cgroup,
+          ownerPid: owner.pid,
+          memoryBytes: owner.memoryBytes,
+          swapBytes: 0,
+          oomGroup: 1,
+          launcherPid: 124,
+          childPid: 125,
+          childExitCode: 1,
+          kernel: "removed",
+        };
+        yield* sql`UPDATE project_team_pi_process SET status='captured',owner_json=${canonicalProjectWorkPayload(owner)} WHERE operation_id=${op.operation.operationId}`;
+        yield* sql`UPDATE project_team_pi_operation SET status='running' WHERE operation_id=${op.operation.operationId}`;
+        const persistence = f.operations.persistence(op);
+        if (!persistence.afterDrain) return yield* Effect.die("Missing Pi cleanup callback");
+        yield* TestClock.setTime(op.deadlineAtMs + 1);
+        yield* rejected(persistence.beforeStart(owner));
+        yield* rejected(persistence.claimActivation(op.allocation));
+        yield* rejected(persistence.afterDrain({ ...drain, invocation: "b".repeat(32) }));
+        yield* persistence.afterDrain(drain);
+        const resources = yield* makeProjectTaskResources("environment");
+        yield* sql.withTransaction(
+          resources
+            .pi(op.operation.operationId, op.allocation)
+            .cleanupDrain({
+              state: "drained",
+              unit: owner.unit,
+              invocation: owner.invocation,
+              cgroup: owner.cgroup,
+              kernel: "removed",
+            }),
+        );
+        yield* f.operations.persistTerminal(op, {
+          identity: { workerId: op.workerId, generation: op.authority.binding.generation },
+          operation: op.operation,
+          outcome: "failed",
+          ownerCaptured: true,
+          native: null,
+          accountingReceipts: [],
+          drain,
+        });
+        expect(yield* sql`SELECT status,drain_json FROM project_team_pi_process`).toEqual([
+          { status: "drained", drain_json: canonicalProjectWorkPayload(drain) },
+        ]);
+        expect(yield* sql`SELECT task_id FROM project_task_resource_budget`).toEqual([]);
+        expect(yield* sql`SELECT unit FROM project_task_resource_child`).toEqual([]);
+      }),
+    ),
+);

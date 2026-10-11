@@ -1,4 +1,10 @@
-import { canonicalProjectWorkPayload, ProjectTeamRunBinding } from "@t3tools/contracts";
+import {
+  canonicalProjectWorkPayload,
+  ProjectTeamRunBinding,
+  ProjectVerificationJobManifest,
+  ProjectTeamGate,
+} from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -74,6 +80,37 @@ const decodeOwner = Schema.decodeUnknownEffect(
     }),
   ),
   { onExcessProperty: "error" },
+);
+const decodeCleanupVerificationIntent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      allocation: PiManagedProcessAllocationSchema,
+      deadlineAtMs: Positive,
+      receipt: Schema.Struct({
+        manifest: ProjectVerificationJobManifest,
+        sha256: Schema.String,
+      }),
+      gate: ProjectTeamGate,
+    }),
+  ),
+);
+const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+const hash = (value: unknown) =>
+  NodeCrypto.createHash("sha256").update(encode(value)).digest("hex");
+const decodeCleanupPiIntent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      ...Intent.fields,
+      request: Schema.Unknown,
+    }),
+  ),
+);
+const decodeCleanupPiRequest = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    kind: Schema.String,
+    threadId: Schema.String,
+    operationId: Schema.optionalKey(Schema.String),
+  }),
 );
 const deny = (message: string) => new PiManagedProcessError({ phase: "quarantine", message });
 const isProcessError = Schema.is(PiManagedProcessError);
@@ -365,6 +402,166 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
         if (row.drain_json === null)
           yield* sql`UPDATE project_task_resource_child SET drain_json=${encode(receipt)} WHERE unit=${row.unit}`;
       });
+    const cleanupOwner = Effect.gen(function* () {
+      yield* transaction;
+      let original: string | null | undefined;
+      if (kind === "verification") {
+        // Legacy verification has no aggregate budget. Cleanup audits its original journal directly.
+        const rows = yield* sql<{
+          project_id: string;
+          task_id: string;
+          job_id: string;
+          deadline_at_ms: number;
+          intent: string | null;
+          intent_hash: string;
+          allocation_hash: string;
+          manifest_hash: string;
+          gate_id: string;
+          gate_revision: number;
+          owner: string | null;
+        }>`SELECT project_id,task_id,job_id,deadline_at_ms,intent_hash,allocation_hash,manifest_hash,gate_id,gate_revision,
+          CASE WHEN length(CAST(intent_json AS BLOB))<=262144 THEN intent_json END AS intent,
+          CASE WHEN length(CAST(owner_json AS BLOB))<=16384 THEN owner_json END AS owner
+          FROM project_work_verification_execution WHERE environment_id=${environmentId} AND attempt_id=${id} LIMIT 2`;
+        const row = rows[0];
+        if (rows.length !== 1 || !row?.intent)
+          return yield* deny("Original verification cleanup authority unavailable");
+        const intent = yield* decodeCleanupVerificationIntent(row.intent);
+        const manifest = intent.receipt.manifest;
+        const raw = yield* decodeJson(row.intent);
+        if (
+          manifest.environmentId !== environmentId ||
+          manifest.projectId !== row.project_id ||
+          manifest.taskId !== row.task_id ||
+          manifest.jobId !== row.job_id ||
+          intent.deadlineAtMs !== row.deadline_at_ms ||
+          intent.receipt.sha256 !== row.manifest_hash ||
+          hash(manifest) !== row.manifest_hash ||
+          intent.gate.recordId !== row.gate_id ||
+          intent.gate.revision !== row.gate_revision ||
+          hash(raw) !== row.intent_hash ||
+          hash(allocation) !== row.allocation_hash ||
+          encode(intent.allocation) !== encode(allocation)
+        )
+          return yield* deny("Original verification cleanup allocation changed");
+        original = row.owner;
+      } else {
+        yield* identity;
+        if (kind === "pi") {
+          const rows = yield* sql<{
+            provider_instance_id: string;
+            thread_id: string;
+            operation_kind: string;
+            root_task_id: string;
+            maximum_tokens: number;
+            request_hash: string;
+            intent: string | null;
+          }>`SELECT provider_instance_id,thread_id,operation_kind,root_task_id,maximum_tokens,request_hash,
+            CASE WHEN length(CAST(intent_json AS BLOB))<=1048576 THEN intent_json END AS intent
+            FROM project_team_pi_operation WHERE environment_id=${environmentId} AND operation_id=${id} LIMIT 2`;
+          const row = rows[0];
+          if (rows.length !== 1 || !row?.intent)
+            return yield* deny("Original Pi cleanup authority unavailable");
+          const intent = yield* decodeCleanupPiIntent(row.intent);
+          const request = yield* decodeCleanupPiRequest(intent.request);
+          if (
+            row.provider_instance_id !== intent.binding.providerInstanceId ||
+            row.thread_id !== intent.binding.threadId ||
+            request.threadId !== row.thread_id ||
+            request.kind !== row.operation_kind ||
+            row.root_task_id !== intent.rootBudget.rootTaskId ||
+            row.maximum_tokens !== intent.operationLimits.maximumTokens ||
+            (request.operationId !== undefined &&
+              (request.operationId !== id || hash(intent.request) !== row.request_hash))
+          )
+            return yield* deny("Original Pi cleanup request or limits changed");
+        }
+        const rows =
+          kind === "pi"
+            ? yield* sql<{ owner: string | null; allocation: string | null }>`SELECT
+              CASE WHEN length(CAST(p.owner_json AS BLOB))<=16384 THEN p.owner_json END AS owner,
+              CASE WHEN length(CAST(p.allocation_json AS BLOB))<=262144 THEN p.allocation_json END AS allocation
+              FROM project_team_pi_process p JOIN project_team_pi_operation o ON o.operation_id=p.operation_id
+              WHERE o.environment_id=${environmentId} AND o.operation_id=${id} AND p.unit=${allocation.unit} LIMIT 2`
+            : yield* sql<{ owner: string | null; allocation: string | null }>`SELECT
+              CASE WHEN length(CAST(s.owner_json AS BLOB))<=16384 THEN s.owner_json END AS owner,
+              CASE WHEN length(CAST(s.allocation_json AS BLOB))<=262144 THEN s.allocation_json END AS allocation
+              FROM project_team_setup_process s JOIN project_team_dispatch d ON d.dispatch_id=s.dispatch_id
+              WHERE d.environment_id=${environmentId} AND s.setup_id=${id} AND s.unit=${allocation.unit} AND s.activation='owned' LIMIT 2`;
+        if (
+          rows.length !== 1 ||
+          !rows[0]?.allocation ||
+          encode(yield* decodeAllocation(rows[0].allocation)) !== encode(allocation)
+        )
+          return yield* deny("Original native cleanup allocation unavailable");
+        original = rows[0].owner;
+      }
+      if (!original) return yield* deny("Original captured cleanup owner unavailable");
+      const owner = yield* decodeOwner(original);
+      if (
+        owner.unit !== allocation.unit ||
+        owner.nonce !== allocation.nonce ||
+        owner.memoryBytes !== allocation.policy.memoryBytes ||
+        !/^[a-f0-9]{32}$/u.test(owner.invocation) ||
+        !owner.cgroup.startsWith("/sys/fs/cgroup/") ||
+        !owner.cgroup.endsWith("/" + owner.unit) ||
+        owner.cgroup.split("/").some((part) => part === "." || part === "..")
+      )
+        return yield* deny("Original captured cleanup owner changed");
+      return owner;
+    });
+    const cleanupChild = Effect.gen(function* () {
+      const rows =
+        yield* sql`SELECT unit FROM project_task_resource_child WHERE unit=${allocation.unit} OR nonce=${allocation.nonce} LIMIT 2`;
+      if (rows.length === 0) return undefined;
+      if (rows.length !== 1) return yield* deny("Native cleanup resource identity is ambiguous");
+      return yield* retained;
+    });
+    const captureCleanup = (owner: PiManagedProcessOwner) =>
+      Effect.gen(function* () {
+        const original = yield* cleanupOwner;
+        if (encode(owner) !== encode(original))
+          return yield* deny("Cleanup capture differs from original retained owner");
+        const child = yield* cleanupChild;
+        // An authenticated historical owner can be cleaned without inventing aggregate authority.
+        if (!child) return;
+        if (child.row.owner_json === encode(original)) return;
+        if (kind !== "setup" || child.row.owner_json !== null)
+          return yield* deny("Native cleanup cannot replace resource ownership");
+        yield* capture(original);
+      });
+    const cleanupDrain = (receipt: PiManagedDrain | PiManagedProcessReconciliation) =>
+      Effect.gen(function* () {
+        const owner = yield* cleanupOwner;
+        const populated = receipt.kernel
+          .split("\n")
+          .filter((line) => /^populated(?:\s|$)/u.test(line));
+        if (
+          receipt.unit !== owner.unit ||
+          receipt.invocation !== owner.invocation ||
+          receipt.cgroup !== owner.cgroup ||
+          (receipt.kernel !== "removed" &&
+            (receipt.kernel.length > 4096 ||
+              populated.length !== 1 ||
+              populated[0] !== "populated 0")) ||
+          ("state" in receipt
+            ? receipt.state !== "drained"
+            : receipt.ownerPid !== owner.pid ||
+              receipt.memoryBytes !== owner.memoryBytes ||
+              receipt.swapBytes !== 0 ||
+              receipt.oomGroup !== 1 ||
+              !Number.isSafeInteger(receipt.launcherPid) ||
+              receipt.launcherPid < 1 ||
+              (receipt.childPid !== null &&
+                (!Number.isSafeInteger(receipt.childPid) || receipt.childPid < 1)) ||
+              (receipt.childExitCode !== null && !Number.isSafeInteger(receipt.childExitCode)))
+        )
+          return yield* deny("Native cleanup requires original matched captured kernel drain");
+        const child = yield* cleanupChild;
+        if (!child) return;
+        yield* captureCleanup(owner);
+        yield* drain(receipt);
+      });
     const guard = <A, E>(work: Effect.Effect<A, E>) =>
       work.pipe(
         Effect.mapError((error) =>
@@ -375,6 +572,9 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
       reserve: guard(reserve),
       capture: (owner: PiManagedProcessOwner) => guard(capture(owner)),
       drain: (receipt: PiManagedDrain | PiManagedProcessReconciliation) => guard(drain(receipt)),
+      captureCleanup: (owner: PiManagedProcessOwner) => guard(captureCleanup(owner)),
+      cleanupDrain: (receipt: PiManagedDrain | PiManagedProcessReconciliation) =>
+        guard(cleanupDrain(receipt)),
     };
   };
   return {
