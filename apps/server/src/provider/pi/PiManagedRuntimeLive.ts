@@ -1524,7 +1524,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     "Required context differs from current assignment",
                     "conflict",
                   );
-                const requiredText = context + "\n\n" + required.text;
+                const requiredText = required.text;
                 const promptBytes =
                   request.kind === "prompt" ? Buffer.byteLength(request.prompt) : 0;
                 if (

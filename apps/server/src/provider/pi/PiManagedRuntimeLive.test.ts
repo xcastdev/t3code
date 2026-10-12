@@ -7651,16 +7651,14 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
                 selection: selected,
                 receipt: prepared,
                 assertCurrent: (current, duplicate) =>
-                  gates
-                    .assertCurrent(current, prepared, selected, duplicate)
-                    .pipe(
-                      Effect.mapError(
-                        () =>
-                          new ProjectWorkVerificationGateError({
-                            reason: "Native original approval target audit failed",
-                          }),
-                      ),
+                  gates.assertCurrent(current, prepared, selected, duplicate).pipe(
+                    Effect.mapError(
+                      () =>
+                        new ProjectWorkVerificationGateError({
+                          reason: "Native original approval target audit failed",
+                        }),
                     ),
+                  ),
               });
             const human = {
               actor: principal.actor,
@@ -12575,7 +12573,6 @@ for (const readonlyKind of [undefined, "review"] as const)
                       briefing =
                         input.transferTexts.find((entry) => entry.transferId === "context")?.text ??
                         "";
-                      expect(briefing).toContain(required.text);
                       const native = {
                         sessionId: "required-review-session",
                         sessionReference: "sessions/required-review.jsonl",
@@ -12665,6 +12662,7 @@ for (const readonlyKind of [undefined, "review"] as const)
           const prepared = yield* f.instance.prepareOperation(request, () => Effect.void);
           const initialized = yield* prepared.run;
           expect(initialized.terminal.outcome).toBe("success");
+          expect(briefing).toBe(required.text);
           const freshness = yield* f.sql<{
             manifest_json: string;
             native_jsonl: string;
