@@ -57,6 +57,8 @@ import {
   makeProjectTeamPreparationRuntime,
   ProjectTeamPreparationRuntimeError,
 } from "./ProjectTeamPreparationRuntime.ts";
+import { makeProjectTeamExecutionHost } from "./ProjectTeamExecutionHost.ts";
+import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import { OrchestrationEngineLive } from "../orchestration/Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/ProjectionPipeline.ts";
@@ -720,3 +722,45 @@ afterAll(() => {
   const remaining = capturedPids.filter((pid) => nativeFs.existsSync(`/proc/${pid}`));
   expect(remaining).toEqual([]);
 });
+
+it.effect(
+  "the actual host reaches provider initialization after original durable setup stages",
+  () =>
+    withServices(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          let initializations = 0;
+          const host = yield* makeProjectTeamExecutionHost({
+            ...f.options,
+            assertEnabled: Effect.void,
+          }).pipe(
+            Effect.provideService(ProjectTeamPiRuntime, f.pi),
+            Effect.provide(
+              Layer.mock(ProviderService)({
+                startSession: () =>
+                  Effect.gen(function* () {
+                    const original = yield* f.dispatch.readRetained(f.request.dispatchId);
+                    expect(original.fence.stage).toBe("setup-complete");
+                    expect(
+                      (yield* f.dispatch.readStageReceipts(f.request.dispatchId)).map(
+                        (x) => x.stage,
+                      ),
+                    ).toEqual(["workspace-ready", "setup-complete"]);
+                    initializations++;
+                    return yield* Effect.die("Controlled stop before any Pi/model operation");
+                  }).pipe(Effect.orDie),
+              }),
+            ),
+          );
+          const recovered = yield* host.recover();
+          expect(recovered.items).toHaveLength(1);
+          expect(initializations).toBe(1);
+          expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual([]);
+          expect(yield* f.sql`SELECT * FROM project_team_pi_process`).toEqual([]);
+          expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+          yield* host.stop;
+        }),
+      ),
+    ),
+);

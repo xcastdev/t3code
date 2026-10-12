@@ -845,8 +845,9 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
               stage,
               evidence: yield* asJson(evidence),
             });
-            owner.snapshot = next;
-            return next;
+            const current = { fence: next.fence, intent: next.intent };
+            owner.snapshot = current;
+            return current;
           }),
         ),
       withWorkspace: (_owner, snapshot, use) =>
