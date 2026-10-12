@@ -349,6 +349,39 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             ? { issueRecordId: issue.recordId, expectedIssueRevision: issue.revision }
             : {}),
         };
+      case "project-team.assignment.start":
+        return plan &&
+          plan.specRevision === task.specRevision &&
+          specGate?.status === "approved" &&
+          planGate?.status === "approved" &&
+          specGate.attribution.actor.kind === "human" &&
+          planGate.attribution.actor.kind === "human" &&
+          !terminal &&
+          !stopped &&
+          !repair
+          ? {
+              ...base,
+              type: kind,
+              assignmentKind: "review",
+              objective:
+                fields.objective ??
+                "Independently review the approved work and its verification evidence.",
+              outputDescriptions: (fields.outputs ?? "Independent review findings")
+                .split("\n")
+                .map((line) => line.trim())
+                .filter(Boolean),
+              specRevision: task.specRevision,
+              specificationGateId: specGate.recordId,
+              expectedSpecificationGateRevision: specGate.revision,
+              parentPlan: {
+                recordId: plan.recordId,
+                expectedRecordRevision: plan.revision,
+                planRevision: plan.planRevision,
+                gateId: planGate.recordId,
+                expectedGateRevision: planGate.revision,
+              },
+            }
+          : null;
       case "project-team.specification.propose": {
         const retained =
           source?.type === kind
@@ -995,6 +1028,41 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               Start investigation
             </Button>
             {status("project-team.investigation.start")}
+          </div>
+        </details>
+        <details className="mt-3">
+          <summary className="cursor-pointer text-sm font-medium">Independent review</summary>
+          <div className="mt-3 space-y-3">
+            {field(
+              "project-team.assignment.start",
+              "objective",
+              "Review objective",
+              "Independently review the approved work and its verification evidence.",
+              32000,
+            )}
+            {field(
+              "project-team.assignment.start",
+              "outputs",
+              "Expected review findings (one per line)",
+              "Independent review findings",
+              64000,
+            )}
+            <p className="text-xs text-muted-foreground">
+              Creates a linked reviewer task within the current approved specification and plan.
+              Uses the task's remaining budget and original deadline.
+            </p>
+            <Button
+              size="sm"
+              disabled={
+                !canWrite ||
+                !build("project-team.assignment.start") ||
+                blockedDraft("project-team.assignment.start")
+              }
+              onClick={() => submit("project-team.assignment.start")}
+            >
+              Start independent review
+            </Button>
+            {status("project-team.assignment.start")}
           </div>
         </details>
       </WorkCard>

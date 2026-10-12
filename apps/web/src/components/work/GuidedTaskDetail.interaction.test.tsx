@@ -328,6 +328,66 @@ describe("GuidedTaskDetail human interactions", () => {
     await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
   }
 
+  it("starts a linked independent review against the exact approved specification and plan", async () => {
+    foundation = records(current, "approved");
+    await render();
+    await fill(
+      "Review objective",
+      "Check the implemented reconnect and retained verification evidence",
+    );
+    await fill("Expected review findings (one per line)", "Review findings\nCriterion assessments");
+    await click("Start independent review");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.assignment.start",
+      assignmentKind: "review",
+      projectId,
+      taskId: current.task.taskId,
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      objective: "Check the implemented reconnect and retained verification evidence",
+      outputDescriptions: ["Review findings", "Criterion assessments"],
+      specRevision: 2,
+      specificationGateId: "spec-gate",
+      expectedSpecificationGateRevision: 1,
+      parentPlan: {
+        recordId: "plan",
+        expectedRecordRevision: 1,
+        planRevision: 3,
+        gateId: "plan-gate",
+        expectedGateRevision: 1,
+      },
+    });
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("retains a review draft and refuses its changed plan target until explicitly reviewed", async () => {
+    foundation = records(current, "approved");
+    await render();
+    await fill("Review objective", "Check the original approved plan");
+    current = context(11);
+    foundation = records(current, "approved").map((record) =>
+      record.recordId === "plan" ? decodeRecord({ ...record, revision: 2 }) : record,
+    );
+    await render();
+    expect(button("Start independent review").disabled).toBe(true);
+    await act(async () => callbacks.get("Start independent review")?.());
+    expect(emitted).toEqual([]);
+    expect(
+      host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Review objective"]')?.value,
+    ).toBe("Check the original approved plan");
+  });
+
+  it("refuses review creation while the parent plan is unapproved, including a retained callback", async () => {
+    foundation = records(current, "approved").map((record) =>
+      record.recordId === "plan-gate" ? decodeRecord({ ...record, status: "pending" }) : record,
+    );
+    await render();
+    expect(button("Start independent review").disabled).toBe(true);
+    await act(async () => callbacks.get("Start independent review")?.());
+    expect(emitted).toEqual([]);
+  });
+
   it("waives the selected criterion through the mounted guided task with exact definition revisions", async () => {
     await render();
     await fill("Waiver reason", "Accept the documented reconnect exception");
