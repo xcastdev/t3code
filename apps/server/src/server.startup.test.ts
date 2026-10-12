@@ -76,6 +76,8 @@ it.skipIf(process.env.T3_SERVER_STARTUP_GATE !== "1")(
       expect(url.port).toBe(String(port));
       expect(url.pathname).toBe("/pair");
       expect(url.hash.startsWith("#token=")).toBe(true);
+      const worktrees = await NodeFSP.stat(NodePath.join(home, "worktrees"));
+      expect(worktrees.mode & 0o777).toBe(0o700);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGINT");
       await done;

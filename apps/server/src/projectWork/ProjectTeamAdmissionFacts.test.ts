@@ -693,6 +693,7 @@ for (const role of ["investigator", "planner", "reviewer", "implementer"] as con
         expect(result.facts.git.worktreePath.startsWith(f.managedWorktreesRoot + "/")).toBe(true);
         expect(result.facts.git.worktreePath).not.toBe(f.primary);
         expect(result.facts.git.branchRef.startsWith("refs/heads/t3-managed/")).toBe(true);
+        expect(yield* git(f.primary, ["check-ref-format", result.facts.git.branchRef])).toBe("");
         expect(result.facts.git.writable).toBe(role === "implementer");
         expect(nativeFs.existsSync(result.facts.git.worktreePath)).toBe(false);
         expect(

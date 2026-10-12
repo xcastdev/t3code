@@ -780,7 +780,7 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                   `workspace:${selected.generation}`,
                 );
                 const worktreePath = path.join(managedRoot, namespace, assignment);
-                const branchRef = `refs/heads/t3-managed/${namespace}/${assignment}`;
+                const branchRef = `refs/heads/t3-managed/${encodeURIComponent(namespace)}/${encodeURIComponent(assignment)}`;
                 const candidate = yield* Effect.try({
                   try: () => physical(worktreePath, true),
                   catch: () => denied("Assigned worktree path is aliased or unavailable"),

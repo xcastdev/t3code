@@ -169,7 +169,7 @@ export const ensureServerDirectories = Effect.fn(function* (derivedPaths: Server
       fs.makeDirectory(derivedPaths.managedSkillsDir, { recursive: true }),
       fs.makeDirectory(derivedPaths.skillHistoryDir, { recursive: true }),
       fs.makeDirectory(derivedPaths.skillRuntimeDir, { recursive: true }),
-      fs.makeDirectory(derivedPaths.worktreesDir, { recursive: true }),
+      fs.makeDirectory(derivedPaths.worktreesDir, { recursive: true, mode: 0o700 }),
       fs.makeDirectory(path.dirname(derivedPaths.keybindingsConfigPath), { recursive: true }),
       fs.makeDirectory(path.dirname(derivedPaths.settingsPath), { recursive: true }),
       fs.makeDirectory(derivedPaths.providerStatusCacheDir, { recursive: true }),
