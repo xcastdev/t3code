@@ -331,6 +331,7 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
   };
   const snapshot = (worktree = false, owned = true) => {
     const handles = new Map<string, number>();
+    let pendingParent: string | undefined;
     const files: Array<{
       path: string;
       dev: string;
@@ -415,7 +416,17 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
         a.commonGitDirectory,
         fs.fstatSync(directory(a.commonGitDirectory), { bigint: true }),
       );
-      directory(path.dirname(a.worktreePath));
+      const parent = path.dirname(a.worktreePath);
+      if (!fs.lstatSync(parent, { throwIfNoEntry: false })) {
+        const root = path.dirname(parent);
+        const fd = directory(root);
+        const stat = fs.fstatSync(fd, { bigint: true });
+        if (stat.uid !== BigInt(process.getuid?.() ?? -1) || (stat.mode & 0o777n) !== 0o700n)
+          return fail();
+        pendingParent = parent;
+      } else {
+        directory(parent);
+      }
       const primaryEntry = path.join(a.primaryRoot, ".git");
       if (fs.lstatSync(primaryEntry).isDirectory()) {
         if (primaryEntry !== a.commonGitDirectory) return fail();
@@ -550,6 +561,7 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
         };
       }
       const verify = () => {
+        if (pendingParent && fs.lstatSync(pendingParent, { throwIfNoEntry: false })) fail();
         const packed = fs.lstatSync(packedRefs, { throwIfNoEntry: false });
         if (packed && (!packed.isFile() || packed.nlink !== 1)) fail();
         if (fs.lstatSync(pack, { throwIfNoEntry: false })) {
@@ -597,7 +609,31 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
           }
         }
       };
-      return { primary, common, config, workspace, ownershipEntry, verify, close };
+      const prepareParent = () => {
+        verify();
+        if (!pendingParent) return;
+        const parent = pendingParent;
+        const root = path.dirname(parent);
+        const fd = directory(root);
+        const stat = fs.fstatSync(fd, { bigint: true });
+        if (stat.uid !== BigInt(process.getuid?.() ?? -1) || (stat.mode & 0o777n) !== 0o700n)
+          return fail();
+        fs.mkdirSync(`/proc/self/fd/${fd}/${path.basename(parent)}`, { mode: 0o700 });
+        pendingParent = undefined;
+        directory(parent);
+        verify();
+      };
+      return {
+        primary,
+        common,
+        config,
+        workspace,
+        ownershipEntry,
+        needsParent: pendingParent !== undefined,
+        prepareParent,
+        verify,
+        close,
+      };
     } catch (cause) {
       close();
       throw cause;
@@ -738,6 +774,14 @@ export const make = Effect.fn("ManagedGitExecution.make")(function* (options: {
     return yield* Effect.scoped(
       Effect.gen(function* () {
         const state = yield* validate(input);
+        if (state.needsParent) {
+          yield* options.revalidate;
+          yield* Effect.try({
+            try: state.prepareParent,
+            catch: (cause) =>
+              error(a.primaryRoot, "Cannot prepare private managed namespace.", cause),
+          });
+        }
         const base = yield* command(["rev-parse", "--verify", `${a.baseRef}^{commit}`], state);
         if (base.code !== 0 || base.stdout.trim() !== a.baseOid)
           return yield* deny("Approved local base ref moved or is unavailable.");

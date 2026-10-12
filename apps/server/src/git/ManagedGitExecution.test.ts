@@ -1725,3 +1725,73 @@ it.effect("managed integration rejects a source commit that is not in the tested
     }),
   ).pipe(Effect.provide(NodeServices.layer), Effect.provideService(HostProcessPlatform, "linux")),
 );
+
+it.effect("prepares a missing private namespace before managed worktree creation", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture();
+    const namespace = f.path.join(f.root, "new-project-namespace");
+    const assignment = {
+      ...f.assignment,
+      worktreePath: f.path.join(namespace, "assigned-1"),
+    };
+    expect(nativeFs.existsSync(namespace)).toBe(false);
+    const git = yield* Git.GitVcsDriver;
+    const context = yield* Managed.make({
+      assignment,
+      revalidate: Effect.void,
+      persistWorkspace: () => Effect.void,
+    });
+    const workflow = yield* Effect.service(Workflow.GitWorkflowService).pipe(
+      Effect.provide(workflowLayer(git, () => Effect.die("Managed path used ordinary discovery"))),
+    );
+    yield* Managed.prepareManagedGitExecution(context, f.input(assignment));
+    expect(nativeFs.existsSync(namespace)).toBe(false);
+    yield* workflow.createWorktree(f.input(assignment), { managed: context });
+    expect(yield* nativeGit(assignment.worktreePath, ["rev-parse", "HEAD"])).toBe(f.oid);
+    expect(yield* nativeGit(assignment.worktreePath, ["symbolic-ref", "HEAD"])).toBe(
+      assignment.branchRef,
+    );
+    expect(nativeFs.statSync(namespace).mode & 0o777).toBe(0o700);
+  }).pipe(Effect.scoped, Effect.provide(real)),
+);
+
+for (const change of ["revoked", "aliased", "insecure root"] as const) {
+  it.effect(`denies missing namespace preparation when ${change}`, () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const namespace = f.path.join(f.root, "new-project-namespace");
+      const assignment = { ...f.assignment, worktreePath: f.path.join(namespace, "assigned-1") };
+      let revoked = false;
+      const context = yield* Managed.make({
+        assignment,
+        revalidate: Effect.suspend(() =>
+          revoked ? Effect.fail(unavailable(f.primary)) : Effect.void,
+        ),
+        persistWorkspace: () => Effect.void,
+      });
+      yield* Managed.prepareManagedGitExecution(context, f.input(assignment));
+      expect(nativeFs.existsSync(namespace)).toBe(false);
+      const foreign = f.path.join(f.root, "foreign");
+      if (change === "revoked") revoked = true;
+      if (change === "aliased") {
+        yield* f.fs.makeDirectory(foreign);
+        yield* f.fs.symlink(foreign, namespace);
+      }
+      if (change === "insecure root") yield* f.fs.chmod(f.root, 0o755);
+      const git = yield* Git.GitVcsDriver;
+      const workflow = yield* Effect.service(Workflow.GitWorkflowService).pipe(
+        Effect.provide(
+          workflowLayer(git, () => Effect.die("Managed path used ordinary discovery")),
+        ),
+      );
+      const result = yield* workflow
+        .createWorktree(f.input(assignment), { managed: context })
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(nativeFs.existsSync(assignment.worktreePath)).toBe(false);
+      expect(yield* nativeGit(f.primary, ["branch", "--list", "assigned-1"])).toBe("");
+      if (change === "aliased") expect(nativeFs.readdirSync(foreign)).toEqual([]);
+      else expect(nativeFs.existsSync(namespace)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(real)),
+  );
+}
