@@ -963,7 +963,7 @@ const PiProductionRuntimeLayerLive = Layer.effect(
         protectedRoots: [config.stateDir, config.secretsDir],
         memoryBytes: 536870912,
         cleanupDeadlineMs: 3000,
-        maxInputTokens: 8192,
+        maxInputTokens: 16384,
         maxOutputTokens: 2048,
       },
       teamRuntime,

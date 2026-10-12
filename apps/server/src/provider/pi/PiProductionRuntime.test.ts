@@ -3,6 +3,8 @@ import {
   ManagedSkillKey,
   ManagedSkillManifest,
   SkillContentHash,
+  ProjectWorkFoundationCommitCommand,
+  type ProjectWorkCommand,
 } from "@t3tools/contracts";
 import { hashSkillPackage, writeSkillPackageContents } from "../../skills/SkillPackage.ts";
 import { preparePiSkillResources } from "./PiSkillResources.ts";
@@ -27,7 +29,11 @@ import { describe, expect, vi, afterEach } from "vite-plus/test";
 import { EnvironmentAuth } from "../../auth/EnvironmentAuth.ts";
 import { makeSqlitePersistenceLive } from "../../persistence/Layers/Sqlite.ts";
 import { layer as authorizationLayer } from "../../projectWork/ProjectTeamAuthorization.ts";
-import { ProjectWorkRepositoryLive } from "../../projectWork/ProjectWorkRepository.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+  readCurrentState,
+} from "../../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkQueryLive } from "../../projectWork/ProjectWorkQuery.ts";
 import { ProjectWorkSearchLive } from "../../projectWork/ProjectWorkSearch.ts";
 import { ProjectWorkNarrativeLive } from "../../projectWork/ProjectWorkNarrative.ts";
@@ -36,12 +42,15 @@ import { ProjectWorkGatewayLive } from "../../projectWork/ProjectWorkGateway.ts"
 import { ProjectWorkProjectionLive } from "../../projectWork/ProjectWorkProjection.ts";
 import {
   providerInstanceId,
+  projectId,
   threadId,
   seed,
   restoreHistoricalBinding,
   at,
 } from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import { ProjectWorkPolicyError } from "../../projectWork/ProjectWorkPolicy.ts";
+import { makeProjectTeamDispatchJournal } from "../../projectWork/ProjectTeamDispatchJournal.ts";
 import { PiModelCatalogue, makePiModelCatalogue } from "./PiModelCatalogue.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import * as Runtime from "./PiManagedRuntimeLive.ts";
@@ -375,6 +384,7 @@ product("publishes immutable limits from captured options and the owned SDK meta
   scoped(
     Effect.gen(function* () {
       const f = yield* fixture;
+      Reflect.set(f.options, "maxInputTokens", 16384);
       const published: PiProductionRuntimeAssets[] = [];
       const service = yield* construct(f, {
         publishAssets: (_id, assets) =>
@@ -391,10 +401,10 @@ product("publishes immutable limits from captured options and the owned SDK meta
       const sdk = yield* decodeSdkVersion(yield* f.fs.readFileString(metadata!.source));
       expect(assets.runtimeFacts).toEqual({
         runtimeVersion: sdk.version,
-        maxInputTokens: 10000,
+        maxInputTokens: 16384,
         maxOutputTokens: 512,
       });
-      expect(f.captured[0]!.maxInputTokens).toBe(10000);
+      expect(f.captured[0]!.maxInputTokens).toBe(16384);
       expect(f.captured[0]!.maxOutputTokens).toBe(512);
       expect(assets.instanceConfiguration).toEqual({ enabled: true, configuration: {} });
       expect(Object.isFrozen(assets.runtimeFacts)).toBe(true);
@@ -1326,71 +1336,178 @@ product(
     ),
 );
 
-product("the approved Runtime consumes factory asset revalidation before durable allocation", () =>
-  scoped(
-    Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe(at)) + 100);
-      const assignment = yield* seed("investigator", "reserved", {
-        nativeSessionId: null,
-        roleTools: [],
-        toolIds: [],
-      });
-      const f = yield* fixture;
-      const primary = f.root + "/primary";
-      const assigned = f.root + "/assigned";
-      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const git = (args: ReadonlyArray<string>) =>
-        Effect.scoped(
-          Effect.gen(function* () {
-            const child = yield* spawner.spawn(ChildProcess.make("/usr/bin/git", args));
-            const [stdout, stderr, code] = yield* Effect.all(
-              [
-                collectUint8StreamText({ stream: child.stdout, maxBytes: 8192 }),
-                collectUint8StreamText({ stream: child.stderr, maxBytes: 8192 }),
-                child.exitCode,
-              ],
-              { concurrency: "unbounded" },
+product(
+  "the approved Runtime consumes factory asset revalidation before durable allocation",
+  () => {
+    const exercise = (tampered: boolean) =>
+      scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe(at)) + 100);
+          const repository = yield* ProjectWorkRepository;
+          let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+          yield* seed("investigator", "reserved", {
+            nativeSessionId: null,
+            roleTools: [],
+            toolIds: [],
+            issueCredential: false,
+          }).pipe(
+            Effect.provideService(ProjectWorkRepository, {
+              ...repository,
+              execute: (command: ProjectWorkCommand) => {
+                if (
+                  command.type === "project-work.foundation.commit" &&
+                  command.transition?.kind === "claim"
+                ) {
+                  pending = command;
+                  return Effect.fail(
+                    new ProjectWorkPolicyError(
+                      "invalid-state",
+                      "Capture the original dispatch claim",
+                    ),
+                  );
+                }
+                return repository.execute(command);
+              },
+            }),
+            Effect.result,
+          );
+          if (pending?.transition?.kind !== "claim")
+            return yield* Effect.die("Missing original factory claim");
+          const assignment = {
+            role: (yield* readCurrentState(
+              yield* SqlClient.SqlClient,
+              projectId,
+            )).foundationRecords!.find((record) => record.kind === "role-revision")!,
+          };
+          if (assignment.role.kind !== "role-revision")
+            return yield* Effect.die("Missing factory role");
+          const f = yield* fixture;
+          const primary = f.root + "/primary";
+          const assigned = f.root + "/assigned";
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const git = (args: ReadonlyArray<string>) =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const child = yield* spawner.spawn(ChildProcess.make("/usr/bin/git", args));
+                const [stdout, stderr, code] = yield* Effect.all(
+                  [
+                    collectUint8StreamText({ stream: child.stdout, maxBytes: 8192 }),
+                    collectUint8StreamText({ stream: child.stderr, maxBytes: 8192 }),
+                    child.exitCode,
+                  ],
+                  { concurrency: "unbounded" },
+                );
+                expect(Number(code)).toBe(0);
+                expect(stdout.truncated || stderr.truncated).toBe(false);
+              }),
             );
-            expect(Number(code)).toBe(0);
-            expect(stdout.truncated || stderr.truncated).toBe(false);
-          }),
-        );
-      yield* git(["init", "-q", primary]);
-      yield* git([
-        "-C",
-        primary,
-        "-c",
-        "user.name=Fixture",
-        "-c",
-        "user.email=fixture@example.test",
-        "commit",
-        "--allow-empty",
-        "-qm",
-        "initial",
-      ]);
-      yield* git(["-C", primary, "worktree", "add", "-qb", "task", assigned]);
-      const model = "inclusionai/ling-3.1-flash:free";
-      const role = { ...assignment.role, instructions: "Inspect the approved assignment", model };
-      yield* restoreHistoricalBinding(role);
-      const crypto = yield* Crypto.Crypto;
-      const instructionsHash = Buffer.from(
-        yield* crypto.digest("SHA-256", new TextEncoder().encode(role.instructions)),
-      ).toString("hex");
-      yield* restoreHistoricalBinding({
-        ...assignment.binding,
-        model,
-        worktree: assigned,
-        configuration: {
-          ...assignment.binding.configuration,
-          instructionsHash,
-          runtimeVersion: "0.99.1",
-          maxDurationMs: 300000,
-          maxTokens: 20000,
-        },
-      });
-      const sql = yield* SqlClient.SqlClient;
-      const source = "https://api.commandcode.ai/provider/v1/models";
-      yield* sql`INSERT INTO project_team_pi_catalogue(source, fetched_at, payload_json)
+          yield* git(["init", "-q", primary]);
+          yield* git([
+            "-C",
+            primary,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+          ]);
+          yield* git(["-C", primary, "worktree", "add", "-qb", "task", assigned]);
+          const model = "inclusionai/ling-3.1-flash:free";
+          const role = {
+            ...assignment.role,
+            instructions: "Inspect the approved assignment",
+            model,
+          };
+          yield* restoreHistoricalBinding(role);
+          const crypto = yield* Crypto.Crypto;
+          const instructionsHash = Buffer.from(
+            yield* crypto.digest("SHA-256", new TextEncoder().encode(role.instructions)),
+          ).toString("hex");
+          const binding = {
+            ...pending.transition.binding,
+            model,
+            worktree: assigned,
+            branch: "refs/heads/task",
+            configuration: {
+              ...pending.transition.binding.configuration,
+              instructionsHash,
+              runtimeVersion: "0.99.1",
+              maxDurationMs: 300000,
+              maxTokens: 20000,
+            },
+          };
+          const sql = yield* SqlClient.SqlClient;
+          const decodeFoundation = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+          yield* repository.execute(
+            yield* decodeFoundation({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: "factory-limits",
+              expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+              attribution: pending.attribution,
+              committedAt: at,
+              records: [
+                {
+                  kind: "limits",
+                  projectId,
+                  recordId: "factory-limits",
+                  revision: 0,
+                  generation: 0,
+                  updatedAt: at,
+                  status: "configured",
+                  environmentModelCalls: 4,
+                  projectWritableWorkers: 2,
+                  modelCalls: 2,
+                  delegationDepth: 2,
+                  repairAllowance: 2,
+                  model,
+                  tokenLimit: 20000,
+                  durationLimitMs: 300000,
+                },
+              ],
+            }),
+          );
+          const journal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 4,
+          });
+          const oidChild = yield* spawner.spawn(
+            ChildProcess.make("/usr/bin/git", ["-C", primary, "rev-parse", "HEAD"]),
+          );
+          const oid = yield* collectUint8StreamText({ stream: oidChild.stdout, maxBytes: 128 });
+          expect(Number(yield* oidChild.exitCode)).toBe(0);
+          const originalDispatch = yield* journal.claimEffect(
+            (yield* journal.reserve({
+              dispatchId: "factory-original",
+              claim: {
+                ...pending,
+                expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+                transition: { ...pending.transition, binding },
+              },
+              git: {
+                effectId: "factory-original",
+                runId: binding.recordId,
+                generation: binding.generation,
+                primaryRoot: primary,
+                commonGitDirectory: primary + "/.git",
+                worktreePath: assigned,
+                branchRef: "refs/heads/task",
+                baseRef: "HEAD",
+                baseOid: oid.text.trim(),
+                ownershipToken: "factory-owner",
+                policyHash: "b".repeat(64),
+              },
+              setupId: "factory-setup",
+              initializeOperationId: "factory-initialize",
+              assignmentOperationId: "factory-assignment",
+              assignment: "Inspect the approved factory assignment",
+            })).fence,
+          );
+          const source = "https://api.commandcode.ai/provider/v1/models";
+          yield* sql`INSERT INTO project_team_pi_catalogue(source, fetched_at, payload_json)
     VALUES(${source}, ${at}, ${encode({
       source,
       fetchedAt: at,
@@ -1401,69 +1518,84 @@ product("the approved Runtime consumes factory asset revalidation before durable
         supported_endpoints: ["/chat/completions"],
       },
     })})`;
-      const catalogue = yield* makePiModelCatalogue.pipe(
-        Effect.provide(FetchHttpClient.layer),
-        Effect.provideService(FetchHttpClient.Fetch, f.fetch),
-      );
-      const service = yield* makePiProductionRuntime({
-        ...f.options,
-        environmentId: "environment",
-      }).pipe(
-        Effect.provideService(PiModelCatalogue, catalogue),
-        Effect.provideService(FetchHttpClient.Fetch, f.fetch),
-      );
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          const managed = yield* service.forInstance(instance);
-          expect(f.revalidationCalls).toBe(0);
-          const request = {
-            kind: "initialize" as const,
-            threadId,
-            cwd: assigned,
-            modelSelection: { instanceId: providerInstanceId, model },
-          };
-          const preparation = managed.prepareOperation(request, () => Effect.void);
-          // The factory must preserve caller values before any asynchronous preparation.
-          request.cwd = primary;
-          request.modelSelection.model = "mutated-after-call";
-          const prepared = yield* preparation;
-          expect(f.revalidationCalls).toBe(1);
-          const before =
-            yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
-          expect(before).toHaveLength(1);
-          expect(before[0]?.status).toBe("allocated");
-          yield* managed.stopAll;
-          const drained =
-            yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
-          expect(drained[0]?.status).toBe("drained");
-          const file = f.captured[0]!.runtimeFiles.find(
-            (entry) => entry.target === "/runtime/dist/pi-worker.mjs",
-          )!;
-          const original = yield* Effect.promise(() => nativeFS.stat(file.source));
-          // Change the captured inode's bytes, then restore its read-only mode. Path-only
-          // preallocation would admit this file; the actual Assets identity read rejects it.
-          yield* Effect.promise(async () => {
-            await nativeFS.chmod(file.source, (original.mode & 0o777) | 0o200);
-            await nativeFS.appendFile(file.source, "\n// changed after asset capture\n");
-            await nativeFS.chmod(file.source, original.mode & 0o777);
-          });
-          const failed = yield* failure(
-            managed.prepareOperation({ kind: "initialize", threadId }, () => Effect.void),
+          const catalogue = yield* makePiModelCatalogue.pipe(
+            Effect.provide(FetchHttpClient.layer),
+            Effect.provideService(FetchHttpClient.Fetch, f.fetch),
           );
-          if (failed._tag === "Failure")
-            expect(failed.failure).toMatchObject({
-              code: "unavailable",
-              detail: "Pi production runtime unavailable",
-            });
-          expect(f.revalidationCalls).toBe(2);
-          expect(
-            yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`,
-          ).toEqual(drained);
-          expect(yield* sql`SELECT operation_id FROM project_team_pi_operation`).toHaveLength(1);
-          expect(f.fetch).not.toHaveBeenCalled();
-          expect(prepared.operation.operationKind).toBe("initialize");
+          const service = yield* makePiProductionRuntime({
+            ...f.options,
+            environmentId: "environment",
+          }).pipe(
+            Effect.provideService(PiModelCatalogue, catalogue),
+            Effect.provideService(FetchHttpClient.Fetch, f.fetch),
+          );
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const managed = yield* service.forInstance(instance);
+              expect(f.revalidationCalls).toBe(0);
+              if (tampered) {
+                const file = f.captured[0]!.runtimeFiles.find(
+                  (entry) => entry.target === "/runtime/dist/pi-worker.mjs",
+                )!;
+                const original = yield* Effect.promise(() => nativeFS.stat(file.source));
+                // Change the captured inode's bytes, then restore its read-only mode. Path-only
+                // preallocation would admit this file; the actual Assets identity read rejects it.
+                yield* Effect.promise(async () => {
+                  await nativeFS.chmod(file.source, (original.mode & 0o777) | 0o200);
+                  await nativeFS.appendFile(file.source, "\n// changed after asset capture\n");
+                  await nativeFS.chmod(file.source, original.mode & 0o777);
+                });
+              }
+              const request = {
+                kind: "initialize" as const,
+                operationId: originalDispatch.intent.request.initializeOperationId,
+                threadId,
+                cwd: assigned,
+                modelSelection: { instanceId: providerInstanceId, model },
+              };
+              const preparation = managed.prepareOperation(request, () => Effect.void);
+              // The factory must preserve caller values before any asynchronous preparation.
+              request.cwd = primary;
+              request.modelSelection.model = "mutated-after-call";
+              if (!tampered) {
+                const prepared = yield* preparation;
+                expect(f.revalidationCalls).toBe(1);
+                const before =
+                  yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
+                expect(before).toHaveLength(1);
+                expect(before[0]?.status).toBe("allocated");
+                yield* managed.stopAll;
+                const drained =
+                  yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
+                expect(drained[0]?.status).toBe("drained");
+                expect(yield* sql`SELECT operation_id FROM project_team_pi_operation`).toHaveLength(
+                  1,
+                );
+                expect(prepared.operation.operationKind).toBe("initialize");
+                expect(f.fetch).not.toHaveBeenCalled();
+                return;
+              }
+              const failed = yield* failure(preparation);
+              if (failed._tag === "Failure")
+                expect(failed.failure).toMatchObject({
+                  code: "unavailable",
+                  detail: "Pi production runtime unavailable",
+                });
+              expect(f.revalidationCalls).toBe(1);
+              expect(
+                yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`,
+              ).toEqual([]);
+              expect(yield* sql`SELECT operation_id FROM project_team_pi_operation`).toHaveLength(
+                0,
+              );
+              expect(f.fetch).not.toHaveBeenCalled();
+            }),
+          );
         }),
       );
-    }),
-  ),
+    return exercise(false).pipe(
+      Effect.andThen(Effect.sync(() => vi.restoreAllMocks())),
+      Effect.andThen(exercise(true)),
+    );
+  },
 );
