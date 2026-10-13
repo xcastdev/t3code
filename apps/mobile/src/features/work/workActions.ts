@@ -722,6 +722,7 @@ export function createWorkActionSession(
             (state.reviewTarget !== null && state.reviewTarget !== target)
           ) {
             update({
+              status: "stale",
               notice:
                 "Review the current human-approved specification and plan before requesting review.",
             });
