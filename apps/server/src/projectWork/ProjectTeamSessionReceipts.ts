@@ -10,6 +10,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { isPiManagedModel, piManagedModelRoute } from "../provider/pi/PiManagedModels.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   MAX_PI_RUNTIME_FILES,
@@ -588,12 +589,15 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
           r.generation !== row.generation ||
           r.request_id !== receipt.requestId ||
           r.accounting_receipt_id !== receipt.accountingReceiptId ||
-          r.route_id !== "command-code-ling-free" ||
+          !isPiManagedModel(binding.model) ||
+          r.route_id !== piManagedModelRoute(binding.model).routeId ||
           r.route_id !== receipt.routeId ||
           r.provider !== receipt.provider ||
           r.model !== binding.model ||
           receipt.model !== binding.model ||
-          ![binding.model, "inclusionai/ling-3.1-flash"].includes(receipt.reportedModel) ||
+          !piManagedModelRoute(binding.model).acceptedReportedModels.includes(
+            receipt.reportedModel,
+          ) ||
           !r.settlement_json ||
           r.maximum_input_tokens + r.maximum_output_tokens > row.maximum_tokens ||
           r.deadline_at_ms > row.deadline_at_ms ||

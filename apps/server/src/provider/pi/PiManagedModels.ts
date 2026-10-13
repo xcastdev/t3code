@@ -5,6 +5,7 @@ export const piManagedModels = [
   "inclusionai/ling-3.0-flash-sante:free",
 ] as const;
 export const PiManagedModel = Schema.Literals(piManagedModels);
+export const isPiManagedModel = Schema.is(PiManagedModel);
 
 // Catalogue refresh selects one explicit route; existing frozen entries remain readable.
 export const piManagedCatalogueModel = "inclusionai/ling-3.0-flash-sante:free";

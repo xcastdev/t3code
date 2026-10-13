@@ -18,6 +18,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { isPiManagedModel, piManagedModelRoute } from "../provider/pi/PiManagedModels.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   PiManagedProcessError,
@@ -562,7 +563,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       if (
         !found ||
         found.binding.environmentId !== options.environmentId ||
-        found.binding.model !== "inclusionai/ling-3.1-flash:free"
+        !isPiManagedModel(found.binding.model)
       )
         return yield* deny("Current managed Pi binding required");
       if (!initialize && (found.binding.status !== "running" || !found.binding.sessionId))
@@ -1710,12 +1711,15 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           requestRow.generation !== row.generation ||
           requestRow.request_id !== receipt.requestId ||
           requestRow.accounting_receipt_id !== receipt.accountingReceiptId ||
-          requestRow.route_id !== "command-code-ling-free" ||
+          !isPiManagedModel(binding.model) ||
+          requestRow.route_id !== piManagedModelRoute(binding.model).routeId ||
           receipt.routeId !== requestRow.route_id ||
           requestRow.provider !== receipt.provider ||
           requestRow.model !== binding.model ||
           receipt.model !== binding.model ||
-          ![binding.model, "inclusionai/ling-3.1-flash"].includes(receipt.reportedModel) ||
+          !piManagedModelRoute(binding.model).acceptedReportedModels.includes(
+            receipt.reportedModel,
+          ) ||
           !requestRow.settlement_json ||
           !Number.isSafeInteger(requestRow.maximum_input_tokens) ||
           requestRow.maximum_input_tokens < 1 ||

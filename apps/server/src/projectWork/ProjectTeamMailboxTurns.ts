@@ -23,6 +23,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { isPiManagedModel, piManagedModelRoute } from "../provider/pi/PiManagedModels.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   type PiManagedOperationRequest,
@@ -1723,7 +1724,8 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         reservation.worker_id !== op.row.worker_id ||
         reservation.generation !== decision.generation ||
         reservation.operation_id !== input.operationId ||
-        reservation.route_id !== "command-code-ling-free" ||
+        !isPiManagedModel(decision.binding.model) ||
+        reservation.route_id !== piManagedModelRoute(decision.binding.model).routeId ||
         reservation.model !== decision.binding.model ||
         reservation.status !== "held" ||
         reservation.capacity_state !== "held" ||
