@@ -34,6 +34,8 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
+import type { makeCodexTestBudget } from "../CodexTestBudget.ts";
 import * as NodeCrypto from "node:crypto";
 import * as Crypto from "effect/Crypto";
 import * as Exit from "effect/Exit";
@@ -96,6 +98,8 @@ const isCodexResumeCursorSchema = Schema.is(CodexResumeCursorSchema);
 const PROVIDER = ProviderDriverKind.make("codex");
 
 export interface CodexAdapterLiveOptions {
+  /** Root-owned disposable test exception; unavailable through client settings. */
+  readonly testBudget?: Effect.Success<ReturnType<typeof makeCodexTestBudget>>;
   readonly instanceId?: ProviderInstanceId;
   readonly environment?: NodeJS.ProcessEnv;
   readonly makeRuntime?: (
@@ -2372,6 +2376,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   codexConfig: CodexSettings,
   options?: CodexAdapterLiveOptions,
 ) {
+  const testBudget = options?.testBudget;
   const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("codex");
   const fileSystem = yield* FileSystem.FileSystem;
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -2388,6 +2393,43 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  const pendingTestSessions = new Map<
+    ThreadId,
+    { readonly runtime: CodexSessionRuntimeShape; readonly scope: Scope.Closeable }
+  >();
+  const adapterScope = yield* Scope.Scope;
+  let testStopping = false;
+  const requestTestStop = Effect.fn("CodexAdapter.requestTestStop")(function* (
+    event?: ProviderEvent,
+  ) {
+    if (testStopping) return;
+    testStopping = true;
+    // Close scopes from the adapter's owner, never from their own event consumer.
+    const active = Array.from(sessions.values());
+    if (event !== undefined)
+      yield* Queue.offer(runtimeEventQueue, {
+        ...runtimeEventBase(event, event.threadId),
+        type: "runtime.error",
+        payload: {
+          message: "The approved Codex test stopped at its saved budget or authority boundary.",
+          class: "provider_error",
+        },
+      });
+    const pending = Array.from(pendingTestSessions.values());
+    yield* Effect.gen(function* () {
+      yield* Effect.forEach(
+        pending,
+        (entry) =>
+          entry.runtime.close.pipe(
+            Effect.ignore,
+            Effect.andThen(Scope.close(entry.scope, Exit.void)),
+            Effect.ignore,
+          ),
+        { concurrency: 1, discard: true },
+      );
+      yield* Effect.forEach(active, stopSessionInternal, { concurrency: 1, discard: true });
+    }).pipe(Effect.forkIn(adapterScope));
+  });
   const resolveTurnProvenance = (modelSelection: ModelSelection | null | undefined) => {
     const selection = modelSelection?.instanceId === boundInstanceId ? modelSelection : undefined;
     const model = trimText(selection?.model);
@@ -2411,6 +2453,38 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             operation: "startSession",
             issue: `Expected provider '${PROVIDER}' but received '${input.provider}'.`,
           });
+        }
+
+        if (testBudget !== undefined) {
+          const selected =
+            input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+          yield* testBudget
+            .authorize({
+              threadId: input.threadId,
+              model: selected?.model ?? "",
+              reasoningEffort:
+                getModelSelectionStringOptionValue(selected, "reasoningEffort") ?? "",
+              serviceTier: getCodexServiceTierOptionValue(selected) ?? "default",
+            })
+            .pipe(
+              Effect.mapError(
+                (error) =>
+                  new ProviderAdapterValidationError({
+                    provider: PROVIDER,
+                    operation: "startSession",
+                    issue:
+                      error._tag === "CodexTestBudgetError"
+                        ? error.reason
+                        : "Original Codex test budget is unavailable",
+                  }),
+              ),
+            );
+          if (testStopping)
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: "Codex test has stopped",
+            });
         }
 
         const existing = sessions.get(input.threadId);
@@ -2509,7 +2583,24 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
         );
         const createRuntime = options?.makeRuntime ?? makeCodexSessionRuntime;
-        const runtime = yield* createRuntime(runtimeInput).pipe(
+        const guardedRuntimeInput =
+          testBudget === undefined
+            ? runtimeInput
+            : {
+                ...runtimeInput,
+                appServerArgs: [
+                  ...(runtimeInput.appServerArgs ?? []),
+                  "--disable",
+                  "multi_agent",
+                  "--disable",
+                  "multi_agent_v2",
+                  "--disable",
+                  "memories",
+                  "--disable",
+                  "goals",
+                ],
+              };
+        const runtime = yield* createRuntime(guardedRuntimeInput).pipe(
           Effect.provideService(Scope.Scope, sessionScope),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
           Effect.provideService(Crypto.Crypto, crypto),
@@ -2528,9 +2619,61 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // this a child of `startSession`, and Effect interrupts a fiber's
         // children when it completes, so the consumer died on return and every
         // runtime event the session emitted afterwards was dropped.
+        if (testBudget !== undefined) {
+          pendingTestSessions.set(input.threadId, { runtime, scope: sessionScope });
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => pendingTestSessions.delete(input.threadId)),
+          );
+          if (testStopping)
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: "Codex test stopped during initialization",
+            });
+        }
+        let lastTestEvent: ProviderEvent | undefined;
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
+            if (testBudget !== undefined) {
+              lastTestEvent = event;
+              const budget = testBudget;
+              if (event.method === "thread/tokenUsage/updated") {
+                const payload = readPayload(
+                  EffectCodexSchema.V2ThreadTokenUsageUpdatedNotification,
+                  event.payload,
+                );
+                const observed = yield* (
+                  payload === undefined
+                    ? budget.halt("invalid-usage")
+                    : budget.observe(input.threadId, payload.tokenUsage.total.totalTokens)
+                ).pipe(Effect.result);
+                if (observed._tag === "Failure" || observed.success.stopReason !== null) {
+                  if (observed._tag === "Failure")
+                    yield* budget.halt("invalid-usage").pipe(Effect.ignore);
+                  yield* requestTestStop(event);
+                  return;
+                }
+              } else if (event.method === "model/rerouted") {
+                yield* budget.halt("model-changed");
+                yield* requestTestStop(event);
+                return;
+              } else if (
+                event.method === "collabAgent/started" ||
+                event.method === "collabAgent/tokenUsage" ||
+                (event.method === "collabAgent/activity" &&
+                  readPayload(
+                    Schema.Struct({ activityKind: Schema.Literal("started") }),
+                    event.payload,
+                  ) !== undefined)
+              ) {
+                yield* budget.halt("unapproved-agent");
+                yield* requestTestStop(event);
+                return;
+              }
+              if (testStopping) return;
+            }
+
             if (event.method === "turn/started" && event.turnId) {
               if (turnTokenUsage.activeTurnId !== event.turnId) {
                 turnTokenUsage.byTurnId.clear();
@@ -2656,7 +2799,18 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             }
             yield* Queue.offerAll(runtimeEventQueue, runtimeEvents);
           }),
-        ).pipe(Effect.forkIn(sessionScope));
+        ).pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              if (testBudget === undefined) return yield* Effect.die(cause);
+              if (testBudget !== undefined) {
+                yield* testBudget.halt("invalid-usage").pipe(Effect.ignore);
+                yield* requestTestStop(lastTestEvent);
+              }
+            }),
+          ),
+          Effect.forkIn(sessionScope),
+        );
 
         const started = yield* runtime.start().pipe(
           Effect.mapError(
@@ -2677,6 +2831,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
+        if (testBudget !== undefined && testStopping)
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Codex test stopped during initialization",
+          });
         sessionContext = {
           threadId: input.threadId,
           scope: sessionScope,
@@ -2729,6 +2889,45 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
     const session = yield* requireSession(input.threadId);
+    if (testBudget !== undefined) {
+      const selected =
+        input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
+      yield* testBudget
+        .authorize(
+          {
+            threadId: input.threadId,
+            model:
+              input.modelSelection === undefined
+                ? (session.turnModel ?? "")
+                : (selected?.model ?? ""),
+            reasoningEffort:
+              input.modelSelection === undefined
+                ? (session.turnEffort ?? "")
+                : (getModelSelectionStringOptionValue(selected, "reasoningEffort") ?? ""),
+            serviceTier: getCodexServiceTierOptionValue(selected) ?? "default",
+          },
+          "turn",
+        )
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "turn/start",
+                issue:
+                  error._tag === "CodexTestBudgetError"
+                    ? error.reason
+                    : "Original Codex test budget is unavailable",
+              }),
+          ),
+        );
+      if (testStopping)
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "turn/start",
+          issue: "Codex test has stopped",
+        });
+    }
     const skillDispatch = dispatchCodexComposerSkills(input.input ?? "", session.skills);
     if (skillDispatch.rawSkillMention) {
       return yield* new ProviderAdapterValidationError({
@@ -2985,6 +3184,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       concurrency: 1,
       discard: true,
     }).pipe(Effect.asVoid);
+
+  if (testBudget !== undefined) {
+    const budget = testBudget;
+    yield* Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      yield* Effect.sleep(Math.max(0, budget.policy.deadlineAtMs - now));
+      yield* budget.halt("deadline");
+      yield* requestTestStop();
+    }).pipe(
+      Effect.catchCause(() => requestTestStop()),
+      Effect.forkIn(adapterScope),
+    );
+  }
 
   yield* Effect.acquireRelease(Effect.void, () =>
     stopAll().pipe(

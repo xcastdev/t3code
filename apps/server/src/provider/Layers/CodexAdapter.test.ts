@@ -22,6 +22,8 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { makeCodexTestBudget } from "../CodexTestBudget.ts";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
@@ -3527,4 +3529,138 @@ turnStartedLayer("CodexAdapter turn provenance", (it) => {
       NodeAssert.equal(payload.effort, "medium");
     }),
   );
+});
+
+it.effect("monitored Codex test closes the runtime on overshoot and denies the next turn", () => {
+  const runtimeFactory = makeRuntimeFactory();
+  const layer = Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      const budget = yield* makeCodexTestBudget({
+        policy: {
+          environmentId: "fixture",
+          projectId: "greeting",
+          taskId: "approved-task",
+          model: "gpt-6-luna",
+          maximumTokens: 64_000,
+          deadlineAtMs: 300_000,
+          memoryBytes: 2_147_483_648,
+        },
+        assertCurrent: Effect.void,
+      });
+      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: runtimeFactory.factory,
+        testBudget: budget,
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
+  return Effect.gen(function* () {
+    const closed = yield* Deferred.make<void>();
+    const adapter = yield* CodexAdapter;
+    const threadId = asThreadId("thread-1");
+    const modelSelection = createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-luna", [
+      { id: "reasoningEffort", value: "high" },
+      { id: "serviceTier", value: "default" },
+    ]);
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      runtimeMode: "approval-required",
+      modelSelection,
+    });
+    const runtime = runtimeFactory.lastRuntime;
+    NodeAssert.ok(runtime);
+    runtime.close = runtime.close.pipe(
+      Effect.andThen(Deferred.succeed(closed, undefined)),
+      Effect.as(undefined),
+    );
+    const receipt = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+      Effect.forkChild,
+    );
+    yield* runtime.emit(
+      codexTokenUsageEvent({
+        id: "budget-overshoot",
+        turnId: "turn-1",
+        inputTokens: 60_000,
+        cachedInputTokens: 0,
+        cacheCreationTokens: 0,
+        outputTokens: 10_000,
+        reasoningTokens: 0,
+      }),
+    );
+    const events = yield* Fiber.join(receipt);
+    NodeAssert.equal(events[0]?.type, "runtime.error");
+    yield* Deferred.await(closed);
+    NodeAssert.equal(
+      (yield* Effect.result(adapter.sendTurn({ threadId, input: "Continue", modelSelection })))
+        ._tag,
+      "Failure",
+    );
+    NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 0);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("monitored Codex deadline closes an idle session without a usage notification", () => {
+  const runtimeFactory = makeRuntimeFactory();
+  const layer = Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      const budget = yield* makeCodexTestBudget({
+        policy: {
+          environmentId: "deadline-fixture",
+          projectId: "greeting",
+          taskId: "approved-task",
+          model: "gpt-6-luna",
+          maximumTokens: 64_000,
+          deadlineAtMs: 300_000,
+          memoryBytes: 2_147_483_648,
+        },
+        assertCurrent: Effect.void,
+      });
+      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: runtimeFactory.factory,
+        testBudget: budget,
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
+  return Effect.gen(function* () {
+    const closed = yield* Deferred.make<void>();
+    const adapter = yield* CodexAdapter;
+    const threadId = asThreadId("deadline-thread");
+    const modelSelection = createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-luna", [
+      { id: "reasoningEffort", value: "high" },
+    ]);
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      runtimeMode: "approval-required",
+      modelSelection,
+    });
+    const runtime = runtimeFactory.lastRuntime;
+    NodeAssert.ok(runtime);
+    runtime.close = runtime.close.pipe(
+      Effect.andThen(Deferred.succeed(closed, undefined)),
+      Effect.as(undefined),
+    );
+    yield* TestClock.adjust(300_000);
+    yield* Deferred.await(closed);
+    NodeAssert.equal(
+      (yield* Effect.result(adapter.sendTurn({ threadId, input: "Continue", modelSelection })))
+        ._tag,
+      "Failure",
+    );
+    NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 0);
+  }).pipe(Effect.provide(layer));
 });
