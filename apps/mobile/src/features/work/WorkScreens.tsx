@@ -607,7 +607,7 @@ function WorkTaskSession({
       {review.reason ? <Notice>{review.reason}</Notice> : null}
       {state.notice ? <Notice>{state.notice}</Notice> : null}
       {state.status === "sending" ? <Notice>Sending…</Notice> : null}
-      {state.status === "preparing" ? <Notice>Preparing the selected criterion…</Notice> : null}
+      {state.status === "preparing" ? <Notice>Preparing the request…</Notice> : null}
       {state.status === "uncertain" ? (
         <WorkButton
           disabled={
@@ -963,6 +963,34 @@ function WorkTaskSession({
               onPress={() => void session.submit({ kind: "control", action: "resume" })}
             >
               Resume task
+            </WorkButton>
+          </WorkCard>
+          <WorkCard title="Independent review">
+            <Notice>
+              Creates a linked reviewer task within the human-approved specification and plan. Uses
+              the task's remaining budget and original deadline.
+            </Notice>
+            <TextInput
+              accessibilityLabel="Review objective"
+              multiline
+              maxLength={64000}
+              editable={state.status === "idle"}
+              value={state.reviewObjective}
+              onChangeText={(text) => session.editReview(text, state.reviewOutputs)}
+            />
+            <TextInput
+              accessibilityLabel="Expected review findings, one per line"
+              multiline
+              maxLength={64000}
+              editable={state.status === "idle"}
+              value={state.reviewOutputs}
+              onChangeText={(text) => session.editReview(state.reviewObjective, text)}
+            />
+            <WorkButton
+              disabled={locked || !review.canReview}
+              onPress={() => void session.submit({ kind: "review" })}
+            >
+              Start independent review
             </WorkButton>
           </WorkCard>
           <WorkCard title="Investigation">

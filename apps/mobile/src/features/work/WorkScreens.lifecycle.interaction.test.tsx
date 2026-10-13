@@ -7,6 +7,7 @@ import {
   ProjectTeamRecordRead,
   ProjectWorkTaskContext,
   ProjectWorkWriteIntent,
+  canonicalProjectWorkPayload,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { Atom, AtomRegistry, AsyncResult } from "effect/unstable/reactivity";
@@ -827,4 +828,87 @@ describe("mounted task lifecycle", () => {
     expect(host.textContent).not.toContain("Selected recipient member-10");
     expect(host.textContent).toContain("Select recipient Worker-0");
   });
+});
+
+it("mounted independent review sends the current human-approved specification and plan", async () => {
+  const hash = (value: unknown) =>
+    NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+  const specHash = hash({
+    specification: current.task.specification,
+    criteria: current.criteria
+      .map(({ criterionId, description, required, waiver }) => ({
+        criterionId,
+        description,
+        required,
+        waiver,
+      }))
+      .sort((a, b) => (a.criterionId < b.criterionId ? -1 : a.criterionId > b.criterionId ? 1 : 0)),
+  });
+  const planHash = hash({ content: "Review exact work", dependencyTaskIds: [] });
+  const fields = {
+    projectId,
+    taskId: current.task.taskId,
+    revision: 1,
+    generation: 0,
+    updatedAt: at,
+  };
+  const attribution = { actor: { kind: "human" }, source: { kind: "mobile" }, recordedAt: at };
+  await snapshot([
+    membership(),
+    decodeRecord({
+      ...fields,
+      recordId: "review-spec",
+      kind: "gate",
+      gate: "specification",
+      status: "approved",
+      specRevision: 2,
+      planRevision: 0,
+      contentHash: specHash,
+      evidenceIds: [],
+      attribution,
+    }),
+    decodeRecord({
+      ...fields,
+      recordId: "review-plan",
+      kind: "plan-revision",
+      status: "proposed",
+      specRevision: 2,
+      planRevision: 1,
+      content: "Review exact work",
+      contentHash: planHash,
+      dependencyTaskIds: [],
+    }),
+    decodeRecord({
+      ...fields,
+      recordId: "review-plan-gate",
+      kind: "gate",
+      gate: "plan",
+      status: "approved",
+      specRevision: 2,
+      planRevision: 1,
+      contentHash: planHash,
+      evidenceIds: [],
+      attribution,
+    }),
+  ]);
+  await render();
+  expect(button("Start independent review").disabled).toBe(false);
+  await fill("Review objective", "Inspect approved code and evidence");
+  await fill("Expected review findings, one per line", "Findings");
+  await click("Start independent review");
+  expect(emitted).toHaveLength(1);
+  expect(emitted[0]).toMatchObject({
+    type: "project-team.assignment.start",
+    assignmentKind: "review",
+    objective: "Inspect approved code and evidence",
+    specificationGateId: "review-spec",
+    parentPlan: { recordId: "review-plan", gateId: "review-plan-gate", planRevision: 1 },
+  });
+  expect(button("Start independent review").disabled).toBe(true);
+});
+it("mounted independent review withholds the action without approved parent targets", async () => {
+  await render();
+  expect(button("Start independent review").disabled).toBe(true);
+  await click("Start independent review");
+  expect(emitted).toHaveLength(0);
 });

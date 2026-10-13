@@ -838,3 +838,115 @@ describe("mobile human work", () => {
     ).toBeNull();
   });
 });
+
+function approvedReviewCurrent() {
+  const value = current();
+  const hash = (value: unknown) =>
+    NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+  const specificationHash = hash({
+    specification: context.task.specification,
+    criteria: context.criteria
+      .map(({ criterionId, description, required, waiver }) => ({
+        criterionId,
+        description,
+        required,
+        waiver,
+      }))
+      .sort((a, b) => (a.criterionId < b.criterionId ? -1 : a.criterionId > b.criterionId ? 1 : 0)),
+  });
+  const planHash = hash({ content: "Repair then verify", dependencyTaskIds: [] });
+  const approved = records.map((record) =>
+    decodeRecord({
+      ...record,
+      ...(record.kind === "plan-revision" ? { contentHash: planHash } : {}),
+      ...(record.kind === "gate" && "gate" in record
+        ? {
+            status: "approved",
+            contentHash: record.gate === "specification" ? specificationHash : planHash,
+          }
+        : {}),
+    }),
+  );
+  return {
+    ...value,
+    foundation: combineProjectWorkFoundationPages({
+      projectId,
+      pages: [{ value: { projectId, revision: 10, items: approved } }],
+    }),
+  };
+}
+it("mobile independent review freezes approved targets and retries the exact uncertain request", async () => {
+  const value = approvedReviewCurrent();
+  const sent: ProjectWorkWriteIntent[] = [];
+  const session = createWorkActionSession(
+    { environmentId, projectId, taskId: context.task.taskId },
+    () => value,
+    async (input) => {
+      sent.push(decodeWrite(input));
+      if (sent.length === 1) throw Error("lost response");
+    },
+    () => CommandId.make("review-command"),
+  );
+  session.editReview("Inspect the exact task code", "Findings\nValidation gaps");
+  await session.submit({ kind: "review" });
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({
+    type: "project-team.assignment.start",
+    assignmentKind: "review",
+    specRevision: 2,
+    specificationGateId: "spec",
+    expectedSpecificationGateRevision: 1,
+    parentPlan: {
+      recordId: "plan",
+      expectedRecordRevision: 1,
+      planRevision: 3,
+      gateId: "plan-gate",
+      expectedGateRevision: 1,
+    },
+    objective: "Inspect the exact task code",
+    outputDescriptions: ["Findings", "Validation gaps"],
+  });
+  expect(session.state.status).toBe("uncertain");
+  session.editReview("Changed objective", "Changed outputs");
+  await session.submit({ kind: "review" });
+  expect(sent).toHaveLength(1);
+  await session.retry();
+  expect(sent[1]).toEqual(sent[0]);
+});
+it("mobile independent review refuses changed targets and pending approvals without retargeting its draft", async () => {
+  let value = approvedReviewCurrent();
+  const send = vi.fn(async (_intent: ProjectWorkWriteIntent) => {});
+  const session = createWorkActionSession(
+    { environmentId, projectId, taskId: context.task.taskId },
+    () => value,
+    send,
+    () => CommandId.make("review-command"),
+  );
+  session.editReview("Inspect old approved targets", "Findings");
+  value = {
+    ...value,
+    foundation: combineProjectWorkFoundationPages({
+      projectId,
+      pages: [
+        {
+          value: {
+            projectId,
+            revision: 10,
+            items: value.foundation.records.map((record) =>
+              decodeRecord({
+                ...record,
+                ...(record.kind === "gate" && "gate" in record && record.gate === "plan"
+                  ? { revision: 2 }
+                  : {}),
+              }),
+            ),
+          },
+        },
+      ],
+    }),
+  };
+  await session.submit({ kind: "review" });
+  expect(send).not.toHaveBeenCalled();
+  expect(session.state.reviewObjective).toBe("Inspect old approved targets");
+  expect(reviewMobileWork(current()).canReview).toBe(false);
+});

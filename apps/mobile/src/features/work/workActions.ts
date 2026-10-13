@@ -144,6 +144,43 @@ function reviewWork(current: MobileWorkCurrent, controls = false) {
     context?.task.activeAttemptId === undefined &&
     context?.activeAttempt === undefined &&
     !records.some((record) => record.kind === "run-binding" && record.status !== "settled");
+  const approvedSpecification = only(
+    records.filter(
+      (record): record is Gate =>
+        record.kind === "gate" &&
+        record.gate === "specification" &&
+        record.specRevision === context?.task.specRevision &&
+        record.planRevision === 0 &&
+        record.status !== "invalidated",
+    ),
+  );
+  const approvedPlan = only(
+    records.filter(
+      (record): record is Gate =>
+        record.kind === "gate" &&
+        record.gate === "plan" &&
+        record.specRevision === context?.task.specRevision &&
+        record.planRevision === plan?.planRevision &&
+        record.contentHash === plan?.contentHash &&
+        record.status !== "invalidated",
+    ),
+  );
+  const canReview =
+    reason === null &&
+    context?.task.specification !== undefined &&
+    plan !== null &&
+    approvedSpecification?.status === "approved" &&
+    approvedSpecification.attribution.actor.kind === "human" &&
+    approvedPlan?.status === "approved" &&
+    approvedPlan.attribution.actor.kind === "human" &&
+    new Set(foundation.records.map((record) => record.recordId)).size ===
+      foundation.records.length &&
+    !records.some(
+      (record) =>
+        record.kind === "repair-episode" &&
+        (record.status === "exhausted" ||
+          (record.status === "active" && record.pendingSemanticRepair !== false)),
+    );
   return {
     reason,
     membership,
@@ -152,12 +189,27 @@ function reviewWork(current: MobileWorkCurrent, controls = false) {
     planGate: reason === null ? planGate : null,
     plan,
     canInvestigate,
+    canReview,
+    approvedSpecification,
+    approvedPlan,
     gates: records.filter((record): record is Gate => record.kind === "gate"),
   };
 }
 
 export function reviewMobileWork(current: MobileWorkCurrent) {
   return reviewWork(current);
+}
+
+function reviewRequestTarget(current: MobileWorkCurrent) {
+  const review = reviewMobileWork(current);
+  return canonicalProjectWorkPayload({
+    revision: current.context?.revision,
+    taskRevision: current.context?.task.revision,
+    specification: current.context ? waiverDefinition(current.context) : null,
+    plan: review.plan,
+    specificationGate: review.approvedSpecification,
+    planGate: review.approvedPlan,
+  });
 }
 
 /** Lifecycle return paths use the same current-owner checks while stopped approvals stay denied. */
@@ -225,6 +277,7 @@ export function reviewMobileTaskControl(current: MobileWorkCurrent) {
 
 export type MobileWorkAction =
   | { readonly kind: "investigate" }
+  | { readonly kind: "review" }
   | { readonly kind: "waiver"; readonly action: "waive" | "revoke" }
   | { readonly kind: "control"; readonly action: "reassign" | "resume" }
   | { readonly kind: "gate"; readonly gateId: string; readonly response: "approved" | "rejected" };
@@ -245,6 +298,9 @@ export interface MobileWorkActionState {
   readonly reason: string;
   readonly recipient: { readonly id: string; readonly revision: number } | null;
   readonly objective: string;
+  readonly reviewObjective: string;
+  readonly reviewOutputs: string;
+  readonly reviewTarget: string | null;
   readonly outputs: string;
   readonly status: "idle" | "preparing" | "sending" | "uncertain" | "stale" | "denied" | "accepted";
   readonly notice: string | null;
@@ -346,6 +402,9 @@ export function createWorkActionSession(
     reason: "",
     recipient: null,
     objective: "",
+    reviewObjective: "Independently review the approved work and its verification evidence.",
+    reviewOutputs: "Independent review findings",
+    reviewTarget: null,
     outputs: "Findings, sources, and open questions",
     status: "idle",
     notice: null,
@@ -406,6 +465,15 @@ export function createWorkActionSession(
     edit(objective: string, outputs: string) {
       if (state.status !== "sending" && state.status !== "uncertain")
         update({ objective, outputs });
+    },
+    editReview(objective: string, outputs: string) {
+      const value = available();
+      if (state.status !== "idle" || value === null) return;
+      update({
+        reviewObjective: objective,
+        reviewOutputs: outputs,
+        reviewTarget: state.reviewTarget ?? reviewRequestTarget(value),
+      });
     },
     editControl(reason: string) {
       if (state.status !== "sending" && state.status !== "uncertain") update({ reason });
@@ -644,6 +712,74 @@ export function createWorkActionSession(
                   }
                 : { action: "resume", reason: state.reason },
           });
+        } else if (action.kind === "review") {
+          const target = reviewRequestTarget(value);
+          if (
+            !review.canReview ||
+            !review.plan ||
+            !review.approvedSpecification ||
+            !review.approvedPlan ||
+            (state.reviewTarget !== null && state.reviewTarget !== target)
+          ) {
+            update({
+              notice:
+                "Review the current human-approved specification and plan before requesting review.",
+            });
+            return;
+          }
+          const objective = state.reviewObjective;
+          const outputs = state.reviewOutputs;
+          update({ status: "preparing", reviewTarget: target, notice: null });
+          const { CryptoDigestAlgorithm, digestStringAsync } = await import("expo-crypto");
+          const specificationHash = await digestStringAsync(
+            CryptoDigestAlgorithm.SHA256,
+            waiverDefinition(value.context),
+          );
+          const planHash = await digestStringAsync(
+            CryptoDigestAlgorithm.SHA256,
+            canonicalProjectWorkPayload({
+              content: review.plan.content,
+              dependencyTaskIds: [...review.plan.dependencyTaskIds].sort(),
+              ...(review.plan.integrationSources === undefined
+                ? {}
+                : { integrationSources: review.plan.integrationSources }),
+            }),
+          );
+          const after = available();
+          if (
+            !after ||
+            reviewRequestTarget(after) !== target ||
+            !reviewMobileWork(after).canReview ||
+            specificationHash !== review.approvedSpecification.contentHash ||
+            planHash !== review.plan.contentHash
+          ) {
+            if (alive)
+              update({
+                status: "stale",
+                notice: "The approved review targets changed. Refresh and review them again.",
+              });
+            return;
+          }
+          intent = decodeWrite({
+            ...base,
+            type: "project-team.assignment.start",
+            assignmentKind: "review",
+            objective,
+            outputDescriptions: outputs
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean),
+            specRevision: value.context.task.specRevision,
+            specificationGateId: review.approvedSpecification.recordId,
+            expectedSpecificationGateRevision: review.approvedSpecification.revision,
+            parentPlan: {
+              recordId: review.plan.recordId,
+              expectedRecordRevision: review.plan.revision,
+              planRevision: review.plan.planRevision,
+              gateId: review.approvedPlan.recordId,
+              expectedGateRevision: review.approvedPlan.revision,
+            },
+          });
         } else if (action.kind === "investigate") {
           if (!review.canInvestigate) {
             update({
@@ -680,11 +816,13 @@ export function createWorkActionSession(
         }
       } catch {
         update({
-          ...(action.kind === "waiver" ? { status: "denied" as const } : {}),
+          ...(action.kind === "waiver" || action.kind === "review"
+            ? { status: "denied" as const }
+            : {}),
           notice:
             action.kind === "waiver"
               ? "The criterion waiver could not be prepared. Review its reason and current definition."
-              : "Enter an investigation objective and one to sixteen outputs within the server's text limits.",
+              : "Enter an objective and one to sixteen outputs within the server's text limits.",
         });
         return;
       }
@@ -717,6 +855,7 @@ export function createWorkActionSession(
           pending: null,
           notice: null,
           waiver: null,
+          reviewTarget: null,
           waiverReason: "",
           waiverEvidenceIds: [],
         });
