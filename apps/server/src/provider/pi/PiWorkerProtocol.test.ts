@@ -469,6 +469,38 @@ describe("parent-bound native operations", () => {
   });
 });
 
+it("roundtrips the approved model request through an escaped frame larger than the former cap", () => {
+  const body = JSON.stringify({ messages: [{ role: "user", content: '"\n'.repeat(3500) }] });
+  expect(Buffer.byteLength(body)).toBeGreaterThan(12288);
+  expect(Buffer.byteLength(body)).toBeLessThanOrEqual(16384);
+  const frame = workerFrame({ type: "request", requestId: 1, lifecycleId: 1, body });
+  const wire = encodePiWorkerFrame(frame);
+  expect(wire.byteLength).toBeGreaterThan(16384);
+  expect(wire.byteLength).toBeLessThanOrEqual(32768);
+  expect(decodePiWorkerFrame(wire.toString().slice(0, -1))).toEqual(frame);
+});
+
+it("keeps the original control-text limit after expanding model request frames", () => {
+  const control = parentFrame({
+    type: "control",
+    controlId: 1,
+    kind: "steer",
+    text: "x".repeat(12288),
+  });
+  const wire = encodePiParentFrame(control);
+  expect(decodePiParentFrame(wire.toString().slice(0, -1))).toEqual(control);
+  expect(() =>
+    encodePiParentFrame(
+      parentFrame({
+        type: "control",
+        controlId: 2,
+        kind: "steer",
+        text: "x".repeat(12289),
+      }),
+    ),
+  ).toThrow();
+});
+
 describe("bounded synchronous frame intake", () => {
   it("fails coalesced queue overflow while the consumer has not drained", async () => {
     const delivered: string[] = [];

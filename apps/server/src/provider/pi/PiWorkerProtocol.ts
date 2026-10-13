@@ -1,10 +1,11 @@
 import * as Schema from "effect/Schema";
 
 export const PI_WORKER_PROTOCOL_VERSION = 1;
-// P1's pinned SDK stream proof used these byte limits and one-chunk ACK window.
+// Requests and their escaped JSON envelopes have separate byte budgets.
 // The frame limit includes LF; JSON escaping and the envelope share that budget.
-export const PI_WORKER_MAX_FRAME_BYTES = 16_384;
-export const PI_WORKER_MAX_REQUEST_BYTES = 12_288;
+export const PI_WORKER_MAX_FRAME_BYTES = 32_768;
+export const PI_WORKER_MAX_REQUEST_BYTES = 16_384;
+const PI_WORKER_MAX_CONTROL_BYTES = 12_288;
 export const PI_WORKER_MAX_RESPONSE_BYTES = 2_097_152;
 export const PI_WORKER_MAX_CHUNK_BYTES = 8_192;
 export const PI_WORKER_MAX_CHUNK_BASE64_BYTES = 4 * Math.ceil(PI_WORKER_MAX_CHUNK_BYTES / 3);
@@ -123,7 +124,7 @@ export const PiWorkerControl = Schema.Struct({
   type: Schema.Literal("control"),
   controlId: RequestId,
   kind: Schema.Literals(["steer", "follow-up"]),
-  text: boundedText(PI_WORKER_MAX_REQUEST_BYTES),
+  text: boundedText(PI_WORKER_MAX_CONTROL_BYTES),
 });
 export type PiWorkerControl = typeof PiWorkerControl.Type;
 export const PiSdkEvent = Schema.Union([

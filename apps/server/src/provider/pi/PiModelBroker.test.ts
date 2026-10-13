@@ -18,6 +18,8 @@ import {
   type PiModelRequestSettlement,
 } from "./PiModelBroker.ts";
 
+import { PI_WORKER_MAX_REQUEST_BYTES } from "./PiWorkerProtocol.ts";
+
 const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const model = "inclusionai/ling-3.1-flash:free";
 const reportedModel = "inclusionai/ling-3.1-flash";
@@ -217,11 +219,32 @@ it.each([
   expect(f.transports).toHaveLength(0);
 });
 
+it("admits the approved larger body while retaining a smaller frozen input allowance", async () => {
+  const body = requestBody({ messages: [{ role: "user", content: '"\n'.repeat(3500) }] });
+  expect(Buffer.byteLength(body)).toBeGreaterThan(12288);
+  expect(Buffer.byteLength(body)).toBeLessThanOrEqual(16384);
+  const f = fixture({ maxInputTokens: 16384 });
+  await f.invoke(body);
+  expect(f.transports).toHaveLength(1);
+  expect(f.reservations).toHaveLength(1);
+  expect(f.reservations[0]?.maxInputTokens).toBe(16384);
+  const frozen = fixture({ maxInputTokens: 8192 });
+  await expect(frozen.invoke(body)).rejects.toThrow("REQUEST_INPUT_LIMIT");
+  expect(frozen.transports).toEqual([]);
+  expect(frozen.reservations).toEqual([]);
+});
+
 it("checks bytes before JSON decode and conservative input token reservation", async () => {
   const f = fixture();
-  await expect(f.invoke("x".repeat(12_289))).rejects.toThrow("REQUEST_BYTE_LIMIT");
+  await expect(f.invoke("x".repeat(PI_WORKER_MAX_REQUEST_BYTES + 1))).rejects.toThrow(
+    "REQUEST_BYTE_LIMIT",
+  );
   await expect(
-    f.invoke(requestBody({ messages: [{ role: "user", content: "é".repeat(7000) }] })),
+    f.invoke(
+      requestBody({
+        messages: [{ role: "user", content: "é".repeat(PI_WORKER_MAX_REQUEST_BYTES / 2) }],
+      }),
+    ),
   ).rejects.toThrow("REQUEST_BYTE_LIMIT");
   const small = fixture({ maxInputTokens: 10 });
   await expect(small.invoke()).rejects.toThrow("REQUEST_INPUT_LIMIT");

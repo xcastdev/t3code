@@ -624,7 +624,7 @@ describe("Pi worker parent model stream", () => {
   });
 
   it("bounds the SDK body containing both initial native context and system context", async () => {
-    const context = sdkControlContext();
+    const context = sdkControlContext().padEnd(PI_WORKER_MAX_REQUEST_BYTES / 2 + 1, "x");
     expect(Buffer.byteLength(context)).toBeLessThanOrEqual(PI_WORKER_MAX_REQUEST_BYTES);
     const frames: PiWorkerFrame["message"][] = [];
     const bodies: Array<{ bytes: number; method: string | undefined }> = [];
@@ -874,7 +874,7 @@ describe("Pi worker parent model stream", () => {
     await expect(
       bridge.fetch("https://t3-worker.invalid/v1/chat/completions", {
         method: "POST",
-        body: "x".repeat(12289),
+        body: "x".repeat(PI_WORKER_MAX_REQUEST_BYTES + 1),
       }),
     ).rejects.toThrow("INVALID_MODEL_REQUEST");
     expect(frames).toEqual([]);
