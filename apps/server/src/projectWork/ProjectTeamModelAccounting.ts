@@ -61,7 +61,11 @@ const Settlement = Schema.Struct({
   reservationId: Id,
   transportDrained: Schema.optional(Schema.Boolean),
   outcome: Schema.Literals(["reported", "failed", "unknown"]),
-  failureCode: Schema.optional(Schema.String.check(Schema.isPattern(/^[A-Z_]{1,64}$/))),
+  failureCode: Schema.optional(
+    Schema.String.check(
+      Schema.isPattern(/^(?:[A-Z_]{1,64}|TRANSPORT_RESPONSE_HTTP_[1-5][0-9]{2})$/),
+    ),
+  ),
   chargedInputTokens: Safe,
   chargedOutputTokens: Safe,
   reportedModel: Schema.optional(Id),

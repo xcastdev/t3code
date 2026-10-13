@@ -865,3 +865,63 @@ it.effect(
       }).pipe(Effect.provide(runtime(path))),
     ),
 );
+
+for (const status of [401, 403, 429, 500])
+  it.effect(`retains bounded HTTP diagnostic accounting ${status}`, () =>
+    fileTest((path) =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const reservation = yield* f.accounting.reserve(f.principal, request());
+        const failureCode = `TRANSPORT_RESPONSE_HTTP_${status}` as const;
+        const value = {
+          ...unknown(reservation.reservationId),
+          failureCode,
+          transportDrained: false,
+        };
+        const receipt = yield* f.accounting.settle(value);
+        expect(yield* f.accounting.settle(value)).toEqual(receipt);
+        const rows = yield* f.sql<{
+          settlement_json: string;
+          capacity_state: string;
+          charged_input_tokens: number;
+          charged_output_tokens: number;
+        }>`SELECT settlement_json,capacity_state,charged_input_tokens,charged_output_tokens FROM project_team_model_request WHERE reservation_id=${reservation.reservationId}`;
+        expect(yield* decodeFixtureJson(rows[0]!.settlement_json)).toMatchObject({ failureCode });
+        expect(rows[0]).toMatchObject({
+          capacity_state: "quarantine",
+          charged_input_tokens: 100,
+          charged_output_tokens: 100,
+        });
+      }).pipe(Effect.provide(runtime(path))),
+    ),
+  );
+
+it.effect("rejects unbounded or unrelated numeric accounting diagnostics", () =>
+  fileTest((path) =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const reservation = yield* f.accounting.reserve(f.principal, request());
+      for (const failureCode of [
+        "TRANSPORT_RESPONSE_HTTP_099",
+        "TRANSPORT_RESPONSE_HTTP_600",
+        "TRANSPORT_RESPONSE_HTTP_401_SECRET",
+        "ERROR_123",
+        "Bearer secret",
+        "A".repeat(65),
+      ])
+        yield* denied(
+          f.accounting.settle({
+            ...unknown(reservation.reservationId),
+            failureCode: failureCode as NonNullable<PiModelRequestSettlement["failureCode"]>,
+          }),
+        );
+      expect(
+        yield* f.sql`SELECT status,capacity_state FROM project_team_model_request WHERE reservation_id=${reservation.reservationId}`,
+      ).toEqual([{ status: "held", capacity_state: "held" }]);
+      yield* f.accounting.settle({
+        ...unknown(reservation.reservationId),
+        failureCode: "TRANSPORT_RESPONSE_REJECTED",
+      });
+    }).pipe(Effect.provide(runtime(path))),
+  ),
+);

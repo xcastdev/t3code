@@ -3221,3 +3221,48 @@ for (const corruption of ["missing", "malformed", "kind", "thread", "operation",
       }),
     ),
   );
+
+for (const status of [401, 403, 429, 500])
+  it.effect(`reconstructs bounded HTTP diagnostic context ${status}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* budgetFixture;
+        const reserved = yield* f.reserve(1);
+        yield* f.accounting.settle({
+          ...f.reservation(1),
+          reservationId: reserved.reservationId,
+          transportDrained: false,
+          outcome: "unknown",
+          failureCode: `TRANSPORT_RESPONSE_HTTP_${status}`,
+          chargedInputTokens: 100,
+          chargedOutputTokens: 100,
+        });
+        expect((yield* f.reader.readRequired(f.snapshot)).required.remaining).toMatchObject({
+          rootUsedTokens: 200,
+          rootRemainingTokens: 800,
+          attemptUsedTokens: 200,
+          outstandingRequests: 1,
+        });
+      }),
+    ),
+  );
+
+for (const failureCode of [
+  "TRANSPORT_RESPONSE_HTTP_099",
+  "TRANSPORT_RESPONSE_HTTP_600",
+  "TRANSPORT_RESPONSE_HTTP_401_SECRET",
+  "ERROR_123",
+  "Bearer secret",
+  "A".repeat(65),
+])
+  it.effect(`rejects invalid retained diagnostic context ${failureCode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* budgetFixture;
+        const reserved = yield* f.reserve(1);
+        yield* f.settle(reserved.reservationId, 1, "unknown", false);
+        yield* f.sql`UPDATE project_team_model_request SET settlement_json=json_set(settlement_json,'$.failureCode',${failureCode})`;
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }),
+    ),
+  );
