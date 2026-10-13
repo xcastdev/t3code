@@ -23,7 +23,7 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import { makeCodexTestBudget } from "../CodexTestBudget.ts";
+import { CodexTestBudgetError, makeCodexTestBudget } from "../CodexTestBudget.ts";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
@@ -3663,4 +3663,186 @@ it.effect("monitored Codex deadline closes an idle session without a usage notif
     );
     NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 0);
   }).pipe(Effect.provide(layer));
+});
+
+const monitoredSelection = createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-luna", [
+  { id: "reasoningEffort", value: "high" },
+]);
+const monitoredLayer = (options: {
+  readonly makeRuntime: NonNullable<
+    NonNullable<Parameters<typeof makeCodexAdapter>[1]>["makeRuntime"]
+  >;
+  readonly assertCurrent?: Effect.Effect<void, CodexTestBudgetError>;
+}) =>
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      const budget = yield* makeCodexTestBudget({
+        policy: {
+          environmentId: "repair",
+          projectId: "greeting",
+          taskId: "approved-task",
+          model: "gpt-6-luna",
+          maximumTokens: 64_000,
+          deadlineAtMs: 300_000,
+          memoryBytes: 2_147_483_648,
+        },
+        assertCurrent: options.assertCurrent ?? Effect.void,
+      });
+      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: options.makeRuntime,
+        testBudget: budget,
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+it.effect("monitored Codex authority loss drains every session before denying continuation", () => {
+  const runtimes: FakeCodexRuntime[] = [];
+  let current = true;
+  const layer = monitoredLayer({
+    makeRuntime: (options) =>
+      Effect.sync(() => {
+        const runtime = new FakeCodexRuntime(options);
+        runtimes.push(runtime);
+        return runtime;
+      }),
+    assertCurrent: Effect.suspend(() =>
+      current ? Effect.void : Effect.fail(new CodexTestBudgetError({ reason: "Revoked" })),
+    ),
+  });
+  return Effect.gen(function* () {
+    const adapter = yield* CodexAdapter;
+    for (const id of ["worker", "reviewer"])
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId(id),
+        runtimeMode: "approval-required",
+        modelSelection: monitoredSelection,
+      });
+    current = false;
+    NodeAssert.equal(
+      (yield* Effect.result(
+        adapter.sendTurn({ threadId: asThreadId("worker"), input: "Continue" }),
+      ))._tag,
+      "Failure",
+    );
+    NodeAssert.deepEqual(yield* adapter.listSessions(), []);
+    for (const runtime of runtimes) {
+      NodeAssert.equal(runtime.closeImpl.mock.calls.length, 1);
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 0);
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("monitored Codex sends frozen options and denies unbudgeted native mutations", () => {
+  const factory = makeRuntimeFactory();
+  return Effect.gen(function* () {
+    const adapter = yield* CodexAdapter;
+    const threadId = asThreadId("worker");
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      runtimeMode: "approval-required",
+      modelSelection: monitoredSelection,
+    });
+    yield* adapter.sendTurn({ threadId, input: "Work" });
+    const runtime = factory.lastRuntime;
+    NodeAssert.ok(runtime);
+    NodeAssert.equal(runtime.options.serviceTier, "default");
+    NodeAssert.deepEqual(runtime.sendTurnImpl.mock.calls[0]?.[0], {
+      input: "Work",
+      model: "gpt-6-luna",
+      effort: "high",
+      serviceTier: "default",
+    });
+    NodeAssert.ok(adapter.compaction?.type === "native");
+    NodeAssert.equal((yield* Effect.result(adapter.compaction.start(threadId)))._tag, "Failure");
+    NodeAssert.equal((yield* Effect.result(adapter.rollbackThread(threadId, 1)))._tag, "Failure");
+    NodeAssert.ok(adapter.forkThread);
+    NodeAssert.equal((yield* Effect.result(adapter.forkThread(threadId)))._tag, "Failure");
+    NodeAssert.equal(runtime.rollbackThreadImpl.mock.calls.length, 0);
+  }).pipe(Effect.provide(monitoredLayer({ makeRuntime: factory.factory })));
+});
+
+it.effect("monitored Codex deadline interrupts construction and drains its allocated owner", () =>
+  Effect.gen(function* () {
+    const allocated = yield* Deferred.make<void>();
+    const released = yield* Deferred.make<void>();
+    const layer = monitoredLayer({
+      makeRuntime: () =>
+        Effect.gen(function* () {
+          yield* Effect.acquireRelease(Deferred.succeed(allocated, undefined), () =>
+            Deferred.succeed(released, undefined),
+          );
+          return yield* Effect.never;
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const launch = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("constructing"),
+          runtimeMode: "approval-required",
+          modelSelection: monitoredSelection,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(allocated);
+      yield* TestClock.adjust(300_000);
+      yield* Deferred.await(released);
+      NodeAssert.equal((yield* Fiber.await(launch))._tag, "Failure");
+      NodeAssert.deepEqual(yield* adapter.listSessions(), []);
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect("monitored Codex rejects a child request before its spawn notification", () => {
+  const factory = makeRuntimeFactory();
+  return Effect.gen(function* () {
+    const adapter = yield* CodexAdapter;
+    const threadId = asThreadId("worker");
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      runtimeMode: "approval-required",
+      modelSelection: monitoredSelection,
+    });
+    const runtime = factory.lastRuntime;
+    NodeAssert.ok(runtime);
+    const closed = yield* Deferred.make<void>();
+    runtime.close = runtime.close.pipe(
+      Effect.andThen(Deferred.succeed(closed, undefined)),
+      Effect.as(undefined),
+    );
+    const error = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+      Effect.forkChild,
+    );
+    yield* runtime.emit({
+      id: asEventId("early-child-request"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      kind: "request",
+      threadId,
+      method: "item/commandExecution/requestApproval",
+      agentKey: RuntimeAgentKey.make("unapproved-child"),
+      requestId: ApprovalRequestId.make("child-request"),
+      requestKind: "command",
+    });
+    NodeAssert.equal((yield* Fiber.join(error))[0]?.type, "runtime.error");
+    yield* Deferred.await(closed);
+    NodeAssert.deepEqual(yield* adapter.listSessions(), []);
+    NodeAssert.equal(
+      (yield* Effect.result(
+        adapter.respondToRequest(threadId, ApprovalRequestId.make("child-request"), "accept"),
+      ))._tag,
+      "Failure",
+    );
+    NodeAssert.equal(runtime.respondToRequestImpl.mock.calls.length, 0);
+  }).pipe(Effect.provide(monitoredLayer({ makeRuntime: factory.factory })));
 });

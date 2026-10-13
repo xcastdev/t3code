@@ -2395,10 +2395,22 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
   const pendingTestSessions = new Map<
     ThreadId,
-    { readonly runtime: CodexSessionRuntimeShape; readonly scope: Scope.Closeable }
+    {
+      runtime: CodexSessionRuntimeShape | undefined;
+      constructing: Fiber.Fiber<unknown, ProviderAdapterProcessError> | undefined;
+      readonly scope: Scope.Closeable;
+    }
   >();
   const adapterScope = yield* Scope.Scope;
   let testStopping = false;
+  let testCleanup: Fiber.Fiber<void, never> | undefined;
+  const closeSessionResources = Effect.fn("CodexAdapter.closeSessionResources")(function* (
+    session: CodexAdapterSessionContext,
+  ) {
+    yield* session.runtime.close.pipe(Effect.ignore);
+    yield* Effect.ignore(Scope.close(session.scope, Exit.void));
+    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+  });
   const requestTestStop = Effect.fn("CodexAdapter.requestTestStop")(function* (
     event?: ProviderEvent,
   ) {
@@ -2406,6 +2418,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     testStopping = true;
     // Close scopes from the adapter's owner, never from their own event consumer.
     const active = Array.from(sessions.values());
+    for (const session of active) session.stopped = true;
+    sessions.clear();
     if (event !== undefined)
       yield* Queue.offer(runtimeEventQueue, {
         ...runtimeEventBase(event, event.threadId),
@@ -2416,20 +2430,59 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         },
       });
     const pending = Array.from(pendingTestSessions.values());
-    yield* Effect.gen(function* () {
+    testCleanup = yield* Effect.gen(function* () {
       yield* Effect.forEach(
         pending,
         (entry) =>
-          entry.runtime.close.pipe(
-            Effect.ignore,
-            Effect.andThen(Scope.close(entry.scope, Exit.void)),
-            Effect.ignore,
-          ),
+          Effect.gen(function* () {
+            if (entry.constructing !== undefined) yield* Fiber.interrupt(entry.constructing);
+            if (entry.runtime !== undefined) yield* entry.runtime.close.pipe(Effect.ignore);
+            yield* Scope.close(entry.scope, Exit.void).pipe(Effect.ignore);
+          }),
         { concurrency: 1, discard: true },
       );
-      yield* Effect.forEach(active, stopSessionInternal, { concurrency: 1, discard: true });
+      yield* Effect.forEach(active, closeSessionResources, { concurrency: 1, discard: true });
     }).pipe(Effect.forkIn(adapterScope));
   });
+  const authorizeTest = Effect.fn("CodexAdapter.authorizeTest")(function* (
+    selection: Parameters<NonNullable<typeof testBudget>["authorize"]>[0],
+    phase: "initialize" | "turn",
+    operation: string,
+  ) {
+    if (testBudget === undefined) return;
+    const result = yield* testBudget.authorize(selection, phase).pipe(Effect.result);
+    if (result._tag === "Failure") {
+      const state = yield* testBudget.read().pipe(Effect.result);
+      if (state._tag === "Failure" || state.success.stopReason !== null) {
+        yield* requestTestStop();
+        if (testCleanup !== undefined) yield* Fiber.join(testCleanup);
+      }
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation,
+        issue:
+          result.failure._tag === "CodexTestBudgetError"
+            ? result.failure.reason
+            : "Original Codex test budget is unavailable",
+      });
+    }
+    if (testStopping) {
+      if (testCleanup !== undefined) yield* Fiber.join(testCleanup);
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation,
+        issue: "Codex test has stopped",
+      });
+    }
+  });
+  const denyTestMutation = (operation: string) =>
+    Effect.fail(
+      new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation,
+        issue: "The bounded Codex test does not authorize compaction, rollback or fork",
+      }),
+    );
   const resolveTurnProvenance = (modelSelection: ModelSelection | null | undefined) => {
     const selection = modelSelection?.instanceId === boundInstanceId ? modelSelection : undefined;
     const model = trimText(selection?.model);
@@ -2458,33 +2511,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         if (testBudget !== undefined) {
           const selected =
             input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
-          yield* testBudget
-            .authorize({
+          yield* authorizeTest(
+            {
               threadId: input.threadId,
               model: selected?.model ?? "",
               reasoningEffort:
                 getModelSelectionStringOptionValue(selected, "reasoningEffort") ?? "",
               serviceTier: getCodexServiceTierOptionValue(selected) ?? "default",
-            })
-            .pipe(
-              Effect.mapError(
-                (error) =>
-                  new ProviderAdapterValidationError({
-                    provider: PROVIDER,
-                    operation: "startSession",
-                    issue:
-                      error._tag === "CodexTestBudgetError"
-                        ? error.reason
-                        : "Original Codex test budget is unavailable",
-                  }),
-              ),
-            );
-          if (testStopping)
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "startSession",
-              issue: "Codex test has stopped",
-            });
+            },
+            "initialize",
+            "startSession",
+          );
         }
 
         const existing = sessions.get(input.threadId);
@@ -2493,9 +2530,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         }
 
         const serviceTier =
-          input.modelSelection?.instanceId === boundInstanceId
-            ? getCodexServiceTierOptionValue(input.modelSelection)
-            : undefined;
+          testBudget !== undefined
+            ? "default"
+            : input.modelSelection?.instanceId === boundInstanceId
+              ? getCodexServiceTierOptionValue(input.modelSelection)
+              : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
         const projectMcpServers = input.projectMcpServers ?? mcpSession?.projectServers ?? [];
         const projectMcpArgs = projectMcpServers.flatMap((server) => {
@@ -2590,6 +2629,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 ...runtimeInput,
                 appServerArgs: [
                   ...(runtimeInput.appServerArgs ?? []),
+                  "-c",
+                  'model_reasoning_effort="high"',
                   "--disable",
                   "multi_agent",
                   "--disable",
@@ -2600,7 +2641,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                   "goals",
                 ],
               };
-        const runtime = yield* createRuntime(guardedRuntimeInput).pipe(
+        const construction = createRuntime(guardedRuntimeInput).pipe(
           Effect.provideService(Scope.Scope, sessionScope),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
           Effect.provideService(Crypto.Crypto, crypto),
@@ -2615,22 +2656,44 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
-        // Fork into the session scope, not the calling fiber. `forkChild` makes
-        // this a child of `startSession`, and Effect interrupts a fiber's
-        // children when it completes, so the consumer died on return and every
-        // runtime event the session emitted afterwards was dropped.
+        const pending: {
+          runtime: CodexSessionRuntimeShape | undefined;
+          constructing: Fiber.Fiber<unknown, ProviderAdapterProcessError> | undefined;
+          readonly scope: Scope.Closeable;
+        } = { runtime: undefined, constructing: undefined, scope: sessionScope };
         if (testBudget !== undefined) {
-          pendingTestSessions.set(input.threadId, { runtime, scope: sessionScope });
+          pendingTestSessions.set(input.threadId, pending);
           yield* Effect.addFinalizer(() =>
-            Effect.sync(() => pendingTestSessions.delete(input.threadId)),
+            Effect.gen(function* () {
+              pendingTestSessions.delete(input.threadId);
+              if (!sessionScopeTransferred && pending.constructing !== undefined)
+                yield* Fiber.interrupt(pending.constructing);
+            }),
           );
-          if (testStopping)
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "startSession",
-              issue: "Codex test stopped during initialization",
-            });
         }
+        const runtime =
+          testBudget === undefined
+            ? yield* construction
+            : yield* Effect.gen(function* () {
+                if (testStopping)
+                  return yield* new ProviderAdapterValidationError({
+                    provider: PROVIDER,
+                    operation: "startSession",
+                    issue: "Codex test has stopped",
+                  });
+                const fiber = yield* construction.pipe(Effect.forkIn(adapterScope));
+                pending.constructing = fiber;
+                const created = yield* Fiber.join(fiber);
+                pending.runtime = created;
+                return created;
+              });
+        if (testBudget !== undefined && testStopping)
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Codex test stopped during initialization",
+          });
+        // The event consumer belongs to the retained session scope, not the launching turn.
         let lastTestEvent: ProviderEvent | undefined;
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
@@ -2658,15 +2721,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 yield* budget.halt("model-changed");
                 yield* requestTestStop(event);
                 return;
-              } else if (
-                event.method === "collabAgent/started" ||
-                event.method === "collabAgent/tokenUsage" ||
-                (event.method === "collabAgent/activity" &&
-                  readPayload(
-                    Schema.Struct({ activityKind: Schema.Literal("started") }),
-                    event.payload,
-                  ) !== undefined)
-              ) {
+              } else if (event.method.startsWith("collabAgent/") || event.agentKey !== undefined) {
                 yield* budget.halt("unapproved-agent");
                 yield* requestTestStop(event);
                 return;
@@ -2812,7 +2867,18 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           Effect.forkIn(sessionScope),
         );
 
-        const started = yield* runtime.start().pipe(
+        if (testBudget !== undefined)
+          yield* authorizeTest(
+            {
+              threadId: input.threadId,
+              model: testBudget.policy.model,
+              reasoningEffort: "high",
+              serviceTier: "default",
+            },
+            "turn",
+            "startSession",
+          );
+        const initialization = runtime.start().pipe(
           Effect.mapError(
             (cause) =>
               new ProviderAdapterProcessError({
@@ -2830,6 +2896,21 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ),
           ),
         );
+
+        const started =
+          testBudget === undefined
+            ? yield* initialization
+            : yield* Effect.gen(function* () {
+                if (testStopping)
+                  return yield* new ProviderAdapterValidationError({
+                    provider: PROVIDER,
+                    operation: "startSession",
+                    issue: "Codex test has stopped",
+                  });
+                const fiber = yield* initialization.pipe(Effect.forkIn(adapterScope));
+                pending.constructing = fiber;
+                return yield* Fiber.join(fiber);
+              });
 
         if (testBudget !== undefined && testStopping)
           return yield* new ProviderAdapterValidationError({
@@ -2892,41 +2973,22 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     if (testBudget !== undefined) {
       const selected =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
-      yield* testBudget
-        .authorize(
-          {
-            threadId: input.threadId,
-            model:
-              input.modelSelection === undefined
-                ? (session.turnModel ?? "")
-                : (selected?.model ?? ""),
-            reasoningEffort:
-              input.modelSelection === undefined
-                ? (session.turnEffort ?? "")
-                : (getModelSelectionStringOptionValue(selected, "reasoningEffort") ?? ""),
-            serviceTier: getCodexServiceTierOptionValue(selected) ?? "default",
-          },
-          "turn",
-        )
-        .pipe(
-          Effect.mapError(
-            (error) =>
-              new ProviderAdapterValidationError({
-                provider: PROVIDER,
-                operation: "turn/start",
-                issue:
-                  error._tag === "CodexTestBudgetError"
-                    ? error.reason
-                    : "Original Codex test budget is unavailable",
-              }),
-          ),
-        );
-      if (testStopping)
-        return yield* new ProviderAdapterValidationError({
-          provider: PROVIDER,
-          operation: "turn/start",
-          issue: "Codex test has stopped",
-        });
+      yield* authorizeTest(
+        {
+          threadId: input.threadId,
+          model:
+            input.modelSelection === undefined
+              ? (session.turnModel ?? "")
+              : (selected?.model ?? ""),
+          reasoningEffort:
+            input.modelSelection === undefined
+              ? (session.turnEffort ?? "")
+              : (getModelSelectionStringOptionValue(selected, "reasoningEffort") ?? ""),
+          serviceTier: getCodexServiceTierOptionValue(selected) ?? "default",
+        },
+        "turn",
+        "turn/start",
+      );
     }
     const skillDispatch = dispatchCodexComposerSkills(input.input ?? "", session.skills);
     if (skillDispatch.rawSkillMention) {
@@ -2952,20 +3014,37 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       session.turnEffort = turnProvenance.effort;
     }
     const reasoningEffort =
-      input.modelSelection?.instanceId === boundInstanceId
-        ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
-        : undefined;
+      testBudget !== undefined
+        ? "high"
+        : input.modelSelection?.instanceId === boundInstanceId
+          ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
+          : undefined;
     const serviceTier =
-      input.modelSelection?.instanceId === boundInstanceId
-        ? getCodexServiceTierOptionValue(input.modelSelection)
-        : undefined;
+      testBudget !== undefined
+        ? "default"
+        : input.modelSelection?.instanceId === boundInstanceId
+          ? getCodexServiceTierOptionValue(input.modelSelection)
+          : undefined;
+    if (testBudget !== undefined)
+      yield* authorizeTest(
+        {
+          threadId: input.threadId,
+          model: testBudget.policy.model,
+          reasoningEffort: "high",
+          serviceTier: "default",
+        },
+        "turn",
+        "turn/start",
+      );
     return yield* session.runtime
       .sendTurn({
         ...(input.input !== undefined ? { input: skillDispatch.prompt } : {}),
         ...(skillDispatch.skills.length > 0 ? { skills: skillDispatch.skills } : {}),
-        ...(input.modelSelection?.instanceId === boundInstanceId
-          ? { model: input.modelSelection.model }
-          : {}),
+        ...(testBudget !== undefined
+          ? { model: testBudget.policy.model }
+          : input.modelSelection?.instanceId === boundInstanceId
+            ? { model: input.modelSelection.model }
+            : {}),
         ...(reasoningEffort
           ? {
               effort: reasoningEffort as EffectCodexSchema.V2TurnStartParams__ReasoningEffort,
@@ -2986,6 +3065,24 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         threadId,
       });
     }
+    return session;
+  });
+
+  const requireForwardSession = Effect.fn("CodexAdapter.requireForwardSession")(function* (
+    threadId: ThreadId,
+  ) {
+    const session = yield* requireSession(threadId);
+    if (testBudget !== undefined)
+      yield* authorizeTest(
+        {
+          threadId,
+          model: session.turnModel ?? "",
+          reasoningEffort: session.turnEffort ?? "",
+          serviceTier: "default",
+        },
+        "turn",
+        "request/continue",
+      );
     return session;
   });
 
@@ -3025,6 +3122,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
 
   const compactThread = Effect.fn("compactThread")(function* (threadId: ThreadId) {
+    if (testBudget !== undefined) return yield* denyTestMutation("thread/compact/start");
     const session = yield* requireSession(threadId);
     yield* session.runtime.compactThread.pipe(
       Effect.mapError((cause) => mapCodexRuntimeError(threadId, "thread/compact/start", cause)),
@@ -3046,6 +3144,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
 
   const rollbackThread: CodexAdapterShape["rollbackThread"] = (threadId, numTurns) => {
+    if (testBudget !== undefined) return denyTestMutation("thread/rollback");
     if (!Number.isInteger(numTurns) || numTurns < 1) {
       return Effect.fail(
         new ProviderAdapterValidationError({
@@ -3081,14 +3180,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   };
 
   const forkThread = (threadId: ThreadId) =>
-    requireSession(threadId).pipe(
-      Effect.flatMap((session) => session.runtime.forkThread()),
-      Effect.mapError((cause) =>
-        cause._tag === "ProviderAdapterSessionNotFoundError"
-          ? cause
-          : mapCodexRuntimeError(threadId, "thread/fork", cause),
-      ),
-    );
+    testBudget !== undefined
+      ? denyTestMutation("thread/fork")
+      : requireSession(threadId).pipe(
+          Effect.flatMap((session) => session.runtime.forkThread()),
+          Effect.mapError((cause) =>
+            cause._tag === "ProviderAdapterSessionNotFoundError"
+              ? cause
+              : mapCodexRuntimeError(threadId, "thread/fork", cause),
+          ),
+        );
 
   const uploadFeedback: CodexAdapterShape["uploadFeedback"] = (input) =>
     requireSession(input.threadId).pipe(
@@ -3102,10 +3203,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
 
   const respondToRequest: CodexAdapterShape["respondToRequest"] = (threadId, requestId, decision) =>
-    requireSession(threadId).pipe(
+    requireForwardSession(threadId).pipe(
       Effect.flatMap((session) => session.runtime.respondToRequest(requestId, decision)),
       Effect.mapError((cause) =>
-        cause._tag === "ProviderAdapterSessionNotFoundError"
+        cause._tag === "ProviderAdapterSessionNotFoundError" ||
+        cause._tag === "ProviderAdapterValidationError"
           ? cause
           : mapCodexRuntimeError(threadId, "item/requestApproval/decision", cause),
       ),
@@ -3116,10 +3218,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     requestId,
     answers,
   ) =>
-    requireSession(threadId).pipe(
+    requireForwardSession(threadId).pipe(
       Effect.flatMap((session) => session.runtime.respondToUserInput(requestId, answers)),
       Effect.mapError((cause) =>
-        cause._tag === "ProviderAdapterSessionNotFoundError"
+        cause._tag === "ProviderAdapterSessionNotFoundError" ||
+        cause._tag === "ProviderAdapterValidationError"
           ? cause
           : mapCodexRuntimeError(threadId, "item/tool/requestUserInput", cause),
       ),
@@ -3131,10 +3234,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     resolution,
     _attachmentsByQuestionId,
   ) =>
-    requireSession(threadId).pipe(
+    requireForwardSession(threadId).pipe(
       Effect.flatMap((session) => session.runtime.resolveUserInput(requestId, resolution)),
       Effect.mapError((cause) =>
-        cause._tag === "ProviderAdapterSessionNotFoundError"
+        cause._tag === "ProviderAdapterSessionNotFoundError" ||
+        cause._tag === "ProviderAdapterValidationError"
           ? cause
           : mapCodexRuntimeError(threadId, "item/tool/requestUserInput", cause),
       ),
@@ -3155,9 +3259,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     }
     session.stopped = true;
     sessions.delete(session.threadId);
-    yield* session.runtime.close.pipe(Effect.ignore);
-    yield* Effect.ignore(Scope.close(session.scope, Exit.void));
-    yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
+    yield* closeSessionResources(session);
   });
 
   const stopSession: CodexAdapterShape["stopSession"] = (threadId) =>
