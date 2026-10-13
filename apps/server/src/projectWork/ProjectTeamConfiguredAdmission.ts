@@ -17,6 +17,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { PiManagedModel } from "../provider/pi/PiManagedModels.ts";
 import { decideProjectWorkCommand, type ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { projectTeamConfigurationGeneration } from "./ProjectTeamConfiguration.ts";
 import { resolveProjectTeamLimits } from "./ProjectTeamLimits.ts";
@@ -73,7 +74,7 @@ const Facts = Schema.Struct({
       source: Schema.Literal("https://api.commandcode.ai/provider/v1/models"),
       fetchedAt: Timestamp,
       selectedEntry: Schema.Struct({
-        id: Schema.Literal("inclusionai/ling-3.1-flash:free"),
+        id: PiManagedModel,
         owned_by: Schema.Literal("command-code"),
         context_length: Positive,
         supported_endpoints: Schema.Array(Schema.String.check(Schema.isMaxLength(128))).check(

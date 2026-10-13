@@ -9,8 +9,9 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { PiManagedModel, piManagedCatalogueModel } from "./PiManagedModels.ts";
+
 const source = "https://api.commandcode.ai/provider/v1/models";
-const model = "inclusionai/ling-3.1-flash:free";
 const maxBytes = 262144;
 const maxAgeMs = 24 * 60 * 60 * 1000;
 const deadlineMs = 10000;
@@ -25,7 +26,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 const SelectedEntry = Schema.Struct({
-  id: Schema.Literal(model),
+  id: PiManagedModel,
   owned_by: Schema.Literal("command-code"),
   context_length: Positive,
   supported_endpoints: Schema.Array(Schema.String.check(Schema.isMaxLength(128))).check(
@@ -206,7 +207,7 @@ export const makePiModelCatalogue = Effect.gen(function* () {
       catch: () => fail("payload"),
     });
     const remote = yield* decodeRemote(body).pipe(Effect.mapError(() => fail("payload")));
-    const selected = remote.data.filter((entry) => entry.id === model);
+    const selected = remote.data.filter((entry) => entry.id === piManagedCatalogueModel);
     if (selected.length !== 1) return yield* fail("model");
     const entry = yield* decodeSelected(selected[0]).pipe(Effect.mapError(() => fail("model")));
     yield* deadline;

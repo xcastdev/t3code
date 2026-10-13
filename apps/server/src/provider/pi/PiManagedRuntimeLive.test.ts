@@ -12830,3 +12830,35 @@ for (const readonlyKind of [undefined, "review"] as const)
         }),
       ),
   );
+
+it.effect(
+  "explicit alternate runtime inspection advertises the selected catalogue model only",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const alternate = "inclusionai/ling-3.0-flash-sante:free" as const;
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          readCatalogue: Effect.succeed({
+            source: "https://api.commandcode.ai/provider/v1/models",
+            fetchedAt: at,
+            selectedEntry: {
+              id: alternate,
+              owned_by: "command-code",
+              context_length: 20000,
+              supported_endpoints: ["/chat/completions"],
+            },
+          }),
+        });
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        expect((yield* instance.inspect).models.map((entry) => entry.slug)).toEqual([alternate]);
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+);

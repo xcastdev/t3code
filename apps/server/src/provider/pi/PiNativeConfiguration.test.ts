@@ -720,3 +720,21 @@ describe("Pi native configuration bounded reads and lifecycle", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });
+
+it.effect(
+  "explicit alternate native model retains its identity and rejects a different catalogue",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const alternate = "inclusionai/ling-3.0-flash-sante:free";
+      const selected = {
+        ...f.input,
+        selectedModel: { provider, model: alternate },
+        catalogue: { ...catalogue, selectedEntry: { ...catalogue.selectedEntry, id: alternate } },
+      };
+      expect((yield* inspectPiNativeConfiguration(selected)).model).toBe(alternate);
+      expect(
+        (yield* Effect.result(inspectPiNativeConfiguration({ ...selected, catalogue })))._tag,
+      ).toBe("Failure");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

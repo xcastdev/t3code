@@ -2,6 +2,8 @@ import * as NodeCrypto from "node:crypto";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
+import { PiManagedModel, piManagedModelRoute } from "./PiManagedModels.ts";
+
 import {
   PI_WORKER_MAX_CHUNK_BYTES,
   PI_WORKER_MAX_REQUEST_BYTES,
@@ -298,6 +300,8 @@ function canonical(value: Schema.Json): string {
     .join(",")}}`;
 }
 
+const decodeManagedModel = Schema.decodeUnknownSync(PiManagedModel);
+
 export function makePiModelBroker(input: PiModelBrokerConfig) {
   // Capture parent configuration and schemas before worker data or asynchronous callbacks can mutate it.
   let tools: ReadonlyArray<PiModelTool>;
@@ -307,13 +311,18 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
     return fail("CONFIG_TOOLS_INVALID");
   }
   const cfg = { ...input, tools, acceptedReportedModels: [...input.acceptedReportedModels] };
+  let route: ReturnType<typeof piManagedModelRoute>;
+  try {
+    route = piManagedModelRoute(decodeManagedModel(cfg.model));
+  } catch {
+    return fail("CONFIG_ROUTE_INVALID");
+  }
   if (
     cfg.provider !== "command-code" ||
-    cfg.model !== "inclusionai/ling-3.1-flash:free" ||
     cfg.endpoint !== "https://api.commandcode.ai/provider/v1/chat/completions" ||
     cfg.acceptedReportedModels.length < 1 ||
     cfg.acceptedReportedModels.length > 2 ||
-    cfg.acceptedReportedModels.some((m) => m !== cfg.model && m !== "inclusionai/ling-3.1-flash") ||
+    cfg.acceptedReportedModels.some((m) => !route.acceptedReportedModels.includes(m)) ||
     new Set(cfg.acceptedReportedModels).size !== cfg.acceptedReportedModels.length
   )
     fail("CONFIG_ROUTE_INVALID");

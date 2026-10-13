@@ -1406,3 +1406,28 @@ it.each([
   expect(f.chunks).toHaveLength(0);
   expect(JSON.stringify(f.settlements)).not.toContain(secret);
 });
+
+it("explicit alternate broker freezes matching request and reported model", async () => {
+  const alternate = "inclusionai/ling-3.0-flash-sante:free";
+  const alias = "inclusionai/ling-3.0-flash-sante";
+  const f = fixture({
+    model: alternate,
+    acceptedReportedModels: [alternate, alias],
+    transport: async () =>
+      response(success().replaceAll(reportedModel, alias).replaceAll(model, alternate)),
+  });
+  await f.invoke(requestBody({ model: alternate }));
+  expect(f.reservations[0]?.model).toBe(alternate);
+  expect(f.settlements[0]?.reportedModel).toBe(alternate);
+});
+it("explicit alternate broker denies cross-model response and full-charges unknown usage", async () => {
+  const alternate = "inclusionai/ling-3.0-flash-sante:free";
+  const f = fixture({ model: alternate, acceptedReportedModels: [alternate] });
+  await expect(f.invoke(requestBody({ model: alternate }))).rejects.toMatchObject({
+    code: "SSE_MODEL_REJECTED",
+  });
+  expect(f.settlements[0]).toMatchObject({
+    outcome: "unknown",
+    chargedInputTokens: f.cfg.maxInputTokens,
+  });
+});

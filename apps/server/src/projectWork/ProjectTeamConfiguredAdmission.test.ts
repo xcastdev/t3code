@@ -106,13 +106,26 @@ const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
 const fixture = Effect.fn("configuredAdmissionTest.fixture")(function* (
   kind: "research" | "code" = "research",
+  selectedModel = model,
 ) {
   yield* runMigrations();
   const sql = yield* SqlClient.SqlClient;
   const gateway = yield* ProjectWorkGateway;
   const repository = yield* ProjectWorkRepository;
   yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${projectId},'Project','/workspace','[]',${at},${at})`;
-  yield* gateway.write(configuration, human, source, { actor: human });
+  yield* gateway.write(
+    {
+      ...configuration,
+      profiles: configuration.profiles.map((profile) => ({ ...profile, model: selectedModel })),
+      modelPolicies: configuration.modelPolicies.map((policy) => ({
+        ...policy,
+        model: selectedModel,
+      })),
+    },
+    human,
+    source,
+    { actor: human },
+  );
   yield* repository.execute({
     type: "project-work.task.create",
     projectId,
@@ -873,4 +886,46 @@ it.effect("rejects unsafe counters and calendar deadlines on the actual configur
       ).toBe("Blocked");
     }),
   ),
+);
+
+it.effect(
+  "explicit alternate admission freezes the approved model without changing token or deadline limits",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const alternate = "inclusionai/ling-3.0-flash-sante:free" as const;
+        const f = yield* fixture("research", alternate);
+        const alternateFacts = {
+          ...facts,
+          provider: {
+            ...facts.provider,
+            catalogue: {
+              ...facts.provider.catalogue,
+              selectedEntry: { ...facts.provider.catalogue.selectedEntry, id: alternate },
+            },
+          },
+        };
+        const prepared = prepareProjectTeamConfiguredAdmission({
+          state: f.state,
+          taskId: f.taskId,
+          nowMs,
+          facts: alternateFacts,
+        });
+        expect(prepared._tag).toBe("Prepared");
+        if (prepared._tag !== "Prepared") return yield* Effect.die(prepared.reason);
+        yield* f.journal.reserve(prepared.request);
+        const state = yield* readCurrentState(f.sql, projectId);
+        const binding = state.foundationRecords?.find((record) => record.kind === "run-binding");
+        expect(binding).toMatchObject({
+          kind: "run-binding",
+          model: alternate,
+          configuration: { maxTokens: 8192, maxDurationMs: 60000 },
+        });
+        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+        expect(
+          prepareProjectTeamConfiguredAdmission({ state: f.state, taskId: f.taskId, nowMs, facts })
+            ._tag,
+        ).not.toBe("Prepared");
+      }),
+    ),
 );

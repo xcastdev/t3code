@@ -27,7 +27,7 @@ const now = 1790812800000;
 const at = "2026-10-01T00:00:00.000Z";
 const day = 24 * 60 * 60 * 1000;
 const entry = {
-  id: "inclusionai/ling-3.1-flash:free",
+  id: "inclusionai/ling-3.0-flash-sante:free",
   owned_by: "command-code",
   context_length: 262144,
   supported_endpoints: ["/chat/completions"],
@@ -148,7 +148,7 @@ it.effect(
 );
 
 for (const [name, entries] of [
-  ["missing free route", [{ ...entry, id: "inclusionai/ling-3.1-flash" }]],
+  ["missing free route", [{ ...entry, id: "inclusionai/ling-3.0-flash-sante" }]],
   ["duplicate free route", [entry, entry]],
   ["wrong owner", [{ ...entry, owned_by: "openai" }]],
   ["zero context", [{ ...entry, context_length: 0 }]],
@@ -573,4 +573,40 @@ it.effect("the actual final SQL receipt cannot outrun the deadline timer", () =>
       expect(yield* f.rows).toEqual(before);
     }),
   ),
+);
+
+it.effect("explicit alternate catalogue selects Ling3.0 without falling back to Ling3.1", () =>
+  memory(
+    Effect.gen(function* () {
+      yield* setup;
+      const alternate = entry;
+      const previous = { ...entry, id: "inclusionai/ling-3.1-flash:free" };
+      const h = make(() => response({ object: "list", data: [previous, alternate] }));
+      const service = yield* h.service;
+      expect((yield* service.refresh).selectedEntry.id).toBe(alternate.id);
+      expect((yield* service.readFresh)?.selectedEntry.id).toBe(alternate.id);
+      expect(h.calls).toHaveLength(1);
+    }),
+  ),
+);
+
+it.effect(
+  "explicit alternate refresh preserves readable old cache and refuses fallback when absent",
+  () =>
+    memory(
+      Effect.gen(function* () {
+        const f = yield* setup;
+        const previous = {
+          ...catalogue,
+          selectedEntry: { ...entry, id: "inclusionai/ling-3.1-flash:free" },
+        };
+        yield* f.seed(previous);
+        const service = yield* make(() =>
+          response({ object: "list", data: [previous.selectedEntry] }),
+        ).service;
+        expect((yield* service.readFresh)?.selectedEntry.id).toBe(previous.selectedEntry.id);
+        expect((yield* Effect.result(service.refresh))._tag).toBe("Failure");
+        expect((yield* service.readFresh)?.selectedEntry.id).toBe(previous.selectedEntry.id);
+      }),
+    ),
 );

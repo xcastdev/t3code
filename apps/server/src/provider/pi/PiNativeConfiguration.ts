@@ -10,8 +10,9 @@ import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
+import { PiManagedModel } from "./PiManagedModels.ts";
+
 const provider = "command-code";
-const model = "inclusionai/ling-3.1-flash:free";
 const baseUrl = "https://api.commandcode.ai/provider/v1";
 const endpoint = `${baseUrl}/chat/completions`;
 const catalogueSource = `${baseUrl}/models`;
@@ -32,7 +33,7 @@ const Catalogue = Schema.Struct({
   source: Schema.Literal(catalogueSource),
   fetchedAt: FetchedAt,
   selectedEntry: Schema.Struct({
-    id: Schema.Literal(model),
+    id: PiManagedModel,
     owned_by: Schema.Literal(provider),
     context_length: PositiveInteger,
     supported_endpoints: Schema.Array(Schema.String).check(
@@ -51,7 +52,7 @@ const Input = Schema.Struct({
   agentDirectory: Directory,
   selectedModel: Schema.Struct({
     provider: Schema.Literal(provider),
-    model: Schema.Literal(model),
+    model: PiManagedModel,
   }),
   catalogue: Catalogue,
   limits: Limits,
@@ -81,7 +82,7 @@ const NativeProvider = Schema.Struct({
   ),
 });
 const NativeModel = Schema.Struct({
-  id: Schema.Literal(model),
+  id: PiManagedModel,
   baseUrl: Schema.optional(Schema.Literal(baseUrl)),
   api: Schema.optional(Schema.Literal("openai-completions")),
   contextWindow: Schema.optional(PositiveInteger),
@@ -281,6 +282,7 @@ export const inspectPiNativeConfiguration = Effect.fn("inspectPiNativeConfigurat
   if (DateTime.formatIso(fetchedAt) !== value.catalogue.fetchedAt)
     return yield* unavailable("configuration");
   const advertised = value.catalogue.selectedEntry;
+  if (advertised.id !== value.selectedModel.model) return yield* unavailable("configuration");
   if (
     value.limits.maxInputTokens + value.limits.maxOutputTokens > advertised.context_length ||
     (advertised.max_output_tokens !== undefined &&
@@ -299,7 +301,8 @@ export const inspectPiNativeConfiguration = Effect.fn("inspectPiNativeConfigurat
       const configured = yield* decodeNativeProvider(selectedProvider).pipe(
         Effect.mapError(() => unavailable("native-configuration")),
       );
-      const selected = configured.models?.filter((entry) => entry.id === model) ?? [];
+      const selected =
+        configured.models?.filter((entry) => entry.id === value.selectedModel.model) ?? [];
       if (selected.length > 1) return yield* unavailable("native-configuration");
       if (selected[0] !== undefined) {
         const configuredModel = yield* decodeNativeModel(selected[0]).pipe(
@@ -319,7 +322,7 @@ export const inspectPiNativeConfiguration = Effect.fn("inspectPiNativeConfigurat
   // Freshness (including the root's 24-hour policy) and current SQL authorization remain caller obligations.
   return Object.freeze({
     provider,
-    model,
+    model: value.selectedModel.model,
     api: "openai-completions" as const,
     endpoint,
     contextWindow: advertised.context_length,

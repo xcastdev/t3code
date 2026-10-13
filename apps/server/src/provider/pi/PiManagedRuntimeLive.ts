@@ -85,9 +85,9 @@ import {
   validatePiManagedSkillPlan,
 } from "./PiManagedSkillResources.ts";
 
+import { PiManagedModel, piManagedModelRoute, piManagedModels } from "./PiManagedModels.ts";
+
 const provider = ProviderDriverKind.make("piAgent");
-const routeId = "command-code-ling-free";
-const model = "inclusionai/ling-3.1-flash:free";
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeBinding = Schema.decodeUnknownSync(ProjectTeamRunBinding);
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
@@ -604,7 +604,7 @@ export interface PiManagedRuntimeLiveOptions {
         readonly source: "https://api.commandcode.ai/provider/v1/models";
         readonly fetchedAt: string;
         readonly selectedEntry: {
-          readonly id: "inclusionai/ling-3.1-flash:free";
+          readonly id: typeof PiManagedModel.Type;
           readonly owned_by: "command-code";
           readonly context_length: number;
           readonly supported_endpoints: ReadonlyArray<string>;
@@ -646,13 +646,19 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const skillRepository = yield* Effect.serviceOption(ManagedSkillRepository);
   const serverConfig = yield* Effect.serviceOption(ServerConfig);
   const materialization = yield* Effect.serviceOption(SkillMaterializationService);
-  const accounting = yield* makeAccounting({
-    environmentId: options.environmentId,
-    routeId,
-    model,
-    acceptedReportedModels: [model, "inclusionai/ling-3.1-flash"],
-    resolveOperation: operations.resolveOperation,
-  });
+  const accountings = yield* Effect.forEach(piManagedModels, (model) =>
+    Effect.gen(function* () {
+      const route = piManagedModelRoute(model);
+      const accounting = yield* makeAccounting({
+        environmentId: options.environmentId,
+        routeId: route.routeId,
+        model,
+        acceptedReportedModels: route.acceptedReportedModels,
+        resolveOperation: operations.resolveOperation,
+      });
+      return { model, accounting };
+    }),
+  );
   const crypto = yield* Crypto.Crypto;
   const clock = yield* Clock.Clock;
   const fs = yield* FileSystem.FileSystem;
@@ -846,7 +852,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
       return yield* deny("Pi request limits exceed the frozen run budget");
     return yield* inspectPiNativeConfiguration({
       agentDirectory,
-      selectedModel: { provider: "command-code", model },
+      selectedModel: {
+        provider: "command-code",
+        model: authority?.binding.model ?? catalogue.selectedEntry.id,
+      },
       catalogue,
       limits: {
         maxInputTokens,
@@ -923,7 +932,12 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
               enabled: instance.enabled,
               checkedAt,
               models: [
-                { slug: model, name: "Ling 3.1 Flash (free)", isCustom: false, capabilities: {} },
+                {
+                  slug: native.model,
+                  name: piManagedModelRoute(native.model).name,
+                  isCustom: false,
+                  capabilities: {},
+                },
               ],
               probe: {
                 installed: true,
@@ -1850,6 +1864,11 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       }
                     }),
                   );
+                const route = piManagedModelRoute(nativeConfig.model);
+                const accounting = accountings.find(
+                  (entry) => entry.model === nativeConfig.model,
+                )?.accounting;
+                if (!accounting) return yield* deny("Selected model accounting is unavailable");
                 const runtime = yield* makePiSessionRuntime({
                   identity: workerIdentity,
                   operation,
@@ -2093,11 +2112,11 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   broker: {
                     ...workerIdentity,
                     operationId: operation.operationId,
-                    routeId,
+                    routeId: route.routeId,
                     provider: nativeConfig.provider,
                     model: nativeConfig.model,
                     endpoint: nativeConfig.endpoint,
-                    acceptedReportedModels: [model, "inclusionai/ling-3.1-flash"],
+                    acceptedReportedModels: route.acceptedReportedModels,
                     tools,
                     maxInputTokens: nativeConfig.maxInputTokens,
                     maxOutputTokens: nativeConfig.maxOutputTokens,
