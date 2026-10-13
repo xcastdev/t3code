@@ -3673,6 +3673,7 @@ const monitoredLayer = (options: {
     NonNullable<Parameters<typeof makeCodexAdapter>[1]>["makeRuntime"]
   >;
   readonly assertCurrent?: Effect.Effect<void, CodexTestBudgetError>;
+  readonly owner?: Scope.Closeable;
 }) =>
   Layer.effect(
     CodexAdapter,
@@ -3689,10 +3690,13 @@ const monitoredLayer = (options: {
         },
         assertCurrent: options.assertCurrent ?? Effect.void,
       });
-      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+      const create = makeCodexAdapter(decodeCodexSettings({}), {
         makeRuntime: options.makeRuntime,
         testBudget: budget,
       });
+      return yield* options.owner === undefined
+        ? create
+        : create.pipe(Effect.provideService(Scope.Scope, options.owner));
     }),
   ).pipe(
     Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
@@ -3846,3 +3850,64 @@ it.effect("monitored Codex rejects a child request before its spawn notification
     NodeAssert.equal(runtime.respondToRequestImpl.mock.calls.length, 0);
   }).pipe(Effect.provide(monitoredLayer({ makeRuntime: factory.factory })));
 });
+
+it.effect("monitored Codex adapter shutdown waits for both session resource drains", () =>
+  Effect.gen(function* () {
+    const closeBegan = yield* Deferred.make<void>();
+    const allowClose = yield* Deferred.make<void>();
+    const ownerClosing = yield* Deferred.make<void>();
+    const owner = yield* Scope.make("sequential");
+    yield* Effect.addFinalizer(() => Scope.close(owner, Exit.void));
+    const released: ThreadId[] = [];
+    const runtimes: FakeCodexRuntime[] = [];
+    const layer = monitoredLayer({
+      owner,
+      makeRuntime: (options) =>
+        Effect.gen(function* () {
+          yield* Effect.acquireRelease(Effect.void, () =>
+            Effect.sync(() => {
+              released.push(options.threadId);
+            }),
+          );
+          const runtime = new FakeCodexRuntime(options);
+          if (runtimes.length === 0)
+            runtime.close = Deferred.succeed(closeBegan, undefined).pipe(
+              Effect.andThen(Deferred.await(allowClose)),
+              Effect.as(undefined),
+            );
+          runtimes.push(runtime);
+          return runtime;
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      for (const id of ["worker", "reviewer"])
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId(id),
+          runtimeMode: "approval-required",
+          modelSelection: monitoredSelection,
+        });
+      NodeAssert.ok(runtimes[0]);
+      yield* runtimes[0].emit(
+        codexTokenUsageEvent({
+          id: "shutdown-overshoot",
+          turnId: "turn-1",
+          inputTokens: 70_000,
+          cachedInputTokens: 0,
+          cacheCreationTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+        }),
+      );
+      yield* Deferred.await(closeBegan);
+      yield* Scope.addFinalizer(owner, Deferred.succeed(ownerClosing, undefined));
+      const closing = yield* Scope.close(owner, Exit.void).pipe(Effect.forkChild);
+      yield* Deferred.await(ownerClosing);
+      yield* Deferred.succeed(allowClose, undefined);
+      yield* Fiber.join(closing);
+      NodeAssert.deepEqual(released.toSorted(), [asThreadId("reviewer"), asThreadId("worker")]);
+      NodeAssert.deepEqual(yield* adapter.listSessions(), []);
+    }).pipe(Effect.provide(layer));
+  }),
+);

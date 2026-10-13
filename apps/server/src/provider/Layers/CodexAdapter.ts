@@ -2402,6 +2402,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     }
   >();
   const adapterScope = yield* Scope.Scope;
+  const testCleanupScope = testBudget === undefined ? undefined : yield* Scope.make("sequential");
+  if (testCleanupScope !== undefined)
+    yield* Effect.addFinalizer(() => Scope.close(testCleanupScope, Exit.void));
   let testStopping = false;
   let testCleanup: Fiber.Fiber<void, never> | undefined;
   const closeSessionResources = Effect.fn("CodexAdapter.closeSessionResources")(function* (
@@ -2442,7 +2445,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         { concurrency: 1, discard: true },
       );
       yield* Effect.forEach(active, closeSessionResources, { concurrency: 1, discard: true });
-    }).pipe(Effect.forkIn(adapterScope));
+    }).pipe(Effect.forkIn(testCleanupScope ?? adapterScope));
   });
   const authorizeTest = Effect.fn("CodexAdapter.authorizeTest")(function* (
     selection: Parameters<NonNullable<typeof testBudget>["authorize"]>[0],
@@ -3301,7 +3304,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   }
 
   yield* Effect.acquireRelease(Effect.void, () =>
-    stopAll().pipe(
+    Effect.gen(function* () {
+      if (testBudget !== undefined) {
+        yield* requestTestStop();
+        if (testCleanup !== undefined) yield* Fiber.join(testCleanup);
+      } else yield* stopAll();
+    }).pipe(
       Effect.andThen(Queue.shutdown(runtimeEventQueue)),
       Effect.andThen(managedNativeEventLogger?.close() ?? Effect.void),
       Effect.ignore,
