@@ -183,6 +183,10 @@ export type PiModelBrokerErrorCode =
   | "SSE_USAGE_OVER_RESERVATION"
   | "TRANSPORT_DRAIN_FAILED"
   | "TRANSPORT_FAILED"
+  | `TRANSPORT_RESPONSE_HTTP_${number}`
+  | "TRANSPORT_RESPONSE_REDIRECTED"
+  | "TRANSPORT_RESPONSE_BODY_MISSING"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED"
   | "TRANSPORT_RESPONSE_REJECTED";
 
 export class PiModelBrokerError extends Error {
@@ -523,15 +527,19 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         }
       }
       check();
-      if (
-        response.redirected ||
-        response.status !== 200 ||
-        !reader ||
-        response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !==
-          "text/event-stream"
-      ) {
+      if (response.redirected) fail("TRANSPORT_RESPONSE_REDIRECTED");
+      // Retain bounded response facts only; bodies and arbitrary headers never enter receipts.
+      if (response.status !== 200) {
+        if (Number.isInteger(response.status) && response.status >= 100 && response.status <= 599)
+          fail(`TRANSPORT_RESPONSE_HTTP_${response.status}`);
         fail("TRANSPORT_RESPONSE_REJECTED");
       }
+      if (!reader) fail("TRANSPORT_RESPONSE_BODY_MISSING");
+      if (
+        response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !==
+        "text/event-stream"
+      )
+        fail("TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED");
       controller.signal.addEventListener("abort", cancelReader, { once: true });
       if (controller.signal.aborted) cancelReader();
       const secret = Buffer.from(credential);

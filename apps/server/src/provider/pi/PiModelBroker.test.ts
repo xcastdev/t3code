@@ -454,7 +454,7 @@ it.each([301, 307, 429, 500])(
         return new Response(secret, { status });
       },
     });
-    await expect(f.invoke()).rejects.toThrow("TRANSPORT_RESPONSE_REJECTED");
+    await expect(f.invoke()).rejects.toMatchObject({ code: `TRANSPORT_RESPONSE_HTTP_${status}` });
     expect(calls).toBe(1);
     expect(f.settlements[0]).toMatchObject({ outcome: "unknown", chargedInputTokens: 20_000 });
   },
@@ -791,7 +791,7 @@ it("records failed rejected-response drain without releasing capacity", async ()
         { status: 429 },
       ),
   });
-  await expect(f.invoke()).rejects.toThrow("TRANSPORT_RESPONSE_REJECTED");
+  await expect(f.invoke()).rejects.toMatchObject({ code: "TRANSPORT_RESPONSE_HTTP_429" });
   expect(f.settlements[0]).toMatchObject({ transportDrained: false, outcome: "unknown" });
 });
 
@@ -847,7 +847,9 @@ it("rejects non-native response content types and credential errors without work
     transport: async () =>
       new Response(secret, { headers: { "content-type": "text/event-streaming" } }),
   });
-  await expect(f.invoke()).rejects.toThrow("TRANSPORT_RESPONSE_REJECTED");
+  await expect(f.invoke()).rejects.toMatchObject({
+    code: "TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED",
+  });
   expect(f.chunks).toHaveLength(0);
   const g = fixture({
     getCredential: async () => {
@@ -1341,4 +1343,66 @@ describe("retained dispatch broker operation IDs", () => {
     expect(f.settlements).toEqual([]);
     expect(f.transports).toEqual([]);
   });
+});
+
+it.each([401, 403, 429, 500])(
+  "retains only HTTP %i status in rejected model accounting",
+  async (status) => {
+    let canceled = false;
+    const f = fixture({
+      transport: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            cancel() {
+              canceled = true;
+            },
+          }),
+          {
+            status,
+            headers: { "content-type": "application/json", "x-private-provider-detail": secret },
+          },
+        ),
+    });
+    const expected = `TRANSPORT_RESPONSE_HTTP_${status}`;
+    await expect(f.invoke()).rejects.toMatchObject({ code: expected, message: expected });
+    expect(canceled).toBe(true);
+    expect(f.chunks).toHaveLength(0);
+    expect(f.settlements).toHaveLength(1);
+    expect(f.settlements[0]).toMatchObject({
+      failureCode: expected,
+      outcome: "unknown",
+      transportDrained: true,
+      chargedInputTokens: 20000,
+      chargedOutputTokens: 512,
+    });
+    expect(JSON.stringify(f.settlements)).not.toContain(secret);
+  },
+);
+
+it.each([
+  { name: "missing body", make: () => new Response(null), code: "TRANSPORT_RESPONSE_BODY_MISSING" },
+  {
+    name: "wrong content type",
+    make: () => new Response(secret, { headers: { "content-type": secret } }),
+    code: "TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED",
+  },
+  {
+    name: "redirected response",
+    make: () => {
+      const result = new Response(secret);
+      Object.defineProperty(result, "redirected", { value: true });
+      return result;
+    },
+    code: "TRANSPORT_RESPONSE_REDIRECTED",
+  },
+])("retains only the response policy for $name", async ({ make, code }) => {
+  const f = fixture({ transport: async () => make() });
+  await expect(f.invoke()).rejects.toMatchObject({ code, message: code });
+  expect(f.settlements[0]).toMatchObject({
+    failureCode: code,
+    outcome: "unknown",
+    transportDrained: true,
+  });
+  expect(f.chunks).toHaveLength(0);
+  expect(JSON.stringify(f.settlements)).not.toContain(secret);
 });
