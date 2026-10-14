@@ -1153,13 +1153,18 @@ it.effect(
     ),
 );
 
-for (const status of [401, 403, 429, 500])
-  it.effect(`retains bounded HTTP diagnostic accounting ${status}`, () =>
+for (const failureCode of [
+  ...[401, 403, 429, 500].map((status) => `TRANSPORT_RESPONSE_HTTP_${status}` as const),
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING",
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_JSON",
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_HTML",
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT",
+] as const)
+  it.effect(`retains bounded response diagnostic accounting ${failureCode}`, () =>
     fileTest((path) =>
       Effect.gen(function* () {
         const f = yield* fixture;
         const reservation = yield* f.accounting.reserve(f.principal, request());
-        const failureCode = `TRANSPORT_RESPONSE_HTTP_${status}` as const;
         const value = {
           ...unknown(reservation.reservationId),
           failureCode,

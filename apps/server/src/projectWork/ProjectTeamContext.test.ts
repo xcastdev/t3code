@@ -3746,8 +3746,14 @@ for (const corruption of ["missing", "malformed", "kind", "thread", "operation",
     ),
   );
 
-for (const status of [401, 403, 429, 500])
-  it.effect(`reconstructs bounded HTTP diagnostic context ${status}`, () =>
+for (const failureCode of [
+  ...[401, 403, 429, 500].map((status) => `TRANSPORT_RESPONSE_HTTP_${status}` as const),
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING",
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_JSON",
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_HTML",
+  "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT",
+] as const)
+  it.effect(`reconstructs bounded response diagnostic context ${failureCode}`, () =>
     scoped(
       Effect.gen(function* () {
         const f = yield* budgetFixture;
@@ -3757,7 +3763,7 @@ for (const status of [401, 403, 429, 500])
           reservationId: reserved.reservationId,
           transportDrained: false,
           outcome: "unknown",
-          failureCode: `TRANSPORT_RESPONSE_HTTP_${status}`,
+          failureCode,
           chargedInputTokens: 100,
           chargedOutputTokens: 100,
         });

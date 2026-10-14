@@ -201,6 +201,10 @@ export type PiModelBrokerErrorCode =
   | "TRANSPORT_RESPONSE_REDIRECTED"
   | "TRANSPORT_RESPONSE_BODY_MISSING"
   | "TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_JSON"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_HTML"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT"
   | "TRANSPORT_RESPONSE_REJECTED";
 
 export class PiModelBrokerError extends Error {
@@ -639,11 +643,15 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         fail("TRANSPORT_RESPONSE_REJECTED");
       }
       if (!reader) fail("TRANSPORT_RESPONSE_BODY_MISSING");
-      if (
-        response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !==
-        "text/event-stream"
-      )
+      const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+      if (contentType !== "text/event-stream") {
+        // Retain fixed categories so failed requests can be diagnosed without provider headers/bodies.
+        if (!contentType) fail("TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING");
+        if (contentType === "application/json") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_JSON");
+        if (contentType === "text/html") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_HTML");
+        if (contentType === "text/plain") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT");
         fail("TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED");
+      }
       controller.signal.addEventListener("abort", cancelReader, { once: true });
       if (controller.signal.aborted) cancelReader();
       const secret = Buffer.from(credential);

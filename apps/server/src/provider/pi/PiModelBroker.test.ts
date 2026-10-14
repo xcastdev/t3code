@@ -1436,3 +1436,39 @@ it("explicit alternate broker denies cross-model response and full-charges unkno
     chargedInputTokens: f.cfg.maxInputTokens,
   });
 });
+
+it.each([
+  [undefined, "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING"],
+  ["application/json; charset=utf-8", "TRANSPORT_RESPONSE_CONTENT_TYPE_JSON"],
+  ["TEXT/HTML; charset=utf-8", "TRANSPORT_RESPONSE_CONTENT_TYPE_HTML"],
+  ["text/plain", "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT"],
+] as const)("retains only the rejected response MIME category %s", async (contentType, code) => {
+  let canceled = false;
+  const f = fixture({
+    transport: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          cancel() {
+            canceled = true;
+          },
+        }),
+        {
+          headers:
+            contentType === undefined
+              ? {}
+              : { "content-type": contentType, "x-private-provider-detail": secret },
+        },
+      ),
+  });
+  await expect(f.invoke()).rejects.toMatchObject({ code, message: code });
+  expect(canceled).toBe(true);
+  expect(f.chunks).toHaveLength(0);
+  expect(f.settlements).toHaveLength(1);
+  expect(f.settlements[0]).toMatchObject({
+    failureCode: code,
+    outcome: "unknown",
+    transportDrained: true,
+  });
+  expect(JSON.stringify(f.settlements)).not.toContain(secret);
+  expect(JSON.stringify(f.settlements)).not.toContain(contentType ?? "content-type");
+});
