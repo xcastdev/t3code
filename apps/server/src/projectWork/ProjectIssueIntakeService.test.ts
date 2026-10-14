@@ -5,6 +5,8 @@ import {
   ProjectWorkApprovalId,
   ProjectWorkCriterionId,
   ProjectWorkTaskId,
+  type ProjectTeamGuidedIntent,
+  type ProjectTeamRecord,
   ProjectIssueIntake,
   canonicalProjectWorkPayload,
 } from "@t3tools/contracts";
@@ -545,6 +547,200 @@ it.effect(
           expect(current.criteria.filter((criterion) => criterion.taskId === taskId)).toEqual(
             criteriaBefore,
           );
+        }
+      }),
+    ),
+);
+
+it.effect(
+  "actual SQL intake preserves managed approved specification and plan records across issue pages",
+  () =>
+    memory(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        yield* f.bind();
+        const linked = yield* seedLinked(f);
+        const taskId = ProjectWorkTaskId.make("local-task");
+        const criterionId = ProjectWorkCriterionId.make("managed-intake-criterion");
+        const human = {
+          actor: { kind: "human" as const, id: "maintainer" },
+          source: { kind: "web" as const, id: "intake-managed-regression" },
+          recordedAt: now,
+        };
+        const envelope = Effect.fn("intakeTest.managedEnvelope")(function* (command: string) {
+          const state = yield* readCurrentState(f.sql, "a");
+          const task = state.tasks.find((entry) => entry.taskId === taskId);
+          if (task === undefined) throw new Error("Missing linked task");
+          return {
+            projectId: ProjectId.make("a"),
+            taskId,
+            commandId: CommandId.make(command),
+            expectedRevision: state.revision,
+            expectedTaskRevision: task.revision,
+          };
+        });
+        const guided = (intent: ProjectTeamGuidedIntent) =>
+          f.repo.execute({
+            type: "project-work.foundation.commit",
+            projectId: ProjectId.make("a"),
+            commandId: intent.commandId,
+            expectedRevision: intent.expectedRevision,
+            records: [],
+            committedAt: now,
+            attribution: human,
+            guided: { intent },
+          });
+        const approveGates = Effect.fn("intakeTest.managedApproveGates")(function* () {
+          const state = yield* readCurrentState(f.sql, "a");
+          const gates =
+            state.foundationRecords?.filter(
+              (record): record is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+                record.kind === "gate" && record.status === "pending",
+            ) ?? [];
+          yield* f.repo.execute({
+            type: "project-work.foundation.commit",
+            projectId: ProjectId.make("a"),
+            commandId: CommandId.make(`managed-intake-approve-${state.revision}`),
+            expectedRevision: state.revision,
+            records: gates.map((gate) => ({
+              ...gate,
+              status: "approved" as const,
+              revision: gate.revision + 1,
+            })),
+            committedAt: now,
+            attribution: human,
+          });
+        });
+        yield* guided({
+          ...(yield* envelope("managed-intake-spec")),
+          type: "project-team.specification.propose",
+          expectedSpecRevision: 0,
+          specification: {
+            objective: "Preserve the approved managed task scope during issue synchronization",
+            scopeIn: "Retain the managed specification, plan, and criterion snapshots",
+            scopeOut: "Changing managed execution policy or task scope",
+            criterionIds: [criterionId],
+            revision: 1,
+            protected: false,
+          },
+          criterionSnapshots: [
+            {
+              criterionId,
+              taskId,
+              description: "Verify issue intake preserves the approved managed scope",
+              required: true,
+              status: "unsatisfied",
+              satisfiedByEvidenceIds: [],
+              revision: 0,
+              updatedAt: now,
+            },
+          ],
+        });
+        yield* approveGates();
+        const planContent = "Preserve and verify the approved managed scope during intake";
+        const stateBeforePlan = yield* readCurrentState(f.sql, "a");
+        const taskBeforePlan = stateBeforePlan.tasks.find((task) => task.taskId === taskId);
+        if (taskBeforePlan === undefined) throw new Error("Missing linked task");
+        yield* guided({
+          projectId: ProjectId.make("a"),
+          taskId,
+          commandId: CommandId.make("managed-intake-plan"),
+          expectedRevision: stateBeforePlan.revision,
+          expectedTaskRevision: taskBeforePlan.revision,
+          type: "project-team.plan.propose",
+          specRevision: 1,
+          content: planContent,
+          dependencyTaskIds: [],
+        });
+        yield* approveGates();
+
+        const approved = yield* readCurrentState(f.sql, "a");
+        const taskRecords =
+          approved.foundationRecords?.filter(
+            (record) => record.kind !== "issue" && "taskId" in record && record.taskId === taskId,
+          ) ?? [];
+        const criteria = approved.criteria.filter((criterion) => criterion.taskId === taskId);
+        const tasks = approved.tasks;
+        const history = (yield* f.repo.replay("a")).filter(
+          (event) =>
+            ("taskId" in event && event.taskId === taskId) ||
+            ("task" in event && event.task.taskId === taskId) ||
+            ("criterion" in event && event.criterion.taskId === taskId) ||
+            ("record" in event &&
+              event.record.kind !== "issue" &&
+              "taskId" in event.record &&
+              event.record.taskId === taskId),
+        );
+        expect(
+          taskRecords.some(
+            (record) => record.kind === "task-membership" && record.taskId === taskId,
+          ),
+        ).toBe(true);
+        expect(
+          taskRecords.some(
+            (record) => record.kind === "plan-revision" && record.content === planContent,
+          ),
+        ).toBe(true);
+        expect(
+          taskRecords.filter((record) => record.kind === "gate" && record.status === "approved"),
+        ).toHaveLength(2);
+        expect(criteria).toHaveLength(1);
+        const assertManagedScope = Effect.fn("intakeTest.assertManagedScope")(function* () {
+          const current = yield* readCurrentState(f.sql, "a");
+          expect(current.tasks).toEqual(tasks);
+          expect(current.criteria.filter((criterion) => criterion.taskId === taskId)).toEqual(
+            criteria,
+          );
+          expect(
+            current.foundationRecords?.filter(
+              (record) => record.kind !== "issue" && "taskId" in record && record.taskId === taskId,
+            ) ?? [],
+          ).toEqual(taskRecords);
+          expect(
+            (yield* f.repo.replay("a")).filter(
+              (event) =>
+                ("taskId" in event && event.taskId === taskId) ||
+                ("task" in event && event.task.taskId === taskId) ||
+                ("criterion" in event && event.criterion.taskId === taskId) ||
+                ("record" in event &&
+                  event.record.kind !== "issue" &&
+                  "taskId" in event.record &&
+                  event.record.taskId === taskId),
+            ),
+          ).toEqual(history);
+        });
+        const newer = {
+          ...issue,
+          title: "Managed task linked issue update",
+          updatedAt: "2026-10-01T00:20:00Z",
+        };
+        const accepted = yield* f.commit(yield* f.claim(), response([newer]));
+        expect(accepted.accepted).toBe(true);
+        expect((yield* issues(f.sql))[0]).toMatchObject({
+          recordId: linked.recordId,
+          taskId,
+          title: newer.title,
+        });
+        yield* assertManagedScope();
+        for (const stale of [
+          newer,
+          { ...newer, title: "Older update", updatedAt: "2026-10-01T00:15:00Z" },
+        ]) {
+          const replayed = yield* f.commit(yield* f.claim(), response([stale]));
+          expect(replayed.results).toEqual([]);
+          yield* assertManagedScope();
+        }
+        const lease = yield* f.claim();
+        for (const conflicting of [
+          { ...newer, body: "Conflicting body at the same revision" },
+          { ...newer, nodeId: "I_managed_replaced" },
+        ]) {
+          const before = yield* snapshot(f.sql);
+          expect((yield* f.commit(lease, response([conflicting])).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          expect(yield* snapshot(f.sql)).toEqual(before);
+          yield* assertManagedScope();
         }
       }),
     ),
