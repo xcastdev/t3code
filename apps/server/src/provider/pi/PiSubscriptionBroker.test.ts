@@ -390,6 +390,303 @@ describe("Pi OpenAI subscription broker", () => {
       expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
     }
   });
+
+  it.each([
+    "conflicting-partial-delta",
+    "empty-partial-delta",
+    "no-delta-invalid-json",
+    "foreign-item-id",
+  ] as const)(
+    "review R3 rejects invalid or mismatched completed arguments: %s",
+    async (mutation) => {
+      const parameters = {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false,
+      };
+      const declared = {
+        type: "function" as const,
+        function: { name: "read", description: "Read a file", parameters },
+      };
+      const call = {
+        id: "fc_1",
+        type: "function_call",
+        call_id: "call-1",
+        name: "read",
+        arguments: '{"path":"README.md"}',
+      };
+      const conflicting = '{"path":"other.md"}';
+      const completedArguments =
+        mutation === "no-delta-invalid-json"
+          ? '{"path":'
+          : mutation === "foreign-item-id"
+            ? call.arguments
+            : conflicting;
+      const data =
+        event({
+          type: "response.created",
+          response: { id: "response-1", model, status: "in_progress" },
+        }) +
+        event({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { id: "reasoning-1", type: "reasoning", summary: [], content: [] },
+        }) +
+        event({
+          type: "response.output_item.done",
+          output_index: 0,
+          item: { id: "reasoning-1", type: "reasoning", summary: [], content: [] },
+        }) +
+        event({
+          type: "response.output_item.added",
+          output_index: 1,
+          item: { ...call, arguments: "" },
+        }) +
+        (mutation === "conflicting-partial-delta" || mutation === "empty-partial-delta"
+          ? event({
+              type: "response.function_call_arguments.delta",
+              item_id: call.id,
+              output_index: 1,
+              delta: mutation === "empty-partial-delta" ? "" : call.arguments,
+            })
+          : "") +
+        event({
+          type: "response.function_call_arguments.done",
+          item_id: mutation === "foreign-item-id" ? "foreign-item" : call.id,
+          output_index: 1,
+          arguments: completedArguments,
+        }) +
+        event({
+          type: "response.output_item.done",
+          output_index: 1,
+          item: { ...call, arguments: completedArguments },
+        }) +
+        event({
+          type: "response.completed",
+          response: {
+            id: "response-1",
+            model,
+            status: "completed",
+            output: [
+              { id: "reasoning-1", type: "reasoning", summary: [], content: [] },
+              { ...call, arguments: completedArguments },
+            ],
+            usage: { input_tokens: 50, output_tokens: 10, total_tokens: 60 },
+          },
+        });
+      const f = fixture({
+        tools: [declared],
+        transport: async () =>
+          new Response(data, { headers: { "content-type": "text/event-stream" } }),
+      });
+      let brokerFailure: unknown;
+      let joined: Promise<void> | undefined;
+      const sdk = streamCodexResponses(
+        sdkModel,
+        normalizeContext({
+          systemPrompt: "Trusted assignment",
+          messages: [{ role: "user", content: "Investigate", timestamp: 1 }],
+          tools: [
+            {
+              name: "read",
+              description: declared.function.description,
+              parameters: Type.Unsafe<{ path: string }>(parameters),
+            },
+          ],
+        }),
+        {
+          apiKey: credential,
+          reasoningEffort: "high",
+          serviceTier: "default",
+          transport: "sse",
+          maxRetries: 0,
+          fetch: async (_url, init) => {
+            const encoded = init?.body;
+            const request =
+              typeof encoded === "string"
+                ? encoded
+                : encoded instanceof Uint8Array &&
+                    new Headers(init?.headers).get("content-encoding") === "zstd"
+                  ? process
+                      .getBuiltinModule("node:zlib")!
+                      .zstdDecompressSync(encoded, { maxOutputLength: 16384 })
+                      .toString("utf8")
+                  : undefined;
+            if (request === undefined) throw Error("SDK request body must be bounded JSON");
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  joined = f
+                    .invoke(request, (chunk) => controller.enqueue(chunk))
+                    .then(
+                      () => controller.close(),
+                      (error: unknown) => {
+                        brokerFailure = error;
+                        controller.error(error);
+                      },
+                    );
+                },
+              }),
+              { headers: { "content-type": "text/event-stream" } },
+            );
+          },
+        },
+      );
+      const result = await sdk.result();
+      expect(joined).toBeDefined();
+      await joined;
+      expect(brokerFailure).toMatchObject({ code: "SSE_TOOL_INVALID" });
+      expect(result.stopReason).toBe("error");
+      expect(
+        result.content.some(
+          (part) => part.type === "toolCall" && JSON.stringify(part.arguments).includes("other.md"),
+        ),
+      ).toBe(false);
+      expect(f.settlements).toMatchObject([{ outcome: "unknown", chargedOutputTokens: 64_000 }]);
+      expect(Buffer.concat(f.chunks).toString()).not.toContain(
+        "response.function_call_arguments.done",
+      );
+    },
+  );
+
+  it("review R3 actual SDK accepts four complete read calls without argument deltas", async () => {
+    const parameters = {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    };
+    const declared = {
+      type: "function" as const,
+      function: { name: "read", description: "Read a file", parameters },
+    };
+    const reasoning = { id: "reasoning-1", type: "reasoning", summary: [], content: [] };
+    const calls = Array.from({ length: 4 }, (_, index) => ({
+      id: `fc_${index + 1}`,
+      type: "function_call",
+      call_id: `call-${index + 1}`,
+      name: "read",
+      arguments: `{"path":"file-${index + 1}.txt"}`,
+    }));
+    const data =
+      event({
+        type: "response.created",
+        response: { id: "response-1", model, status: "in_progress" },
+      }) +
+      event({ type: "response.output_item.added", output_index: 0, item: reasoning }) +
+      event({ type: "response.output_item.done", output_index: 0, item: reasoning }) +
+      calls
+        .map(
+          (call, offset) =>
+            event({
+              type: "response.output_item.added",
+              output_index: offset + 1,
+              item: { ...call, arguments: "" },
+            }) +
+            event({
+              type: "response.function_call_arguments.done",
+              item_id: call.id,
+              output_index: offset + 1,
+              arguments: call.arguments,
+            }) +
+            event({
+              type: "response.output_item.done",
+              output_index: offset + 1,
+              item: call,
+            }),
+        )
+        .join("") +
+      event({
+        type: "response.completed",
+        response: {
+          id: "response-1",
+          model,
+          status: "completed",
+          output: [reasoning, ...calls],
+          usage: { input_tokens: 50, output_tokens: 18, total_tokens: 68 },
+        },
+      });
+    const f = fixture({
+      tools: [declared],
+      transport: async () =>
+        new Response(data, { headers: { "content-type": "text/event-stream" } }),
+    });
+    let brokerFailure: unknown;
+    let joined: Promise<void> | undefined;
+    const sdk = streamCodexResponses(
+      sdkModel,
+      normalizeContext({
+        systemPrompt: "Trusted assignment",
+        messages: [{ role: "user", content: "Investigate", timestamp: 1 }],
+        tools: [
+          {
+            name: "read",
+            description: declared.function.description,
+            parameters: Type.Unsafe<{ path: string }>(parameters),
+          },
+        ],
+      }),
+      {
+        apiKey: credential,
+        reasoningEffort: "high",
+        serviceTier: "default",
+        transport: "sse",
+        maxRetries: 0,
+        fetch: async (_url, init) => {
+          const encoded = init?.body;
+          const request =
+            typeof encoded === "string"
+              ? encoded
+              : encoded instanceof Uint8Array &&
+                  new Headers(init?.headers).get("content-encoding") === "zstd"
+                ? process
+                    .getBuiltinModule("node:zlib")!
+                    .zstdDecompressSync(encoded, { maxOutputLength: 16384 })
+                    .toString("utf8")
+                : undefined;
+          if (request === undefined) throw Error("SDK request body must be bounded JSON");
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                joined = f
+                  .invoke(request, (chunk) => controller.enqueue(chunk))
+                  .then(
+                    () => controller.close(),
+                    (error: unknown) => {
+                      brokerFailure = error;
+                      controller.error(error);
+                    },
+                  );
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        },
+      },
+    );
+    const result = await sdk.result();
+    expect(joined).toBeDefined();
+    await joined;
+    expect(brokerFailure).toBeUndefined();
+    expect(result.stopReason).toBe("toolUse");
+    expect(result.content.filter((part) => part.type === "toolCall")).toMatchObject(
+      calls.map((call, index) => ({
+        id: `${call.call_id}|${call.id}`,
+        name: "read",
+        arguments: { path: `file-${index + 1}.txt` },
+      })),
+    );
+    expect(f.settlements).toMatchObject([
+      {
+        outcome: "reported",
+        chargedInputTokens: 50,
+        chargedOutputTokens: 18,
+        transportDrained: true,
+      },
+    ]);
+  });
+
   it("review R4 retains reported input overshoot on the monitored route", async () => {
     const data = success()
       .replace('"input_tokens":50', '"input_tokens":17000')

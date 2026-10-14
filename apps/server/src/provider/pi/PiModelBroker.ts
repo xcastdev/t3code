@@ -729,6 +729,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
           callId: string;
           itemId: string | undefined;
           arguments: string;
+          hasArgumentDelta: boolean;
           argumentsDone: boolean;
           finalized: boolean;
         }
@@ -850,6 +851,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
                   callId: item.callId,
                   itemId: item.itemId,
                   arguments: "",
+                  hasArgumentDelta: false,
                   argumentsDone: false,
                   finalized: false,
                 });
@@ -882,9 +884,20 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
               )
                 fail("SSE_TOOL_INVALID");
               if (argument.complete) {
-                if (prior.arguments !== argument.arguments) fail("SSE_TOOL_INVALID");
+                try {
+                  decodeArguments(argument.arguments);
+                } catch {
+                  fail("SSE_TOOL_INVALID");
+                }
+                if (prior.arguments !== argument.arguments) {
+                  if (prior.hasArgumentDelta || prior.arguments !== "") fail("SSE_TOOL_INVALID");
+                  prior.arguments = argument.arguments;
+                }
                 prior.argumentsDone = true;
-              } else prior.arguments += argument.arguments;
+              } else {
+                prior.hasArgumentDelta = true;
+                prior.arguments += argument.arguments;
+              }
             }
             if (adapted.terminal) {
               const calls = adapted.toolCalls ?? [];
