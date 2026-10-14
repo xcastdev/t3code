@@ -197,9 +197,22 @@ describe("Pi OpenAI subscription broker", () => {
   );
   it.each([
     "valid",
+    "sdk-metadata",
+    "sdk-null-caller",
     "arguments",
     "identity",
     "item-id",
+    "order",
+    "unknown-field",
+    "namespace-empty",
+    "namespace-path",
+    "namespace-oversized",
+    "namespace-credential-echo",
+    "namespace-account-echo",
+    "caller-program",
+    "caller-unknown-key",
+    "async-true",
+    "unknown-tool",
     "extra-finalized",
     "missing-finalized",
     "missing-terminal",
@@ -214,12 +227,37 @@ describe("Pi OpenAI subscription broker", () => {
       type: "function" as const,
       function: { name: "lookup", description: "Look up a value", parameters },
     };
+    const metadata =
+      mutation === "sdk-metadata"
+        ? { namespace: "fixture", caller: { type: "direct" }, async: false }
+        : mutation === "sdk-null-caller"
+          ? { namespace: "fixture", caller: null, async: false }
+          : mutation === "unknown-field"
+            ? { unknown_metadata: true }
+            : mutation === "namespace-empty"
+              ? { namespace: "" }
+              : mutation === "namespace-oversized"
+                ? { namespace: "n".repeat(129) }
+                : mutation === "namespace-path"
+                  ? { namespace: "../escape" }
+                  : mutation === "namespace-credential-echo"
+                    ? { namespace: credential }
+                    : mutation === "namespace-account-echo"
+                      ? { namespace: accountId }
+                      : mutation === "caller-program"
+                        ? { caller: { type: "program" } }
+                        : mutation === "caller-unknown-key"
+                          ? { caller: { type: "direct", unexpected: true } }
+                          : mutation === "async-true"
+                            ? { async: true }
+                            : {};
     const call = {
       id: "fc_1",
       type: "function_call",
       call_id: "call-1",
-      name: "lookup",
+      name: mutation === "unknown-tool" ? "delete_project" : "lookup",
       arguments: '{"key":"A"}',
+      ...metadata,
     };
     const finalized = {
       ...call,
@@ -251,7 +289,11 @@ describe("Pi OpenAI subscription broker", () => {
       }) +
       (mutation === "missing-finalized"
         ? ""
-        : event({ type: "response.output_item.done", output_index: 0, item: finalized })) +
+        : event({
+            type: "response.output_item.done",
+            output_index: mutation === "order" ? 1 : 0,
+            item: finalized,
+          })) +
       (mutation === "extra-finalized"
         ? event({
             type: "response.output_item.done",
@@ -331,13 +373,18 @@ describe("Pi OpenAI subscription broker", () => {
     expect(joined).toBeDefined();
     await joined;
     const calls = result.content.filter((part) => part.type === "toolCall");
-    if (mutation === "valid") {
+    if (mutation === "valid" || mutation === "sdk-metadata" || mutation === "sdk-null-caller") {
       expect(brokerFailure).toBeUndefined();
       expect(result.stopReason).toBe("toolUse");
-      expect(calls).toMatchObject([{ name: "lookup", arguments: { key: "A" } }]);
-      expect(f.settlements).toMatchObject([{ outcome: "reported" }]);
+      expect(calls).toMatchObject([{ id: "call-1|fc_1", name: "lookup", arguments: { key: "A" } }]);
+      expect(f.settlements).toMatchObject([{ outcome: "reported", transportDrained: true }]);
     } else {
-      expect(brokerFailure).toMatchObject({ code: "SSE_TOOL_INVALID" });
+      expect(brokerFailure).toMatchObject({
+        code:
+          mutation === "namespace-credential-echo" || mutation === "namespace-account-echo"
+            ? "CREDENTIAL_ECHO_REJECTED"
+            : "SSE_TOOL_INVALID",
+      });
       expect(result.stopReason).toBe("error");
       expect(calls.some((call) => call.arguments.key === "B")).toBe(false);
       expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
@@ -1233,6 +1280,26 @@ describe("SDK subscription request header parity", () => {
     let joined: Promise<void> | undefined;
     const sdkAccountId = "synthetic-worker-account";
     const sdkCredential = `${part({ alg: "none" })}.${part({ exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_account_id: sdkAccountId } })}.synthetic-worker-signature`;
+    const parameters = {
+      type: "object",
+      properties: { key: { type: "string" } },
+      required: ["key"],
+      additionalProperties: false,
+    };
+    const declared = {
+      type: "function" as const,
+      function: { name: "lookup", description: "Look up a value", parameters },
+    };
+    const toolCall = {
+      id: "fc_header",
+      type: "function_call",
+      call_id: "call_header",
+      name: "lookup",
+      arguments: '{"key":"header"}',
+      namespace: "fixture",
+      caller: { type: "direct" },
+      async: false,
+    };
     const message = {
       type: "message",
       id: "message-1",
@@ -1248,35 +1315,54 @@ describe("SDK subscription request header parity", () => {
       event({
         type: "response.output_item.added",
         output_index: 0,
+        item: { ...toolCall, arguments: "" },
+      }) +
+      event({
+        type: "response.function_call_arguments.delta",
+        item_id: toolCall.id,
+        output_index: 0,
+        delta: toolCall.arguments,
+      }) +
+      event({
+        type: "response.function_call_arguments.done",
+        item_id: toolCall.id,
+        output_index: 0,
+        arguments: toolCall.arguments,
+      }) +
+      event({ type: "response.output_item.done", output_index: 0, item: toolCall }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 1,
         item: { ...message, status: "in_progress", content: [] },
       }) +
       event({
         type: "response.content_part.added",
         item_id: message.id,
-        output_index: 0,
+        output_index: 1,
         content_index: 0,
         part: { type: "output_text", text: "", annotations: [] },
       }) +
       event({
         type: "response.output_text.delta",
         item_id: message.id,
-        output_index: 0,
+        output_index: 1,
         content_index: 0,
         delta: "Done",
         obfuscation: "actual-sdk-fixture-padding",
       }) +
-      event({ type: "response.output_item.done", output_index: 0, item: message }) +
+      event({ type: "response.output_item.done", output_index: 1, item: message }) +
       event({
         type: "response.completed",
         response: {
           id: "response-1",
           model,
           status: "completed",
-          output: [message],
+          output: [toolCall, message],
           usage: { input_tokens: 8, output_tokens: 1, total_tokens: 9 },
         },
       });
     const f = fixture({
+      tools: [declared],
       transport: async (_url, init) => {
         parentHeaders = new Headers(init.headers);
         parentBody = JSON.parse(init.body);
@@ -1288,7 +1374,13 @@ describe("SDK subscription request header parity", () => {
       normalizeContext({
         systemPrompt: "Trusted assignment",
         messages: [{ role: "user", content: "Investigate", timestamp: 1 }],
-        tools: [],
+        tools: [
+          {
+            name: "lookup",
+            description: declared.function.description,
+            parameters: Type.Unsafe<{ key: string }>(parameters),
+          },
+        ],
       }),
       {
         apiKey: sdkCredential,
@@ -1333,8 +1425,11 @@ describe("SDK subscription request header parity", () => {
     const result = await sdk.result();
     await joined;
     expect(result.errorMessage).toBeUndefined();
-    expect(result.stopReason).not.toBe("error");
+    expect(result.stopReason).toBe("toolUse");
     expect(result.content.some((part) => part.type === "text" && part.text === "Done")).toBe(true);
+    expect(result.content.filter((part) => part.type === "toolCall")).toMatchObject([
+      { id: "call_header|fc_header", name: "lookup", arguments: { key: "header" } },
+    ]);
     expect(sdkHeaders).toBeDefined();
     expect(parentHeaders).toBeDefined();
     expect(parentHeaders!.get("user-agent")).toBe(sdkHeaders!.get("user-agent"));
@@ -1346,7 +1441,14 @@ describe("SDK subscription request header parity", () => {
     expect(parentHeaders!.get("x-worker-only")).toBeNull();
     expect(parentBody).toEqual(sdkBody);
     expect(f.reservations).toHaveLength(1);
-    expect(f.settlements).toMatchObject([{ outcome: "reported", transportDrained: true }]);
+    expect(f.settlements).toMatchObject([
+      {
+        outcome: "reported",
+        transportDrained: true,
+        chargedInputTokens: 8,
+        chargedOutputTokens: 1,
+      },
+    ]);
   });
 
   it.each(["absent", "empty"] as const)(

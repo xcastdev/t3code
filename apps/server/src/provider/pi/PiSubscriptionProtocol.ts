@@ -17,6 +17,26 @@ const only = (value: Record<string, unknown>, keys: readonly string[]) =>
   Object.keys(value).every((key) => keys.includes(key));
 const text = (value: unknown): value is string =>
   typeof value === "string" && Buffer.byteLength(value) <= 12_288;
+const functionCallFields = [
+  "id",
+  "type",
+  "call_id",
+  "name",
+  "arguments",
+  "status",
+  "namespace",
+  "caller",
+  "async",
+];
+// These annotations do not grant another tool or an asynchronous execution mode.
+const validFunctionCallMetadata = (item: Record<string, unknown>) =>
+  (item.namespace === undefined ||
+    (typeof item.namespace === "string" &&
+      /^[a-zA-Z0-9_-]{1,128}(?![\s\S])/.test(item.namespace))) &&
+  (item.caller === undefined ||
+    item.caller === null ||
+    (isRecord(item.caller) && only(item.caller, ["type"]) && item.caller.type === "direct")) &&
+  (item.async === undefined || item.async === false);
 // Complete model output and opaque reasoning share the existing response-body budget.
 // Request transport separately enforces its smaller whole-body budget.
 const modelText = (value: unknown): value is string =>
@@ -404,7 +424,8 @@ export function decodePiSubscriptionEvent(
     }
     if (
       !isRecord(item) ||
-      !only(item, ["id", "type", "call_id", "name", "arguments", "status"]) ||
+      !only(item, functionCallFields) ||
+      !validFunctionCallMetadata(item) ||
       item.type !== "function_call" ||
       !text(item.name) ||
       !text(item.call_id) ||
@@ -483,7 +504,8 @@ export function decodePiSubscriptionEvent(
         throw new Error("SSE_FRAME_INVALID");
       if (item.type === "function_call") {
         if (
-          !only(item, ["id", "type", "call_id", "name", "arguments", "status"]) ||
+          !only(item, functionCallFields) ||
+          !validFunctionCallMetadata(item) ||
           !text(item.name) ||
           !text(item.call_id) ||
           !text(item.arguments) ||
@@ -647,7 +669,8 @@ export function decodePiSubscriptionEvent(
         throw new Error("SSE_FRAME_INVALID");
       if (
         payload.item.type === "function_call" &&
-        (!only(payload.item, ["id", "type", "status", "call_id", "name", "arguments"]) ||
+        (!only(payload.item, functionCallFields) ||
+          !validFunctionCallMetadata(payload.item) ||
           !text(payload.item.name) ||
           !text(payload.item.call_id) ||
           !text(payload.item.arguments) ||
