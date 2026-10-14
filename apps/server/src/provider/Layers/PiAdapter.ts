@@ -100,7 +100,7 @@ const accountingReceipt = Schema.Struct({
   reservationId: receiptText,
   accountingReceiptId: receiptText,
   routeId: receiptText,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: receiptText,
   reportedModel: receiptText,
   usage: Schema.Struct({

@@ -135,6 +135,74 @@ describe("retained dispatch operation IDs", () => {
   });
 });
 
+describe("subscription worker bootstrap", () => {
+  it("accepts and retains the pinned Codex Responses route in its immutable bootstrap", () => {
+    const subscriptionBootstrap = {
+      ...runtimeBootstrap,
+      model: {
+        provider: "openai-codex",
+        modelId: "gpt-6-luna",
+        api: "openai-codex-responses" as const,
+        contextWindow: 200_000,
+        maxTokens: 2_048,
+        reasoning: true,
+        reasoningEffort: "high" as const,
+        serviceTier: "default" as const,
+      },
+    };
+    const frame = {
+      ...parentFrame(subscriptionBootstrap),
+      operationId: "subscription-bootstrap",
+      operationKind: "prompt" as const,
+    };
+    expect(decodePiParentFrame(json(frame))).toEqual(frame);
+
+    const protocol = makePiWorkerProtocol(identity, {
+      operationId: "subscription-bootstrap",
+      operationKind: "prompt",
+    });
+    protocol.acceptParent(frame);
+    expect(protocol.bootstrap).toEqual(subscriptionBootstrap);
+    expect(() =>
+      protocol.acceptParent({
+        ...frame,
+        sequence: 1,
+        message: { ...subscriptionBootstrap, model: runtimeBootstrap.model },
+      }),
+    ).toThrow("BOOTSTRAP_BARRIER");
+    expect(protocol.bootstrap).toEqual(subscriptionBootstrap);
+  });
+
+  it("rejects unsupported API and non-pinned subscription routing fields", () => {
+    const pinnedModel = {
+      provider: "openai-codex",
+      modelId: "gpt-6-luna",
+      api: "openai-codex-responses",
+      contextWindow: 200_000,
+      maxTokens: 2_048,
+      reasoning: true,
+      reasoningEffort: "high",
+      serviceTier: "default",
+    };
+    for (const model of [
+      { ...pinnedModel, api: "openai-responses" },
+      { ...pinnedModel, provider: "openai" },
+      { ...pinnedModel, modelId: "gpt-6-other" },
+      { ...pinnedModel, reasoningEffort: "medium" },
+      { ...pinnedModel, serviceTier: "flex" },
+    ]) {
+      expect(() =>
+        decodePiParentFrame(
+          JSON.stringify({
+            ...parentFrame(runtimeBootstrap),
+            message: { ...runtimeBootstrap, model },
+          }),
+        ),
+      ).toThrow("INVALID_PARENT_FRAME");
+    }
+  });
+});
+
 function runtimePeers(operationKind: PiWorkerOperation["operationKind"] = "prompt") {
   const operation = { operationId: "operation-1", operationKind };
   const protocol = makePiWorkerProtocol(identity, operation);

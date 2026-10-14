@@ -25,6 +25,15 @@ const TokenAccounting = {
   remainingTokens: Integer,
   heldCalls: Integer,
   quarantinedCalls: Integer,
+  policy: Schema.optionalKey(
+    Schema.Struct({
+      accountingMode: Schema.Literal("openai-subscription-monitored"),
+      thresholdTokens: Schema.Literal(64_000),
+      observedChargedTokens: Integer,
+      nominalHeldTokens: Integer,
+      stoppedReason: Schema.optionalKey(Schema.Literals(["threshold-reached", "unknown-usage"])),
+    }),
+  ),
 };
 /** Recorded accounting is an observation, separate from task and binding authority. */
 export const ProjectTeamBindingAccounting = Schema.Union([

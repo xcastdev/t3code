@@ -16,6 +16,7 @@ import {
   type PiManagedOperationRequest,
 } from "./PiManagedRuntime.ts";
 import { makePiManagedRuntimeLive } from "./PiManagedRuntimeLive.ts";
+import { inspectPiSubscriptionConfiguration } from "./PiSubscriptionConfiguration.ts";
 import { PiModelCatalogue } from "./PiModelCatalogue.ts";
 import { MAX_PI_RUNTIME_FILES } from "./PiManagedProcess.ts";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
@@ -62,6 +63,10 @@ export interface PiProductionRuntimeAssets {
     readonly runtimeVersion: "0.99.1";
     readonly maxInputTokens: number;
     readonly maxOutputTokens: number;
+    readonly subscription?: {
+      readonly selection: NonNullable<PiProductionRuntimeHooks["subscriptionTest"]>["selection"];
+      readonly configuration: Effect.Success<ReturnType<typeof inspectPiSubscriptionConfiguration>>;
+    };
   };
   readonly runtimeFiles: ReadonlyArray<{ readonly source: string; readonly target: string }>;
   readonly revalidate: Effect.Effect<void, PiManagedRuntimeError>;
@@ -70,6 +75,7 @@ export interface PiProductionRuntimeAssets {
   ) => Effect.Effect<A, E | PiManagedRuntimeError, R>;
 }
 export interface PiProductionRuntimeHooks {
+  readonly subscriptionTest?: Parameters<typeof makePiManagedRuntimeLive>[0]["subscriptionTest"];
   readonly resolveOperationId?: (
     instanceId: Parameters<PiManagedRuntime["Service"]["forInstance"]>[0]["instanceId"],
     request: PiManagedOperationRequest,
@@ -80,6 +86,11 @@ export interface PiProductionRuntimeHooks {
     runtime: PiManagedRuntimeInstance,
   ) => Effect.Effect<void, PiManagedRuntimeError, Scope.Scope>;
 }
+/** Only the disposable Root entry supplies this; ordinary servers retain the absent default. */
+export const PiSubscriptionTest = Context.Reference<PiProductionRuntimeHooks["subscriptionTest"]>(
+  "t3/provider/pi/PiSubscriptionTest",
+  { defaultValue: () => undefined },
+);
 const decodeOptions = Schema.decodeEffect(Options, { onExcessProperty: "error" });
 const decodeConfiguration = Schema.decodeUnknownEffect(PiDriverConfiguration, {
   onExcessProperty: "error",
@@ -334,11 +345,23 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
 ) {
   const publishAssets = hooks?.publishAssets;
   const resolveOperationId = hooks?.resolveOperationId;
+  const subscriptionTest =
+    hooks?.subscriptionTest === undefined
+      ? undefined
+      : Object.freeze({
+          selection: Object.freeze({ ...hooks.subscriptionTest.selection }),
+          credentialSource: Object.freeze({ ...hooks.subscriptionTest.credentialSource }),
+        });
   const decodedOptions = yield* decodeOptions(supplied).pipe(Effect.mapError(unavailable));
   const options = Object.freeze({
     ...decodedOptions,
-    protectedRoots: Object.freeze([...decodedOptions.protectedRoots]),
+    protectedRoots: Object.freeze([
+      ...decodedOptions.protectedRoots,
+      ...(subscriptionTest === undefined ? [] : [subscriptionTest.credentialSource.directory]),
+    ]),
   });
+  const subscriptionAbortControllers = new Set<AbortController>();
+  const subscriptionAccountingState: { failure: unknown } = { failure: undefined };
   const sql = yield* SqlClient.SqlClient;
   const outsideTransaction = Effect.gen(function* () {
     if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
@@ -391,6 +414,9 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       if (!instance.enabled) {
         const runtime = yield* makePiManagedRuntimeLive({
           ...options,
+          ...(subscriptionTest === undefined ? {} : { subscriptionTest }),
+          subscriptionAbortControllers,
+          subscriptionAccountingState,
           runtimeFiles: [],
           readCatalogue,
           transport,
@@ -561,6 +587,9 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       );
       const liveOptions = {
         ...options,
+        ...(subscriptionTest === undefined ? {} : { subscriptionTest }),
+        subscriptionAbortControllers,
+        subscriptionAccountingState,
         runtimeFiles: assets.runtimeFiles,
         allocateSkillStage: Effect.gen(function* () {
           if (!accepting) return yield* closed();
@@ -615,6 +644,28 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
         },
       });
       if (publishAssets) {
+        const subscription =
+          subscriptionTest === undefined
+            ? undefined
+            : Object.freeze({
+                selection: subscriptionTest.selection,
+                configuration: yield* inspectPiSubscriptionConfiguration({
+                  agentDirectory,
+                  runtimeVersion: assets.sdkVersion,
+                  nodeVersion: process.versions.node,
+                  selectedModel: {
+                    provider: "openai-codex",
+                    model: subscriptionTest.selection.model,
+                  },
+                  reasoningEffort: "high",
+                  serviceTier: "default",
+                  limits: {
+                    maxInputTokens: options.maxInputTokens,
+                    maxOutputTokens: options.maxOutputTokens,
+                    deadlineMs: subscriptionTest.selection.maximumDurationMs,
+                  },
+                }).pipe(Effect.mapError(unavailable)),
+              });
         const published: PiProductionRuntimeAssets = Object.freeze({
           instanceConfiguration: Object.freeze({
             enabled: instance.enabled,
@@ -624,6 +675,7 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
             runtimeVersion: assets.sdkVersion,
             maxInputTokens: options.maxInputTokens,
             maxOutputTokens: options.maxOutputTokens,
+            ...(subscription === undefined ? {} : { subscription }),
           }),
           runtimeFiles: Object.freeze(
             assets.runtimeFiles.map((file) => Object.freeze({ ...file })),

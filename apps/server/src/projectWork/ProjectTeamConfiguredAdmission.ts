@@ -61,6 +61,61 @@ const RootCaps = Schema.Struct({
   projectWritableWorkers: Safe.check(Schema.isLessThanOrEqualTo(64)),
   modelCalls: Positive.check(Schema.isLessThanOrEqualTo(128)),
 });
+const SubscriptionConfiguration = Schema.Struct({
+  provider: Schema.Literal("openai-codex"),
+  model: Schema.Literal("gpt-6-luna"),
+  api: Schema.Literal("openai-codex-responses"),
+  endpoint: Schema.Literal("https://chatgpt.com/backend-api/codex/responses"),
+  contextWindow: Positive,
+  maxInputTokens: Positive.check(Schema.isLessThanOrEqualTo(16_384)),
+  maxOutputTokens: Schema.Literal(2_048),
+  advertisedMaxOutputTokens: Positive,
+  deadlineMs: Schema.Literal(300_000),
+  reasoning: Schema.Literal(true),
+  reasoningEffort: Schema.Literal("high"),
+  serviceTier: Schema.Literal("default"),
+  input: Schema.Tuple([Schema.Literal("text")]),
+  cost: Schema.Literal("unknown"),
+  catalogue: Schema.Struct({
+    source: Schema.Literal("pi-sdk:0.99.1/openai-codex"),
+    fetchedAt: Timestamp,
+  }),
+});
+const Subscription = Schema.Struct({
+  selection: Schema.Struct({
+    projectId: Schema.String,
+    rootTaskId: ProjectWorkTaskId,
+    model: Schema.Literal("gpt-6-luna"),
+    maximumTokens: Schema.Literal(64_000),
+    maximumDurationMs: Schema.Literal(300_000),
+  }),
+  configuration: SubscriptionConfiguration,
+});
+const CommandCatalogue = Schema.Struct({
+  source: Schema.Literal("https://api.commandcode.ai/provider/v1/models"),
+  fetchedAt: Timestamp,
+  selectedEntry: Schema.Struct({
+    id: PiManagedModel,
+    owned_by: Schema.Literal("command-code"),
+    context_length: Positive,
+    supported_endpoints: Schema.Array(Schema.String.check(Schema.isMaxLength(128))).check(
+      Schema.isMaxLength(32),
+    ),
+    max_output_tokens: Schema.optional(Positive),
+  }),
+});
+const SubscriptionCatalogue = Schema.Struct({
+  source: Schema.Literal("pi-sdk:0.99.1/openai-codex"),
+  fetchedAt: Timestamp,
+  selectedEntry: Schema.Struct({
+    id: Schema.Literal("gpt-6-luna"),
+    owned_by: Schema.Literal("openai-codex"),
+    context_length: Positive,
+    supported_endpoints: Schema.Array(Schema.String.check(Schema.isMaxLength(128))).check(
+      Schema.isMaxLength(32),
+    ),
+  }),
+});
 const Facts = Schema.Struct({
   environmentId: EnvironmentId,
   provider: Schema.Struct({
@@ -70,19 +125,8 @@ const Facts = Schema.Struct({
     runtimeVersion: Schema.String,
     maxInputTokens: Positive.check(Schema.isLessThanOrEqualTo(1_000_000)),
     maxOutputTokens: Positive.check(Schema.isLessThanOrEqualTo(65_536)),
-    catalogue: Schema.Struct({
-      source: Schema.Literal("https://api.commandcode.ai/provider/v1/models"),
-      fetchedAt: Timestamp,
-      selectedEntry: Schema.Struct({
-        id: PiManagedModel,
-        owned_by: Schema.Literal("command-code"),
-        context_length: Positive,
-        supported_endpoints: Schema.Array(Schema.String.check(Schema.isMaxLength(128))).check(
-          Schema.isMaxLength(32),
-        ),
-        max_output_tokens: Schema.optional(Positive),
-      }),
-    }),
+    catalogue: Schema.Union([CommandCatalogue, SubscriptionCatalogue]),
+    subscription: Schema.optional(Subscription),
   }),
   supportedToolIds: Ids,
   ownedSkillIds: Ids,
@@ -166,24 +210,49 @@ export const prepareProjectTeamConfiguredAdmission = (input: {
     const provider = facts.provider;
     const entry = provider.catalogue.selectedEntry;
     const fetchedAt = DateTime.toEpochMillis(DateTime.makeUnsafe(provider.catalogue.fetchedAt));
+    const subscription = provider.subscription;
     if (
       !provider.enabled ||
       provider.driverKind !== "piAgent" ||
       provider.runtimeVersion !== "0.99.1"
     )
       reject("Current enabled pinned Pi runtime is required");
-    if (
-      fetchedAt > nowMs ||
-      nowMs - fetchedAt >= 86_400_000 ||
-      !entry.supported_endpoints.includes("/chat/completions")
-    )
-      reject("Current supported CommandCode catalogue is required");
-    if (
-      entry.max_output_tokens !== undefined &&
-      (entry.max_output_tokens > entry.context_length ||
-        provider.maxOutputTokens > entry.max_output_tokens)
-    )
-      reject("Actual Pi output limit exceeds supported metadata");
+    if (fetchedAt > nowMs || nowMs - fetchedAt >= 86_400_000)
+      reject("Current model metadata is required");
+    if (subscription === undefined) {
+      if (
+        provider.catalogue.source !== "https://api.commandcode.ai/provider/v1/models" ||
+        !entry.supported_endpoints.some((endpoint) => endpoint === "/chat/completions")
+      )
+        reject("Current supported CommandCode catalogue is required");
+      const advertisedOutput = "max_output_tokens" in entry ? entry.max_output_tokens : undefined;
+      if (
+        advertisedOutput !== undefined &&
+        (advertisedOutput > entry.context_length || provider.maxOutputTokens > advertisedOutput)
+      )
+        reject("Actual Pi output limit exceeds supported metadata");
+    } else {
+      const inspected = subscription.configuration;
+      if (
+        provider.catalogue.source !== "pi-sdk:0.99.1/openai-codex" ||
+        inspected.catalogue.source !== provider.catalogue.source ||
+        inspected.catalogue.fetchedAt !== provider.catalogue.fetchedAt ||
+        entry.id !== inspected.model ||
+        entry.owned_by !== inspected.provider ||
+        entry.context_length !== inspected.contextWindow ||
+        entry.supported_endpoints.length !== 1 ||
+        entry.supported_endpoints[0] !== "/codex/responses" ||
+        inspected.maxInputTokens !== provider.maxInputTokens ||
+        inspected.maxOutputTokens !== provider.maxOutputTokens ||
+        inspected.maxOutputTokens !== 2_048 ||
+        inspected.deadlineMs !== 300_000 ||
+        inspected.reasoningEffort !== "high" ||
+        inspected.serviceTier !== "default" ||
+        inspected.maxInputTokens > 16_384 ||
+        inspected.maxInputTokens + inspected.maxOutputTokens > inspected.contextWindow
+      )
+        reject("Current actual OpenAI subscription SDK metadata is required");
+    }
     const routeReservation = provider.maxInputTokens + provider.maxOutputTokens;
     if (!validPositive(routeReservation) || routeReservation > entry.context_length)
       reject("Actual Pi reservation exceeds model context");
@@ -242,6 +311,19 @@ export const prepareProjectTeamConfiguredAdmission = (input: {
       if (membership!.parentTaskId === undefined) break;
       rootTaskId = membership!.parentTaskId;
     }
+    if (
+      subscription !== undefined &&
+      (subscription.selection.projectId !== String(state.projectId) ||
+        subscription.selection.rootTaskId !== rootTaskId ||
+        (facts.rootAnchor._tag === "NewRoot" && rootTaskId !== taskId) ||
+        (facts.rootAnchor._tag === "RetainedRoot" &&
+          (facts.rootAnchor.budget.rootTaskId !== rootTaskId ||
+            facts.rootAnchor.budget.maximumTokens !== subscription.selection.maximumTokens ||
+            facts.rootAnchor.budget.deadlineAtMs >
+              nowMs + subscription.selection.maximumDurationMs)) ||
+        subscription.selection.model !== entry.id)
+    )
+      reject("Private subscription selection does not match the current project root");
     const membership = lineage[0]!;
     if (membership.executionKind !== "managed" || membership.assignment === undefined)
       reject("Explicit active managed assignment is required");
@@ -343,6 +425,12 @@ export const prepareProjectTeamConfiguredAdmission = (input: {
       reject("Successor role does not match assignment");
     const policy = policies.find((p) => p.model === role.model)!;
     if (role.model !== entry.id) reject("Configured model is unavailable on the actual Pi route");
+    if (
+      subscription !== undefined &&
+      (policy.tokenLimit !== subscription.selection.maximumTokens ||
+        policy.durationLimitMs !== subscription.selection.maximumDurationMs)
+    )
+      reject("Configured subscription limits differ from the private selection");
     if (
       new Set(role.tools).size !== role.tools.length ||
       role.tools.some((id) => !facts.supportedToolIds.includes(id))

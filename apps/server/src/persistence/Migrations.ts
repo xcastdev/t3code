@@ -113,6 +113,7 @@ import ForkMigration0042 from "./Migrations/fork/042_ProjectMemoryProcessing.ts"
 import ForkMigration0043 from "./Migrations/fork/043_ProjectMemoryQuery.ts";
 import ForkMigration0044 from "./Migrations/fork/044_ProjectTaskResources.ts";
 import ForkMigration0045 from "./Migrations/fork/045_ProjectMemoryCompanion.ts";
+import ForkMigration0046 from "./Migrations/fork/046_ProjectTeamPiSubscription.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -226,6 +227,7 @@ export const forkMigrationEntries = [
   [43, "ProjectMemoryQuery", ForkMigration0043],
   [44, "ProjectTaskResources", ForkMigration0044],
   [45, "ProjectMemoryCompanion", ForkMigration0045],
+  [46, "ProjectTeamPiSubscription", ForkMigration0046],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";

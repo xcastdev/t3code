@@ -35,7 +35,15 @@ import {
   type ProjectTeamAuthority,
 } from "../../projectWork/ProjectTeamAuthorization.ts";
 import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
-import { make as makeAccounting } from "../../projectWork/ProjectTeamModelAccounting.ts";
+import {
+  make as makeAccounting,
+  makeProjectTeamPiSubscriptionParentPolicy,
+  type ProjectTeamPiSubscriptionTestSelection,
+  type ProjectTeamPiSubscriptionGrantIdentity,
+} from "../../projectWork/ProjectTeamModelAccounting.ts";
+import { SqlClient } from "effect/unstable/sql";
+import { inspectPiSubscriptionConfiguration } from "./PiSubscriptionConfiguration.ts";
+import { readPiSubscriptionCredential } from "./PiSubscriptionCredential.ts";
 import { ProjectWorkGateway } from "../../projectWork/ProjectWorkGateway.ts";
 import { ManagedSkillRepository } from "../../skills/ManagedSkillRepository.ts";
 import { ServerConfig } from "../../config.ts";
@@ -85,7 +93,7 @@ import {
   validatePiManagedSkillPlan,
 } from "./PiManagedSkillResources.ts";
 
-import { PiManagedModel, piManagedModelRoute, piManagedModels } from "./PiManagedModels.ts";
+import { PiManagedModel, piBrokerModelRoute, piManagedModels } from "./PiManagedModels.ts";
 
 const provider = ProviderDriverKind.make("piAgent");
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -577,6 +585,15 @@ const finalWorkspaceFence = (paths: Path.Path, fence: WorkspaceFence, signal?: A
   });
 
 export interface PiManagedRuntimeLiveOptions {
+  /** One factory shares cancellation across its instances; never a wire option. */
+  readonly subscriptionAbortControllers?: Set<AbortController>;
+  /** One production factory retains uncertain accounting across its per-instance runtimes. */
+  readonly subscriptionAccountingState?: { failure: unknown };
+  /** Root-only disposable subscription selection, never provider configuration. */
+  readonly subscriptionTest?: {
+    readonly selection: ProjectTeamPiSubscriptionTestSelection;
+    readonly credentialSource: { readonly directory: string; readonly format: "pi" | "codex" };
+  };
   readonly environmentId: string;
   readonly agentDirectory: string;
   readonly nativeStateRoot: string;
@@ -624,7 +641,19 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const options = {
     ...supplied,
     runtimeFiles: structuredClone(supplied.runtimeFiles),
-    protectedRoots: [...supplied.protectedRoots],
+    protectedRoots: [
+      ...supplied.protectedRoots,
+      ...(supplied.subscriptionTest === undefined
+        ? []
+        : [supplied.subscriptionTest.credentialSource.directory]),
+    ],
+    subscriptionTest:
+      supplied.subscriptionTest === undefined
+        ? undefined
+        : Object.freeze({
+            selection: Object.freeze({ ...supplied.subscriptionTest.selection }),
+            credentialSource: Object.freeze({ ...supplied.subscriptionTest.credentialSource }),
+          }),
   };
   const operations = yield* makeProjectTeamPiOperations({ environmentId: options.environmentId });
   const mailbox = yield* makeProjectTeamMailboxConsumption({
@@ -646,15 +675,47 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const skillRepository = yield* Effect.serviceOption(ManagedSkillRepository);
   const serverConfig = yield* Effect.serviceOption(ServerConfig);
   const materialization = yield* Effect.serviceOption(SkillMaterializationService);
-  const accountings = yield* Effect.forEach(piManagedModels, (model) =>
+  const sql = yield* SqlClient.SqlClient;
+  const subscriptionPolicy =
+    options.subscriptionTest === undefined
+      ? undefined
+      : makeProjectTeamPiSubscriptionParentPolicy(sql, options.subscriptionTest.selection);
+  const subscriptionControllers =
+    supplied.subscriptionAbortControllers ?? new Set<AbortController>();
+  const stopSubscription = () => {
+    for (const controller of subscriptionControllers) controller.abort();
+  };
+  const subscriptionAccountingState: { failure: unknown } =
+    supplied.subscriptionAccountingState ?? { failure: undefined };
+  const assertSubscriptionAccountingHealthy = () =>
+    subscriptionAccountingState.failure === undefined
+      ? Effect.void
+      : Effect.fail(deny("Pi subscription accounting requires reconciliation", "uncertain"));
+  const stopAfterSubscriptionAccountingFailure = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(
+      Effect.tapCause((cause) =>
+        Effect.sync(() => {
+          subscriptionAccountingState.failure ??= cause;
+          stopSubscription();
+        }),
+      ),
+    );
+  const accountingModels =
+    options.subscriptionTest === undefined
+      ? piManagedModels
+      : [...piManagedModels, "gpt-6-luna" as const];
+  const accountings = yield* Effect.forEach(accountingModels, (model) =>
     Effect.gen(function* () {
-      const route = piManagedModelRoute(model);
+      const route = piBrokerModelRoute(model);
       const accounting = yield* makeAccounting({
         environmentId: options.environmentId,
         routeId: route.routeId,
         model,
         acceptedReportedModels: route.acceptedReportedModels,
         resolveOperation: operations.resolveOperation,
+        ...(model === "gpt-6-luna" && options.subscriptionTest !== undefined
+          ? { subscriptionTest: options.subscriptionTest.selection }
+          : {}),
       });
       return { model, accounting };
     }),
@@ -838,6 +899,29 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     agentDirectory: string,
     authority?: ProjectTeamAuthority,
   ) {
+    if (
+      authority?.binding.model === "gpt-6-luna" ||
+      (!authority && options.subscriptionTest !== undefined)
+    ) {
+      const selected = options.subscriptionTest;
+      if (!selected || (authority && authority.binding.projectId !== selected.selection.projectId))
+        return yield* deny("Pi subscription requires its private root selection");
+      return yield* inspectPiSubscriptionConfiguration({
+        agentDirectory,
+        runtimeVersion: "0.99.1",
+        nodeVersion: process.versions.node,
+        selectedModel: { provider: "openai-codex", model: "gpt-6-luna" },
+        reasoningEffort: "high",
+        serviceTier: "default",
+        limits: {
+          maxInputTokens: options.maxInputTokens,
+          maxOutputTokens: options.maxOutputTokens,
+          deadlineMs: Math.min(300_000, authority?.binding.configuration.maxDurationMs ?? 300_000),
+        },
+      }).pipe(
+        Effect.mapError(() => deny("Pi subscription configuration unavailable", "unavailable")),
+      );
+    }
     const catalogue = yield* options.readCatalogue.pipe(
       Effect.mapError(() => deny("Pi catalogue read unavailable", "unavailable")),
     );
@@ -934,7 +1018,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
               models: [
                 {
                   slug: native.model,
-                  name: piManagedModelRoute(native.model).name,
+                  name: piBrokerModelRoute(native.model).name,
                   isCustom: false,
                   capabilities: {},
                 },
@@ -1659,6 +1743,35 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         )).operationId,
                   operationKind: request.kind,
                 };
+                let subscriptionIdentity: ProjectTeamPiSubscriptionGrantIdentity | undefined;
+                if (nativeConfig.provider === "openai-codex") {
+                  const selected = options.subscriptionTest;
+                  if (!selected || !subscriptionPolicy)
+                    return yield* deny("Pi subscription selection unavailable");
+                  const original = yield* operations.readRootBudget(
+                    authority,
+                    operation,
+                    request,
+                    resourceHash,
+                  );
+                  if (
+                    original.rootTaskId !== selected.selection.rootTaskId ||
+                    original.maximumTokens !== selected.selection.maximumTokens
+                  )
+                    return yield* deny("Pi subscription original root differs");
+                  subscriptionIdentity = {
+                    environmentId: options.environmentId,
+                    projectId: binding.projectId,
+                    rootTaskId: original.rootTaskId,
+                    model: "gpt-6-luna",
+                    routeId: "openai-subscription-luna",
+                    maximumTokens: selected.selection.maximumTokens,
+                    maximumDurationMs: selected.selection.maximumDurationMs,
+                    deadlineAtMs: original.deadlineAtMs,
+                  };
+                  yield* assertSubscriptionAccountingHealthy();
+                  yield* subscriptionPolicy.check(subscriptionIdentity);
+                }
                 const workerId = yield* crypto.randomUUIDv4;
                 const workerIdentity = { workerId, generation: binding.generation };
                 const nativeStateDirectory =
@@ -1833,6 +1946,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   guard(
                     Effect.gen(function* () {
                       if (signal.aborted) return yield* deny("Pi operation canceled");
+                      if (subscriptionIdentity && subscriptionPolicy) {
+                        yield* assertSubscriptionAccountingHealthy();
+                        yield* subscriptionPolicy.check(subscriptionIdentity);
+                      }
                       const current = yield* operations.authorize(durable);
                       if (
                         piManagedSkillResourceIdentity(
@@ -1864,7 +1981,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       }
                     }),
                   );
-                const route = piManagedModelRoute(nativeConfig.model);
+                const route = piBrokerModelRoute(nativeConfig.model);
                 const accounting = accountings.find(
                   (entry) => entry.model === nativeConfig.model,
                 )?.accounting;
@@ -1880,14 +1997,26 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     resources: resources.resources,
                     context: descriptor("context"),
                     prompt: request.kind === "prompt" ? descriptor("prompt") : null,
-                    model: {
-                      provider: nativeConfig.provider,
-                      modelId: nativeConfig.model,
-                      api: nativeConfig.api,
-                      contextWindow: nativeConfig.contextWindow,
-                      maxTokens: nativeConfig.maxOutputTokens,
-                      reasoning: false,
-                    },
+                    model:
+                      nativeConfig.provider === "openai-codex"
+                        ? {
+                            provider: nativeConfig.provider,
+                            modelId: nativeConfig.model,
+                            api: nativeConfig.api,
+                            contextWindow: nativeConfig.contextWindow,
+                            maxTokens: nativeConfig.maxOutputTokens,
+                            reasoning: true,
+                            reasoningEffort: nativeConfig.reasoningEffort,
+                            serviceTier: nativeConfig.serviceTier,
+                          }
+                        : {
+                            provider: nativeConfig.provider,
+                            modelId: nativeConfig.model,
+                            api: nativeConfig.api,
+                            contextWindow: nativeConfig.contextWindow,
+                            maxTokens: nativeConfig.maxOutputTokens,
+                            reasoning: false,
+                          },
                     allowedTools: tools.map((tool) => ({
                       name: tool.function.name,
                       execution: toolCapabilities.find(
@@ -2128,11 +2257,29 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       ),
                     ),
                     authorizeCurrent: (_phase, signal) => perform(check(signal)),
+                    ...(subscriptionIdentity === undefined
+                      ? {}
+                      : {
+                          authorizeSubscriptionTest: (signal: AbortSignal) =>
+                            perform(check(signal)),
+                        }),
                     getCredential: (signal) =>
                       perform(
                         check(signal).pipe(
-                          Effect.andThen(readPiSavedLiteralCredential(agentDirectory)),
-                          Effect.map(Redacted.value),
+                          Effect.andThen(
+                            subscriptionIdentity && options.subscriptionTest
+                              ? readPiSubscriptionCredential(
+                                  options.subscriptionTest.credentialSource,
+                                  subscriptionIdentity.deadlineAtMs,
+                                ).pipe(
+                                  Effect.map(
+                                    (credential) => Redacted.value(credential).accessToken,
+                                  ),
+                                )
+                              : readPiSavedLiteralCredential(agentDirectory).pipe(
+                                  Effect.map(Redacted.value),
+                                ),
+                          ),
                         ),
                       ),
                     reserveRequest: (reservation, signal) =>
@@ -2175,7 +2322,23 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                               }),
                             ),
                         }),
-                    settleRequest: (settlement) => perform(accounting.settle(settlement)),
+                    settleRequest: (settlement) => {
+                      const settle = Effect.gen(function* () {
+                        const receipt = yield* accounting.settle(settlement);
+                        if (
+                          subscriptionIdentity &&
+                          subscriptionPolicy &&
+                          (yield* subscriptionPolicy.readStop(subscriptionIdentity))
+                        )
+                          stopSubscription();
+                        return receipt;
+                      });
+                      return perform(
+                        subscriptionIdentity
+                          ? stopAfterSubscriptionAccountingFailure(settle)
+                          : settle,
+                      );
+                    },
                     transport: options.transport,
                   },
                 });
@@ -2184,6 +2347,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 let stopFailure: PiManagedRuntimeError | undefined;
                 let started = false;
                 const cancellation = new AbortController();
+                if (subscriptionIdentity) subscriptionControllers.add(cancellation);
                 let execution:
                   | Promise<import("./PiSessionRuntime.ts").PiSessionTerminal>
                   | undefined;
@@ -2272,6 +2436,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         return yield* deny("Pi operation publication canceled", "conflict");
                       const result = { terminal, session: sessionFor(current, terminal.native) };
                       active.delete(request.threadId);
+                      subscriptionControllers.delete(cancellation);
                       done.resolve();
                       ownsRun = false;
                       return result;
@@ -2282,6 +2447,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         ownsRun
                           ? Effect.gen(function* () {
                               cancellation.abort();
+                              subscriptionControllers.delete(cancellation);
                               if (execution)
                                 yield* Effect.promise(() =>
                                   execution!.then(
@@ -2346,10 +2512,12 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           operation.operationId
                         )
                           active.delete(request.threadId);
+                        subscriptionControllers.delete(cancellation);
                         done.resolve();
                         return;
                       }
                       cancellation.abort();
+                      subscriptionControllers.delete(cancellation);
                       yield* Effect.promise(() => done.promise);
                       if (stopFailure) return yield* stopFailure;
                     }),

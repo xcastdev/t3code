@@ -31,6 +31,7 @@ import {
   make,
   ModelAccountingError,
   type ProjectTeamModelAccountingOptions,
+  type ProjectTeamPiSubscriptionTestSelection,
 } from "./ProjectTeamModelAccounting.ts";
 
 const encodeFixtureJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Json));
@@ -128,6 +129,90 @@ const fixture = Effect.gen(function* () {
   return { ...f, options, accounting, counts };
 });
 
+const subscriptionFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const role = decodeRecord({
+    ...f.role,
+    recordId: "subscription-role",
+    roleRevision: 2,
+    model: "gpt-6-luna",
+  });
+  if (role.kind !== "role-revision") return yield* Effect.die("Invalid subscription role fixture");
+  const member = decodeRecord({
+    ...f.member,
+    recordId: "subscription-member",
+    roleRevisionId: role.recordId,
+  });
+  if (member.kind !== "member") return yield* Effect.die("Invalid subscription member fixture");
+  yield* f.change(role);
+  yield* f.change(member);
+  const rootTaskId = ProjectWorkTaskId.make("subscription-root");
+  const binding = yield* createManagedAssignment({
+    taskId: rootTaskId,
+    recordId: "subscription-binding",
+    attemptId: "subscription-attempt",
+    commandId: "subscription-dispatch",
+    providerInstanceId,
+    threadId: ThreadId.make("subscription-thread"),
+    status: "running",
+    role,
+    memberId: member.recordId,
+    configuration: {
+      ...f.binding.configuration,
+      runtimeVersion: "0.99.1",
+      maxTokens: 64_000,
+      maxDurationMs: 300_000,
+    },
+    sessionId: "subscription-session",
+  });
+  const authority = yield* f.auth.issueCredential({
+    providerInstanceId,
+    threadId: binding.threadId,
+  });
+  if (!authority) return yield* Effect.die("Missing subscription fixture authority");
+  const principal = {
+    actor: {
+      kind: "agent" as const,
+      id: Authorization.managedActorId(authority.credential),
+    },
+    managed: authority.credential,
+  };
+  const resolved = yield* f.auth.resolve(principal);
+  expect(resolved?.binding.recordId).toBe(binding.recordId);
+  yield* f.sql`INSERT INTO model_operation_fixture VALUES (${binding.recordId},'subscription-worker','subscription-prompt',${rootTaskId},64000,300100)`;
+  const subscriptionTest: ProjectTeamPiSubscriptionTestSelection = {
+    projectId,
+    rootTaskId,
+    model: "gpt-6-luna",
+    maximumTokens: 64_000,
+    maximumDurationMs: 300_000,
+  };
+  const options = {
+    ...f.options,
+    routeId: "openai-subscription-luna",
+    model: "gpt-6-luna",
+    acceptedReportedModels: ["gpt-6-luna"],
+    subscriptionTest,
+  } satisfies ProjectTeamModelAccountingOptions;
+  const accounting = yield* make(options);
+  const reservation = (requestId = 1) => ({
+    workerId: "subscription-worker",
+    generation: binding.generation,
+    operationId: "subscription-prompt",
+    requestId,
+    routeId: "openai-subscription-luna",
+    provider: "openai-codex" as const,
+    model: "gpt-6-luna",
+    maxInputTokens: 16_384,
+    maxOutputTokens: 2_048,
+    callCount: 1 as const,
+    deadlineAtMs: 300100,
+    accountingMode: "openai-subscription-monitored" as const,
+    unknownMaximumTokens: 64_000 as const,
+  });
+  return { ...f, binding, principal, accounting, reservation, rootTaskId, options };
+});
+
 it.effect("denies ordinary, stale and revoked authority without reserving", () =>
   fileTest((path) =>
     Effect.gen(function* () {
@@ -141,6 +226,208 @@ it.effect("denies ordinary, stale and revoked authority without reserving", () =
       );
       yield* f.change(decodeRecord({ ...f.binding, revision: 2, status: "stopping" }));
       yield* denied(f.accounting.reserve(f.principal, request()));
+      expect(yield* f.counts()).toEqual([{ budgets: 0, requests: 0 }]);
+    }).pipe(Effect.provide(runtime(path))),
+  ),
+);
+
+it.effect(
+  "reserves for the approved subscription root and records reported usage above its output envelope",
+  () =>
+    fileTest((path) =>
+      Effect.gen(function* () {
+        const f = yield* subscriptionFixture;
+        const request = f.reservation();
+        const reserved = yield* f.accounting.reserve(f.principal, request);
+        expect(reserved.status).toBe("reserved");
+        const settlement: PiModelRequestSettlement = {
+          ...request,
+          reservationId: reserved.reservationId,
+          transportDrained: true,
+          outcome: "reported",
+          chargedInputTokens: 1_024,
+          chargedOutputTokens: 3_072,
+          reportedModel: "gpt-6-luna",
+          reportedUsage: {
+            prompt_tokens: 1_024,
+            completion_tokens: 3_072,
+            total_tokens: 4_096,
+          },
+        };
+        yield* f.accounting.settle(settlement);
+        expect(
+          yield* f.sql`SELECT status,provider,model,route_id,accounting_mode,unknown_maximum_tokens,charged_input_tokens,charged_output_tokens FROM project_team_model_request WHERE root_task_id=${f.rootTaskId}`,
+        ).toEqual([
+          {
+            status: "reported",
+            provider: "openai-codex",
+            model: "gpt-6-luna",
+            route_id: "openai-subscription-luna",
+            accounting_mode: "openai-subscription-monitored",
+            unknown_maximum_tokens: 64_000,
+            charged_input_tokens: 1024,
+            charged_output_tokens: 3072,
+          },
+        ]);
+      }).pipe(Effect.provide(runtime(path))),
+    ),
+);
+
+it.effect(
+  "charges the root threshold once across requests and rejects a successor reservation",
+  () =>
+    fileTest((path) =>
+      Effect.gen(function* () {
+        const f = yield* subscriptionFixture;
+        let crossingSettlement: PiModelRequestSettlement | undefined;
+        let crossingReceipt: { readonly accountingReceiptId: string } | undefined;
+        for (let requestId = 1; requestId <= 4; requestId++) {
+          const request = f.reservation(requestId);
+          const reserved = yield* f.accounting.reserve(f.principal, request);
+          const settlement: PiModelRequestSettlement = {
+            ...request,
+            reservationId: reserved.reservationId,
+            transportDrained: true,
+            outcome: "reported",
+            chargedInputTokens: 16_384,
+            chargedOutputTokens: 2_048,
+            reportedModel: "gpt-6-luna",
+            reportedUsage: {
+              prompt_tokens: 16_384,
+              completion_tokens: 2_048,
+              total_tokens: 18_432,
+            },
+          };
+          const receipt = yield* f.accounting.settle(settlement);
+          if (requestId === 4) {
+            crossingSettlement = settlement;
+            crossingReceipt = receipt;
+          }
+        }
+        if (!crossingSettlement || !crossingReceipt)
+          return yield* Effect.die("Missing threshold-crossing settlement");
+        expect(yield* f.accounting.settle(crossingSettlement)).toEqual(crossingReceipt);
+        yield* denied(f.accounting.reserve(f.principal, f.reservation(5)));
+        expect(
+          yield* f.sql`SELECT SUM(charged_input_tokens + charged_output_tokens) AS charged FROM project_team_model_request WHERE root_task_id=${f.rootTaskId}`,
+        ).toEqual([{ charged: 73_728 }]);
+        expect(
+          yield* f.sql`SELECT maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms,stop_reason
+        FROM project_team_pi_subscription_grant WHERE root_task_id=${f.rootTaskId}`,
+        ).toEqual([
+          {
+            maximum_tokens: 64_000,
+            maximum_duration_ms: 300_000,
+            deadline_at_ms: 300_100,
+            stopped_at_ms: 100,
+            stop_reason: "threshold-reached",
+          },
+        ]);
+        expect(yield* f.counts()).toEqual([{ budgets: 1, requests: 4 }]);
+      }).pipe(Effect.provide(runtime(path))),
+    ),
+);
+
+it.effect("upgrades a reported subscription receipt to failure without erasing overshoot", () =>
+  fileTest((path) =>
+    Effect.gen(function* () {
+      const f = yield* subscriptionFixture;
+      const request = f.reservation();
+      const reserved = yield* f.accounting.reserve(f.principal, request);
+      const reported: PiModelRequestSettlement = {
+        ...request,
+        reservationId: reserved.reservationId,
+        transportDrained: true,
+        outcome: "reported",
+        chargedInputTokens: 1_024,
+        chargedOutputTokens: 3_072,
+        reportedModel: "gpt-6-luna",
+        reportedUsage: { prompt_tokens: 1_024, completion_tokens: 3_072, total_tokens: 4_096 },
+      };
+      const receipt = yield* f.accounting.settle(reported);
+      const failed: PiModelRequestSettlement = {
+        ...request,
+        reservationId: reserved.reservationId,
+        outcome: "failed",
+        chargedInputTokens: 16_384,
+        chargedOutputTokens: 3_072,
+      };
+      expect(yield* f.accounting.settle(failed)).toEqual(receipt);
+      expect(yield* f.accounting.settle(failed)).toEqual(receipt);
+      expect(
+        yield* f.sql`SELECT status,charged_input_tokens,charged_output_tokens,accounting_receipt_id
+        FROM project_team_model_request WHERE reservation_id=${reserved.reservationId}`,
+      ).toEqual([
+        {
+          status: "failed",
+          charged_input_tokens: 16_384,
+          charged_output_tokens: 3_072,
+          accounting_receipt_id: receipt.accountingReceiptId,
+        },
+      ]);
+    }).pipe(Effect.provide(runtime(path))),
+  ),
+);
+
+it.effect(
+  "quarantines unknown subscription usage at its conservative maximum and stops successors",
+  () =>
+    fileTest((path) =>
+      Effect.gen(function* () {
+        const f = yield* subscriptionFixture;
+        const request = f.reservation();
+        const reserved = yield* f.accounting.reserve(f.principal, request);
+        const settlement: PiModelRequestSettlement = {
+          ...request,
+          reservationId: reserved.reservationId,
+          transportDrained: true,
+          outcome: "unknown",
+          chargedInputTokens: 16_384,
+          chargedOutputTokens: 64_000,
+        };
+        const receipt = yield* f.accounting.settle(settlement);
+        expect(yield* f.accounting.settle(settlement)).toEqual(receipt);
+        expect(
+          yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens FROM project_team_model_request WHERE root_task_id=${f.rootTaskId}`,
+        ).toEqual([
+          {
+            status: "unknown",
+            capacity_state: "quarantine",
+            charged_input_tokens: 16_384,
+            charged_output_tokens: 64_000,
+          },
+        ]);
+        yield* denied(f.accounting.reserve(f.principal, f.reservation(2)));
+        expect(
+          yield* f.sql`SELECT stopped_at_ms,stop_reason FROM project_team_pi_subscription_grant
+        WHERE root_task_id=${f.rootTaskId}`,
+        ).toEqual([{ stopped_at_ms: 100, stop_reason: "unknown-usage" }]);
+        expect(yield* f.counts()).toEqual([{ budgets: 1, requests: 1 }]);
+      }).pipe(Effect.provide(runtime(path))),
+    ),
+);
+
+it.effect("requires the private subscription selection to name the genuine current root", () =>
+  fileTest((path) =>
+    Effect.gen(function* () {
+      const f = yield* subscriptionFixture;
+      const request = f.reservation();
+      const withoutSelection = yield* make({
+        environmentId: f.options.environmentId,
+        routeId: f.options.routeId,
+        model: f.options.model,
+        acceptedReportedModels: f.options.acceptedReportedModels,
+        resolveOperation: f.options.resolveOperation,
+      });
+      yield* denied(withoutSelection.reserve(f.principal, request));
+      const foreignRoot = yield* make({
+        ...f.options,
+        subscriptionTest: {
+          ...f.options.subscriptionTest,
+          rootTaskId: "foreign-subscription-root",
+        },
+      });
+      yield* denied(foreignRoot.reserve(f.principal, request));
       expect(yield* f.counts()).toEqual([{ budgets: 0, requests: 0 }]);
     }).pipe(Effect.provide(runtime(path))),
   ),

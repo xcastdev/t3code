@@ -59,6 +59,7 @@ import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository
 const nativeFs = process.getBuiltinModule("fs");
 const instanceId = ProviderInstanceId.make("pi-instance");
 const model = "inclusionai/ling-3.1-flash:free";
+const subscriptionModel = "gpt-6-luna";
 const nowMs = Date.parse(at) + 1;
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const unused = Effect.fail(
@@ -132,6 +133,8 @@ const git = Effect.fn("admissionFactsTest.git")(function* (cwd: string, args: re
 const fixture = Effect.fn("admissionFactsTest.fixture")(function* (options?: {
   readonly missingRuntime?: boolean;
   readonly runtimeFacts?: PiProductionRuntimeAssets["runtimeFacts"];
+  readonly selectedModel?: typeof model | typeof subscriptionModel;
+  readonly catalogueReadForbidden?: boolean;
   readonly skills?: readonly string[];
   readonly ownedSkill?: boolean;
   readonly role?: "investigator" | "planner" | "reviewer" | "implementer";
@@ -243,14 +246,21 @@ const fixture = Effect.fn("admissionFactsTest.fixture")(function* (options?: {
     taskPriorities: [],
     profiles: roles.map((role) => ({
       role,
-      model,
+      model: options?.selectedModel ?? model,
       instructions: `Instructions for ${role}`,
       tools: ["pi.read", "project-work.report"],
       skills: selectedSkills,
       memoryAccess: "project",
       delegationDepth: 2,
     })),
-    modelPolicies: [{ model, tokenLimit: 8192, durationLimitMs: 60000, modelCalls: 2 }],
+    modelPolicies: [
+      {
+        model: options?.selectedModel ?? model,
+        tokenLimit: options?.selectedModel === subscriptionModel ? 64_000 : 8192,
+        durationLimitMs: options?.selectedModel === subscriptionModel ? 300_000 : 60000,
+        modelCalls: 2,
+      },
+    ],
   };
   const human = { kind: "human", id: "human" } as const;
   const source = { kind: "web", id: "web" } as const;
@@ -375,23 +385,30 @@ const fixture = Effect.fn("admissionFactsTest.fixture")(function* (options?: {
       ? parentId
       : state.tasks.find((task) => task.taskId !== parentId)!.taskId;
   yield* TestClock.setTime(nowMs);
-  const catalogue = {
-    source: "https://api.commandcode.ai/provider/v1/models",
-    fetchedAt: at,
-    selectedEntry: {
-      id: model,
-      owned_by: "command-code",
-      context_length: 262144,
-      supported_endpoints: ["/chat/completions"],
-    },
-  };
-  yield* sql`INSERT INTO project_team_pi_catalogue VALUES (${catalogue.source},${at},${encodeJson(catalogue)})`;
-  const modelCatalogue = yield* makePiModelCatalogue.pipe(
-    Effect.provideService(
-      HttpClient.HttpClient,
-      HttpClient.make(() => Effect.die("Facts must never refresh/fetch")),
-    ),
-  );
+  if (!options?.catalogueReadForbidden) {
+    const catalogue = {
+      source: "https://api.commandcode.ai/provider/v1/models",
+      fetchedAt: at,
+      selectedEntry: {
+        id: model,
+        owned_by: "command-code",
+        context_length: 262144,
+        supported_endpoints: ["/chat/completions"],
+      },
+    };
+    yield* sql`INSERT INTO project_team_pi_catalogue VALUES (${catalogue.source},${at},${encodeJson(catalogue)})`;
+  }
+  const modelCatalogue = options?.catalogueReadForbidden
+    ? PiModelCatalogue.of({
+        readFresh: Effect.die("Private subscription admission must not read CommandCode facts"),
+        refresh: Effect.die("Private subscription admission must not refresh CommandCode facts"),
+      })
+    : yield* makePiModelCatalogue.pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make(() => Effect.die("Facts must never refresh/fetch")),
+        ),
+      );
   const pi = yield* makeProjectTeamPiRuntime();
   const assets: PiProductionRuntimeAssets = {
     ...(options?.missingRuntime
@@ -444,6 +461,34 @@ const fixture = Effect.fn("admissionFactsTest.fixture")(function* (options?: {
   };
 });
 
+const privateSubscriptionSelection = (rootTaskId: string) => ({
+  projectId: String(projectId),
+  rootTaskId: ProjectWorkTaskId.make(rootTaskId),
+  model: "gpt-6-luna" as const,
+  maximumTokens: 64_000 as const,
+  maximumDurationMs: 300_000 as const,
+});
+const privateSubscriptionConfiguration = {
+  provider: "openai-codex" as const,
+  model: "gpt-6-luna" as const,
+  api: "openai-codex-responses" as const,
+  endpoint: "https://chatgpt.com/backend-api/codex/responses" as const,
+  contextWindow: 272_000,
+  maxInputTokens: 16_384,
+  maxOutputTokens: 2_048 as const,
+  advertisedMaxOutputTokens: 16_384,
+  deadlineMs: 300_000,
+  reasoning: true as const,
+  reasoningEffort: "high" as const,
+  serviceTier: "default" as const,
+  input: ["text"] as const,
+  cost: "unknown" as const,
+  catalogue: {
+    source: "pi-sdk:0.99.1/openai-codex" as const,
+    fetchedAt: at,
+  },
+};
+
 it.effect("measures actual SQL/Git facts and reserves the unchanged prepared request", () =>
   withServices(
     Effect.gen(function* () {
@@ -468,6 +513,98 @@ it.effect("measures actual SQL/Git facts and reserves the unchanged prepared req
       expect(nativeFs.existsSync(f.managedWorktreesRoot + "/" + prepared.request.git.runId)).toBe(
         false,
       );
+    }),
+  ),
+);
+
+it.effect(
+  "borrows the private subscription facts for Code without reading CommandCode catalogue",
+  () =>
+    withServices(
+      Effect.gen(function* () {
+        const f = yield* fixture({
+          role: "implementer",
+          selectedModel: subscriptionModel,
+          catalogueReadForbidden: true,
+          runtimeFacts: {
+            runtimeVersion: "0.99.1",
+            maxInputTokens: 16_384,
+            maxOutputTokens: 2_048,
+            subscription: {
+              selection: privateSubscriptionSelection("parent"),
+              configuration: privateSubscriptionConfiguration,
+            },
+          },
+        });
+        const read = yield* f.service.read({ state: f.state, taskId: f.taskId });
+        expect(read._tag).toBe("Facts");
+        if (read._tag !== "Facts") return;
+        expect(read.facts.provider.catalogue).toEqual({
+          source: "pi-sdk:0.99.1/openai-codex",
+          fetchedAt: at,
+          selectedEntry: {
+            id: "gpt-6-luna",
+            owned_by: "openai-codex",
+            context_length: 272_000,
+            supported_endpoints: ["/codex/responses"],
+          },
+        });
+        expect(read.facts.provider.subscription).toEqual({
+          selection: privateSubscriptionSelection("parent"),
+          configuration: privateSubscriptionConfiguration,
+        });
+        const prepared = prepareProjectTeamConfiguredAdmission({
+          state: f.state,
+          taskId: f.taskId,
+          nowMs,
+          facts: read.facts,
+        });
+        if (prepared._tag !== "Prepared") return yield* Effect.die(prepared.reason);
+        expect(prepared.request.claim.transition?.kind).toBe("claim");
+        if (prepared.request.claim.transition?.kind !== "claim") return;
+        expect(prepared.request.claim.transition.binding.model).toBe("gpt-6-luna");
+        expect(prepared.request.claim.transition.binding.configuration.maxTokens).toBe(64_000);
+        expect(prepared.request.claim.transition.binding.configuration.maxDurationMs).toBe(300_000);
+        expect("maxOutputTokens" in prepared.request.claim.transition.binding.configuration).toBe(
+          false,
+        );
+      }),
+    ),
+);
+
+it.effect("refuses Code when the actual private subscription hook is absent", () =>
+  withServices(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        role: "implementer",
+        selectedModel: subscriptionModel,
+        catalogueReadForbidden: true,
+      });
+      expect((yield* f.service.read({ state: f.state, taskId: f.taskId }))._tag).toBe("Blocked");
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("refuses Code when private subscription metadata belongs to a foreign root", () =>
+  withServices(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        role: "implementer",
+        selectedModel: subscriptionModel,
+        catalogueReadForbidden: true,
+        runtimeFacts: {
+          runtimeVersion: "0.99.1",
+          maxInputTokens: 16_384,
+          maxOutputTokens: 2_048,
+          subscription: {
+            selection: privateSubscriptionSelection("foreign-root"),
+            configuration: privateSubscriptionConfiguration,
+          },
+        },
+      });
+      expect((yield* f.service.read({ state: f.state, taskId: f.taskId }))._tag).toBe("Blocked");
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
     }),
   ),
 );

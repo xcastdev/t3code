@@ -18,7 +18,10 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { isPiManagedModel, piManagedModelRoute } from "../provider/pi/PiManagedModels.ts";
+import {
+  isPiBrokerManagedModel,
+  piBrokerModelRoute as piBrokerModelRouteFor,
+} from "../provider/pi/PiManagedModels.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   PiManagedProcessError,
@@ -261,7 +264,7 @@ const decodeTerminal = Schema.decodeEffect(
           reservationId: Schema.String,
           accountingReceiptId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256)),
           routeId: Schema.String,
-          provider: Schema.Literal("command-code"),
+          provider: Schema.Literals(["command-code", "openai-codex"]),
           model: Schema.String,
           reportedModel: Schema.String,
           usage: Usage,
@@ -563,7 +566,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       if (
         !found ||
         found.binding.environmentId !== options.environmentId ||
-        !isPiManagedModel(found.binding.model)
+        !isPiBrokerManagedModel(found.binding.model)
       )
         return yield* deny("Current managed Pi binding required");
       if (!initialize && (found.binding.status !== "running" || !found.binding.sessionId))
@@ -1673,6 +1676,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         deadline_at_ms: number;
         charged_input_tokens: number;
         charged_output_tokens: number;
+        accounting_mode: string;
+        unknown_maximum_tokens: number | null;
       }>`SELECT * FROM project_team_model_request WHERE operation_id=${row.operation_id}
         AND request_lane='pi' AND request_scope='' LIMIT 257`;
       const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
@@ -1695,6 +1700,38 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       let chargedTokens = 0;
       for (const receipt of terminal.accountingReceipts) {
         const requestRow = requests.find((entry) => entry.reservation_id === receipt.reservationId);
+        if (requestRow?.accounting_mode === "openai-subscription-monitored") {
+          const rootBudgets = yield* sql<{
+            maximum_tokens: number;
+            deadline_at_ms: number;
+          }>`SELECT maximum_tokens,deadline_at_ms
+            FROM project_team_model_budget WHERE environment_id=${requestRow.environment_id}
+            AND project_id=${requestRow.project_id} AND root_task_id=${requestRow.root_task_id}`;
+          const grants = yield* sql<{
+            model: string;
+            route_id: string;
+            maximum_tokens: number;
+            maximum_duration_ms: number;
+            deadline_at_ms: number;
+            stopped_at_ms: number | null;
+          }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms
+            FROM project_team_pi_subscription_grant WHERE environment_id=${requestRow.environment_id}
+            AND project_id=${requestRow.project_id} AND root_task_id=${requestRow.root_task_id}`;
+          const grant = grants[0];
+          if (
+            !grant ||
+            grant.model !== "gpt-6-luna" ||
+            grant.route_id !== "openai-subscription-luna" ||
+            grant.maximum_tokens !== 64_000 ||
+            grant.maximum_duration_ms !== 300_000 ||
+            rootBudgets.length !== 1 ||
+            !rootBudgets[0] ||
+            rootBudgets[0].maximum_tokens > 64_000 ||
+            grant.deadline_at_ms !== rootBudgets[0]?.deadline_at_ms ||
+            requestRow.unknown_maximum_tokens !== 64_000
+          )
+            return yield* deny("Stable subscription grant differs", "uncertain");
+        }
         if (
           !requestRow ||
           reservations.has(receipt.reservationId) ||
@@ -1711,14 +1748,18 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           requestRow.generation !== row.generation ||
           requestRow.request_id !== receipt.requestId ||
           requestRow.accounting_receipt_id !== receipt.accountingReceiptId ||
-          !isPiManagedModel(binding.model) ||
-          requestRow.route_id !== piManagedModelRoute(binding.model).routeId ||
+          !isPiBrokerManagedModel(binding.model) ||
+          (requestRow.accounting_mode === "openai-subscription-monitored") !==
+            (binding.model === "gpt-6-luna" && receipt.provider === "openai-codex") ||
+          requestRow.route_id !== piBrokerModelRouteFor(binding.model).routeId ||
           receipt.routeId !== requestRow.route_id ||
           requestRow.provider !== receipt.provider ||
           requestRow.model !== binding.model ||
+          requestRow.unknown_maximum_tokens !==
+            (requestRow.accounting_mode === "openai-subscription-monitored" ? 64_000 : null) ||
           receipt.model !== binding.model ||
-          !piManagedModelRoute(binding.model).acceptedReportedModels.includes(
-            receipt.reportedModel,
+          !piBrokerModelRouteFor(binding.model).acceptedReportedModels.some(
+            (model) => model === receipt.reportedModel,
           ) ||
           !requestRow.settlement_json ||
           !Number.isSafeInteger(requestRow.maximum_input_tokens) ||
@@ -1732,8 +1773,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           !Number.isSafeInteger(requestRow.deadline_at_ms) ||
           requestRow.deadline_at_ms < 1 ||
           requestRow.deadline_at_ms > row.deadline_at_ms ||
-          receipt.usage.prompt_tokens > requestRow.maximum_input_tokens ||
-          receipt.usage.completion_tokens > requestRow.maximum_output_tokens ||
+          (requestRow.accounting_mode !== "openai-subscription-monitored" &&
+            (receipt.usage.prompt_tokens > requestRow.maximum_input_tokens ||
+              receipt.usage.completion_tokens > requestRow.maximum_output_tokens)) ||
           Object.values(receipt.usage.prompt_tokens_details ?? {}).some(
             (value) => value !== undefined && value > receipt.usage.prompt_tokens,
           ) ||
@@ -1759,6 +1801,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           maxOutputTokens: requestRow.maximum_output_tokens,
           callCount: 1,
           deadlineAtMs: requestRow.deadline_at_ms,
+          ...(requestRow.accounting_mode === "openai-subscription-monitored"
+            ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+            : {}),
         };
         const reservation = yield* decodeJson(requestRow.reservation_json).pipe(
           Effect.mapError(() => deny("Stable Pi reservation unavailable", "uncertain")),
@@ -1778,6 +1823,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               chargedOutputTokens: requestRow.charged_output_tokens,
               reportedModel: receipt.reportedModel,
               reportedUsage: receipt.usage,
+              ...(requestRow.accounting_mode === "openai-subscription-monitored"
+                ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+                : {}),
             }) ||
           receipt.usage.total_tokens !==
             receipt.usage.prompt_tokens + receipt.usage.completion_tokens ||
@@ -1787,7 +1835,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           return yield* deny("Stable Pi accounting evidence differs", "uncertain");
         // Released calls consume actual usage, not each sequential reservation's ceiling.
         chargedTokens += receipt.usage.total_tokens;
-        if (!Number.isSafeInteger(chargedTokens) || chargedTokens > row.maximum_tokens)
+        if (
+          !Number.isSafeInteger(chargedTokens) ||
+          (chargedTokens > row.maximum_tokens &&
+            requestRow.accounting_mode !== "openai-subscription-monitored")
+        )
           return yield* deny("Stable Pi accounting exceeds original budget", "uncertain");
         reservations.add(receipt.reservationId);
         accountingReceipts.add(receipt.accountingReceiptId);
@@ -2512,14 +2564,32 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           )
             return yield* deny("Pi drain receipt mismatch", "uncertain");
           const requests = yield* sql<{
+            environment_id: string;
+            project_id: string;
+            root_task_id: string;
+            run_id: string;
+            attempt_id: string;
+            worker_id: string;
+            generation: number;
+            operation_id: string;
             request_id: number;
             reservation_id: string;
             accounting_receipt_id: string | null;
             status: string;
+            capacity_state: string;
             route_id: string;
             provider: string;
             model: string;
-          }>`SELECT request_id,reservation_id,accounting_receipt_id,status,route_id,provider,model FROM project_team_model_request WHERE worker_id=${captured.workerId} AND operation_id=${row.operation_id} AND generation=${row.generation}
+            maximum_input_tokens: number;
+            maximum_output_tokens: number;
+            deadline_at_ms: number;
+            accounting_mode: string;
+            unknown_maximum_tokens: number | null;
+            charged_input_tokens: number;
+            charged_output_tokens: number;
+            reservation_json: string;
+            settlement_json: string | null;
+          }>`SELECT * FROM project_team_model_request WHERE worker_id=${captured.workerId} AND operation_id=${row.operation_id} AND generation=${row.generation}
             AND request_lane='pi' AND request_scope=''`;
           const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
             environmentId: row.environment_id,
@@ -2533,17 +2603,114 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             const request = requests.find(
               (request) => request.reservation_id === receipt.reservationId,
             );
+            if (request?.accounting_mode === "openai-subscription-monitored") {
+              const budgets = yield* sql<{
+                maximum_tokens: number;
+                deadline_at_ms: number;
+              }>`SELECT maximum_tokens,deadline_at_ms
+                FROM project_team_model_budget WHERE environment_id=${request.environment_id}
+                AND project_id=${request.project_id} AND root_task_id=${request.root_task_id}`;
+              const grants = yield* sql<{
+                model: string;
+                route_id: string;
+                maximum_tokens: number;
+                maximum_duration_ms: number;
+                deadline_at_ms: number;
+              }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms
+                FROM project_team_pi_subscription_grant WHERE environment_id=${request.environment_id}
+                AND project_id=${request.project_id} AND root_task_id=${request.root_task_id}`;
+              const grant = grants[0];
+              if (
+                !grant ||
+                budgets.length !== 1 ||
+                !budgets[0] ||
+                budgets[0].maximum_tokens > 64_000 ||
+                grant.model !== "gpt-6-luna" ||
+                grant.route_id !== "openai-subscription-luna" ||
+                grant.maximum_tokens !== 64_000 ||
+                grant.maximum_duration_ms !== 300_000 ||
+                grant.deadline_at_ms !== budgets[0]?.deadline_at_ms ||
+                request.unknown_maximum_tokens !== 64_000
+              )
+                return yield* deny("Pi subscription terminal grant differs", "uncertain");
+            }
             if (
               !request ||
               request.status !== "reported" ||
               receipts.has(receipt.reservationId) ||
               request.accounting_receipt_id !== receipt.accountingReceiptId ||
               request.request_id !== receipt.requestId ||
+              request.environment_id !== options.environmentId ||
+              request.project_id !== row.project_id ||
+              request.root_task_id !== row.root_task_id ||
+              request.run_id !== captured.authority.binding.recordId ||
+              request.attempt_id !== captured.authority.binding.attemptId ||
               request.route_id !== receipt.routeId ||
               request.provider !== receipt.provider ||
-              request.model !== receipt.model
+              request.model !== receipt.model ||
+              request.accounting_mode !==
+                (receipt.provider === "openai-codex" ? "openai-subscription-monitored" : "hard") ||
+              !isPiBrokerManagedModel(captured.authority.binding.model) ||
+              request.model !== captured.authority.binding.model ||
+              request.route_id !==
+                piBrokerModelRouteFor(captured.authority.binding.model).routeId ||
+              !piBrokerModelRouteFor(captured.authority.binding.model).acceptedReportedModels.some(
+                (model) => model === receipt.reportedModel,
+              ) ||
+              request.unknown_maximum_tokens !==
+                (request.accounting_mode === "openai-subscription-monitored" ? 64_000 : null) ||
+              (request.accounting_mode === "openai-subscription-monitored"
+                ? receipt.model !== "gpt-6-luna" ||
+                  receipt.routeId !== "openai-subscription-luna" ||
+                  receipt.reportedModel !== "gpt-6-luna"
+                : request.maximum_input_tokens < receipt.usage.prompt_tokens ||
+                  request.maximum_output_tokens < receipt.usage.completion_tokens) ||
+              receipt.usage.total_tokens !==
+                receipt.usage.prompt_tokens + receipt.usage.completion_tokens ||
+              request.charged_input_tokens !== receipt.usage.prompt_tokens ||
+              request.charged_output_tokens !== receipt.usage.completion_tokens ||
+              request.capacity_state !== "released" ||
+              !request.settlement_json
             )
               return yield* deny("Pi accounting receipt mismatch", "uncertain");
+            const reservationFields = {
+              workerId: request.worker_id,
+              generation: request.generation,
+              operationId: request.operation_id,
+              requestId: request.request_id,
+              routeId: request.route_id,
+              provider: request.provider,
+              model: request.model,
+              maxInputTokens: request.maximum_input_tokens,
+              maxOutputTokens: request.maximum_output_tokens,
+              callCount: 1,
+              deadlineAtMs: request.deadline_at_ms,
+              ...(request.accounting_mode === "openai-subscription-monitored"
+                ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+                : {}),
+            };
+            const savedReservation = yield* decodeJson(request.reservation_json).pipe(
+              Effect.mapError(() => deny("Pi terminal reservation is malformed", "uncertain")),
+            );
+            const savedSettlement = yield* decodeJson(request.settlement_json).pipe(
+              Effect.mapError(() => deny("Pi terminal settlement is malformed", "uncertain")),
+            );
+            if (
+              canonicalProjectWorkPayload(savedReservation) !==
+                canonicalProjectWorkPayload(reservationFields) ||
+              canonicalProjectWorkPayload(savedSettlement) !==
+                canonicalProjectWorkPayload({
+                  ...reservationFields,
+                  reservationId: receipt.reservationId,
+                  outcome: "reported",
+                  transportDrained: true,
+                  chargedInputTokens: request.charged_input_tokens,
+                  chargedOutputTokens: request.charged_output_tokens,
+                  reportedModel: receipt.reportedModel,
+                  reportedUsage: receipt.usage,
+                })
+            )
+              return yield* deny("Pi terminal usage journal differs from its receipt", "uncertain");
             receipts.add(receipt.reservationId);
           }
           const pendingAccounting =
@@ -2823,6 +2990,32 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       current: (...args: Parameters<typeof current>) =>
         guard(ownTransaction().pipe(Effect.andThen(current(...args)))),
       admitCurrent,
+      readRootBudget: (
+        authority: ProjectTeamAuthority,
+        operation: PiWorkerOperation,
+        request: unknown,
+        resourceHash: string,
+      ) =>
+        guard(
+          ownTransaction().pipe(
+            Effect.andThen(
+              sql.withTransaction(
+                Effect.gen(function* () {
+                  const root = yield* roots(authority);
+                  const limits = yield* rootBudget(
+                    authority,
+                    root,
+                    operation,
+                    undefined,
+                    request,
+                    resourceHash,
+                  );
+                  return limits.rootBudget;
+                }),
+              ),
+            ),
+          ),
+        ),
       lookup: (...args: Parameters<typeof lookup>) => guard(lookup(...args)),
       lookupInTransaction,
       readCompaction: (...args: Parameters<typeof readCompaction>) =>

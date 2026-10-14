@@ -85,11 +85,26 @@ export const PiWorkerBootstrap = Schema.Struct({
   model: Schema.Struct({
     provider: boundedText(128).check(Schema.isPattern(/^[a-zA-Z0-9_-]+$/)),
     modelId: boundedText(256).check(Schema.isPattern(/^[a-zA-Z0-9_./:-]+$/)),
-    api: Schema.Literal("openai-completions"),
+    api: Schema.Literals(["openai-completions", "openai-codex-responses"]),
     contextWindow: RequestId,
     maxTokens: RequestId,
     reasoning: Schema.Boolean,
-  }),
+    reasoningEffort: Schema.optional(Schema.Literal("high")),
+    serviceTier: Schema.optional(Schema.Literal("default")),
+  }).check(
+    Schema.makeFilter((model) =>
+      model.api === "openai-completions"
+        ? model.provider !== "openai-codex" &&
+          model.modelId !== "gpt-6-luna" &&
+          model.reasoningEffort === undefined &&
+          model.serviceTier === undefined
+        : model.provider === "openai-codex" &&
+          model.modelId === "gpt-6-luna" &&
+          model.reasoning &&
+          model.reasoningEffort === "high" &&
+          model.serviceTier === "default",
+    ),
+  ),
   allowedTools: Schema.Array(
     Schema.Struct({
       name: Token,
@@ -323,6 +338,14 @@ const decodeToolInput = Schema.decodeSync(Schema.fromJsonString(PiWorkerToolInpu
 const decodeToolOutput = Schema.decodeSync(Schema.fromJsonString(PiWorkerToolOutput), strict);
 const decodeBootstrap = Schema.decodeSync(Schema.fromJsonString(PiWorkerBootstrap), strict);
 const encodeBootstrap = Schema.encodeSync(Schema.fromJsonString(PiWorkerBootstrap), strict);
+
+const freezeTree = <T>(value: T): T => {
+  if (value !== null && typeof value === "object") {
+    for (const child of Object.values(value)) freezeTree(child);
+    Object.freeze(value);
+  }
+  return value;
+};
 
 export class PiWorkerProtocolError extends Error {
   readonly code: string;
@@ -790,7 +813,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
                 (message.resources?.skills.length ?? 0)
               )
                 fail("DUPLICATE_SKILL");
-              bootstrap = message;
+              bootstrap = freezeTree(decodeBootstrap(encodeBootstrap(message)));
               registerTransfer(message.context, "context", "parent");
               initialTransfers++;
               if (message.prompt) {

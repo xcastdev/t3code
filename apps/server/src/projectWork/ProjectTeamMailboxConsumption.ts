@@ -65,7 +65,7 @@ const BoundInput = Schema.Struct({
   worker_id: Id,
   generation: Safe,
   route_id: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   system_text_sha256: Digest,
   encoded_request_sha256: Digest,
@@ -76,12 +76,14 @@ const Reservation = Schema.Struct({
   operationId: Id,
   requestId: Positive,
   routeId: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   maxInputTokens: Positive,
   maxOutputTokens: Positive,
   callCount: Schema.Literal(1),
   deadlineAtMs: Positive,
+  accountingMode: Schema.optional(Schema.Literal("openai-subscription-monitored")),
+  unknownMaximumTokens: Schema.optional(Schema.Literal(64_000)),
 });
 const ReservationRow = Schema.Struct({
   reservation_id: Id,
@@ -95,11 +97,13 @@ const ReservationRow = Schema.Struct({
   operation_id: Id,
   request_id: Positive,
   route_id: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   maximum_input_tokens: Positive,
   maximum_output_tokens: Positive,
   deadline_at_ms: Positive,
+  accounting_mode: Schema.Literals(["hard", "openai-subscription-monitored"]),
+  unknown_maximum_tokens: Schema.NullOr(Schema.Literal(64_000)),
   status: Schema.Literals(["held", "reported", "failed", "unknown"]),
   capacity_state: Schema.Literals(["held", "released", "quarantine", "legacy"]),
   reservation_json: bounded(8192),
@@ -655,7 +659,7 @@ export const makeProjectTeamMailboxConsumption = Effect.fn("makeProjectTeamMailb
       yield* selectedCurrent(sealed, owner);
       const reservations =
         yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,
-      maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,CASE WHEN length(CAST(reservation_json AS BLOB)) <= 8192 THEN reservation_json ELSE NULL END AS reservation_json
+      maximum_input_tokens,maximum_output_tokens,deadline_at_ms,accounting_mode,unknown_maximum_tokens,status,capacity_state,CASE WHEN length(CAST(reservation_json AS BLOB)) <= 8192 THEN reservation_json ELSE NULL END AS reservation_json
       FROM project_team_model_request WHERE reservation_id=${input.reservationId} LIMIT 2`;
       if (reservations.length !== 1)
         return yield* deny("Actual reserved input is missing or ambiguous");
@@ -673,7 +677,15 @@ export const makeProjectTeamMailboxConsumption = Effect.fn("makeProjectTeamMailb
         maxOutputTokens: reservation.maximum_output_tokens,
         callCount: 1,
         deadlineAtMs: reservation.deadline_at_ms,
+        ...(reservation.accounting_mode === "openai-subscription-monitored"
+          ? {
+              accountingMode: "openai-subscription-monitored",
+              unknownMaximumTokens: 64_000,
+            }
+          : {}),
       };
+      const monitored = reservation.accounting_mode === "openai-subscription-monitored";
+      const subscriptionModel = original.binding.model === "gpt-6-luna";
       if (
         reservation.environment_id !== environmentId ||
         reservation.project_id !== original.binding.projectId ||
@@ -684,12 +696,43 @@ export const makeProjectTeamMailboxConsumption = Effect.fn("makeProjectTeamMailb
         reservation.generation !== original.binding.generation ||
         reservation.operation_id !== input.operationId ||
         reservation.model !== original.binding.model ||
+        monitored !== subscriptionModel ||
+        reservation.provider !== (subscriptionModel ? "openai-codex" : "command-code") ||
+        reservation.unknown_maximum_tokens !== (monitored ? 64_000 : null) ||
+        decoded.accountingMode !== (monitored ? "openai-subscription-monitored" : undefined) ||
+        decoded.unknownMaximumTokens !== (monitored ? 64_000 : undefined) ||
+        (monitored && reservation.route_id !== "openai-subscription-luna") ||
         reservation.deadline_at_ms > original.row.deadline_at_ms ||
         reservation.maximum_input_tokens + reservation.maximum_output_tokens >
           original.row.maximum_tokens ||
         canonical(decoded) !== canonical(expected)
       )
         return yield* deny("Reserved input does not belong to original assignment");
+      if (monitored) {
+        const grants = yield* sql<{
+          model: string;
+          route_id: string;
+          maximum_tokens: number;
+          maximum_duration_ms: number;
+          deadline_at_ms: number;
+          stopped_at_ms: number | null;
+        }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms
+          FROM project_team_pi_subscription_grant WHERE environment_id=${environmentId}
+          AND project_id=${reservation.project_id} AND root_task_id=${reservation.root_task_id} LIMIT 2`;
+        const grant = grants[0];
+        if (
+          grants.length !== 1 ||
+          grant?.model !== "gpt-6-luna" ||
+          grant.route_id !== "openai-subscription-luna" ||
+          grant.maximum_tokens !== 64_000 ||
+          grant.maximum_duration_ms !== 300_000 ||
+          grant.deadline_at_ms !== original.snapshot.intent.limits.rootDeadlineAtMs ||
+          grant.deadline_at_ms < reservation.deadline_at_ms ||
+          grant.stopped_at_ms !== null ||
+          original.snapshot.intent.limits.maximumTokens > grant.maximum_tokens
+        )
+          return yield* deny("Reserved subscription input is stopped or ungranted");
+      }
       const expectedInput = yield* decodeBoundInput({
         reservation_id: reservation.reservation_id,
         operation_id: input.operationId,

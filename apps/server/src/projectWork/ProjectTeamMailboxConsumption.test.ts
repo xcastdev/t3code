@@ -66,6 +66,7 @@ const native: PiNativeReference = {
 const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   assignment = "Investigate the original approved task",
   retainRoleReceipt = false,
+  selectedModel = model,
 ) {
   const repository = yield* ProjectWorkRepository;
   const sql = yield* SqlClient.SqlClient;
@@ -97,7 +98,7 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   const state = yield* readCurrentState(sql, projectId);
   const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
   if (role?.kind !== "role-revision") return yield* Effect.die("Missing original role");
-  yield* restoreHistoricalBinding({ ...role, model });
+  yield* restoreHistoricalBinding({ ...role, model: selectedModel });
   if (retainRoleReceipt) {
     const restored = yield* readCurrentState(sql, projectId);
     const currentRole = restored.foundationRecords?.find(
@@ -122,14 +123,15 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   const worktree = yield* fs.makeTempDirectoryScoped();
   const nativeRoot = yield* fs.makeTempDirectoryScoped();
   const protectedRoot = yield* fs.makeTempDirectoryScoped();
+  const maximumTokens = selectedModel === "gpt-6-luna" ? 64_000 : 20_000;
   const binding = {
     ...claim.transition.binding,
     worktree,
     branch: "refs/heads/mailbox",
-    model,
+    model: selectedModel,
     configuration: {
       ...claim.transition.binding.configuration,
-      maxTokens: 20000,
+      maxTokens: maximumTokens,
       maxDurationMs: 300000,
       runtimeVersion: "0.99.1",
       instructionsHash: NodeCrypto.createHash("sha256").update(role.instructions).digest("hex"),
@@ -161,8 +163,8 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
         generation: 0,
         updatedAt: at,
         status: "configured",
-        model,
-        tokenLimit: 20000,
+        model: selectedModel,
+        tokenLimit: maximumTokens,
         durationLimitMs: 300000,
         environmentModelCalls: 2,
         modelCalls: 2,
@@ -347,11 +349,25 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   });
   const reserveInput = Effect.gen(function* () {
     yield* activate(prompt, native);
+    const subscription = selectedModel === "gpt-6-luna";
+    const routeId = subscription ? "openai-subscription-luna" : "command-code-ling-free";
+    const provider = subscription ? ("openai-codex" as const) : ("command-code" as const);
     const accounting = yield* makeAccounting({
       environmentId: "environment",
-      routeId: "command-code-ling-free",
-      model,
-      acceptedReportedModels: [model],
+      routeId,
+      model: selectedModel,
+      acceptedReportedModels: [selectedModel],
+      ...(subscription
+        ? {
+            subscriptionTest: {
+              projectId,
+              rootTaskId: binding.taskId,
+              model: "gpt-6-luna" as const,
+              maximumTokens: 64_000 as const,
+              maximumDurationMs: 300_000 as const,
+            },
+          }
+        : {}),
       resolveOperation: operations.resolveOperation,
     });
     const fields = {
@@ -359,13 +375,19 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
       operationId: prompt.operation.operationId,
       generation: 0,
       requestId: 1,
-      routeId: "command-code-ling-free",
-      provider: "command-code" as const,
-      model,
-      maxInputTokens: 1000,
-      maxOutputTokens: 100,
+      routeId,
+      provider,
+      model: selectedModel,
+      maxInputTokens: subscription ? 16_384 : 1000,
+      maxOutputTokens: subscription ? 2_048 : 100,
       callCount: 1 as const,
       deadlineAtMs: prompt.deadlineAtMs,
+      ...(subscription
+        ? {
+            accountingMode: "openai-subscription-monitored" as const,
+            unknownMaximumTokens: 64_000 as const,
+          }
+        : {}),
     };
     const reservation = yield* accounting.reserve(prompt.principal, fields);
     const settle = Effect.gen(function* () {
@@ -377,7 +399,7 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
         transportDrained: true,
         chargedInputTokens: 10,
         chargedOutputTokens: 2,
-        reportedModel: model,
+        reportedModel: selectedModel,
         reportedUsage: usage,
       });
       return {
@@ -386,12 +408,23 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
         accountingReceiptId: settled.accountingReceiptId,
         routeId: fields.routeId,
         provider: fields.provider,
-        model,
-        reportedModel: model,
+        model: selectedModel,
+        reportedModel: selectedModel,
         usage,
       };
     });
-    return { ...reservation, settle };
+    const stopSubscriptionGrant = Effect.gen(function* () {
+      if (!subscription) return yield* Effect.die("Only subscription reservations have a grant");
+      return yield* accounting.settle({
+        ...fields,
+        reservationId: reservation.reservationId,
+        transportDrained: true,
+        outcome: "unknown",
+        chargedInputTokens: 16_384,
+        chargedOutputTokens: 64_000,
+      });
+    });
+    return { ...reservation, settle, stopSubscriptionGrant };
   });
   const messages = Effect.gen(function* () {
     return (
@@ -661,6 +694,112 @@ it.effect("binds a real reserved original input exactly without granting message
         yield* reserved.settle,
       ]);
       expect((yield* f.messages).map((m) => [m.status, m.deliveryCursor])).toEqual([["queued", 0]]);
+    }),
+  ),
+);
+
+it.effect(
+  "binds and delivers a genuinely granted subscription assignment through its durable receipt",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment(undefined, false, "gpt-6-luna");
+        yield* f.addMessage("subscription-message");
+        const sealed = yield* f.mailbox.sealInitialAssignment({
+          operationId: f.request.assignmentOperationId,
+          baseSystemText: "Original subscription instructions",
+        });
+        const reserved = yield* f.reserveInput;
+        expect(
+          yield* f.sql`SELECT provider,accounting_mode,unknown_maximum_tokens
+          FROM project_team_model_request WHERE reservation_id=${reserved.reservationId}`,
+        ).toEqual([
+          {
+            provider: "openai-codex",
+            accounting_mode: "openai-subscription-monitored",
+            unknown_maximum_tokens: 64_000,
+          },
+        ]);
+        const bound = yield* f.mailbox.bindRequestInput({
+          operationId: f.request.assignmentOperationId,
+          reservationId: reserved.reservationId,
+          encodedRequestSha256: "d".repeat(64),
+        });
+        expect(bound).toEqual({
+          reservationId: reserved.reservationId,
+          encodedRequestSha256: "d".repeat(64),
+        });
+        expect(sealed.systemText).toContain("Original subscription instructions");
+        expect(sealed.systemText).toContain("Review the captured task");
+        yield* f.complete(f.prompt, { ...native, leafId: "subscription-delivered" }, "success", [
+          yield* reserved.settle,
+        ]);
+        const delivered = yield* f.mailbox.reflectAssignment(f.snapshot);
+        expect(delivered.status).toBe("delivered");
+        if (delivered.status !== "delivered")
+          return yield* Effect.die("Granted subscription assignment was not delivered");
+        expect(delivered.receipt.terminal.accountingReceipts[0]).toMatchObject({
+          reservationId: reserved.reservationId,
+          routeId: "openai-subscription-luna",
+          provider: "openai-codex",
+          model: "gpt-6-luna",
+        });
+        expect((yield* f.messages)[0]).toMatchObject({ status: "delivered", deliveryCursor: 1 });
+      }),
+    ),
+);
+
+it.effect("rejects a subscription reservation owned by a foreign run", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixtureWithAssignment(undefined, false, "gpt-6-luna");
+      yield* f.mailbox.sealInitialAssignment({
+        operationId: f.request.assignmentOperationId,
+        baseSystemText: "Original subscription instructions",
+      });
+      const reserved = yield* f.reserveInput;
+      yield* f.sql`UPDATE project_team_model_request SET run_id=${"foreign-run"}
+        WHERE reservation_id=${reserved.reservationId}`;
+      expect(
+        (yield* f.mailbox
+          .bindRequestInput({
+            operationId: f.request.assignmentOperationId,
+            reservationId: reserved.reservationId,
+            encodedRequestSha256: "e".repeat(64),
+          })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.sql`SELECT reservation_id FROM project_team_mailbox_input`).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("rejects a subscription reservation after its durable grant has stopped", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixtureWithAssignment(undefined, false, "gpt-6-luna");
+      yield* f.mailbox.sealInitialAssignment({
+        operationId: f.request.assignmentOperationId,
+        baseSystemText: "Original subscription instructions",
+      });
+      const reserved = yield* f.reserveInput;
+      expect(
+        yield* f.sql`SELECT root_task_id FROM project_team_pi_subscription_grant`,
+      ).toHaveLength(1);
+      yield* reserved.stopSubscriptionGrant;
+      expect(
+        yield* f.sql`SELECT stopped_at_ms,stop_reason FROM project_team_pi_subscription_grant`,
+      ).toEqual([{ stopped_at_ms: now, stop_reason: "unknown-usage" }]);
+      expect(
+        (yield* f.mailbox
+          .bindRequestInput({
+            operationId: f.request.assignmentOperationId,
+            reservationId: reserved.reservationId,
+            encodedRequestSha256: "f".repeat(64),
+          })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.sql`SELECT reservation_id FROM project_team_mailbox_input`).toEqual([]);
     }),
   ),
 );
@@ -1337,58 +1476,59 @@ it.effect(
       }),
     ),
 );
-it.effect(
-  "failed owning COMMIT exposes neither successful reflection nor public messages before test cleanup; exact retry works",
-  () =>
-    scoped(
-      Effect.gen(function* () {
-        const f = yield* consumedFixture;
-        const query = yield* ProjectWorkQuery;
-        const before = yield* query.listFoundationRecords({ projectId, kinds: ["message"] });
-        yield* f.sql`PRAGMA foreign_keys=ON`;
-        yield* f.sql`CREATE TABLE mailbox_commit_parent(id TEXT PRIMARY KEY)`;
-        yield* f.sql`CREATE TABLE mailbox_commit_child(id TEXT REFERENCES mailbox_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
-        yield* f.sql`CREATE TRIGGER fail_mailbox_commit AFTER UPDATE ON project_team_mailbox_batch WHEN NEW.status='delivered' BEGIN INSERT INTO mailbox_commit_child VALUES('missing'); END`;
-        let escaped = false;
-        expect(
-          (yield* f.mailbox.reflectAssignment(f.snapshot).pipe(
-            Effect.tap(() =>
-              Effect.sync(() => {
-                escaped = true;
-              }),
-            ),
-            Effect.exit,
-          ))._tag,
-        ).toBe("Failure");
-        expect(escaped).toBe(false);
-        expect(yield* f.sql`SELECT status FROM project_team_mailbox_batch`).toEqual([
-          { status: "delivered" },
-        ]);
-        expect((yield* f.mailbox.reflectAssignment(f.snapshot).pipe(Effect.exit))._tag).toBe(
-          "Failure",
-        );
-        expect(
-          (yield* query.listFoundationRecords({ projectId, kinds: ["message"] }).pipe(Effect.exit))
-            ._tag,
-        ).toBe("Failure");
-        expect((yield* query.exportSnapshot(projectId, false, true).pipe(Effect.exit))._tag).toBe(
-          "Failure",
-        );
-        // Only the disposable test connection is cleaned, inside its own captured loan.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
+it.effect("failed owning COMMIT automatically rolls back reflection and exact retry works", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* consumedFixture;
+      const query = yield* ProjectWorkQuery;
+      const before = yield* query.listFoundationRecords({ projectId, kinds: ["message"] });
+      const beforeMessages = yield* f.messages;
+      const beforeExport = yield* query.exportSnapshot(projectId, false, true);
+      const beforeEvents =
+        yield* f.sql`SELECT event_id,command_id FROM project_work_events ORDER BY event_id`;
+      const beforeReceipts =
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts ORDER BY command_id`;
+      yield* f.sql`PRAGMA foreign_keys=ON`;
+      yield* f.sql`CREATE TABLE mailbox_commit_parent(id TEXT PRIMARY KEY)`;
+      yield* f.sql`CREATE TABLE mailbox_commit_child(id TEXT REFERENCES mailbox_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      yield* f.sql`CREATE TRIGGER fail_mailbox_commit AFTER UPDATE ON project_team_mailbox_batch WHEN NEW.status='delivered' BEGIN INSERT INTO mailbox_commit_child VALUES('missing'); END`;
+      let escaped = false;
+      const failedReflection = f.mailbox.reflectAssignment(f.snapshot).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            escaped = true;
           }),
-        );
-        expect(yield* query.listFoundationRecords({ projectId, kinds: ["message"] })).toEqual(
-          before,
-        );
-        expect(yield* f.sql`SELECT operation_id FROM project_team_mailbox_reflection`).toEqual([]);
-        yield* f.sql`DROP TRIGGER fail_mailbox_commit`;
-        expect((yield* f.mailbox.reflectAssignment(f.snapshot)).status).toBe("delivered");
-      }),
-    ),
+        ),
+        Effect.exit,
+      );
+      expect((yield* failedReflection)._tag).toBe("Failure");
+      expect(escaped).toBe(false);
+      expect(yield* f.sql`SELECT status FROM project_team_mailbox_batch`).toEqual([
+        { status: "sealed" },
+      ]);
+      expect(yield* f.sql`SELECT operation_id FROM project_team_mailbox_reflection`).toEqual([]);
+      expect(
+        yield* f.sql`SELECT event_id,command_id FROM project_work_events ORDER BY event_id`,
+      ).toEqual(beforeEvents);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts ORDER BY command_id`,
+      ).toEqual(beforeReceipts);
+      expect(yield* f.messages).toEqual(beforeMessages);
+      expect(yield* query.listFoundationRecords({ projectId, kinds: ["message"] })).toEqual(before);
+      expect(yield* query.exportSnapshot(projectId, false, true)).toEqual(beforeExport);
+      expect((yield* f.mailbox.reflectAssignment(f.snapshot).pipe(Effect.exit))._tag).toBe(
+        "Failure",
+      );
+      expect(yield* f.sql`SELECT status FROM project_team_mailbox_batch`).toEqual([
+        { status: "sealed" },
+      ]);
+      yield* f.sql`DROP TRIGGER fail_mailbox_commit`;
+      expect((yield* f.mailbox.reflectAssignment(f.snapshot)).status).toBe("delivered");
+      expect(
+        (yield* f.messages).map((message) => [message.status, message.deliveryCursor]),
+      ).toEqual([["delivered", 1]]);
+    }),
+  ),
 );
 
 for (const corrupt of ["canonical", "hash", "oversize"] as const) {

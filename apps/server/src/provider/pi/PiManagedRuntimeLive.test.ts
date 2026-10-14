@@ -110,6 +110,8 @@ import {
 } from "../../projectWork/ProjectWorkVerificationRequest.ts";
 import { ServerEnvironmentIdentity } from "../../environment/ServerEnvironment.ts";
 import { readProjectTeamBindingAccountingInTransaction } from "../../projectWork/ProjectTeamUsageRead.ts";
+import type { ProjectTeamPiSubscriptionTestSelection } from "../../projectWork/ProjectTeamModelAccounting.ts";
+import * as PiModelAccounting from "../../projectWork/ProjectTeamModelAccounting.ts";
 import { ProjectLifecycle, ProjectLifecycleLive } from "../../project/ProjectLifecycle.ts";
 import { readProjectMemoryProjectionSyncInTransaction } from "../../projectWork/memory/ProjectMemoryProjectDeletion.ts";
 import * as DispatchJournal from "../../projectWork/ProjectTeamDispatchJournal.ts";
@@ -174,6 +176,7 @@ import {
   makePiManagedRuntimeLive,
   type PiManagedRuntimeLiveOptions,
 } from "./PiManagedRuntimeLive.ts";
+import { makePiModelBroker } from "./PiModelBroker.ts";
 
 const decodeClosure = Schema.decodeEffect(
   Schema.fromJsonString(
@@ -6133,6 +6136,7 @@ type RuntimeFixtureProfile = {
   readonly originalClockAtMs?: number;
   readonly ownedScratchDirectory?: string;
   readonly physicalWorkspace?: boolean;
+  readonly model?: string;
 };
 const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   reviewer = false,
@@ -6143,6 +6147,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   assignment = "Implement the approved retained context",
   profile?: RuntimeFixtureProfile,
 ) {
+  const selectedModel = profile?.model ?? model;
   if (reviewer || readonlyKind === "review") return yield* requiredReviewTransferFixture();
   const fixtureAt =
     profile?.originalClockAtMs === undefined
@@ -6207,7 +6212,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
             r.kind === "role-revision"
               ? {
                   ...r,
-                  model,
+                  model: selectedModel,
                   ...(profile
                     ? {
                         instructions: profile.instructions,
@@ -6317,7 +6322,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           modelCalls: 2,
           delegationDepth: 2,
           repairAllowance: 2,
-          model,
+          model: selectedModel,
           tokenLimit: profile?.maximumTokens ?? 2000,
           durationLimitMs: profile?.durationMs ?? 2000,
         },
@@ -6349,7 +6354,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       ...claim.transition.binding,
       worktree: path,
       branch,
-      model,
+      model: selectedModel,
       configuration: {
         ...claim.transition.binding.configuration,
         runtimeVersion: "0.99.1",
@@ -6551,7 +6556,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
         recordId: "readonly-runtime-role",
         roleId: "readonly-runtime-role",
         revision: 0,
-        model,
+        model: selectedModel,
         delegationDepth: role.delegationDepth,
       };
       yield* repository.execute(
@@ -6596,7 +6601,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
         providerInstanceId,
         threadId,
         environmentId: "environment",
-        model,
+        model: selectedModel,
         configuration: {
           ...configuration,
           instructionsHash: NodeCrypto.createHash("sha256")
@@ -6816,6 +6821,7 @@ const dispatchedRuntimeFixture = Effect.fn("dispatchedRuntimeFixture")(function*
 const initializeRequiredContext = Effect.fn("initializeRequiredContext")(function* (
   f: Effect.Success<ReturnType<typeof requiredTransferFixture>>,
   retainAssignment = false,
+  targetInstance: PiManagedRuntimeInstance = f.instance,
 ) {
   const journal = yield* makeProjectTeamDispatchJournal({
     environmentId: "environment",
@@ -6973,7 +6979,7 @@ const initializeRequiredContext = Effect.fn("initializeRequiredContext")(functio
     ),
   );
   yield* Effect.gen(function* () {
-    const initialized = yield* f.instance.prepareOperation(
+    const initialized = yield* targetInstance.prepareOperation(
       {
         threadId: f.binding.threadId,
         kind: "initialize",
@@ -6985,7 +6991,7 @@ const initializeRequiredContext = Effect.fn("initializeRequiredContext")(functio
     yield* stage("session-bound");
     yield* stage("assignment-intent");
     if (retainAssignment) {
-      const assigned = yield* f.instance.prepareOperation(
+      const assigned = yield* targetInstance.prepareOperation(
         {
           threadId: f.binding.threadId,
           kind: "prompt",
@@ -7050,11 +7056,17 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
             const settings = yield* ServerSettings.ServerSettingsService;
             yield* settings.updateSettings({ projectTeamExecutionEnabled: true });
             const approvedAtMs = yield* Clock.currentTimeMillis;
+            const subscriptionSmoke = process.env.PI_MANAGED_RUNTIME_SUBSCRIPTION_SMOKE === "1";
+            const subscriptionFailureSmoke =
+              subscriptionSmoke &&
+              process.env.PI_MANAGED_RUNTIME_SUBSCRIPTION_FAILURE_SMOKE === "1";
+            const durationMs = subscriptionSmoke ? 300_000 : 60_000;
+            const maxInputTokens = subscriptionSmoke ? 16_384 : 12_000;
             const f = yield* dispatchedRuntimeFixture({
-              ...basicRuntimeProfile,
+              ...(subscriptionSmoke ? subscriptionRuntimeProfile : basicRuntimeProfile),
               role: "implementer",
-              durationMs: 60000,
-              maxInputTokens: 12000,
+              durationMs,
+              maxInputTokens,
               originalClockAtMs: approvedAtMs,
               ownedScratchDirectory,
               physicalWorkspace: true,
@@ -7063,7 +7075,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
               DateTime.formatIso(DateTime.makeUnsafe(approvedAtMs)),
             );
             const originalDeadlineAtMs = f.snapshot.intent.limits.rootDeadlineAtMs;
-            expect(originalDeadlineAtMs).toBeGreaterThanOrEqual(approvedAtMs + 60000);
+            expect(originalDeadlineAtMs).toBeGreaterThanOrEqual(approvedAtMs + durationMs);
             expect(yield* Clock.currentTimeMillis).toBeLessThan(
               f.snapshot.intent.limits.deadlineAtMs,
             );
@@ -7097,9 +7109,26 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
                 yield* fs.writeFileString(evidence + "/sessions.json", json(sessions));
               }).pipe(Effect.orDie),
             );
+            const syntheticAccess = `header.${Buffer.from(
+              json({
+                exp: Math.ceil(originalDeadlineAtMs / 1000) + 60,
+                "https://api.openai.com/auth": { chatgpt_account_id: "synthetic-native-account" },
+              }),
+            ).toString("base64url")}.signature`;
             yield* fs.writeFileString(
               f.options.agentDirectory + "/auth.json",
-              json({ "command-code": { type: "api_key", key: "synthetic-parent-key" } }),
+              json(
+                subscriptionSmoke
+                  ? {
+                      "openai-codex": {
+                        type: "oauth",
+                        access: syntheticAccess,
+                        expires: originalDeadlineAtMs + 60_000,
+                        accountId: "synthetic-native-account",
+                      },
+                    }
+                  : { "command-code": { type: "api_key", key: "synthetic-parent-key" } },
+              ),
             );
             const captured: Array<{
               unit: string;
@@ -7119,12 +7148,56 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
               captured.push({ unit, kind, pid, startTime });
               yield* fs.writeFileString(evidence + "/captured-pids.json", json(captured));
             });
+            const assertChildrenDrained = Effect.fn("nativeSmoke.assertChildrenDrained")(function* (
+              children: readonly { unit: string; owner_json: string; drain_json: string }[],
+            ) {
+              for (const child of children) {
+                const owner = parseOwner(child.owner_json);
+                const drain = parseFullDrain(child.drain_json);
+                expect(owner.unit).toBe(child.unit);
+                expect(drain.unit).toBe(child.unit);
+                expect(drain.invocation).toBe(owner.invocation);
+                expect(drain.memoryBytes).toBe(536870912);
+                expect(drain.swapBytes).toBe(0);
+                expect(drain.oomGroup).toBe(1);
+                expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(
+                  true,
+                );
+                const identities = captured.filter((item) => item.unit === child.unit);
+                expect(identities.map((item) => item.kind)).toEqual([
+                  "launcher",
+                  "owner",
+                  "started",
+                ]);
+                expect(identities.map((item) => item.pid)).toEqual([
+                  drain.launcherPid,
+                  drain.ownerPid,
+                  drain.childPid,
+                ]);
+                for (const item of identities) {
+                  const stat = yield* fs
+                    .readFileString(`/proc/${item.pid}/stat`)
+                    .pipe(Effect.option);
+                  if (Option.isSome(stat))
+                    expect(
+                      stat.value.slice(stat.value.lastIndexOf(") ") + 2).split(" ")[19],
+                    ).not.toBe(item.startTime);
+                }
+                if (yield* fs.exists(drain.cgroup + "/cgroup.events"))
+                  expect(yield* fs.readFileString(drain.cgroup + "/cgroup.events")).toContain(
+                    "populated 0",
+                  );
+              }
+            });
             const originalSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            let nativeLauncherExited = Promise.withResolvers<void>();
             const observed = ChildProcessSpawner.make((command) => {
               if (command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run")
                 return originalSpawner.spawn(command);
               const unit = command.args.find((arg) => arg.startsWith("--unit="))?.slice(7);
               if (!unit) return originalSpawner.spawn(command);
+              const launcherExited = Promise.withResolvers<void>();
+              nativeLauncherExited = launcherExited;
               let pending = Buffer.alloc(0);
               let transcript = Buffer.alloc(0);
               const args = [...command.args];
@@ -7159,6 +7232,9 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
                   Effect.map((handle) =>
                     ChildProcessSpawner.makeHandle({
                       ...handle,
+                      exitCode: handle.exitCode.pipe(
+                        Effect.tap(() => Effect.sync(() => launcherExited.resolve())),
+                      ),
                       stdout: handle.stdout.pipe(
                         Stream.tap((chunk) =>
                           Effect.gen(function* () {
@@ -7199,12 +7275,38 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
                 );
             });
             let calls = 0;
+            const originalSessionRuntime = SessionRuntime.makePiSessionRuntime;
+            const raceSpy = vi
+              .spyOn(SessionRuntime, "makePiSessionRuntime")
+              .mockImplementation((input) =>
+                originalSessionRuntime({
+                  ...input,
+                  onWorkerFrame: async (frame, signal) => {
+                    // Force native exit to overtake buffered receipt processing.
+                    if (subscriptionSmoke && frame.message.type === "native")
+                      await nativeLauncherExited.promise;
+                    await input.onWorkerFrame?.(frame, signal);
+                  },
+                }),
+              );
+            yield* Effect.addFinalizer(() => Effect.sync(() => raceSpy.mockRestore()));
             const runtime = yield* makePiManagedRuntimeLive({
               ...f.options,
               ...assets,
               memoryBytes: 536870912,
-              maxInputTokens: 12000,
-              maxOutputTokens: 512,
+              maxInputTokens,
+              maxOutputTokens: subscriptionSmoke ? 2_048 : 512,
+              ...(subscriptionSmoke
+                ? {
+                    subscriptionTest: {
+                      selection: subscriptionSelection(f),
+                      credentialSource: {
+                        directory: f.options.agentDirectory,
+                        format: "pi" as const,
+                      },
+                    },
+                  }
+                : {}),
               cleanupDeadlineMs: 5000,
               revalidateRuntime: assets.revalidate.pipe(
                 Effect.mapError(
@@ -7234,6 +7336,82 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
                     "utf8",
                   );
                 expect(calls).toBe(1);
+                expect(Buffer.byteLength(init.body)).toBeLessThanOrEqual(maxInputTokens);
+                if (subscriptionSmoke) {
+                  expect(init.headers).toMatchObject({
+                    Authorization: `Bearer ${syntheticAccess}`,
+                    "chatgpt-account-id": "synthetic-native-account",
+                    "OpenAI-Beta": "responses=experimental",
+                    accept: "text/event-stream",
+                  });
+                  const body = JSON.parse(init.body);
+                  expect(body).toMatchObject({
+                    model: "gpt-6-luna",
+                    stream: true,
+                    store: false,
+                    reasoning: { effort: "high" },
+                    service_tier: "default",
+                  });
+                  expect(body.instructions).toContain(f.request.assignment);
+                  expect(body).not.toHaveProperty("messages");
+                  if (subscriptionFailureSmoke)
+                    return new Response("controlled unknown usage", { status: 503 });
+                  const message = {
+                    type: "message",
+                    id: "native-message",
+                    role: "assistant",
+                    status: "completed",
+                    content: [
+                      { type: "output_text", text: "Native smoke complete", annotations: [] },
+                    ],
+                  };
+                  const events = [
+                    {
+                      type: "response.created",
+                      response: {
+                        id: "native-response",
+                        model: "gpt-6-luna",
+                        status: "in_progress",
+                      },
+                    },
+                    {
+                      type: "response.output_item.added",
+                      output_index: 0,
+                      item: { ...message, status: "in_progress", content: [] },
+                    },
+                    {
+                      type: "response.content_part.added",
+                      output_index: 0,
+                      content_index: 0,
+                      item_id: message.id,
+                      part: { type: "output_text", text: "", annotations: [] },
+                    },
+                    {
+                      type: "response.output_text.delta",
+                      output_index: 0,
+                      content_index: 0,
+                      item_id: message.id,
+                      delta: "Native smoke complete",
+                    },
+                    { type: "response.output_item.done", output_index: 0, item: message },
+                    {
+                      type: "response.completed",
+                      response: {
+                        id: "native-response",
+                        model: "gpt-6-luna",
+                        status: "completed",
+                        output: [message],
+                        usage: { input_tokens: 20, output_tokens: 5, total_tokens: 25 },
+                      },
+                    },
+                  ];
+                  return new Response(
+                    events
+                      .map((event) => `event: ${event.type}\ndata: ${json(event)}\n\n`)
+                      .join(""),
+                    { headers: { "content-type": "text/event-stream" } },
+                  );
+                }
                 expect(init.headers).toEqual({
                   "Content-Type": "application/json",
                   Authorization: "Bearer synthetic-parent-key",
@@ -7278,10 +7456,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
               runtimeFiles: assets.runtimeFiles,
               revalidate: revalidateAssets,
               borrow: <A, E, R>(use: Effect.Effect<A, E, R>) =>
-                revalidateAssets.pipe(
-                  Effect.andThen(use),
-                  Effect.tap(() => revalidateAssets),
-                ),
+                revalidateAssets.pipe(Effect.andThen(use)),
             };
             yield* pi.publishAssets(providerInstanceId, ownedAssets, instance);
             const permit = yield* Semaphore.make(1);
@@ -7472,6 +7647,48 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
               },
               () => Effect.void,
             );
+            if (subscriptionFailureSmoke) {
+              const refused = yield* assignment.run.pipe(Effect.result);
+              expect(refused).toMatchObject({ _tag: "Failure", failure: { code: "uncertain" } });
+              expect(calls).toBe(1);
+              expect(
+                yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+                FROM project_team_model_request WHERE operation_id=${assignment.operation.operationId}`,
+              ).toEqual([
+                {
+                  status: "unknown",
+                  capacity_state: "quarantine",
+                  charged_input_tokens: 16_384,
+                  charged_output_tokens: 64_000,
+                },
+              ]);
+              expect(
+                yield* f.sql`SELECT stop_reason FROM project_team_pi_subscription_grant`,
+              ).toEqual([{ stop_reason: "unknown-usage" }]);
+              const children = yield* f.sql<{
+                unit: string;
+                owner_json: string;
+                drain_json: string;
+              }>`SELECT unit,owner_json,drain_json
+                FROM project_task_resource_child LIMIT 3`;
+              expect(children).toHaveLength(2);
+              expect(
+                yield* f.sql`SELECT unit FROM project_task_resource_child WHERE drain_json IS NULL`,
+              ).toEqual([]);
+              yield* assertChildrenDrained(children);
+              yield* fs.writeFileString(
+                evidence + "/native-failure-results.json",
+                json({
+                  originalDeadlineAtMs,
+                  originalBudget: budget,
+                  refused,
+                  children,
+                  calls,
+                  captured,
+                }),
+              );
+              return;
+            }
             const second = yield* assignment.run;
             expect(second.terminal.outcome).toBe("success");
             expect(calls).toBe(1);
@@ -7501,35 +7718,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
                 captured,
               }),
             );
-            for (const child of children) {
-              const owner = parseOwner(child.owner_json);
-              const drain = parseFullDrain(child.drain_json);
-              expect(owner.unit).toBe(child.unit);
-              expect(drain.unit).toBe(child.unit);
-              expect(drain.invocation).toBe(owner.invocation);
-              expect(drain.memoryBytes).toBe(536870912);
-              expect(drain.swapBytes).toBe(0);
-              expect(drain.oomGroup).toBe(1);
-              expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(true);
-              const identities = captured.filter((item) => item.unit === child.unit);
-              expect(identities.map((item) => item.kind)).toEqual(["launcher", "owner", "started"]);
-              expect(identities.map((item) => item.pid)).toEqual([
-                drain.launcherPid,
-                drain.ownerPid,
-                drain.childPid,
-              ]);
-              for (const item of identities) {
-                const stat = yield* fs.readFileString(`/proc/${item.pid}/stat`).pipe(Effect.option);
-                if (Option.isSome(stat))
-                  expect(
-                    stat.value.slice(stat.value.lastIndexOf(") ") + 2).split(" ")[19],
-                  ).not.toBe(item.startTime);
-              }
-              if (yield* fs.exists(drain.cgroup + "/cgroup.events"))
-                expect(yield* fs.readFileString(drain.cgroup + "/cgroup.events")).toContain(
-                  "populated 0",
-                );
-            }
+            yield* assertChildrenDrained(children);
             yield* workspace.verifyRetained(snapshot, physical, setup);
             const verifyJoined = (
               _receipt: DispatchJournal.ProjectTeamDispatchStageReceipt,
@@ -7744,6 +7933,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
             });
             yield* verification.sweep;
             const result = yield* host.journal.readResult(selection.jobId);
+            yield* fs.writeFileString(evidence + "/verification-result.json", json(result));
             expect(result).toMatchObject({ outcome: "success", exitCode: 0, outputComplete: true });
             if (!result?.drain) return yield* Effect.die("Actual verifier drain absent");
             expect(result.drain.memoryBytes).toBe(2147483648);
@@ -7807,7 +7997,7 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
             );
           }),
         ),
-      45000,
+      90000,
     );
   },
 );
@@ -12523,6 +12713,644 @@ for (const change of [
         ).toEqual(intents);
       }),
     ),
+  );
+
+const subscriptionRuntimeProfile: RuntimeFixtureProfile = {
+  ...basicRuntimeProfile,
+  model: "gpt-6-luna",
+  maximumTokens: 64_000,
+  durationMs: 300_000,
+  maxInputTokens: 16_384,
+  maxOutputTokens: 2_048,
+};
+const subscriptionSelection = (
+  f: Pick<Effect.Success<ReturnType<typeof dispatchedRuntimeFixture>>, "binding" | "snapshot">,
+): ProjectTeamPiSubscriptionTestSelection => ({
+  projectId: f.binding.projectId,
+  rootTaskId: f.snapshot.intent.limits.rootTaskId,
+  model: "gpt-6-luna",
+  maximumTokens: 64_000,
+  maximumDurationMs: 300_000,
+});
+
+it.effect(
+  "denies a subscription model without the private root selection before native preparation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* dispatchedRuntimeFixture(subscriptionRuntimeProfile);
+        let catalogueReads = 0;
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          readCatalogue: f.options.readCatalogue.pipe(
+            Effect.tap(() => Effect.sync(() => catalogueReads++)),
+          ),
+        });
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const result = yield* instance
+          .prepareOperation(
+            {
+              threadId: f.binding.threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+            },
+            () => Effect.void,
+          )
+          .pipe(Effect.result);
+
+        expect(result._tag).toBe("Failure");
+        expect(catalogueReads).toBe(0);
+        expect(f.allocations).toBe(0);
+        expect(f.transports).toBe(0);
+        expect(yield* f.fs.readDirectory(f.options.nativeStateRoot)).toEqual([]);
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+        expect(yield* f.sql`SELECT reservation_id FROM project_team_model_request`).toEqual([]);
+      }),
+    ),
+);
+
+it.effect(
+  "keeps private Luna selection on the actual Live bootstrap and parent credential broker",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* dispatchedRuntimeFixture(subscriptionRuntimeProfile);
+        const selection = subscriptionSelection(f);
+        const deadlineAtMs = f.snapshot.intent.limits.rootDeadlineAtMs;
+        const accessToken = `header.${Buffer.from(
+          json({
+            exp: Math.ceil(deadlineAtMs / 1000) + 60,
+            "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
+          }),
+        ).toString("base64url")}.signature`;
+        yield* f.fs.writeFileString(
+          f.options.agentDirectory + "/auth.json",
+          json({
+            "openai-codex": {
+              type: "oauth",
+              access: accessToken,
+              expires: deadlineAtMs + 60_000,
+              accountId: "fixture-account",
+            },
+          }),
+        );
+        let catalogueReads = 0;
+        const options: PiManagedRuntimeLiveOptions = {
+          ...f.options,
+          subscriptionTest: {
+            selection,
+            credentialSource: { directory: f.options.agentDirectory, format: "pi" },
+          },
+          readCatalogue: f.options.readCatalogue.pipe(
+            Effect.tap(() => Effect.sync(() => catalogueReads++)),
+          ),
+        };
+        const runtime = yield* makePiManagedRuntimeLive(options);
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        let captured: SessionRuntime.PiSessionRuntimeOptions | undefined;
+        const original = SessionRuntime.makePiSessionRuntime;
+        const spy = vi.spyOn(SessionRuntime, "makePiSessionRuntime").mockImplementation((input) => {
+          captured = input;
+          return original(input);
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const prepared = yield* instance.prepareOperation(
+          {
+            threadId: f.binding.threadId,
+            kind: "initialize",
+            operationId: f.request.initializeOperationId,
+          },
+          () => Effect.void,
+        );
+        if (!captured) return yield* Effect.die("Live did not construct the intercepted session");
+        expect(captured.bootstrap.model).toMatchObject({
+          provider: "openai-codex",
+          modelId: "gpt-6-luna",
+          api: "openai-codex-responses",
+          maxTokens: 2_048,
+          reasoning: true,
+          reasoningEffort: "high",
+          serviceTier: "default",
+        });
+        expect(captured.broker).toMatchObject({
+          provider: "openai-codex",
+          model: "gpt-6-luna",
+          routeId: "openai-subscription-luna",
+          endpoint: "https://chatgpt.com/backend-api/codex/responses",
+        });
+        expect(
+          yield* Effect.tryPromise(() =>
+            captured!.broker.getCredential(new AbortController().signal),
+          ),
+        ).toBe(accessToken);
+        expect(catalogueReads).toBe(0);
+        expect(f.transports).toBe(0);
+        yield* instance.stopAll;
+        expect(prepared.operation.operationId).toBe(f.request.initializeOperationId);
+      }),
+    ),
+);
+
+it.effect(
+  "a stopped subscription root refuses preparation before native state or model access",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* dispatchedRuntimeFixture(subscriptionRuntimeProfile);
+        const selection = subscriptionSelection(f);
+        yield* f.sql`INSERT INTO project_team_pi_subscription_grant
+        (environment_id,project_id,root_task_id,model,route_id,maximum_tokens,maximum_duration_ms,
+         deadline_at_ms,stopped_at_ms,stop_reason)
+        VALUES ('environment',${selection.projectId},${selection.rootTaskId},'gpt-6-luna',
+          'openai-subscription-luna',64000,300000,${f.snapshot.intent.limits.rootDeadlineAtMs},
+          ${Date.parse(at) + 1},'threshold-reached')`;
+        let catalogueReads = 0;
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          subscriptionTest: {
+            selection,
+            credentialSource: { directory: f.options.agentDirectory, format: "pi" },
+          },
+          readCatalogue: f.options.readCatalogue.pipe(
+            Effect.tap(() => Effect.sync(() => catalogueReads++)),
+          ),
+        });
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const result = yield* instance
+          .prepareOperation(
+            {
+              threadId: f.binding.threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+            },
+            () => Effect.void,
+          )
+          .pipe(Effect.result);
+
+        expect(result._tag).toBe("Failure");
+        expect(catalogueReads).toBe(0);
+        expect(f.allocations).toBe(0);
+        expect(f.transports).toBe(0);
+        expect(yield* f.fs.readDirectory(f.options.nativeStateRoot)).toEqual([]);
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+        expect(yield* f.sql`SELECT reservation_id FROM project_team_model_request`).toEqual([]);
+      }),
+    ),
+);
+
+for (const stopFailure of ["settlement", "post-commit-stop-read"] as const)
+  it.live(
+    `unknown subscription usage aborts the managed controller and controlled sibling after ${stopFailure}`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const originalClockAtMs = DateTime.toEpochMillis(DateTime.nowUnsafe());
+          const f = yield* requiredTransferFixture(
+            false,
+            false,
+            undefined,
+            false,
+            "project",
+            "Investigate current assignment",
+            { ...subscriptionRuntimeProfile, originalClockAtMs },
+          );
+          const selection = subscriptionSelection(f);
+          const deadlineAtMs = f.snapshot.intent.limits.rootDeadlineAtMs;
+          const accessToken = `header.${Buffer.from(
+            json({
+              exp: Math.ceil(deadlineAtMs / 1000) + 60,
+              "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" },
+            }),
+          ).toString("base64url")}.signature`;
+          yield* f.fs.writeFileString(
+            f.options.agentDirectory + "/auth.json",
+            json({
+              "openai-codex": {
+                type: "oauth",
+                access: accessToken,
+                expires: deadlineAtMs + 60_000,
+                accountId: "fixture-account",
+              },
+            }),
+          );
+          // The current controller is registered by the actual managed runtime; the sibling is an
+          // explicitly controlled in-flight peer used to prove root-wide cancellation and join.
+          const controlledSibling = new AbortController();
+          const controlledSiblingJoined = Promise.withResolvers<void>();
+          controlledSibling.signal.addEventListener(
+            "abort",
+            () => controlledSiblingJoined.resolve(),
+            { once: true },
+          );
+          const controllers = new Set<AbortController>([controlledSibling]);
+          let transports = 0;
+          let requestBody: unknown;
+          let actualRuntimeSignal: AbortSignal | undefined;
+          let stopReadFailureInjected = false;
+          if (stopFailure === "settlement")
+            yield* f.sql`CREATE TRIGGER injected_subscription_settlement_failure
+            BEFORE UPDATE OF status ON project_team_model_request
+            WHEN NEW.accounting_mode='openai-subscription-monitored' AND NEW.status='unknown'
+            BEGIN SELECT RAISE(ABORT,'injected subscription settlement failure'); END`;
+          if (stopFailure === "post-commit-stop-read") {
+            const originalPolicy = PiModelAccounting.makeProjectTeamPiSubscriptionParentPolicy;
+            const policySpy = vi
+              .spyOn(PiModelAccounting, "makeProjectTeamPiSubscriptionParentPolicy")
+              .mockImplementation((sql, selection) => {
+                const policy = originalPolicy(sql, selection);
+                return {
+                  ...policy,
+                  readStop: (identity) =>
+                    Effect.gen(function* () {
+                      const stopped = yield* policy.readStop(identity);
+                      const committedTargetSettlement = yield* sql<{
+                        status: string;
+                        capacity_state: string;
+                        accounting_receipt_id: string | null;
+                      }>`SELECT status,capacity_state,accounting_receipt_id
+                      FROM project_team_model_request
+                      WHERE operation_id=${f.request.assignmentOperationId}
+                        AND root_task_id=${selection.rootTaskId}
+                        AND accounting_mode='openai-subscription-monitored'
+                        AND status='unknown' AND capacity_state='quarantine'
+                        AND accounting_receipt_id IS NOT NULL`.pipe(
+                        Effect.mapError(
+                          () =>
+                            new PiModelAccounting.ModelAccountingError({
+                              reason: "Controlled subscription settlement read failed",
+                            }),
+                        ),
+                      );
+                      if (
+                        stopped &&
+                        !stopReadFailureInjected &&
+                        committedTargetSettlement.length === 1
+                      ) {
+                        stopReadFailureInjected = true;
+                        yield* sql.unsafe("SELECT * FROM injected_subscription_stop_read").pipe(
+                          Effect.mapError(
+                            () =>
+                              new PiModelAccounting.ModelAccountingError({
+                                reason: "Injected post-commit subscription stop-read failure",
+                              }),
+                          ),
+                          Effect.as(stopped),
+                        );
+                      }
+                      return stopped;
+                    }),
+                };
+              });
+            yield* Effect.addFinalizer(() => Effect.sync(() => policySpy.mockRestore()));
+          }
+          const runtime = yield* makePiManagedRuntimeLive({
+            ...f.options,
+            subscriptionTest: {
+              selection,
+              credentialSource: { directory: f.options.agentDirectory, format: "pi" },
+            },
+            subscriptionAbortControllers: controllers,
+            transport: async (_endpoint, input) => {
+              transports++;
+              requestBody = decodeNativeJsonEvidence(input.body);
+              actualRuntimeSignal = [...controllers].find(
+                (controller) => controller !== controlledSibling,
+              )?.signal;
+              return new Response("intercepted fixture failure", { status: 503 });
+            },
+          });
+          const instance = yield* runtime.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          yield* initializeRequiredContext(f, false, instance);
+          let captured: SessionRuntime.PiSessionRuntimeOptions | undefined;
+          let controlledRunFailure: unknown;
+          const controlledRunFinished = Promise.withResolvers<void>();
+          const original = SessionRuntime.makePiSessionRuntime;
+          const spy = vi
+            .spyOn(SessionRuntime, "makePiSessionRuntime")
+            .mockImplementation((input) => {
+              captured = input;
+              return original(input).pipe(
+                Effect.map((session) => ({
+                  ...session,
+                  run: () =>
+                    Effect.gen(function* () {
+                      // Exercise the exact prompt owner, allocation, broker, and accounting ports, then
+                      // persist uncertainty without starting a native child or inventing a drain.
+                      // The parent stop and this completion receipt join terminal persistence.
+                      if (input.operation.operationKind !== "prompt")
+                        return yield* Effect.die("Expected the original assignment prompt owner");
+                      const promptText = input.transferTexts.find(
+                        (entry) => entry.transferId === "prompt",
+                      )?.text;
+                      if (promptText !== f.request.assignment)
+                        return yield* Effect.die(
+                          "Prompt owner lost the retained assignment context",
+                        );
+                      const signal = yield* Effect.abortSignal;
+                      const allocation = input.persistence.allocation;
+                      // Controlled owner metadata only; this fixture starts no child or certified drain.
+                      const owner = {
+                        type: "owner" as const,
+                        unit: allocation.unit,
+                        nonce: allocation.nonce,
+                        invocation: "b".repeat(32),
+                        cgroup: `/sys/fs/cgroup/controlled/${allocation.unit}`,
+                        pid: 99999999,
+                        memoryBytes: allocation.policy.memoryBytes,
+                        swapBytes: 0,
+                        oomGroup: 1,
+                      };
+                      yield* Effect.promise(() =>
+                        input.authorizeCurrent(
+                          {
+                            identity: input.identity,
+                            operation: input.operation,
+                            phase: "beforeAcquire",
+                          },
+                          signal,
+                        ),
+                      );
+
+                      yield* input.persistence.claimActivation(allocation);
+
+                      yield* input.persistence.beforeStart(owner);
+
+                      const broker = makePiModelBroker(input.broker);
+                      const failure = yield* Effect.promise(() =>
+                        broker
+                          .request({
+                            body: json({
+                              model: "gpt-6-luna",
+                              store: false,
+                              stream: true,
+                              instructions: input.transferTexts.find(
+                                (entry) => entry.transferId === "context",
+                              )?.text,
+                              input: [{ type: "message", role: "user", content: promptText }],
+                              text: { verbosity: "high" },
+                              include: ["reasoning.encrypted_content"],
+                              tool_choice: "auto",
+                              parallel_tool_calls: true,
+                              reasoning: { effort: "high", summary: "auto" },
+                              service_tier: "default",
+                            }),
+                            requestId: 1,
+                            signal,
+                            onChunk: async () => {},
+                          })
+                          .then(
+                            () => undefined,
+                            (error: unknown) => error,
+                          ),
+                      );
+
+                      expect(failure).toMatchObject({ code: "SETTLEMENT_FAILED" });
+                      const terminal: SessionRuntime.PiSessionTerminal = {
+                        identity: input.identity,
+                        operation: input.operation,
+                        outcome: "quarantine",
+                        ownerCaptured: true,
+                        native: null,
+                        drain: null,
+                        accountingReceipts: [],
+                      };
+                      yield* Effect.tryPromise({
+                        try: () =>
+                          input.persistTerminal(
+                            terminal,
+                            AbortSignal.timeout(input.cleanupDeadlineMs),
+                          ),
+                        catch: () =>
+                          new SessionRuntime.PiSessionRuntimeError({
+                            code: "CONTROLLED_SUBSCRIPTION_TERMINAL",
+                          }),
+                      });
+                      return terminal;
+                    }).pipe(
+                      Effect.uninterruptible,
+                      Effect.tapCause((cause) =>
+                        Effect.sync(() => {
+                          controlledRunFailure = cause;
+                        }),
+                      ),
+                      Effect.ensuring(Effect.sync(() => controlledRunFinished.resolve())),
+                    ),
+                })),
+              );
+            });
+          yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+          const prepared = yield* instance.prepareOperation(
+            {
+              threadId: f.binding.threadId,
+              kind: "prompt",
+              operationId: f.request.assignmentOperationId,
+              prompt: f.request.assignment,
+            },
+            () => Effect.void,
+          );
+          expect(controllers.size).toBe(2);
+          if (!captured) return yield* Effect.die("Live did not construct the controlled broker");
+          const runResult = yield* prepared.run.pipe(Effect.result);
+
+          expect(runResult._tag).toBe("Failure");
+          if (stopFailure === "post-commit-stop-read") expect(stopReadFailureInjected).toBe(true);
+          expect(transports).toBe(1);
+          expect(requestBody).toMatchObject({
+            model: "gpt-6-luna",
+            store: false,
+            stream: true,
+            instructions: expect.any(String),
+            input: [{ type: "message", role: "user", content: f.request.assignment }],
+            text: { verbosity: "high" },
+            include: ["reasoning.encrypted_content"],
+            tool_choice: "auto",
+            parallel_tool_calls: true,
+            reasoning: { effort: "high", summary: "auto" },
+            service_tier: "default",
+          });
+          expect(requestBody).not.toHaveProperty("messages");
+          expect(requestBody).not.toHaveProperty("max_tokens");
+          expect(requestBody).not.toHaveProperty("stream_options");
+
+          const settled = yield* f.sql<{
+            status: string;
+            capacity_state: string;
+            charged_input_tokens: number;
+            charged_output_tokens: number;
+            accounting_receipt_id: string | null;
+            operation_id: string;
+            worker_id: string;
+            generation: number;
+            run_id: string;
+            attempt_id: string;
+            root_task_id: string;
+            model: string;
+            route_id: string;
+            maximum_input_tokens: number;
+            maximum_output_tokens: number;
+            unknown_maximum_tokens: number | null;
+          }>`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens,accounting_receipt_id
+          ,operation_id,worker_id,generation,run_id,attempt_id,root_task_id,model,route_id,
+          maximum_input_tokens,maximum_output_tokens,unknown_maximum_tokens
+        FROM project_team_model_request WHERE operation_id=${prepared.operation.operationId}`;
+          expect(settled).toHaveLength(1);
+          expect(settled[0]).toMatchObject({
+            status: stopFailure === "settlement" ? "held" : "unknown",
+            capacity_state: stopFailure === "settlement" ? "held" : "quarantine",
+            charged_input_tokens: stopFailure === "settlement" ? 0 : 16_384,
+            charged_output_tokens: stopFailure === "settlement" ? 0 : 64_000,
+            operation_id: f.request.assignmentOperationId,
+            worker_id: captured.identity.workerId,
+            generation: f.binding.generation,
+            run_id: f.binding.recordId,
+            attempt_id: f.binding.attemptId,
+            root_task_id: selection.rootTaskId,
+            model: "gpt-6-luna",
+            route_id: "openai-subscription-luna",
+            maximum_input_tokens: 16_384,
+            maximum_output_tokens: 2_048,
+            unknown_maximum_tokens: 64_000,
+          });
+          if (stopFailure === "settlement") expect(settled[0]?.accounting_receipt_id).toBeNull();
+          else expect(settled[0]?.accounting_receipt_id).toEqual(expect.any(String));
+          expect(
+            yield* f.sql<{
+              stopped_at_ms: number | null;
+              stop_reason: string | null;
+              model: string;
+              route_id: string;
+              maximum_tokens: number;
+              maximum_duration_ms: number;
+              deadline_at_ms: number;
+            }>`SELECT stopped_at_ms,stop_reason,model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms
+          FROM project_team_pi_subscription_grant
+          WHERE environment_id='environment' AND project_id=${selection.projectId} AND root_task_id=${selection.rootTaskId}`,
+          ).toMatchObject([
+            {
+              stopped_at_ms: stopFailure === "settlement" ? null : expect.any(Number),
+              stop_reason: stopFailure === "settlement" ? null : "unknown-usage",
+              model: "gpt-6-luna",
+              route_id: "openai-subscription-luna",
+              maximum_tokens: 64_000,
+              maximum_duration_ms: 300_000,
+              deadline_at_ms: deadlineAtMs,
+            },
+          ]);
+          expect(actualRuntimeSignal?.aborted).toBe(true);
+          expect(controlledSibling.signal.aborted).toBe(true);
+          yield* Effect.promise(() => controlledSiblingJoined.promise);
+          yield* instance.stopAll;
+          yield* Effect.promise(() => controlledRunFinished.promise);
+          expect(controlledRunFailure).toBeUndefined();
+          controllers.delete(controlledSibling);
+          expect(controllers.size).toBe(0);
+          expect(
+            yield* f.sql<{
+              operation_kind: string;
+              status: string;
+              outcome: string | null;
+            }>`SELECT operation_kind,status,json_extract(terminal_json,'$.outcome') AS outcome
+          FROM project_team_pi_operation WHERE operation_id=${prepared.operation.operationId}`,
+          ).toEqual([{ operation_kind: "prompt", status: "quarantine", outcome: "quarantine" }]);
+
+          const nativeDenial = yield* Effect.promise(() =>
+            captured!
+              .authorizeCurrent(
+                {
+                  identity: captured!.identity,
+                  operation: captured!.operation,
+                  phase: "beforeAcquire",
+                },
+                new AbortController().signal,
+              )
+              .then(
+                () => undefined,
+                (error: unknown) => error,
+              ),
+          );
+          expect(nativeDenial).toMatchObject({
+            code: "uncertain",
+            detail: "Pi subscription accounting requires reconciliation",
+          });
+
+          const laterBroker = makePiModelBroker(captured.broker);
+          const modelDenial = yield* Effect.promise(() =>
+            laterBroker
+              .request({
+                body: json({
+                  model: "gpt-6-luna",
+                  store: false,
+                  stream: true,
+                  instructions: captured!.broker.requiredSystemText,
+                  input: [{ type: "message", role: "user", content: "must be denied" }],
+                  text: { verbosity: "high" },
+                  include: ["reasoning.encrypted_content"],
+                  tool_choice: "auto",
+                  parallel_tool_calls: true,
+                  reasoning: { effort: "high", summary: "auto" },
+                  service_tier: "default",
+                }),
+                requestId: 2,
+                signal: new AbortController().signal,
+                onChunk: async () => {},
+              })
+              .then(
+                () => undefined,
+                (error: unknown) => error,
+              ),
+          );
+          expect(modelDenial).toMatchObject({ code: "AUTHORIZATION_REJECTED" });
+          expect(transports).toBe(1);
+          expect(
+            yield* f.sql`SELECT reservation_id FROM project_team_model_request
+          WHERE operation_id=${prepared.operation.operationId}`,
+          ).toHaveLength(1);
+
+          const terminal = yield* f.sql<{
+            status: string;
+            outcome: string | null;
+          }>`SELECT status,json_extract(terminal_json,'$.outcome') AS outcome
+        FROM project_team_pi_operation WHERE operation_id=${prepared.operation.operationId}`;
+          expect(terminal).toEqual([{ status: "quarantine", outcome: "quarantine" }]);
+          expect(controllers.size).toBe(0);
+          expect(
+            yield* f.sql`SELECT operation_id FROM project_team_pi_process
+          WHERE operation_id=${prepared.operation.operationId}`,
+          ).toEqual([{ operation_id: prepared.operation.operationId }]);
+          expect(
+            yield* f.sql<{
+              status: string;
+              allocation_json: string;
+              owner_json: string | null;
+              drain_json: string | null;
+            }>`SELECT status,allocation_json,owner_json,drain_json
+          FROM project_team_pi_process WHERE operation_id=${prepared.operation.operationId}`,
+          ).toMatchObject([
+            {
+              status: "quarantine",
+              allocation_json: expect.any(String),
+              owner_json: expect.any(String),
+              drain_json: null,
+            },
+          ]);
+        }),
+      ),
   );
 
 for (const readonlyKind of [undefined, "review"] as const)

@@ -23,7 +23,10 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { isPiManagedModel, piManagedModelRoute } from "../provider/pi/PiManagedModels.ts";
+import {
+  isPiBrokerManagedModel,
+  piBrokerModelRoute as piBrokerModelRouteFor,
+} from "../provider/pi/PiManagedModels.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   type PiManagedOperationRequest,
@@ -306,7 +309,7 @@ const BoundInput = Schema.Struct({
   worker_id: Id,
   generation: Safe,
   route_id: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   system_text_sha256: Digest,
   encoded_request_sha256: Digest,
@@ -317,12 +320,14 @@ const ReservationFields = {
   operationId: Id,
   requestId: Positive,
   routeId: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   maxInputTokens: Positive,
   maxOutputTokens: Positive,
   callCount: Schema.Literal(1),
   deadlineAtMs: Positive,
+  accountingMode: Schema.optional(Schema.Literal("openai-subscription-monitored")),
+  unknownMaximumTokens: Schema.optional(Schema.Literal(64_000)),
 };
 const Reservation = Schema.Struct(ReservationFields);
 const ReservationRow = Schema.Struct({
@@ -337,13 +342,15 @@ const ReservationRow = Schema.Struct({
   operation_id: Id,
   request_id: Positive,
   route_id: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   maximum_input_tokens: Positive,
   maximum_output_tokens: Positive,
   deadline_at_ms: Positive,
   status: Schema.Literals(["held", "reported", "failed", "unknown"]),
   capacity_state: Schema.Literals(["held", "released", "quarantine", "legacy"]),
+  accounting_mode: Schema.Literals(["hard", "openai-subscription-monitored"]),
+  unknown_maximum_tokens: Schema.NullOr(Schema.Literal(64_000)),
   reservation_json: bounded(8192),
 });
 const SnapshotInput = Schema.Struct({
@@ -444,6 +451,7 @@ const decodeUsage = Schema.decodeUnknownEffect(
   strict,
 );
 const decodeReservationRow = Schema.decodeUnknownEffect(ReservationRow, strict);
+const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json), strict);
 const decodeReservation = Schema.decodeUnknownEffect(Schema.fromJsonString(Reservation), strict);
 const decodeBoundInput = Schema.decodeUnknownEffect(BoundInput, strict);
 const decodeReflectionRow = Schema.decodeUnknownEffect(ReflectionRow, strict);
@@ -1691,7 +1699,7 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
       )
         return yield* deny("Later input has no current owned seal");
       const rows =
-        yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,
+        yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,accounting_mode,unknown_maximum_tokens,
       CASE WHEN length(CAST(reservation_json AS BLOB)) <= 8192 THEN reservation_json ELSE NULL END AS reservation_json
       FROM project_team_model_request WHERE reservation_id=${input.reservationId}
         AND request_lane='pi' AND request_scope='' LIMIT 2`;
@@ -1711,6 +1719,9 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         maxOutputTokens: reservation.maximum_output_tokens,
         callCount: 1 as const,
         deadlineAtMs: reservation.deadline_at_ms,
+        ...(reservation.accounting_mode === "openai-subscription-monitored"
+          ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+          : {}),
       };
       const captured = yield* decodeReservation(reservation.reservation_json).pipe(
         Effect.mapError(() => deny("Later model reservation identity is malformed")),
@@ -1724,9 +1735,13 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         reservation.worker_id !== op.row.worker_id ||
         reservation.generation !== decision.generation ||
         reservation.operation_id !== input.operationId ||
-        !isPiManagedModel(decision.binding.model) ||
-        reservation.route_id !== piManagedModelRoute(decision.binding.model).routeId ||
+        !isPiBrokerManagedModel(decision.binding.model) ||
+        reservation.route_id !== piBrokerModelRouteFor(decision.binding.model).routeId ||
         reservation.model !== decision.binding.model ||
+        (reservation.accounting_mode === "openai-subscription-monitored") !==
+          (decision.binding.model === "gpt-6-luna" && reservation.provider === "openai-codex") ||
+        reservation.unknown_maximum_tokens !==
+          (reservation.accounting_mode === "openai-subscription-monitored" ? 64_000 : null) ||
         reservation.status !== "held" ||
         reservation.capacity_state !== "held" ||
         canonical(captured) !== canonical(fields) ||
@@ -1735,6 +1750,39 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
         reservation.deadline_at_ms > op.row.deadline_at_ms
       )
         return yield* deny("Later model reservation differs from its actual operation");
+      if (reservation.accounting_mode === "openai-subscription-monitored") {
+        const rootBudgets = yield* sql<{
+          maximum_tokens: number;
+          deadline_at_ms: number;
+        }>`SELECT maximum_tokens,deadline_at_ms
+          FROM project_team_model_budget WHERE environment_id=${reservation.environment_id}
+          AND project_id=${reservation.project_id} AND root_task_id=${reservation.root_task_id}`;
+        const grants = yield* sql<{
+          model: string;
+          route_id: string;
+          maximum_tokens: number;
+          maximum_duration_ms: number;
+          deadline_at_ms: number;
+          stopped_at_ms: number | null;
+        }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms
+          FROM project_team_pi_subscription_grant WHERE environment_id=${reservation.environment_id}
+          AND project_id=${reservation.project_id} AND root_task_id=${reservation.root_task_id}`;
+        const grant = grants[0];
+        if (
+          !grant ||
+          grant.model !== "gpt-6-luna" ||
+          grant.route_id !== "openai-subscription-luna" ||
+          grant.maximum_tokens !== 64_000 ||
+          grant.maximum_duration_ms !== 300_000 ||
+          rootBudgets.length !== 1 ||
+          !rootBudgets[0] ||
+          rootBudgets[0].maximum_tokens > 64_000 ||
+          grant.deadline_at_ms !== rootBudgets[0]?.deadline_at_ms ||
+          grant.deadline_at_ms < reservation.deadline_at_ms ||
+          grant.stopped_at_ms !== null
+        )
+          return yield* deny("Later subscription reservation is stopped or ungranted");
+      }
       const recorded = {
         reservation_id: input.reservationId,
         operation_id: input.operationId,
@@ -1793,6 +1841,32 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
           (r) => r.reservationId === input.reservation_id,
         );
         const match = matches[0];
+        const requestRows = yield* sql<{
+          environment_id: string;
+          project_id: string;
+          root_task_id: string;
+          operation_id: string;
+          worker_id: string;
+          generation: number;
+          request_id: number;
+          route_id: string;
+          provider: string;
+          model: string;
+          status: string;
+          capacity_state: string;
+          accounting_receipt_id: string | null;
+          reservation_json: string;
+          settlement_json: string | null;
+          maximum_input_tokens: number;
+          maximum_output_tokens: number;
+          deadline_at_ms: number;
+          accounting_mode: string;
+          unknown_maximum_tokens: number | null;
+          charged_input_tokens: number;
+          charged_output_tokens: number;
+        }>`SELECT * FROM project_team_model_request WHERE reservation_id=${input.reservation_id}
+          AND request_lane='pi' AND request_scope=''`;
+        const accounted = requestRows[0];
         if (
           seen.has(input.reservation_id) ||
           matches.length !== 1 ||
@@ -1807,6 +1881,102 @@ export const makeProjectTeamMailboxTurns = Effect.fn("makeProjectTeamMailboxTurn
           input.system_text_sha256 !== sealed.row.system_text_sha256
         )
           return yield* deny("Later consumed request differs from its bound input");
+        if (
+          !accounted ||
+          !match ||
+          accounted.status !== "reported" ||
+          accounted.capacity_state !== "released" ||
+          accounted.environment_id !== environmentId ||
+          accounted.project_id !== decision.projectId ||
+          accounted.root_task_id !== decision.rootBudget.rootTaskId ||
+          accounted.operation_id !== decision.request.operationId ||
+          accounted.request_id !== match.requestId ||
+          accounted.provider !== match.provider ||
+          accounted.model !== match.model ||
+          accounted.route_id !== match.routeId ||
+          (accounted.accounting_mode === "openai-subscription-monitored") !==
+            (match.provider === "openai-codex" && match.model === "gpt-6-luna") ||
+          accounted.unknown_maximum_tokens !==
+            (accounted.accounting_mode === "openai-subscription-monitored" ? 64_000 : null) ||
+          !accounted.settlement_json
+        )
+          return yield* deny("Later terminal accounting differs from its durable reservation");
+        if (accounted.accounting_mode === "openai-subscription-monitored") {
+          const rootBudgets = yield* sql<{
+            maximum_tokens: number;
+            deadline_at_ms: number;
+          }>`SELECT maximum_tokens,deadline_at_ms
+            FROM project_team_model_budget WHERE environment_id=${accounted.environment_id}
+            AND project_id=${accounted.project_id} AND root_task_id=${accounted.root_task_id}`;
+          const grants = yield* sql<{
+            model: string;
+            route_id: string;
+            maximum_tokens: number;
+            maximum_duration_ms: number;
+            deadline_at_ms: number;
+            stopped_at_ms: number | null;
+          }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms
+            FROM project_team_pi_subscription_grant WHERE environment_id=${accounted.environment_id}
+            AND project_id=${accounted.project_id} AND root_task_id=${accounted.root_task_id}`;
+          const grant = grants[0];
+          if (
+            !grant ||
+            grant.model !== accounted.model ||
+            grant.route_id !== accounted.route_id ||
+            grant.maximum_tokens !== 64_000 ||
+            grant.maximum_duration_ms !== 300_000 ||
+            rootBudgets.length !== 1 ||
+            !rootBudgets[0] ||
+            rootBudgets[0].maximum_tokens > 64_000 ||
+            grant.deadline_at_ms !== rootBudgets[0]?.deadline_at_ms ||
+            grant.deadline_at_ms < accounted.deadline_at_ms
+          )
+            return yield* deny("Later terminal subscription grant differs");
+        }
+        const fields = {
+          workerId: accounted.worker_id,
+          generation: accounted.generation,
+          operationId: accounted.operation_id,
+          requestId: accounted.request_id,
+          routeId: accounted.route_id,
+          provider: accounted.provider,
+          model: accounted.model,
+          maxInputTokens: accounted.maximum_input_tokens,
+          maxOutputTokens: accounted.maximum_output_tokens,
+          callCount: 1,
+          deadlineAtMs: accounted.deadline_at_ms,
+          ...(accounted.accounting_mode === "openai-subscription-monitored"
+            ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+            : {}),
+        };
+        const reservationJournal = yield* decodeJson(accounted.reservation_json).pipe(
+          Effect.mapError(() => deny("Later terminal reservation journal is malformed")),
+        );
+        const settlementJournal = yield* decodeJson(accounted.settlement_json).pipe(
+          Effect.mapError(() => deny("Later terminal settlement journal is malformed")),
+        );
+        if (
+          canonical(reservationJournal) !== canonical(fields) ||
+          !match.usage ||
+          match.usage.total_tokens !== match.usage.prompt_tokens + match.usage.completion_tokens ||
+          (accounted.accounting_mode !== "openai-subscription-monitored" &&
+            (match.usage.prompt_tokens > accounted.maximum_input_tokens ||
+              match.usage.completion_tokens > accounted.maximum_output_tokens)) ||
+          accounted.charged_input_tokens !== match.usage.prompt_tokens ||
+          accounted.charged_output_tokens !== match.usage.completion_tokens ||
+          canonical(settlementJournal) !==
+            canonical({
+              ...fields,
+              reservationId: input.reservation_id,
+              outcome: "reported",
+              transportDrained: true,
+              chargedInputTokens: accounted.charged_input_tokens,
+              chargedOutputTokens: accounted.charged_output_tokens,
+              reportedModel: match.reportedModel,
+              reportedUsage: match.usage,
+            })
+        )
+          return yield* deny("Later terminal receipt differs from durable usage");
         seen.add(input.reservation_id);
       }
     });

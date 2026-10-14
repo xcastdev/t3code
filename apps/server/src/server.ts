@@ -62,7 +62,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { PiManagedRuntime, PiManagedRuntimeError } from "./provider/pi/PiManagedRuntime.ts";
 import { PiModelCatalogue } from "./provider/pi/PiModelCatalogue.ts";
-import { makePiProductionRuntime } from "./provider/pi/PiProductionRuntime.ts";
+import { makePiProductionRuntime, PiSubscriptionTest } from "./provider/pi/PiProductionRuntime.ts";
 import {
   ProjectTeamPiRuntime,
   makeProjectTeamPiRuntime,
@@ -953,6 +953,7 @@ const PiProductionRuntimeLayerLive = Layer.effect(
         ? path.resolve(entryDirectory, "../dist")
         : entryDirectory;
     const teamRuntime = yield* ProjectTeamPiRuntime;
+    const subscriptionTest = yield* PiSubscriptionTest;
     return yield* makePiProductionRuntime(
       {
         environmentId: yield* environment.getEnvironmentId,
@@ -966,7 +967,7 @@ const PiProductionRuntimeLayerLive = Layer.effect(
         maxInputTokens: 16384,
         maxOutputTokens: 2048,
       },
-      teamRuntime,
+      { ...teamRuntime, ...(subscriptionTest === undefined ? {} : { subscriptionTest }) },
     );
   }).pipe(Effect.orDie),
 ).pipe(
@@ -981,6 +982,7 @@ const PiProductionRuntimeLayerLive = Layer.effect(
 
 const PiCatalogueActivationLive = Layer.effectDiscard(
   Effect.gen(function* () {
+    if ((yield* PiSubscriptionTest) !== undefined) return;
     const catalogue = yield* PiModelCatalogue;
     const settings = yield* ServerSettings.ServerSettingsService;
     const instances = yield* ProviderInstanceRegistry;

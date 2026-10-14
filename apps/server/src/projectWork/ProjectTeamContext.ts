@@ -61,7 +61,9 @@ const fields = {
   operationId: Id,
   requestId: Positive,
   routeId: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
+  accountingMode: Schema.optionalKey(Schema.Literals(["hard", "openai-subscription-monitored"])),
+  unknownMaximumTokens: Schema.optionalKey(Schema.Literal(64_000)),
   model: Id,
   maxInputTokens: Positive,
   maxOutputTokens: Positive,
@@ -295,7 +297,7 @@ const ModelRow = Schema.Struct({
   request_scope: Schema.String.check(Schema.isMaxLength(64)),
   request_id: Positive,
   route_id: Id,
-  provider: Schema.Literals(["command-code", "openrouter"]),
+  provider: Schema.Literals(["command-code", "openai-codex", "openrouter"]),
   model: Id,
   environment_slot: Safe,
   model_slot: Safe,
@@ -306,6 +308,8 @@ const ModelRow = Schema.Struct({
   capacity_state: Schema.Literals(["held", "released", "quarantine", "legacy"]),
   charged_input_tokens: Safe,
   charged_output_tokens: Safe,
+  accounting_mode: Schema.Literals(["hard", "openai-subscription-monitored"]),
+  unknown_maximum_tokens: Schema.NullOr(Schema.Literal(64_000)),
   accounting_receipt_id: Schema.NullOr(Id),
   reservation_json: Schema.String,
   settlement_json: Schema.NullOr(Schema.String),
@@ -1009,7 +1013,8 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
     const selection = sql`(environment_id=${options.environmentId} AND project_id=${binding.projectId}
       AND root_task_id=${limits.rootTaskId}) OR run_id IN ${sql.in([...owners.keys()])}`;
     const metadata = yield* sql<{ reservation_id: string; bytes: number }>`SELECT reservation_id,
-      length(CAST(reservation_json AS BLOB))+COALESCE(length(CAST(settlement_json AS BLOB)),0) AS bytes
+      length(CAST(reservation_json AS BLOB))+COALESCE(length(CAST(settlement_json AS BLOB)),0)+
+      length(CAST(accounting_mode AS BLOB))+COALESCE(length(CAST(unknown_maximum_tokens AS BLOB)),0) AS bytes
       FROM project_team_model_request WHERE ${selection} ORDER BY reservation_id LIMIT 4097`;
     if (
       metadata.length > Bounds.ledgerRows ||
@@ -1038,7 +1043,12 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
     if (rows.length !== metadata.length) return yield* deny("Remaining budget ledger changed");
     let rootUsedTokens = 0;
     let attemptUsedTokens = 0;
+    let observedChargedTokens = 0;
+    let nominalHeldTokens = 0;
+    let unknownChargedTokens = 0;
+    let unknownOutcomeCalls = 0;
     let outstandingRequests = 0;
+    let accountingMode: "hard" | "openai-subscription-monitored" | undefined;
     const receipts: Array<{
       reservationId: string;
       runId: string;
@@ -1067,14 +1077,21 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         row.generation !== claim.binding.generation ||
         (row.request_lane === "pi" &&
           (row.model !== claim.binding.model ||
-            row.provider !== "command-code" ||
+            (row.accounting_mode === "hard"
+              ? row.provider !== "command-code"
+              : row.provider !== "openai-codex" || row.route_id !== "openai-subscription-luna") ||
             row.request_scope !== "")) ||
+        (row.request_lane === "memory" &&
+          (row.accounting_mode !== "hard" || row.unknown_maximum_tokens !== null)) ||
         row.deadline_at_ms > owner.intent.limits.deadlineAtMs ||
         metadata[index]?.reservation_id !== row.reservation_id ||
         Buffer.byteLength(row.reservation_json) > 8192 ||
         Buffer.byteLength(row.settlement_json ?? "") > 16384
       )
         return yield* deny("Remaining budget owner identity is invalid");
+      if (accountingMode !== undefined && accountingMode !== row.accounting_mode)
+        return yield* deny("Remaining budget ledger mixes accounting modes");
+      accountingMode = row.accounting_mode;
       if (row.request_lane === "memory") {
         let ledger = memoryLedgers.get(row.operation_id);
         if (ledger === undefined) {
@@ -1118,6 +1135,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         continue;
       }
       const reservation = yield* decodeReservation(row.reservation_json);
+      const monitored = row.accounting_mode === "openai-subscription-monitored";
       const expected = {
         workerId: row.worker_id,
         generation: row.generation,
@@ -1130,7 +1148,19 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         maxOutputTokens: row.maximum_output_tokens,
         callCount: 1,
         deadlineAtMs: row.deadline_at_ms,
+        ...(monitored
+          ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+          : {}),
       };
+      if (
+        row.unknown_maximum_tokens !== (monitored ? 64_000 : null) ||
+        reservation.accountingMode !== (monitored ? "openai-subscription-monitored" : undefined) ||
+        reservation.unknownMaximumTokens !== (monitored ? 64_000 : undefined) ||
+        (monitored
+          ? row.provider !== "openai-codex" || row.route_id !== "openai-subscription-luna"
+          : row.provider !== "command-code")
+      )
+        return yield* deny("Remaining budget accounting mode is invalid");
       const maximum = add(row.maximum_input_tokens, row.maximum_output_tokens);
       if (!same(reservation, expected) || maximum > owner.intent.limits.attemptMaximumTokens)
         return yield* deny("Remaining budget reservation disagrees with physical identity");
@@ -1144,6 +1174,7 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           row.settlement_json !== null
         )
           return yield* deny("Held model request has contradictory settlement");
+        nominalHeldTokens = add(nominalHeldTokens, maximum);
       } else {
         if (
           row.settlement_json === null ||
@@ -1168,8 +1199,9 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           (row.status === "reported" && usage === undefined) ||
           (usage !== undefined &&
             (add(usage.prompt_tokens, usage.completion_tokens) !== usage.total_tokens ||
-              usage.prompt_tokens > row.maximum_input_tokens ||
-              usage.completion_tokens > row.maximum_output_tokens ||
+              (!monitored &&
+                (usage.prompt_tokens > row.maximum_input_tokens ||
+                  usage.completion_tokens > row.maximum_output_tokens)) ||
               Object.values(usage.prompt_tokens_details ?? {}).some(
                 (n) => n !== undefined && n > usage.prompt_tokens,
               ) ||
@@ -1184,12 +1216,25 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         )
           return yield* deny("Retained reported usage is inconsistent");
         const inputCharge =
-          row.status === "reported" ? usage!.prompt_tokens : row.maximum_input_tokens;
+          row.status === "reported"
+            ? usage!.prompt_tokens
+            : monitored
+              ? row.charged_input_tokens
+              : row.maximum_input_tokens;
         const outputCharge =
-          row.status === "reported" ? usage!.completion_tokens : row.maximum_output_tokens;
+          row.status === "reported"
+            ? usage!.completion_tokens
+            : monitored
+              ? row.charged_output_tokens
+              : row.maximum_output_tokens;
+        if (monitored && row.status === "unknown" && outputCharge !== row.unknown_maximum_tokens)
+          return yield* deny("Unknown subscription usage lacks its conservative charge");
         if (inputCharge !== row.charged_input_tokens || outputCharge !== row.charged_output_tokens)
           return yield* deny("Uncertain model requests must retain their full charge");
         charged = add(inputCharge, outputCharge);
+        observedChargedTokens = add(observedChargedTokens, charged);
+        if (row.status !== "reported") unknownChargedTokens = add(unknownChargedTokens, charged);
+        if (row.status === "unknown") unknownOutcomeCalls++;
       }
       rootUsedTokens = add(rootUsedTokens, charged);
       if (row.attempt_id === binding.attemptId) attemptUsedTokens = add(attemptUsedTokens, charged);
@@ -1204,10 +1249,64 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         accountingReceiptId: row.accounting_receipt_id,
       });
     }
-    if (rootUsedTokens > limits.maximumTokens) return yield* deny("Root model budget is overdrawn");
+    if (accountingMode !== "openai-subscription-monitored" && rootUsedTokens > limits.maximumTokens)
+      return yield* deny("Root model budget is overdrawn");
+    const monitoredGrant = yield* sql<{
+      model: string;
+      route_id: string;
+      maximum_tokens: number;
+      maximum_duration_ms: number;
+      deadline_at_ms: number;
+      stopped_at_ms: number | null;
+      stop_reason: string | null;
+    }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms,stop_reason
+      FROM project_team_pi_subscription_grant WHERE environment_id=${options.environmentId}
+      AND project_id=${binding.projectId} AND root_task_id=${limits.rootTaskId} LIMIT 2`;
+    if (
+      monitoredGrant.length > 1 ||
+      (accountingMode === "openai-subscription-monitored" &&
+        (monitoredGrant.length !== 1 ||
+          monitoredGrant[0]?.model !== "gpt-6-luna" ||
+          monitoredGrant[0]?.route_id !== "openai-subscription-luna" ||
+          monitoredGrant[0]?.maximum_tokens !== 64_000 ||
+          monitoredGrant[0]?.maximum_tokens !== limits.maximumTokens ||
+          monitoredGrant[0]?.maximum_duration_ms !== 300_000 ||
+          monitoredGrant[0]?.deadline_at_ms !== limits.rootDeadlineAtMs ||
+          (monitoredGrant[0]?.stopped_at_ms === null) !==
+            (monitoredGrant[0]?.stop_reason === null) ||
+          (monitoredGrant[0]?.stop_reason !== null &&
+            monitoredGrant[0]?.stop_reason !== "threshold-reached" &&
+            monitoredGrant[0]?.stop_reason !== "unknown-usage") ||
+          (monitoredGrant[0]?.stop_reason === "threshold-reached" &&
+            observedChargedTokens < 64_000) ||
+          (monitoredGrant[0]?.stop_reason === "unknown-usage" && unknownOutcomeCalls === 0) ||
+          (monitoredGrant[0]?.stop_reason === null &&
+            (observedChargedTokens >= 64_000 || unknownOutcomeCalls > 0)))) ||
+      (accountingMode !== "openai-subscription-monitored" && monitoredGrant.length !== 0)
+    )
+      return yield* deny("Subscription stopping record is invalid");
     return {
       rootUsedTokens,
-      rootRemainingTokens: limits.maximumTokens - rootUsedTokens,
+      rootRemainingTokens: Math.max(
+        0,
+        limits.maximumTokens -
+          (accountingMode === "openai-subscription-monitored"
+            ? observedChargedTokens
+            : rootUsedTokens),
+      ),
+      ...(accountingMode === "openai-subscription-monitored"
+        ? {
+            policy: {
+              accountingMode,
+              thresholdTokens: 64_000,
+              ...(monitoredGrant[0]?.stop_reason === null
+                ? {}
+                : { stoppedReason: monitoredGrant[0]?.stop_reason }),
+              observedChargedTokens,
+              nominalHeldTokens,
+            },
+          }
+        : {}),
       // The producer enforces each operation's maximum; attempt usage is cumulative information, not a replacement producer gate.
       attemptUsedTokens,
       outstandingRequests,

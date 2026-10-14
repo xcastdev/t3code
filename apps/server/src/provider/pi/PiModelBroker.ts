@@ -2,7 +2,16 @@ import * as NodeCrypto from "node:crypto";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 
-import { PiManagedModel, piManagedModelRoute } from "./PiManagedModels.ts";
+import {
+  PiManagedModel,
+  PiSubscriptionManagedModel,
+  piManagedModelRoute,
+  piSubscriptionModelRoute,
+} from "./PiManagedModels.ts";
+import {
+  decodePiSubscriptionEvent,
+  decodePiSubscriptionRequest,
+} from "./PiSubscriptionProtocol.ts";
 
 import {
   PI_WORKER_MAX_CHUNK_BYTES,
@@ -12,6 +21,8 @@ import {
 } from "./PiWorkerProtocol.ts";
 
 const strict = { onExcessProperty: "error" } as const;
+const decodeManagedModel = Schema.decodeUnknownSync(PiManagedModel);
+const decodeSubscriptionModel = Schema.decodeUnknownSync(PiSubscriptionManagedModel);
 const Integer = Schema.Int.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
@@ -209,12 +220,14 @@ export interface PiModelRequestReservation {
   readonly operationId: string;
   readonly requestId: number;
   readonly routeId: string;
-  readonly provider: "command-code";
+  readonly provider: "command-code" | "openai-codex";
   readonly model: string;
   readonly maxInputTokens: number;
   readonly maxOutputTokens: number;
   readonly callCount: 1;
   readonly deadlineAtMs: number;
+  readonly accountingMode?: "openai-subscription-monitored";
+  readonly unknownMaximumTokens?: 64_000;
 }
 export interface PiModelRequestSettlement extends PiModelRequestReservation {
   readonly reservationId: string;
@@ -232,7 +245,7 @@ export interface PiModelAccountingReceipt {
   readonly reservationId: string;
   readonly accountingReceiptId: string;
   readonly routeId: string;
-  readonly provider: "command-code";
+  readonly provider: "command-code" | "openai-codex";
   readonly model: string;
   readonly reportedModel: string;
   readonly usage: PiModelUsage;
@@ -242,7 +255,7 @@ export interface PiModelBrokerConfig {
   readonly generation: number;
   readonly operationId: string;
   readonly routeId: string;
-  readonly provider: "command-code";
+  readonly provider: "command-code" | "openai-codex";
   readonly model: string;
   readonly endpoint: string;
   readonly acceptedReportedModels: readonly string[];
@@ -257,6 +270,8 @@ export interface PiModelBrokerConfig {
     signal: AbortSignal,
   ) => Promise<void>;
   readonly getCredential: (signal: AbortSignal) => Promise<string>;
+  /** Root-owned approved subscription test; absent on ordinary hard-budget routes. */
+  readonly authorizeSubscriptionTest?: (signal: AbortSignal) => Promise<void>;
   readonly authorizeCurrent: (
     phase: "beforeReserve" | "beforeTransport" | "beforeForward" | "beforeReturn",
     signal: AbortSignal,
@@ -300,8 +315,6 @@ function canonical(value: Schema.Json): string {
     .join(",")}}`;
 }
 
-const decodeManagedModel = Schema.decodeUnknownSync(PiManagedModel);
-
 export function makePiModelBroker(input: PiModelBrokerConfig) {
   // Capture parent configuration and schemas before worker data or asynchronous callbacks can mutate it.
   let tools: ReadonlyArray<PiModelTool>;
@@ -311,21 +324,28 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
     return fail("CONFIG_TOOLS_INVALID");
   }
   const cfg = { ...input, tools, acceptedReportedModels: [...input.acceptedReportedModels] };
-  let route: ReturnType<typeof piManagedModelRoute>;
+  let route: ReturnType<typeof piManagedModelRoute> | ReturnType<typeof piSubscriptionModelRoute>;
+  const subscription = cfg.provider === "openai-codex";
   try {
-    route = piManagedModelRoute(decodeManagedModel(cfg.model));
+    route = subscription
+      ? piSubscriptionModelRoute(decodeSubscriptionModel(cfg.model))
+      : piManagedModelRoute(decodeManagedModel(cfg.model));
   } catch {
     return fail("CONFIG_ROUTE_INVALID");
   }
+  const routeAcceptedReportedModels: readonly string[] = route.acceptedReportedModels;
   if (
-    cfg.provider !== "command-code" ||
-    cfg.endpoint !== "https://api.commandcode.ai/provider/v1/chat/completions" ||
+    cfg.provider !== route.provider ||
+    cfg.routeId !== route.routeId ||
+    cfg.endpoint !== route.endpoint ||
     cfg.acceptedReportedModels.length < 1 ||
     cfg.acceptedReportedModels.length > 2 ||
-    cfg.acceptedReportedModels.some((m) => !route.acceptedReportedModels.includes(m)) ||
+    cfg.acceptedReportedModels.some((m) => !routeAcceptedReportedModels.includes(m)) ||
     new Set(cfg.acceptedReportedModels).size !== cfg.acceptedReportedModels.length
   )
     fail("CONFIG_ROUTE_INVALID");
+  if (subscription && typeof cfg.authorizeSubscriptionTest !== "function")
+    fail("CONFIG_CALLBACK_REQUIRED");
   try {
     decodeName(cfg.workerId);
     decodeOperationId(cfg.operationId);
@@ -339,6 +359,8 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
   }
   if (cfg.deadlineMs > 300_000 || cfg.maxInputTokens > 1_000_000 || cfg.maxOutputTokens > 65_536)
     fail("CONFIG_LIMITS_INVALID");
+  if (subscription && (cfg.maxInputTokens !== 16_384 || cfg.maxOutputTokens !== 2_048))
+    fail("CONFIG_LIMITS_INVALID");
   if (
     [
       cfg.authorizeCurrent,
@@ -346,6 +368,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       cfg.reserveRequest,
       cfg.settleRequest,
       cfg.transport,
+      ...(subscription ? [cfg.authorizeSubscriptionTest] : []),
     ].some((f) => typeof f !== "function")
   )
     fail("CONFIG_CALLBACK_REQUIRED");
@@ -369,13 +392,27 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
 
   const request = async (operation: PiModelBrokerRequest): Promise<PiModelAccountingReceipt> => {
     let parsed: typeof Request.Type;
+    let outboundBody: string;
     try {
       if (Buffer.byteLength(operation.body) > PI_WORKER_MAX_REQUEST_BYTES)
         fail("REQUEST_BYTE_LIMIT");
-      parsed = decodeRequest(operation.body);
+      if (subscription) {
+        const adapted = decodePiSubscriptionRequest(operation.body, cfg.model);
+        parsed = decodeRequest(adapted.normalizedBody);
+        outboundBody = adapted.canonicalBody;
+      } else {
+        parsed = decodeRequest(operation.body);
+        outboundBody = encodeRequest({ ...parsed, model: cfg.model });
+      }
       decodePositive(operation.requestId);
     } catch (error) {
       if (error instanceof PiModelBrokerError) throw error;
+      if (subscription && error instanceof Error) {
+        if (error.message === "REQUEST_MODEL_OR_OUTPUT_INVALID")
+          return fail("REQUEST_MODEL_OR_OUTPUT_INVALID");
+        if (error.message === "REQUEST_TOOL_ARGUMENTS_INVALID")
+          return fail("REQUEST_TOOL_ARGUMENTS_INVALID");
+      }
       return fail("REQUEST_INVALID");
     }
     if (cfg.requiredSystemText !== undefined) {
@@ -390,11 +427,11 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       if (systems.length !== 1 || systemText !== cfg.requiredSystemText)
         fail("REQUEST_SYSTEM_INPUT_INVALID");
     }
-    const encodedBody = encodeRequest({ ...parsed, model: cfg.model });
+    const encodedBody = outboundBody!;
     if (usedRequestIds.has(operation.requestId)) fail("REQUEST_REPLAY");
     if (active) fail("REQUEST_CONCURRENT");
     if (usedRequestIds.size >= 1_024) fail("REQUEST_COUNT_LIMIT");
-    if (parsed.model !== cfg.model || parsed.max_tokens > cfg.maxOutputTokens)
+    if (parsed.model !== cfg.model || (!subscription && parsed.max_tokens > cfg.maxOutputTokens))
       fail("REQUEST_MODEL_OR_OUTPUT_INVALID");
     // UTF-8 bytes conservatively bound the plain text tokenizer's input, including the serialized overhead.
     if (Buffer.byteLength(operation.body) > cfg.maxInputTokens) fail("REQUEST_INPUT_LIMIT");
@@ -448,6 +485,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       check();
       try {
         await cfg.authorizeCurrent(phase, controller.signal);
+        if (subscription) await cfg.authorizeSubscriptionTest!(controller.signal);
       } catch {
         fail("AUTHORIZATION_REJECTED");
       }
@@ -465,6 +503,12 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       maxOutputTokens: parsed.max_tokens,
       callCount: 1,
       deadlineAtMs: DateTime.toEpochMillis(DateTime.nowUnsafe()) + cfg.deadlineMs,
+      ...(subscription
+        ? {
+            accountingMode: "openai-subscription-monitored" as const,
+            unknownMaximumTokens: 64_000 as const,
+          }
+        : {}),
     };
     let reservationId: string | undefined;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -505,6 +549,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         }
         check();
       }
+      if (subscription) await authorize("beforeTransport");
       let credential: string;
       try {
         credential = await cfg.getCredential(controller.signal);
@@ -513,13 +558,52 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       }
       if (!credential || Buffer.byteLength(credential) > 8_192 || /[\r\n]/.test(credential))
         fail("CREDENTIAL_INVALID");
+      let subscriptionAccountId: string | undefined;
+      if (subscription) {
+        try {
+          const parts = credential.split(".");
+          const payload: unknown = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8"));
+          if (!payload || typeof payload !== "object") fail("CREDENTIAL_INVALID");
+          const claims = payload as Record<string, unknown>;
+          const auth = claims["https://api.openai.com/auth"];
+          if (!auth || typeof auth !== "object") fail("CREDENTIAL_INVALID");
+          const accountId = (auth as Record<string, unknown>).chatgpt_account_id;
+          if (
+            typeof claims.exp !== "number" ||
+            !Number.isSafeInteger(claims.exp) ||
+            claims.exp * 1000 <= reservation.deadlineAtMs ||
+            typeof accountId !== "string" ||
+            accountId.length < 1 ||
+            accountId.length > 4096 ||
+            /[\p{Cc}\p{Cf}]/u.test(accountId)
+          )
+            fail("CREDENTIAL_INVALID");
+          subscriptionAccountId = accountId;
+        } catch (error) {
+          if (error instanceof PiModelBrokerError) throw error;
+          fail("CREDENTIAL_INVALID");
+        }
+      }
+      // Keep the existing CommandCode check ordering unchanged; subscription authority is
+      // rechecked after credential retrieval to close the asynchronous custody window.
       await authorize("beforeTransport");
       let response: Response;
       try {
         response = await cfg.transport(cfg.endpoint, {
           method: "POST",
           redirect: "error",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${credential}`,
+            ...(subscription
+              ? {
+                  "chatgpt-account-id": subscriptionAccountId!,
+                  originator: "pi",
+                  "OpenAI-Beta": "responses=experimental",
+                  accept: "text/event-stream",
+                }
+              : {}),
+          },
           body: encodedBody,
           signal: controller.signal,
         });
@@ -552,17 +636,35 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       controller.signal.addEventListener("abort", cancelReader, { once: true });
       if (controller.signal.aborted) cancelReader();
       const secret = Buffer.from(credential);
+      const accountSecret = Buffer.from(subscriptionAccountId ?? "");
       let rawTail = Buffer.alloc(0);
+      let rawAccountTail = Buffer.alloc(0);
       let semanticTail = Buffer.alloc(0);
+      let semanticAccountTail = Buffer.alloc(0);
       let responseBytes = 0;
       let contentSeen = false;
       let finishSeen = false;
       let done = false;
       const outputCalls = new Map<number, { name: string; id: string }>();
+      const subscriptionCalls = new Map<
+        number,
+        {
+          name: string;
+          callId: string;
+          itemId: string | undefined;
+          arguments: string;
+          argumentsDone: boolean;
+          finalized: boolean;
+        }
+      >();
       const pending: Array<{ bytes: Buffer; semanticBytes: number }> = [];
       let pendingSemanticBytes = 0;
       let outputBytes = 0;
       let frameCount = 0;
+      let subscriptionEvent = "";
+      let subscriptionEventLine = "";
+      let subscriptionResponseId: string | undefined;
+      let subscriptionStarted = false;
       const enqueue = (bytes: Uint8Array, semanticBytes: number) => {
         if (outputBytes + bytes.length > PI_WORKER_MAX_RESPONSE_BYTES) fail("RESPONSE_BYTE_LIMIT");
         outputBytes += bytes.length;
@@ -592,18 +694,27 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
           await forward(first.bytes);
         }
       };
-      const scanSecret = (tail: Buffer, bytes: Uint8Array) => {
+      const scanSecret = (tail: Buffer, bytes: Uint8Array, needle = secret) => {
         const combined = Buffer.concat([tail, bytes]);
-        if (combined.includes(secret)) fail("CREDENTIAL_ECHO_REJECTED");
-        return Buffer.from(combined.subarray(Math.max(0, combined.length - secret.length + 1)));
+        if (needle.length > 0 && combined.includes(needle)) fail("CREDENTIAL_ECHO_REJECTED");
+        return Buffer.from(combined.subarray(Math.max(0, combined.length - needle.length + 1)));
       };
-      const line = Buffer.alloc(65_536);
+      const line = Buffer.alloc(subscription ? PI_WORKER_MAX_RESPONSE_BYTES : 65_536);
       let length = 0;
       const consume = async (bytes: Uint8Array) => {
         const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r?\n$/, "");
         if (text === "") return;
-        if (!text.startsWith("data: ") || done || ++frameCount > 16_384) fail("SSE_FRAME_INVALID");
+        if (done || ++frameCount > 16_384) fail("SSE_FRAME_INVALID");
+        if (subscription && text.startsWith("event: ")) {
+          if (subscriptionEvent) fail("SSE_FRAME_INVALID");
+          subscriptionEvent = text.slice(7);
+          subscriptionEventLine = text + "\n";
+          if (!/^[a-z][a-z0-9_.]{1,80}$/.test(subscriptionEvent)) fail("SSE_FRAME_INVALID");
+          return;
+        }
+        if (!text.startsWith("data: ")) fail("SSE_FRAME_INVALID");
         if (text === "data: [DONE]") {
+          if (subscription) fail("SSE_ACCOUNTING_REQUIRED");
           if (!usage || !contentSeen || !finishSeen) fail("SSE_ACCOUNTING_REQUIRED");
           done = true;
           enqueue(Buffer.from("data: [DONE]\n\n"), 0);
@@ -612,8 +723,147 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         if (usage) fail("SSE_AFTER_ACCOUNTING");
         let native: typeof Native.Type;
         try {
-          native = decodeNative(text.slice(6));
-        } catch {
+          if (subscription) {
+            const responsePayload: unknown = JSON.parse(text.slice(6));
+            if (
+              !subscriptionEvent &&
+              responsePayload !== null &&
+              typeof responsePayload === "object" &&
+              "type" in responsePayload &&
+              typeof responsePayload.type === "string"
+            )
+              subscriptionEvent = responsePayload.type;
+            const scanValue = (value: unknown): void => {
+              if (typeof value === "string") {
+                if (
+                  value.includes(credential) ||
+                  value.includes(encodeJson(credential).slice(1, -1)) ||
+                  (subscriptionAccountId && value.includes(subscriptionAccountId))
+                )
+                  fail("CREDENTIAL_ECHO_REJECTED");
+              } else if (Array.isArray(value)) value.forEach(scanValue);
+              else if (value && typeof value === "object") Object.values(value).forEach(scanValue);
+            };
+            scanValue(responsePayload);
+            const adapted = decodePiSubscriptionEvent(
+              subscriptionEvent,
+              responsePayload,
+              cfg.model,
+            );
+            for (const name of adapted.toolNames ?? [])
+              if (!advertised.has(name)) fail("SSE_TOOL_INVALID");
+            const item = adapted.toolItem;
+            if (item) {
+              if (!Number.isSafeInteger(item.index) || item.index < 0 || item.index >= 32)
+                fail("SSE_TOOL_INVALID");
+              const prior = subscriptionCalls.get(item.index);
+              if (item.phase === "added") {
+                if (
+                  prior ||
+                  item.arguments !== "" ||
+                  [...subscriptionCalls.values()].some(
+                    (call) =>
+                      call.callId === item.callId ||
+                      (item.itemId !== undefined && call.itemId === item.itemId),
+                  )
+                )
+                  fail("SSE_TOOL_INVALID");
+                subscriptionCalls.set(item.index, {
+                  name: item.name,
+                  callId: item.callId,
+                  itemId: item.itemId,
+                  arguments: "",
+                  argumentsDone: false,
+                  finalized: false,
+                });
+              } else {
+                if (
+                  !prior ||
+                  prior.finalized ||
+                  prior.name !== item.name ||
+                  prior.callId !== item.callId ||
+                  prior.itemId !== item.itemId ||
+                  prior.arguments !== item.arguments
+                )
+                  fail("SSE_TOOL_INVALID");
+                try {
+                  decodeArguments(item.arguments);
+                } catch {
+                  fail("SSE_TOOL_INVALID");
+                }
+                prior.finalized = true;
+              }
+            }
+            const argument = adapted.argumentItem;
+            if (argument) {
+              const prior = subscriptionCalls.get(argument.index);
+              if (
+                !prior ||
+                prior.finalized ||
+                prior.argumentsDone ||
+                (argument.itemId !== undefined && prior.itemId !== argument.itemId)
+              )
+                fail("SSE_TOOL_INVALID");
+              if (argument.complete) {
+                if (prior.arguments !== argument.arguments) fail("SSE_TOOL_INVALID");
+                prior.argumentsDone = true;
+              } else prior.arguments += argument.arguments;
+            }
+            if (adapted.terminal) {
+              const calls = adapted.toolCalls ?? [];
+              if (calls.length !== subscriptionCalls.size) fail("SSE_TOOL_INVALID");
+              const seen = new Set<number>();
+              for (const call of calls) {
+                const prior = subscriptionCalls.get(call.index);
+                if (
+                  !prior ||
+                  !prior.finalized ||
+                  seen.has(call.index) ||
+                  prior.name !== call.name ||
+                  prior.callId !== call.callId ||
+                  prior.itemId !== call.itemId ||
+                  prior.arguments !== call.arguments
+                )
+                  fail("SSE_TOOL_INVALID");
+                seen.add(call.index);
+              }
+            }
+            if (
+              subscriptionEvent === "response.created" ||
+              subscriptionEvent === "response.in_progress"
+            )
+              subscriptionStarted = true;
+            if (adapted.responseId) {
+              if (subscriptionResponseId && subscriptionResponseId !== adapted.responseId)
+                fail("SSE_MODEL_REJECTED");
+              subscriptionResponseId = adapted.responseId;
+            }
+            native = decodeNative(
+              JSON.stringify({
+                ...adapted.chunk,
+                ...(adapted.usage === undefined ? {} : { usage: adapted.usage }),
+              }),
+            );
+            if (adapted.terminal) {
+              if (!subscriptionStarted || !subscriptionResponseId) fail("SSE_ACCOUNTING_REQUIRED");
+              contentSeen = true;
+              finishSeen = true;
+            }
+          } else native = decodeNative(text.slice(6));
+        } catch (error) {
+          if (error instanceof PiModelBrokerError) throw error;
+          if (
+            error instanceof Error &&
+            [
+              "SSE_FRAME_INVALID",
+              "SSE_MODEL_REJECTED",
+              "SSE_ACCOUNTING_REQUIRED",
+              "SSE_USAGE_INVALID",
+              "SSE_TOOL_INVALID",
+              "CREDENTIAL_ECHO_REJECTED",
+            ].includes(error.message)
+          )
+            fail(error.message as PiModelBrokerErrorCode);
           fail("SSE_FRAME_INVALID");
         }
         if (!cfg.acceptedReportedModels.includes(native.model)) fail("SSE_MODEL_REJECTED");
@@ -634,11 +884,15 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
               outputCalls.set(call.index, { name: call.function.name, id: call.id });
             }
             if (!outputCalls.has(call.index)) fail("SSE_TOOL_INVALID");
-            if (call.function.arguments) values.push(call.function.arguments);
+            if (call.function.arguments) {
+              values.push(call.function.arguments);
+            }
           }
         }
         const semantic = Buffer.from(values.join(""));
         semanticTail = scanSecret(semanticTail, semantic);
+        if (accountSecret.length > 0)
+          semanticAccountTail = scanSecret(semanticAccountTail, semantic, accountSecret);
         // Decode JSON escapes before checking arbitrary strings too, without retaining diagnostics.
         const nativeText = encodeNative(native);
         if (
@@ -697,8 +951,9 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
           usage = nativeUsage;
           reportedModel = native.model;
           if (
-            usage.prompt_tokens > cfg.maxInputTokens ||
-            usage.completion_tokens > parsed.max_tokens
+            !subscription &&
+            (usage.prompt_tokens > cfg.maxInputTokens ||
+              usage.completion_tokens > parsed.max_tokens)
           )
             fail("SSE_USAGE_OVER_RESERVATION");
         } else if (!preliminary) {
@@ -711,8 +966,24 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
             finishSeen = true;
           }
         }
-        enqueue(bytes, semantic.length);
-        enqueue(Buffer.from("\n"), 0);
+        if (subscription) {
+          // SSE payload is a string; these checks search for credential substrings.
+          // oxlint-disable-next-line unicorn/prefer-set-has
+          const rawPayload = text.slice(6);
+          if (
+            rawPayload.includes(credential) ||
+            rawPayload.includes(encodeJson(credential).slice(1, -1)) ||
+            (subscriptionAccountId && rawPayload.includes(subscriptionAccountId))
+          )
+            fail("CREDENTIAL_ECHO_REJECTED");
+          enqueue(Buffer.from(`${subscriptionEventLine}${text}\n\n`), semantic.length);
+          subscriptionEvent = "";
+          subscriptionEventLine = "";
+        } else {
+          enqueue(bytes, semantic.length);
+          enqueue(Buffer.from("\n"), 0);
+        }
+        if (subscription && finishSeen && usage) done = true;
         await flush(false);
       };
       while (true) {
@@ -729,6 +1000,12 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
             rawTail,
             read.value.subarray(start, start + PI_WORKER_MAX_CHUNK_BYTES),
           );
+          if (accountSecret.length > 0)
+            rawAccountTail = scanSecret(
+              rawAccountTail,
+              read.value.subarray(start, start + PI_WORKER_MAX_CHUNK_BYTES),
+              accountSecret,
+            );
         }
         for (let offset = 0; offset < read.value.length;) {
           const newline = read.value.indexOf(10, offset);
@@ -771,12 +1048,18 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
             reservationId,
             transportDrained: !cancelFailed,
             outcome: usage ? (failure ? "failed" : "reported") : "unknown",
-            chargedInputTokens: failure
-              ? Math.max(usage?.prompt_tokens ?? 0, reservation.maxInputTokens)
-              : (usage?.prompt_tokens ?? reservation.maxInputTokens),
-            chargedOutputTokens: failure
-              ? Math.max(usage?.completion_tokens ?? 0, reservation.maxOutputTokens)
-              : (usage?.completion_tokens ?? reservation.maxOutputTokens),
+            chargedInputTokens: usage
+              ? failure
+                ? Math.max(usage.prompt_tokens, reservation.maxInputTokens)
+                : usage.prompt_tokens
+              : reservation.maxInputTokens,
+            chargedOutputTokens: usage
+              ? failure
+                ? Math.max(usage.completion_tokens, reservation.maxOutputTokens)
+                : usage.completion_tokens
+              : subscription
+                ? 64_000
+                : reservation.maxOutputTokens,
             ...(failure ? { failureCode: failure.code } : {}),
             ...(usage && reportedModel ? { reportedUsage: usage, reportedModel } : {}),
           };

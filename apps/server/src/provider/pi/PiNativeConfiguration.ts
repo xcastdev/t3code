@@ -270,6 +270,14 @@ const readBoundedFile = Effect.fn("PiNativeConfiguration.readBoundedFile")(funct
   }).pipe(Effect.uninterruptible);
 });
 
+/** Read only the bounded auth.json contents after the caller's parent-side authority check. */
+export const readPiAuthFile = Effect.fn("readPiAuthFile")(function* (agentDirectory: unknown) {
+  const directory = yield* canonicalDirectory(agentDirectory, "credential-unavailable");
+  const contents = yield* readBoundedFile(directory, "auth.json", "credential-unavailable");
+  if (contents === undefined) return yield* unavailable("credential-unavailable");
+  return contents;
+});
+
 /** Root supplies the current selected catalogue and SQL-frozen route; this grants no authority. */
 export const inspectPiNativeConfiguration = Effect.fn("inspectPiNativeConfiguration")(function* (
   input: unknown,
@@ -336,6 +344,14 @@ export const inspectPiNativeConfiguration = Effect.fn("inspectPiNativeConfigurat
     catalogue: Object.freeze({ source: catalogueSource, fetchedAt: value.catalogue.fetchedAt }),
   });
 });
+
+/** Parent inspection only; absent native overrides retain the pinned SDK model. */
+export const readPiNativeModelsFile = Effect.fn("PiNativeConfiguration.readPiNativeModelsFile")(
+  function* (agentDirectory: unknown) {
+    const directory = yield* canonicalDirectory(agentDirectory, "native-configuration");
+    return yield* readBoundedFile(directory, "models.json", "native-configuration");
+  },
+);
 
 /** Invoke only from the parent broker after its current-authority check; never during inspection. */
 export const readPiSavedLiteralCredential = Effect.fn("readPiSavedLiteralCredential")(function* (

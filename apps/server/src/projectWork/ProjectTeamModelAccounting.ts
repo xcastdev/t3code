@@ -32,12 +32,14 @@ const fields = {
   operationId: Id,
   requestId: Positive,
   routeId: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   maxInputTokens: Positive,
   maxOutputTokens: Positive,
   callCount: Schema.Literal(1),
   deadlineAtMs: Positive,
+  accountingMode: Schema.optionalKey(Schema.Literal("openai-subscription-monitored")),
+  unknownMaximumTokens: Schema.optionalKey(Schema.Literal(64_000)),
 };
 const Reservation = Schema.Struct(fields);
 const InputDetails = Schema.Struct({
@@ -151,6 +153,8 @@ type Row = {
   charged_input_tokens: number;
   charged_output_tokens: number;
   accounting_receipt_id: string | null;
+  accounting_mode: string;
+  unknown_maximum_tokens: number | null;
   reservation_json: string;
   settlement_json: string | null;
 };
@@ -182,7 +186,7 @@ const RecordedRow = Schema.Struct({
   request_scope: Schema.String.check(Schema.isMaxLength(256)),
   request_id: Positive,
   route_id: Id,
-  provider: Schema.Literals(["command-code", "openrouter"]),
+  provider: Schema.Literals(["command-code", "openai-codex", "openrouter"]),
   model: Id,
   maximum_input_tokens: Positive,
   maximum_output_tokens: Positive,
@@ -192,6 +196,8 @@ const RecordedRow = Schema.Struct({
   charged_input_tokens: Safe,
   charged_output_tokens: Safe,
   accounting_receipt_id: Schema.NullOr(Id),
+  accounting_mode: Schema.Literals(["hard", "openai-subscription-monitored"]),
+  unknown_maximum_tokens: Schema.NullOr(Schema.Literal(64_000)),
   reservation_json: Schema.String.check(
     Schema.makeFilter((value) => Buffer.byteLength(value) <= 8192),
   ),
@@ -209,6 +215,17 @@ export const auditProjectTeamRecordedPiModelRow = Effect.fn(
   terminalAccounting?: readonly PiModelAccountingReceipt[],
 ) {
   const reservation = yield* storedReservation(row.reservation_json);
+  const monitored = reservation.accountingMode === "openai-subscription-monitored";
+  if (
+    monitored !== (row.provider === "openai-codex") ||
+    (monitored
+      ? row.accounting_mode !== "openai-subscription-monitored"
+      : row.accounting_mode !== "hard") ||
+    row.unknown_maximum_tokens !== (monitored ? 64_000 : null) ||
+    (monitored && reservation.unknownMaximumTokens !== 64_000) ||
+    (row.provider === "openai-codex" && row.route_id !== "openai-subscription-luna")
+  )
+    return yield* deny("Recorded subscription accounting mode differs");
   if (!matchesReservation(row, reservation))
     return yield* deny("Recorded native reservation differs");
   if (row.status === "held") {
@@ -236,6 +253,26 @@ export const auditProjectTeamRecordedPiModelRow = Effect.fn(
     transportDrained,
     ...settledReservation
   } = settlement;
+  const chargedUsageMismatch =
+    outcome === "reported"
+      ? reportedUsage === undefined ||
+        reportedModel === undefined ||
+        reportedUsage.prompt_tokens !== chargedInputTokens ||
+        reportedUsage.completion_tokens !== chargedOutputTokens ||
+        reportedUsage.total_tokens !== chargedInputTokens + chargedOutputTokens ||
+        (!monitored &&
+          (chargedInputTokens > reservation.maxInputTokens ||
+            chargedOutputTokens > reservation.maxOutputTokens))
+      : outcome === "unknown"
+        ? chargedInputTokens !== reservation.maxInputTokens ||
+          chargedOutputTokens !== (monitored ? 64_000 : reservation.maxOutputTokens)
+        : monitored
+          ? chargedInputTokens !==
+              Math.max(reservation.maxInputTokens, reportedUsage?.prompt_tokens ?? 0) ||
+            chargedOutputTokens !==
+              Math.max(reservation.maxOutputTokens, reportedUsage?.completion_tokens ?? 0)
+          : chargedInputTokens !== reservation.maxInputTokens ||
+            chargedOutputTokens !== reservation.maxOutputTokens;
   if (terminalAccounting !== undefined) {
     const receipts = terminalAccounting.filter(
       (receipt) => receipt.reservationId === row.reservation_id,
@@ -262,18 +299,14 @@ export const auditProjectTeamRecordedPiModelRow = Effect.fn(
     outcome !== row.status ||
     chargedInputTokens !== row.charged_input_tokens ||
     chargedOutputTokens !== row.charged_output_tokens ||
-    row.capacity_state !== (transportDrained === true ? "released" : "quarantine") ||
-    (outcome === "reported"
-      ? reportedUsage === undefined ||
-        reportedModel === undefined ||
-        (terminalAccounting === undefined && reportedModel !== row.model) ||
-        reportedUsage.prompt_tokens !== chargedInputTokens ||
-        reportedUsage.completion_tokens !== chargedOutputTokens ||
-        reportedUsage.total_tokens !== chargedInputTokens + chargedOutputTokens ||
-        chargedInputTokens > reservation.maxInputTokens ||
-        chargedOutputTokens > reservation.maxOutputTokens
-      : chargedInputTokens !== reservation.maxInputTokens ||
-        chargedOutputTokens !== reservation.maxOutputTokens)
+    row.capacity_state !==
+      (monitored && outcome === "unknown"
+        ? "quarantine"
+        : transportDrained === true
+          ? "released"
+          : "quarantine") ||
+    (outcome === "reported" && terminalAccounting === undefined && reportedModel !== row.model) ||
+    chargedUsageMismatch
   )
     return yield* deny("Recorded native settlement differs");
 });
@@ -284,12 +317,31 @@ export interface ProjectTeamModelAccountingOptions {
   readonly routeId: string;
   readonly model: string;
   readonly acceptedReportedModels: ReadonlyArray<string>;
+  /** Private, immutable authority for the one approved OpenAI subscription test root. */
+  readonly subscriptionTest?: ProjectTeamPiSubscriptionTestSelection;
   /** Read the durable operation and ancestral root limits using the transaction's SQL context. */
   readonly resolveOperation: (
     authority: ProjectTeamAuthority,
     reservation: PiModelRequestReservation,
   ) => Effect.Effect<typeof Operation.Type, ModelAccountingError>;
 }
+
+export interface ProjectTeamPiSubscriptionTestSelection {
+  readonly projectId: string;
+  readonly rootTaskId: string;
+  readonly model: "gpt-6-luna";
+  readonly maximumTokens: 64_000;
+  readonly maximumDurationMs: 300_000;
+}
+
+const SubscriptionSelection = Schema.Struct({
+  projectId: Id,
+  rootTaskId: Id,
+  model: Schema.Literal("gpt-6-luna"),
+  maximumTokens: Schema.Literal(64_000),
+  maximumDurationMs: Schema.Literal(300_000),
+});
+const decodeSubscriptionSelection = Schema.decodeUnknownSync(SubscriptionSelection, strict);
 export class ProjectTeamModelAccounting extends Context.Service<
   ProjectTeamModelAccounting,
   {
@@ -320,6 +372,10 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
       options.maximumConcurrentModelCalls === undefined ? 2 : options.maximumConcurrentModelCalls,
     acceptedReportedModels: options.acceptedReportedModels,
   });
+  const subscriptionTest =
+    options.subscriptionTest === undefined
+      ? undefined
+      : yield* validate(SubscriptionSelection, { ...options.subscriptionTest });
   if (typeof options.resolveOperation !== "function")
     return yield* deny("Operation authority required");
   const sql = yield* SqlClient.SqlClient;
@@ -355,9 +411,17 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             authority.binding.status !== "running" ||
             authority.binding.generation !== reservation.generation ||
             authority.binding.environmentId !== policy.environmentId ||
-            authority.binding.model !== policy.model ||
-            reservation.model !== policy.model ||
-            reservation.routeId !== policy.routeId
+            (reservation.accountingMode === "openai-subscription-monitored"
+              ? !subscriptionTest ||
+                reservation.provider !== "openai-codex" ||
+                reservation.model !== subscriptionTest.model ||
+                authority.binding.model !== subscriptionTest.model ||
+                reservation.routeId !== "openai-subscription-luna" ||
+                authority.binding.projectId !== subscriptionTest.projectId
+              : reservation.provider !== "command-code" ||
+                authority.binding.model !== policy.model ||
+                reservation.model !== policy.model ||
+                reservation.routeId !== policy.routeId)
           )
             return yield* deny("Model request authority denied");
           const operation = yield* validate(
@@ -371,9 +435,16 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             reservation.deadlineAtMs > operation.operationDeadlineAtMs ||
             reservation.deadlineAtMs > operation.deadlineAtMs ||
             maximum > operation.operationMaximumTokens ||
-            maximum > binding.configuration.maxTokens
-          )
+            maximum > binding.configuration.maxTokens ||
+            (reservation.accountingMode === "openai-subscription-monitored" &&
+              (reservation.unknownMaximumTokens !== 64_000 ||
+                reservation.maxInputTokens + reservation.maxOutputTokens >
+                  subscriptionTest!.maximumTokens ||
+                operation.rootTaskId !== subscriptionTest!.rootTaskId ||
+                operation.maximumTokens > subscriptionTest!.maximumTokens))
+          ) {
             return yield* deny("Model operation policy mismatch");
+          }
           const deadline = Math.min(
             reservation.deadlineAtMs,
             operation.deadlineAtMs,
@@ -387,6 +458,34 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             ),
           );
           yield* clockCheck(deadline);
+          if (reservation.accountingMode === "openai-subscription-monitored") {
+            const grant = yield* sql<{
+              model: string;
+              route_id: string;
+              maximum_tokens: number;
+              maximum_duration_ms: number;
+              deadline_at_ms: number;
+              stopped_at_ms: number | null;
+            }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms
+              FROM project_team_pi_subscription_grant WHERE environment_id=${policy.environmentId}
+              AND project_id=${binding.projectId} AND root_task_id=${operation.rootTaskId}`;
+            const currentTime = yield* Clock.currentTimeMillis;
+            if (!grant[0]) {
+              if (operation.deadlineAtMs - currentTime > subscriptionTest!.maximumDurationMs)
+                return yield* deny("Subscription root deadline exceeds its approved duration");
+              yield* sql`INSERT INTO project_team_pi_subscription_grant
+                (environment_id,project_id,root_task_id,model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms)
+                VALUES (${policy.environmentId},${binding.projectId},${operation.rootTaskId},${subscriptionTest!.model},'openai-subscription-luna',${subscriptionTest!.maximumTokens},${subscriptionTest!.maximumDurationMs},${operation.deadlineAtMs})`;
+            } else if (
+              grant[0].model !== subscriptionTest!.model ||
+              grant[0].route_id !== "openai-subscription-luna" ||
+              grant[0].maximum_tokens !== subscriptionTest!.maximumTokens ||
+              grant[0].maximum_duration_ms !== subscriptionTest!.maximumDurationMs ||
+              grant[0].deadline_at_ms !== operation.deadlineAtMs ||
+              grant[0].stopped_at_ms !== null
+            )
+              return yield* deny("Subscription root grant is stopped or changed");
+          }
           const legacy = yield* sql<{
             reservation_id: string;
           }>`SELECT reservation_id FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND capacity_state='legacy' LIMIT 1`;
@@ -416,7 +515,13 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
               previous.project_id !== binding.projectId ||
               previous.root_task_id !== operation.rootTaskId ||
               previous.run_id !== binding.recordId ||
-              previous.attempt_id !== binding.attemptId
+              previous.attempt_id !== binding.attemptId ||
+              previous.accounting_mode !==
+                (reservation.accountingMode === "openai-subscription-monitored"
+                  ? "openai-subscription-monitored"
+                  : "hard") ||
+              previous.unknown_maximum_tokens !==
+                (reservation.accountingMode === "openai-subscription-monitored" ? 64_000 : null)
             )
               return yield* deny("Model request identity changed");
             yield* clockCheck(deadline);
@@ -427,11 +532,16 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           const usage = yield* sql<{
             input: number;
             output: number;
-          }>`SELECT COALESCE(SUM(CASE WHEN status='held' THEN maximum_input_tokens ELSE charged_input_tokens END),0) AS input,COALESCE(SUM(CASE WHEN status='held' THEN maximum_output_tokens ELSE charged_output_tokens END),0) AS output FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND project_id=${binding.projectId} AND root_task_id=${operation.rootTaskId}`;
+          }>`SELECT COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_input_tokens ELSE CASE WHEN status='held' THEN maximum_input_tokens ELSE charged_input_tokens END END),0) AS input,COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_output_tokens ELSE CASE WHEN status='held' THEN maximum_output_tokens ELSE charged_output_tokens END END),0) AS output FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND project_id=${binding.projectId} AND root_task_id=${operation.rootTaskId}`;
           const charged = usage[0];
           const used = charged ? sum(charged.input, charged.output) : undefined;
           const total = used === undefined ? undefined : sum(used, maximum);
-          if (total === undefined || total > operation.maximumTokens)
+          if (
+            total === undefined ||
+            (reservation.accountingMode === "openai-subscription-monitored"
+              ? used === undefined || used >= 64_000
+              : total > operation.maximumTokens)
+          )
             return yield* deny("Root model budget exhausted");
           // The root can contain several attempts. Every lane and operation in
           // this original attempt consumes its admitted attempt ceiling.
@@ -460,21 +570,29 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           );
           yield* clockCheck(Math.min(deadline, originalAttempt?.deadline ?? deadline));
           const attemptUsage = yield* sql<{ tokens: number }>`SELECT
-            COALESCE(SUM(CASE WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
+            COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_input_tokens+charged_output_tokens
+              WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
               ELSE charged_input_tokens+charged_output_tokens END),0) AS tokens
             FROM project_team_model_request WHERE environment_id=${policy.environmentId}
               AND project_id=${binding.projectId} AND run_id=${binding.recordId}
               AND generation=${binding.generation} AND attempt_id=${binding.attemptId}`;
-          const attemptTotal = sum(attemptUsage[0]?.tokens ?? -1, maximum);
+          const attemptBase = attemptUsage[0]?.tokens ?? -1;
+          const attemptTotal =
+            reservation.accountingMode === "openai-subscription-monitored"
+              ? attemptBase
+              : sum(attemptBase, maximum);
           if (
             attemptTotal === undefined ||
             (attemptUsage[0]?.tokens ?? -1) < 0 ||
             !Number.isSafeInteger(attemptUsage[0]?.tokens) ||
-            attemptTotal > attemptMaximum
+            attemptTotal > attemptMaximum ||
+            (reservation.accountingMode === "openai-subscription-monitored" &&
+              attemptTotal >= attemptMaximum)
           )
             return yield* deny("Original attempt model budget exhausted");
           const operationUsage = yield* sql<{ tokens: number }>`SELECT
-            COALESCE(SUM(CASE WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
+            COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_input_tokens+charged_output_tokens
+              WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
               ELSE charged_input_tokens+charged_output_tokens END),0) AS tokens
             FROM project_team_model_request WHERE environment_id=${policy.environmentId}
             AND project_id=${binding.projectId} AND run_id=${binding.recordId}
@@ -484,8 +602,10 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
             usedOperation === undefined ||
             !Number.isSafeInteger(usedOperation) ||
             usedOperation < 0 ||
-            !Number.isSafeInteger(usedOperation + maximum) ||
-            usedOperation + maximum > operation.operationMaximumTokens
+            (reservation.accountingMode === "openai-subscription-monitored"
+              ? usedOperation >= operation.operationMaximumTokens
+              : !Number.isSafeInteger(usedOperation + maximum) ||
+                usedOperation + maximum > operation.operationMaximumTokens)
           )
             return yield* deny("Original operation model budget exhausted");
           const slots = yield* sql<{
@@ -500,11 +620,13 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           const modelSlot = Array.from(
             { length: policy.maximumConcurrentModelCalls },
             (_, i) => i,
-          ).find((i) => !slots.some((row) => row.model === policy.model && row.model_slot === i));
+          ).find(
+            (i) => !slots.some((row) => row.model === reservation.model && row.model_slot === i),
+          );
           if (environmentSlot === undefined || modelSlot === undefined)
             return yield* deny("Model call capacity exhausted");
           const reservationId = yield* crypto.randomUUIDv4;
-          yield* sql`INSERT INTO project_team_model_request (reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,environment_slot,model_slot,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,charged_input_tokens,charged_output_tokens,reservation_json) VALUES (${reservationId},${policy.environmentId},${binding.projectId},${operation.rootTaskId},${binding.recordId},${binding.attemptId},${reservation.workerId},${reservation.generation},${reservation.operationId},${reservation.requestId},${reservation.routeId},${reservation.provider},${reservation.model},${environmentSlot},${modelSlot},${reservation.maxInputTokens},${reservation.maxOutputTokens},${reservation.deadlineAtMs},'held','held',0,0,${encodeReservation(reservation)})`;
+          yield* sql`INSERT INTO project_team_model_request (reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,environment_slot,model_slot,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,charged_input_tokens,charged_output_tokens,reservation_json,accounting_mode,unknown_maximum_tokens) VALUES (${reservationId},${policy.environmentId},${binding.projectId},${operation.rootTaskId},${binding.recordId},${binding.attemptId},${reservation.workerId},${reservation.generation},${reservation.operationId},${reservation.requestId},${reservation.routeId},${reservation.provider},${reservation.model},${environmentSlot},${modelSlot},${reservation.maxInputTokens},${reservation.maxOutputTokens},${reservation.deadlineAtMs},'held','held',0,0,${encodeReservation(reservation)},${reservation.accountingMode === "openai-subscription-monitored" ? "openai-subscription-monitored" : "hard"},${reservation.unknownMaximumTokens ?? null})`;
           yield* clockCheck(deadline);
           return { reservationId, status: "reserved" as const };
         }),
@@ -521,14 +643,17 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
       const usage = settlement.reportedUsage;
       if (settlement.outcome === "reported" && (!usage || !settlement.reportedModel))
         return yield* deny("Reported usage required");
+      if (settlement.outcome === "unknown" && usage !== undefined)
+        return yield* deny("Unknown usage cannot include partial reported usage");
       if ((usage === undefined) !== (settlement.reportedModel === undefined))
         return yield* deny("Incomplete reported usage");
       if (
         usage &&
         (!policy.acceptedReportedModels.includes(settlement.reportedModel ?? "") ||
           sum(usage.prompt_tokens, usage.completion_tokens) !== usage.total_tokens ||
-          usage.prompt_tokens > settlement.maxInputTokens ||
-          usage.completion_tokens > settlement.maxOutputTokens ||
+          (settlement.accountingMode !== "openai-subscription-monitored" &&
+            (usage.prompt_tokens > settlement.maxInputTokens ||
+              usage.completion_tokens > settlement.maxOutputTokens)) ||
           Object.values(usage.prompt_tokens_details ?? {}).some(
             (n) => n !== undefined && n > usage.prompt_tokens,
           ) ||
@@ -540,15 +665,17 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           ))
       )
         return yield* deny("Invalid reported usage");
-      const inputCharge =
-        settlement.outcome === "reported" ? usage!.prompt_tokens : settlement.maxInputTokens;
-      const outputCharge =
-        settlement.outcome === "reported" ? usage!.completion_tokens : settlement.maxOutputTokens;
-      if (
-        settlement.chargedInputTokens !== inputCharge ||
-        settlement.chargedOutputTokens !== outputCharge
-      )
-        return yield* deny("Invalid settlement charge");
+      let inputCharge =
+        settlement.outcome === "reported"
+          ? usage!.prompt_tokens
+          : Math.max(usage?.prompt_tokens ?? 0, settlement.maxInputTokens);
+      let outputCharge =
+        settlement.outcome === "reported"
+          ? usage!.completion_tokens
+          : settlement.accountingMode === "openai-subscription-monitored" &&
+              settlement.outcome === "unknown"
+            ? (settlement.unknownMaximumTokens ?? 64_000)
+            : Math.max(usage?.completion_tokens ?? 0, settlement.maxOutputTokens);
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           const rows =
@@ -558,22 +685,66 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           if (
             !row ||
             row.environment_id !== policy.environmentId ||
-            row.route_id !== policy.routeId ||
-            row.model !== policy.model
+            (settlement.accountingMode === "openai-subscription-monitored"
+              ? row.route_id !== "openai-subscription-luna" ||
+                row.model !== "gpt-6-luna" ||
+                row.provider !== "openai-codex"
+              : row.route_id !== policy.routeId ||
+                row.model !== policy.model ||
+                row.provider !== "command-code")
           )
             return yield* deny("Reservation unavailable");
           const reservation = yield* storedReservation(row.reservation_json);
           const supplied = yield* validate(
             Reservation,
             Object.fromEntries(
-              Object.keys(fields).map((key) => [key, Reflect.get(settlement, key)]),
+              Object.keys(fields)
+                .filter((key) => Object.hasOwn(settlement, key))
+                .map((key) => [key, Reflect.get(settlement, key)]),
             ),
           );
           if (
             encodeReservation(reservation) !== encodeReservation(supplied) ||
-            !matchesReservation(row, reservation)
+            !matchesReservation(row, reservation) ||
+            row.accounting_mode !==
+              (reservation.accountingMode === "openai-subscription-monitored"
+                ? "openai-subscription-monitored"
+                : "hard") ||
+            row.unknown_maximum_tokens !==
+              (reservation.accountingMode === "openai-subscription-monitored" ? 64_000 : null)
           )
             return yield* deny("Settlement identity changed");
+          if (reservation.accountingMode === "openai-subscription-monitored") {
+            const grants = yield* sql<{
+              model: string;
+              route_id: string;
+              maximum_tokens: number;
+              maximum_duration_ms: number;
+              deadline_at_ms: number;
+            }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms
+              FROM project_team_pi_subscription_grant WHERE environment_id=${row.environment_id}
+              AND project_id=${row.project_id} AND root_task_id=${row.root_task_id}`;
+            const grant = grants[0];
+            if (
+              !grant ||
+              grant.model !== reservation.model ||
+              grant.route_id !== reservation.routeId ||
+              grant.maximum_tokens !== 64_000 ||
+              grant.maximum_duration_ms !== 300_000 ||
+              grant.deadline_at_ms < reservation.deadlineAtMs
+            )
+              return yield* deny("Durable subscription grant changed");
+          }
+          if (row.status !== "held" && row.settlement_json) {
+            const previous = yield* storedSettlement(row.settlement_json);
+            inputCharge = Math.max(inputCharge, previous.chargedInputTokens);
+            outputCharge = Math.max(outputCharge, previous.chargedOutputTokens);
+          }
+          if (
+            settlement.chargedInputTokens !== inputCharge ||
+            settlement.chargedOutputTokens !== outputCharge
+          )
+            return yield* deny("Invalid settlement charge");
           let committedSettlement = settlement;
           if (row.status !== "held") {
             if (!row.settlement_json || !row.accounting_receipt_id)
@@ -619,13 +790,30 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           if (row.status === "held" && row.capacity_state !== "held")
             return yield* deny("Reservation capacity journal mismatch");
           const capacityState =
-            row.status === "held"
-              ? settlement.transportDrained === true
-                ? "released"
-                : "quarantine"
-              : row.capacity_state;
+            settlement.accountingMode === "openai-subscription-monitored" &&
+            settlement.outcome === "unknown"
+              ? "quarantine"
+              : row.status === "held"
+                ? settlement.transportDrained === true
+                  ? "released"
+                  : "quarantine"
+                : row.capacity_state;
           const receipt = row.accounting_receipt_id ?? (yield* crypto.randomUUIDv4);
           yield* sql`UPDATE project_team_model_request SET status=${settlement.outcome},capacity_state=${capacityState},charged_input_tokens=${inputCharge},charged_output_tokens=${outputCharge},accounting_receipt_id=${receipt},settlement_json=${encodeSettlement(committedSettlement)} WHERE reservation_id=${row.reservation_id}`;
+          if (settlement.accountingMode === "openai-subscription-monitored") {
+            const rootUsage = yield* sql<{
+              tokens: number;
+            }>`SELECT COALESCE(SUM(charged_input_tokens+charged_output_tokens),0) AS tokens
+              FROM project_team_model_request WHERE environment_id=${row.environment_id} AND project_id=${row.project_id}
+              AND root_task_id=${row.root_task_id}`;
+            const breached =
+              settlement.outcome === "unknown" || (rootUsage[0]?.tokens ?? 0) >= 64_000;
+            if (breached)
+              yield* sql`UPDATE project_team_pi_subscription_grant
+              SET stopped_at_ms=COALESCE(stopped_at_ms,${yield* Clock.currentTimeMillis}),
+                  stop_reason=COALESCE(stop_reason,${settlement.outcome === "unknown" ? "unknown-usage" : "threshold-reached"})
+              WHERE environment_id=${row.environment_id} AND project_id=${row.project_id} AND root_task_id=${row.root_task_id}`;
+          }
           return { accountingReceiptId: receipt };
         }),
       );
@@ -634,3 +822,67 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
   );
   return ProjectTeamModelAccounting.of({ reserve, settle });
 });
+
+export interface ProjectTeamPiSubscriptionGrantIdentity {
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly rootTaskId: string;
+  readonly model: "gpt-6-luna";
+  readonly routeId: "openai-subscription-luna";
+  readonly maximumTokens: 64_000;
+  readonly maximumDurationMs: 300_000;
+  readonly deadlineAtMs: number;
+}
+
+/** Root composes this with its constructor-captured SQL client for live and native stop checks. */
+export const makeProjectTeamPiSubscriptionParentPolicy = (
+  sql: SqlClient.SqlClient,
+  selection: ProjectTeamPiSubscriptionTestSelection,
+) => {
+  const frozen = decodeSubscriptionSelection({ ...selection });
+  const read = (identity: ProjectTeamPiSubscriptionGrantIdentity) =>
+    Effect.gen(function* () {
+      const rows = yield* sql<{
+        model: string;
+        route_id: string;
+        maximum_tokens: number;
+        maximum_duration_ms: number;
+        deadline_at_ms: number;
+        stopped_at_ms: number | null;
+      }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms
+        FROM project_team_pi_subscription_grant WHERE environment_id=${identity.environmentId}
+        AND project_id=${identity.projectId} AND root_task_id=${identity.rootTaskId}`;
+      const row = rows[0];
+      if (
+        identity.projectId !== frozen.projectId ||
+        identity.rootTaskId !== frozen.rootTaskId ||
+        identity.model !== frozen.model ||
+        identity.maximumTokens !== frozen.maximumTokens ||
+        identity.maximumDurationMs !== frozen.maximumDurationMs ||
+        identity.routeId !== "openai-subscription-luna"
+      )
+        return yield* deny("Subscription parent authority differs from its frozen selection");
+      if (!row) return undefined;
+      if (
+        row.model !== frozen.model ||
+        row.route_id !== identity.routeId ||
+        row.maximum_tokens !== frozen.maximumTokens ||
+        row.maximum_duration_ms !== frozen.maximumDurationMs ||
+        row.deadline_at_ms !== identity.deadlineAtMs
+      )
+        return yield* deny("Durable subscription grant is unavailable or changed");
+      return row;
+    });
+  return {
+    check: (identity: ProjectTeamPiSubscriptionGrantIdentity) =>
+      read(identity).pipe(
+        Effect.flatMap((row) =>
+          row === undefined || row.stopped_at_ms === null
+            ? Effect.void
+            : Effect.fail(deny("Subscription root is stopped")),
+        ),
+      ),
+    readStop: (identity: ProjectTeamPiSubscriptionGrantIdentity) =>
+      read(identity).pipe(Effect.map((row) => row !== undefined && row.stopped_at_ms !== null)),
+  };
+};

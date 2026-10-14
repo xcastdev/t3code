@@ -1590,14 +1590,15 @@ const reportedReceipt = (
   requestId: number,
   inputTokens: number,
   outputTokens: number,
+  receiptProvider: PiModelAccountingReceipt["provider"] = "command-code",
 ): PiModelAccountingReceipt => ({
   requestId,
   reservationId: `reservation-${requestId}`,
   accountingReceiptId: `accounting-${requestId}`,
-  routeId: "frozen-route",
-  provider: "command-code",
-  model: "frozen-model",
-  reportedModel: "reported-alias",
+  routeId: receiptProvider === "openai-codex" ? "openai-subscription-luna" : "frozen-route",
+  provider: receiptProvider,
+  model: receiptProvider === "openai-codex" ? "gpt-6-luna" : "frozen-model",
+  reportedModel: receiptProvider === "openai-codex" ? "gpt-6-luna" : "reported-alias",
   usage: {
     prompt_tokens: inputTokens,
     completion_tokens: outputTokens,
@@ -1605,39 +1606,42 @@ const reportedReceipt = (
     prompt_tokens_details: { cached_tokens: requestId === 1 ? 7 : 3 },
   },
 });
-for (const outcome of ["success", "canceled", "failed"] as const)
-  it.effect(`repair R4 ${outcome} preserves deduplicated authoritative usage`, () =>
-    Effect.gen(function* () {
-      const fake = yield* makeFake();
-      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
-      const queue = yield* subscribe(adapter.streamEvents);
-      yield* adapter.startSession(startInput);
-      yield* adapter.sendTurn({ threadId, input: "prompt" });
-      const operation = fake.operations[1]!;
-      const output = fake.output(operation, outcome);
-      const first = reportedReceipt(1, 60, 12);
-      const second = reportedReceipt(2, 40, 8);
-      yield* Deferred.succeed(operation.result, {
-        ...output,
-        terminal: { ...output.terminal, accountingReceipts: [first, second, first] },
-      });
-      const event = yield* nextType(
-        queue,
-        outcome === "canceled" ? "turn.aborted" : "turn.completed",
-      );
-      expect(event.payload).toMatchObject({
-        tokenUsage: {
-          usageScope: "main_agent",
-          usageStatus: outcome === "success" ? "complete" : "partial",
-          inputTokens: 100,
-          outputTokens: 20,
-          cachedInputTokens: 10,
-          hasSubagents: false,
-        },
-      });
-      expect(event.payload).not.toHaveProperty("totalCostUsd");
-    }),
-  );
+for (const receiptProvider of ["command-code", "openai-codex"] as const)
+  for (const outcome of ["success", "canceled", "failed"] as const)
+    it.effect(
+      `repair R4 ${receiptProvider} ${outcome} preserves deduplicated authoritative usage`,
+      () =>
+        Effect.gen(function* () {
+          const fake = yield* makeFake();
+          const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+          const queue = yield* subscribe(adapter.streamEvents);
+          yield* adapter.startSession(startInput);
+          yield* adapter.sendTurn({ threadId, input: "prompt" });
+          const operation = fake.operations[1]!;
+          const output = fake.output(operation, outcome);
+          const first = reportedReceipt(1, 60, 12, receiptProvider);
+          const second = reportedReceipt(2, 40, 8, receiptProvider);
+          yield* Deferred.succeed(operation.result, {
+            ...output,
+            terminal: { ...output.terminal, accountingReceipts: [first, second, first] },
+          });
+          const event = yield* nextType(
+            queue,
+            outcome === "canceled" ? "turn.aborted" : "turn.completed",
+          );
+          expect(event.payload).toMatchObject({
+            tokenUsage: {
+              usageScope: "main_agent",
+              usageStatus: outcome === "success" ? "complete" : "partial",
+              inputTokens: 100,
+              outputTokens: 20,
+              cachedInputTokens: 10,
+              hasSubagents: false,
+            },
+          });
+          expect(event.payload).not.toHaveProperty("totalCostUsd");
+        }),
+    );
 
 it.effect("repair R5 private diagnostics never reach errors snapshots or terminal events", () =>
   Effect.gen(function* () {

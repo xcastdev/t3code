@@ -207,6 +207,7 @@ const decodeBindingAccounting = Schema.decodeUnknownOption(ProjectTeamBindingAcc
 const decodeBindingAccountingPage = Schema.decodeUnknownOption(
   Schema.Array(ProjectTeamBindingAccounting).check(Schema.isMaxLength(128)),
 );
+const formatTokenCount = (tokens: number) => tokens.toLocaleString("en-US");
 type AccountingOwner = {
   readonly projectId: ProjectId;
   readonly recordId: string;
@@ -234,10 +235,21 @@ export function asProjectTeamBindingAccounting(
   )
     return undefined;
   if (accounting.availability !== "available") return accounting;
-  const coherent = (scope: typeof accounting.attempt) =>
-    Number.isSafeInteger(scope.chargedTokens + scope.reservedTokens) &&
-    scope.chargedTokens + scope.reservedTokens + scope.remainingTokens === scope.maximumTokens &&
-    scope.unknownChargedTokens <= scope.chargedTokens;
+  const coherent = (scope: typeof accounting.attempt) => {
+    const used = scope.chargedTokens + scope.reservedTokens;
+    return (
+      Number.isSafeInteger(used) &&
+      scope.unknownChargedTokens <= scope.chargedTokens &&
+      (scope.policy === undefined
+        ? used <= scope.maximumTokens &&
+          scope.remainingTokens === Math.max(0, scope.maximumTokens - used)
+        : scope.policy.accountingMode === "openai-subscription-monitored" &&
+          scope.policy.thresholdTokens === 64_000 &&
+          scope.policy.observedChargedTokens === scope.chargedTokens &&
+          scope.policy.nominalHeldTokens === scope.reservedTokens &&
+          scope.remainingTokens === Math.max(0, scope.maximumTokens - scope.chargedTokens))
+    );
+  };
   const { root, attempt, operation } = accounting;
   const within = (scope: typeof attempt, parent: typeof attempt) =>
     scope.maximumTokens <= parent.maximumTokens &&
@@ -250,8 +262,17 @@ export function asProjectTeamBindingAccounting(
   if (
     !coherent(root) ||
     !coherent(attempt) ||
+    (root.policy?.stoppedReason === "unknown-usage" && root.unknownChargedTokens === 0) ||
+    root.policy?.accountingMode !== attempt.policy?.accountingMode ||
+    root.policy?.thresholdTokens !== attempt.policy?.thresholdTokens ||
+    root.policy?.stoppedReason !== attempt.policy?.stoppedReason ||
     !within(attempt, root) ||
-    (operation !== undefined && (!coherent(operation) || !within(operation, attempt)))
+    (operation !== undefined &&
+      (!coherent(operation) ||
+        operation.policy?.accountingMode !== root.policy?.accountingMode ||
+        operation.policy?.thresholdTokens !== root.policy?.thresholdTokens ||
+        operation.policy?.stoppedReason !== root.policy?.stoppedReason ||
+        !within(operation, attempt)))
   )
     return undefined;
   return accounting;
@@ -275,7 +296,9 @@ export function projectTeamAccountingCaptions(
           minute: "2-digit",
         })
       : "unavailable";
-    return `${label}: ${scope.chargedTokens} charged${scope.unknownChargedTokens > 0 ? ` (${scope.unknownChargedTokens} unknown)` : ""}, ${scope.reservedTokens} held; ${scope.remainingTokens}/${scope.maximumTokens} tokens remaining. Original deadline ${deadline}.${scope.quarantinedCalls > 0 ? ` ${scope.quarantinedCalls} quarantined calls.` : ""}`;
+    const policy = scope.policy;
+    const monitored = policy !== undefined;
+    return `${label}: ${formatTokenCount(scope.chargedTokens)} charged${scope.unknownChargedTokens > 0 ? ` (${formatTokenCount(scope.unknownChargedTokens)} conservatively charged for unknown usage)` : ""}, ${formatTokenCount(scope.reservedTokens)} held; ${formatTokenCount(scope.remainingTokens)}/${formatTokenCount(scope.maximumTokens)} ${monitored ? "threshold headroom" : "tokens remaining"}.${policy === undefined ? "" : ` Monitored stopping threshold: ${formatTokenCount(policy.thresholdTokens)} tokens; this is not a hard upstream output limit.`} Original deadline ${deadline}.${scope.quarantinedCalls > 0 ? ` ${scope.quarantinedCalls} quarantined calls.` : ""}`;
   };
   return [
     caption("Shared root", accounting.root),

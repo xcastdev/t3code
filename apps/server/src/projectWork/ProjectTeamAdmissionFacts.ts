@@ -53,6 +53,42 @@ const runtimeFacts = Schema.Struct({
   runtimeVersion: Schema.Literal("0.99.1"),
   maxInputTokens: positive.check(Schema.isLessThanOrEqualTo(1_000_000)),
   maxOutputTokens: positive.check(Schema.isLessThanOrEqualTo(65_536)),
+  subscription: Schema.optional(
+    Schema.Struct({
+      selection: Schema.Struct({
+        projectId: Schema.String,
+        rootTaskId: ProjectWorkTaskId,
+        model: Schema.Literal("gpt-6-luna"),
+        maximumTokens: Schema.Literal(64_000),
+        maximumDurationMs: Schema.Literal(300_000),
+      }),
+      configuration: Schema.Struct({
+        provider: Schema.Literal("openai-codex"),
+        model: Schema.Literal("gpt-6-luna"),
+        api: Schema.Literal("openai-codex-responses"),
+        endpoint: Schema.Literal("https://chatgpt.com/backend-api/codex/responses"),
+        contextWindow: positive,
+        maxInputTokens: positive.check(Schema.isLessThanOrEqualTo(16_384)),
+        maxOutputTokens: Schema.Literal(2_048),
+        advertisedMaxOutputTokens: positive,
+        deadlineMs: Schema.Literal(300_000),
+        reasoning: Schema.Literal(true),
+        reasoningEffort: Schema.Literal("high"),
+        serviceTier: Schema.Literal("default"),
+        input: Schema.Tuple([Schema.Literal("text")]),
+        cost: Schema.Literal("unknown"),
+        catalogue: Schema.Struct({
+          source: Schema.Literal("pi-sdk:0.99.1/openai-codex"),
+          fetchedAt: Schema.String.check(
+            Schema.makeFilter((value) => {
+              const parsed = DateTime.make(value);
+              return Option.isSome(parsed) && DateTime.formatIso(parsed.value) === value;
+            }),
+          ),
+        }),
+      }),
+    }),
+  ),
 });
 const budgetRows = Schema.Array(
   Schema.Struct({ maximumTokens: positive, deadlineAtMs: positive }),
@@ -590,9 +626,6 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
           if (!equal(beforeCapture, input.state))
             return yield* denied("Current reducer snapshot changed");
           yield* assertDelivered(beforeCapture, input.taskId);
-          const fresh = yield* catalogue.readFresh;
-          if (fresh === undefined)
-            return yield* denied("Fresh owned catalogue metadata is unavailable");
           return yield* pi.withInstance(selected.instanceId, (borrowed) =>
             Effect.gen(function* () {
               const instance = yield* registry.getInstance(selected.instanceId);
@@ -642,24 +675,68 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                     "Configured Pi instance differs from the actual runtime epoch",
                   );
                 const measuredRuntime = yield* decodeRuntimeFacts(borrowed.assets.runtimeFacts);
-                const stored = yield* readCatalogueRow();
                 const now = clock.currentTimeMillisUnsafe();
-                const at = DateTime.make(fresh.fetchedAt);
+                const subscription = measuredRuntime.subscription;
+                if ((selected.role.model === "gpt-6-luna") !== (subscription !== undefined))
+                  return yield* denied("Actual private subscription selection is unavailable");
+                const fresh = subscription === undefined ? yield* catalogue.readFresh : undefined;
+                if (subscription === undefined && fresh === undefined)
+                  return yield* denied("Fresh owned catalogue metadata is unavailable");
+                const stored = subscription === undefined ? yield* readCatalogueRow() : undefined;
+                const privateCatalogue =
+                  subscription === undefined
+                    ? undefined
+                    : {
+                        source: subscription.configuration.catalogue.source,
+                        fetchedAt: subscription.configuration.catalogue.fetchedAt,
+                        selectedEntry: {
+                          id: subscription.configuration.model,
+                          owned_by: subscription.configuration.provider,
+                          context_length: subscription.configuration.contextWindow,
+                          supported_endpoints: ["/codex/responses"] as const,
+                        },
+                      };
+                const actualCatalogue = privateCatalogue ?? fresh!;
+                const at = DateTime.make(actualCatalogue.fetchedAt);
                 if (
-                  !equal(stored.value, fresh) ||
-                  stored.row.source !== fresh.source ||
-                  stored.row.fetchedAt !== fresh.fetchedAt ||
                   Option.isNone(at) ||
                   now < DateTime.toEpochMillis(at.value) ||
                   now - DateTime.toEpochMillis(at.value) >= 86_400_000
                 )
+                  return yield* denied("Measured model metadata changed or expired");
+                if (
+                  subscription === undefined &&
+                  (!equal(stored!.value, fresh) ||
+                    stored!.row.source !== fresh!.source ||
+                    stored!.row.fetchedAt !== fresh!.fetchedAt)
+                )
                   return yield* denied("Measured catalogue changed or expired");
-                const entry = fresh.selectedEntry;
+                if (subscription !== undefined) {
+                  const privateSelection = subscription.selection;
+                  const configuration = subscription.configuration;
+                  if (
+                    privateSelection.projectId !== String(input.state.projectId) ||
+                    privateSelection.rootTaskId !== selected.rootTaskId ||
+                    privateSelection.model !== configuration.model ||
+                    privateSelection.maximumTokens !== 64_000 ||
+                    privateSelection.maximumDurationMs !== 300_000 ||
+                    configuration.maxInputTokens !== measuredRuntime.maxInputTokens ||
+                    configuration.maxOutputTokens !== measuredRuntime.maxOutputTokens ||
+                    configuration.maxOutputTokens !== 2_048 ||
+                    configuration.deadlineMs !== privateSelection.maximumDurationMs ||
+                    configuration.maxInputTokens + configuration.maxOutputTokens >
+                      configuration.contextWindow
+                  )
+                    return yield* denied("Private subscription selection changed");
+                }
+                const entry = actualCatalogue.selectedEntry;
                 if (
                   selected.role.model !== entry.id ||
                   measuredRuntime.maxInputTokens + measuredRuntime.maxOutputTokens >
                     entry.context_length ||
-                  (entry.max_output_tokens !== undefined &&
+                  (subscription === undefined &&
+                    "max_output_tokens" in entry &&
+                    entry.max_output_tokens !== undefined &&
                     measuredRuntime.maxOutputTokens > entry.max_output_tokens)
                 )
                   return yield* denied(
@@ -850,7 +927,7 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                     driverKind: instance.driverKind,
                     enabled: instance.enabled,
                     ...measuredRuntime,
-                    catalogue: fresh,
+                    catalogue: actualCatalogue,
                   }),
                   supportedToolIds: Object.freeze(supportedToolIds),
                   ownedSkillIds: Object.freeze(selection.map((skill) => skill.skillId)),
@@ -889,15 +966,24 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                   (yield* registry.getInstance(selected.instanceId)) !== instance
                 )
                   return yield* denied("Admission authority changed before publication");
-                const finalCatalogue = yield* readCatalogueRow();
                 const finalNow = clock.currentTimeMillisUnsafe();
                 if (
-                  !equal(finalCatalogue.row, stored.row) ||
                   Option.isNone(at) ||
                   finalNow < DateTime.toEpochMillis(at.value) ||
                   finalNow - DateTime.toEpochMillis(at.value) >= 86_400_000
                 )
-                  return yield* denied("Catalogue identity changed before publication");
+                  return yield* denied("Model metadata expired before publication");
+                if (subscription === undefined) {
+                  const finalCatalogue = yield* readCatalogueRow();
+                  if (!equal(finalCatalogue.row, stored!.row))
+                    return yield* denied("Catalogue identity changed before publication");
+                } else if (
+                  !equal(yield* decodeRuntimeFacts(borrowed.assets.runtimeFacts), measuredRuntime)
+                ) {
+                  return yield* denied(
+                    "Private subscription SDK metadata changed before publication",
+                  );
+                }
                 yield* Effect.try({
                   try: () => {
                     if (
@@ -918,7 +1004,7 @@ export const makeProjectTeamAdmissionFacts = Effect.fn("makeProjectTeamAdmission
                     facts,
                     providerConfiguration: configured,
                     skills: selection,
-                    catalogue: stored.row,
+                    catalogue: stored?.row ?? subscription?.configuration,
                     protected: paths.protected,
                   }),
                 };

@@ -106,6 +106,72 @@ describe("bounded team supervision contract", () => {
       ).toThrow();
   });
 
+  it("accepts monitored accounting policy while retaining charged overshoot", () => {
+    const policy = {
+      accountingMode: "openai-subscription-monitored",
+      thresholdTokens: 64_000,
+      observedChargedTokens: 80_384,
+      nominalHeldTokens: 0,
+      stoppedReason: "threshold-reached",
+    };
+    const monitored = {
+      availability: "available",
+      projectId: "project",
+      environmentId: "environment",
+      bindingId: "binding",
+      generation: 1,
+      taskId: "task",
+      attemptId: "attempt",
+      observedAt: "2026-10-01T00:00:00.000Z",
+      root: {
+        taskId: "root",
+        maximumTokens: 64_000,
+        deadlineAtMs: 300_000,
+        chargedTokens: 80_384,
+        reservedTokens: 0,
+        unknownChargedTokens: 0,
+        remainingTokens: 0,
+        heldCalls: 0,
+        quarantinedCalls: 0,
+        policy,
+      },
+      attempt: {
+        maximumTokens: 64_000,
+        deadlineAtMs: 300_000,
+        chargedTokens: 80_384,
+        reservedTokens: 0,
+        unknownChargedTokens: 0,
+        remainingTokens: 0,
+        heldCalls: 0,
+        quarantinedCalls: 0,
+        policy,
+      },
+    };
+    expect(
+      decode({
+        ...summary,
+        bindings: { items: [{ ...binding, accounting: monitored }], hasMore: false },
+      }),
+    ).toMatchObject({ bindings: { items: [{ accounting: monitored }] } });
+    expect(() =>
+      decode({
+        ...summary,
+        bindings: {
+          items: [
+            {
+              ...binding,
+              accounting: {
+                ...monitored,
+                root: { ...monitored.root, policy: { ...policy, thresholdTokens: 63_999 } },
+              },
+            },
+          ],
+          hasMore: false,
+        },
+      }),
+    ).toThrow();
+  });
+
   it("keeps the frozen binding model separate from the inspected role model", () => {
     const result = decode({ ...summary, bindings: { items: [binding], hasMore: false } });
     expect(result).toMatchObject({

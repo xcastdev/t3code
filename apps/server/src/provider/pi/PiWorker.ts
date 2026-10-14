@@ -6,7 +6,11 @@ import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { InMemoryCredentialStore, InMemoryModelsStore, Type } from "@earendil-works/pi-ai";
-import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
+import { streamSimple as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";
+import {
+  stream as streamCodexResponses,
+  type streamSimple as simpleCodexResponses,
+} from "@earendil-works/pi-ai/api/openai-codex-responses";
 import {
   VERSION,
   SessionManager,
@@ -166,6 +170,7 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
     return writes;
   };
   const modelBridge = makePiWorkerModelBridge({
+    api: () => protocol.bootstrap?.model.api ?? "openai-completions",
     lifecycleId: () => lifecycleId,
     emit: (message) => {
       if (message.type === "request" && !protocol.canStartRequest) throw Error("REQUEST_BARRIER");
@@ -322,10 +327,20 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
           allowModelNetwork: false,
           refreshOnCreate: false,
         });
+        const subscription = bootstrap.model.api === "openai-codex-responses";
+        const syntheticAccountToken = subscription
+          ? `eyJhbGciOiJub25lIn0.${Buffer.from(
+              JSON.stringify({
+                "https://api.openai.com/auth": { chatgpt_account_id: "t3-worker-placeholder" },
+              }),
+            ).toString("base64url")}.`
+          : "worker-placeholder";
         runtime.registerProvider(bootstrap.model.provider, {
-          api: "openai-completions",
-          baseUrl: "https://t3-worker.invalid/v1",
-          apiKey: "worker-placeholder",
+          api: bootstrap.model.api,
+          baseUrl: subscription
+            ? "https://t3-worker.invalid/codex"
+            : "https://t3-worker.invalid/v1",
+          apiKey: syntheticAccountToken,
           models: [
             {
               id: bootstrap.model.modelId,
@@ -340,14 +355,32 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
           ],
           streamSimple: (model, requestContext, requestOptions) => {
             if (
-              model.api !== "openai-completions" ||
+              model.api !== bootstrap.model.api ||
               model.provider !== bootstrap.model.provider ||
               model.id !== bootstrap.model.modelId
             )
               throw Error("INVALID_MODEL_REQUEST");
-            return streamSimple({ ...model, api: "openai-completions" }, requestContext, {
+            if (model.api === "openai-codex-responses") {
+              if (bootstrap.model.api !== "openai-codex-responses")
+                throw Error("INVALID_MODEL_REQUEST");
+              const subscriptionModel = { ...model, api: "openai-codex-responses" as const };
+              return streamPiWorkerSubscription(subscriptionModel, requestContext, {
+                ...requestOptions,
+                apiKey: syntheticAccountToken,
+                env: {},
+                fetch: modelBridge.fetch,
+                maxRetries: 0,
+                maxTokens: bootstrap.model.maxTokens,
+                transport: "sse",
+                reasoning: "high",
+              });
+            }
+            if (model.api !== "openai-completions" || bootstrap.model.api !== "openai-completions")
+              throw Error("INVALID_MODEL_REQUEST");
+            const completionsModel = { ...model, api: "openai-completions" as const };
+            return streamCompletions(completionsModel, requestContext, {
               ...requestOptions,
-              apiKey: "worker-placeholder",
+              apiKey: syntheticAccountToken,
               env: {},
               fetch: modelBridge.fetch,
               maxRetries: 0,
@@ -719,11 +752,31 @@ export function splitPiWorkerText(text: string) {
   return parts;
 }
 
+/** The worker's subscription producer always uses its intercepted SSE transport. */
+export function streamPiWorkerSubscription(
+  ...[model, context, options]: Parameters<typeof simpleCodexResponses>
+) {
+  if (typeof options?.fetch !== "function") throw Error("INVALID_MODEL_REQUEST");
+  const subscriptionModel = { ...model, api: "openai-codex-responses" as const };
+  return streamCodexResponses(subscriptionModel, context, {
+    ...options,
+    env: {},
+    transport: "sse",
+    reasoningEffort: "high",
+    maxRetries: 0,
+    serviceTier: "default",
+  });
+}
+
 /** SDK fetch streams end only when parent accounting ends, with one consumed chunk per ACK. */
 export function makePiWorkerModelBridge(options: {
   emit: (message: PiWorkerFrame["message"]) => Promise<void>;
   lifecycleId: () => number;
+  api?: PiWorkerBootstrap["model"]["api"] | (() => PiWorkerBootstrap["model"]["api"]);
 }) {
+  const getApi = () =>
+    typeof options.api === "function" ? options.api() : (options.api ?? "openai-completions");
+  let pinnedApi: PiWorkerBootstrap["model"]["api"] | undefined;
   type Pending = {
     id: number;
     headers: ReturnType<typeof Promise.withResolvers<Response>>;
@@ -783,14 +836,50 @@ export function makePiWorkerModelBridge(options: {
   return {
     async fetch(url: string | URL | Request, init?: RequestInit): Promise<Response> {
       const capturedLifecycleId = options.lifecycleId();
+      const requestedApi = getApi();
+      if (pinnedApi !== undefined && pinnedApi !== requestedApi)
+        throw Error("INVALID_MODEL_REQUEST");
+      pinnedApi ??= requestedApi;
+      const api = pinnedApi;
+      const endpoint =
+        api === "openai-codex-responses"
+          ? "https://t3-worker.invalid/codex/responses"
+          : "https://t3-worker.invalid/v1/chat/completions";
       if (active) await active.completion.promise;
       if (failure) throw failure;
-      if (
-        String(url) !== "https://t3-worker.invalid/v1/chat/completions" ||
-        init?.method !== "POST" ||
-        typeof init.body !== "string" ||
-        Buffer.byteLength(init.body) > PI_WORKER_MAX_REQUEST_BYTES
-      )
+      if (String(url) !== endpoint || init?.method !== "POST") throw Error("INVALID_MODEL_REQUEST");
+      let body: string;
+      if (typeof init.body === "string") {
+        body = init.body;
+        if (api === "openai-codex-responses") {
+          const headers = new Headers(init.headers);
+          if (headers.get("content-type") !== "application/json" || headers.has("content-encoding"))
+            throw Error("INVALID_MODEL_REQUEST");
+        }
+      } else if (api === "openai-codex-responses" && init.body instanceof Uint8Array) {
+        if (init.body.byteLength > PI_WORKER_MAX_REQUEST_BYTES)
+          throw Error("INVALID_MODEL_REQUEST");
+        const headers = new Headers(init.headers);
+        if (
+          headers.get("content-encoding") !== "zstd" ||
+          headers.get("content-type") !== "application/json"
+        )
+          throw Error("INVALID_MODEL_REQUEST");
+        try {
+          const zlib = process.getBuiltinModule("node:zlib");
+          if (!zlib || typeof zlib.zstdDecompressSync !== "function")
+            throw Error("ZSTD_UNAVAILABLE");
+          const decoded = zlib.zstdDecompressSync(init.body, {
+            maxOutputLength: PI_WORKER_MAX_REQUEST_BYTES,
+          });
+          if (decoded.byteLength > PI_WORKER_MAX_REQUEST_BYTES)
+            throw Error("INVALID_MODEL_REQUEST");
+          body = new TextDecoder("utf-8", { fatal: true }).decode(decoded);
+        } catch {
+          throw Error("INVALID_MODEL_REQUEST");
+        }
+      } else throw Error("INVALID_MODEL_REQUEST");
+      if (Buffer.byteLength(body, "utf8") > PI_WORKER_MAX_REQUEST_BYTES)
         throw Error("INVALID_MODEL_REQUEST");
       if (init.signal?.aborted) throw Error("CANCELED");
       const headers = Promise.withResolvers<Response>();
@@ -848,7 +937,7 @@ export function makePiWorkerModelBridge(options: {
           type: "request",
           requestId: pending.id,
           lifecycleId: capturedLifecycleId,
-          body: init.body,
+          body,
         });
       } catch (error) {
         fail(error instanceof Error ? error : Error("IPC_FAILURE"));

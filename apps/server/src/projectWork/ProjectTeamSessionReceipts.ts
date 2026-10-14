@@ -10,7 +10,10 @@ import {
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { isPiManagedModel, piManagedModelRoute } from "../provider/pi/PiManagedModels.ts";
+import {
+  isPiBrokerManagedModel,
+  piBrokerModelRoute as piBrokerModelRouteFor,
+} from "../provider/pi/PiManagedModels.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   MAX_PI_RUNTIME_FILES,
@@ -100,7 +103,7 @@ const decodeTerminal = Schema.decodeEffect(
           reservationId: Schema.String,
           accountingReceiptId: Schema.String,
           routeId: Schema.String,
-          provider: Schema.Literal("command-code"),
+          provider: Schema.Literals(["command-code", "openai-codex"]),
           model: Schema.String,
           reportedModel: Schema.String,
           usage: Usage,
@@ -298,7 +301,7 @@ const AccountingRow = Schema.Struct({
   operation_id: Id,
   request_id: Positive,
   route_id: Id,
-  provider: Schema.Literal("command-code"),
+  provider: Schema.Literals(["command-code", "openai-codex"]),
   model: Id,
   status: Schema.Literals(["held", "reported", "failed", "unknown"]),
   capacity_state: Schema.Literals(["held", "released", "quarantine", "legacy"]),
@@ -310,6 +313,8 @@ const AccountingRow = Schema.Struct({
   deadline_at_ms: Positive,
   charged_input_tokens: Safe,
   charged_output_tokens: Safe,
+  accounting_mode: Schema.Literals(["hard", "openai-subscription-monitored"]),
+  unknown_maximum_tokens: Schema.NullOr(Schema.Literal(64_000)),
 });
 const decodeRow = Schema.decodeUnknownEffect(OperationRow, strict);
 const decodeIntent = Schema.decodeUnknownEffect(Schema.fromJsonString(Intent), strict);
@@ -546,7 +551,7 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         return yield* deny("Original Pi process/native ownership differs");
       const rawRequests = yield* sql<
         Record<string, unknown>
-      >`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,status,capacity_state,accounting_receipt_id,settlement_json,reservation_json,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,charged_input_tokens,charged_output_tokens FROM project_team_model_request WHERE operation_id=${operationId}
+      >`SELECT reservation_id,environment_id,project_id,root_task_id,run_id,attempt_id,worker_id,generation,operation_id,request_id,route_id,provider,model,status,capacity_state,accounting_receipt_id,settlement_json,reservation_json,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,charged_input_tokens,charged_output_tokens,accounting_mode,unknown_maximum_tokens FROM project_team_model_request WHERE operation_id=${operationId}
         AND request_lane='pi' AND request_scope='' LIMIT 257`;
       const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
         environmentId: options.environmentId,
@@ -572,6 +577,29 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
       let chargedTokens = 0;
       for (const receipt of terminal.accountingReceipts) {
         const r = requests.find((r) => r.reservation_id === receipt.reservationId);
+        if (r?.accounting_mode === "openai-subscription-monitored") {
+          const grants = yield* sql<{
+            model: string;
+            route_id: string;
+            maximum_tokens: number;
+            maximum_duration_ms: number;
+            deadline_at_ms: number;
+            stopped_at_ms: number | null;
+          }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms
+            FROM project_team_pi_subscription_grant WHERE environment_id=${r.environment_id}
+            AND project_id=${r.project_id} AND root_task_id=${r.root_task_id}`;
+          const grant = grants[0];
+          if (
+            !grant ||
+            grant.model !== "gpt-6-luna" ||
+            grant.route_id !== "openai-subscription-luna" ||
+            grant.maximum_tokens !== 64_000 ||
+            grant.maximum_duration_ms !== 300_000 ||
+            grant.deadline_at_ms !== limits.rootDeadlineAtMs ||
+            r.unknown_maximum_tokens !== 64_000
+          )
+            return yield* deny("Original subscription grant differs");
+        }
         if (
           !r ||
           seenReceipts.has(receipt.reservationId) ||
@@ -589,20 +617,25 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
           r.generation !== row.generation ||
           r.request_id !== receipt.requestId ||
           r.accounting_receipt_id !== receipt.accountingReceiptId ||
-          !isPiManagedModel(binding.model) ||
-          r.route_id !== piManagedModelRoute(binding.model).routeId ||
+          !isPiBrokerManagedModel(binding.model) ||
+          (r.accounting_mode === "openai-subscription-monitored") !==
+            (binding.model === "gpt-6-luna" && receipt.provider === "openai-codex") ||
+          r.route_id !== piBrokerModelRouteFor(binding.model).routeId ||
           r.route_id !== receipt.routeId ||
           r.provider !== receipt.provider ||
           r.model !== binding.model ||
+          r.unknown_maximum_tokens !==
+            (r.accounting_mode === "openai-subscription-monitored" ? 64_000 : null) ||
           receipt.model !== binding.model ||
-          !piManagedModelRoute(binding.model).acceptedReportedModels.includes(
-            receipt.reportedModel,
+          !piBrokerModelRouteFor(binding.model).acceptedReportedModels.some(
+            (model) => model === receipt.reportedModel,
           ) ||
           !r.settlement_json ||
           r.maximum_input_tokens + r.maximum_output_tokens > row.maximum_tokens ||
           r.deadline_at_ms > row.deadline_at_ms ||
-          receipt.usage.prompt_tokens > r.maximum_input_tokens ||
-          receipt.usage.completion_tokens > r.maximum_output_tokens ||
+          (r.accounting_mode !== "openai-subscription-monitored" &&
+            (receipt.usage.prompt_tokens > r.maximum_input_tokens ||
+              receipt.usage.completion_tokens > r.maximum_output_tokens)) ||
           Object.values(receipt.usage.prompt_tokens_details ?? {}).some(
             (v) => v !== undefined && v > receipt.usage.prompt_tokens,
           ) ||
@@ -628,6 +661,9 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
           maxOutputTokens: r.maximum_output_tokens,
           callCount: 1,
           deadlineAtMs: r.deadline_at_ms,
+          ...(r.accounting_mode === "openai-subscription-monitored"
+            ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+            : {}),
         };
         const reservation = yield* decodeJson(r.reservation_json).pipe(Effect.mapError(corrupt));
         const settlement = yield* decodeJson(r.settlement_json).pipe(Effect.mapError(corrupt));
@@ -644,6 +680,9 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
               chargedOutputTokens: r.charged_output_tokens,
               reportedModel: receipt.reportedModel,
               reportedUsage: receipt.usage,
+              ...(r.accounting_mode === "openai-subscription-monitored"
+                ? { accountingMode: "openai-subscription-monitored", unknownMaximumTokens: 64_000 }
+                : {}),
             }) ||
           receipt.usage.total_tokens !==
             receipt.usage.prompt_tokens + receipt.usage.completion_tokens ||
@@ -656,7 +695,8 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         if (
           !Number.isSafeInteger(requestCharge) ||
           !Number.isSafeInteger(totalCharge) ||
-          totalCharge > row.maximum_tokens
+          (totalCharge > row.maximum_tokens &&
+            r.accounting_mode !== "openai-subscription-monitored")
         )
           return yield* deny("Original Pi aggregate accounting exceeds operation limit");
         chargedTokens = totalCharge;

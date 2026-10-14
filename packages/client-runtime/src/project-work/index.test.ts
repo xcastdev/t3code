@@ -35,6 +35,8 @@ import {
   asProjectWorkArray,
   asProjectWorkVerificationJob,
   asProjectTeamSupervisionSummary,
+  asProjectTeamBindingAccounting,
+  projectTeamAccountingCaptions,
   projectTeamSupervisionAvailable,
   asProjectWorkFoundationPage,
   combineProjectWorkFoundationPages,
@@ -50,6 +52,184 @@ import {
 } from "./index.ts";
 
 describe("project-work client bounds", () => {
+  it("normalizes monitored overshoot and captions threshold headroom without a hard output promise", () => {
+    const owner = {
+      projectId: ProjectId.make("project"),
+      recordId: "binding",
+      generation: 1,
+      taskId: "task",
+      attemptId: "attempt",
+      environmentId: EnvironmentId.make("environment"),
+    };
+    const policy = {
+      accountingMode: "openai-subscription-monitored",
+      thresholdTokens: 64_000 as const,
+      observedChargedTokens: 80_384,
+      nominalHeldTokens: 0,
+      stoppedReason: "threshold-reached",
+    } as const;
+    const accounting = {
+      availability: "available" as const,
+      projectId: ProjectId.make("project"),
+      environmentId: EnvironmentId.make("environment"),
+      bindingId: "binding",
+      generation: 1,
+      taskId: "task",
+      attemptId: "attempt",
+      observedAt: "2026-10-01T00:00:00.000Z",
+      root: {
+        taskId: "root",
+        maximumTokens: 64_000,
+        deadlineAtMs: 2_000,
+        chargedTokens: 80_384,
+        reservedTokens: 0,
+        unknownChargedTokens: 0,
+        remainingTokens: 0,
+        heldCalls: 0,
+        quarantinedCalls: 0,
+        policy,
+      },
+      attempt: {
+        maximumTokens: 64_000,
+        deadlineAtMs: 2_000,
+        chargedTokens: 80_384,
+        reservedTokens: 0,
+        unknownChargedTokens: 0,
+        remainingTokens: 0,
+        heldCalls: 0,
+        quarantinedCalls: 0,
+        policy,
+      },
+    };
+    const normalized = asProjectTeamBindingAccounting(accounting, owner);
+    expect(normalized).toEqual(accounting);
+    const captions = projectTeamAccountingCaptions(normalized).join(" ");
+    expect(captions).toContain("80,384 charged");
+    expect(captions).toContain("Monitored stopping threshold: 64,000 tokens");
+    expect(captions).toContain("not a hard upstream output limit");
+    const { policy: _rootPolicy, ...root } = accounting.root;
+    const { policy: _attemptPolicy, ...attempt } = accounting.attempt;
+    void _rootPolicy;
+    void _attemptPolicy;
+    const hard = {
+      ...accounting,
+      root: { ...root, chargedTokens: 100, remainingTokens: 63_900 },
+      attempt: { ...attempt, chargedTokens: 100, remainingTokens: 63_900 },
+    };
+    expect(asProjectTeamBindingAccounting(hard, owner)).toEqual(hard);
+  });
+
+  it("rejects monitored policy counters that do not match the recorded scope", () => {
+    const owner = {
+      projectId: ProjectId.make("project"),
+      recordId: "binding",
+      generation: 1,
+      taskId: "task",
+      attemptId: "attempt",
+      environmentId: EnvironmentId.make("environment"),
+    };
+    const scope = {
+      maximumTokens: 64_000,
+      deadlineAtMs: 2_000,
+      chargedTokens: 80_384,
+      reservedTokens: 0,
+      unknownChargedTokens: 0,
+      remainingTokens: 0,
+      heldCalls: 0,
+      quarantinedCalls: 0,
+      policy: {
+        accountingMode: "openai-subscription-monitored" as const,
+        thresholdTokens: 64_000 as const,
+        observedChargedTokens: 80_383,
+        nominalHeldTokens: 0,
+      },
+    };
+    expect(
+      asProjectTeamBindingAccounting(
+        {
+          availability: "available" as const,
+          projectId: ProjectId.make("project"),
+          environmentId: EnvironmentId.make("environment"),
+          bindingId: "binding",
+          generation: 1,
+          taskId: "task",
+          attemptId: "attempt",
+          observedAt: "2026-10-01T00:00:00.000Z",
+          root: { taskId: "root", ...scope },
+          attempt: scope,
+        },
+        owner,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("uses charged usage alone for monitored headroom and keeps hard reservations conservative", () => {
+    const owner = {
+      projectId: ProjectId.make("project"),
+      recordId: "binding",
+      generation: 1,
+      taskId: "task",
+      attemptId: "attempt",
+      environmentId: EnvironmentId.make("environment"),
+    };
+    const identity = {
+      projectId: ProjectId.make("project"),
+      environmentId: EnvironmentId.make("environment"),
+      bindingId: "binding",
+      generation: 1,
+      taskId: "task",
+      attemptId: "attempt",
+      observedAt: "2026-10-01T00:00:00.000Z",
+    };
+    const monitoredScope = {
+      maximumTokens: 64_000,
+      deadlineAtMs: 2_000,
+      chargedTokens: 55_000,
+      reservedTokens: 18_432,
+      unknownChargedTokens: 0,
+      remainingTokens: 9_000,
+      heldCalls: 1,
+      quarantinedCalls: 0,
+      policy: {
+        accountingMode: "openai-subscription-monitored" as const,
+        thresholdTokens: 64_000 as const,
+        observedChargedTokens: 55_000,
+        nominalHeldTokens: 18_432,
+      },
+    };
+    const monitored = {
+      availability: "available" as const,
+      ...identity,
+      root: { taskId: "root", ...monitoredScope },
+      attempt: monitoredScope,
+    };
+    expect(asProjectTeamBindingAccounting(monitored, owner)).toEqual(monitored);
+    expect(projectTeamAccountingCaptions(monitored).join(" ")).toContain(
+      "18,432 held; 9,000/64,000 threshold headroom",
+    );
+
+    const hardScope = {
+      maximumTokens: 64_000,
+      deadlineAtMs: 2_000,
+      chargedTokens: 10_000,
+      reservedTokens: 18_432,
+      unknownChargedTokens: 0,
+      remainingTokens: 35_568,
+      heldCalls: 1,
+      quarantinedCalls: 0,
+    };
+    const hard = {
+      availability: "available" as const,
+      ...identity,
+      root: { taskId: "root", ...hardScope },
+      attempt: hardScope,
+    };
+    expect(asProjectTeamBindingAccounting(hard, owner)).toEqual(hard);
+    expect(projectTeamAccountingCaptions(hard).join(" ")).toContain(
+      "18,432 held; 35,568/64,000 tokens remaining",
+    );
+  });
+
   it("keeps read collections bounded when the server response is malformed", () => {
     expect(asProjectWorkArray({ records: Array.from({ length: 500 }, () => ({})) })).toEqual([]);
     expect(asProjectWorkArray(["first", "second"])).toHaveLength(2);

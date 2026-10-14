@@ -57,12 +57,13 @@ import * as Runtime from "./PiManagedRuntimeLive.ts";
 import * as RuntimeAssets from "./PiRuntimeAssets.ts";
 import {
   makePiProductionRuntime,
+  PiSubscriptionTest,
   type PiProductionRuntimeOptions,
   type PiProductionRuntimeAssets,
   type PiProductionRuntimeHooks,
 } from "./PiProductionRuntime.ts";
 
-import type { PiManagedRuntimeInstance } from "./PiManagedRuntime.ts";
+import type { PiDriverConfiguration, PiManagedRuntimeInstance } from "./PiManagedRuntime.ts";
 import { makeProjectTeamPiRuntime } from "../../projectWork/ProjectTeamPiRuntime.ts";
 
 const NodeFS = process.getBuiltinModule("fs");
@@ -210,6 +211,13 @@ const failure = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   );
 
 describe("private Pi production factory", () => {
+  it.effect("the constructor-only subscription context has no default selection", () =>
+    scoped(
+      Effect.gen(function* () {
+        expect(yield* PiSubscriptionTest).toBeUndefined();
+      }),
+    ),
+  );
   it.effect(
     "construction has no staging, native state, catalogue refresh or worker acquisition",
     () =>
@@ -247,6 +255,79 @@ describe("private Pi production factory", () => {
           expect(f.captured[0]?.runtimeFiles).toEqual([]);
           expect(f.reads).toBe(0);
           expect(f.refreshes).toBe(0);
+          expect(f.fetch).not.toHaveBeenCalled();
+          expect(yield* f.fs.exists(f.options.stagingRoot)).toBe(false);
+          expect(yield* f.fs.exists(f.options.nativeStateRoot)).toBe(false);
+        }),
+      ),
+  );
+  it.effect("provider instance configuration cannot opt into the private subscription route", () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const configuration: PiDriverConfiguration = {};
+        Reflect.set(configuration, "model", {
+          provider: "openai-codex",
+          model: "gpt-6-luna",
+        });
+        const service = yield* construct(f);
+        const result = yield* Effect.result(
+          service.forInstance({
+            ...instance,
+            configuration,
+          }),
+        );
+
+        expect(result._tag).toBe("Failure");
+        expect(f.captured).toHaveLength(0);
+        expect(f.reads).toBe(0);
+        expect(f.refreshes).toBe(0);
+        expect(f.fetch).not.toHaveBeenCalled();
+        expect(yield* f.fs.exists(f.options.stagingRoot)).toBe(false);
+        expect(yield* f.fs.exists(f.options.nativeStateRoot)).toBe(false);
+      }),
+    ),
+  );
+  it.effect(
+    "the production factory snapshots private subscription authority before instance setup",
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const selection = {
+            projectId: "fixture-project",
+            rootTaskId: "fixture-root",
+            model: "gpt-6-luna" as const,
+            maximumTokens: 64_000 as const,
+            maximumDurationMs: 300_000 as const,
+          };
+          const credentialSource = {
+            directory: f.options.agentDirectory,
+            format: "pi" as const,
+          };
+          const hook = { selection, credentialSource };
+          const service = yield* construct(f, { subscriptionTest: hook });
+          selection.rootTaskId = "changed-root";
+          credentialSource.directory = f.root + "/changed-credentials";
+
+          yield* service.forInstance({ ...instance, enabled: false });
+
+          const captured = f.captured[0]?.subscriptionTest;
+          expect(captured?.selection).toEqual({
+            projectId: "fixture-project",
+            rootTaskId: "fixture-root",
+            model: "gpt-6-luna",
+            maximumTokens: 64_000,
+            maximumDurationMs: 300_000,
+          });
+          expect(captured?.credentialSource).toEqual({
+            directory: f.options.agentDirectory,
+            format: "pi",
+          });
+          expect(Object.isFrozen(captured)).toBe(true);
+          expect(Object.isFrozen(captured?.selection)).toBe(true);
+          expect(Object.isFrozen(captured?.credentialSource)).toBe(true);
+          expect(f.reads).toBe(0);
           expect(f.fetch).not.toHaveBeenCalled();
           expect(yield* f.fs.exists(f.options.stagingRoot)).toBe(false);
           expect(yield* f.fs.exists(f.options.nativeStateRoot)).toBe(false);

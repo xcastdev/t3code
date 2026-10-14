@@ -716,8 +716,11 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
             const childPid = yield* child.start;
             exitTask = tracked(
               perform(child.awaitExit).then(
-                (receipt) => {
+                async (receipt) => {
                   drain = receipt;
+                  // Exit can overtake buffered stdout and its durable callbacks.
+                  // Judge the protocol only after that owned stream has drained.
+                  await reader;
                   if (!protocol.successful) fail(failure("EARLY_EXIT"));
                   return receipt;
                 },

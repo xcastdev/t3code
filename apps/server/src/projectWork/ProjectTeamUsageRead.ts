@@ -39,7 +39,16 @@ const decodeBinding = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectTe
   onExcessProperty: "error",
 });
 type ModelRow = Effect.Success<ReturnType<typeof decodeProjectTeamRecordedModelRow>>;
-const recordedUsage = (rows: readonly ModelRow[], maximumTokens: number, deadlineAtMs: number) => {
+const recordedUsage = (
+  rows: readonly ModelRow[],
+  maximumTokens: number,
+  deadlineAtMs: number,
+  stoppedReason?: "threshold-reached" | "unknown-usage",
+  monitoredGrant = false,
+) => {
+  const modes = new Set(rows.map((row) => row.accounting_mode));
+  if (modes.size > 1) return undefined;
+  const monitored = modes.has("openai-subscription-monitored") || monitoredGrant;
   let chargedTokens = 0;
   let reservedTokens = 0;
   let unknownChargedTokens = 0;
@@ -61,16 +70,27 @@ const recordedUsage = (rows: readonly ModelRow[], maximumTokens: number, deadlin
       return undefined;
   }
   const total = chargedTokens + reservedTokens;
-  if (!Number.isSafeInteger(total) || total > maximumTokens) return undefined;
+  if (!Number.isSafeInteger(total) || (!monitored && total > maximumTokens)) return undefined;
   return {
     maximumTokens,
     deadlineAtMs,
     chargedTokens,
     reservedTokens,
     unknownChargedTokens,
-    remainingTokens: maximumTokens - total,
+    remainingTokens: Math.max(0, maximumTokens - (monitored ? chargedTokens : total)),
     heldCalls,
     quarantinedCalls,
+    ...(monitored
+      ? {
+          policy: {
+            accountingMode: "openai-subscription-monitored" as const,
+            thresholdTokens: 64_000 as const,
+            observedChargedTokens: chargedTokens,
+            nominalHeldTokens: reservedTokens,
+            ...(stoppedReason === undefined ? {} : { stoppedReason }),
+          },
+        }
+      : {}),
   };
 };
 
@@ -240,6 +260,7 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
               length(CAST(maximum_input_tokens AS BLOB))+length(CAST(maximum_output_tokens AS BLOB))+
               length(CAST(deadline_at_ms AS BLOB))+length(CAST(status AS BLOB))+length(CAST(capacity_state AS BLOB))+
               length(CAST(charged_input_tokens AS BLOB))+length(CAST(charged_output_tokens AS BLOB))+
+              length(CAST(accounting_mode AS BLOB))+COALESCE(length(CAST(unknown_maximum_tokens AS BLOB)),0)+
               COALESCE(length(CAST(accounting_receipt_id AS BLOB)),0)+length(CAST(reservation_json AS BLOB))+
               COALESCE(length(CAST(settlement_json AS BLOB)),0) AS bytes FROM project_team_model_request
               WHERE project_id=${projectId} LIMIT 4097`;
@@ -445,7 +466,8 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
               yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,
               run_id,attempt_id,worker_id,generation,operation_id,request_lane,request_scope,request_id,
               route_id,provider,model,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,
-              charged_input_tokens,charged_output_tokens,accounting_receipt_id,reservation_json,settlement_json
+              charged_input_tokens,charged_output_tokens,accounting_mode,unknown_maximum_tokens,
+              accounting_receipt_id,reservation_json,settlement_json
               FROM project_team_model_request WHERE project_id=${projectId} AND root_task_id=${original.rootTaskId} LIMIT 4097`;
             if (physicalModels.length !== modelMetadata.length)
               return unavailable(selected, "ledger-invalid");
@@ -490,10 +512,70 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
             modelRows = decodedRows;
             rootModels.set(original.rootTaskId, modelRows);
           }
+          const subscriptionGrants = yield* sql<{
+            model: string | null;
+            routeId: string | null;
+            maximumTokens: number | null;
+            maximumDurationMs: number | null;
+            deadlineAtMs: number | null;
+            stoppedAtMs: number | null;
+            stopReason: string | null;
+          }>`SELECT
+            CASE WHEN model='gpt-6-luna' THEN model END AS model,
+            CASE WHEN route_id='openai-subscription-luna' THEN route_id END AS routeId,
+            CASE WHEN typeof(maximum_tokens)='integer' THEN maximum_tokens ELSE -1 END AS maximumTokens,
+            CASE WHEN typeof(maximum_duration_ms)='integer' THEN maximum_duration_ms ELSE -1 END AS maximumDurationMs,
+            CASE WHEN typeof(deadline_at_ms)='integer' AND deadline_at_ms BETWEEN 1 AND 9007199254740991 THEN deadline_at_ms ELSE -1 END AS deadlineAtMs,
+            CASE WHEN stopped_at_ms IS NULL THEN NULL
+              WHEN typeof(stopped_at_ms)='integer' AND stopped_at_ms BETWEEN 1 AND 9007199254740991 THEN stopped_at_ms ELSE -1 END AS stoppedAtMs,
+            CASE WHEN stop_reason IS NULL OR stop_reason IN ('threshold-reached','unknown-usage') THEN stop_reason ELSE '__invalid__' END AS stopReason
+            FROM project_team_pi_subscription_grant WHERE environment_id=${environmentId}
+            AND project_id=${projectId} AND root_task_id=${original.rootTaskId} LIMIT 2`;
+          const modes = new Set(modelRows.map((model) => model.accounting_mode));
+          if (modes.size > 1 || subscriptionGrants.length > 1)
+            return unavailable(selected, "ledger-invalid");
+          const grant = subscriptionGrants[0];
+          const hasMonitoredRows = modes.has("openai-subscription-monitored");
+          const monitored = grant !== undefined;
+          if (
+            (hasMonitoredRows && !monitored) ||
+            (modelRows.length > 0 && monitored !== hasMonitoredRows) ||
+            (grant !== undefined &&
+              (grant.model !== "gpt-6-luna" ||
+                grant.routeId !== "openai-subscription-luna" ||
+                grant.maximumTokens !== 64_000 ||
+                original.rootMaximumTokens !== 64_000 ||
+                grant.maximumDurationMs !== 300_000 ||
+                grant.deadlineAtMs !== original.rootDeadlineAtMs ||
+                (grant.stoppedAtMs === null) !== (grant.stopReason === null) ||
+                (grant.stopReason !== null &&
+                  grant.stopReason !== "threshold-reached" &&
+                  grant.stopReason !== "unknown-usage")))
+          )
+            return unavailable(selected, "ledger-invalid");
+          const stoppedReason =
+            grant?.stopReason === "threshold-reached" || grant?.stopReason === "unknown-usage"
+              ? grant.stopReason
+              : undefined;
+          const chargedTotal = modelRows.reduce(
+            (total, model) => total + model.charged_input_tokens + model.charged_output_tokens,
+            0,
+          );
+          const hasUnknown = modelRows.some((model) => model.status === "unknown");
+          if (
+            grant !== undefined &&
+            (!Number.isSafeInteger(chargedTotal) ||
+              (stoppedReason === "threshold-reached" && chargedTotal < 64_000) ||
+              (stoppedReason === "unknown-usage" && !hasUnknown) ||
+              (stoppedReason === undefined && (chargedTotal >= 64_000 || hasUnknown)))
+          )
+            return unavailable(selected, "ledger-invalid");
           const root = recordedUsage(
             modelRows,
             original.rootMaximumTokens,
             original.rootDeadlineAtMs,
+            stoppedReason,
+            monitored,
           );
           const attempt = recordedUsage(
             modelRows.filter(
@@ -504,6 +586,8 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
             ),
             original.attemptMaximumTokens,
             original.attemptDeadlineAtMs,
+            stoppedReason,
+            monitored,
           );
           if (!root || !attempt) return unavailable(selected, "limit-exceeded");
           const latest = original.operations.at(-1);
@@ -512,6 +596,8 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
                 modelRows.filter((model) => model.operation_id === latest.operationId),
                 latest.maximumTokens,
                 latest.deadlineAtMs,
+                stoppedReason,
+                monitored,
               )
             : undefined;
           if (latest && !operation) return unavailable(selected, "limit-exceeded");

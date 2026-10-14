@@ -31,11 +31,22 @@ import {
   type ProjectTeamConfiguredAdmissionFacts,
 } from "./ProjectTeamConfiguredAdmission.ts";
 
+const decodeFoundationCommand = Schema.decodeEffect(ProjectWorkFoundationCommitCommand);
 const human = { kind: "human", id: "human" } as const;
 const source = { kind: "web", id: "web" } as const;
 const model = "inclusionai/ling-3.1-flash:free";
+const subscriptionModel = "gpt-6-luna";
 const nowMs = Date.parse(at) + 1;
 const parentId = ProjectWorkTaskId.make("parent");
+type CommandCatalogue = Extract<
+  ProjectTeamConfiguredAdmissionFacts["provider"]["catalogue"],
+  { readonly source: "https://api.commandcode.ai/provider/v1/models" }
+>;
+type CommandConfiguredAdmissionFacts = Omit<ProjectTeamConfiguredAdmissionFacts, "provider"> & {
+  readonly provider: Omit<ProjectTeamConfiguredAdmissionFacts["provider"], "catalogue"> & {
+    readonly catalogue: CommandCatalogue;
+  };
+};
 const roles = [
   "coordinator",
   "investigator",
@@ -68,7 +79,7 @@ const configuration: ProjectTeamConfigurationIntent = {
   })),
   modelPolicies: [{ model, tokenLimit: 8192, durationLimitMs: 60000, modelCalls: 2 }],
 };
-const facts: ProjectTeamConfiguredAdmissionFacts = {
+const facts: CommandConfiguredAdmissionFacts = {
   environmentId: EnvironmentId.make("environment"),
   provider: {
     instanceId: ProviderInstanceId.make("pi-instance"),
@@ -102,6 +113,58 @@ const facts: ProjectTeamConfiguredAdmissionFacts = {
   },
   rootAnchor: { _tag: "NewRoot" },
 };
+const subscriptionFacts = (
+  selection: NonNullable<
+    ProjectTeamConfiguredAdmissionFacts["provider"]["subscription"]
+  >["selection"],
+): ProjectTeamConfiguredAdmissionFacts => ({
+  environmentId: facts.environmentId,
+  provider: {
+    instanceId: facts.provider.instanceId,
+    driverKind: facts.provider.driverKind,
+    enabled: facts.provider.enabled,
+    runtimeVersion: facts.provider.runtimeVersion,
+    maxInputTokens: 16_384,
+    maxOutputTokens: 2_048,
+    catalogue: {
+      source: "pi-sdk:0.99.1/openai-codex",
+      fetchedAt: at,
+      selectedEntry: {
+        id: subscriptionModel,
+        owned_by: "openai-codex",
+        context_length: 272_000,
+        supported_endpoints: ["/codex/responses"],
+      },
+    },
+    subscription: {
+      selection,
+      configuration: {
+        provider: "openai-codex",
+        model: subscriptionModel,
+        api: "openai-codex-responses",
+        endpoint: "https://chatgpt.com/backend-api/codex/responses",
+        contextWindow: 272_000,
+        maxInputTokens: 16_384,
+        maxOutputTokens: 2_048,
+        advertisedMaxOutputTokens: 16_384,
+        deadlineMs: 300_000,
+        reasoning: true,
+        reasoningEffort: "high",
+        serviceTier: "default",
+        input: ["text"],
+        cost: "unknown",
+        catalogue: {
+          source: "pi-sdk:0.99.1/openai-codex",
+          fetchedAt: at,
+        },
+      },
+    },
+  },
+  supportedToolIds: facts.supportedToolIds,
+  ownedSkillIds: facts.ownedSkillIds,
+  git: facts.git,
+  rootAnchor: facts.rootAnchor,
+});
 const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
 const fixture = Effect.fn("configuredAdmissionTest.fixture")(function* (
@@ -120,6 +183,9 @@ const fixture = Effect.fn("configuredAdmissionTest.fixture")(function* (
       modelPolicies: configuration.modelPolicies.map((policy) => ({
         ...policy,
         model: selectedModel,
+        ...(selectedModel === subscriptionModel
+          ? { tokenLimit: 64_000, durationLimitMs: 300_000 }
+          : {}),
       })),
     },
     human,
@@ -207,7 +273,7 @@ const fixture = Effect.fn("configuredAdmissionTest.fixture")(function* (
   const change = Effect.fn("configuredAdmissionTest.change")(function* (record: ProjectTeamRecord) {
     const current = yield* readCurrentState(sql, projectId);
     yield* repository.execute(
-      yield* Schema.decodeEffect(ProjectWorkFoundationCommitCommand)({
+      yield* decodeFoundationCommand({
         type: "project-work.foundation.commit",
         projectId,
         commandId: `change-${record.recordId}-${record.revision}`,
@@ -308,10 +374,7 @@ it.effect(
 );
 
 const factDenials: ReadonlyArray<
-  readonly [
-    string,
-    (input: ProjectTeamConfiguredAdmissionFacts) => ProjectTeamConfiguredAdmissionFacts,
-  ]
+  readonly [string, (input: CommandConfiguredAdmissionFacts) => CommandConfiguredAdmissionFacts]
 > = [
   [
     "disabled actual instance",
@@ -541,6 +604,78 @@ it.effect("uses actual approved specification and plan for isolated writable cod
           },
         })._tag,
       ).toBe("Blocked");
+    }),
+  ),
+);
+
+it.effect("admits Code from the exact private subscription facts with nominal route limits", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture("code", subscriptionModel);
+      const selected = subscriptionFacts({
+        projectId: String(projectId),
+        rootTaskId: parentId,
+        model: subscriptionModel,
+        maximumTokens: 64_000,
+        maximumDurationMs: 300_000,
+      });
+      expect(selected.provider.catalogue.selectedEntry).toEqual({
+        id: subscriptionModel,
+        owned_by: "openai-codex",
+        context_length: 272_000,
+        supported_endpoints: ["/codex/responses"],
+      });
+      expect(selected.provider.subscription?.configuration).toMatchObject({
+        reasoningEffort: "high",
+        serviceTier: "default",
+        maxInputTokens: 16_384,
+        maxOutputTokens: 2_048,
+      });
+      const prepared = prepareProjectTeamConfiguredAdmission({
+        state: f.state,
+        taskId: f.taskId,
+        nowMs,
+        facts: {
+          ...selected,
+          git: { ...selected.git, writable: true },
+        },
+      });
+      if (prepared._tag !== "Prepared") return yield* Effect.die(prepared.reason);
+      expect(prepared.request.claim.transition?.kind).toBe("claim");
+      if (prepared.request.claim.transition?.kind !== "claim") return;
+      expect(prepared.request.claim.transition.binding.model).toBe(subscriptionModel);
+      expect(prepared.request.claim.transition.binding.configuration.maxTokens).toBe(64_000);
+      expect(prepared.request.claim.transition.binding.configuration.maxDurationMs).toBe(300_000);
+      expect("maxOutputTokens" in prepared.request.claim.transition.binding.configuration).toBe(
+        false,
+      );
+    }),
+  ),
+);
+
+it.effect("refuses subscription Code when its private selection belongs to another root", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture("code", subscriptionModel);
+      const selected = subscriptionFacts({
+        projectId: String(projectId),
+        rootTaskId: ProjectWorkTaskId.make("foreign-root"),
+        model: subscriptionModel,
+        maximumTokens: 64_000,
+        maximumDurationMs: 300_000,
+      });
+      expect(
+        prepareProjectTeamConfiguredAdmission({
+          state: f.state,
+          taskId: f.taskId,
+          nowMs,
+          facts: {
+            ...selected,
+            git: { ...selected.git, writable: true },
+          },
+        })._tag,
+      ).toBe("Blocked");
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
     }),
   ),
 );

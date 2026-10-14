@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import * as NodeCrypto from "node:crypto";
 import {
+  EnvironmentId,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamWriteIntent,
   canonicalProjectWorkPayload,
@@ -16,6 +17,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as FileSystem from "effect/FileSystem";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -40,9 +42,11 @@ import { makeProjectTeamContext, ProjectTeamContextError } from "./ProjectTeamCo
 import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 import * as Accounting from "./ProjectTeamModelAccounting.ts";
+import { readProjectTeamBindingAccountingInTransaction } from "./ProjectTeamUsageRead.ts";
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { verificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import { ProjectTeamAuthorization } from "./ProjectTeamAuthorization.ts";
+import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
 import * as Layer from "effect/Layer";
 import { ProjectWorkVerificationRequest } from "./ProjectWorkVerificationRequest.ts";
@@ -52,10 +56,13 @@ import {
   ProjectWorkVerificationGateError,
 } from "./ProjectWorkVerificationGate.ts";
 import { managedActorId } from "./ProjectTeamAuthorization.ts";
+import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts";
+import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import type {
   PiModelRequestReservation,
   PiModelRequestSettlement,
 } from "../provider/pi/PiModelBroker.ts";
+import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 
 const encodeRetainedEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeVerificationIntent = Schema.decodeUnknownEffect(ProjectTeamWriteIntent);
@@ -71,10 +78,13 @@ const makeFixture = (
   verified = false,
   memoryAccess: "none" | "project" | "shared" = "none",
   messageAddresses = false,
+  subscription = false,
 ) =>
   Effect.gen(function* () {
     const repository = yield* ProjectWorkRepository;
     const sql = yield* SqlClient.SqlClient;
+    const fs = subscription ? yield* FileSystem.FileSystem : undefined;
+    const dispatchWorktree = fs ? yield* fs.makeTempDirectoryScoped() : "/workspace-assigned";
     let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
     // The real fixture commits approvals and the execution grant; intercept only its final claim.
     const parentVerification = verified ? yield* verificationFixture : undefined;
@@ -198,7 +208,13 @@ const makeFixture = (
                 return repository.execute({
                   ...command,
                   records: command.records.map((record) =>
-                    record.kind === "role-revision" ? { ...record, memoryAccess } : record,
+                    record.kind === "role-revision"
+                      ? {
+                          ...record,
+                          memoryAccess,
+                          ...(subscription ? { model: "gpt-6-luna" } : {}),
+                        }
+                      : record,
                   ),
                 });
               if (
@@ -214,7 +230,24 @@ const makeFixture = (
                 command.type === "project-work.foundation.commit" &&
                 command.transition?.kind === "claim"
               ) {
-                pending = command;
+                pending =
+                  subscription && command.transition?.kind === "claim"
+                    ? {
+                        ...command,
+                        transition: {
+                          ...command.transition,
+                          binding: {
+                            ...command.transition.binding,
+                            model: "gpt-6-luna",
+                            configuration: {
+                              ...command.transition.binding.configuration,
+                              maxTokens: 64_000,
+                              maxDurationMs: 300_000,
+                            },
+                          },
+                        },
+                      }
+                    : command;
                 return Effect.fail(
                   new ProjectWorkPolicyError(
                     "invalid-state",
@@ -405,9 +438,9 @@ const makeFixture = (
             modelCalls: 2,
             delegationDepth: 2,
             repairAllowance: 2,
-            model: "test",
-            tokenLimit: 2000,
-            durationLimitMs: 2000,
+            model: subscription ? "gpt-6-luna" : "test",
+            tokenLimit: subscription ? 64_000 : 2000,
+            durationLimitMs: subscription ? 300_000 : 2000,
           },
         ],
       }),
@@ -421,7 +454,7 @@ const makeFixture = (
         binding: {
           ...pending.transition.binding,
           branch: "refs/heads/assigned",
-          worktree: "/workspace-assigned",
+          worktree: dispatchWorktree,
         },
       },
     };
@@ -434,7 +467,7 @@ const makeFixture = (
         generation: 0,
         primaryRoot: "/workspace",
         commonGitDirectory: "/workspace/.git",
-        worktreePath: "/workspace-assigned",
+        worktreePath: dispatchWorktree,
         branchRef: "refs/heads/assigned",
         baseRef: "refs/heads/main",
         baseOid: "a".repeat(40),
@@ -1513,9 +1546,18 @@ it.effect("retained context preserves nested producer decorations and distinct t
   ),
 );
 
-const makeBudgetFixture = (writableWorkers = 1) =>
+const makeBudgetFixture = (writableWorkers = 1, subscription = false) =>
   Effect.gen(function* () {
-    const f = yield* makeFixture("implementer", writableWorkers);
+    if (subscription) yield* TestClock.setTime(Date.parse(at) + 1);
+    const f = yield* makeFixture(
+      "implementer",
+      writableWorkers,
+      undefined,
+      false,
+      "none",
+      false,
+      subscription,
+    );
     const claim = f.snapshot.intent.compiledClaim.transition;
     if (claim?.kind !== "claim") return yield* Effect.die("Fixture claim missing");
     const binding = { ...claim.binding, status: "running" as const, revision: 1 };
@@ -1528,34 +1570,117 @@ const makeBudgetFixture = (writableWorkers = 1) =>
       threadId: binding.threadId,
     };
     const principal = { actor: { kind: "agent" as const, id: managedActorId(managed) }, managed };
+    const piRuntime = subscription
+      ? yield* Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const nativeStateRoot = yield* fs.makeTempDirectoryScoped();
+          const protectedRoot = yield* fs.makeTempDirectoryScoped();
+          const allocation = yield* preallocatePiManagedProcess({
+            workspaceRoot: f.request.git.worktreePath,
+            workspaceAccess: "readwrite",
+            nativeStateRoot,
+            protectedRoots: [protectedRoot],
+            runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+            argv: ["/bin/true"],
+            memoryBytes: 33_554_432,
+            runtimeSeconds: 10,
+          });
+          const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+          const identity = {
+            providerInstanceId: binding.providerInstanceId,
+            threadId: binding.threadId,
+          };
+          const operation = yield* operations.prepare(
+            identity,
+            { threadId: binding.threadId, kind: "initialize" },
+            "subscription-usage-reader",
+            { allocation, workerId: "worker", operationId: "initialize" },
+          );
+          const owner = {
+            type: "owner" as const,
+            unit: allocation.unit,
+            nonce: allocation.nonce,
+            invocation: "a".repeat(32),
+            cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+            pid: 123,
+            memoryBytes: allocation.policy.memoryBytes,
+            swapBytes: 0 as const,
+            oomGroup: 1 as const,
+          };
+          const native = {
+            sessionId: binding.sessionId ?? "subscription-native",
+            sessionReference: "sessions/subscription-native.jsonl",
+            leafId: "subscription-leaf",
+            persisted: true,
+          };
+          const drain = {
+            unit: owner.unit,
+            invocation: owner.invocation,
+            cgroup: owner.cgroup,
+            ownerPid: owner.pid,
+            memoryBytes: owner.memoryBytes,
+            swapBytes: 0 as const,
+            oomGroup: 1 as const,
+            launcherPid: 124,
+            childPid: 125,
+            childExitCode: 0,
+            kernel: "populated 0\nfrozen 0",
+          };
+          yield* operations.persistence(operation).claimActivation(allocation);
+          yield* operations.persistence(operation).beforeStart(owner);
+          yield* operations.persistNative(operation, native);
+          return { allocation, operations, operation, native, drain };
+        })
+      : undefined;
     const accounting = yield* Accounting.make({
       environmentId: "environment",
-      routeId: "configured",
-      model: "test",
-      acceptedReportedModels: ["test"],
-      resolveOperation: (_authority, reservation) =>
-        Effect.succeed({
-          workerId: reservation.workerId,
-          operationId: reservation.operationId,
-          rootTaskId: f.snapshot.intent.limits.rootTaskId,
-          maximumTokens: f.snapshot.intent.limits.maximumTokens,
-          deadlineAtMs: f.snapshot.intent.limits.rootDeadlineAtMs,
-          operationMaximumTokens: f.snapshot.intent.limits.attemptMaximumTokens,
-          operationDeadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
-        }),
+      routeId: subscription ? "openai-subscription-luna" : "configured",
+      model: subscription ? "gpt-6-luna" : "test",
+      acceptedReportedModels: [subscription ? "gpt-6-luna" : "test"],
+      ...(subscription
+        ? {
+            subscriptionTest: {
+              projectId,
+              rootTaskId: f.snapshot.intent.limits.rootTaskId,
+              model: "gpt-6-luna" as const,
+              maximumTokens: 64_000 as const,
+              maximumDurationMs: 300_000 as const,
+            },
+          }
+        : {}),
+      resolveOperation:
+        piRuntime === undefined
+          ? (_authority, reservation) =>
+              Effect.succeed({
+                workerId: reservation.workerId,
+                operationId: reservation.operationId,
+                rootTaskId: f.snapshot.intent.limits.rootTaskId,
+                maximumTokens: f.snapshot.intent.limits.maximumTokens,
+                deadlineAtMs: f.snapshot.intent.limits.rootDeadlineAtMs,
+                operationMaximumTokens: f.snapshot.intent.limits.attemptMaximumTokens,
+                operationDeadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
+              })
+          : (authority, reservation) =>
+              piRuntime.operations.resolveOperation(authority, reservation),
     });
     const reservation = (requestId: number): PiModelRequestReservation => ({
-      workerId: "worker",
+      workerId: piRuntime?.operation.workerId ?? "worker",
       generation: binding.generation,
-      operationId: "assignment",
+      operationId: piRuntime?.operation.operation.operationId ?? "assignment",
       requestId,
-      routeId: "configured",
-      provider: "command-code",
-      model: "test",
-      maxInputTokens: 100,
-      maxOutputTokens: 100,
+      routeId: subscription ? "openai-subscription-luna" : "configured",
+      provider: subscription ? "openai-codex" : "command-code",
+      model: subscription ? "gpt-6-luna" : "test",
+      maxInputTokens: subscription ? 16_384 : 100,
+      maxOutputTokens: subscription ? 2_048 : 100,
       callCount: 1,
-      deadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
+      deadlineAtMs: piRuntime?.operation.deadlineAtMs ?? f.snapshot.intent.limits.deadlineAtMs,
+      ...(subscription
+        ? {
+            accountingMode: "openai-subscription-monitored" as const,
+            unknownMaximumTokens: 64_000 as const,
+          }
+        : {}),
     });
     const reserve = (id: number) => accounting.reserve(principal, reservation(id));
     const settle = (
@@ -1569,18 +1694,58 @@ const makeBudgetFixture = (writableWorkers = 1) =>
         reservationId,
         transportDrained: drained,
         outcome,
-        chargedInputTokens: outcome === "reported" ? 10 : 100,
-        chargedOutputTokens: outcome === "reported" ? 20 : 100,
+        chargedInputTokens:
+          outcome === "reported" ? (subscription ? 16_384 : 10) : subscription ? 16_384 : 100,
+        chargedOutputTokens:
+          outcome === "reported" ? (subscription ? 64_000 : 20) : subscription ? 64_000 : 100,
         ...(outcome === "reported"
           ? {
-              reportedModel: "test",
-              reportedUsage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+              reportedModel: subscription ? "gpt-6-luna" : "test",
+              reportedUsage: subscription
+                ? { prompt_tokens: 16_384, completion_tokens: 64_000, total_tokens: 80_384 }
+                : { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
             }
           : {}),
       };
-      return accounting.settle(value);
+      return Effect.gen(function* () {
+        const receipt = yield* accounting.settle(value);
+        if (piRuntime) {
+          const terminal: PiSessionTerminal = {
+            identity: {
+              workerId: piRuntime.operation.workerId,
+              generation: binding.generation,
+            },
+            operation: piRuntime.operation.operation,
+            outcome: outcome === "reported" ? "success" : "failed",
+            ownerCaptured: true,
+            native: piRuntime.native,
+            drain: piRuntime.drain,
+            accountingReceipts:
+              outcome === "reported"
+                ? [
+                    {
+                      requestId: id,
+                      routeId: "openai-subscription-luna",
+                      provider: "openai-codex",
+                      model: "gpt-6-luna",
+                      reportedModel: "gpt-6-luna",
+                      usage: {
+                        prompt_tokens: 16_384,
+                        completion_tokens: 64_000,
+                        total_tokens: 80_384,
+                      },
+                      reservationId,
+                      accountingReceiptId: receipt.accountingReceiptId,
+                    },
+                  ]
+                : [],
+          };
+          yield* piRuntime.operations.persistTerminal(piRuntime.operation, terminal);
+        }
+        return receipt;
+      });
     };
-    return { ...f, reserve, settle, reservation, accounting };
+    return { ...f, reserve, settle, reservation, accounting, principal, piRuntime };
   });
 
 const budgetFixture = makeBudgetFixture();
@@ -1934,6 +2099,32 @@ it.effect(
           attemptUsedTokens: 430,
           outstandingRequests: 2,
         });
+        const recordedModes =
+          yield* f.sql`SELECT accounting_mode,unknown_maximum_tokens,status,capacity_state
+          FROM project_team_model_request`;
+        expect(recordedModes).toHaveLength(3);
+        expect(recordedModes).toEqual(
+          expect.arrayContaining([
+            {
+              accounting_mode: "hard",
+              unknown_maximum_tokens: null,
+              status: "reported",
+              capacity_state: "released",
+            },
+            {
+              accounting_mode: "hard",
+              unknown_maximum_tokens: null,
+              status: "unknown",
+              capacity_state: "quarantine",
+            },
+            {
+              accounting_mode: "hard",
+              unknown_maximum_tokens: null,
+              status: "held",
+              capacity_state: "held",
+            },
+          ]),
+        );
         const fresh = yield* makeProjectTeamContext({
           environmentId: "environment",
           maximumEnvironmentModelCalls: 4,
@@ -1944,6 +2135,339 @@ it.effect(
         expect(result.required.frozenLimits.attemptMaximumTokens).toBe(1000);
       }),
     ),
+);
+
+it.effect(
+  "keeps quarantined subscription usage visible in required context above its threshold",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* makeBudgetFixture(1, true);
+        const reserved = yield* f.reserve(1);
+        yield* f.settle(reserved.reservationId, 1, "unknown");
+        const context = yield* f.reader.readRequired(f.snapshot);
+        expect(context.required.remaining).toMatchObject({
+          rootUsedTokens: 80_384,
+          rootRemainingTokens: 0,
+          attemptUsedTokens: 80_384,
+          outstandingRequests: 1,
+          policy: {
+            accountingMode: "openai-subscription-monitored",
+            thresholdTokens: 64_000,
+            stoppedReason: "unknown-usage",
+            observedChargedTokens: 80_384,
+            nominalHeldTokens: 0,
+          },
+        });
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Missing subscription usage claim");
+        const accounting = yield* f.sql
+          .withTransaction(
+            readProjectTeamBindingAccountingInTransaction(f.sql, projectId, [
+              {
+                recordId: claim.binding.recordId,
+                taskId: claim.taskId,
+                attemptId: claim.binding.attemptId,
+                generation: claim.binding.generation,
+              },
+            ]),
+          )
+          .pipe(
+            Effect.provideService(ServerEnvironmentIdentity, {
+              getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+            }),
+          );
+        expect(accounting).toEqual([
+          expect.objectContaining({
+            availability: "available",
+            root: expect.objectContaining({
+              chargedTokens: 80_384,
+              reservedTokens: 0,
+              unknownChargedTokens: 80_384,
+              remainingTokens: 0,
+              quarantinedCalls: 1,
+              policy: {
+                accountingMode: "openai-subscription-monitored",
+                thresholdTokens: 64_000,
+                stoppedReason: "unknown-usage",
+                observedChargedTokens: 80_384,
+                nominalHeldTokens: 0,
+              },
+            }),
+            attempt: expect.objectContaining({
+              chargedTokens: 80_384,
+              remainingTokens: 0,
+              policy: expect.objectContaining({
+                accountingMode: "openai-subscription-monitored",
+                thresholdTokens: 64_000,
+                stoppedReason: "unknown-usage",
+              }),
+            }),
+            operation: expect.objectContaining({
+              operationId: "initialize",
+              workerId: "worker",
+              chargedTokens: 80_384,
+              remainingTokens: 0,
+              quarantinedCalls: 1,
+              policy: expect.objectContaining({
+                accountingMode: "openai-subscription-monitored",
+                thresholdTokens: 64_000,
+                stoppedReason: "unknown-usage",
+              }),
+            }),
+          }),
+        ]);
+        expect(
+          yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens,
+            accounting_mode,unknown_maximum_tokens FROM project_team_model_request`,
+        ).toEqual([
+          {
+            status: "unknown",
+            capacity_state: "quarantine",
+            charged_input_tokens: 16_384,
+            charged_output_tokens: 64_000,
+            accounting_mode: "openai-subscription-monitored",
+            unknown_maximum_tokens: 64_000,
+          },
+        ]);
+      }),
+    ),
+);
+
+it.effect("preserves monitored threshold headroom while a nominal request is held", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeBudgetFixture(1, true);
+      yield* f.reserve(1);
+      const context = yield* f.reader.readRequired(f.snapshot);
+      expect(context.required.remaining).toMatchObject({
+        rootUsedTokens: 18_432,
+        rootRemainingTokens: 64_000,
+        outstandingRequests: 1,
+        policy: {
+          accountingMode: "openai-subscription-monitored",
+          observedChargedTokens: 0,
+          nominalHeldTokens: 18_432,
+        },
+      });
+
+      const claim = f.snapshot.intent.compiledClaim.transition;
+      if (claim?.kind !== "claim") return yield* Effect.die("Missing subscription usage claim");
+      const accounting = yield* f.sql
+        .withTransaction(
+          readProjectTeamBindingAccountingInTransaction(f.sql, projectId, [
+            {
+              recordId: claim.binding.recordId,
+              taskId: claim.taskId,
+              attemptId: claim.binding.attemptId,
+              generation: claim.binding.generation,
+            },
+          ]),
+        )
+        .pipe(
+          Effect.provideService(ServerEnvironmentIdentity, {
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+          }),
+        );
+      expect(accounting).toMatchObject([
+        {
+          availability: "available",
+          root: {
+            chargedTokens: 0,
+            reservedTokens: 18_432,
+            remainingTokens: 64_000,
+            policy: {
+              accountingMode: "openai-subscription-monitored",
+              observedChargedTokens: 0,
+              nominalHeldTokens: 18_432,
+            },
+          },
+        },
+      ]);
+    }),
+  ),
+);
+
+it.effect("retains successful subscription output overshoot in required context", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeBudgetFixture(1, true);
+      const reserved = yield* f.reserve(1);
+      yield* f.settle(reserved.reservationId, 1, "reported");
+      const context = yield* f.reader.readRequired(f.snapshot);
+      expect(context.required.remaining).toMatchObject({
+        rootUsedTokens: 80_384,
+        rootRemainingTokens: 0,
+        attemptUsedTokens: 80_384,
+        policy: {
+          accountingMode: "openai-subscription-monitored",
+          thresholdTokens: 64_000,
+          stoppedReason: "threshold-reached",
+          observedChargedTokens: 80_384,
+          nominalHeldTokens: 0,
+        },
+      });
+      const claim = f.snapshot.intent.compiledClaim.transition;
+      if (claim?.kind !== "claim") return yield* Effect.die("Missing subscription usage claim");
+      const accounting = yield* f.sql
+        .withTransaction(
+          readProjectTeamBindingAccountingInTransaction(f.sql, projectId, [
+            {
+              recordId: claim.binding.recordId,
+              taskId: claim.taskId,
+              attemptId: claim.binding.attemptId,
+              generation: claim.binding.generation,
+            },
+          ]),
+        )
+        .pipe(
+          Effect.provideService(ServerEnvironmentIdentity, {
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+          }),
+        );
+      expect(accounting).toEqual([
+        expect.objectContaining({
+          availability: "available",
+          root: expect.objectContaining({
+            chargedTokens: 80_384,
+            remainingTokens: 0,
+            policy: {
+              accountingMode: "openai-subscription-monitored",
+              thresholdTokens: 64_000,
+              stoppedReason: "threshold-reached",
+              observedChargedTokens: 80_384,
+              nominalHeldTokens: 0,
+            },
+          }),
+          attempt: expect.objectContaining({
+            chargedTokens: 80_384,
+            remainingTokens: 0,
+            policy: expect.objectContaining({
+              accountingMode: "openai-subscription-monitored",
+              thresholdTokens: 64_000,
+              stoppedReason: "threshold-reached",
+            }),
+          }),
+          operation: expect.objectContaining({
+            operationId: "initialize",
+            workerId: "worker",
+            chargedTokens: 80_384,
+            remainingTokens: 0,
+            policy: expect.objectContaining({
+              accountingMode: "openai-subscription-monitored",
+              thresholdTokens: 64_000,
+              stoppedReason: "threshold-reached",
+            }),
+          }),
+        }),
+      ]);
+    }),
+  ),
+);
+
+it.effect("rejects mixed accounting modes under an authenticated subscription operation", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeBudgetFixture(1, true);
+      if (!f.piRuntime) return yield* Effect.die("Missing retained Pi operation");
+      const monitored = f.reservation(1);
+      const monitoredReservation = yield* f.accounting.reserve(f.principal, monitored);
+      const hardAccounting = yield* Accounting.make({
+        environmentId: "environment",
+        routeId: "test-hard-mode",
+        model: "gpt-6-luna",
+        acceptedReportedModels: ["gpt-6-luna"],
+        resolveOperation: f.piRuntime.operations.resolveOperation,
+      });
+      const hard: PiModelRequestReservation = {
+        workerId: f.piRuntime.operation.workerId,
+        generation: f.piRuntime.operation.authority.binding.generation,
+        operationId: f.piRuntime.operation.operation.operationId,
+        requestId: 2,
+        routeId: "test-hard-mode",
+        provider: "command-code",
+        model: "gpt-6-luna",
+        maxInputTokens: 100,
+        maxOutputTokens: 100,
+        callCount: 1,
+        deadlineAtMs: f.piRuntime.operation.deadlineAtMs,
+      };
+      const hardReservation = yield* hardAccounting.reserve(f.principal, hard);
+      yield* hardAccounting.settle({
+        ...hard,
+        reservationId: hardReservation.reservationId,
+        outcome: "unknown",
+        transportDrained: true,
+        chargedInputTokens: 100,
+        chargedOutputTokens: 100,
+      });
+      yield* f.accounting.settle({
+        ...monitored,
+        reservationId: monitoredReservation.reservationId,
+        outcome: "unknown",
+        transportDrained: true,
+        chargedInputTokens: 16_384,
+        chargedOutputTokens: 64_000,
+      });
+
+      const claim = f.snapshot.intent.compiledClaim.transition;
+      if (claim?.kind !== "claim") return yield* Effect.die("Missing subscription usage claim");
+      const accounting = yield* f.sql
+        .withTransaction(
+          readProjectTeamBindingAccountingInTransaction(f.sql, projectId, [
+            {
+              recordId: claim.binding.recordId,
+              taskId: claim.taskId,
+              attemptId: claim.binding.attemptId,
+              generation: claim.binding.generation,
+            },
+          ]),
+        )
+        .pipe(
+          Effect.provideService(ServerEnvironmentIdentity, {
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+          }),
+        );
+      expect(accounting).toMatchObject([{ availability: "unavailable", reason: "ledger-invalid" }]);
+    }),
+  ),
+);
+
+it.effect("does not accept a subscription grant owned by another environment", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* makeBudgetFixture(1, true);
+      const reservation = yield* f.reserve(1);
+      yield* f.settle(reservation.reservationId, 1, "unknown");
+      const retainedGrant = yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`;
+      expect(
+        (yield* f.sql`UPDATE project_team_pi_subscription_grant
+        SET environment_id='foreign-environment' WHERE environment_id='environment'
+        AND project_id=${projectId}`.pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`).toEqual(retainedGrant);
+
+      const claim = f.snapshot.intent.compiledClaim.transition;
+      if (claim?.kind !== "claim") return yield* Effect.die("Missing subscription usage claim");
+      const accounting = yield* f.sql
+        .withTransaction(
+          readProjectTeamBindingAccountingInTransaction(f.sql, projectId, [
+            {
+              recordId: claim.binding.recordId,
+              taskId: claim.taskId,
+              attemptId: claim.binding.attemptId,
+              generation: claim.binding.generation,
+            },
+          ]),
+        )
+        .pipe(
+          Effect.provideService(ServerEnvironmentIdentity, {
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("foreign-environment")),
+          }),
+        );
+      expect(accounting).toMatchObject([{ availability: "unavailable", reason: "owner-invalid" }]);
+    }),
+  ),
 );
 
 for (const corruption of [

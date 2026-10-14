@@ -9,6 +9,7 @@ import {
   makePiWorkerSettings,
   makePiSdkWorker,
   splitPiWorkerText,
+  streamPiWorkerSubscription,
 } from "./PiWorker.ts";
 import {
   PI_WORKER_MAX_REQUEST_BYTES,
@@ -38,7 +39,7 @@ const decodeDiagnosticEntry = Schema.decodeSync(
 const decodeDiagnosticContent = Schema.decodeUnknownSync(
   Schema.Array(Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })),
 );
-
+const zstdCompressor = () => process.getBuiltinModule("node:zlib")?.zstdCompressSync;
 describe("Pinned Pi worker effective settings", () => {
   it("retains exact initial context as SDK provenance without duplicating the conversation", async () => {
     const fs = process.getBuiltinModule("fs").promises;
@@ -530,6 +531,114 @@ describe("Pinned Pi worker effective settings", () => {
 });
 
 describe("Pi worker parent model stream", () => {
+  it("produces the frozen subscription High and Standard request through the intercepted SDK", async () => {
+    const frames: PiWorkerFrame["message"][] = [];
+    const message = {
+      type: "message",
+      id: "synthetic-message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "Done", annotations: [] }],
+    };
+    const events = [
+      {
+        type: "response.created",
+        response: { id: "synthetic-response", model: "gpt-6-luna", status: "in_progress" },
+      },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { ...message, status: "in_progress", content: [] },
+      },
+      {
+        type: "response.content_part.added",
+        output_index: 0,
+        content_index: 0,
+        item_id: message.id,
+        part: { type: "output_text", text: "", annotations: [] },
+      },
+      {
+        type: "response.output_text.delta",
+        output_index: 0,
+        content_index: 0,
+        item_id: message.id,
+        delta: "Done",
+      },
+      { type: "response.output_item.done", output_index: 0, item: message },
+      {
+        type: "response.completed",
+        response: {
+          id: "synthetic-response",
+          model: "gpt-6-luna",
+          status: "completed",
+          output: [message],
+          usage: { input_tokens: 8, output_tokens: 1, total_tokens: 9 },
+        },
+      },
+    ]
+      .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+      .join("");
+    const bridge = makePiWorkerModelBridge({
+      api: "openai-codex-responses",
+      lifecycleId: () => 1,
+      emit: async (frame) => {
+        frames.push(frame);
+        if (frame.type === "request") {
+          bridge.accept({ type: "headers", requestId: frame.requestId, status: 200 }, 0);
+          bridge.accept(
+            {
+              type: "chunk",
+              requestId: frame.requestId,
+              data: Buffer.from(events).toString("base64"),
+            },
+            1,
+          );
+        } else if (frame.type === "ack") {
+          bridge.accept({ type: "end", requestId: frame.requestId }, 2);
+        }
+      },
+    });
+    const token = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "synthetic-only" } })).toString("base64url")}.`;
+    const result = await streamPiWorkerSubscription(
+      {
+        api: "openai-codex-responses",
+        id: "gpt-6-luna",
+        provider: "openai-codex",
+        name: "Synthetic",
+        baseUrl: "https://t3-worker.invalid/codex",
+        reasoning: true,
+        input: ["text"],
+        contextWindow: 272_000,
+        maxTokens: 2_048,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+      normalizeContext({
+        systemPrompt: "Exact approved assignment",
+        messages: [{ role: "user", content: "Investigate", timestamp: 0 }],
+      }),
+      {
+        apiKey: token,
+        fetch: bridge.fetch,
+        reasoning: "low",
+        transport: "auto",
+        maxRetries: 3,
+      },
+    ).result();
+    await bridge.drain();
+    expect(result.stopReason).toBe("stop");
+    expect(result.usage.totalTokens).toBe(9);
+    const requests = frames.filter((frame) => frame.type === "request");
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    if (request?.type !== "request") throw Error("Missing intercepted SDK request");
+    expect(JSON.parse(request.body)).toMatchObject({
+      model: "gpt-6-luna",
+      reasoning: { effort: "high" },
+      service_tier: "default",
+    });
+    expect(request.body).not.toContain(token);
+    expect(request.body).not.toContain("synthetic-only");
+  });
   const sdkControlContext = () => {
     const path = process.env.PI_WORKER_BODY_DIAGNOSTIC_SESSION;
     if (!path) return "x".repeat(6500);
@@ -847,6 +956,160 @@ describe("Pi worker parent model stream", () => {
     expect(frames).toContainEqual({ type: "ack", requestId: 1, chunkSequence: 1 });
     bridge.accept({ type: "end", requestId: 1 }, 2);
     await bridge.drain();
+  });
+
+  it("brokers the configured Codex Responses endpoint and decoded JSON body without headers", async () => {
+    const frames: PiWorkerFrame["message"][] = [];
+    const bridge = makePiWorkerModelBridge({
+      api: "openai-codex-responses",
+      emit: async (message) => {
+        frames.push(message);
+        if (message.type === "request") {
+          bridge.accept({ type: "headers", requestId: message.requestId, status: 200 }, 0);
+          bridge.accept({ type: "end", requestId: message.requestId }, 1);
+        }
+      },
+      lifecycleId: () => 4,
+    });
+    const body = JSON.stringify({ model: "gpt-6-luna", input: [{ role: "user", content: "hi" }] });
+    const response = await bridge.fetch("https://t3-worker.invalid/codex/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer synthetic-only",
+        "chatgpt-account-id": "synthetic-account-only",
+        "openai-beta": "responses=experimental",
+      },
+      body,
+    });
+    await response.body?.cancel();
+    await bridge.drain();
+
+    expect(frames).toEqual([{ type: "request", requestId: 1, lifecycleId: 4, body }]);
+    const request = frames[0];
+    if (request?.type !== "request") throw Error("Expected the bridged subscription request");
+    expect(JSON.parse(request.body)).toEqual({
+      model: "gpt-6-luna",
+      input: [{ role: "user", content: "hi" }],
+    });
+  });
+
+  it.skipIf(!zstdCompressor())(
+    "decompresses a bounded zstd Codex request before crossing the parent bridge",
+    async () => {
+      const frames: PiWorkerFrame["message"][] = [];
+      const bridge = makePiWorkerModelBridge({
+        api: "openai-codex-responses",
+        emit: async (message) => {
+          frames.push(message);
+          if (message.type === "request") {
+            bridge.accept({ type: "headers", requestId: message.requestId, status: 200 }, 0);
+            bridge.accept({ type: "end", requestId: message.requestId }, 1);
+          }
+        },
+        lifecycleId: () => 5,
+      });
+      const body = JSON.stringify({
+        model: "gpt-6-luna",
+        input: [{ role: "user", content: "compressed" }],
+      });
+      const compressed = zstdCompressor()?.(Buffer.from(body));
+      if (!compressed) throw Error("zstd compressor is unavailable");
+      const response = await bridge.fetch("https://t3-worker.invalid/codex/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "zstd",
+        },
+        body: compressed,
+      });
+      await response.body?.cancel();
+      await bridge.drain();
+      expect(frames).toEqual([{ type: "request", requestId: 1, lifecycleId: 5, body }]);
+    },
+  );
+
+  it.each([
+    ["Completions endpoint", "https://t3-worker.invalid/v1/chat/completions"],
+    ["external endpoint", "https://example.com/codex/responses"],
+    ["query-bearing endpoint", "https://t3-worker.invalid/codex/responses?alternate=1"],
+    ["noncanonical endpoint", "https://t3-worker.invalid/codex/responses/"],
+  ])("rejects the %s before emitting a parent request", async (_case, url) => {
+    const frames: PiWorkerFrame["message"][] = [];
+    const bridge = makePiWorkerModelBridge({
+      api: "openai-codex-responses",
+      emit: async (message) => {
+        frames.push(message);
+      },
+      lifecycleId: () => 1,
+    });
+    await expect(
+      bridge.fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    ).rejects.toThrow("INVALID_MODEL_REQUEST");
+    expect(frames).toEqual([]);
+  });
+
+  it.each([
+    ["unsupported method", { method: "GET", headers: { "content-type": "application/json" } }],
+    ["wrong content type", { method: "POST", headers: { "content-type": "text/plain" } }],
+    [
+      "wrong encoding",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "content-encoding": "gzip" },
+      },
+    ],
+  ])("rejects a Codex request with %s before emitting it", async (_case, init) => {
+    const frames: PiWorkerFrame["message"][] = [];
+    const bridge = makePiWorkerModelBridge({
+      api: "openai-codex-responses",
+      emit: async (message) => {
+        frames.push(message);
+      },
+      lifecycleId: () => 1,
+    });
+    await expect(
+      bridge.fetch("https://t3-worker.invalid/codex/responses", { ...init, body: "{}" }),
+    ).rejects.toThrow("INVALID_MODEL_REQUEST");
+    expect(frames).toEqual([]);
+  });
+
+  it("rejects oversized compressed and uncompressed Codex request bodies before emitting", async () => {
+    const frames: PiWorkerFrame["message"][] = [];
+    const bridge = makePiWorkerModelBridge({
+      api: "openai-codex-responses",
+      emit: async (message) => {
+        frames.push(message);
+      },
+      lifecycleId: () => 1,
+    });
+    const url = "https://t3-worker.invalid/codex/responses";
+    await expect(
+      bridge.fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "x".repeat(PI_WORKER_MAX_REQUEST_BYTES + 1),
+      }),
+    ).rejects.toThrow("INVALID_MODEL_REQUEST");
+    const compress = zstdCompressor();
+    if (compress) {
+      const expanded = Buffer.from("x".repeat(PI_WORKER_MAX_REQUEST_BYTES + 1));
+      await expect(
+        bridge.fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "content-encoding": "zstd",
+          },
+          body: compress(expanded),
+        }),
+      ).rejects.toThrow("INVALID_MODEL_REQUEST");
+    }
+    expect(frames).toEqual([]);
   });
 
   it("rejects an external URL before emitting a parent request", async () => {
