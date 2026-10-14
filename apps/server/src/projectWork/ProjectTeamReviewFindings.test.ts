@@ -60,9 +60,11 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import {
   canonicalProjectWorkPayload,
+  CommandId,
   ProjectId,
   EventId,
   EnvironmentId,
+  ProviderInstanceId,
   AuthOrchestrationOperateScope,
   AuthSessionId,
   type GitRunStackedActionInput,
@@ -70,7 +72,6 @@ import {
   type OrchestrationProjectShell,
   GitCommandError,
   ProjectTeamReviewFindingIntent,
-  ProjectTeamReviewFinding,
   ProjectTeamReviewFindingProvenance,
   ProjectTeamRecord,
   ProjectTeamGate,
@@ -88,6 +89,7 @@ import {
   ProjectWorkRelationship,
   ProjectWorkTaskId,
   ProjectTeamIntegrationSourceRef,
+  type ProjectTeamConfigurationIntent,
 } from "@t3tools/contracts";
 import {
   scoped,
@@ -97,6 +99,7 @@ import {
   at,
   restoreHistoricalBinding,
   gatewayRuntime,
+  createManagedAssignment,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
 import {
   makeProjectTeamReviewCompletionProposals,
@@ -160,7 +163,10 @@ import { makeProjectTeamCompletedReviewReader } from "./ProjectTeamReviewComplet
 import { makeProjectTeamReviewTargets } from "./ProjectTeamReviewTargets.ts";
 import { makeProjectTeamReviewFreshness } from "./ProjectTeamReviewFreshness.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
+import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { runMigrations } from "../persistence/Migrations.ts";
 import { makeProjectWorkArtifacts } from "./ProjectWorkArtifacts.ts";
+import { PROJECT_TASK_MEMORY_BYTES } from "./ProjectTaskResources.ts";
 import { ProjectWorkProjection, ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import { executePiProjectWorkBridgeTool } from "../provider/pi/PiProjectWorkTools.ts";
@@ -176,14 +182,14 @@ import {
   ProjectWorkVerificationExecutionError,
   ProjectWorkVerificationExecutionIntent,
 } from "./ProjectWorkVerificationExecutionJournal.ts";
+import {
+  prepareProjectTeamConfiguredAdmission,
+  type ProjectTeamConfiguredAdmissionFacts,
+} from "./ProjectTeamConfiguredAdmission.ts";
 
 const canonical = canonicalProjectWorkPayload;
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 const strict = { onExcessProperty: "error" } as const;
-const decodeStoredResolutionFinding = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(ProjectTeamReviewFinding),
-  strict,
-);
 const decodeIntent = Schema.decodeUnknownSync(ProjectTeamReviewFindingIntent, strict);
 const decodeCommit = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand, strict);
 const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord, strict);
@@ -546,19 +552,18 @@ const establishControlledReviewRoot = (
 // Actual disposable execution storage with controlled custody; no process or Git probe runs.
 const retainControlledVerification = (
   f: Effect.Success<typeof verificationFixture>,
-  outcome: "success" | "failed",
+  outcome: "success" | "failed" | "timed-out" | "canceled",
 ) =>
   Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(at) + 1);
     const current = yield* readCurrentState(f.sql, projectId);
     const gate = current.foundationRecords?.find(
       (r) => r.kind === "gate" && r.verificationJobId === f.selection.jobId,
     );
     if (gate?.kind !== "gate") return yield* Effect.die("Missing approved verification gate");
     const job = f.prepared.manifest;
-    const nonce =
-      job.jobId === "verification-1"
-        ? "22222222-2222-4222-8222-222222222222"
-        : "33333333-3333-4333-8333-333333333333";
+    const allocationDigest = digest(canonical({ dispatchId: job.dispatchId, jobId: job.jobId }));
+    const nonce = `${allocationDigest.slice(0, 8)}-${allocationDigest.slice(8, 12)}-4${allocationDigest.slice(13, 16)}-8${allocationDigest.slice(17, 20)}-${allocationDigest.slice(20, 32)}`;
     const memoryBytes = 536870912;
     const runtimeSeconds = Math.ceil(job.command.limits.maxDurationMs / 1000);
     const allocation = {
@@ -580,6 +585,56 @@ const retainControlledVerification = (
         runtimeSeconds,
       },
     };
+    const dispatchJournal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    const originalDispatch = yield* dispatchJournal.readRetained(job.dispatchId);
+    const originalClaim = originalDispatch.intent.compiledClaim.transition;
+    const sourceBinding = originalClaim?.kind === "claim" ? originalClaim.binding : undefined;
+    const authorityTuple = {
+      manifest: {
+        dispatchId: job.dispatchId,
+        projectId: job.projectId,
+        taskId: job.taskId,
+        bindingId: job.bindingId,
+        generation: job.generation,
+      },
+      retained: {
+        dispatchId: originalDispatch.intent.request.dispatchId,
+        projectId: originalDispatch.intent.request.claim.projectId,
+        taskId: sourceBinding?.taskId ?? null,
+        bindingId: sourceBinding?.recordId ?? null,
+        generation: sourceBinding?.generation ?? null,
+      },
+    };
+    if (
+      originalClaim?.kind !== "claim" ||
+      originalDispatch.intent.request.claim.projectId !== job.projectId ||
+      originalClaim.binding.taskId !== job.taskId ||
+      originalClaim.binding.recordId !== job.bindingId ||
+      originalClaim.binding.generation !== job.generation
+    )
+      return yield* Effect.die(
+        `Verification fixture lost its original dispatch authority: ${canonical(authorityTuple)}`,
+      );
+    // The controlled fixture retains the budget from the exact settled dispatch. Verification
+    // cannot create or renew this root allocation itself.
+    yield* f.sql`INSERT OR IGNORE INTO project_task_resource_budget VALUES(
+      ${job.environmentId},${job.projectId},${originalDispatch.intent.limits.rootTaskId},
+      ${originalDispatch.intent.limits.rootDeadlineAtMs},${PROJECT_TASK_MEMORY_BYTES})`;
+    const retainedBudget = yield* f.sql<{
+      deadline_at_ms: number;
+      memory_bytes: number;
+    }>`SELECT deadline_at_ms,memory_bytes FROM project_task_resource_budget
+      WHERE environment_id=${job.environmentId} AND project_id=${job.projectId}
+      AND task_id=${originalDispatch.intent.limits.rootTaskId} LIMIT 2`;
+    expect(retainedBudget).toEqual([
+      {
+        deadline_at_ms: originalDispatch.intent.limits.rootDeadlineAtMs,
+        memory_bytes: PROJECT_TASK_MEMORY_BYTES,
+      },
+    ]);
     const journal = yield* makeProjectWorkVerificationExecutionJournal({
       environmentId: "environment",
       assertCurrent: (intent, state, phase, attemptId) =>
@@ -717,25 +772,201 @@ const retainControlledVerification = (
       finishedAtMs: yield* Clock.currentTimeMillis,
     });
   });
+const configuredReviewModel = "inclusionai/ling-3.1-flash:free";
+const configuredReviewProvider = ProviderInstanceId.make("pi");
+const configuredReviewRoles = [
+  "coordinator",
+  "investigator",
+  "planner",
+  "implementer",
+  "reviewer",
+  "integrator",
+] as const;
+const configuredReviewConfiguration: ProjectTeamConfigurationIntent = {
+  type: "project-team.configure",
+  commandId: CommandId.make("configured-review-configure"),
+  projectId,
+  expectedRevision: 0,
+  expectedConfigurationGeneration: 0,
+  enabled: true,
+  providerInstanceId: configuredReviewProvider,
+  projectPriority: 1,
+  taskPriorities: [],
+  profiles: configuredReviewRoles.map((role) => ({
+    role,
+    instructions: `Instructions for ${role}`,
+    skills: [],
+    tools:
+      role === "implementer" || role === "integrator"
+        ? ["pi.read", "pi.write", "project-work.report"]
+        : ["pi.read", "project-work.report"],
+    model: configuredReviewModel,
+    memoryAccess: "project",
+    delegationDepth: 2,
+  })),
+  modelPolicies: [
+    { model: configuredReviewModel, tokenLimit: 8192, durationLimitMs: 60_000, modelCalls: 2 },
+  ],
+};
+const configuredReviewGit: ProjectTeamConfiguredAdmissionFacts["git"] = {
+  primaryRoot: "/workspace",
+  commonGitDirectory: "/workspace/.git",
+  worktreePath: "/assigned-worktree",
+  branchRef: "refs/heads/assigned",
+  baseRef: "refs/heads/main",
+  baseOid: "a".repeat(40),
+  policyHash: "b".repeat(64),
+  writable: true,
+};
+const configuredReviewFacts = (
+  rootAnchor: ProjectTeamConfiguredAdmissionFacts["rootAnchor"],
+  git: ProjectTeamConfiguredAdmissionFacts["git"] = configuredReviewGit,
+): ProjectTeamConfiguredAdmissionFacts => ({
+  environmentId: EnvironmentId.make("environment"),
+  provider: {
+    instanceId: configuredReviewProvider,
+    driverKind: "piAgent",
+    enabled: true,
+    runtimeVersion: "0.99.1",
+    maxInputTokens: 1024,
+    maxOutputTokens: 512,
+    catalogue: {
+      source: "https://api.commandcode.ai/provider/v1/models",
+      fetchedAt: at,
+      selectedEntry: {
+        id: configuredReviewModel,
+        owned_by: "command-code",
+        context_length: 262144,
+        supported_endpoints: ["/chat/completions"],
+      },
+    },
+  },
+  supportedToolIds: ["pi.read", "pi.write", "project-work.report"],
+  ownedSkillIds: [],
+  git,
+  rootAnchor,
+});
+const makeConfiguredReviewSourceFixture = (suffix: string) =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const gateway = yield* ProjectWorkGateway;
+    const repository = yield* ProjectWorkRepository;
+    const taskId = ProjectWorkTaskId.make("parent");
+    const nowMs = Date.parse(at) + 1;
+    yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${projectId},'Project','/workspace','[]',${at},${at})`;
+    yield* gateway.write(
+      configuredReviewConfiguration,
+      { kind: "human", id: "human" },
+      { kind: "web", id: "web" },
+      { actor: { kind: "human", id: "human" } },
+    );
+    yield* repository.execute({
+      type: "project-work.task.create",
+      projectId,
+      taskId,
+      commandId: CommandId.make("configured-review-create-parent"),
+      title: "Implement the approved task",
+      createdAt: at,
+    });
+    let state = yield* readCurrentState(sql, projectId);
+    const role = state.foundationRecords?.find(
+      (record) => record.kind === "role-revision" && record.role === "implementer",
+    );
+    const member = state.foundationRecords?.find(
+      (record) => record.kind === "member" && record.roleRevisionId === role?.recordId,
+    );
+    if (role?.kind !== "role-revision" || member?.kind !== "member")
+      return yield* Effect.die("Missing configured implementation member");
+    const uncommitted = yield* createManagedAssignment({
+      taskId,
+      recordId: "configured-review-uncommitted",
+      attemptId: "configured-review-uncommitted-attempt",
+      commandId: "configured-review-uncommitted-claim",
+      providerInstanceId: configuredReviewProvider,
+      threadId: ThreadId.make("configured-review-thread"),
+      role,
+      memberId: member.recordId,
+      status: "reserved",
+      configuration: {
+        instructionsHash: "configured-review-fixture",
+        toolIds: role.tools,
+        skillIds: [],
+        runtimeVersion: "0.99.1",
+        maxTokens: 8192,
+        maxDurationMs: 60_000,
+        paidFallback: false,
+      },
+    }).pipe(
+      Effect.provideService(ProjectWorkRepository, {
+        ...repository,
+        execute: (command) =>
+          command.type === "project-work.foundation.commit" && command.transition?.kind === "claim"
+            ? Effect.fail(new ProjectWorkPolicyError("invalid-state", "Retain the approved grant"))
+            : repository.execute(command),
+      }),
+      Effect.result,
+    );
+    expect(uncommitted._tag).toBe("Failure");
+    state = yield* readCurrentState(sql, projectId);
+    yield* TestClock.setTime(nowMs);
+    const prepared = prepareProjectTeamConfiguredAdmission({
+      state,
+      taskId,
+      nowMs,
+      facts: configuredReviewFacts({ _tag: "NewRoot" }),
+    });
+    if (prepared._tag !== "Prepared") return yield* Effect.die(prepared.reason);
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+      verifyStage: () => Effect.void,
+      verifySettlement: () => Effect.void,
+    });
+    const reserved = yield* journal.reserve(prepared.request);
+    const claimed = yield* journal.claimEffect(reserved.fence);
+    yield* journal.settleAfterJoined(claimed.fence, {
+      receiptId: "configured-review-root-settlement",
+      stage: "settled",
+      evidence: { controlledDrain: true },
+    });
+    return yield* makeVerificationFixture("implementer", suffix);
+  });
 const makeFindingFixture = (
   coherentCustody = false,
-  verificationOutcome?: "success" | "failed",
+  verificationOutcome?: "success" | "failed" | "timed-out" | "canceled",
   existing?: Effect.Success<typeof verificationFixture> & {
     readonly reviewRootBindingId: string | undefined;
   },
   suffix = "",
+  configuredAdmissionSource = false,
 ) =>
   Effect.gen(function* () {
-    const initial = existing ?? (yield* verificationFixture);
+    const initial =
+      existing ??
+      (configuredAdmissionSource
+        ? yield* Effect.serviceOption(ProjectWorkGateway).pipe(
+            Effect.flatMap((gateway) =>
+              Option.match(gateway, {
+                onNone: () => Effect.die("Configured review source requires its existing gateway"),
+                onSome: (existingGateway) =>
+                  makeConfiguredReviewSourceFixture(suffix).pipe(
+                    Effect.provideService(ProjectWorkGateway, existingGateway),
+                  ),
+              }),
+            ),
+          )
+        : yield* verificationFixture);
     const key = (id: string) => id + suffix;
     const f =
       existing ??
       (coherentCustody
         ? yield* establishControlledReviewRoot(initial)
         : { ...initial, reviewRootBindingId: undefined });
-    const controlledWorkspace = coherentCustody
-      ? yield* (yield* FileSystem.FileSystem).makeTempDirectoryScoped()
-      : undefined;
+    const controlledWorkspace =
+      coherentCustody || configuredAdmissionSource
+        ? yield* (yield* FileSystem.FileSystem).makeTempDirectoryScoped()
+        : undefined;
     const { sql, repository } = f;
     const auth = yield* ProjectTeamAuthorization;
     const state = () => readCurrentState(sql, projectId);
@@ -882,6 +1113,7 @@ const makeFindingFixture = (
         ...member,
         recordId: key("review-member"),
         roleRevisionId: key("review-role"),
+        coordinator: false,
       }),
     ]);
     current = yield* state();
@@ -1019,6 +1251,18 @@ const makeFindingFixture = (
       assignment: "Review the original target",
     });
     const snapshot = yield* journal.claimEffect(reservation.fence);
+    const compiledClaim = snapshot.intent.compiledClaim.transition;
+    if (compiledClaim?.kind !== "claim")
+      return yield* Effect.die("Missing compiled reviewer claim binding");
+    expect(compiledClaim.binding.recordId).toBe(binding.recordId);
+    expect(compiledClaim.binding.generation).toBe(binding.generation);
+    expect(compiledClaim.binding.configuration.maxTokens).toBe(
+      snapshot.intent.limits.attemptMaximumTokens,
+    );
+    expect(compiledClaim.binding.configuration.maxDurationMs).toBe(
+      snapshot.intent.limits.deadlineAtMs - (Date.parse(at) + 1),
+    );
+    expect(Date.parse(compiledClaim.claim.leasedUntil)).toBe(snapshot.intent.limits.deadlineAtMs);
     const targets = yield* makeProjectTeamReviewTargets({
       environmentId: "environment",
       maximumEnvironmentModelCalls: 4,
@@ -1069,7 +1313,7 @@ const makeFindingFixture = (
     };
     const nativeIntent = {
       request,
-      binding,
+      binding: compiledClaim.binding,
       role: reviewRole,
       allocation,
       resourceHash: "a".repeat(64),
@@ -1133,11 +1377,11 @@ const makeFindingFixture = (
       assertCurrent: Effect.void,
     });
     const running = decodeRecord({
-      ...binding,
+      ...compiledClaim.binding,
       status: "running",
       sessionId: native.sessionId,
       revision: 1,
-      ...(coherentCustody ? { updatedAt: DateTime.formatIso(yield* DateTime.now) } : {}),
+      updatedAt: DateTime.formatIso(yield* DateTime.now),
     });
     if (running.kind !== "run-binding") return yield* Effect.die("Invalid running binding");
     yield* restoreHistoricalBinding(running);
@@ -1563,68 +1807,60 @@ it.effect("actual report route denies inherited/foreign compilation and raw reco
   ),
 );
 
-it.effect(
-  "failed owning COMMIT cannot expose a finding or successful receipt before connection cleanup; exact retry works",
-  () =>
-    scopedGateway(
-      Effect.gen(function* () {
-        const f = yield* fixture;
-        const gateway = yield* ProjectWorkGateway;
-        const query = yield* ProjectWorkQuery;
-        const intent = yield* f.report();
-        const before = yield* f.state();
-        yield* f.sql`CREATE TABLE controlled_findings_parent (id TEXT PRIMARY KEY)`;
-        yield* f.sql`CREATE TABLE controlled_findings_child (id TEXT REFERENCES controlled_findings_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
-        yield* f.sql`CREATE TRIGGER controlled_findings_commit_failure AFTER INSERT ON project_team_review_finding BEGIN INSERT INTO controlled_findings_child VALUES ('missing'); END`;
-        let escaped = false;
-        expect(
-          (yield* reportTool(f, intent).pipe(
-            Effect.tap(() =>
-              Effect.sync(() => {
-                escaped = true;
-              }),
-            ),
-            Effect.exit,
-          ))._tag,
-        ).toBe("Failure");
-        expect(escaped).toBe(false);
-        expect(yield* f.sql`SELECT COUNT(*) AS count FROM controlled_findings_child`).toEqual([
-          { count: 1 },
-        ]);
-        expect(
-          (yield* query
-            .listFoundationRecords({ projectId, kinds: ["review-finding"] })
-            .pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        expect(
-          (yield* gateway
-            .read({ projectId, operation: "foundation-records", recordKinds: ["review-finding"] })
-            .pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        // Disposable test connection only; production callers never manually clean a foreign loan.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
-        expect(yield* f.state()).toEqual(before);
-        expect(
-          yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
-        ).toEqual([{ count: 0 }]);
-        yield* f.sql`DROP TRIGGER controlled_findings_commit_failure`;
-        yield* reportTool(f, intent);
-        expect(
-          decodePage(
-            yield* gateway.read({
-              projectId,
-              operation: "foundation-records",
-              recordKinds: ["review-finding"],
+it.effect("failed owning COMMIT leaves no finding or successful receipt; exact retry works", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const gateway = yield* ProjectWorkGateway;
+      const query = yield* ProjectWorkQuery;
+      const intent = yield* f.report();
+      const before = yield* f.state();
+      const beforeSnapshot = yield* query.snapshot(projectId);
+      yield* f.sql`CREATE TABLE controlled_findings_parent (id TEXT PRIMARY KEY)`;
+      yield* f.sql`CREATE TABLE controlled_findings_child (id TEXT REFERENCES controlled_findings_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      yield* f.sql`CREATE TRIGGER controlled_findings_commit_failure AFTER INSERT ON project_team_review_finding BEGIN INSERT INTO controlled_findings_child VALUES ('missing'); END`;
+      let escaped = false;
+      expect(
+        (yield* reportTool(f, intent).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              escaped = true;
             }),
-          ).items,
-        ).toHaveLength(1);
-      }),
-    ),
+          ),
+          Effect.exit,
+        ))._tag,
+      ).toBe("Failure");
+      expect(escaped).toBe(false);
+      expect(yield* f.sql`SELECT COUNT(*) AS count FROM controlled_findings_child`).toEqual([
+        { count: 0 },
+      ]);
+      expect(yield* query.snapshot(projectId)).toEqual(beforeSnapshot);
+      expect(
+        decodePage(
+          yield* gateway.read({
+            projectId,
+            operation: "foundation-records",
+            recordKinds: ["review-finding"],
+          }),
+        ).items,
+      ).toHaveLength(0);
+      expect(yield* f.state()).toEqual(before);
+      expect(
+        yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
+      ).toEqual([{ count: 0 }]);
+      yield* f.sql`DROP TRIGGER controlled_findings_commit_failure`;
+      yield* reportTool(f, intent);
+      expect(
+        decodePage(
+          yield* gateway.read({
+            projectId,
+            operation: "foundation-records",
+            recordKinds: ["review-finding"],
+          }),
+        ).items,
+      ).toHaveLength(1);
+    }),
+  ),
 );
 
 it.effect(
@@ -1792,12 +2028,21 @@ it.effect("stable finding identity rejects reuse against a replaced original tar
 const decodeCompletionReport = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, strict);
 const makeProposalFixture = (
   coherentCustody = false,
-  verificationOutcome?: "success" | "failed",
+  verificationOutcome?: "success" | "failed" | "timed-out" | "canceled",
   existing?: Effect.Success<ReturnType<typeof makeFindingFixture>>,
   suffix = "",
+  configuredAdmissionSource = false,
 ) =>
   Effect.gen(function* () {
-    const f = existing ?? (yield* makeFindingFixture(coherentCustody, verificationOutcome));
+    const f =
+      existing ??
+      (yield* makeFindingFixture(
+        coherentCustody,
+        verificationOutcome,
+        undefined,
+        suffix,
+        configuredAdmissionSource,
+      ));
     const key = (value: string) => value + suffix;
     const current = yield* f.state();
     const task = current.tasks.find((t) => t.taskId === f.running.taskId)!;
@@ -1861,21 +2106,22 @@ const makeProposalFixture = (
     VALUES (${key("review-assignment")},'environment',${projectId},${f.running.recordId},0,${f.running.providerInstanceId},${f.running.threadId},${key("review-assignment-worker")},1,'prompt',${digest(canonical(request))},
     ${root.recordId},${root.taskId},${operationLimits.maximumTokens},${operationLimits.deadlineAtMs},'running',${canonical(intent)})`;
     // Synthetic retained custody only; no process is started by this fixture.
-    const allocation = coherentCustody
-      ? yield* preallocatePiManagedProcess({
-          workspaceRoot: f.running.worktree,
-          workspaceAccess: "readonly",
-          nativeStateRoot: f.allocation.launch.nativeState!.path,
-          protectedRoots: f.allocation.launch.protectedRoots,
-          runtimeFiles: f.allocation.launch.runtimeFiles.map((file) => ({
-            source: file.source,
-            target: file.target,
-          })),
-          argv: f.allocation.launch.argv,
-          memoryBytes: f.allocation.policy.memoryBytes,
-          runtimeSeconds: f.allocation.policy.runtimeSeconds,
-        })
-      : { ...f.allocation, unit: f.allocation.unit + "-assignment" };
+    const allocation =
+      coherentCustody || configuredAdmissionSource
+        ? yield* preallocatePiManagedProcess({
+            workspaceRoot: f.running.worktree,
+            workspaceAccess: "readonly",
+            nativeStateRoot: f.allocation.launch.nativeState!.path,
+            protectedRoots: f.allocation.launch.protectedRoots,
+            runtimeFiles: f.allocation.launch.runtimeFiles.map((file) => ({
+              source: file.source,
+              target: file.target,
+            })),
+            argv: f.allocation.launch.argv,
+            memoryBytes: f.allocation.policy.memoryBytes,
+            runtimeSeconds: f.allocation.policy.runtimeSeconds,
+          })
+        : { ...f.allocation, unit: f.allocation.unit + "-assignment" };
     const assignmentOwner = {
       ...f.owner,
       unit: allocation.unit,
@@ -1945,6 +2191,7 @@ const makeProposalFixture = (
       assignmentAllocation: allocation,
       assignmentOwner,
       operationLimits,
+      receiptRootBindingId: root.recordId,
     };
   });
 const proposalFixture = makeProposalFixture();
@@ -2045,7 +2292,7 @@ const makeConsumedReviewFixture = (
     readonly parentAssessment?: boolean | "empty";
     readonly withoutCurrentTarget?: boolean;
     readonly assessmentVerdict?: "met" | "not-met";
-    readonly verificationOutcome?: "success" | "failed";
+    readonly verificationOutcome?: "success" | "failed" | "timed-out" | "canceled";
     readonly suffix?: string;
   } = {},
   existing?: Effect.Success<ReturnType<typeof makeProposalFixture>>,
@@ -2184,6 +2431,32 @@ const makeConsumedReviewFixture = (
       deadlineAtMs: prompt.deadlineAtMs,
     };
     const reservation = yield* accounting.reserve(f.principal, fields);
+    const limits = f.proposalSnapshot.intent.limits;
+    const persistedRoot = yield* f.sql<{
+      root_binding_id: string;
+      root_task_id: string;
+    }>`SELECT root_binding_id,root_task_id FROM project_team_pi_operation WHERE operation_id=${f.operation.operationId} LIMIT 2`;
+    const operationRootProof = yield* f.sql.withTransaction(
+      operations.resolveOperation(authority, fields),
+    );
+    if (
+      persistedRoot.length !== 1 ||
+      persistedRoot[0]?.root_binding_id !== f.receiptRootBindingId ||
+      persistedRoot[0]?.root_task_id !== limits.rootTaskId ||
+      operationRootProof.rootTaskId !== limits.rootTaskId
+    )
+      return yield* Effect.die(
+        `PiOperations.resolveOperation did not retain the original human root before receipt read: ${canonical(
+          {
+            rowCount: persistedRoot.length,
+            rowRootBindingId: persistedRoot[0]?.root_binding_id ?? null,
+            retainedRootBindingId: f.receiptRootBindingId,
+            rowRootTaskId: persistedRoot[0]?.root_task_id ?? null,
+            proofRootTaskId: operationRootProof.rootTaskId,
+            expectedRootTaskId: limits.rootTaskId,
+          },
+        )}`,
+      );
     // Controlled broker-input custody, not an HTTP/model request.
     yield* mailbox.bindRequestInput({
       operationId: f.operation.operationId,
@@ -2248,7 +2521,32 @@ const makeConsumedReviewFixture = (
       environmentId: "environment",
       maximumEnvironmentModelCalls: 128,
     });
-    const originalReceipt = yield* sessions.readAssignment(f.proposalSnapshot);
+    const receiptClaim = f.proposalSnapshot.intent.compiledClaim.transition;
+    if (receiptClaim?.kind !== "claim")
+      return yield* Effect.die("Missing reviewer claim before session receipt read");
+    const originalReceipt = yield* sessions.readAssignment(f.proposalSnapshot).pipe(
+      Effect.tapError((error) =>
+        Effect.die(
+          new Error(
+            `Actual session receipt reader rejected the operation accepted by Pi accounting: ${canonical(
+              {
+                receiptError: { code: error.code, reason: error.reason },
+                operationRootTaskId: operationRootProof.rootTaskId,
+                reviewerBindingId: receiptClaim.binding.recordId,
+                reviewerParentRunId: receiptClaim.binding.parentRunId ?? null,
+                rootTaskId: limits.rootTaskId,
+                constructedRootBindingId: f.receiptRootBindingId,
+                producerAcceptedRoot: {
+                  rowBindingId: persistedRoot[0]?.root_binding_id ?? null,
+                  rowTaskId: persistedRoot[0]?.root_task_id ?? null,
+                  rootTaskId: operationRootProof.rootTaskId,
+                },
+              },
+            )}`,
+          ),
+        ),
+      ),
+    );
     if (!originalReceipt) return yield* Effect.die("Missing full original assignment receipt");
     const job = f.target.prepared.manifest;
     const implementationBinding = (yield* f.state()).foundationRecords?.find(
@@ -2418,6 +2716,7 @@ const makeConsumedReviewFixture = (
       prepare,
       joined,
       originalReceipt,
+      sessions,
       prompt,
       reservation,
       referenceId,
@@ -2425,6 +2724,99 @@ const makeConsumedReviewFixture = (
     };
   });
 const consumedReviewFixture = makeConsumedReviewFixture();
+
+it.effect("reads a completed human-approved child receipt against its retained original root", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const proposal = yield* makeProposalFixture(
+        false,
+        "failed",
+        undefined,
+        "-receipt-root",
+        true,
+      );
+      const f = yield* makeConsumedReviewFixture(
+        {
+          parentAssessment: true,
+          verificationOutcome: "failed",
+        },
+        proposal,
+      );
+      const state = yield* f.state();
+      expect(
+        state.tasks.find((task) => task.taskId === f.proposalSnapshot.intent.limits.rootTaskId)
+          ?.state,
+      ).toBe("ready");
+      expect(yield* f.sessions.readAssignment(f.proposalSnapshot)).toEqual(f.originalReceipt);
+      const rows = yield* f.sql<{
+        root_binding_id: string;
+        root_task_id: string;
+      }>`SELECT root_binding_id,root_task_id FROM project_team_pi_operation WHERE operation_id=${f.operation.operationId} LIMIT 2`;
+      expect(rows).toEqual([
+        {
+          root_binding_id: f.receiptRootBindingId,
+          root_task_id: f.proposalSnapshot.intent.limits.rootTaskId,
+        },
+      ]);
+    }),
+  ),
+);
+
+it.effect("denies a completed child receipt when its operation names a foreign root binding", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const proposal = yield* makeProposalFixture(
+        false,
+        "failed",
+        undefined,
+        "-receipt-root",
+        true,
+      );
+      const f = yield* makeConsumedReviewFixture({ verificationOutcome: "failed" }, proposal);
+      yield* f.sql`UPDATE project_team_pi_operation SET root_binding_id='foreign-retained-root' WHERE operation_id=${f.operation.operationId}`;
+      expect((yield* f.sessions.readAssignment(f.proposalSnapshot).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+    }),
+  ),
+);
+
+it.effect("denies a completed child receipt after its original root grant is invalidated", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const proposal = yield* makeProposalFixture(
+        false,
+        "failed",
+        undefined,
+        "-receipt-root",
+        true,
+      );
+      const f = yield* makeConsumedReviewFixture({ verificationOutcome: "failed" }, proposal);
+      const state = yield* f.state();
+      const root = state.foundationRecords?.find(
+        (record) => record.kind === "run-binding" && record.recordId === f.receiptRootBindingId,
+      );
+      if (root?.kind !== "run-binding") return yield* Effect.die("Missing original retained root");
+      const rootGate = state.foundationRecords?.find(
+        (record) => record.kind === "gate" && record.recordId === root.authorizationGateId,
+      );
+      if (rootGate?.kind !== "gate") return yield* Effect.die("Missing original root grant");
+      yield* restoreHistoricalBinding({
+        ...rootGate,
+        status: "invalidated",
+        revision: rootGate.revision + 1,
+      });
+      expect(
+        (yield* f.state()).foundationRecords?.find(
+          (record) => record.kind === "gate" && record.recordId === rootGate.recordId,
+        ),
+      ).toMatchObject({ status: "invalidated", revision: rootGate.revision + 1 });
+      expect((yield* f.sessions.readAssignment(f.proposalSnapshot).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+    }),
+  ),
+);
 
 it.effect(
   "a historical completed review reader authenticates accepted joined review without a new target loan",
@@ -2842,13 +3234,15 @@ for (const corrupt of ["raw-output", "permission-receipt", "enqueue-events"] as 
   );
 }
 it.effect(
-  "a human publication failed owning COMMIT exposes no permission and exact retry keeps one pending request",
+  "a human publication failed owning COMMIT leaves no permission and exact retry keeps one pending request",
   () =>
     scopedGateway(
       Effect.gen(function* () {
         const { f, input, target, permission, authorization, publication } =
           yield* makeHumanPublicationFixture();
         const before = yield* f.repository.replay(projectId);
+        const query = yield* ProjectWorkQuery;
+        const beforeSnapshot = yield* query.snapshot(projectId);
         yield* f.sql`CREATE TABLE controlled_publication_parent (id TEXT PRIMARY KEY)`;
         yield* f.sql`CREATE TABLE controlled_publication_child (id TEXT REFERENCES controlled_publication_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER controlled_publication_commit_failure AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'publication-permission:%' BEGIN INSERT INTO controlled_publication_child VALUES ('missing'); END`;
@@ -2866,21 +3260,14 @@ it.effect(
             ))._tag,
         ).toBe("Failure");
         expect(escaped).toBe(false);
+        expect(yield* f.sql`SELECT COUNT(*) AS count FROM controlled_publication_child`).toEqual([
+          { count: 0 },
+        ]);
         const physical = yield* f.sql<{
           payload: string;
         }>`SELECT json_extract(payload_json,'$.payload.summary') AS payload FROM project_team_effect WHERE json_extract(payload_json,'$.effectKind')='publication' LIMIT 2`;
-        expect(physical).toHaveLength(1);
-        const request = yield* decodeControlledPublicationRequest(physical[0]!.payload);
-        expect(
-          (yield* authorization.assertCurrent(request, "dispatch").pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        // Disposal of this controlled failed physical transaction only; production never rolls back a foreign loan.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
+        expect(physical).toHaveLength(0);
+        expect(yield* query.snapshot(projectId)).toEqual(beforeSnapshot);
         expect(yield* f.repository.replay(projectId)).toEqual(before);
         yield* f.sql`DROP TRIGGER controlled_publication_commit_failure`;
         const retained = yield* publication.enqueuePrepared(
@@ -3699,6 +4086,9 @@ it.effect("an integration selection cannot escape its failed owning COMMIT", () 
       const ref = yield* completeIntegrationSourceReview(f);
       const integration = yield* integrationSelectionTask(f);
       const service = yield* makeProjectTeamIntegrationSources({ environmentId: "environment" });
+      const before = yield* f.state();
+      const query = yield* ProjectWorkQuery;
+      const beforeSnapshot = yield* query.snapshot(projectId);
       yield* f.sql`CREATE TABLE controlled_sources_parent(id TEXT PRIMARY KEY)`;
       yield* f.sql`CREATE TABLE controlled_sources_child(id TEXT REFERENCES controlled_sources_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
       let escaped = false;
@@ -3723,13 +4113,11 @@ it.effect("an integration selection cannot escape its failed owning COMMIT", () 
         );
       expect((yield* effect)._tag).toBe("Failure");
       expect(escaped).toBe(false);
-      // Dispose this test's failed physical transaction; production does not roll back another owner.
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          const connection = yield* f.sql.reserve;
-          yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-        }),
-      );
+      expect(yield* f.sql`SELECT COUNT(*) AS count FROM controlled_sources_child`).toEqual([
+        { count: 0 },
+      ]);
+      expect(yield* query.snapshot(projectId)).toEqual(beforeSnapshot);
+      expect(yield* f.state()).toEqual(before);
       const selected = yield* f.sql.withTransaction(
         service.compileInTransaction({
           projectId,
@@ -4722,21 +5110,903 @@ for (const verificationOutcome of [undefined, "success"] as const) {
   );
 }
 it.effect(
-  "completed assessment qualification retains a negative review of failed verification",
+  "a qualified negative review atomically records one bounded semantic repair episode for its original implementation target",
   () =>
-    scoped(
+    scopedGateway(
       Effect.gen(function* () {
-        const f = yield* makeConsumedReviewFixture({
-          parentAssessment: true,
-          assessmentVerdict: "not-met",
-          verificationOutcome: "failed",
-        });
+        const proposal = yield* makeProposalFixture(
+          false,
+          "failed",
+          undefined,
+          "-semantic-negative",
+          true,
+        );
+        const f = yield* makeConsumedReviewFixture(
+          {
+            parentAssessment: true,
+            assessmentVerdict: "not-met",
+            verificationOutcome: "failed",
+          },
+          proposal,
+        );
+        if (f.completionReport.type !== "project-team.assignment.report")
+          return yield* Effect.die("Completed reviewer report required");
         const before = yield* f.state();
+        expect(before.tasks.find((task) => task.taskId === f.selection.taskId)?.state).toBe(
+          "ready",
+        );
+        const originalJournal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+        });
+        const original = yield* originalJournal.readRetained(f.target.prepared.manifest.dispatchId);
+        yield* originalJournal.readStageReceipts(original.fence.dispatchId);
+        expect(original.fence.stage).toBe("settled");
+        expect(original.intent.compiledClaim.transition).toMatchObject({
+          kind: "claim",
+          binding: {
+            projectId: f.selection.projectId,
+            taskId: f.selection.taskId,
+            recordId: f.target.prepared.manifest.bindingId,
+            generation: f.target.prepared.manifest.generation,
+          },
+        });
+        const transition = original.intent.compiledClaim.transition;
+        if (transition?.kind !== "claim")
+          return yield* Effect.die("Original implementation claim required");
+        const configuredLimit = before.foundationRecords
+          ?.filter((record) => record.kind === "limits")
+          .find((record) => record.status === "configured");
+        const reviewedCriterionIds = (f.completionReport.criterionAssessments ?? [])
+          .map((assessment) => assessment.criterionId)
+          .sort();
+        const expectedFingerprint = digest(
+          canonical({
+            rootTaskId: original.intent.limits.rootTaskId,
+            taskId: f.selection.taskId,
+            semanticCause: "failed-verification",
+            criterionIds: reviewedCriterionIds,
+          }),
+        );
+        const expectedRelevantRevision = digest(
+          canonical({
+            scopeHash: transition.binding.scopeHash,
+            testedTree: f.target.prepared.manifest.target.testedTree,
+          }),
+        );
         expect((yield* f.prepare())?.status).toBe("completed");
         expect(yield* f.state()).toEqual(before);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        const after = yield* f.state();
+        const episodes = after.foundationRecords?.filter(
+          (record) =>
+            record.kind === "repair-episode" &&
+            (record.rootTaskId ?? record.taskId) === original.intent.limits.rootTaskId,
+        );
+        expect(episodes).toHaveLength(1);
+        expect(episodes?.[0]).toMatchObject({
+          taskId: f.selection.taskId,
+          rootTaskId: original.intent.limits.rootTaskId,
+          failureFingerprint: expectedFingerprint,
+          relevantRevision: expectedRelevantRevision,
+          allowance: Math.min(
+            original.intent.limits.repairAllowance,
+            original.intent.rootCaps.repairAllowance,
+            configuredLimit?.repairAllowance ?? 0,
+          ),
+          semanticRepairs: 0,
+          pendingSemanticRepair: true,
+          status: "active",
+        });
+        expect(after.tasks.find((task) => task.taskId === f.selection.taskId)).toEqual(
+          before.tasks.find((task) => task.taskId === f.selection.taskId),
+        );
+        expect(
+          after.criteria.filter((criterion) => criterion.taskId === f.selection.taskId),
+        ).toEqual(before.criteria.filter((criterion) => criterion.taskId === f.selection.taskId));
+        expect(after.blockers).toEqual(before.blockers);
+        expect(
+          (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)))
+            .duplicate,
+        ).toBe(true);
+        expect(yield* f.state()).toEqual(after);
       }),
     ),
 );
+it.effect(
+  "a qualified review episode flows through configured admission and debits its original root grant once",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const proposal = yield* makeProposalFixture(
+          false,
+          "failed",
+          undefined,
+          "-integrated-admission",
+          true,
+        );
+        const f = yield* makeConsumedReviewFixture(
+          {
+            parentAssessment: true,
+            assessmentVerdict: "not-met",
+            verificationOutcome: "failed",
+          },
+          proposal,
+        );
+        if (f.completionReport.type !== "project-team.assignment.report")
+          return yield* Effect.die("Completed reviewer report required");
+        const originalJournal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+        });
+        const original = yield* originalJournal.readRetained(f.target.prepared.manifest.dispatchId);
+        const originalClaim = original.intent.compiledClaim.transition;
+        if (originalClaim?.kind !== "claim")
+          return yield* Effect.die("Original implementation claim required");
+        expect(original.fence.stage).toBe("settled");
+        expect(originalClaim.binding.model).toBe(configuredReviewModel);
+        expect(
+          (yield* f.state()).tasks.find((task) => task.taskId === f.selection.taskId)?.state,
+        ).toBe("ready");
+        const qualifiedReview = yield* f.prepare();
+        expect(qualifiedReview?.status).toBe("completed");
+        if (qualifiedReview?.status === "completed")
+          expect(qualifiedReview.parentAssessments?.semanticRepair).toMatchObject({
+            action: "repair",
+            rootTaskId: original.intent.limits.rootTaskId,
+            taskId: f.selection.taskId,
+          });
+
+        const reviewerJournal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(reviewerJournal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        const afterReview = yield* f.state();
+        const episodes = afterReview.foundationRecords?.filter(
+          (record) =>
+            record.kind === "repair-episode" &&
+            (record.rootTaskId ?? record.taskId) === original.intent.limits.rootTaskId,
+        );
+        expect(episodes).toHaveLength(1);
+        const episode = episodes?.[0];
+        if (episode?.kind !== "repair-episode")
+          return yield* Effect.die(
+            "Qualified reviewer settlement did not create its repair episode",
+          );
+        expect(episode).toMatchObject({
+          taskId: f.selection.taskId,
+          rootTaskId: original.intent.limits.rootTaskId,
+          pendingSemanticRepair: true,
+          semanticRepairs: 0,
+          status: "active",
+        });
+
+        const originalGit = original.intent.request.git;
+        const repairFacts = configuredReviewFacts(
+          {
+            _tag: "RetainedRoot",
+            budget: {
+              rootTaskId: original.intent.limits.rootTaskId,
+              maximumTokens: original.intent.limits.maximumTokens,
+              deadlineAtMs: original.intent.limits.rootDeadlineAtMs,
+            },
+            caps: original.intent.rootCaps,
+          },
+          {
+            primaryRoot: originalGit.primaryRoot,
+            commonGitDirectory: originalGit.commonGitDirectory,
+            worktreePath: originalGit.worktreePath,
+            branchRef: originalGit.branchRef,
+            baseRef: originalGit.baseRef,
+            baseOid: originalGit.baseOid,
+            policyHash: originalGit.policyHash,
+            writable: true,
+          },
+        );
+        const repairJournal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+        });
+        const prepared = prepareProjectTeamConfiguredAdmission({
+          state: afterReview,
+          taskId: f.selection.taskId,
+          nowMs: Date.parse(at) + 10,
+          facts: repairFacts,
+        });
+        if (prepared._tag !== "Prepared") return yield* Effect.die(prepared.reason);
+        expect(prepared.request.claim.transition).toMatchObject({
+          kind: "claim",
+          repair: { episodeId: episode.recordId },
+        });
+
+        const repairClaim = prepared.request.claim.transition;
+        if (repairClaim?.kind !== "claim" || repairClaim.repair?.episodeId !== episode.recordId)
+          return yield* Effect.die("Prepared repair claim lost its canonical episode");
+        const mismatchedGrantRequest = {
+          ...prepared.request,
+          claim: {
+            ...prepared.request.claim,
+            transition: {
+              ...repairClaim,
+              binding: {
+                ...repairClaim.binding,
+                authorizationGateId: projectTeamDerivedRecordId(
+                  prepared.request.claim.commandId,
+                  "foreign-repair-inherited-grant",
+                ),
+              },
+            },
+          },
+        };
+        expect(
+          (yield* repairJournal.reserve(mismatchedGrantRequest).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(afterReview);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_dispatch WHERE dispatch_id=${prepared.request.dispatchId}`,
+        ).toEqual([]);
+        const foreignGrantRequest = {
+          ...prepared.request,
+          claim: {
+            ...prepared.request.claim,
+            transition: {
+              ...repairClaim,
+              authorizationGateId: projectTeamDerivedRecordId(
+                prepared.request.claim.commandId,
+                "foreign-repair-grant",
+              ),
+            },
+          },
+        };
+        expect((yield* repairJournal.reserve(foreignGrantRequest).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(afterReview);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_dispatch WHERE dispatch_id=${prepared.request.dispatchId}`,
+        ).toEqual([]);
+
+        const rejected = yield* repairJournal
+          .reserve({
+            ...prepared.request,
+            claim: {
+              ...prepared.request.claim,
+              expectedRevision: prepared.request.claim.expectedRevision + 1,
+            },
+          })
+          .pipe(Effect.result);
+        expect(rejected._tag).toBe("Failure");
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(afterReview);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_dispatch WHERE dispatch_id=${prepared.request.dispatchId}`,
+        ).toEqual([]);
+        const repairDispatch = yield* repairJournal.reserve(prepared.request);
+        expect(repairDispatch.intent.limits).toMatchObject({
+          maximumTokens: original.intent.limits.maximumTokens,
+          rootDeadlineAtMs: original.intent.limits.rootDeadlineAtMs,
+          repairAllowance: original.intent.limits.repairAllowance,
+        });
+        expect(repairDispatch.intent.rootCaps).toEqual(original.intent.rootCaps);
+        const afterDebit = yield* readCurrentState(f.sql, projectId);
+        const expectedRepairGrantId = projectTeamDerivedRecordId(
+          repairDispatch.intent.compiledClaim.commandId,
+          `repair-grant:${episode.recordId}:${repairClaim.binding.generation}`,
+        );
+        const repairBindings = afterDebit.foundationRecords?.filter(
+          (record) =>
+            record.kind === "run-binding" && record.recordId === repairClaim.binding.recordId,
+        );
+        const repairGrants = afterDebit.foundationRecords?.filter(
+          (record) => record.kind === "gate" && record.recordId === expectedRepairGrantId,
+        );
+        expect(repairBindings).toHaveLength(1);
+        expect(repairBindings?.[0]).toMatchObject({
+          authorizationGateId: expectedRepairGrantId,
+          repairEpisodeId: episode.recordId,
+        });
+        expect(repairGrants).toHaveLength(1);
+        expect(repairGrants?.[0]).toMatchObject({
+          gate: "repair",
+          status: "consumed",
+          consumedByRunId: repairClaim.binding.recordId,
+          repairAuthorization: {
+            episodeId: episode.recordId,
+            inheritedGateId: repairClaim.authorizationGateId,
+          },
+        });
+        expect(
+          afterDebit.foundationRecords?.find(
+            (record) => record.kind === "repair-episode" && record.recordId === episode.recordId,
+          ),
+        ).toMatchObject({
+          status: "active",
+          semanticRepairs: 1,
+          allowance: original.intent.limits.repairAllowance,
+          pendingSemanticRepair: false,
+          lastSemanticRevision: episode.relevantRevision,
+        });
+        expect(
+          afterDebit.foundationRecords?.find(
+            (record) => record.kind === "task-membership" && record.taskId === f.selection.taskId,
+          ),
+        ).toMatchObject({ assignment: { repairEpisodeId: episode.recordId } });
+        const repairBinding = repairBindings?.[0];
+        if (repairBinding?.kind !== "run-binding")
+          return yield* Effect.die("Missing repair binding");
+        const repairOperations = yield* makeProjectTeamPiOperations({
+          environmentId: "environment",
+        });
+        const repairAuthority = yield* repairOperations.current(
+          {
+            providerInstanceId: repairBinding.providerInstanceId,
+            threadId: repairBinding.threadId,
+          },
+          true,
+        );
+        expect(
+          yield* repairOperations.readRootBudget(
+            repairAuthority,
+            {
+              operationId: repairDispatch.intent.request.initializeOperationId,
+              operationKind: "initialize",
+            },
+            {
+              kind: "initialize",
+              operationId: repairDispatch.intent.request.initializeOperationId,
+              threadId: repairBinding.threadId,
+              resumeCursor: null,
+            },
+            "a".repeat(64),
+          ),
+        ).toEqual({
+          rootTaskId: original.intent.limits.rootTaskId,
+          maximumTokens: original.intent.limits.maximumTokens,
+          deadlineAtMs: original.intent.limits.rootDeadlineAtMs,
+        });
+        expect(yield* repairJournal.reserve(prepared.request)).toEqual(repairDispatch);
+        expect(
+          yield* f.withTarget(
+            reviewerJournal.settleAfterJoined(f.proposalSnapshot.fence, f.joined),
+          ),
+        ).toMatchObject({ duplicate: true });
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(afterDebit);
+      }),
+    ),
+);
+for (const initialPendingSemanticRepair of [false, true, "legacy"] as const) {
+  it.effect(
+    `a qualified positive assessment resolves only its matching semantic repair episode${
+      initialPendingSemanticRepair === true
+        ? " with an existing pending repair fence"
+        : initialPendingSemanticRepair === "legacy"
+          ? " with a legacy episode lacking the pending marker"
+          : ""
+    }`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const proposal = yield* makeProposalFixture(
+            false,
+            "success",
+            undefined,
+            "-semantic-positive",
+            true,
+          );
+          const f = yield* makeConsumedReviewFixture(
+            {
+              parentAssessment: true,
+              assessmentVerdict: "met",
+              verificationOutcome: "success",
+            },
+            proposal,
+          );
+          if (f.completionReport.type !== "project-team.assignment.report")
+            return yield* Effect.die("Completed reviewer report required");
+          const originalJournal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 128,
+          });
+          const original = yield* originalJournal.readRetained(
+            f.target.prepared.manifest.dispatchId,
+          );
+          const originalClaim = original.intent.compiledClaim.transition;
+          if (originalClaim?.kind !== "claim")
+            return yield* Effect.die("Original implementation claim required");
+          const criterionIds = (f.completionReport.criterionAssessments ?? [])
+            .map((assessment) => assessment.criterionId)
+            .sort();
+          const failureFingerprint = digest(
+            canonical({
+              rootTaskId: original.intent.limits.rootTaskId,
+              taskId: f.selection.taskId,
+              semanticCause: "failed-verification",
+              criterionIds,
+            }),
+          );
+          const relevantRevision = digest(
+            canonical({
+              scopeHash: originalClaim.binding.scopeHash,
+              testedTree: f.target.prepared.manifest.target.testedTree,
+            }),
+          );
+          const allowance = Math.min(
+            original.intent.limits.repairAllowance,
+            original.intent.rootCaps.repairAllowance,
+          );
+          const makeEpisode = (
+            recordId: string,
+            fingerprint: string,
+            status: "active" | "resolved",
+            pendingSemanticRepair: boolean | "legacy" = false,
+          ): ProjectTeamRecord => ({
+            kind: "repair-episode",
+            projectId,
+            recordId,
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status,
+            taskId: f.selection.taskId,
+            rootTaskId: original.intent.limits.rootTaskId,
+            failureFingerprint: fingerprint,
+            relevantRevision,
+            allowance,
+            semanticRepairs: Math.min(1, allowance),
+            ...(pendingSemanticRepair === "legacy" ? {} : { pendingSemanticRepair }),
+            ...(allowance === 0 ? {} : { lastSemanticRevision: relevantRevision }),
+            transportRetries: 0,
+            timeoutCount: 0,
+            attemptIds: [originalClaim.claim.attemptId],
+          });
+          const resolvedAlready = makeEpisode(
+            "unrelated-resolved-semantic-episode",
+            "b".repeat(64),
+            "resolved",
+          );
+          yield* f.commitRecords("seed-review-repair-episodes", [
+            makeEpisode(
+              "matching-semantic-episode",
+              failureFingerprint,
+              "active",
+              initialPendingSemanticRepair,
+            ),
+            resolvedAlready,
+          ]);
+          const before = yield* f.state();
+          const pendingEpisode = before.foundationRecords?.find(
+            (record): record is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+              record.kind === "repair-episode" && record.recordId === "matching-semantic-episode",
+          );
+          const journal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 128,
+            verifyStage: () => Effect.void,
+            verifySettlement: () => Effect.void,
+            prepareReviewCompletion: f.consumer.prepare,
+            verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+          });
+          yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+          const after = yield* f.state();
+          expect(
+            after.foundationRecords?.find(
+              (record) =>
+                record.kind === "repair-episode" && record.recordId === "matching-semantic-episode",
+            ),
+          ).toMatchObject({
+            status: "resolved",
+            pendingSemanticRepair: false,
+            revision: (pendingEpisode?.revision ?? -1) + 1,
+            generation: pendingEpisode?.generation,
+            failureFingerprint,
+            relevantRevision,
+            lastSemanticRevision: pendingEpisode?.lastSemanticRevision,
+            semanticRepairs: Math.min(1, allowance),
+            allowance,
+            rootTaskId: original.intent.limits.rootTaskId,
+            transportRetries: pendingEpisode?.transportRetries,
+            timeoutCount: pendingEpisode?.timeoutCount,
+            attemptIds: pendingEpisode?.attemptIds,
+          });
+          expect(
+            after.foundationRecords?.find(
+              (record) =>
+                record.kind === "repair-episode" &&
+                record.recordId === "unrelated-resolved-semantic-episode",
+            ),
+          ).toEqual(resolvedAlready);
+          expect(after.blockers).toEqual(before.blockers);
+          expect(after.tasks.find((task) => task.taskId === f.selection.taskId)).toEqual(
+            before.tasks.find((task) => task.taskId === f.selection.taskId),
+          );
+          const retainedAfter = yield* originalJournal.readRetained(
+            f.target.prepared.manifest.dispatchId,
+          );
+          expect(retainedAfter.intent.limits).toEqual(original.intent.limits);
+          expect(retainedAfter.intent.rootCaps).toEqual(original.intent.rootCaps);
+          expect(
+            (yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined)))
+              .duplicate,
+          ).toBe(true);
+          expect(yield* f.state()).toEqual(after);
+        }),
+      ),
+  );
+}
+it.effect(
+  "a repeated qualified failure on the same tested tree exhausts the matching episode and opens actionable attention",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const proposal = yield* makeProposalFixture(
+          false,
+          "failed",
+          undefined,
+          "-semantic-repeat",
+          true,
+        );
+        const f = yield* makeConsumedReviewFixture(
+          {
+            parentAssessment: true,
+            assessmentVerdict: "not-met",
+            verificationOutcome: "failed",
+          },
+          proposal,
+        );
+        if (f.completionReport.type !== "project-team.assignment.report")
+          return yield* Effect.die("Completed reviewer report required");
+        const originalJournal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+        });
+        const original = yield* originalJournal.readRetained(f.target.prepared.manifest.dispatchId);
+        const originalClaim = original.intent.compiledClaim.transition;
+        if (originalClaim?.kind !== "claim")
+          return yield* Effect.die("Original implementation claim required");
+        const criterionIds = (f.completionReport.criterionAssessments ?? [])
+          .map((assessment) => assessment.criterionId)
+          .sort();
+        const failureFingerprint = digest(
+          canonical({
+            rootTaskId: original.intent.limits.rootTaskId,
+            taskId: f.selection.taskId,
+            semanticCause: "failed-verification",
+            criterionIds,
+          }),
+        );
+        const relevantRevision = digest(
+          canonical({
+            scopeHash: originalClaim.binding.scopeHash,
+            testedTree: f.target.prepared.manifest.target.testedTree,
+          }),
+        );
+        const allowance = Math.min(
+          original.intent.limits.repairAllowance,
+          original.intent.rootCaps.repairAllowance,
+        );
+        yield* f.commitRecords("seed-repeated-semantic-episode", [
+          {
+            kind: "repair-episode",
+            projectId,
+            recordId: "repeated-semantic-episode",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "active",
+            taskId: f.selection.taskId,
+            rootTaskId: original.intent.limits.rootTaskId,
+            failureFingerprint,
+            relevantRevision,
+            allowance,
+            semanticRepairs: 0,
+            pendingSemanticRepair: true,
+            transportRetries: 0,
+            timeoutCount: 0,
+            attemptIds: [originalClaim.claim.attemptId],
+          },
+        ]);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        const after = yield* f.state();
+        expect(
+          after.foundationRecords?.find(
+            (record) =>
+              record.kind === "repair-episode" && record.recordId === "repeated-semantic-episode",
+          ),
+        ).toMatchObject({
+          status: "exhausted",
+          pendingSemanticRepair: true,
+          allowance,
+          semanticRepairs: 0,
+          failureFingerprint,
+          relevantRevision,
+        });
+        expect(
+          after.blockers.find(
+            (blocker) =>
+              blocker.taskId === f.selection.taskId &&
+              blocker.resolvedAt === undefined &&
+              blocker.referenceIds.includes("repeated-semantic-episode"),
+          ),
+        ).toMatchObject({
+          attention: true,
+          reason: expect.stringContaining("Repeated verification failure"),
+        });
+      }),
+    ),
+);
+it.effect(
+  "a qualified failure after a consumed repair reopens the same episode for a changed tested tree",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const proposal = yield* makeProposalFixture(
+          false,
+          "failed",
+          undefined,
+          "-semantic-repair-retry",
+          true,
+        );
+        const f = yield* makeConsumedReviewFixture(
+          {
+            parentAssessment: true,
+            assessmentVerdict: "not-met",
+            verificationOutcome: "failed",
+          },
+          proposal,
+        );
+        if (f.completionReport.type !== "project-team.assignment.report")
+          return yield* Effect.die("Completed reviewer report required");
+        const originalJournal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+        });
+        const original = yield* originalJournal.readRetained(f.target.prepared.manifest.dispatchId);
+        const originalClaim = original.intent.compiledClaim.transition;
+        if (originalClaim?.kind !== "claim")
+          return yield* Effect.die("Original implementation claim required");
+        const criterionIds = (f.completionReport.criterionAssessments ?? [])
+          .map((assessment) => assessment.criterionId)
+          .sort();
+        const failureFingerprint = digest(
+          canonical({
+            rootTaskId: original.intent.limits.rootTaskId,
+            taskId: f.selection.taskId,
+            semanticCause: "failed-verification",
+            criterionIds,
+          }),
+        );
+        const previousRevision = digest(
+          canonical({
+            scopeHash: originalClaim.binding.scopeHash,
+            testedTree: "prior-tested-tree",
+          }),
+        );
+        const allowance = Math.min(
+          original.intent.limits.repairAllowance,
+          original.intent.rootCaps.repairAllowance,
+        );
+        yield* f.commitRecords("seed-consumed-semantic-repair", [
+          {
+            kind: "repair-episode",
+            projectId,
+            recordId: "consumed-semantic-repair",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "active",
+            taskId: f.selection.taskId,
+            rootTaskId: original.intent.limits.rootTaskId,
+            failureFingerprint,
+            relevantRevision: previousRevision,
+            allowance,
+            semanticRepairs: 1,
+            pendingSemanticRepair: false,
+            lastSemanticRevision: previousRevision,
+            transportRetries: 0,
+            timeoutCount: 0,
+            attemptIds: [originalClaim.claim.attemptId],
+          },
+        ]);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        expect(
+          (yield* f.state()).foundationRecords?.find(
+            (record) =>
+              record.kind === "repair-episode" && record.recordId === "consumed-semantic-repair",
+          ),
+        ).toMatchObject({
+          status: "active",
+          allowance,
+          semanticRepairs: 1,
+          pendingSemanticRepair: true,
+          lastSemanticRevision: previousRevision,
+        });
+      }),
+    ),
+);
+it.effect(
+  "a lower current configured repair allowance exhausts an episode at that effective cap",
+  () =>
+    scopedGateway(
+      Effect.gen(function* () {
+        const proposal = yield* makeProposalFixture(
+          false,
+          "failed",
+          undefined,
+          "-semantic-lowered-cap",
+          true,
+        );
+        const f = yield* makeConsumedReviewFixture(
+          {
+            parentAssessment: true,
+            assessmentVerdict: "not-met",
+            verificationOutcome: "failed",
+          },
+          proposal,
+        );
+        if (f.completionReport.type !== "project-team.assignment.report")
+          return yield* Effect.die("Completed reviewer report required");
+        const originalJournal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+        });
+        const original = yield* originalJournal.readRetained(f.target.prepared.manifest.dispatchId);
+        const originalClaim = original.intent.compiledClaim.transition;
+        if (originalClaim?.kind !== "claim")
+          return yield* Effect.die("Original implementation claim required");
+        const criterionIds = (f.completionReport.criterionAssessments ?? [])
+          .map((assessment) => assessment.criterionId)
+          .sort();
+        const failureFingerprint = digest(
+          canonical({
+            rootTaskId: original.intent.limits.rootTaskId,
+            taskId: f.selection.taskId,
+            semanticCause: "failed-verification",
+            criterionIds,
+          }),
+        );
+        const priorRevision = digest(
+          canonical({
+            scopeHash: originalClaim.binding.scopeHash,
+            testedTree: "prior-tested-tree",
+          }),
+        );
+        const allowance = Math.min(
+          original.intent.limits.repairAllowance,
+          original.intent.rootCaps.repairAllowance,
+        );
+        const configuredLimits = (yield* f.state()).foundationRecords?.find(
+          (record) => record.kind === "limits" && record.status === "configured",
+        );
+        if (configuredLimits?.kind !== "limits" || configuredLimits.repairAllowance < 2)
+          return yield* Effect.die(
+            "Fixture requires a configured repair allowance of at least two",
+          );
+        yield* f.commitRecords("lower-current-semantic-repair-allowance", [
+          { ...configuredLimits, revision: configuredLimits.revision + 1, repairAllowance: 1 },
+          {
+            kind: "repair-episode",
+            projectId,
+            recordId: "current-cap-semantic-repair",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "active",
+            taskId: f.selection.taskId,
+            rootTaskId: original.intent.limits.rootTaskId,
+            failureFingerprint,
+            relevantRevision: priorRevision,
+            allowance,
+            semanticRepairs: 1,
+            pendingSemanticRepair: false,
+            lastSemanticRevision: priorRevision,
+            transportRetries: 0,
+            timeoutCount: 0,
+            attemptIds: [originalClaim.claim.attemptId],
+          },
+        ]);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 128,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+          prepareReviewCompletion: f.consumer.prepare,
+          verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+        });
+        yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+        expect(
+          (yield* f.state()).foundationRecords?.find(
+            (record) =>
+              record.kind === "repair-episode" && record.recordId === "current-cap-semantic-repair",
+          ),
+        ).toMatchObject({
+          status: "exhausted",
+          allowance,
+          semanticRepairs: 1,
+          pendingSemanticRepair: true,
+        });
+      }),
+    ),
+);
+for (const verificationOutcome of ["timed-out", "canceled"] as const)
+  it.effect(
+    `a negative review with ${verificationOutcome} verification remains visible without semantic repair authority`,
+    () =>
+      scopedGateway(
+        Effect.gen(function* () {
+          const proposal = yield* makeProposalFixture(
+            false,
+            verificationOutcome,
+            undefined,
+            "-semantic-terminal",
+            true,
+          );
+          const f = yield* makeConsumedReviewFixture(
+            {
+              parentAssessment: true,
+              assessmentVerdict: "not-met",
+            },
+            proposal,
+          );
+          const before = yield* f.state();
+          const proof = yield* f.prepare();
+          expect(proof?.status).toBe("completed");
+          if (proof?.status === "completed")
+            expect(proof.parentAssessments?.semanticRepair).toBeUndefined();
+          expect(yield* f.state()).toEqual(before);
+          const journal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 128,
+            verifyStage: () => Effect.void,
+            verifySettlement: () => Effect.void,
+            prepareReviewCompletion: f.consumer.prepare,
+            verifyReviewTarget: f.targetService.assertOriginalInTransaction,
+          });
+          yield* f.withTarget(journal.settleAfterJoined(f.proposalSnapshot.fence, f.joined));
+          const after = yield* f.state();
+          expect(
+            after.foundationRecords?.some(
+              (record) => record.kind === "repair-episode" && record.taskId === f.selection.taskId,
+            ),
+          ).toBe(false);
+          expect(after.tasks.find((task) => task.taskId === f.selection.taskId)).toEqual(
+            before.tasks.find((task) => task.taskId === f.selection.taskId),
+          );
+          expect(after.tasks.find((task) => task.taskId === f.running.taskId)?.state).toBe(
+            "completed",
+          );
+        }),
+      ),
+  );
 it.effect(
   "completed assessment qualification settles only the reviewer child and exact replay remains stable",
   () =>
@@ -5232,7 +6502,7 @@ it.effect(
     ),
 );
 it.effect(
-  "integrated completed review settlement failed COMMIT exposes no successful completion or public snapshot before owned cleanup",
+  "integrated completed review settlement failed COMMIT exposes no completion or public snapshot",
   () =>
     scopedGateway(
       Effect.gen(function* () {
@@ -5246,6 +6516,14 @@ it.effect(
         );
         const query = yield* ProjectWorkQuery;
         const gateway = yield* ProjectWorkGateway;
+        const beforeSnapshot = yield* query.snapshot(projectId);
+        const beforeFindings = decodePage(
+          yield* gateway.read({
+            projectId,
+            operation: "foundation-records",
+            recordKinds: ["review-finding"],
+          }),
+        ).items;
         const journal = yield* makeProjectTeamDispatchJournal({
           environmentId: "environment",
           maximumEnvironmentModelCalls: 128,
@@ -5273,20 +6551,17 @@ it.effect(
           (yield* f.sql<{
             count: number;
           }>`SELECT COUNT(*) AS count FROM completion_commit_child`)[0]?.count,
-        ).toBeGreaterThan(0);
-        expect((yield* query.snapshot(projectId).pipe(Effect.exit))._tag).toBe("Failure");
+        ).toBe(0);
+        expect(yield* query.snapshot(projectId)).toEqual(beforeSnapshot);
         expect(
-          (yield* gateway
-            .read({ projectId, operation: "foundation-records", recordKinds: ["review-finding"] })
-            .pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        // Only this disposable test owns the connection loan; production never rolls back a foreign loan.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
+          decodePage(
+            yield* gateway.read({
+              projectId,
+              operation: "foundation-records",
+              recordKinds: ["review-finding"],
+            }),
+          ).items,
+        ).toEqual(beforeFindings);
         expect(yield* f.state()).toEqual(before);
         expect(yield* f.journal.readStageReceipts(f.proposalSnapshot.fence.dispatchId)).toEqual(
           priorReceipts,
@@ -5665,7 +6940,6 @@ for (const invalid of [
             invalid === "duplicate-criterion" ? [assessment, assessment] : [assessment],
         };
         expect((yield* completionTool(f, report).pipe(Effect.exit))._tag).toBe("Failure");
-        expect(yield* readProposal(f)).toBeUndefined();
         expect(yield* f.state()).toEqual(before);
         expect(
           yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${report.commandId}`,
@@ -6456,7 +7730,7 @@ it.effect(
 );
 
 it.effect(
-  "pending criterion assessment failed owning COMMIT exposes no successful receipt or public state before cleanup",
+  "pending criterion assessment failed owning COMMIT exposes no successful receipt or public state",
   () =>
     scopedGateway(
       Effect.gen(function* () {
@@ -6464,6 +7738,14 @@ it.effect(
         const gateway = yield* ProjectWorkGateway;
         const query = yield* ProjectWorkQuery;
         const before = yield* f.state();
+        const beforeSnapshot = yield* query.snapshot(projectId);
+        const beforeFindings = decodePage(
+          yield* gateway.read({
+            projectId,
+            operation: "foundation-records",
+            recordKinds: ["review-finding"],
+          }),
+        ).items;
         const report = {
           ...f.completionReport,
           expectedRevision: before.revision,
@@ -6485,23 +7767,19 @@ it.effect(
         ).toBe("Failure");
         expect(escaped).toBe(false);
         expect(yield* f.sql`SELECT COUNT(*) AS count FROM proposal_commit_child`).toEqual([
-          { count: 1 },
+          { count: 0 },
         ]);
-        expect((yield* readProposal(f).pipe(Effect.exit))._tag).toBe("Failure");
-        expect(
-          (yield* gateway
-            .read({ projectId, operation: "foundation-records", recordKinds: ["review-finding"] })
-            .pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        expect((yield* query.snapshot(projectId).pipe(Effect.exit))._tag).toBe("Failure");
-        // This disposable connection loan is owned by the test; production never rolls back a foreign loan.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
         expect(yield* readProposal(f)).toBeUndefined();
+        expect(yield* query.snapshot(projectId)).toEqual(beforeSnapshot);
+        expect(
+          decodePage(
+            yield* gateway.read({
+              projectId,
+              operation: "foundation-records",
+              recordKinds: ["review-finding"],
+            }),
+          ).items,
+        ).toEqual(beforeFindings);
         expect(yield* f.state()).toEqual(before);
         expect(
           yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${f.completionReport.commandId}`,
@@ -7216,7 +8494,7 @@ for (const corrupt of ["stderr", "receipt-attribution", "receipt-events"] as con
 }
 
 it.effect(
-  "a resolution failed owning COMMIT exposes no retained proof and exact retry keeps the original judgment",
+  "a resolution failed owning COMMIT retains no proof and exact retry keeps the original judgment",
   () =>
     scopedGateway(
       Effect.gen(function* () {
@@ -7229,6 +8507,8 @@ it.effect(
           resolutionArtifactIds: [rows[0]!.attemptId + ":stdout"],
         });
         const before = yield* f.state();
+        const query = yield* ProjectWorkQuery;
+        const beforeSnapshot = yield* query.snapshot(projectId);
         yield* f.sql`CREATE TABLE controlled_resolution_parent (id TEXT PRIMARY KEY)`;
         yield* f.sql`CREATE TABLE controlled_resolution_child (id TEXT REFERENCES controlled_resolution_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER controlled_resolution_commit_failure AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'review-finding-resolution:%' BEGIN INSERT INTO controlled_resolution_child VALUES ('missing'); END`;
@@ -7245,37 +8525,9 @@ it.effect(
         ).toBe("Failure");
         expect(escaped).toBe(false);
         expect(yield* f.sql`SELECT COUNT(*) AS count FROM controlled_resolution_child`).toEqual([
-          { count: 1 },
+          { count: 0 },
         ]);
-        const reader = yield* makeProjectTeamReviewResolutionReader({
-          environmentId: "environment",
-        });
-        const uncommitted = yield* f.sql<{
-          recordId: string;
-          payload: string;
-        }>`SELECT record_id AS recordId,payload_json AS payload FROM project_team_review_finding WHERE project_id=${projectId}`;
-        expect(uncommitted).toHaveLength(1);
-        const finding = yield* decodeStoredResolutionFinding(uncommitted[0]!.payload);
-        if (finding.kind !== "review-finding")
-          return yield* Effect.die("Missing uncommitted finding");
-        expect(
-          (yield* f.sql
-            .withTransaction(
-              reader.readInTransaction({
-                findingRecordId: finding.recordId,
-                expectedFindingRevision: finding.revision,
-                expectedFindingSha256: digest(canonical(finding)),
-              }),
-            )
-            .pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        // Disposal of this controlled failed physical transaction only; no production foreign-loan rollback.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
+        expect(yield* query.snapshot(projectId)).toEqual(beforeSnapshot);
         expect(yield* f.state()).toEqual(before);
         expect(
           yield* f.sql`SELECT COUNT(*) AS count FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
@@ -7596,38 +8848,32 @@ it.effect(
       }),
     ),
 );
-it.effect(
-  "managed merge failed owning COMMIT sends nothing and retains no partial approval after cleanup",
-  () =>
-    scopedGateway(
-      Effect.gen(function* () {
-        const m = yield* makeHumanManagedMergeFixture();
-        const before = yield* m.f.repository.replay(projectId);
-        yield* m.f.sql`CREATE TABLE controlled_merge_parent(id TEXT PRIMARY KEY)`;
-        yield* m.f
-          .sql`CREATE TABLE controlled_merge_child(id TEXT REFERENCES controlled_merge_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
-        yield* m.f
-          .sql`CREATE TRIGGER controlled_merge_failed_commit AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'managed-merge-permission:%' BEGIN INSERT INTO controlled_merge_child VALUES ('missing'); END`;
-        expect(
-          (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        expect(m.counts().writes).toBe(0);
-        // Only dispose the failed physical transaction belonging to this controlled database.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* m.f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
-        expect(yield* m.f.repository.replay(projectId)).toEqual(before);
-        expect(yield* m.f.sql`SELECT operation_id FROM project_work_managed_merge`).toEqual([]);
-        yield* m.f.sql`DROP TRIGGER controlled_merge_failed_commit`;
-        expect(
-          (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports)).confirmation.kind,
-        ).toBe("merged");
-        expect(m.counts().writes).toBe(1);
-      }),
-    ),
+it.effect("managed merge failed owning COMMIT sends nothing and retains no partial approval", () =>
+  scopedGateway(
+    Effect.gen(function* () {
+      const m = yield* makeHumanManagedMergeFixture();
+      const before = yield* m.f.repository.replay(projectId);
+      yield* m.f.sql`CREATE TABLE controlled_merge_parent(id TEXT PRIMARY KEY)`;
+      yield* m.f
+        .sql`CREATE TABLE controlled_merge_child(id TEXT REFERENCES controlled_merge_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      yield* m.f
+        .sql`CREATE TRIGGER controlled_merge_failed_commit AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'managed-merge-permission:%' BEGIN INSERT INTO controlled_merge_child VALUES ('missing'); END`;
+      expect(
+        (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.exit))._tag,
+      ).toBe("Failure");
+      expect(m.counts().writes).toBe(0);
+      expect(yield* m.f.sql`SELECT COUNT(*) AS count FROM controlled_merge_child`).toEqual([
+        { count: 0 },
+      ]);
+      expect(yield* m.f.repository.replay(projectId)).toEqual(before);
+      expect(yield* m.f.sql`SELECT operation_id FROM project_work_managed_merge`).toEqual([]);
+      yield* m.f.sql`DROP TRIGGER controlled_merge_failed_commit`;
+      expect(
+        (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports)).confirmation.kind,
+      ).toBe("merged");
+      expect(m.counts().writes).toBe(1);
+    }),
+  ),
 );
 it.effect(
   "managed merge uncertainty reconciles external observations without resending or producing delivery",
@@ -8498,9 +9744,7 @@ it.effect(
           settleReviewRoot: true,
         });
         const before = yield* m.f.state();
-        const query = yield* ProjectWorkQuery,
-          gateway = yield* ProjectWorkGateway,
-          bus = yield* ProjectWorkEventBus;
+        const bus = yield* ProjectWorkEventBus;
         const published: string[] = [];
         const drained = yield* Deferred.make<void>();
         const changes = yield* bus.subscribe;
@@ -8522,16 +9766,13 @@ it.effect(
           .sql`CREATE TABLE controlled_acceptance_child(id TEXT REFERENCES controlled_acceptance_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* m.f
           .sql`CREATE TRIGGER controlled_acceptance_commit AFTER INSERT ON project_work_evidence WHEN NEW.evidence_id LIKE 'delivery-acceptance:%' BEGIN INSERT INTO controlled_acceptance_child VALUES ('missing'); END`;
-        // SqlClient's owning COMMIT finalizer preserves this deferred SQL failure as a defect.
+        // The SQLite client rolls back the failed owning COMMIT while preserving its defect.
         expect(
           (yield* m.service.run(m.mergeInput, m.resolved, m.human, m.ports).pipe(Effect.exit))._tag,
         ).toBe("Failure");
-        expect((yield* query.snapshot(projectId).pipe(Effect.exit))._tag).toBe("Failure");
-        expect(
-          (yield* gateway
-            .read({ projectId, operation: "foundation-records", recordKinds: ["gate"] })
-            .pipe(Effect.exit))._tag,
-        ).toBe("Failure");
+        expect(yield* m.f.sql`SELECT COUNT(*) AS count FROM controlled_acceptance_child`).toEqual([
+          { count: 0 },
+        ]);
         // This unpersisted bus marker drains only the controlled observer, granting no domain authority.
         yield* bus.publish([
           {
@@ -8555,14 +9796,19 @@ it.effect(
         ]);
         yield* Deferred.await(drained);
         expect(published.some((id) => id.startsWith("delivery-acceptance:"))).toBe(false);
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* m.f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
-        expect((yield* m.f.state()).tasks).toEqual(before.tasks);
-        expect((yield* m.f.state()).criteria).toEqual(before.criteria);
+        const afterFailedAcceptance = yield* m.f.state();
+        expect(
+          afterFailedAcceptance.evidence.some((e) =>
+            e.evidenceId.startsWith("delivery-acceptance:"),
+          ),
+        ).toBe(false);
+        expect(afterFailedAcceptance.tasks).toEqual(before.tasks);
+        expect(afterFailedAcceptance.criteria).toEqual(before.criteria);
+        expect(
+          afterFailedAcceptance.evidence.some((e) =>
+            e.evidenceId.startsWith("managed-merge-permission:"),
+          ),
+        ).toBe(true);
         const deliveries = yield* m.f
           .sql`SELECT operation_id FROM project_work_managed_merge WHERE project_id=${projectId} AND status='confirmed' LIMIT 2`;
         expect(deliveries.length).toBe(1);

@@ -72,6 +72,13 @@ const stable = (record: TeamRecord) => {
     Object.fromEntries(Object.entries(record).filter(([key]) => !mutable.has(key))),
   );
 };
+export type ProjectTeamSemanticRepairResolution = {
+  readonly episodeId: string;
+  readonly priorRevision: number;
+  readonly reviewerBindingId: string;
+  readonly reviewerGeneration: number;
+  readonly receiptId: string;
+};
 /** Foundation consistency only; session authorization and eligibility are separate gates. */
 export const validateProjectTeamRecord = (
   state: ProjectWorkReducerState,
@@ -93,6 +100,7 @@ export const validateProjectTeamRecord = (
     { kind: "publication.claim" | "publication.reflect" }
   >,
   reviewResolution?: Extract<ProjectWorkTeamTransition, { kind: "review.resolve" }>,
+  semanticRepairResolution?: ProjectTeamSemanticRepairResolution,
 ): TeamRecord => {
   const r = decodeTeamRecord(input);
   const records = state.foundationRecords ?? [];
@@ -437,12 +445,60 @@ export const validateProjectTeamRecord = (
         reject("Answer requires human attribution");
       break;
     case "repair-episode":
+      if (old?.kind === "repair-episode" && semanticRepairResolution !== undefined) {
+        const reviewerBinding = records.find(
+          (entry): entry is Extract<TeamRecord, { kind: "run-binding" }> =>
+            entry.kind === "run-binding" &&
+            entry.recordId === semanticRepairResolution.reviewerBindingId,
+        );
+        const reviewerRole = records.find(
+          (entry) =>
+            entry.kind === "role-revision" &&
+            reviewerBinding?.kind === "run-binding" &&
+            entry.recordId === reviewerBinding.roleRevisionId,
+        );
+        const permitsQualifiedResolution =
+          origin.actor.kind === "system" &&
+          origin.actor.id === "project-team-runtime" &&
+          origin.source.kind === "system" &&
+          origin.source.id === "project-team-runtime" &&
+          semanticRepairResolution.episodeId === old.recordId &&
+          semanticRepairResolution.priorRevision === old.revision &&
+          semanticRepairResolution.receiptId.length > 0 &&
+          reviewerBinding?.kind === "run-binding" &&
+          reviewerBinding.projectId === old.projectId &&
+          (reviewerBinding.status === "running" || reviewerBinding.status === "stopping") &&
+          reviewerBinding.generation === semanticRepairResolution.reviewerGeneration &&
+          reviewerBinding.leaseGeneration === semanticRepairResolution.reviewerGeneration &&
+          reviewerRole?.kind === "role-revision" &&
+          reviewerRole.role === "reviewer" &&
+          reviewerRole.status === "available" &&
+          old.pendingSemanticRepair !== false &&
+          old.status !== "resolved" &&
+          r.status === "resolved" &&
+          r.pendingSemanticRepair === false &&
+          r.revision === old.revision + 1 &&
+          r.generation === old.generation &&
+          r.taskId === old.taskId &&
+          r.failureFingerprint === old.failureFingerprint &&
+          r.relevantRevision === old.relevantRevision &&
+          r.lastSemanticRevision === old.lastSemanticRevision &&
+          r.semanticRepairs === old.semanticRepairs &&
+          r.allowance === old.allowance &&
+          r.rootTaskId === old.rootTaskId &&
+          r.transportRetries === old.transportRetries &&
+          r.timeoutCount === old.timeoutCount &&
+          canonicalProjectWorkPayload(r.attemptIds) === canonicalProjectWorkPayload(old.attemptIds);
+        if (!permitsQualifiedResolution)
+          reject("Pending semantic repair requires its exact canonical debit");
+      }
       if (
         old?.kind === "repair-episode" &&
         old.pendingSemanticRepair !== false &&
         r.pendingSemanticRepair === false &&
         (r.semanticRepairs !== old.semanticRepairs + 1 ||
-          r.lastSemanticRevision !== old.relevantRevision)
+          r.lastSemanticRevision !== old.relevantRevision) &&
+        semanticRepairResolution === undefined
       )
         reject("Pending semantic repair requires its exact canonical debit");
       if (

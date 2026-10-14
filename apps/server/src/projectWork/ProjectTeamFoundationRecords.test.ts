@@ -762,6 +762,31 @@ it("pending semantic repair cannot be erased or cleared without exactly one cano
     pendingSemanticRepair: true,
   };
   const state = { ...initial(), foundationRecords: [episode] };
+  const runtime = {
+    actor: { kind: "system" as const, id: "project-team-runtime" },
+    source: { kind: "system" as const, id: "project-team-runtime" },
+    recordedAt: at,
+  };
+  const { pendingSemanticRepair: _legacyMarker, ...legacyEpisode } = episode;
+  const legacyState = { ...state, foundationRecords: [legacyEpisode] };
+  expect(() =>
+    validateProjectTeamRecord(
+      legacyState,
+      {
+        ...legacyEpisode,
+        status: "resolved",
+        revision: 1,
+        pendingSemanticRepair: false,
+      },
+      runtime,
+    ),
+  ).toThrow("canonical debit");
+  const resolvedWithoutDebit = {
+    ...episode,
+    status: "resolved" as const,
+    revision: 1,
+    pendingSemanticRepair: false,
+  };
   expect(() =>
     validateProjectTeamRecord(
       state,
@@ -799,4 +824,45 @@ it("pending semantic repair cannot be erased or cleared without exactly one cano
       human,
     ),
   ).toMatchObject({ pendingSemanticRepair: false, semanticRepairs: 1, transportRetries: 1 });
+  expect(() => validateProjectTeamRecord(state, resolvedWithoutDebit, runtime)).toThrow(
+    "canonical debit",
+  );
+  expect(() =>
+    validateProjectTeamRecord(
+      state,
+      resolvedWithoutDebit,
+      runtime,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        episodeId: "another-episode",
+        priorRevision: episode.revision,
+        reviewerBindingId: "review-binding",
+        reviewerGeneration: 2,
+        receiptId: "review-receipt",
+      },
+    ),
+  ).toThrow("canonical debit");
+  expect(() =>
+    validateProjectTeamRecord(
+      state,
+      resolvedWithoutDebit,
+      runtime,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        episodeId: episode.recordId,
+        priorRevision: episode.revision,
+        reviewerBindingId: "missing-review-binding",
+        reviewerGeneration: 2,
+        receiptId: "review-receipt",
+      },
+    ),
+  ).toThrow("canonical debit");
 });

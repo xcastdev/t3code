@@ -537,6 +537,275 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
                 catch: () => fail("Qualified verification evidence or applicability changed"),
               })
             : undefined;
+        const failedCriterionIds = report.criterionAssessments
+          .filter((assessment) => assessment.verdict === "not-met")
+          .map((assessment) => assessment.criterionId)
+          .sort();
+        const positiveCriterionIds = report.criterionAssessments
+          .filter((assessment) => assessment.verdict === "met")
+          .map((assessment) => assessment.criterionId)
+          .sort();
+        const selectedCriterionIds = report.criterionAssessments
+          .map((assessment) => assessment.criterionId)
+          .sort();
+        const authoritativeTerminal =
+          verification._tag === "Terminal" &&
+          verification.snapshot.phase === "terminal" &&
+          verification.snapshot.owner !== null &&
+          verification.result.drain !== null &&
+          verification.result.drain.ownerPid === verification.snapshot.owner.pid &&
+          verification.result.drain.childPid !== null &&
+          verification.result.drain.childExitCode === verification.result.exitCode &&
+          verification.result.finishedAtMs < verification.snapshot.intent.deadlineAtMs;
+        const semanticAction =
+          authoritativeTerminal &&
+          verification.result.outcome === "failed" &&
+          verification.result.exitCode !== null &&
+          verification.result.exitCode !== 0 &&
+          failedCriterionIds.length > 0
+            ? { action: "repair" as const, criterionIds: selectedCriterionIds }
+            : authoritativeTerminal &&
+                verification.result.outcome === "success" &&
+                verification.result.exitCode === 0 &&
+                positiveCriterionIds.length === report.criterionAssessments.length
+              ? { action: "resolve" as const, criterionIds: selectedCriterionIds }
+              : undefined;
+        let semanticRepair: NonNullable<
+          Extract<ProjectTeamReviewCompletionProof, { status: "completed" }>["parentAssessments"]
+        >["semanticRepair"];
+        if (semanticAction !== undefined && semanticAction.criterionIds.length > 0) {
+          const sourceDispatchId = target.prepared.manifest.dispatchId;
+          const sourceResult = yield* journal
+            .readRetained(sourceDispatchId)
+            .pipe(
+              Effect.catchTag("ProjectTeamDispatchJournalError", () => Effect.succeed(undefined)),
+            );
+          if (sourceResult !== undefined) {
+            const source = sourceResult;
+            const sourceHistory = yield* journal.readStageReceipts(sourceDispatchId).pipe(
+              Effect.as(true),
+              Effect.catchTag("ProjectTeamDispatchJournalError", () => Effect.succeed(false)),
+            );
+            if (sourceHistory) {
+              const sourceTransition = source.intent.compiledClaim.transition;
+              const sourceBinding =
+                sourceTransition?.kind === "claim" ? sourceTransition.binding : undefined;
+              const sourceTasks = state.tasks.filter(
+                (candidate) => candidate.taskId === manifest.target.taskId,
+              );
+              const sourceBindings = records.filter(
+                (record) =>
+                  record.kind === "run-binding" && record.taskId === manifest.target.taskId,
+              );
+              const sourceBindingRows = sourceBindings.filter(
+                (record) => record.recordId === sourceBinding?.recordId,
+              );
+              const persistedSourceBinding = sourceBindingRows[0];
+              const sourceRoles = records.filter(
+                (record) =>
+                  record.kind === "role-revision" &&
+                  record.recordId === sourceBinding?.roleRevisionId,
+              );
+              const sourceMembers = records.filter(
+                (record) => record.kind === "member" && record.recordId === sourceBinding?.memberId,
+              );
+              const sourceMemberships = records.filter(
+                (record) =>
+                  record.kind === "task-membership" && record.taskId === manifest.target.taskId,
+              );
+              const sourcePlans = records.filter(
+                (record) =>
+                  record.kind === "plan-revision" &&
+                  record.taskId === manifest.target.taskId &&
+                  record.planRevision === target.assignment.planRevision &&
+                  record.status === "proposed",
+              );
+              const sourcePlan = sourcePlans[0];
+              const currentSourceScopeHash =
+                sourcePlan?.kind === "plan-revision"
+                  ? projectTeamScopeHash(state, manifest.target.taskId, sourcePlan)
+                  : undefined;
+              const planGates = sourcePlans.flatMap((candidate) =>
+                candidate.kind === "plan-revision"
+                  ? records.filter(
+                      (record) =>
+                        record.kind === "gate" &&
+                        record.taskId === manifest.target.taskId &&
+                        record.gate === "plan" &&
+                        record.status === "approved" &&
+                        record.specRevision === target.assignment.specRevision &&
+                        record.planRevision === target.assignment.planRevision &&
+                        record.contentHash === candidate.contentHash,
+                    )
+                  : [],
+              );
+              const specificationGates = records.filter(
+                (record) =>
+                  record.kind === "gate" &&
+                  record.taskId === manifest.target.taskId &&
+                  record.gate === "specification" &&
+                  record.status === "approved" &&
+                  record.specRevision === target.assignment.specRevision &&
+                  record.planRevision === 0,
+              );
+              const sourcePolicy = records.filter(
+                (record) =>
+                  record.kind === "limits" &&
+                  record.status === "configured" &&
+                  record.model === sourceBinding?.model,
+              );
+              const sourceGrants = records.filter(
+                (record) =>
+                  record.kind === "gate" && record.recordId === sourceBinding?.authorizationGateId,
+              );
+              const sourceTask = sourceTasks[0];
+              const sourceRole = sourceRoles[0];
+              const sourceMember = sourceMembers[0];
+              const sourceMembership = sourceMemberships[0];
+              const sourcePolicyRecord = sourcePolicy[0];
+              const sourceGrant = sourceGrants[0];
+              const root = (() => {
+                let current = manifest.target.taskId;
+                const visited = new Set<string>();
+                for (let depth = 0; depth < 9; depth++) {
+                  if (visited.has(current)) return undefined;
+                  visited.add(current);
+                  const parentRows = records.filter(
+                    (record) => record.kind === "task-membership" && record.taskId === current,
+                  );
+                  if (parentRows.length === 0) return current;
+                  if (parentRows.length !== 1 || parentRows[0]?.kind !== "task-membership")
+                    return undefined;
+                  if (parentRows[0].parentTaskId === undefined) return current;
+                  current = parentRows[0].parentTaskId;
+                }
+                return undefined;
+              })();
+              const currentOwner =
+                sourceBinding !== undefined &&
+                sourceBindingRows.length === 1 &&
+                persistedSourceBinding?.kind === "run-binding" &&
+                sameBinding(persistedSourceBinding) === sameBinding(sourceBinding) &&
+                persistedSourceBinding.generation === sourceBinding.generation &&
+                persistedSourceBinding.status === "settled" &&
+                sourceBindings.every(
+                  (record) =>
+                    record.kind === "run-binding" &&
+                    record.generation <= sourceBinding.generation &&
+                    (record.generation !== sourceBinding.generation ||
+                      record.recordId === sourceBinding.recordId),
+                );
+              const parentAvailable =
+                source.fence.stage === "settled" &&
+                source.intent.request.dispatchId === sourceDispatchId &&
+                source.intent.compiledClaim.projectId === task.projectId &&
+                sourceBinding?.environmentId === options.environmentId &&
+                sourceBinding?.projectId === task.projectId &&
+                sourceBinding?.taskId === manifest.target.taskId &&
+                sourceBinding?.recordId === target.prepared.manifest.bindingId &&
+                sourceBinding?.generation === target.prepared.manifest.generation &&
+                sourceBinding?.scopeHash === currentSourceScopeHash &&
+                target.prepared.manifest.dispatchId === sourceDispatchId &&
+                target.prepared.manifest.environmentId === options.environmentId &&
+                target.prepared.manifest.projectId === task.projectId &&
+                target.prepared.manifest.taskId === manifest.target.taskId &&
+                sourceBinding?.specRevision === target.assignment.specRevision &&
+                sourceBinding?.planRevision === target.assignment.planRevision &&
+                target.prepared.manifest.specRevision === target.assignment.specRevision &&
+                target.prepared.manifest.planRevision === target.assignment.planRevision &&
+                sourceTasks.length === 1 &&
+                sourceTask?.specRevision === target.assignment.specRevision &&
+                (sourceTask?.state === "in-progress" || sourceTask?.state === "ready") &&
+                sourcePlans.length === 1 &&
+                sourcePlan?.kind === "plan-revision" &&
+                sourcePolicy.length === 1 &&
+                sourcePolicyRecord?.kind === "limits" &&
+                sourcePolicyRecord.recordId === source.intent.limits.limitsRecordId &&
+                sourceRoles.length === 1 &&
+                sourceRole?.kind === "role-revision" &&
+                sourceRole.status === "available" &&
+                (sourceRole.role === "implementer" || sourceRole.role === "integrator") &&
+                sourceMembers.length === 1 &&
+                sourceMember?.kind === "member" &&
+                sourceMember.status === "active" &&
+                sourceMember.roleRevisionId === sourceRole.recordId &&
+                sourceMemberships.length === 1 &&
+                sourceMembership?.kind === "task-membership" &&
+                sourceMembership.status === "active" &&
+                (sourceMembership.controlState === undefined ||
+                  sourceMembership.controlState === "active") &&
+                sourceMembership.requestedSuccessorMemberId === undefined &&
+                sourceMembership.assignment?.authorizationGateId ===
+                  sourceBinding?.authorizationGateId &&
+                sourceGrants.length === 1 &&
+                sourceGrant?.kind === "gate" &&
+                sourceGrant.status === "consumed" &&
+                sourceGrant.consumedByRunId === sourceBinding?.recordId &&
+                currentOwner &&
+                planGates.length === 1 &&
+                specificationGates.length === 1 &&
+                root === source.intent.limits.rootTaskId &&
+                !state.blockers.some(
+                  (blocker) =>
+                    blocker.taskId === manifest.target.taskId && blocker.resolvedAt === undefined,
+                ) &&
+                semanticAction.criterionIds.every((criterionId) =>
+                  target.prepared.manifest.criteria.some(
+                    (criterion) => criterion.criterionId === criterionId,
+                  ),
+                ) &&
+                !semanticAction.criterionIds.some((criterionId) =>
+                  state.criteria.some(
+                    (criterion) =>
+                      criterion.taskId === manifest.target.taskId &&
+                      criterion.criterionId === criterionId &&
+                      criterion.status === "waived",
+                  ),
+                );
+              const repairAllowance =
+                sourcePolicyRecord?.kind === "limits"
+                  ? Math.min(
+                      source.intent.limits.repairAllowance,
+                      source.intent.rootCaps.repairAllowance,
+                      sourcePolicyRecord.repairAllowance,
+                    )
+                  : undefined;
+              if (
+                parentAvailable &&
+                sourceRole?.kind === "role-revision" &&
+                sourceBinding?.scopeHash !== undefined &&
+                root !== undefined &&
+                repairAllowance !== undefined
+              ) {
+                const failureFingerprint = hash({
+                  rootTaskId: root,
+                  taskId: manifest.target.taskId,
+                  semanticCause: "failed-verification",
+                  criterionIds: semanticAction.criterionIds,
+                });
+                semanticRepair = {
+                  action: semanticAction.action,
+                  taskId: manifest.target.taskId,
+                  rootTaskId: root,
+                  sourceDispatchId,
+                  bindingId: sourceBinding.recordId,
+                  generation: sourceBinding.generation,
+                  role: sourceRole.role,
+                  specRevision: target.assignment.specRevision,
+                  planRevision: target.assignment.planRevision,
+                  criterionIds: semanticAction.criterionIds,
+                  testedTree: target.prepared.manifest.target.testedTree,
+                  failureFingerprint,
+                  relevantRevision: hash({
+                    scopeHash: sourceBinding.scopeHash,
+                    testedTree: target.prepared.manifest.target.testedTree,
+                  }),
+                  allowance: repairAllowance,
+                };
+              }
+            }
+          }
+        }
         parentAssessments = {
           snapshots: assessments,
           verification: {
@@ -554,6 +823,7 @@ export const makeProjectTeamReviewCompletion = (input: typeof Options.Type) => {
                   applicabilityId: qualifiedEvidence.applicability.records[0]!.recordId,
                 }),
           },
+          ...(semanticRepair === undefined ? {} : { semanticRepair }),
         };
       }
       for (const prior of records.filter(

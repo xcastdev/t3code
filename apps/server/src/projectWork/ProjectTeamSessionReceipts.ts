@@ -376,6 +376,182 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         return yield* deny("Original dispatch has no claim", "denied");
       return { snapshot: original, binding: transition.binding };
     });
+    // A human-approved child may have no live parentRunId while retaining its original root budget.
+    const retainedHumanRoot = Effect.fn("ProjectTeamSessionReceipts.retainedHumanRoot")(function* (
+      snapshot: ProjectTeamDispatchSnapshot,
+      binding: typeof ProjectTeamRunBinding.Type,
+      state: Effect.Success<ReturnType<typeof readCurrentState>>,
+    ) {
+      const records = state.foundationRecords ?? [];
+      const rootTaskId = snapshot.intent.limits.rootTaskId;
+      const childMemberships = records.filter(
+        (record) => record.kind === "task-membership" && record.taskId === binding.taskId,
+      );
+      const childMembership = childMemberships[0];
+      const childGates = records.filter(
+        (record) => record.kind === "gate" && record.recordId === binding.authorizationGateId,
+      );
+      const childGate = childGates[0];
+      if (
+        binding.parentRunId !== undefined ||
+        binding.environmentId !== options.environmentId ||
+        binding.taskId === rootTaskId ||
+        childMemberships.length !== 1 ||
+        childMembership?.kind !== "task-membership" ||
+        childMembership.projectId !== binding.projectId ||
+        childMembership.status !== "active" ||
+        (childMembership.controlState !== undefined && childMembership.controlState !== "active") ||
+        childMembership.executionKind === "legacy" ||
+        childMembership.parentTaskId === undefined ||
+        childMembership.assignment?.authorizationGateId !== binding.authorizationGateId ||
+        childGates.length !== 1 ||
+        childGate?.kind !== "gate" ||
+        childGate.projectId !== binding.projectId ||
+        childGate.taskId !== binding.taskId ||
+        childGate.gate !== "assignment" ||
+        childGate.status !== "consumed" ||
+        childGate.consumedByRunId !== binding.recordId ||
+        childGate.attribution?.actor.kind !== "human" ||
+        childGate.assignmentAuthorization?.parentTaskId !== childMembership.parentTaskId ||
+        (childGate.assignmentAuthorization?.assignmentKind !== "planning" &&
+          childGate.assignmentAuthorization?.assignmentKind !== "review")
+      )
+        return yield* deny("Original human child assignment provenance changed", "denied");
+
+      const seenTasks = new Set<string>();
+      let taskId = binding.taskId;
+      let rootTask: (typeof state.tasks)[number] | undefined;
+      let rootMembership:
+        | Extract<NonNullable<typeof state.foundationRecords>[number], { kind: "task-membership" }>
+        | undefined;
+      for (let depth = 0; depth < 9; depth++) {
+        if (seenTasks.has(taskId)) return yield* deny("Original human task ancestry is cyclic");
+        seenTasks.add(taskId);
+        const tasks = state.tasks.filter(
+          (task) => task.taskId === taskId && task.projectId === binding.projectId,
+        );
+        const memberships = records.filter(
+          (record) =>
+            record.kind === "task-membership" &&
+            record.taskId === taskId &&
+            record.projectId === binding.projectId,
+        );
+        const membership = memberships[0];
+        if (
+          tasks.length !== 1 ||
+          memberships.length !== 1 ||
+          membership?.kind !== "task-membership" ||
+          membership.status !== "active" ||
+          (membership.controlState !== undefined && membership.controlState !== "active") ||
+          membership.executionKind === "legacy"
+        )
+          return yield* deny("Original human task ancestry is missing or changed");
+        if (taskId === rootTaskId) {
+          if (membership.parentTaskId !== undefined)
+            return yield* deny("Original human root task has a foreign parent");
+          rootTask = tasks[0];
+          rootMembership = membership;
+          break;
+        }
+        if (membership.parentTaskId === undefined)
+          return yield* deny("Original human task does not descend from its retained root");
+        taskId = membership.parentTaskId;
+      }
+      if (!rootTask || !rootMembership)
+        return yield* deny("Original human root task is outside the ancestry bound");
+
+      const anchors = yield* sql<{
+        dispatch_id: string;
+      }>`SELECT dispatch_id FROM project_team_dispatch
+          WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId}
+          ORDER BY created_at,dispatch_id LIMIT 1`;
+      if (anchors.length !== 1) return yield* deny("Original human root dispatch is missing");
+      const original = yield* journal.readRetained(anchors[0]!.dispatch_id);
+      yield* journal.readStageReceipts(original.fence.dispatchId);
+      const originalClaim = original.intent.compiledClaim.transition;
+      const originalBinding = originalClaim?.kind === "claim" ? originalClaim.binding : undefined;
+      if (
+        originalClaim?.kind !== "claim" ||
+        !originalBinding ||
+        original.fence.claimGeneration < 1 ||
+        ![
+          "setup-complete",
+          "session-bound",
+          "assignment-intent",
+          "assignment-observed",
+          "settled",
+        ].includes(original.fence.stage) ||
+        original.intent.limits.rootTaskId !== rootTaskId ||
+        originalBinding.taskId !== rootTaskId ||
+        originalBinding.parentRunId !== undefined ||
+        originalBinding.projectId !== binding.projectId ||
+        originalBinding.environmentId !== options.environmentId ||
+        snapshot.intent.limits.maximumTokens !== original.intent.limits.maximumTokens ||
+        snapshot.intent.limits.rootDeadlineAtMs !== original.intent.limits.rootDeadlineAtMs ||
+        encode(snapshot.intent.rootCaps) !== encode(original.intent.rootCaps)
+      )
+        return yield* deny("Original human root dispatch or frozen grant changed");
+
+      const originalBindings = records.filter(
+        (record) => record.kind === "run-binding" && record.recordId === originalBinding.recordId,
+      );
+      const currentRoot = originalBindings[0];
+      const rootRoles = records.filter(
+        (record) =>
+          record.kind === "role-revision" && record.recordId === originalBinding.roleRevisionId,
+      );
+      const rootRole = rootRoles[0];
+      const rootGates = records.filter(
+        (record) =>
+          record.kind === "gate" && record.recordId === originalBinding.authorizationGateId,
+      );
+      const rootGate = rootGates[0];
+      const budgets = yield* sql<{
+        maximum_tokens: number;
+        deadline_at_ms: number;
+      }>`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget
+          WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId} LIMIT 2`;
+      if (
+        originalBindings.length !== 1 ||
+        currentRoot?.kind !== "run-binding" ||
+        immutableBinding(currentRoot) !== immutableBinding(originalBinding) ||
+        currentRoot.status === "revoked" ||
+        currentRoot.status === "stopping" ||
+        currentRoot.status === "quarantined" ||
+        rootRoles.length !== 1 ||
+        rootRole?.kind !== "role-revision" ||
+        rootRole.projectId !== binding.projectId ||
+        rootRole.model !== originalBinding.model ||
+        originalBinding.configuration.instructionsHash !==
+          NodeCrypto.createHash("sha256").update(rootRole.instructions).digest("hex") ||
+        rootGates.length !== 1 ||
+        rootGate?.kind !== "gate" ||
+        rootGate.projectId !== binding.projectId ||
+        rootGate.taskId !== rootTaskId ||
+        rootGate.status !== "consumed" ||
+        rootGate.consumedByRunId !== originalBinding.recordId ||
+        rootTask.state === "canceled" ||
+        rootTask.specRevision !== originalBinding.specRevision ||
+        rootMembership.parentTaskId !== undefined ||
+        budgets.length !== 1 ||
+        budgets[0]?.maximum_tokens !== original.intent.limits.maximumTokens ||
+        budgets[0]?.deadline_at_ms !== original.intent.limits.rootDeadlineAtMs
+      )
+        return yield* deny("Original human root binding, gate, or budget changed");
+
+      const changedRoots = yield* sql`SELECT 1 FROM project_team_dispatch
+          WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${rootTaskId}
+          AND (root_maximum_tokens <> ${original.intent.limits.maximumTokens}
+            OR root_deadline_at_ms <> ${original.intent.limits.rootDeadlineAtMs}
+            OR json_extract(intent_json,'$.rootCaps.maximumDelegationDepth') IS NOT ${original.intent.rootCaps.maximumDelegationDepth}
+            OR json_extract(intent_json,'$.rootCaps.repairAllowance') IS NOT ${original.intent.rootCaps.repairAllowance}
+            OR json_extract(intent_json,'$.rootCaps.environmentModelCalls') IS NOT ${original.intent.rootCaps.environmentModelCalls}
+            OR json_extract(intent_json,'$.rootCaps.projectWritableWorkers') IS NOT ${original.intent.rootCaps.projectWritableWorkers}
+            OR json_extract(intent_json,'$.rootCaps.modelCalls') IS NOT ${original.intent.rootCaps.modelCalls}) LIMIT 1`;
+      if (changedRoots.length > 0)
+        return yield* deny("Original human root caps changed across dispatch history");
+      return originalBinding;
+    });
     const readOperation = Effect.fn("ProjectTeamSessionReceipts.readOperation")(function* (
       context: Effect.Success<ReturnType<typeof retained>>,
       kind: "initialize" | "prompt",
@@ -400,6 +576,11 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
       const intent = yield* decodeIntent(row.intent_json).pipe(Effect.mapError(corrupt));
       const request = intent.request;
       const limits = snapshot.intent.limits;
+      const state = yield* readCurrentState(sql, binding.projectId);
+      const inheritedRoot =
+        !binding.parentRunId && binding.taskId !== limits.rootTaskId
+          ? yield* retainedHumanRoot(snapshot, binding, state)
+          : undefined;
       if (
         row.operation_id !== operationId ||
         row.environment_id !== options.environmentId ||
@@ -430,7 +611,8 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         binding.configuration.toolIds.some((id) => !intent.role.tools.includes(id)) ||
         binding.configuration.skillIds.some((id) => !intent.role.skills.includes(id)) ||
         row.root_task_id !== limits.rootTaskId ||
-        (!binding.parentRunId && row.root_binding_id !== binding.recordId) ||
+        (!binding.parentRunId &&
+          row.root_binding_id !== (inheritedRoot?.recordId ?? binding.recordId)) ||
         encode(intent.rootBudget) !==
           encode({
             rootTaskId: limits.rootTaskId,
@@ -440,7 +622,9 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         intent.operationLimits.maximumTokens !== row.maximum_tokens ||
         intent.operationLimits.deadlineAtMs !== row.deadline_at_ms ||
         row.maximum_tokens > limits.attemptMaximumTokens ||
-        row.deadline_at_ms > limits.deadlineAtMs
+        row.deadline_at_ms > limits.deadlineAtMs ||
+        row.maximum_tokens > limits.maximumTokens ||
+        row.deadline_at_ms > limits.rootDeadlineAtMs
       )
         return yield* deny("Original Pi request or binding identity differs", "denied");
       const budgets = yield* sql<{
@@ -454,7 +638,6 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
       )
         return yield* deny("Original Pi root budget is missing or contradictory");
       // Read frozen provenance without checking whether this run still has execution authority.
-      const state = yield* readCurrentState(sql, binding.projectId);
       const roles = (state.foundationRecords ?? []).filter(
         (r) => r.kind === "role-revision" && r.recordId === binding.roleRevisionId,
       );
@@ -484,7 +667,8 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
           return yield* deny("Original Pi ancestor is missing or foreign");
         ancestor = parent;
       }
-      if (row.root_binding_id !== ancestor.recordId || ancestor.taskId !== row.root_task_id)
+      const rootBinding = inheritedRoot ?? ancestor;
+      if (row.root_binding_id !== rootBinding.recordId || rootBinding.taskId !== row.root_task_id)
         return yield* deny("Original Pi root binding differs");
       if (row.status !== "settled")
         return yield* deny(

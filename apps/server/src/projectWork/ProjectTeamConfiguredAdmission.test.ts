@@ -821,6 +821,122 @@ it.effect("caps a second actual research child to its original journal root budg
 );
 
 it.effect(
+  "consumes one retained semantic repair episode through configured admission without renewing its original root limits",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const first = prepareProjectTeamConfiguredAdmission({
+          state: f.state,
+          taskId: f.taskId,
+          nowMs,
+          facts,
+        });
+        if (first._tag !== "Prepared") return yield* Effect.die(first.reason);
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+        });
+        const reserved = yield* journal.reserve(first.request);
+        const claimed = yield* journal.claimEffect(reserved.fence);
+        yield* journal.settleAfterJoined(claimed.fence, {
+          receiptId: "configured-admission-original-settlement",
+          stage: "settled",
+          evidence: { controlledDrain: true },
+        });
+        const original = yield* journal.readRetained(first.request.dispatchId);
+        const originalClaim = original.intent.compiledClaim.transition;
+        if (originalClaim?.kind !== "claim")
+          return yield* Effect.die("Original implementation claim required");
+        const current = yield* readCurrentState(f.sql, projectId);
+        const episode: ProjectTeamRecord = {
+          kind: "repair-episode",
+          projectId,
+          recordId: "qualified-semantic-repair",
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          status: "active",
+          taskId: f.taskId,
+          rootTaskId: original.intent.limits.rootTaskId,
+          failureFingerprint: "a".repeat(64),
+          relevantRevision: "tested-tree-before-repair",
+          allowance: original.intent.limits.repairAllowance,
+          semanticRepairs: 0,
+          pendingSemanticRepair: true,
+          transportRetries: 0,
+          timeoutCount: 0,
+          attemptIds: [originalClaim.claim.attemptId],
+        };
+        yield* f.repository.execute(
+          yield* decodeFoundationCommand({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "retain-qualified-semantic-repair",
+            expectedRevision: current.revision,
+            attribution: { actor: human, source, recordedAt: at },
+            records: [episode],
+            committedAt: at,
+          }),
+        );
+        const beforeRepair = yield* readCurrentState(f.sql, projectId);
+        const originalLimits = original.intent.limits;
+        const retry = prepareProjectTeamConfiguredAdmission({
+          state: beforeRepair,
+          taskId: f.taskId,
+          nowMs: nowMs + 10,
+          facts: {
+            ...facts,
+            rootAnchor: {
+              _tag: "RetainedRoot",
+              budget: {
+                rootTaskId: originalLimits.rootTaskId,
+                maximumTokens: originalLimits.maximumTokens,
+                deadlineAtMs: originalLimits.rootDeadlineAtMs,
+              },
+              caps: original.intent.rootCaps,
+            },
+          },
+        });
+        if (retry._tag !== "Prepared") return yield* Effect.die(retry.reason);
+        expect(retry.request.claim.transition).toMatchObject({
+          kind: "claim",
+          repair: { episodeId: episode.recordId },
+        });
+        expect(
+          retry.request.claim.transition?.kind === "claim" &&
+            retry.request.claim.transition.binding.configuration.maxTokens,
+        ).toBe(originalClaim.binding.configuration.maxTokens);
+        const retried = yield* journal.reserve(retry.request);
+        expect(retried.intent.limits).toMatchObject({
+          maximumTokens: originalLimits.maximumTokens,
+          rootDeadlineAtMs: originalLimits.rootDeadlineAtMs,
+          repairAllowance: originalLimits.repairAllowance,
+        });
+        const afterRepairClaim = yield* readCurrentState(f.sql, projectId);
+        expect(
+          afterRepairClaim.foundationRecords?.find(
+            (record) => record.kind === "repair-episode" && record.recordId === episode.recordId,
+          ),
+        ).toMatchObject({
+          semanticRepairs: 1,
+          allowance: originalLimits.repairAllowance,
+          pendingSemanticRepair: false,
+          lastSemanticRevision: episode.relevantRevision,
+          status: "active",
+        });
+        expect(
+          afterRepairClaim.foundationRecords?.find(
+            (record) => record.kind === "task-membership" && record.taskId === f.taskId,
+          ),
+        ).toMatchObject({ assignment: { repairEpisodeId: episode.recordId } });
+      }),
+    ),
+);
+
+it.effect(
   "honors the persisted exact successor and blocks a read-only integrator until journal support",
   () =>
     scoped(

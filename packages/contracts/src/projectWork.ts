@@ -1455,6 +1455,28 @@ const ReviewParentAssessments = Schema.Struct({
     evidenceId: Schema.optionalKey(GuidedId),
     applicabilityId: Schema.optionalKey(GuidedId),
   }),
+  semanticRepair: Schema.optionalKey(
+    Schema.Struct({
+      action: Schema.Literals(["repair", "resolve"]),
+      taskId: ProjectWorkTaskId,
+      rootTaskId: ProjectWorkTaskId,
+      sourceDispatchId: GuidedId,
+      bindingId: GuidedId,
+      generation: JoinedRunCounter,
+      role: Schema.Literals(["implementer", "integrator"]),
+      specRevision: JoinedRunCounter,
+      planRevision: JoinedRunCounter,
+      criterionIds: Schema.Array(GuidedId).check(
+        Schema.isMinLength(1),
+        Schema.isMaxLength(64),
+        Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+      ),
+      testedTree: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/u)),
+      failureFingerprint: ReviewProofDigest,
+      relevantRevision: ReviewProofDigest,
+      allowance: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 })),
+    }),
+  ),
 });
 /** Private joined settlement carries retained child proof, never an approval grant. */
 export const ProjectTeamJoinedFailureProof = Schema.Struct({

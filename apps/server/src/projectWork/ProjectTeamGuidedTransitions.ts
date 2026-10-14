@@ -11,7 +11,10 @@ import {
   type ProjectWorkCommand,
 } from "@t3tools/contracts";
 import type { ProjectWorkReducerState, ProjectWorkEvent } from "./ProjectWorkDecider.ts";
-import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
+import {
+  validateProjectTeamRecord,
+  type ProjectTeamSemanticRepairResolution,
+} from "./ProjectTeamFoundationRecords.ts";
 import {
   assertKnownTask,
   assertNoActiveAttempt,
@@ -80,10 +83,21 @@ export const decideProjectTeamGuidedTransition = (
     r: ProjectTeamRecord,
     consumption?: { runId: string; commandId: string; inheritedGateId?: string },
     settlement?: { bindingId: string; generation: number; receiptId: string },
+    semanticRepairResolution?: ProjectTeamSemanticRepairResolution,
   ) =>
     emit({
       type: "project-work.foundation.recorded",
-      record: validateProjectTeamRecord(state, r, command.attribution, consumption, settlement),
+      record: validateProjectTeamRecord(
+        state,
+        r,
+        command.attribution,
+        consumption,
+        settlement,
+        undefined,
+        undefined,
+        undefined,
+        semanticRepairResolution,
+      ),
       occurredAt: at,
     });
   const records = () => state.foundationRecords ?? [];
@@ -591,6 +605,283 @@ export const decideProjectTeamGuidedTransition = (
         )
           reject("Joined reviewer outputs or original report identity changed");
       }
+      let semanticRepairEpisode: Episode | undefined;
+      let semanticRepairEscalation: string | undefined;
+      let semanticRepairResolution: ProjectTeamSemanticRepairResolution | undefined;
+      const semantic =
+        completion?.status === "completed"
+          ? completion.parentAssessments?.semanticRepair
+          : undefined;
+      if (semantic && completion?.status === "completed") {
+        const report = completion.report;
+        if (report.type !== "project-team.assignment.report")
+          reject("Semantic repair requires the retained completed review report");
+        const assessments = report.criterionAssessments ?? [];
+        const assessmentIds = assessments.map((assessment) => assessment.criterionId).sort();
+        const verification = completion.parentAssessments?.verification;
+        const targetTask = state.tasks.find((candidate) => candidate.taskId === semantic.taskId);
+        const targetMemberships = records().filter(
+          (record) => record.kind === "task-membership" && record.taskId === semantic.taskId,
+        );
+        const targetMembership = targetMemberships[0];
+        const sourceBindings = records().filter(
+          (record): record is Binding =>
+            record.kind === "run-binding" && record.taskId === semantic.taskId,
+        );
+        const sourceBindingRows = sourceBindings.filter(
+          (record) => record.recordId === semantic.bindingId,
+        );
+        const sourceBinding = sourceBindingRows[0];
+        const sourceRole = records().find(
+          (record) =>
+            record.kind === "role-revision" && record.recordId === sourceBinding?.roleRevisionId,
+        );
+        const sourceMember = records().find(
+          (record) => record.kind === "member" && record.recordId === sourceBinding?.memberId,
+        );
+        const sourceGrants = records().filter(
+          (record) =>
+            record.kind === "gate" && record.recordId === sourceBinding?.authorizationGateId,
+        );
+        const sourceGrant = sourceGrants[0];
+        const sourcePlans = records().filter(
+          (record) =>
+            record.kind === "plan-revision" &&
+            record.taskId === semantic.taskId &&
+            record.planRevision === semantic.planRevision &&
+            record.status === "proposed",
+        );
+        const sourcePlan = sourcePlans[0];
+        const currentSourceScopeHash =
+          sourcePlan?.kind === "plan-revision"
+            ? projectTeamScopeHash(state, semantic.taskId, sourcePlan)
+            : undefined;
+        const sourceSpecificationGates = records().filter(
+          (record) =>
+            record.kind === "gate" &&
+            record.taskId === semantic.taskId &&
+            record.gate === "specification" &&
+            record.status === "approved" &&
+            record.specRevision === semantic.specRevision &&
+            record.planRevision === 0,
+        );
+        const sourcePlanGates = sourcePlans.flatMap((plan) =>
+          plan.kind === "plan-revision"
+            ? records().filter(
+                (record) =>
+                  record.kind === "gate" &&
+                  record.taskId === semantic.taskId &&
+                  record.gate === "plan" &&
+                  record.status === "approved" &&
+                  record.specRevision === semantic.specRevision &&
+                  record.planRevision === semantic.planRevision &&
+                  record.contentHash === plan.contentHash,
+              )
+            : [],
+        );
+        const configuredPolicies = records().filter(
+          (record) =>
+            record.kind === "limits" &&
+            record.status === "configured" &&
+            record.model === sourceBinding?.model,
+        );
+        const policy = configuredPolicies[0];
+        const rootTaskId = canonicalRoot(semantic.taskId);
+        const currentOwner =
+          sourceBindings.length > 0 &&
+          sourceBindingRows.length === 1 &&
+          sourceBinding?.kind === "run-binding" &&
+          sourceBinding.status === "settled" &&
+          sourceBinding.generation === semantic.generation &&
+          sourceBindings.every(
+            (record) =>
+              record.kind === "run-binding" &&
+              record.generation <= semantic.generation &&
+              (record.generation !== semantic.generation || record.recordId === semantic.bindingId),
+          );
+        const sourceAuthorized =
+          completion.target.projectId === command.projectId &&
+          completion.target.taskId === semantic.taskId &&
+          semantic.rootTaskId === rootTaskId &&
+          sourceBinding?.kind === "run-binding" &&
+          sourceBinding.projectId === command.projectId &&
+          sourceBinding.taskId === semantic.taskId &&
+          sourceBinding.revision < Number.MAX_SAFE_INTEGER &&
+          sourceBinding.specRevision === semantic.specRevision &&
+          sourceBinding.planRevision === semantic.planRevision &&
+          sourceBinding.scopeHash === currentSourceScopeHash &&
+          sourceBinding.generation === semantic.generation &&
+          (targetTask?.state === "in-progress" || targetTask?.state === "ready") &&
+          targetTask.specRevision === semantic.specRevision &&
+          sourceRole?.kind === "role-revision" &&
+          sourceRole.status === "available" &&
+          sourceRole.role === semantic.role &&
+          (sourceRole.role === "implementer" || sourceRole.role === "integrator") &&
+          sourceMember?.kind === "member" &&
+          sourceMember.status === "active" &&
+          sourceMember.roleRevisionId === sourceRole.recordId &&
+          sourceGrants.length === 1 &&
+          sourceGrant?.kind === "gate" &&
+          sourceGrant.status === "consumed" &&
+          sourceGrant.consumedByRunId === sourceBinding.recordId &&
+          currentOwner &&
+          targetMemberships.length === 1 &&
+          targetMembership?.kind === "task-membership" &&
+          targetMembership.status === "active" &&
+          (targetMembership.controlState === undefined ||
+            targetMembership.controlState === "active") &&
+          targetMembership.requestedSuccessorMemberId === undefined &&
+          targetMembership.assignment?.authorizationGateId === sourceBinding.authorizationGateId &&
+          sourcePlans.length === 1 &&
+          sourcePlan?.kind === "plan-revision" &&
+          sourcePlanGates.length === 1 &&
+          sourceSpecificationGates.length === 1 &&
+          configuredPolicies.length === 1 &&
+          policy?.kind === "limits" &&
+          semantic.allowance <= policy.repairAllowance &&
+          semantic.criterionIds.length > 0 &&
+          same(assessmentIds, semantic.criterionIds) &&
+          (semantic.action !== "repair" ||
+            assessments.some((assessment) => assessment.verdict === "not-met")) &&
+          (semantic.action !== "resolve" ||
+            assessments.every((assessment) => assessment.verdict === "met")) &&
+          semantic.criterionIds.every((criterionId) => {
+            const matches = state.criteria.filter(
+              (criterion) =>
+                criterion.taskId === semantic.taskId &&
+                criterion.criterionId === criterionId &&
+                criterion.status !== "waived",
+            );
+            return matches.length === 1;
+          }) &&
+          !state.blockers.some(
+            (blocker) => blocker.taskId === semantic.taskId && blocker.resolvedAt === undefined,
+          ) &&
+          verification?.environmentId !== undefined &&
+          ((semantic.action === "repair" &&
+            verification.outcome === "failed" &&
+            verification.exitCode !== null &&
+            verification.exitCode !== 0) ||
+            (semantic.action === "resolve" &&
+              verification.outcome === "success" &&
+              verification.exitCode === 0 &&
+              assessments.length === assessmentIds.length));
+        if (sourceAuthorized && sourceBinding?.scopeHash !== undefined) {
+          const expectedFingerprint = hash({
+            rootTaskId,
+            taskId: semantic.taskId,
+            semanticCause: "failed-verification",
+            criterionIds: semantic.criterionIds,
+          });
+          const expectedRelevantRevision = hash({
+            scopeHash: sourceBinding.scopeHash,
+            testedTree: semantic.testedTree,
+          });
+          if (
+            semantic.failureFingerprint === expectedFingerprint &&
+            semantic.relevantRevision === expectedRelevantRevision
+          ) {
+            const matching = records().filter(
+              (record): record is Episode =>
+                record.kind === "repair-episode" &&
+                (record.rootTaskId ?? record.taskId) === rootTaskId &&
+                record.failureFingerprint === semantic.failureFingerprint,
+            );
+            const pending = records().filter(
+              (record): record is Episode =>
+                record.kind === "repair-episode" &&
+                (record.rootTaskId ?? record.taskId) === rootTaskId &&
+                record.status !== "resolved" &&
+                record.pendingSemanticRepair !== false,
+            );
+            if (
+              semantic.action === "repair" &&
+              matching.length <= 1 &&
+              (matching[0] === undefined || matching[0].taskId === semantic.taskId) &&
+              (pending.length === 0 ||
+                (pending.length === 1 &&
+                  pending[0]?.failureFingerprint === semantic.failureFingerprint))
+            ) {
+              const old = matching[0];
+              const attemptIds = old?.attemptIds.includes(sourceBinding.attemptId)
+                ? old.attemptIds
+                : [...(old?.attemptIds ?? []), sourceBinding.attemptId];
+              if (
+                attemptIds.length <= 64 &&
+                (old === undefined || old.revision < Number.MAX_SAFE_INTEGER)
+              ) {
+                const unchanged =
+                  old?.lastSemanticRevision === semantic.relevantRevision ||
+                  (old?.pendingSemanticRepair === true &&
+                    old.relevantRevision === semantic.relevantRevision);
+                const exhausted =
+                  semantic.allowance === 0 ||
+                  old?.status === "exhausted" ||
+                  old?.status === "resolved" ||
+                  (old !== undefined &&
+                    old.semanticRepairs >= Math.min(old.allowance, semantic.allowance)) ||
+                  unchanged;
+                semanticRepairEpisode = old
+                  ? {
+                      ...old,
+                      revision: old.revision + 1,
+                      updatedAt: at,
+                      relevantRevision: semantic.relevantRevision,
+                      pendingSemanticRepair: true,
+                      status: exhausted ? "exhausted" : "active",
+                      attemptIds,
+                    }
+                  : {
+                      ...fields("semantic-repair-episode"),
+                      kind: "repair-episode",
+                      status: exhausted ? "exhausted" : "active",
+                      taskId: semantic.taskId,
+                      rootTaskId: ProjectWorkTaskId.make(rootTaskId),
+                      failureFingerprint: semantic.failureFingerprint,
+                      relevantRevision: semantic.relevantRevision,
+                      allowance: semantic.allowance,
+                      semanticRepairs: 0,
+                      pendingSemanticRepair: true,
+                      transportRetries: 0,
+                      timeoutCount: 0,
+                      attemptIds,
+                    };
+                if (exhausted)
+                  semanticRepairEscalation = unchanged
+                    ? "Repeated verification failure without a relevant tested-tree change"
+                    : "The configured semantic repair allowance is exhausted";
+              }
+            } else if (
+              semantic.action === "resolve" &&
+              matching.length === 1 &&
+              matching[0]?.taskId === semantic.taskId &&
+              matching[0]?.status !== "resolved" &&
+              matching[0]?.revision < Number.MAX_SAFE_INTEGER
+            ) {
+              // A retained positive reviewer settlement may close this exact pending episode
+              // without another repair debit.
+              if (
+                matching[0]?.pendingSemanticRepair !== false &&
+                completion?.status === "completed"
+              )
+                semanticRepairResolution = {
+                  episodeId: matching[0].recordId,
+                  priorRevision: matching[0].revision,
+                  reviewerBindingId: run!.recordId,
+                  reviewerGeneration: run!.generation,
+                  receiptId: completion.joinedReceiptId,
+                };
+              semanticRepairEpisode = {
+                ...matching[0],
+                status: "resolved",
+                pendingSemanticRepair: false,
+                revision: matching[0].revision + 1,
+                updatedAt: at,
+              };
+            }
+          }
+        }
+      }
       const parentProgress =
         completion?.status === "completed"
           ? prepareReviewCriterionProgress({
@@ -614,6 +905,15 @@ export const decideProjectTeamGuidedTransition = (
                   r.kind === "repair-episode" && r.recordId === failureEpisode!.recordId,
               )?.revision ?? 0,
             ]),
+        ...(semanticRepairEpisode === undefined
+          ? []
+          : [
+              records().find(
+                (record): record is Episode =>
+                  record.kind === "repair-episode" &&
+                  record.recordId === semanticRepairEpisode!.recordId,
+              )?.revision ?? 0,
+            ]),
         ...effects.map((r) => r.revision),
         ...writers.map((r) => r.revision),
         ...(completion?.status === "completed"
@@ -630,6 +930,15 @@ export const decideProjectTeamGuidedTransition = (
         reject("Joined review attention task revision is exhausted");
       if (failureAttention && task.revision > Number.MAX_SAFE_INTEGER - 2)
         reject("Joined Pi failure attention task revision is exhausted");
+      const semanticTarget =
+        semanticRepairEscalation === undefined || semantic === undefined
+          ? undefined
+          : state.tasks.find((candidate) => candidate.taskId === semantic.taskId);
+      if (
+        semanticRepairEscalation !== undefined &&
+        (semanticTarget === undefined || semanticTarget.revision > Number.MAX_SAFE_INTEGER - 1)
+      )
+        reject("Semantic repair escalation task revision is exhausted");
       const eventCount =
         1 +
         parentProgress.length +
@@ -643,7 +952,9 @@ export const decideProjectTeamGuidedTransition = (
               ? 1
               : 0) +
         (attention ? 1 : 0) +
-        (failureAttention ? 3 : 0);
+        (failureAttention ? 3 : 0) +
+        (semanticRepairEpisode === undefined ? 0 : 1) +
+        (semanticRepairEscalation === undefined ? 0 : 1);
       if (
         !Number.isSafeInteger(state.revision) ||
         state.revision < 0 ||
@@ -725,6 +1036,8 @@ export const decideProjectTeamGuidedTransition = (
         });
       }
       if (failureEpisode !== undefined) record(failureEpisode);
+      if (semanticRepairEpisode !== undefined)
+        record(semanticRepairEpisode, undefined, undefined, semanticRepairResolution);
       if (failureAttention && t.failure !== undefined)
         emit({
           type: "project-work.task.failed",
@@ -803,6 +1116,28 @@ export const decideProjectTeamGuidedTransition = (
             attribution: command.attribution,
           },
         });
+      if (
+        semanticRepairEscalation !== undefined &&
+        semanticRepairEpisode !== undefined &&
+        semantic
+      ) {
+        emit({
+          type: "project-work.task.blocked",
+          taskId: semantic.taskId,
+          blockedAt: at,
+          occurredAt: at,
+          blocker: {
+            blockerId: ProjectWorkBlockerId.make(id("semantic-repair-blocker")),
+            taskId: semantic.taskId,
+            reason: `Repair episode ${semanticRepairEpisode.recordId}: ${semanticRepairEscalation}. Diagnose the cause, revise scope, approve one exact repair, or abandon.`,
+            resolver: "Human diagnosis or one exact repair decision",
+            referenceIds: [semanticRepairEpisode.recordId],
+            attention: true,
+            revision: 0,
+            attribution: command.attribution,
+          },
+        });
+      }
       break;
     }
     case "claim": {

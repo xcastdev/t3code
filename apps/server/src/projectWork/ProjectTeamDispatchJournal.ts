@@ -663,6 +663,58 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       const initial = intent.compiledClaim.transition;
       if (initial?.kind !== "claim") return yield* deny("Dispatch claim is missing");
       const frozen = initial.binding;
+      const repair = initial.repair;
+      const expectedFrozen =
+        repair === undefined
+          ? frozen
+          : {
+              ...frozen,
+              authorizationGateId: projectTeamDerivedRecordId(
+                intent.compiledClaim.commandId,
+                `repair-grant:${repair.episodeId}:${frozen.generation}`,
+              ),
+            };
+      const repairGrants =
+        repair === undefined
+          ? []
+          : records.filter(
+              (record) =>
+                record.kind === "gate" && record.recordId === expectedFrozen.authorizationGateId,
+            );
+      const repairGrant = repairGrants[0];
+      const repairEpisodes =
+        repair === undefined
+          ? []
+          : records.filter(
+              (record) => record.kind === "repair-episode" && record.recordId === repair.episodeId,
+            );
+      const repairEpisode = repairEpisodes[0];
+      if (
+        repair !== undefined &&
+        ((frozen.authorizationGateId !== initial.authorizationGateId &&
+          frozen.authorizationGateId !== expectedFrozen.authorizationGateId) ||
+          binding.authorizationGateId !== expectedFrozen.authorizationGateId ||
+          binding.repairEpisodeId !== repair.episodeId ||
+          repairEpisodes.length !== 1 ||
+          repairEpisode?.kind !== "repair-episode" ||
+          repairEpisode.taskId !== binding.taskId ||
+          !repairEpisode.attemptIds.includes(binding.attemptId) ||
+          repairGrants.length !== 1 ||
+          repairGrant?.kind !== "gate" ||
+          repairGrant.gate !== "repair" ||
+          repairGrant.status !== "consumed" ||
+          repairGrant.consumedByRunId !== binding.recordId ||
+          repairGrant.consumedByCommandId !== intent.compiledClaim.commandId ||
+          repairGrant.repairAuthorization?.episodeId !== repair.episodeId ||
+          repairGrant.repairAuthorization?.inheritedGateId !== initial.authorizationGateId ||
+          repairGrant.repairAuthorization?.failureFingerprint !==
+            repairEpisode.failureFingerprint ||
+          repairGrant.repairAuthorization?.relevantRevision !== repairEpisode.relevantRevision ||
+          repairGrant.repairAuthorization?.semanticRepairNumber !== repairEpisode.semanticRepairs)
+      )
+        return yield* deny(
+          "Repair binding does not match its original grant and derived repair grant",
+        );
       if (
         binding.taskId !== frozen.taskId ||
         binding.attemptId !== frozen.attemptId ||
@@ -676,7 +728,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           revision: frozen.revision,
           updatedAt: frozen.updatedAt,
           sessionId: frozen.sessionId,
-        }) !== fingerprint(frozen)
+        }) !== fingerprint(expectedFrozen)
       )
         return yield* deny("Frozen dispatch configuration changed");
       const bindingRows = yield* sql<{
@@ -1040,12 +1092,25 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
             request.claim.commandId,
             "writable-reservation",
           );
+          if (
+            transition.repair !== undefined &&
+            binding.authorizationGateId !== transition.authorizationGateId
+          )
+            return yield* deny("Repair input binding changed its inherited authorization grant");
           const compiledClaim: typeof ProjectWorkFoundationCommitCommand.Type = {
             ...request.claim,
             transition: {
               ...transition,
               binding: {
                 ...binding,
+                ...(transition.repair === undefined
+                  ? {}
+                  : {
+                      authorizationGateId: projectTeamDerivedRecordId(
+                        request.claim.commandId,
+                        `repair-grant:${transition.repair.episodeId}:${binding.generation}`,
+                      ),
+                    }),
                 configuration: {
                   ...binding.configuration,
                   maxTokens: limits.attemptMaximumTokens,
