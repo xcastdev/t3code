@@ -26,6 +26,7 @@ import {
   type PiSessionTerminal,
 } from "./PiSessionRuntime.ts";
 import type { PiModelRequestSettlement } from "./PiModelBroker.ts";
+import { piManagedModelRoute } from "./PiManagedModels.ts";
 import type { PiWorkerFrame } from "./PiWorkerProtocol.ts";
 
 const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -134,7 +135,7 @@ function fixture(
       workerId: "worker",
       generation: 7,
       operationId: "operation",
-      routeId: "ling-free",
+      routeId: piManagedModelRoute(model).routeId,
       provider: "command-code",
       model,
       endpoint: "https://api.commandcode.ai/provider/v1/chat/completions",
@@ -1074,13 +1075,15 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
             broker: {
               ...f.options.broker,
               authorizeCurrent: async (current) => {
-                if (phase === current) throw new Error("stale authority");
+                if (phase === current) throw new Error("stale authority: synthetic-parent-secret");
               },
             },
           });
           yield* runtime.run().pipe(Effect.exit);
           expect(f.terminals[0]?.outcome).toBe("failed");
           expect(f.terminals[0]?.drain?.kernel).toBe("removed");
+          expect(f.terminals[0]?.failureCode).toBe("AUTHORIZATION_REJECTED");
+          expect(json(f.terminals[0])).not.toContain("synthetic-parent-secret");
           if (phase === "beforeReserve" || phase === "beforeTransport")
             expect(f.events).not.toContain("transport");
           if (phase === "beforeReturn")

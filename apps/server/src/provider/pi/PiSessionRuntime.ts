@@ -9,8 +9,10 @@ import {
 } from "./PiManagedProcess.ts";
 import {
   makePiModelBroker,
+  PiModelBrokerError,
   type PiModelAccountingReceipt,
   type PiModelBrokerConfig,
+  type PiModelBrokerErrorCode,
 } from "./PiModelBroker.ts";
 import {
   decodePiWorkerFrame,
@@ -309,6 +311,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
         let terminal: PiSessionTerminal | undefined;
         let unresolvedPersistenceFailed = false;
         const accountingReceipts: PiModelAccountingReceipt[] = [];
+        let brokerFailureCode: PiModelBrokerErrorCode | undefined;
         const tracked = <A>(promise: Promise<A>) => {
           pending.add(promise);
           promise.then(
@@ -408,6 +411,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           let flushed = Promise.withResolvers<void>();
           const fail = (error: unknown) => {
             const first = fatal === undefined;
+            if (first && error instanceof PiModelBrokerError) brokerFailureCode = error.code;
             fatal ??= error;
             if (first && isRuntimeError(error) && error.code === "CANCELED") canceled = true;
             controller.abort();
@@ -891,7 +895,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
             native,
             drain,
             accountingReceipts: [...accountingReceipts],
-            failureCode: "OPERATION_FAILED",
+            failureCode: brokerFailureCode ?? "OPERATION_FAILED",
           };
         yield* promiseEffect(() =>
           waitSignal(

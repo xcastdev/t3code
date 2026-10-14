@@ -7057,6 +7057,8 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
             yield* settings.updateSettings({ projectTeamExecutionEnabled: true });
             const approvedAtMs = yield* Clock.currentTimeMillis;
             const subscriptionSmoke = process.env.PI_MANAGED_RUNTIME_SUBSCRIPTION_SMOKE === "1";
+            const subscriptionToolsSmoke =
+              subscriptionSmoke && process.env.PI_MANAGED_RUNTIME_SUBSCRIPTION_TOOLS_SMOKE === "1";
             const subscriptionFailureSmoke =
               subscriptionSmoke &&
               process.env.PI_MANAGED_RUNTIME_SUBSCRIPTION_FAILURE_SMOKE === "1";
@@ -7064,6 +7066,12 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
             const maxInputTokens = subscriptionSmoke ? 16_384 : 12_000;
             const f = yield* dispatchedRuntimeFixture({
               ...(subscriptionSmoke ? subscriptionRuntimeProfile : basicRuntimeProfile),
+              ...(subscriptionToolsSmoke
+                ? {
+                    roleTools: ["project-work.report", "pi.read", "pi.write"],
+                    toolIds: ["project-work.report", "pi.read", "pi.write"],
+                  }
+                : {}),
               role: "implementer",
               durationMs,
               maxInputTokens,
@@ -7281,13 +7289,34 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
               .mockImplementation((input) =>
                 originalSessionRuntime({
                   ...input,
+                  ...(subscriptionToolsSmoke
+                    ? {
+                        broker: {
+                          ...input.broker,
+                          requiredSystemText: input.transferTexts.find(
+                            (transfer) => transfer.transferId === "context",
+                          )!.text,
+                          // This fixture checks the SDK text boundary; mailbox SQL is separate.
+                          bindRequestInput: async () => {},
+                        },
+                      }
+                    : {}),
                   onWorkerFrame: async (frame, signal) => {
                     // Force native exit to overtake buffered receipt processing.
                     if (subscriptionSmoke && frame.message.type === "native")
                       await nativeLauncherExited.promise;
                     await input.onWorkerFrame?.(frame, signal);
                   },
-                }),
+                }).pipe(
+                  Effect.tapCause((cause) =>
+                    fs
+                      .writeFileString(
+                        evidence + "/session-configuration-failure.txt",
+                        Cause.pretty(cause),
+                      )
+                      .pipe(Effect.orDie),
+                  ),
+                ),
               );
             yield* Effect.addFinalizer(() => Effect.sync(() => raceSpy.mockRestore()));
             const runtime = yield* makePiManagedRuntimeLive({
