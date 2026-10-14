@@ -357,7 +357,7 @@ export const decideProjectTeamGuidedTransition = (
         task.state === "in-progress" &&
         task.activeAttemptId === attempt.attemptId &&
         (attempt.state === "leased" || attempt.state === "running") &&
-        run.status === "running" &&
+        (run.status === "running" || run.status === "quarantined") &&
         memberships.length === 1 &&
         membership?.kind === "task-membership" &&
         membership.status === "active" &&

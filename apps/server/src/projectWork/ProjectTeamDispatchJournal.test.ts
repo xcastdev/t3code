@@ -2113,71 +2113,116 @@ it.effect("joined settlement atomically closes binding, writer, effects and acti
   ),
 );
 
+for (const bindingStatus of ["running", "quarantined"] as const)
+  it.effect(
+    `joined ${bindingStatus} Pi failure reflects once with the allowance frozen by the original dispatch`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture;
+          const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
+          let preparedAllowance: number | undefined;
+          let preparations = 0;
+          const initializedState = yield* readCurrentState(f.sql, projectId);
+          const binding = initializedState.foundationRecords?.find((r) => r.kind === "run-binding");
+          if (binding?.kind !== "run-binding") return yield* Effect.die("Missing original binding");
+          yield* f.repository.execute(
+            yield* decodeCommit({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: "pi-native-fixture",
+              expectedRevision: initializedState.revision,
+              records: [{ ...binding, status: bindingStatus, revision: binding.revision + 1 }],
+              committedAt: at,
+              attribution: {
+                actor: { kind: "system", id: "pi-runtime" },
+                source: { kind: "system", id: "pi-runtime" },
+                recordedAt: at,
+              },
+            }),
+          );
+          const journal = yield* makeProjectTeamDispatchJournal({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 4,
+            verifyStage: () => Effect.void,
+            verifySettlement: () => Effect.void,
+            prepareFailure: (snapshot) => {
+              preparations++;
+              preparedAllowance = Math.min(
+                snapshot.intent.limits.repairAllowance,
+                snapshot.intent.rootCaps.repairAllowance,
+              );
+              return Effect.succeed({
+                fingerprint: "e".repeat(64),
+                operationId: "original-pi-operation",
+              });
+            },
+          });
+          const settled = yield* journal.settleAfterJoined(claimed.fence, joinedReceipt);
+          const state = yield* readCurrentState(f.sql, projectId);
+          const episode = state.foundationRecords?.find((r) => r.kind === "repair-episode");
+          expect(preparations).toBe(1);
+          expect(episode).toMatchObject({
+            failureFingerprint: "e".repeat(64),
+            allowance: preparedAllowance,
+            semanticRepairs: 0,
+            pendingSemanticRepair: false,
+            transportRetries: 0,
+            timeoutCount: 0,
+          });
+          expect(state.tasks[0]).toMatchObject({ state: "blocked", failureKind: "manual-triage" });
+          expect(state.blockers.some((blocker) => blocker.attention)).toBe(true);
+          const revision = state.revision;
+          expect((yield* journal.settleAfterJoined(claimed.fence, joinedReceipt)).duplicate).toBe(
+            true,
+          );
+          expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(revision);
+          expect(preparations).toBe(1);
+          expect((yield* journal.readRetained(f.request.dispatchId)).fence).toEqual(settled.fence);
+        }),
+      ),
+  );
+
 it.effect(
-  "joined Pi failure reflects once with the allowance frozen by the original dispatch",
+  "quarantined joined settlement without qualified Pi failure proof adds no attention",
   () =>
     scoped(
       Effect.gen(function* () {
         const f = yield* fixture;
         const claimed = yield* f.journal.claimEffect((yield* f.journal.reserve(f.request)).fence);
-        let preparedAllowance: number | undefined;
-        let preparations = 0;
-        const initializedState = yield* readCurrentState(f.sql, projectId);
-        const binding = initializedState.foundationRecords?.find((r) => r.kind === "run-binding");
+        const initial = yield* readCurrentState(f.sql, projectId);
+        const binding = initial.foundationRecords?.find((record) => record.kind === "run-binding");
         if (binding?.kind !== "run-binding") return yield* Effect.die("Missing original binding");
         yield* f.repository.execute(
           yield* decodeCommit({
             type: "project-work.foundation.commit",
             projectId,
-            commandId: "pi-native-fixture",
-            expectedRevision: initializedState.revision,
-            records: [{ ...binding, status: "running", revision: binding.revision + 1 }],
+            commandId: "pi-unqualified-quarantine-fixture",
+            expectedRevision: initial.revision,
+            records: [{ ...binding, status: "quarantined", revision: binding.revision + 1 }],
             committedAt: at,
-            attribution: {
-              actor: { kind: "system", id: "pi-runtime" },
-              source: { kind: "system", id: "pi-runtime" },
-              recordedAt: at,
-            },
+            attribution,
           }),
         );
+        let preparations = 0;
         const journal = yield* makeProjectTeamDispatchJournal({
           environmentId: "environment",
           maximumEnvironmentModelCalls: 4,
           verifyStage: () => Effect.void,
           verifySettlement: () => Effect.void,
-          prepareFailure: (snapshot) => {
+          prepareFailure: () => {
             preparations++;
-            preparedAllowance = Math.min(
-              snapshot.intent.limits.repairAllowance,
-              snapshot.intent.rootCaps.repairAllowance,
-            );
-            return Effect.succeed({
-              fingerprint: "e".repeat(64),
-              operationId: "original-pi-operation",
-            });
+            return Effect.succeed(undefined);
           },
         });
-        const settled = yield* journal.settleAfterJoined(claimed.fence, joinedReceipt);
+        yield* journal.settleAfterJoined(claimed.fence, joinedReceipt);
         const state = yield* readCurrentState(f.sql, projectId);
-        const episode = state.foundationRecords?.find((r) => r.kind === "repair-episode");
         expect(preparations).toBe(1);
-        expect(episode).toMatchObject({
-          failureFingerprint: "e".repeat(64),
-          allowance: preparedAllowance,
-          semanticRepairs: 0,
-          pendingSemanticRepair: false,
-          transportRetries: 0,
-          timeoutCount: 0,
-        });
-        expect(state.tasks[0]).toMatchObject({ state: "blocked", failureKind: "manual-triage" });
-        expect(state.blockers.some((blocker) => blocker.attention)).toBe(true);
-        const revision = state.revision;
-        expect((yield* journal.settleAfterJoined(claimed.fence, joinedReceipt)).duplicate).toBe(
-          true,
+        expect(state.foundationRecords?.some((record) => record.kind === "repair-episode")).toBe(
+          false,
         );
-        expect((yield* readCurrentState(f.sql, projectId)).revision).toBe(revision);
-        expect(preparations).toBe(1);
-        expect((yield* journal.readRetained(f.request.dispatchId)).fence).toEqual(settled.fence);
+        expect(state.tasks[0]?.failureKind).not.toBe("manual-triage");
+        expect(state.blockers.some((blocker) => blocker.attention)).toBe(false);
       }),
     ),
 );

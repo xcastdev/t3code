@@ -9,6 +9,7 @@ import {
   ProjectWorkCriterionId,
   ProjectWorkEvidenceId,
   ProjectWorkAttemptId,
+  ProjectWorkBlockerId,
   ProviderInstanceId,
   ThreadId,
   EnvironmentId,
@@ -2683,6 +2684,29 @@ const reviewSettlementFixture = () => {
   };
   return { state, command, proof, binding, parent };
 };
+const quarantinedReviewSettlementFixture = () => {
+  const f = reviewSettlementFixture();
+  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+  const binding = {
+    ...f.binding,
+    status: "quarantined" as const,
+    revision: f.binding.revision + 1,
+  };
+  const state: ProjectWorkReducerState = {
+    ...f.state,
+    revision: f.state.revision + 1,
+    foundationRecords: f.state.foundationRecords!.map((record) =>
+      record.recordId === binding.recordId ? binding : record,
+    ),
+  };
+  const transition = { ...f.command.transition, expectedBindingRevision: binding.revision };
+  return {
+    ...f,
+    state,
+    binding,
+    command: { ...f.command, expectedRevision: state.revision, transition },
+  };
+};
 const reviewSnapshotHash = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
 
@@ -2929,67 +2953,71 @@ it("trusted review settlement retains denied child attention after stopping with
   expect(next.tasks.find((task) => task.taskId === taskId)).toEqual(f.parent);
 });
 
-it("joined quarantined Pi failure blocks only the original active task with its frozen allowance", () => {
-  const f = reviewSettlementFixture();
-  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
-  const transition = { ...f.command.transition };
-  delete transition.reviewCompletion;
-  const next = applyProjectWorkEvents(
-    f.state,
-    decideProjectWorkCommand(f.state, {
-      ...f.command,
-      transition: {
-        ...transition,
-        failure: {
-          fingerprint: "c".repeat(64),
-          operationId: "original-pi-prompt",
-          repairAllowance: 1,
+for (const bindingStatus of ["running", "quarantined"] as const)
+  it(`joined ${bindingStatus} Pi failure blocks only the original active task with its frozen allowance`, () => {
+    const f =
+      bindingStatus === "quarantined"
+        ? quarantinedReviewSettlementFixture()
+        : reviewSettlementFixture();
+    if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+    const transition = { ...f.command.transition };
+    delete transition.reviewCompletion;
+    const next = applyProjectWorkEvents(
+      f.state,
+      decideProjectWorkCommand(f.state, {
+        ...f.command,
+        transition: {
+          ...transition,
+          failure: {
+            fingerprint: "c".repeat(64),
+            operationId: "original-pi-prompt",
+            repairAllowance: 1,
+          },
         },
-      },
-    }),
-  );
-  const episode = next.foundationRecords!.find(
-    (record): record is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
-      record.kind === "repair-episode",
-  );
-  expect(episode).toMatchObject({
-    rootTaskId: f.parent.taskId,
-    failureFingerprint: "c".repeat(64),
-    allowance: 1,
-    semanticRepairs: 0,
-    pendingSemanticRepair: false,
-    transportRetries: 0,
-    timeoutCount: 0,
+      }),
+    );
+    const episode = next.foundationRecords!.find(
+      (record): record is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        record.kind === "repair-episode",
+    );
+    expect(episode).toMatchObject({
+      rootTaskId: f.parent.taskId,
+      failureFingerprint: "c".repeat(64),
+      allowance: 1,
+      semanticRepairs: 0,
+      pendingSemanticRepair: false,
+      transportRetries: 0,
+      timeoutCount: 0,
+    });
+    expect(next.tasks.find((task) => task.taskId === f.binding.taskId)).toMatchObject({
+      state: "blocked",
+      failureKind: "manual-triage",
+    });
+    expect(
+      next.tasks.find((task) => task.taskId === f.binding.taskId)?.activeAttemptId,
+    ).toBeUndefined();
+    expect(next.attempts.find((attempt) => attempt.attemptId === f.binding.attemptId)?.state).toBe(
+      "failed",
+    );
+    expect(next.blockers).toContainEqual(
+      expect.objectContaining({
+        taskId: f.binding.taskId,
+        attention: true,
+        referenceIds: [episode!.recordId, "original-pi-prompt"],
+      }),
+    );
+    expect(
+      next.foundationRecords!.some(
+        (record) => record.kind === "effect" && record.effectKind === "stop",
+      ),
+    ).toBe(false);
+    expect(
+      next.foundationRecords!.find((record) => record.recordId === f.binding.recordId)?.status,
+    ).toBe("settled");
   });
-  expect(next.tasks.find((task) => task.taskId === f.binding.taskId)).toMatchObject({
-    state: "blocked",
-    failureKind: "manual-triage",
-  });
-  expect(
-    next.tasks.find((task) => task.taskId === f.binding.taskId)?.activeAttemptId,
-  ).toBeUndefined();
-  expect(next.attempts.find((attempt) => attempt.attemptId === f.binding.attemptId)?.state).toBe(
-    "failed",
-  );
-  expect(next.blockers).toContainEqual(
-    expect.objectContaining({
-      taskId: f.binding.taskId,
-      attention: true,
-      referenceIds: [episode!.recordId, "original-pi-prompt"],
-    }),
-  );
-  expect(
-    next.foundationRecords!.some(
-      (record) => record.kind === "effect" && record.effectKind === "stop",
-    ),
-  ).toBe(false);
-  expect(
-    next.foundationRecords!.find((record) => record.recordId === f.binding.recordId)?.status,
-  ).toBe("settled");
-});
 
 it("joined Pi failure rejects aggregate revision overflow before recording any settlement", () => {
-  const f = reviewSettlementFixture();
+  const f = quarantinedReviewSettlementFixture();
   if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
   const transition = { ...f.command.transition };
   delete transition.reviewCompletion;
@@ -3017,9 +3045,9 @@ it("joined Pi failure rejects aggregate revision overflow before recording any s
   expect(canonicalProjectWorkPayload(state)).toBe(before);
 });
 
-for (const controlState of ["paused", "canceled"] as const)
+for (const controlState of ["paused", "canceled", "reassigned"] as const)
   it(`joined quarantined Pi failure does not override intentional ${controlState} control`, () => {
-    const f = reviewSettlementFixture();
+    const f = quarantinedReviewSettlementFixture();
     if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
     const transition = { ...f.command.transition };
     delete transition.reviewCompletion;
@@ -3027,10 +3055,14 @@ for (const controlState of ["paused", "canceled"] as const)
       (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
     );
     if (membership?.kind !== "task-membership") throw new Error("Membership fixture required");
-    const state = {
+    const state: ProjectWorkReducerState = {
       ...f.state,
       foundationRecords: f.state.foundationRecords!.map((record) =>
-        record.recordId === membership.recordId ? { ...membership, controlState } : record,
+        record.recordId === membership.recordId
+          ? controlState === "reassigned"
+            ? { ...membership, requestedSuccessorMemberId: "replacement-reviewer" }
+            : { ...membership, controlState }
+          : record,
       ),
     };
     const next = applyProjectWorkEvents(
@@ -3056,6 +3088,46 @@ for (const controlState of ["paused", "canceled"] as const)
       "manual-triage",
     );
   });
+
+it("joined quarantined Pi failure preserves existing task attention without duplicating it", () => {
+  const f = quarantinedReviewSettlementFixture();
+  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+  const transition = { ...f.command.transition };
+  delete transition.reviewCompletion;
+  const existingBlocker = {
+    blockerId: ProjectWorkBlockerId.make("preexisting-pi-attention"),
+    taskId: f.binding.taskId,
+    reason: "Existing operator attention",
+    resolver: "Resolve the retained blocker",
+    referenceIds: ["prior-evidence"],
+    attention: true,
+    revision: 0,
+    attribution: f.command.attribution,
+  };
+  const state: ProjectWorkReducerState = {
+    ...f.state,
+    blockers: [...f.state.blockers, existingBlocker],
+  };
+  const next = applyProjectWorkEvents(
+    state,
+    decideProjectWorkCommand(state, {
+      ...f.command,
+      transition: {
+        ...transition,
+        failure: {
+          fingerprint: "f".repeat(64),
+          operationId: "original-pi-prompt",
+          repairAllowance: 1,
+        },
+      },
+    }),
+  );
+  expect(next.blockers).toEqual(state.blockers);
+  expect(next.foundationRecords!.some((record) => record.kind === "repair-episode")).toBe(false);
+  expect(next.tasks.find((task) => task.taskId === f.binding.taskId)?.failureKind).not.toBe(
+    "manual-triage",
+  );
+});
 
 it("trusted review settlement rejects an unfinished child deliverable of the review task", () => {
   const f = reviewSettlementFixture();

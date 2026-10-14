@@ -1959,7 +1959,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
             task.state === "in-progress" &&
             task.activeAttemptId === attempt.attemptId &&
             (attempt.state === "leased" || attempt.state === "running") &&
-            binding.status === "running" &&
+            (binding.status === "running" || binding.status === "quarantined") &&
             membership?.length === 1 &&
             membership[0]?.kind === "task-membership" &&
             membership[0].status === "active" &&
