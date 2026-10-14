@@ -524,6 +524,9 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
     };
     let reservationId: string | undefined;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let initialRead:
+      | Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>["read"]>>
+      | undefined;
     let cancelPending: Promise<void> | undefined;
     let cancelFailed = false;
     const cancelReader = () => {
@@ -660,6 +663,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
             check();
             const first = await reader.read();
             check();
+            initialRead = first;
             const bytes = first.value;
             if (first.done && (!bytes || bytes.byteLength === 0)) {
               diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_EMPTY";
@@ -678,11 +682,10 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
                   diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_JSON_PREFIX";
                 } else if (/^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)/i.test(trimmed)) {
                   diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_HTML_PREFIX";
-                } else if (/^(?:data:|event:|id:|retry:|:)/.test(prefix)) {
-                  diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_SSE_MARKER_PREFIX";
                 } else if (
                   trimmed.length > 0 &&
                   !trimmed.startsWith("<") &&
+                  !/^(?:data:|event:|id:|retry:|:)/.test(prefix) &&
                   !["data:", "event:", "id:", "retry:"].some((marker) => marker.startsWith(prefix))
                 ) {
                   diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_OTHER_PREFIX";
@@ -693,14 +696,18 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
             }
           } catch {
             // The deadline/caller abort remains authoritative; other read errors stay indeterminate.
+            initialRead = undefined;
             check();
+            fail("TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING");
           }
-          fail(diagnostic);
+          if (diagnostic !== "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING") fail(diagnostic);
         }
-        if (contentType === "application/json") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_JSON");
-        if (contentType === "text/html") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_HTML");
-        if (contentType === "text/plain") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT");
-        fail("TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED");
+        if (contentType) {
+          if (contentType === "application/json") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_JSON");
+          if (contentType === "text/html") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_HTML");
+          if (contentType === "text/plain") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT");
+          fail("TRANSPORT_RESPONSE_CONTENT_TYPE_REJECTED");
+        }
       }
       controller.signal.addEventListener("abort", cancelReader, { once: true });
       if (controller.signal.aborted) cancelReader();
@@ -1057,31 +1064,31 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       };
       while (true) {
         check();
-        const read = await reader.read();
+        const read = initialRead ?? (await reader.read());
+        initialRead = undefined;
         check();
-        if (read.done) break;
-        if (responseBytes + read.value.length > PI_WORKER_MAX_RESPONSE_BYTES)
+        const chunk = read.value;
+        if (read.done && (!chunk || chunk.byteLength === 0)) break;
+        if (!chunk) fail("TRANSPORT_RESPONSE_BODY_MISSING");
+        if (responseBytes + chunk.length > PI_WORKER_MAX_RESPONSE_BYTES)
           fail("RESPONSE_BYTE_LIMIT");
-        responseBytes += read.value.length;
+        responseBytes += chunk.length;
         // Scan bounded slices before retention, including echoes across transport read boundaries.
-        for (let start = 0; start < read.value.length; start += PI_WORKER_MAX_CHUNK_BYTES) {
-          rawTail = scanSecret(
-            rawTail,
-            read.value.subarray(start, start + PI_WORKER_MAX_CHUNK_BYTES),
-          );
+        for (let start = 0; start < chunk.length; start += PI_WORKER_MAX_CHUNK_BYTES) {
+          rawTail = scanSecret(rawTail, chunk.subarray(start, start + PI_WORKER_MAX_CHUNK_BYTES));
           if (accountSecret.length > 0)
             rawAccountTail = scanSecret(
               rawAccountTail,
-              read.value.subarray(start, start + PI_WORKER_MAX_CHUNK_BYTES),
+              chunk.subarray(start, start + PI_WORKER_MAX_CHUNK_BYTES),
               accountSecret,
             );
         }
-        for (let offset = 0; offset < read.value.length;) {
-          const newline = read.value.indexOf(10, offset);
-          const end = newline < 0 ? read.value.length : newline + 1;
+        for (let offset = 0; offset < chunk.length;) {
+          const newline = chunk.indexOf(10, offset);
+          const end = newline < 0 ? chunk.length : newline + 1;
           const size = end - offset;
           if (length + size > line.length) fail("SSE_FRAME_BYTE_LIMIT");
-          line.set(read.value.subarray(offset, end), length);
+          line.set(chunk.subarray(offset, end), length);
           length += size;
           if (newline >= 0) {
             await consume(line.subarray(0, length));
@@ -1089,6 +1096,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
           }
           offset = end;
         }
+        if (read.done) break;
       }
       if (length !== 0 || !done || !usage || !reportedModel) fail("SSE_ACCOUNTING_REQUIRED");
       await flush(true);

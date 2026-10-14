@@ -1273,7 +1273,7 @@ describe("SDK subscription request header parity", () => {
       transport: async (_url, init) => {
         parentHeaders = new Headers(init.headers);
         parentBody = JSON.parse(init.body);
-        return new Response(response, { headers: { "content-type": "text/event-stream" } });
+        return new Response(new TextEncoder().encode(response));
       },
     });
     const sdk = streamCodexResponses(
@@ -1327,6 +1327,7 @@ describe("SDK subscription request header parity", () => {
     await joined;
     expect(result.errorMessage).toBeUndefined();
     expect(result.stopReason).not.toBe("error");
+    expect(result.content.some((part) => part.type === "text" && part.text === "Done")).toBe(true);
     expect(sdkHeaders).toBeDefined();
     expect(parentHeaders).toBeDefined();
     expect(parentHeaders!.get("user-agent")).toBe(sdkHeaders!.get("user-agent"));
@@ -1338,7 +1339,7 @@ describe("SDK subscription request header parity", () => {
     expect(parentHeaders!.get("x-worker-only")).toBeNull();
     expect(parentBody).toEqual(sdkBody);
     expect(f.reservations).toHaveLength(1);
-    expect(f.settlements).toHaveLength(1);
+    expect(f.settlements).toMatchObject([{ outcome: "reported", transportDrained: true }]);
   });
 
   it.each(["absent", "empty"] as const)(
@@ -1393,6 +1394,38 @@ const prefixFixture = (
   return { ...f, prefixTransportCalls: () => calls };
 };
 
+it.each(["complete", "one-byte fragments"] as const)(
+  "validates and accounts subscription SSE without MIME: %s",
+  async (fragmentation) => {
+    const bytes = new TextEncoder().encode(success().replace(/^event:.*\n/gm, ""));
+    const f = prefixFixture({
+      transport: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              const size = fragmentation === "complete" ? bytes.length : 1;
+              for (let offset = 0; offset < bytes.length; offset += size)
+                controller.enqueue(bytes.slice(offset, offset + size));
+              controller.close();
+            },
+          }),
+        ),
+    });
+    const receipt = await f.invoke();
+    expect(receipt.usage).toMatchObject({ prompt_tokens: 50, completion_tokens: 10 });
+    expect(f.prefixTransportCalls()).toBe(1);
+    expect(Buffer.concat(f.chunks).toString()).toContain("bounded result");
+    expect(f.settlements).toMatchObject([
+      {
+        outcome: "reported",
+        transportDrained: true,
+        chargedInputTokens: 50,
+        chargedOutputTokens: 10,
+      },
+    ]);
+  },
+);
+
 const missingMimePrefixes = [
   [
     "JSON",
@@ -1405,16 +1438,59 @@ const missingMimePrefixes = [
     "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_HTML_PREFIX",
   ],
   [
-    "SSE marker",
-    new TextEncoder().encode("data: {"),
-    "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_SSE_MARKER_PREFIX",
-  ],
-  [
     "other text",
     new TextEncoder().encode("synthetic-proxy-response"),
     "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_OTHER_PREFIX",
   ],
 ] as const;
+
+it.each([
+  [
+    "foreign model",
+    success().replaceAll(`"model":"${model}"`, '"model":"foreign-model"'),
+    "SSE_MODEL_REJECTED",
+  ],
+  [
+    "missing terminal usage",
+    success().replace(/event: response\.completed\ndata:.*\n\n$/, ""),
+    "SSE_ACCOUNTING_REQUIRED",
+  ],
+  [
+    "credential echo",
+    success().replace('"delta":"bounded result"', `"delta":"${credential}"`),
+    "CREDENTIAL_ECHO_REJECTED",
+  ],
+] as const)(
+  "parses missing-MIME SSE candidates through validation (%s)",
+  async (_name, data, code) => {
+    const f = prefixFixture({
+      transport: async () => new Response(new TextEncoder().encode(data)),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code });
+    expect(f.prefixTransportCalls()).toBe(1);
+    expect(f.chunks).toHaveLength(0);
+    expect(f.settlements).toMatchObject([
+      { failureCode: code, outcome: "unknown", transportDrained: true },
+    ]);
+    expect(JSON.stringify(f.settlements)).not.toContain(data);
+    expect(JSON.stringify(f.settlements)).not.toContain(credential);
+  },
+);
+
+it("continues to reject a nonempty wrong MIME type", async () => {
+  const f = prefixFixture({
+    transport: async () => new Response(success(), { headers: { "content-type": "text/plain" } }),
+  });
+  await expect(f.invoke()).rejects.toMatchObject({ code: "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT" });
+  expect(f.chunks).toHaveLength(0);
+  expect(f.settlements).toMatchObject([
+    {
+      failureCode: "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT",
+      outcome: "unknown",
+      transportDrained: true,
+    },
+  ]);
+});
 
 it.each(missingMimePrefixes)(
   "retains only the bounded missing-MIME %s prefix category",
@@ -1468,35 +1544,66 @@ it("retains EMPTY only for a completed empty missing-MIME body", async () => {
   });
 });
 
-it.each([
-  ["malformed UTF-8", new Uint8Array([0xff, 0xfe])],
-  ["whitespace only", new TextEncoder().encode(" \n\t")],
-  ["incomplete SSE marker", new TextEncoder().encode("da")],
-  ["incomplete HTML marker", new TextEncoder().encode("<!doctype htm")],
-  ["oversized first chunk", new Uint8Array(PI_WORKER_MAX_CHUNK_BYTES + 1).fill(123)],
-] as const)("keeps indeterminate missing-MIME %s at the original code", async (_name, bytes) => {
+it("retains the fixed diagnostic when the initial missing-MIME body read fails", async () => {
   const f = prefixFixture({
     transport: async () =>
       new Response(
         new ReadableStream<Uint8Array>({
           start(controller) {
-            controller.enqueue(bytes);
-            controller.close();
+            controller.error(new Error("synthetic private transport failure"));
           },
         }),
       ),
   });
   await expect(f.invoke()).rejects.toMatchObject({
     code: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING",
+    message: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING",
   });
-  expect(f.chunks).toHaveLength(0);
   expect(f.prefixTransportCalls()).toBe(1);
-  expect(f.settlements[0]).toMatchObject({
-    failureCode: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING",
-    outcome: "unknown",
-    transportDrained: true,
-  });
+  expect(f.chunks).toHaveLength(0);
+  expect(f.settlements).toMatchObject([
+    { outcome: "unknown", failureCode: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING" },
+  ]);
+  expect(JSON.stringify(f.settlements)).not.toContain("synthetic private transport failure");
 });
+
+it.each([
+  ["malformed UTF-8", new Uint8Array([0xff, 0xfe]), "SSE_ACCOUNTING_REQUIRED"],
+  ["whitespace only", new TextEncoder().encode(" \n\t"), "SSE_FRAME_INVALID"],
+  ["malformed data marker", new TextEncoder().encode("data: {"), "SSE_ACCOUNTING_REQUIRED"],
+  ["fragmented data marker", new TextEncoder().encode("da"), "SSE_ACCOUNTING_REQUIRED"],
+  ["incomplete HTML marker", new TextEncoder().encode("<!doctype htm"), "SSE_ACCOUNTING_REQUIRED"],
+  [
+    "oversized first chunk",
+    new Uint8Array(PI_WORKER_MAX_CHUNK_BYTES + 1).fill(123),
+    "SSE_ACCOUNTING_REQUIRED",
+  ],
+] as const)(
+  "replays indeterminate missing-MIME %s into the bounded parser",
+  async (_name, bytes, code) => {
+    const f = prefixFixture({
+      transport: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(bytes);
+              controller.close();
+            },
+          }),
+        ),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({
+      code,
+    });
+    expect(f.chunks).toHaveLength(0);
+    expect(f.prefixTransportCalls()).toBe(1);
+    expect(f.settlements[0]).toMatchObject({
+      failureCode: code,
+      outcome: "unknown",
+      transportDrained: true,
+    });
+  },
+);
 
 it("cancels and awaits a pending missing-MIME prefix read at its original deadline", async () => {
   const readEntered = deferred<void>();
