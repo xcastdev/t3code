@@ -8042,6 +8042,7 @@ for (const compactProof of [
   "memorySharedRoot",
   "memoryPipeline",
   "memoryCompanionIndex",
+  "memoryCompanionSharedRoot",
   "memoryCompanionQuery",
   "memoryCompanionRecovery",
   "memoryCompanionCapture",
@@ -8117,7 +8118,9 @@ for (const compactProof of [
           const lateSecret = 'controlled-memory-"key\\tail';
           const companionProof = compactProof?.startsWith("memoryCompanion") === true;
           const pipelineProof =
-            compactProof === "memoryPipeline" || compactProof === "memoryCompanionIndex";
+            compactProof === "memoryPipeline" ||
+            compactProof === "memoryCompanionIndex" ||
+            compactProof === "memoryCompanionSharedRoot";
           const memoryProof = compactProof?.startsWith("memory") === true;
           const accountingProof =
             compactProof === "memoryAccounting" || compactProof === "memorySharedRoot";
@@ -8209,7 +8212,7 @@ for (const compactProof of [
             | undefined;
           const f = yield* requiredTransferFixture(
             false,
-            compactProof === "memorySharedRoot",
+            compactProof === "memorySharedRoot" || compactProof === "memoryCompanionSharedRoot",
             undefined,
             memoryProof,
             compactProof === "memoryQueryNoGrant"

@@ -749,7 +749,8 @@ export const makeProjectMemoryCompanionJournal = Effect.fn("makeProjectMemoryCom
               kernel: string | null;
             }>`SELECT CASE WHEN length(CAST(json_extract(drain_json,'$.kernel') AS BLOB))<=4096 THEN json_extract(drain_json,'$.kernel') END AS kernel FROM project_task_resource_child
         WHERE unit=${original.intent.allocation.unit} AND nonce=${original.intent.allocation.nonce}
-        AND environment_id=${environmentId} AND project_id=${projectId} AND task_id=${original.intent.owner.operation.taskId}
+        AND environment_id=${environmentId} AND project_id=${projectId}
+        AND (task_id=${original.intent.owner.operation.rootTaskId} OR task_id=${original.intent.owner.operation.taskId})
         AND authority_kind='memory-companion' AND authority_id=${original.intent.invocationId}
         AND length(CAST(allocation_json AS BLOB))<=262144 AND allocation_json=${encode(original.intent.allocation)}
         AND length(CAST(owner_json AS BLOB))<=16384 AND owner_json=${encode(original.owner)}

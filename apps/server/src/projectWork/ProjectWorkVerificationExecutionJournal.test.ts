@@ -109,7 +109,7 @@ const makeFixture = Effect.fn("makeExecutionJournalFixture")(function* (
   // Controlled custody fixture supplies the prior frozen task budget. Production
   // verification cannot originate or renew this budget when no Pi owner retained it.
   if (retainTaskBudget)
-    yield* f.sql`INSERT INTO project_task_resource_budget VALUES('environment',${f.selection.projectId},${f.selection.taskId},${intent.deadlineAtMs + 300000},2147483648)`;
+    yield* f.sql`INSERT INTO project_task_resource_budget VALUES('environment',${f.selection.projectId},${f.snapshot.intent.limits.rootTaskId},${f.snapshot.intent.limits.rootDeadlineAtMs},2147483648)`;
   const approval = yield* makeProjectWorkVerificationGate({
     environmentId: "environment",
     maximumEnvironmentModelCalls: 4,

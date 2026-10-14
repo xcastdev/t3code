@@ -676,6 +676,8 @@ export const makeProjectTeamWorkspace = Effect.fn("makeProjectTeamWorkspace")(fu
   });
   const recovery = makeProjectManagedSetup({
     ...setupJournal,
+    read: (input) =>
+      setupJournal.readOwnership(input).pipe(Effect.map((value) => value?.retained ?? null)),
     resolveSelection: () =>
       Effect.fail(new ProjectManagedSetupError({ reason: "Recovery cannot select a script" })),
     preallocate: preallocatePiManagedProcess,

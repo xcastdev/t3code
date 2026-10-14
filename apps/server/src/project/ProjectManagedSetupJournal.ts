@@ -31,6 +31,24 @@ const inputSchema = Schema.Struct({
   worktreePath: id,
   deadlineAtMs: positive,
 });
+const decodeCleanupDispatch = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      request: Schema.Struct({
+        setupId: id,
+        dispatchId: id,
+        git: Schema.Struct({ runId: id, generation: safe, worktreePath: id }),
+      }),
+      compiledClaim: Schema.Struct({
+        transition: Schema.Struct({
+          kind: Schema.Literal("claim"),
+          binding: Schema.Struct({ threadId: id }),
+        }),
+      }),
+      limits: Schema.Struct({ deadlineAtMs: positive }),
+    }),
+  ),
+);
 const launch = Schema.Struct({
   workspaceRoot: id,
   workspaceAccess: Schema.optional(Schema.Literals(["readonly", "readwrite"])),
@@ -274,6 +292,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
     const dispatch = yield* makeProjectTeamDispatchJournal(options);
     const read = Effect.fn("ProjectManagedSetupJournal.read")(function* (
       raw: ProjectManagedSetupInput,
+      cleanup = false,
     ) {
       const input = yield* decodeInput(raw);
       const rows = yield* sql`SELECT setup.* FROM project_team_setup_process setup
@@ -282,14 +301,31 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
       if (!rows[0]) return null;
       if (rows.length !== 1) return yield* failure("Setup identity is ambiguous");
       const row = yield* decodeRow(rows[0]);
-      if (!row.input_json)
-        return yield* failure(
-          "Legacy setup retains cleanup knowledge; launch input is unavailable",
-        );
-      if (
-        row.dispatch_id !== input.dispatchId ||
-        !same(yield* decodeInputJson(row.input_json), input)
-      )
+      if (row.dispatch_id !== input.dispatchId)
+        return yield* failure("Setup input does not match its original assignment");
+      if (row.input_json === null) {
+        if (!cleanup)
+          return yield* failure(
+            "Legacy setup retains cleanup knowledge; launch input is unavailable",
+          );
+        // An immutable original dispatch authenticates cleanup identity, without re-admitting START.
+        const originals = yield* sql<{ intent: string | null }>`SELECT
+          CASE WHEN length(CAST(intent_json AS BLOB))<=1048576 THEN intent_json END AS intent
+          FROM project_team_dispatch WHERE dispatch_id=${row.dispatch_id} AND environment_id=${options.environmentId} LIMIT 2`;
+        if (originals.length !== 1 || !originals[0]?.intent)
+          return yield* failure("Legacy setup original dispatch is unavailable");
+        const original = yield* decodeCleanupDispatch(originals[0].intent);
+        if (
+          original.request.setupId !== input.setupId ||
+          original.request.dispatchId !== input.dispatchId ||
+          original.request.git.runId !== input.bindingId ||
+          original.request.git.generation !== input.generation ||
+          original.request.git.worktreePath !== input.worktreePath ||
+          original.compiledClaim.transition.binding.threadId !== input.threadId ||
+          original.limits.deadlineAtMs !== input.deadlineAtMs
+        )
+          return yield* failure("Legacy cleanup input does not match its original assignment");
+      } else if (!same(yield* decodeInputJson(row.input_json), input))
         return yield* failure("Setup input does not match its original assignment");
       const selection = yield* decodeSelection(row.selection_json);
       const allocation =
@@ -310,6 +346,8 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
         (!allocation || row.activation !== "owned" || !ownerConsistent(owner, allocation))
       )
         return yield* failure("Retained setup owner is inconsistent");
+      if (row.input_json === null && (!allocation || !owner || row.activation !== "owned"))
+        return yield* failure("Legacy cleanup requires its original captured owner");
       const retained: ProjectManagedSetupRetained = {
         selection,
         allocation,
@@ -540,7 +578,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
       const drainJson = receipt.drain === null ? null : yield* bounded(receipt.drain);
       yield* sql.withTransaction(
         Effect.gen(function* () {
-          const old = yield* read(input);
+          const old = yield* read(input, receipt.outcome === "failed");
           if (
             !old ||
             !isProjectManagedSetupReceiptValid({ ...old.retained, receipt }) ||
@@ -568,7 +606,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
           const status = receiptStatus(receipt);
           yield* sql`UPDATE project_team_setup_process SET receipt_json=${receiptJson},drain_json=${drainJson},status=${status}
         WHERE setup_id=${input.setupId} AND receipt_json IS NULL`;
-          if (!same((yield* read(input))?.retained.receipt, receipt))
+          if (!same((yield* read(input, receipt.outcome === "failed"))?.retained.receipt, receipt))
             return yield* failure("Setup completion receipt did not commit");
         }).pipe(
           Effect.tap(() =>
@@ -587,7 +625,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
       const knowledge = yield* bounded(decoded);
       yield* sql.withTransaction(
         Effect.gen(function* () {
-          const old = yield* read(input);
+          const old = yield* read(input, true);
           if (!old || !held.expected)
             return yield* failure("Uncertainty has no original setup snapshot");
           const { uncertain: _uncertain, ...actual } = old.retained;
@@ -653,7 +691,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
         sql
           .withTransaction(
             Effect.gen(function* () {
-              const retained = yield* read(input);
+              const retained = yield* read(input, true);
               if (!retained || !same(retained.retained.allocation, allocation))
                 return yield* failure("Setup cleanup has no original allocation");
               yield* taskResources.setup(input.setupId, allocation).cleanupDrain(drain);
@@ -671,7 +709,7 @@ export const makeProjectManagedSetupJournal = Effect.fn("makeProjectManagedSetup
       markUncertain: (...args: Parameters<typeof markUncertain>) =>
         markUncertain(...args).pipe(Effect.mapError(setupError)),
       readOwnership: (input: ProjectManagedSetupInput) =>
-        read(input).pipe(
+        read(input, true).pipe(
           Effect.map((value) =>
             value === null
               ? null
