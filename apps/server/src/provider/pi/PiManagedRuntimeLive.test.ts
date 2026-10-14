@@ -1,6 +1,10 @@
 import { vi } from "vite-plus/test";
 import * as SessionRuntime from "./PiSessionRuntime.ts";
 import * as ManagedProcess from "./PiManagedProcess.ts";
+import * as RuntimeLive from "./PiManagedRuntimeLive.ts";
+import { makePiProductionRuntime } from "./PiProductionRuntime.ts";
+import { PiModelCatalogue } from "./PiModelCatalogue.ts";
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import {
@@ -6137,6 +6141,8 @@ type RuntimeFixtureProfile = {
   readonly ownedScratchDirectory?: string;
   readonly physicalWorkspace?: boolean;
   readonly model?: string;
+  /** Two human-approved planning children; controlled parent receipts, real child SDK in the opt-in case. */
+  readonly nativePlanningSiblings?: boolean;
 };
 const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   reviewer = false,
@@ -6363,7 +6369,10 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
               toolIds: [...profile.toolIds],
               skillIds: [...profile.skillIds],
               maxTokens: profile.maximumTokens,
-              maxDurationMs: profile.durationMs,
+              maxDurationMs:
+                profile.nativePlanningSiblings && id !== "required-root"
+                  ? 60_000
+                  : profile.durationMs,
             }
           : {}),
         ...(memory ? { toolIds: [...role.tools] } : {}),
@@ -6398,7 +6407,10 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       setupId: id + "-setup",
       initializeOperationId: id + "-initialize",
       assignmentOperationId: id + "-assignment",
-      assignment,
+      assignment:
+        profile?.nativePlanningSiblings && id !== "required-root"
+          ? `${assignment} (${id})`
+          : assignment,
     };
     const reserveStartedAtMs = yield* Clock.currentTimeMillis;
     const reserved = yield* journal.reserve(request);
@@ -6419,6 +6431,10 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
     return { request, snapshot, binding };
   });
   let retained = yield* reserve(pending, assigned, "refs/heads/required-root", "required-root");
+  const root = retained;
+  const siblings: Array<typeof retained> = [];
+  if (profile?.nativePlanningSiblings && (!child || readonlyKind !== "planning"))
+    return yield* Effect.die("Native siblings require genuine planning child authority");
   if (child) {
     const parentOperations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
     const parentRequest = {
@@ -6449,253 +6465,337 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
         resourceHash: piManagedSkillResourceIdentity([]),
       },
     );
-    yield* parentOperations.persistNative(parent, {
+    const parentNative = {
       sessionId: "required-parent-session",
       sessionReference: "sessions/parent.jsonl",
       leafId: null,
       persisted: false,
-    });
-    yield* sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${parent.operation.operationId}`;
-    if (readonlyKind !== undefined) {
-      let state = yield* readCurrentState(sql, projectId);
-      const parentTask = state.tasks.find((task) => task.taskId === retained.binding.taskId);
-      const specification = state.foundationRecords?.find(
-        (record) =>
-          record.kind === "gate" &&
-          record.taskId === parentTask?.taskId &&
-          record.gate === "specification",
-      );
-      const plan = state.foundationRecords?.find(
-        (record) => record.kind === "plan-revision" && record.taskId === parentTask?.taskId,
-      );
-      const planGate = state.foundationRecords?.find(
-        (record) =>
-          record.kind === "gate" && record.taskId === parentTask?.taskId && record.gate === "plan",
-      );
-      if (
-        !parentTask ||
-        specification?.kind !== "gate" ||
-        plan?.kind !== "plan-revision" ||
-        planGate?.kind !== "gate"
-      )
-        return yield* Effect.die("Missing real retained parent scope");
-      const human = {
-        actor: { kind: "human", id: "readonly-runtime-human" },
-        source: { kind: "web", id: "readonly-runtime-browser" },
-        recordedAt: fixtureAt,
-      } as const;
-      const envelope = {
-        projectId,
-        taskId: parentTask.taskId,
-        commandId: "readonly-runtime-grant",
-        expectedRevision: state.revision,
-        expectedTaskRevision: parentTask.revision,
+    };
+    if (profile?.nativePlanningSiblings) {
+      // Parent-only controlled history: no parent SDK/process is claimed. Use the real lifecycle
+      // ports rather than changing stored authority, budgets or operation status with SQL.
+      const owner = {
+        type: "owner" as const,
+        unit: parentAllocation.unit,
+        nonce: parentAllocation.nonce,
+        invocation: "a".repeat(32),
+        cgroup: `/sys/fs/cgroup/controlled/${parentAllocation.unit}`,
+        pid: 99999999,
+        memoryBytes: parentAllocation.policy.memoryBytes,
+        swapBytes: 0 as const,
+        oomGroup: 1 as const,
       };
-      yield* repository.execute(
-        yield* decodeRequiredFoundation({
-          type: "project-work.foundation.commit",
-          projectId,
-          commandId: envelope.commandId,
-          expectedRevision: state.revision,
-          attribution: human,
-          committedAt: fixtureAt,
-          records: [],
-          guided: {
-            intent:
-              readonlyKind === "investigation"
-                ? {
-                    ...envelope,
-                    type: "project-team.investigation.start",
-                    objective: "Investigate original bounded scope",
-                    outputDescriptions: ["Sourced investigation findings"],
-                  }
-                : {
-                    ...envelope,
-                    type: "project-team.assignment.start",
-                    assignmentKind: readonlyKind,
-                    objective:
-                      readonlyKind === "planning"
-                        ? "Draft the first child plan"
-                        : "Review original approved scope",
-                    outputDescriptions: [
-                      readonlyKind === "planning"
-                        ? "Proposed first plan"
-                        : "Independent review findings",
-                    ],
-                    specRevision: parentTask.specRevision,
-                    specificationGateId: specification.recordId,
-                    expectedSpecificationGateRevision: specification.revision,
-                    parentPlan: {
-                      recordId: plan.recordId,
-                      expectedRecordRevision: plan.revision,
-                      planRevision: plan.planRevision,
-                      gateId: planGate.recordId,
-                      expectedGateRevision: planGate.revision,
-                    },
-                  },
-          },
-        }),
-      );
-      state = yield* readCurrentState(sql, projectId);
-      const grant = state.foundationRecords?.find(
-        (record) =>
-          record.kind === "gate" &&
-          record.taskId !== parentTask.taskId &&
-          (record.gate === "assignment" || record.gate === "investigation"),
-      );
-      const task = state.tasks.find(
-        (task) => task.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
-      );
-      const generatedRole = state.foundationRecords?.find(
-        (record) => record.kind === "role-revision" && record.recordId !== "role",
-      );
-      if (!task || grant?.kind !== "gate" || generatedRole?.kind !== "role-revision")
-        return yield* Effect.die("Missing real readonly child scope");
-      const roleRecord = {
-        ...generatedRole,
-        recordId: "readonly-runtime-role",
-        roleId: "readonly-runtime-role",
-        revision: 0,
-        model: selectedModel,
-        delegationDepth: role.delegationDepth,
-      };
-      yield* repository.execute(
-        yield* decodeRequiredFoundation({
-          type: "project-work.foundation.commit",
-          projectId,
-          commandId: "readonly-runtime-configure",
-          expectedRevision: state.revision,
-          attribution: human,
-          committedAt: fixtureAt,
-          records: [
-            roleRecord,
-            {
-              kind: "member",
-              projectId,
-              recordId: "readonly-runtime-member",
-              revision: 0,
-              generation: 0,
-              updatedAt: fixtureAt,
-              status: "active",
-              name: "Readonly context worker",
-              coordinator: false,
-              roleRevisionId: roleRecord.recordId,
-            },
-          ],
-        }),
-      );
-      state = yield* readCurrentState(sql, projectId);
-      const binding = {
-        kind: "run-binding",
-        projectId,
-        recordId: "required-child-binding",
-        revision: 0,
-        generation: 0,
-        updatedAt: fixtureAt,
-        status: "reserved",
-        taskId: task.taskId,
-        attemptId: "required-child-attempt",
-        memberId: "readonly-runtime-member",
-        roleRevisionId: roleRecord.recordId,
-        parentRunId: retained.binding.recordId,
-        providerInstanceId,
-        threadId,
+      const persistence = parentOperations.persistence(parent);
+      yield* persistence.claimActivation(parentAllocation);
+      yield* persistence.beforeStart(owner);
+      yield* parentOperations.persistNative(parent, parentNative);
+      yield* parentOperations.persistTerminal(parent, {
+        identity: { workerId: parent.workerId, generation: parent.authority.binding.generation },
+        operation: parent.operation,
+        outcome: "success",
+        ownerCaptured: true,
+        native: parentNative,
+        accountingReceipts: [],
+        drain: {
+          unit: owner.unit,
+          invocation: owner.invocation,
+          cgroup: owner.cgroup,
+          ownerPid: owner.pid,
+          memoryBytes: owner.memoryBytes,
+          swapBytes: 0,
+          oomGroup: 1,
+          launcherPid: 99999998,
+          childPid: 99999997,
+          childExitCode: 0,
+          kernel: "removed",
+        },
+      });
+      const parentJournal = yield* makeProjectTeamDispatchJournal({
         environmentId: "environment",
-        model: selectedModel,
-        configuration: {
-          ...configuration,
-          instructionsHash: NodeCrypto.createHash("sha256")
-            .update(roleRecord.instructions)
-            .digest("hex"),
-        },
-        worktree: "/workspace",
-        branch: "task",
-        leaseGeneration: 0,
-        specRevision: task.specRevision,
-        planRevision: 0,
-        authorizationGateId: grant.recordId,
-        scopeHash: projectTeamScopeHash(state, task.taskId),
-      };
-      pending = yield* decodeRequiredFoundation({
-        type: "project-work.foundation.commit",
-        projectId,
-        commandId: "readonly-runtime-claim",
-        expectedRevision: state.revision,
-        attribution,
-        committedAt: fixtureAt,
-        records: [],
-        transition: {
-          kind: "claim",
-          taskId: task.taskId,
-          expectedTaskRevision: task.revision,
-          authorizationGateId: grant.recordId,
-          expectedGateRevision: grant.revision,
-          binding,
-          claim: {
-            type: "project-work.task.claim",
-            projectId,
-            taskId: task.taskId,
-            commandId: "readonly-runtime-claim",
-            attemptId: binding.attemptId,
-            leaseToken: "readonly-runtime-lease",
-            leasedUntil: "2030-01-01T00:00:00.000Z",
-            claimedAt: fixtureAt,
-          },
-        },
+        maximumEnvironmentModelCalls: 4,
+        verifyStage: (receipt, original) =>
+          receipt.evidence.bindingId === original.intent.request.git.runId
+            ? Effect.void
+            : Effect.fail(
+                new ProjectTeamDispatchJournalError({ reason: "Foreign controlled parent" }),
+              ),
       });
+      let parentSnapshot = root.snapshot;
+      for (const stage of [
+        "workspace-ready",
+        "setup-complete",
+        "session-bound",
+        "assignment-intent",
+      ] as const)
+        parentSnapshot = yield* parentJournal.readRetained(
+          (yield* parentJournal.advanceStage(parentSnapshot.fence, {
+            receiptId: `controlled-parent-${stage}`,
+            stage,
+            evidence: { bindingId: root.binding.recordId },
+          })).fence.dispatchId,
+        );
     } else {
-      yield* repository.execute({
-        type: "project-work.task.create",
-        projectId,
-        taskId: ProjectWorkTaskId.make("required-child"),
-        commandId: CommandId.make("required-child-create"),
-        title: "Child task",
-        createdAt: fixtureAt,
-      });
-      yield* repository.execute(
-        yield* decodeRequiredFoundation({
+      yield* parentOperations.persistNative(parent, parentNative);
+      yield* sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${parent.operation.operationId}`;
+    }
+    for (
+      let siblingIndex = 0;
+      siblingIndex < (profile?.nativePlanningSiblings ? 2 : 1);
+      siblingIndex++
+    ) {
+      const suffix = siblingIndex === 0 ? "" : "-sibling";
+      if (readonlyKind !== undefined) {
+        let state = yield* readCurrentState(sql, projectId);
+        const previousTaskIds = new Set(state.tasks.map((task) => task.taskId));
+        const previousRoleIds = new Set(
+          state.foundationRecords
+            ?.filter((record) => record.kind === "role-revision")
+            .map((record) => record.recordId),
+        );
+        const parentTask = state.tasks.find((task) => task.taskId === root.binding.taskId);
+        const specification = state.foundationRecords?.find(
+          (record) =>
+            record.kind === "gate" &&
+            record.taskId === parentTask?.taskId &&
+            record.gate === "specification",
+        );
+        const plan = state.foundationRecords?.find(
+          (record) => record.kind === "plan-revision" && record.taskId === parentTask?.taskId,
+        );
+        const planGate = state.foundationRecords?.find(
+          (record) =>
+            record.kind === "gate" &&
+            record.taskId === parentTask?.taskId &&
+            record.gate === "plan",
+        );
+        if (
+          !parentTask ||
+          specification?.kind !== "gate" ||
+          plan?.kind !== "plan-revision" ||
+          planGate?.kind !== "gate"
+        )
+          return yield* Effect.die("Missing real retained parent scope");
+        const human = {
+          actor: { kind: "human", id: "readonly-runtime-human" },
+          source: { kind: "web", id: "readonly-runtime-browser" },
+          recordedAt: fixtureAt,
+        } as const;
+        const envelope = {
+          projectId,
+          taskId: parentTask.taskId,
+          commandId: "readonly-runtime-grant" + suffix,
+          expectedRevision: state.revision,
+          expectedTaskRevision: parentTask.revision,
+        };
+        yield* repository.execute(
+          yield* decodeRequiredFoundation({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: envelope.commandId,
+            expectedRevision: state.revision,
+            attribution: human,
+            committedAt: fixtureAt,
+            records: [],
+            guided: {
+              intent:
+                readonlyKind === "investigation"
+                  ? {
+                      ...envelope,
+                      type: "project-team.investigation.start",
+                      objective: "Investigate original bounded scope",
+                      outputDescriptions: ["Sourced investigation findings"],
+                    }
+                  : {
+                      ...envelope,
+                      type: "project-team.assignment.start",
+                      assignmentKind: readonlyKind,
+                      objective:
+                        readonlyKind === "planning"
+                          ? "Draft the first child plan"
+                          : "Review original approved scope",
+                      outputDescriptions: [
+                        readonlyKind === "planning"
+                          ? "Proposed first plan"
+                          : "Independent review findings",
+                      ],
+                      specRevision: parentTask.specRevision,
+                      specificationGateId: specification.recordId,
+                      expectedSpecificationGateRevision: specification.revision,
+                      parentPlan: {
+                        recordId: plan.recordId,
+                        expectedRecordRevision: plan.revision,
+                        planRevision: plan.planRevision,
+                        gateId: planGate.recordId,
+                        expectedGateRevision: planGate.revision,
+                      },
+                    },
+            },
+          }),
+        );
+        state = yield* readCurrentState(sql, projectId);
+        const grant = state.foundationRecords?.find(
+          (record) =>
+            record.kind === "gate" &&
+            !previousTaskIds.has(record.taskId) &&
+            (record.gate === "assignment" || record.gate === "investigation"),
+        );
+        const task = state.tasks.find(
+          (task) => task.taskId === (grant?.kind === "gate" ? grant.taskId : undefined),
+        );
+        const generatedRole = state.foundationRecords?.find(
+          (record) => record.kind === "role-revision" && !previousRoleIds.has(record.recordId),
+        );
+        if (!task || grant?.kind !== "gate" || generatedRole?.kind !== "role-revision")
+          return yield* Effect.die("Missing real readonly child scope");
+        const roleRecord = {
+          ...generatedRole,
+          recordId: "readonly-runtime-role" + suffix,
+          roleId: "readonly-runtime-role" + suffix,
+          revision: 0,
+          model: selectedModel,
+          delegationDepth: role.delegationDepth,
+        };
+        yield* repository.execute(
+          yield* decodeRequiredFoundation({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "readonly-runtime-configure" + suffix,
+            expectedRevision: state.revision,
+            attribution: human,
+            committedAt: fixtureAt,
+            records: [
+              roleRecord,
+              {
+                kind: "member",
+                projectId,
+                recordId: "readonly-runtime-member" + suffix,
+                revision: 0,
+                generation: 0,
+                updatedAt: fixtureAt,
+                status: "active",
+                name: "Readonly context worker",
+                coordinator: false,
+                roleRevisionId: roleRecord.recordId,
+              },
+            ],
+          }),
+        );
+        state = yield* readCurrentState(sql, projectId);
+        const binding = {
+          kind: "run-binding",
+          projectId,
+          recordId: "required-child-binding" + suffix,
+          revision: 0,
+          generation: 0,
+          updatedAt: fixtureAt,
+          status: "reserved",
+          taskId: task.taskId,
+          attemptId: "required-child-attempt" + suffix,
+          memberId: "readonly-runtime-member" + suffix,
+          roleRevisionId: roleRecord.recordId,
+          parentRunId: root.binding.recordId,
+          providerInstanceId,
+          threadId: siblingIndex === 0 ? threadId : ThreadId.make("required-sibling-thread"),
+          environmentId: "environment",
+          model: selectedModel,
+          configuration: {
+            ...configuration,
+            instructionsHash: NodeCrypto.createHash("sha256")
+              .update(roleRecord.instructions)
+              .digest("hex"),
+          },
+          worktree: "/workspace",
+          branch: "task",
+          leaseGeneration: 0,
+          specRevision: task.specRevision,
+          planRevision: 0,
+          authorizationGateId: grant.recordId,
+          scopeHash: projectTeamScopeHash(state, task.taskId),
+        };
+        pending = yield* decodeRequiredFoundation({
           type: "project-work.foundation.commit",
           projectId,
-          commandId: "required-child-membership",
-          expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+          commandId: "readonly-runtime-claim" + suffix,
+          expectedRevision: state.revision,
           attribution,
           committedAt: fixtureAt,
-          records: [
-            {
-              kind: "task-membership",
+          records: [],
+          transition: {
+            kind: "claim",
+            taskId: task.taskId,
+            expectedTaskRevision: task.revision,
+            authorizationGateId: grant.recordId,
+            expectedGateRevision: grant.revision,
+            binding,
+            claim: {
+              type: "project-work.task.claim",
               projectId,
-              recordId: "required-child-membership",
-              revision: 0,
-              generation: 0,
-              updatedAt: fixtureAt,
-              status: "active",
-              taskId: "required-child",
-              parentTaskId: retained.binding.taskId,
-              executionKind: "managed",
-              deliverableKind: "code",
-              controlState: "active",
+              taskId: task.taskId,
+              commandId: "readonly-runtime-claim" + suffix,
+              attemptId: binding.attemptId,
+              leaseToken: "readonly-runtime-lease" + suffix,
+              leasedUntil: "2030-01-01T00:00:00.000Z",
+              claimedAt: fixtureAt,
             },
-          ],
-        }),
-      );
-      pending = undefined;
-      yield* createManagedAssignment({
-        taskId: ProjectWorkTaskId.make("required-child"),
-        recordId: "required-child-binding",
-        attemptId: "required-child-attempt",
-        commandId: "required-child-claim",
-        providerInstanceId,
-        threadId,
-        role,
-        status: "reserved",
-        configuration,
-        parentRunId: retained.binding.recordId,
-      }).pipe(Effect.provideService(ProjectWorkRepository, captureClaim), Effect.result);
-      if (!pending) return yield* Effect.die("Missing child claim");
+          },
+        });
+      } else {
+        yield* repository.execute({
+          type: "project-work.task.create",
+          projectId,
+          taskId: ProjectWorkTaskId.make("required-child"),
+          commandId: CommandId.make("required-child-create"),
+          title: "Child task",
+          createdAt: fixtureAt,
+        });
+        yield* repository.execute(
+          yield* decodeRequiredFoundation({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "required-child-membership",
+            expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+            attribution,
+            committedAt: fixtureAt,
+            records: [
+              {
+                kind: "task-membership",
+                projectId,
+                recordId: "required-child-membership",
+                revision: 0,
+                generation: 0,
+                updatedAt: fixtureAt,
+                status: "active",
+                taskId: "required-child",
+                parentTaskId: root.binding.taskId,
+                executionKind: "managed",
+                deliverableKind: "code",
+                controlState: "active",
+              },
+            ],
+          }),
+        );
+        pending = undefined;
+        yield* createManagedAssignment({
+          taskId: ProjectWorkTaskId.make("required-child"),
+          recordId: "required-child-binding" + suffix,
+          attemptId: "required-child-attempt" + suffix,
+          commandId: "required-child-claim",
+          providerInstanceId,
+          threadId,
+          role,
+          status: "reserved",
+          configuration,
+          parentRunId: root.binding.recordId,
+        }).pipe(Effect.provideService(ProjectWorkRepository, captureClaim), Effect.result);
+        if (!pending) return yield* Effect.die("Missing child claim");
+      }
+      const childId = "required-child" + suffix;
+      const childPath = scratch + "/child" + suffix;
+      yield* git(["-C", main, "worktree", "add", "-qb", childId, childPath]);
+      retained = yield* reserve(pending, childPath, "refs/heads/" + childId, childId);
+      siblings.push(retained);
     }
-    const childPath = scratch + "/child";
-    yield* git(["-C", main, "worktree", "add", "-qb", "required-child", childPath]);
-    retained = yield* reserve(pending, childPath, "refs/heads/required-child", "required-child");
+    retained = siblings[0]!;
   }
   let allocations = 0;
   let transports = 0;
@@ -6746,6 +6846,8 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
     instance,
     reader,
     ...retained,
+    root,
+    siblings,
     get allocations() {
       return allocations;
     },
@@ -12764,6 +12866,735 @@ const subscriptionSelection = (
   maximumTokens: 64_000,
   maximumDurationMs: 300_000,
 });
+
+const decodeConcurrentAllocation = Schema.decodeSync(
+  Schema.fromJsonString(ManagedProcess.PiManagedProcessAllocationSchema),
+);
+const isConcurrentUserMessage = Schema.is(
+  Schema.Struct({
+    role: Schema.Literal("user"),
+    content: Schema.Array(Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })),
+  }),
+);
+const decodeConcurrentOwner = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      unit: Schema.String,
+      invocation: Schema.String,
+      pid: Schema.Int,
+      cgroup: Schema.String,
+      memoryBytes: Schema.Int,
+    }),
+  ),
+);
+
+// Separate opt-in gate: no held SDK declarations or ordinary runtime checks enable this case.
+describe.runIf(process.env.PI_MANAGED_RUNTIME_NATIVE_CONCURRENT === "1")(
+  "two native subscription prompt groups under one approved root",
+  () => {
+    for (const omitSiblingRegistration of [false, true])
+      it.live(
+        omitSiblingRegistration
+          ? "negative control leaves the unregistered native sibling live until exact owner teardown"
+          : "production factory HTTP 503 cancels and joins both concurrent native prompt groups",
+        () =>
+          scoped(
+            Effect.gen(function* () {
+              const distributionDirectory = process.env.PI_MANAGED_RUNTIME_INITIALIZATION_DIST;
+              const evidenceRoot = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+              if (!distributionDirectory || !evidenceRoot)
+                return yield* Effect.die(
+                  "Owned SDK 0.99.1 distribution and native evidence are required",
+                );
+              const fs = yield* FileSystem.FileSystem;
+              const evidence = evidenceRoot + (omitSiblingRegistration ? "/negative" : "/positive");
+              yield* fs.makeDirectory(evidence, { recursive: true, mode: 0o700 });
+              const ownedScratchDirectory = distributionDirectory + "-owned-runtime";
+              yield* fs.makeDirectory(ownedScratchDirectory, { recursive: true, mode: 0o700 });
+              const settings = yield* ServerSettings.ServerSettingsService;
+              yield* settings.updateSettings({ projectTeamExecutionEnabled: true });
+              const approvedAtMs = yield* Clock.currentTimeMillis;
+              const f = yield* requiredTransferFixture(
+                false,
+                true,
+                "planning",
+                false,
+                "none",
+                "Draft the approved bounded child plan",
+                {
+                  ...subscriptionRuntimeProfile,
+                  originalClockAtMs: approvedAtMs,
+                  ownedScratchDirectory,
+                  nativePlanningSiblings: true,
+                },
+              );
+              if (!("siblings" in f))
+                return yield* Effect.die("Expected planning sibling fixture, not a review fixture");
+              expect(f.siblings).toHaveLength(2);
+              const [first, second] = f.siblings;
+              if (!first || !second) return yield* Effect.die("Missing genuine sibling claims");
+              expect(first.binding.taskId).not.toBe(second.binding.taskId);
+              expect(first.binding.threadId).not.toBe(second.binding.threadId);
+              expect(first.binding.worktree).not.toBe(second.binding.worktree);
+              const originalDeadlineAtMs = f.root.snapshot.intent.limits.rootDeadlineAtMs;
+              const originalRoot = f.root.snapshot.intent;
+              expect(originalRoot.limits.maximumTokens).toBe(64_000);
+              expect(originalDeadlineAtMs).toBeGreaterThanOrEqual(approvedAtMs + 300_000);
+              for (const child of f.siblings) {
+                expect(child.binding.parentRunId).toBe(f.root.binding.recordId);
+                expect(child.snapshot.intent.limits.rootTaskId).toBe(f.root.binding.taskId);
+                expect(child.snapshot.intent.limits.rootDeadlineAtMs).toBe(originalDeadlineAtMs);
+                expect(child.snapshot.intent.limits.deadlineAtMs).toBeLessThanOrEqual(
+                  originalDeadlineAtMs,
+                );
+                expect(child.binding.configuration.maxDurationMs).toBe(60_000);
+              }
+              const access = `header.${Buffer.from(
+                json({
+                  exp: Math.ceil(originalDeadlineAtMs / 1000) + 60,
+                  "https://api.openai.com/auth": {
+                    chatgpt_account_id: "synthetic-concurrent-account",
+                  },
+                }),
+              ).toString("base64url")}.signature`;
+              yield* fs.writeFileString(
+                f.options.agentDirectory + "/auth.json",
+                json({
+                  "openai-codex": {
+                    type: "oauth",
+                    access,
+                    expires: originalDeadlineAtMs + 60_000,
+                    accountId: "synthetic-concurrent-account",
+                  },
+                }),
+              );
+              const captured: Array<{
+                unit: string;
+                kind: string;
+                pid: number;
+                startTime: string;
+              }> = [];
+              const capture = Effect.fn("nativeConcurrent.capture")(function* (
+                unit: string,
+                kind: string,
+                pid: number,
+              ) {
+                const stat = yield* fs.readFileString(`/proc/${pid}/stat`);
+                const startTime = stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[19];
+                if (!startTime || !/^\d+$/.test(startTime))
+                  return yield* Effect.die("Native PID start absent");
+                captured.push({ unit, kind, pid, startTime });
+                yield* fs.writeFileString(evidence + "/captured-pids.json", json(captured));
+              });
+              const originalSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+              const observed = ChildProcessSpawner.make((command) => {
+                if (
+                  command._tag !== "StandardCommand" ||
+                  command.command !== "/usr/bin/systemd-run"
+                )
+                  return originalSpawner.spawn(command);
+                const unit = command.args.find((arg) => arg.startsWith("--unit="))?.slice(7);
+                if (!unit) return Effect.die("Native launcher unit absent");
+                const args = [...command.args];
+                const helperIndex = args.indexOf("/usr/bin/python3");
+                if (helperIndex < 0) return Effect.die("Native owner helper absent");
+                // Same tighter envelope as the retained activation smoke; no allocation/deadline change.
+                args.splice(
+                  helperIndex,
+                  0,
+                  "-p",
+                  "TasksMax=128",
+                  "-p",
+                  "CPUQuota=200%",
+                  "-p",
+                  "AllowedCPUs=0,1",
+                );
+                let pending = Buffer.alloc(0);
+                let transcript = Buffer.alloc(0);
+                return originalSpawner
+                  .spawn(ChildProcess.make(command.command, args, command.options))
+                  .pipe(
+                    Effect.tap((handle) => capture(unit, "launcher", Number(handle.pid))),
+                    Effect.tap((handle) =>
+                      fs.writeFileString(
+                        evidence + "/" + unit + ".launch.json",
+                        json({ command: command.command, args, launcherPid: Number(handle.pid) }),
+                      ),
+                    ),
+                    Effect.map((handle) =>
+                      ChildProcessSpawner.makeHandle({
+                        ...handle,
+                        stdout: handle.stdout.pipe(
+                          Stream.tap((chunk) =>
+                            Effect.gen(function* () {
+                              transcript = Buffer.concat([transcript, chunk]);
+                              if (transcript.byteLength > 1048576)
+                                return yield* Effect.die("Native transcript bound exceeded");
+                              yield* fs.writeFile(
+                                evidence + "/" + unit + ".frames.jsonl",
+                                transcript,
+                              );
+                              pending = Buffer.concat([pending, chunk]);
+                              for (;;) {
+                                const newline = pending.indexOf(10);
+                                if (newline < 0) break;
+                                if (newline > 65536)
+                                  return yield* Effect.die("Native ownership frame bound exceeded");
+                                const frame = yield* decodeActivationFrame(
+                                  pending.subarray(0, newline).toString("utf8"),
+                                ).pipe(Effect.orDie);
+                                pending = pending.subarray(newline + 1);
+                                if (frame.type === "owner" || frame.type === "started") {
+                                  if (frame.pid === undefined)
+                                    return yield* Effect.die("Native ownership PID absent");
+                                  yield* capture(unit, frame.type, frame.pid);
+                                }
+                              }
+                              if (pending.byteLength > 65536)
+                                return yield* Effect.die("Native ownership frame bound exceeded");
+                            }),
+                          ),
+                        ),
+                      }),
+                    ),
+                  );
+              });
+              const arrived = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+              const failFirst = Promise.withResolvers<void>();
+              const transportAborted = [
+                Promise.withResolvers<void>(),
+                Promise.withResolvers<void>(),
+              ];
+              const signals: Array<AbortSignal | undefined> = [];
+              const requests: Array<unknown> = [];
+              let calls = 0;
+              const transport: typeof globalThis.fetch = async (_endpoint, init) => {
+                if (typeof init?.body !== "string" || !init.signal)
+                  throw Error("Original broker request absent");
+                expect(String(_endpoint)).toBe("https://chatgpt.com/backend-api/codex/responses");
+                expect(init.headers).toMatchObject({
+                  Authorization: `Bearer ${access}`,
+                  "chatgpt-account-id": "synthetic-concurrent-account",
+                });
+                calls++;
+                if (calls > 2)
+                  throw Error("Unexpected model transport; external calls are forbidden");
+                const body = decodeNativeJsonEvidence(init.body);
+                const index = f.siblings.findIndex((child) =>
+                  init.body!.toString().includes(child.request.assignment),
+                );
+                if (index < 0 || signals[index])
+                  throw Error("Foreign or duplicate native model request");
+                expect(Buffer.byteLength(init.body)).toBeLessThanOrEqual(16_384);
+                expect(body).toMatchObject({
+                  model: "gpt-6-luna",
+                  stream: true,
+                  store: false,
+                  reasoning: { effort: "high" },
+                  service_tier: "default",
+                });
+                signals[index] = init.signal;
+                requests[index] = body;
+                const signal = init.signal;
+                signal.addEventListener("abort", () => transportAborted[index]!.resolve(), {
+                  once: true,
+                });
+                arrived[index]!.resolve();
+                if (index === 0) {
+                  await failFirst.promise;
+                  return new Response("controlled unknown accounting", { status: 503 });
+                }
+                return await new Promise<Response>((_resolve, reject) => {
+                  const abort = () =>
+                    reject(signal.reason ?? Error("Captured sibling transport canceled"));
+                  if (signal.aborted) abort();
+                  else signal.addEventListener("abort", abort, { once: true });
+                });
+              };
+              const constructed: Array<Parameters<typeof RuntimeLive.makePiManagedRuntimeLive>[0]> =
+                [];
+              const originalLive = RuntimeLive.makePiManagedRuntimeLive;
+              const factorySpy = vi
+                .spyOn(RuntimeLive, "makePiManagedRuntimeLive")
+                .mockImplementation((options) => {
+                  constructed.push(options);
+                  // Observation only: keep the actual production factory descriptors and private state.
+                  return originalLive(options);
+                });
+              yield* Effect.addFinalizer(() => Effect.sync(() => factorySpy.mockRestore()));
+              const stagingRoot =
+                ownedScratchDirectory +
+                "/concurrent-stage-" +
+                (omitSiblingRegistration ? "negative" : "positive");
+              const factory = yield* makePiProductionRuntime(
+                {
+                  environmentId: "environment",
+                  distributionDirectory,
+                  agentDirectory: f.options.agentDirectory,
+                  nativeStateRoot: f.options.nativeStateRoot,
+                  stagingRoot,
+                  protectedRoots: [...f.options.protectedRoots, evidence],
+                  memoryBytes: 536870912,
+                  cleanupDeadlineMs: 5000,
+                  maxInputTokens: 16_384,
+                  maxOutputTokens: 2_048,
+                },
+                {
+                  subscriptionTest: {
+                    selection: subscriptionSelection(f),
+                    credentialSource: { directory: f.options.agentDirectory, format: "pi" },
+                  },
+                },
+              ).pipe(
+                Effect.provideService(
+                  PiModelCatalogue,
+                  PiModelCatalogue.of({
+                    readFresh: Effect.succeed(undefined),
+                    refresh: Effect.die("Catalogue/backend calls forbidden"),
+                  }),
+                ),
+                Effect.provideService(FetchHttpClient.Fetch, transport),
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
+              );
+              const instance = yield* factory.forInstance({
+                instanceId: providerInstanceId,
+                enabled: true,
+                configuration: {},
+              });
+              yield* Effect.addFinalizer(() => instance.stopAll.pipe(Effect.orDie));
+              expect(constructed).toHaveLength(1);
+              const factoryOptions = constructed[0]!;
+              const controllers = factoryOptions.subscriptionAbortControllers;
+              const accountingState = factoryOptions.subscriptionAccountingState;
+              if (!controllers || !accountingState)
+                return yield* Effect.die("Production shared state absent");
+              const closure = yield* Effect.forEach(factoryOptions.runtimeFiles, (file) =>
+                fs
+                  .readFile(file.source)
+                  .pipe(
+                    Effect.map((bytes) => ({
+                      ...file,
+                      bytes: bytes.length,
+                      sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+                    })),
+                  ),
+              );
+              yield* fs.writeFileString(evidence + "/closure.json", json(closure));
+              const initializationTerminals: Array<SessionRuntime.PiSessionTerminal> = [];
+              const sessionReceipts = yield* makeProjectTeamSessionReceipts({
+                environmentId: "environment",
+                maximumEnvironmentModelCalls: 4,
+              });
+              const journal = yield* makeProjectTeamDispatchJournal({
+                environmentId: "environment",
+                maximumEnvironmentModelCalls: 4,
+                verifyStage: (receipt, original) =>
+                  Effect.gen(function* () {
+                    expect(receipt.evidence.bindingId).toBe(original.intent.request.git.runId);
+                    if (receipt.stage === "session-bound" || receipt.stage === "assignment-intent")
+                      expect(yield* sessionReceipts.readInitialization(original)).toBeDefined();
+                  }).pipe(
+                    Effect.mapError(
+                      () =>
+                        new ProjectTeamDispatchJournalError({
+                          reason: "Concurrent stage receipt audit failed",
+                        }),
+                    ),
+                  ),
+              });
+              for (const child of f.siblings) {
+                let snapshot = child.snapshot;
+                // Controlled no-script setup on actual disposable Git worktrees; both initializations
+                // and both prompt groups below run the SDK and its real journal/process authority.
+                for (const stage of ["workspace-ready", "setup-complete"] as const)
+                  snapshot = yield* journal.readRetained(
+                    (yield* journal.advanceStage(snapshot.fence, {
+                      receiptId: `${child.request.dispatchId}-${stage}`,
+                      stage,
+                      evidence: { bindingId: child.binding.recordId },
+                    })).fence.dispatchId,
+                  );
+                const initialized = yield* instance.prepareOperation(
+                  {
+                    threadId: child.binding.threadId,
+                    kind: "initialize",
+                    operationId: child.request.initializeOperationId,
+                  },
+                  () => Effect.void,
+                );
+                const result = yield* initialized.run;
+                expect(result.terminal.outcome).toBe("success");
+                expect(result.terminal.native?.persisted).toBe(true);
+                initializationTerminals.push(result.terminal);
+                for (const stage of ["session-bound", "assignment-intent"] as const)
+                  snapshot = yield* journal.readRetained(
+                    (yield* journal.advanceStage(snapshot.fence, {
+                      receiptId: `${child.request.dispatchId}-${stage}`,
+                      stage,
+                      evidence: {
+                        bindingId: child.binding.recordId,
+                        initializeOperationId: child.request.initializeOperationId,
+                      },
+                    })).fence.dispatchId,
+                  );
+              }
+              expect(calls).toBe(0);
+              expect(controllers.size).toBe(0);
+              const promptA = yield* instance.prepareOperation(
+                {
+                  threadId: first.binding.threadId,
+                  kind: "prompt",
+                  operationId: first.request.assignmentOperationId,
+                  prompt: first.request.assignment,
+                },
+                () => Effect.void,
+              );
+              expect(controllers.size).toBe(1);
+              const controllerA = [...controllers][0]!;
+              const promptB = yield* instance.prepareOperation(
+                {
+                  threadId: second.binding.threadId,
+                  kind: "prompt",
+                  operationId: second.request.assignmentOperationId,
+                  prompt: second.request.assignment,
+                },
+                () => Effect.void,
+              );
+              expect(controllers.size).toBe(2);
+              const controllerB = [...controllers].find((controller) => controller !== controllerA);
+              if (!controllerB) return yield* Effect.die("Second actual native controller absent");
+              // Negative control changes exactly one registration. The second SDK, operation,
+              // native descriptor, accounting ports and original authority are unchanged.
+              if (omitSiblingRegistration) expect(controllers.delete(controllerB)).toBe(true);
+              const runningA = yield* Effect.forkChild(promptA.run.pipe(Effect.result));
+              const runningB = yield* Effect.forkChild(promptB.run.pipe(Effect.result));
+              yield* Effect.gen(function* () {
+                yield* Effect.raceFirst(
+                  Effect.promise(() => Promise.all(arrived.map((receipt) => receipt.promise))),
+                  Effect.raceFirst(Fiber.join(runningA), Fiber.join(runningB)).pipe(
+                    Effect.flatMap(() =>
+                      Effect.die("A native group terminated before both real requests arrived"),
+                    ),
+                  ),
+                );
+                const live = yield* f.sql<{
+                  operation_id: string;
+                  unit: string;
+                  allocation_json: string;
+                  owner_json: string;
+                }>`
+              SELECT o.operation_id,p.unit,p.allocation_json,p.owner_json FROM project_team_pi_operation o
+              JOIN project_team_pi_process p ON p.operation_id=o.operation_id
+              WHERE o.operation_id IN (${promptA.operation.operationId},${promptB.operation.operationId})
+                AND o.status='running' AND p.status='captured' LIMIT 3`;
+                expect(live).toHaveLength(2);
+                const held = yield* f.sql<{
+                  operation_id: string;
+                  root_task_id: string;
+                  status: string;
+                  run_id: string;
+                  attempt_id: string;
+                  generation: number;
+                  maximum_input_tokens: number;
+                  maximum_output_tokens: number;
+                  accounting_mode: string;
+                  unknown_maximum_tokens: number;
+                }>`
+              SELECT operation_id,root_task_id,status,run_id,attempt_id,generation,maximum_input_tokens,
+                maximum_output_tokens,accounting_mode,unknown_maximum_tokens
+              FROM project_team_model_request WHERE operation_id IN (${promptA.operation.operationId},${promptB.operation.operationId}) ORDER BY operation_id LIMIT 3`;
+                expect(held).toHaveLength(2);
+                for (const row of held) {
+                  const child = f.siblings.find(
+                    (entry) => entry.request.assignmentOperationId === row.operation_id,
+                  );
+                  if (!child)
+                    return yield* Effect.die("Held request lost its original child authority");
+                  expect(row).toMatchObject({
+                    root_task_id: f.root.binding.taskId,
+                    run_id: child.binding.recordId,
+                    attempt_id: child.binding.attemptId,
+                    generation: child.binding.generation,
+                    maximum_input_tokens: 16_384,
+                    maximum_output_tokens: 2_048,
+                    status: "held",
+                    accounting_mode: "openai-subscription-monitored",
+                    unknown_maximum_tokens: 64_000,
+                  });
+                }
+                const budget =
+                  yield* f.sql`SELECT task_id,deadline_at_ms,memory_bytes FROM project_task_resource_budget LIMIT 3`;
+                expect(budget).toEqual([
+                  {
+                    task_id: f.root.binding.taskId,
+                    deadline_at_ms: originalDeadlineAtMs,
+                    memory_bytes: 2147483648,
+                  },
+                ]);
+                const activeResources =
+                  yield* f.sql`SELECT task_id,unit,memory_bytes FROM project_task_resource_child WHERE drain_json IS NULL LIMIT 3`;
+                expect(activeResources).toHaveLength(2);
+                for (const row of activeResources)
+                  expect(row).toMatchObject({
+                    task_id: f.root.binding.taskId,
+                    memory_bytes: 536870912,
+                  });
+                const journals: Array<{ operationId: string; path: string; content: string }> = [];
+                for (const [index, child] of f.siblings.entries()) {
+                  const row = live.find(
+                    (entry) => entry.operation_id === child.request.assignmentOperationId,
+                  );
+                  const native = initializationTerminals[index]?.native;
+                  if (!row || !native)
+                    return yield* Effect.die("Actual prompt/native owner absent");
+                  const allocation = decodeConcurrentAllocation(row.allocation_json);
+                  const owner = decodeConcurrentOwner(row.owner_json);
+                  const identities = captured.filter((identity) => identity.unit === row.unit);
+                  expect(identities.map((identity) => identity.kind)).toEqual([
+                    "launcher",
+                    "owner",
+                    "started",
+                  ]);
+                  expect(identities[1]?.pid).toBe(owner.pid);
+                  expect(allocation).toMatchObject({
+                    policy: { memoryBytes: 536870912, runtimeSeconds: 60 },
+                  });
+                  expect(
+                    allocation.launch.runtimeFiles.map(({ source, target }) => ({
+                      source,
+                      target,
+                    })),
+                  ).toEqual(
+                    factoryOptions.runtimeFiles.map(({ source, target }) => ({ source, target })),
+                  );
+                  expect(yield* fs.readFileString(owner.cgroup + "/pids.max")).toBe("128\n");
+                  const cpu = (yield* fs.readFileString(owner.cgroup + "/cpu.max"))
+                    .trim()
+                    .split(" ")
+                    .map(Number);
+                  expect(cpu[0]! / cpu[1]!).toBe(2);
+                  // Read the real namespace from its immutable owned allocation.
+                  const path = allocation.launch.nativeStateRoot + "/" + native.sessionReference;
+                  const stat = yield* fs.stat(path);
+                  expect(Number(stat.size)).toBeLessThanOrEqual(1048576);
+                  const content = yield* fs.readFileString(path);
+                  const users = content
+                    .trim()
+                    .split("\n")
+                    .map((line) => decodeNativeJsonEvidence(line).message)
+                    .filter(isConcurrentUserMessage);
+                  expect(
+                    users.some((message) =>
+                      message.content.some((part) => part.text === child.request.assignment),
+                    ),
+                  ).toBe(true);
+                  expect(content).toContain(native.sessionId);
+                  expect(allocation.launch.protectedRoots).toContain(f.request.git.primaryRoot);
+                  journals.push({
+                    operationId: child.request.assignmentOperationId,
+                    path,
+                    content,
+                  });
+                }
+                expect(signals.map((signal) => signal?.aborted)).toEqual([false, false]);
+                expect(controllerA.signal.aborted).toBe(false);
+                expect(controllerB.signal.aborted).toBe(false);
+                yield* fs.writeFileString(
+                  evidence + "/concurrent-barrier.json",
+                  json({
+                    live,
+                    held,
+                    budget,
+                    activeResources,
+                    journals,
+                    requests,
+                    captured,
+                    approvedAtMs,
+                    originalDeadlineAtMs,
+                    root: originalRoot,
+                    children: f.siblings.map((child) => child.snapshot.intent),
+                    qualification:
+                      "Controlled parent initialization and no-script setup receipts; actual SDK initializations and two concurrent native SDK prompt groups; synthetic OAuth/intercepted HTTP only; zero external model/backend calls",
+                  }),
+                );
+                failFirst.resolve();
+                const resultA = yield* Fiber.join(runningA);
+                expect(resultA._tag).toBe("Failure");
+                expect(controllerA.signal.aborted).toBe(true);
+                const grant =
+                  yield* f.sql`SELECT root_task_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stop_reason,stopped_at_ms
+              FROM project_team_pi_subscription_grant LIMIT 2`;
+                expect(grant).toEqual([
+                  {
+                    root_task_id: f.root.binding.taskId,
+                    maximum_tokens: 64_000,
+                    maximum_duration_ms: 300_000,
+                    deadline_at_ms: originalDeadlineAtMs,
+                    stop_reason: "unknown-usage",
+                    stopped_at_ms: expect.any(Number),
+                  },
+                ]);
+                if (omitSiblingRegistration) {
+                  expect(controllerB.signal.aborted).toBe(false);
+                  expect(signals[1]?.aborted).toBe(false);
+                  const secondLive =
+                    yield* f.sql`SELECT o.status,p.drain_json,o.terminal_json FROM project_team_pi_operation o
+                JOIN project_team_pi_process p ON p.operation_id=o.operation_id WHERE o.operation_id=${promptB.operation.operationId}`;
+                  expect(secondLive).toEqual([
+                    { status: "running", drain_json: null, terminal_json: null },
+                  ]);
+                  const siblingOwner = live.find(
+                    (row) => row.operation_id === promptB.operation.operationId,
+                  )!;
+                  for (const identity of captured.filter(
+                    (item) => item.unit === siblingOwner.unit,
+                  )) {
+                    const stat = yield* fs.readFileString(`/proc/${identity.pid}/stat`);
+                    expect(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[19]).toBe(
+                      identity.startTime,
+                    );
+                  }
+                  yield* fs.writeFileString(
+                    evidence + "/negative-before-teardown.json",
+                    json({
+                      secondLive,
+                      unit: siblingOwner.unit,
+                      captured: captured.filter((item) => item.unit === siblingOwner.unit),
+                      siblingControllerAborted: controllerB.signal.aborted,
+                      transportAborted: signals[1]?.aborted,
+                    }),
+                  );
+                  // Public runtime stop owns the captured exact native owner and joins its cleanup.
+                  yield* instance.requestStop(second.binding.threadId);
+                } else {
+                  expect(controllerB.signal.aborted).toBe(true);
+                  yield* Effect.promise(() => transportAborted[1]!.promise);
+                }
+                const resultB = yield* Fiber.join(runningB);
+                expect(resultB._tag).toBe("Failure");
+                const terminals = yield* f.sql<{
+                  operation_id: string;
+                  status: string;
+                  terminal_json: string;
+                  unit: string;
+                  owner_json: string;
+                  drain_json: string;
+                }>`
+              SELECT o.operation_id,o.status,o.terminal_json,p.unit,p.owner_json,p.drain_json FROM project_team_pi_operation o
+              JOIN project_team_pi_process p ON p.operation_id=o.operation_id
+              WHERE o.operation_id IN (${first.request.initializeOperationId},${second.request.initializeOperationId},${promptA.operation.operationId},${promptB.operation.operationId})
+              ORDER BY o.operation_id LIMIT 5`;
+                expect(terminals).toHaveLength(4);
+                for (const row of terminals) {
+                  const owner = parseOwner(row.owner_json);
+                  const drain = parseFullDrain(row.drain_json);
+                  const terminal = decodeNativeJsonEvidence(row.terminal_json);
+                  expect(terminal).toMatchObject({
+                    operation: { operationId: row.operation_id },
+                    ownerCaptured: true,
+                    drain,
+                  });
+                  expect(drain).toMatchObject({
+                    unit: row.unit,
+                    ownerPid: owner.pid,
+                    invocation: owner.invocation,
+                    memoryBytes: 536870912,
+                    swapBytes: 0,
+                    oomGroup: 1,
+                  });
+                  expect(
+                    drain.kernel === "removed" || drain.kernel.split("\n").includes("populated 0"),
+                  ).toBe(true);
+                  const identities = captured.filter((item) => item.unit === row.unit);
+                  expect(identities.map((item) => item.kind)).toEqual([
+                    "launcher",
+                    "owner",
+                    "started",
+                  ]);
+                  expect(identities.map((item) => item.pid)).toEqual([
+                    drain.launcherPid,
+                    drain.ownerPid,
+                    drain.childPid,
+                  ]);
+                  for (const identity of identities) {
+                    const stat = yield* fs
+                      .readFileString(`/proc/${identity.pid}/stat`)
+                      .pipe(Effect.option);
+                    if (Option.isSome(stat))
+                      expect(
+                        stat.value.slice(stat.value.lastIndexOf(") ") + 2).split(" ")[19],
+                      ).not.toBe(identity.startTime);
+                  }
+                  if (yield* fs.exists(drain.cgroup + "/cgroup.events"))
+                    expect(yield* fs.readFileString(drain.cgroup + "/cgroup.events")).toContain(
+                      "populated 0",
+                    );
+                }
+                expect(captured).toHaveLength(12);
+                const resources = yield* f.sql<{
+                  unit: string;
+                  task_id: string;
+                  drain_json: string | null;
+                }>`SELECT unit,task_id,drain_json FROM project_task_resource_child LIMIT 6`;
+                for (const row of terminals)
+                  expect(resources.find((resource) => resource.unit === row.unit)).toMatchObject({
+                    task_id: f.root.binding.taskId,
+                    drain_json: row.drain_json,
+                  });
+                expect(
+                  yield* f.sql`SELECT unit FROM project_task_resource_child WHERE drain_json IS NULL LIMIT 1`,
+                ).toEqual([]);
+                const accounting =
+                  yield* f.sql`SELECT operation_id,root_task_id,status,capacity_state,charged_input_tokens,charged_output_tokens,accounting_receipt_id
+              FROM project_team_model_request ORDER BY operation_id LIMIT 3`;
+                expect(accounting).toHaveLength(2);
+                for (const row of accounting)
+                  expect(row).toMatchObject({
+                    root_task_id: f.root.binding.taskId,
+                    status: "unknown",
+                    capacity_state: "quarantine",
+                    charged_input_tokens: 16_384,
+                    charged_output_tokens: 64_000,
+                    accounting_receipt_id: expect.any(String),
+                  });
+                expect(calls).toBe(2);
+                expect(constructed).toHaveLength(1);
+                expect(factoryOptions.subscriptionAbortControllers).toBe(controllers);
+                expect(factoryOptions.subscriptionAccountingState).toBe(accountingState);
+                const retainedRoot = yield* journal.readRetained(f.root.request.dispatchId);
+                expect(retainedRoot.intent).toEqual(originalRoot);
+                yield* fs.writeFileString(
+                  evidence + "/joined-results.json",
+                  json({
+                    terminals,
+                    resources,
+                    accounting,
+                    grant,
+                    captured,
+                    resultA,
+                    resultB,
+                    calls,
+                    omitSiblingRegistration,
+                  }),
+                );
+              }).pipe(
+                Effect.ensuring(
+                  Effect.gen(function* () {
+                    // Always stop both exact bindings, including a barrier/assertion failure. Do not
+                    // leave a transport gate waiting while stopping and joining captured native owners.
+                    failFirst.resolve();
+                    yield* instance.stopAll.pipe(Effect.orDie);
+                    yield* Fiber.join(runningA);
+                    yield* Fiber.join(runningB);
+                  }).pipe(Effect.uninterruptible),
+                ),
+              );
+            }),
+          ),
+        120000,
+      );
+  },
+);
 
 it.effect(
   "denies a subscription model without the private root selection before native preparation",
