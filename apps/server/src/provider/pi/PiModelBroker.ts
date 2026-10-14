@@ -781,15 +781,16 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r?\n$/, "");
         if (text === "") return;
         if (done || ++frameCount > 16_384) fail("SSE_FRAME_INVALID");
-        if (subscription && text.startsWith("event: ")) {
+        if (subscription && text.startsWith("event:")) {
           if (subscriptionEvent) fail("SSE_FRAME_INVALID");
-          subscriptionEvent = text.slice(7);
+          subscriptionEvent = text.slice(6).replace(/^ /, "");
           subscriptionEventLine = text + "\n";
           if (!/^[a-z][a-z0-9_.]{1,80}$/.test(subscriptionEvent)) fail("SSE_FRAME_INVALID");
           return;
         }
-        if (!text.startsWith("data: ")) fail("SSE_FRAME_INVALID");
-        if (text === "data: [DONE]") {
+        if (!text.startsWith(subscription ? "data:" : "data: ")) fail("SSE_FRAME_INVALID");
+        const data = subscription ? text.slice(5).replace(/^ /, "") : text.slice(6);
+        if (data === "[DONE]") {
           if (subscription) fail("SSE_ACCOUNTING_REQUIRED");
           if (!usage || !contentSeen || !finishSeen) fail("SSE_ACCOUNTING_REQUIRED");
           done = true;
@@ -800,7 +801,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         let native: typeof Native.Type;
         try {
           if (subscription) {
-            const responsePayload: unknown = JSON.parse(text.slice(6));
+            const responsePayload: unknown = JSON.parse(data);
             if (
               !subscriptionEvent &&
               responsePayload !== null &&
@@ -925,7 +926,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
               contentSeen = true;
               finishSeen = true;
             }
-          } else native = decodeNative(text.slice(6));
+          } else native = decodeNative(data);
         } catch (error) {
           if (error instanceof PiModelBrokerError) throw error;
           if (

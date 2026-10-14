@@ -1394,40 +1394,49 @@ const prefixFixture = (
   return { ...f, prefixTransportCalls: () => calls };
 };
 
-it.each(["complete", "one-byte fragments", "leading blank lines"] as const)(
-  "validates and accounts subscription SSE without MIME: %s",
-  async (fragmentation) => {
-    const bytes = new TextEncoder().encode(
-      (fragmentation === "leading blank lines" ? "\n\n" : "") +
-        success().replace(/^event:.*\n/gm, ""),
-    );
-    const f = prefixFixture({
-      transport: async () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              const size = fragmentation === "one-byte fragments" ? 1 : bytes.length;
-              for (let offset = 0; offset < bytes.length; offset += size)
-                controller.enqueue(bytes.slice(offset, offset + size));
-              controller.close();
-            },
-          }),
-        ),
-    });
-    const receipt = await f.invoke();
-    expect(receipt.usage).toMatchObject({ prompt_tokens: 50, completion_tokens: 10 });
-    expect(f.prefixTransportCalls()).toBe(1);
-    expect(Buffer.concat(f.chunks).toString()).toContain("bounded result");
-    expect(f.settlements).toMatchObject([
-      {
-        outcome: "reported",
-        transportDrained: true,
-        chargedInputTokens: 50,
-        chargedOutputTokens: 10,
-      },
-    ]);
-  },
-);
+it.each([
+  "complete",
+  "one-byte fragments",
+  "leading blank lines",
+  "compact fields",
+  "compact fragmented fields",
+] as const)("validates and accounts subscription SSE without MIME: %s", async (fragmentation) => {
+  const bytes = new TextEncoder().encode(
+    (fragmentation === "leading blank lines" ? "\n\n" : "") +
+      (fragmentation.startsWith("compact")
+        ? success().replace(/^(event|data): /gm, "$1:")
+        : success().replace(/^event:.*\n/gm, "")),
+  );
+  const f = prefixFixture({
+    transport: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            const size =
+              fragmentation === "one-byte fragments" ||
+              fragmentation === "compact fragmented fields"
+                ? 1
+                : bytes.length;
+            for (let offset = 0; offset < bytes.length; offset += size)
+              controller.enqueue(bytes.slice(offset, offset + size));
+            controller.close();
+          },
+        }),
+      ),
+  });
+  const receipt = await f.invoke();
+  expect(receipt.usage).toMatchObject({ prompt_tokens: 50, completion_tokens: 10 });
+  expect(f.prefixTransportCalls()).toBe(1);
+  expect(Buffer.concat(f.chunks).toString()).toContain("bounded result");
+  expect(f.settlements).toMatchObject([
+    {
+      outcome: "reported",
+      transportDrained: true,
+      chargedInputTokens: 50,
+      chargedOutputTokens: 10,
+    },
+  ]);
+});
 
 const missingMimePrefixes = [
   [
