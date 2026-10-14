@@ -3,6 +3,7 @@ import { Type, type AssistantMessage, type Model, type Usage } from "@earendil-w
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { piManagedModelRoute } from "./PiManagedModels.ts";
+import { PI_WORKER_MAX_CHUNK_BYTES } from "./PiWorkerProtocol.ts";
 import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import {
   makePiModelBroker,
@@ -1368,4 +1369,168 @@ describe("SDK subscription request header parity", () => {
       expect(f.transportCalls()).toBe(0);
     },
   );
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+const prefixFixture = (
+  overrides: Partial<PiModelBrokerConfig> & Pick<PiModelBrokerConfig, "transport">,
+) => {
+  let calls = 0;
+  const transport = overrides.transport;
+  const f = fixture({
+    ...overrides,
+    transport: async (...args) => {
+      calls++;
+      return transport(...args);
+    },
+  });
+  return { ...f, prefixTransportCalls: () => calls };
+};
+
+const missingMimePrefixes = [
+  [
+    "JSON",
+    new TextEncoder().encode('{"error":'),
+    "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_JSON_PREFIX",
+  ],
+  [
+    "HTML",
+    new TextEncoder().encode("<!doctype html><html>"),
+    "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_HTML_PREFIX",
+  ],
+  [
+    "SSE marker",
+    new TextEncoder().encode("data: {"),
+    "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_SSE_MARKER_PREFIX",
+  ],
+  [
+    "other text",
+    new TextEncoder().encode("synthetic-proxy-response"),
+    "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_OTHER_PREFIX",
+  ],
+] as const;
+
+it.each(missingMimePrefixes)(
+  "retains only the bounded missing-MIME %s prefix category",
+  async (_name, bytes, code) => {
+    const f = prefixFixture({
+      transport: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(bytes);
+              controller.close();
+            },
+          }),
+        ),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code, message: code });
+    expect(f.prefixTransportCalls()).toBe(1);
+    expect(f.chunks).toHaveLength(0);
+    expect(f.settlements).toHaveLength(1);
+    expect(f.settlements[0]).toMatchObject({
+      failureCode: code,
+      outcome: "unknown",
+      transportDrained: true,
+      chargedInputTokens: 16_384,
+      chargedOutputTokens: 64_000,
+    });
+    expect(JSON.stringify(f.settlements)).not.toContain(new TextDecoder().decode(bytes));
+  },
+);
+
+it("retains EMPTY only for a completed empty missing-MIME body", async () => {
+  const f = prefixFixture({
+    transport: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.close();
+          },
+        }),
+      ),
+  });
+  await expect(f.invoke()).rejects.toMatchObject({
+    code: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_EMPTY",
+  });
+  expect(f.chunks).toHaveLength(0);
+  expect(f.prefixTransportCalls()).toBe(1);
+  expect(f.settlements[0]).toMatchObject({
+    failureCode: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_EMPTY",
+    outcome: "unknown",
+    transportDrained: true,
+  });
+});
+
+it.each([
+  ["malformed UTF-8", new Uint8Array([0xff, 0xfe])],
+  ["whitespace only", new TextEncoder().encode(" \n\t")],
+  ["incomplete SSE marker", new TextEncoder().encode("da")],
+  ["incomplete HTML marker", new TextEncoder().encode("<!doctype htm")],
+  ["oversized first chunk", new Uint8Array(PI_WORKER_MAX_CHUNK_BYTES + 1).fill(123)],
+] as const)("keeps indeterminate missing-MIME %s at the original code", async (_name, bytes) => {
+  const f = prefixFixture({
+    transport: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+      ),
+  });
+  await expect(f.invoke()).rejects.toMatchObject({
+    code: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING",
+  });
+  expect(f.chunks).toHaveLength(0);
+  expect(f.prefixTransportCalls()).toBe(1);
+  expect(f.settlements[0]).toMatchObject({
+    failureCode: "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING",
+    outcome: "unknown",
+    transportDrained: true,
+  });
+});
+
+it("cancels and awaits a pending missing-MIME prefix read at its original deadline", async () => {
+  const readEntered = deferred<void>();
+  const cancelEntered = deferred<void>();
+  const finishCancel = deferred<void>();
+  const f = prefixFixture({
+    deadlineMs: 100,
+    transport: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull() {
+            readEntered.resolve();
+          },
+          cancel() {
+            cancelEntered.resolve();
+            return finishCancel.promise;
+          },
+        }),
+      ),
+  });
+  const pending = f.invoke();
+  await readEntered.promise;
+  await cancelEntered.promise;
+  expect(f.settlements).toHaveLength(0);
+  finishCancel.resolve();
+  await expect(pending).rejects.toMatchObject({ code: "REQUEST_ABORTED" });
+  expect(f.prefixTransportCalls()).toBe(1);
+  expect(f.chunks).toHaveLength(0);
+  expect(f.settlements).toHaveLength(1);
+  expect(f.settlements[0]).toMatchObject({
+    failureCode: "REQUEST_ABORTED",
+    outcome: "unknown",
+    transportDrained: true,
+    chargedInputTokens: 16_384,
+    chargedOutputTokens: 64_000,
+  });
 });

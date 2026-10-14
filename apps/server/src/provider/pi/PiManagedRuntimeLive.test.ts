@@ -5706,8 +5706,13 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
   const fixtureSpy = vi
     .spyOn(DispatchJournal, "makeProjectTeamDispatchJournal")
     .mockImplementation((options) => {
-      const { prepareReviewCompletion, verifyReviewTarget, ...fixtureOptions } = options;
-      if (prepareReviewCompletion !== undefined || verifyReviewTarget !== undefined)
+      const { prepareReviewCompletion, prepareFailure, verifyReviewTarget, ...fixtureOptions } =
+        options;
+      if (
+        prepareReviewCompletion !== undefined ||
+        prepareFailure !== undefined ||
+        verifyReviewTarget !== undefined
+      )
         throw Error("Original root fixture unexpectedly supplied review callbacks");
       return originalJournal(fixtureOptions).pipe(
         Effect.map((journal) => ({

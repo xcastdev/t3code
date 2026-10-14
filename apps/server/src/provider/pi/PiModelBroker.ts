@@ -205,6 +205,11 @@ export type PiModelBrokerErrorCode =
   | "TRANSPORT_RESPONSE_CONTENT_TYPE_JSON"
   | "TRANSPORT_RESPONSE_CONTENT_TYPE_HTML"
   | "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_JSON_PREFIX"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_HTML_PREFIX"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_SSE_MARKER_PREFIX"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_OTHER_PREFIX"
+  | "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_EMPTY"
   | "TRANSPORT_RESPONSE_REJECTED";
 
 export class PiModelBrokerError extends Error {
@@ -646,7 +651,52 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
       if (contentType !== "text/event-stream") {
         // Retain fixed categories so failed requests can be diagnosed without provider headers/bodies.
-        if (!contentType) fail("TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING");
+        if (!contentType) {
+          if (!subscription) fail("TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING");
+          let diagnostic: PiModelBrokerErrorCode = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING";
+          controller.signal.addEventListener("abort", cancelReader, { once: true });
+          if (controller.signal.aborted) cancelReader();
+          try {
+            check();
+            const first = await reader.read();
+            check();
+            const bytes = first.value;
+            if (first.done && (!bytes || bytes.byteLength === 0)) {
+              diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_EMPTY";
+            } else if (
+              bytes &&
+              bytes.byteLength > 0 &&
+              bytes.byteLength <= PI_WORKER_MAX_CHUNK_BYTES
+            ) {
+              try {
+                const raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+                  bytes,
+                );
+                const prefix = raw.replace(/^\uFEFF/, "");
+                const trimmed = prefix.trimStart();
+                if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+                  diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_JSON_PREFIX";
+                } else if (/^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)/i.test(trimmed)) {
+                  diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_HTML_PREFIX";
+                } else if (/^(?:data:|event:|id:|retry:|:)/.test(prefix)) {
+                  diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_SSE_MARKER_PREFIX";
+                } else if (
+                  trimmed.length > 0 &&
+                  !trimmed.startsWith("<") &&
+                  !["data:", "event:", "id:", "retry:"].some((marker) => marker.startsWith(prefix))
+                ) {
+                  diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_OTHER_PREFIX";
+                }
+              } catch {
+                // Invalid UTF-8 is not enough evidence to retain a more specific category.
+              }
+            }
+          } catch {
+            // The deadline/caller abort remains authoritative; other read errors stay indeterminate.
+            check();
+          }
+          fail(diagnostic);
+        }
         if (contentType === "application/json") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_JSON");
         if (contentType === "text/html") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_HTML");
         if (contentType === "text/plain") fail("TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT");
