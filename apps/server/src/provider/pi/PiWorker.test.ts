@@ -153,7 +153,7 @@ describe("Pinned Pi worker effective settings", () => {
       const broker = makePiModelBroker({
         ...identity,
         ...promptOperation,
-        routeId: "approved-route",
+        routeId: "command-code-ling-free",
         provider: "command-code",
         model,
         endpoint: "https://api.commandcode.ai/provider/v1/chat/completions",

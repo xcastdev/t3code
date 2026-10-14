@@ -618,12 +618,13 @@ describe("frozen tool manifest and bounded payloads", () => {
     peer: ReturnType<typeof runtimePeers>,
     text = '{"arguments":{"path":"README.md"}}',
     callId = 1,
+    nativeCallId = `native-call-${callId}`,
   ) {
-    peer.worker({
+    const call = peer.worker({
       type: "tool-call",
       lifecycleId: 1,
       callId,
-      nativeCallId: `native-call-${callId}`,
+      nativeCallId,
       toolName: "read",
       execution: peer.protocol.bootstrap!.allowedTools[0]!.execution,
       input: { transferId: `input-${callId}`, totalBytes: Buffer.byteLength(text) },
@@ -639,7 +640,105 @@ describe("frozen tool manifest and bounded payloads", () => {
           .toString("base64"),
       });
     peer.worker({ type: "transfer-end", transferId: `input-${callId}` });
+    return call;
   }
+  it.each(["call_fixture|fc_fixture", `${"a".repeat(63)}|${"b".repeat(64)}`])(
+    "accepts the SDK composite native ID through the encoded bridge approval/result lifecycle (%#)",
+    (nativeCallId) => {
+      const peer = toolPeer("bridge");
+      const call = input(peer, '{"arguments":{"path":"README.md"}}', 1, nativeCallId);
+      expect(decodePiWorkerFrame(encodePiWorkerFrame(call).toString().trimEnd())).toEqual(call);
+      expect(peer.protocol.takeTransfer("input-1")).toEqual({
+        purpose: "tool-input",
+        value: { arguments: { path: "README.md" } },
+      });
+
+      peer.parent({ type: "tool-authorized", callId: 1, allowed: true });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_start", callId: 1, toolName: "read" },
+      });
+      const output = '{"kind":"text","text":"# T3"}';
+      peer.parent({
+        type: "tool-result",
+        callId: 1,
+        output: { transferId: "output", totalBytes: Buffer.byteLength(output) },
+      });
+      peer.parent({
+        type: "transfer-chunk",
+        transferId: "output",
+        index: 0,
+        offset: 0,
+        data: Buffer.from(output).toString("base64"),
+      });
+      peer.parent({ type: "transfer-end", transferId: "output" });
+      expect(peer.protocol.takeTransfer("output")).toEqual({
+        purpose: "tool-result",
+        value: { kind: "text", text: "# T3" },
+      });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_end", callId: 1, toolName: "read", isError: false },
+      });
+      expect(peer.protocol.canStartRequest).toBe(true);
+    },
+  );
+  it("rejects malformed SDK native-call composites while generic frame tokens remain restricted", () => {
+    const peer = toolPeer("bridge");
+    const badNativeCallIds = [
+      "call_one|fc_one|extra",
+      "call_one/fc_one",
+      "call_one|../fc_one",
+      "call_one|fc_one\r\n",
+      "call_one|fc_one\n",
+      "call_one|",
+      "|fc_one",
+      `call_${"a".repeat(60)}|fc_${"b".repeat(60)}`,
+    ];
+    for (const nativeCallId of badNativeCallIds) {
+      expect(() =>
+        decodePiWorkerFrame(
+          json(
+            workerFrame({
+              type: "tool-call",
+              callId: 1,
+              nativeCallId,
+              lifecycleId: 1,
+              toolName: "read",
+              execution: "bridge",
+              input: { transferId: "input", totalBytes: 0 },
+            }),
+          ),
+        ),
+      ).toThrow();
+    }
+    expect(() =>
+      decodePiWorkerFrame(
+        json({
+          ...workerFrame({ type: "done" }),
+          workerId: "call_fixture|fc_fixture",
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      decodePiWorkerFrame(
+        json(
+          workerFrame({
+            type: "tool-call",
+            callId: 1,
+            nativeCallId: "call_fixture|fc_fixture",
+            lifecycleId: 1,
+            toolName: "read|unexpected",
+            execution: "bridge",
+            input: { transferId: "input", totalBytes: 0 },
+          }),
+        ),
+      ),
+    ).toThrow();
+    expect(peer.protocol.successful).toBe(false);
+  });
   it.each(["local", "bridge"] as const)("delivers only authorized %s tool results", (execution) => {
     const peer = toolPeer(execution);
     input(peer);
