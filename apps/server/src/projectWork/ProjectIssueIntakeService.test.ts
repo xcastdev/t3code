@@ -2,6 +2,8 @@ import * as NodeCrypto from "node:crypto";
 import {
   CommandId,
   ProjectId,
+  ProjectWorkApprovalId,
+  ProjectWorkCriterionId,
   ProjectWorkTaskId,
   ProjectIssueIntake,
   canonicalProjectWorkPayload,
@@ -353,6 +355,197 @@ it.effect(
           expect(yield* f.sql`SELECT * FROM project_issue_external`).toEqual(external);
         }
         expect(f.published).toHaveLength(1);
+      }),
+    ),
+);
+
+it.effect(
+  "actual SQL intake preserves an approved task scope across newer, repeated, stale, and conflicting issue pages",
+  () =>
+    memory(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        yield* f.bind();
+        const linked = yield* seedLinked(f);
+        const taskId = ProjectWorkTaskId.make("local-task");
+        const criterionId = ProjectWorkCriterionId.make("local-criterion");
+        const human = {
+          actor: { kind: "human" as const, id: "maintainer" },
+          source: { kind: "web" as const, id: "intake-regression" },
+          recordedAt: at,
+        };
+
+        let state = yield* readCurrentState(f.sql, "a");
+        yield* f.repo.execute({
+          type: "project-work.criterion.upsert",
+          projectId: ProjectId.make("a"),
+          taskId,
+          commandId: CommandId.make("approved-scope-criterion"),
+          expectedRevision: state.revision,
+          criterion: {
+            criterionId,
+            taskId,
+            description: "Keep the reviewed behavior within the approved scope",
+            required: true,
+            status: "unsatisfied",
+            satisfiedByEvidenceIds: [],
+            revision: 0,
+            updatedAt: at,
+          },
+          updatedAt: at,
+        });
+        state = yield* readCurrentState(f.sql, "a");
+        yield* f.repo.execute({
+          type: "project-work.task.specify",
+          projectId: ProjectId.make("a"),
+          taskId,
+          commandId: CommandId.make("approved-scope-specification"),
+          expectedRevision: state.revision,
+          attribution: human,
+          specification: {
+            objective: "Investigate the linked issue without changing its approved scope",
+            scopeIn: "Preserve the agreed behavior and its single acceptance criterion",
+            scopeOut: "Unrelated product behavior and managed execution policy",
+            criterionIds: [criterionId],
+            revision: 1,
+            protected: false,
+          },
+          updatedAt: at,
+        });
+        state = yield* readCurrentState(f.sql, "a");
+        yield* f.repo.execute({
+          type: "project-work.task.approve",
+          projectId: ProjectId.make("a"),
+          taskId,
+          commandId: CommandId.make("approved-scope-approval"),
+          expectedRevision: state.revision,
+          attribution: human,
+          approvalId: ProjectWorkApprovalId.make("approved-scope-approval"),
+          specRevision: 1,
+          approvedAt: at,
+        });
+
+        const approved = yield* readCurrentState(f.sql, "a");
+        const taskBefore = approved.tasks.find((task) => task.taskId === taskId)!;
+        const criteriaBefore = approved.criteria.filter((criterion) => criterion.taskId === taskId);
+        expect(taskBefore).toMatchObject({
+          taskId,
+          state: "specified",
+          specification: { revision: 1, criterionIds: [criterionId], protected: false },
+          approval: {
+            taskId,
+            specRevision: 1,
+            approvalId: ProjectWorkApprovalId.make("approved-scope-approval"),
+          },
+        });
+        expect(criteriaBefore).toHaveLength(1);
+        const historyBeforeNewer = yield* f.repo.replay("a");
+        const taskHistoryBefore = historyBeforeNewer.filter(
+          (event) =>
+            ("taskId" in event && event.taskId === taskId) ||
+            ("task" in event && event.task.taskId === taskId) ||
+            ("criterion" in event && event.criterion.taskId === taskId),
+        );
+
+        const newer = {
+          ...issue,
+          title: "Updated external title",
+          body: "Updated external description",
+          bodyTruncated: false,
+          updatedAt: "2026-10-01T00:20:00Z",
+        };
+        const accepted = yield* f.commit(yield* f.claim(), response([newer]));
+        expect(accepted.accepted).toBe(true);
+        expect(accepted.results).toHaveLength(1);
+        expect(accepted.results[0]!.events).toHaveLength(1);
+
+        const observed = (yield* issues(f.sql))[0]!;
+        expect(observed).toMatchObject({
+          recordId: linked.recordId,
+          projectId: "a",
+          revision: linked.revision + 1,
+          sourceRevision: newer.updatedAt,
+          title: newer.title,
+          body: newer.body,
+          taskId: linked.taskId,
+          missionId: linked.missionId,
+          identity: linked.identity,
+        });
+        const taskAfterNewer = (yield* readCurrentState(f.sql, "a")).tasks.find(
+          (task) => task.taskId === taskId,
+        )!;
+        const criteriaAfterNewer = (yield* readCurrentState(f.sql, "a")).criteria.filter(
+          (criterion) => criterion.taskId === taskId,
+        );
+        expect(taskAfterNewer).toEqual(taskBefore);
+        expect((yield* readCurrentState(f.sql, "a")).tasks).toEqual(approved.tasks);
+        expect(criteriaAfterNewer).toEqual(criteriaBefore);
+        const historyAfterNewer = yield* f.repo.replay("a");
+        expect(
+          historyAfterNewer.filter(
+            (event) =>
+              ("taskId" in event && event.taskId === taskId) ||
+              ("task" in event && event.task.taskId === taskId) ||
+              ("criterion" in event && event.criterion.taskId === taskId),
+          ),
+        ).toEqual(taskHistoryBefore);
+        const externalAfterNewer = yield* f.sql<{ payload: string }>`
+          SELECT payload_json AS payload FROM project_issue_external
+        `;
+        expect(yield* decodeJson(externalAfterNewer[0]!.payload)).toEqual({
+          repository,
+          issue: newer,
+        });
+        const publicationsAfterNewer = [...f.published];
+
+        for (const stale of [
+          newer,
+          {
+            ...newer,
+            title: "Older external title",
+            body: "Older external description",
+            updatedAt: "2026-10-01T00:15:00Z",
+          },
+        ]) {
+          const replayed = yield* f.commit(yield* f.claim(), response([stale]));
+          expect(replayed.accepted).toBe(true);
+          expect(replayed.results).toEqual([]);
+          expect((yield* issues(f.sql))[0]).toEqual(observed);
+          expect(
+            yield* f.sql<{ payload: string }>`
+              SELECT payload_json AS payload FROM project_issue_external
+            `,
+          ).toEqual(externalAfterNewer);
+          const current = yield* readCurrentState(f.sql, "a");
+          expect(current.tasks).toEqual(approved.tasks);
+          expect(current.criteria.filter((criterion) => criterion.taskId === taskId)).toEqual(
+            criteriaBefore,
+          );
+          expect(yield* f.repo.replay("a")).toEqual(historyAfterNewer);
+          expect(f.published).toEqual(publicationsAfterNewer);
+        }
+
+        // Rejected page transactions retain the original lease for the next observation.
+        const leased = yield* f.claim();
+        for (const conflicting of [
+          { ...newer, body: "Conflicting body at the same source revision" },
+          { ...newer, nodeId: "I_replaced", title: "Conflicting issue identity" },
+        ]) {
+          const before = yield* snapshot(f.sql);
+          const historyBefore = yield* f.repo.replay("a");
+          const publicationsBefore = [...f.published];
+          expect((yield* f.commit(leased, response([conflicting])).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          expect(yield* snapshot(f.sql)).toEqual(before);
+          expect(yield* f.repo.replay("a")).toEqual(historyBefore);
+          expect(f.published).toEqual(publicationsBefore);
+          const current = yield* readCurrentState(f.sql, "a");
+          expect(current.tasks).toEqual(approved.tasks);
+          expect(current.criteria.filter((criterion) => criterion.taskId === taskId)).toEqual(
+            criteriaBefore,
+          );
+        }
       }),
     ),
 );
