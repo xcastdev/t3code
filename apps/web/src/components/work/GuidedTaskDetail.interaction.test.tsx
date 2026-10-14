@@ -1318,6 +1318,64 @@ describe("GuidedTaskDetail human interactions", () => {
     expect(host.textContent).not.toContain("Approve specification revision 2");
   });
 
+  it("shows each retained finding once across task and child collections", async () => {
+    const comment = {
+      commentId: "finding-once",
+      projectId,
+      taskId: "task-1",
+      body: "A retained investigation finding",
+      createdAt: at,
+      revision: 1,
+    };
+    const evidence = {
+      evidenceId: "evidence-once",
+      taskId: "task-1",
+      kind: "observation",
+      summary: "A retained validation result",
+      detail: "The observed transition succeeded",
+      recordedAt: at,
+      revision: 1,
+    };
+    current = decodeContext({
+      ...current,
+      comments: [comment],
+      evidence: [evidence],
+      children: {
+        ...emptyChildren,
+        comments: [
+          comment,
+          {
+            ...comment,
+            commentId: "child-finding",
+            taskId: "research-child",
+            body: "A distinct child finding",
+          },
+        ],
+        evidence: [
+          evidence,
+          {
+            ...evidence,
+            evidenceId: "child-evidence",
+            taskId: "research-child",
+            summary: "A distinct child result",
+          },
+        ],
+      },
+    });
+    foundation = records(current);
+    await render();
+    expect(
+      [...host.querySelectorAll("p")].filter((element) => element.textContent === comment.body),
+    ).toHaveLength(1);
+    expect(
+      [...host.querySelectorAll("summary")].filter(
+        (element) => element.textContent === evidence.summary,
+      ),
+    ).toHaveLength(1);
+    expect(host.textContent).toContain("A distinct child finding");
+    expect(host.textContent).toContain("A distinct child result");
+  });
+
   it("shows linked findings and preserves execution invalidation history", async () => {
     current = decodeContext({
       ...current,

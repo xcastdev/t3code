@@ -823,6 +823,15 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
         </p>
       </WorkCard>
     );
+  // Task context can repeat the same finding in its top-level and child collections.
+  const commentsById = new Map(context?.comments.map((comment) => [comment.commentId, comment]));
+  for (const comment of context?.children.comments ?? [])
+    if (!commentsById.has(comment.commentId)) commentsById.set(comment.commentId, comment);
+  const evidenceById = new Map(
+    context?.evidence.map((evidence) => [evidence.evidenceId, evidence]),
+  );
+  for (const evidence of context?.children.evidence ?? [])
+    if (!evidenceById.has(evidence.evidenceId)) evidenceById.set(evidence.evidenceId, evidence);
   const specKind = "project-team.specification.propose";
   const waiverKind = "project-team.criterion.waiver";
   const waiverDraft = draftFor(waiverKind);
@@ -969,17 +978,12 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
       </WorkCard>
       <WorkCard>
         <h3 className="mb-3 font-medium">Internal findings</h3>
-        {context?.comments.map((comment) => (
+        {[...commentsById.values()].map((comment) => (
           <p key={comment.commentId} className="mb-2 whitespace-pre-wrap break-words text-sm">
             {comment.body}
           </p>
         ))}
-        {context?.children.comments.map((comment) => (
-          <p key={comment.commentId} className="mb-2 whitespace-pre-wrap break-words text-sm">
-            {comment.body}
-          </p>
-        ))}
-        {[...(context?.evidence ?? []), ...(context?.children.evidence ?? [])].map((evidence) => (
+        {[...evidenceById.values()].map((evidence) => (
           <details key={evidence.evidenceId} className="mb-2 text-sm">
             <summary>{evidence.summary}</summary>
             <p className="whitespace-pre-wrap break-words">{evidence.detail ?? evidence.summary}</p>
@@ -988,10 +992,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             </p>
           </details>
         ))}
-        {!context?.comments.length &&
-        !context?.children.comments.length &&
-        !context?.evidence.length &&
-        !context?.children.evidence.length ? (
+        {!commentsById.size && !evidenceById.size ? (
           <p className="mb-3 text-sm text-muted-foreground">No findings have been recorded yet.</p>
         ) : null}
         <details className="mt-3">
