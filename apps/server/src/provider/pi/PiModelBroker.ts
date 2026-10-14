@@ -685,8 +685,8 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
                 } else if (
                   trimmed.length > 0 &&
                   !trimmed.startsWith("<") &&
-                  !/^(?:data:|event:|id:|retry:|:)/.test(prefix) &&
-                  !["data:", "event:", "id:", "retry:"].some((marker) => marker.startsWith(prefix))
+                  !/^(?:data:|event:|id:|retry:|:)/.test(trimmed) &&
+                  !["data:", "event:", "id:", "retry:"].some((marker) => marker.startsWith(trimmed))
                 ) {
                   diagnostic = "TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING_OTHER_PREFIX";
                 }

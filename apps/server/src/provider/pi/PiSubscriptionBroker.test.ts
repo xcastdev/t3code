@@ -1394,16 +1394,19 @@ const prefixFixture = (
   return { ...f, prefixTransportCalls: () => calls };
 };
 
-it.each(["complete", "one-byte fragments"] as const)(
+it.each(["complete", "one-byte fragments", "leading blank lines"] as const)(
   "validates and accounts subscription SSE without MIME: %s",
   async (fragmentation) => {
-    const bytes = new TextEncoder().encode(success().replace(/^event:.*\n/gm, ""));
+    const bytes = new TextEncoder().encode(
+      (fragmentation === "leading blank lines" ? "\n\n" : "") +
+        success().replace(/^event:.*\n/gm, ""),
+    );
     const f = prefixFixture({
       transport: async () =>
         new Response(
           new ReadableStream<Uint8Array>({
             start(controller) {
-              const size = fragmentation === "complete" ? bytes.length : 1;
+              const size = fragmentation === "one-byte fragments" ? 1 : bytes.length;
               for (let offset = 0; offset < bytes.length; offset += size)
                 controller.enqueue(bytes.slice(offset, offset + size));
               controller.close();
