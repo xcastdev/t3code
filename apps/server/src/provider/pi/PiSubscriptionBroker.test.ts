@@ -1216,3 +1216,156 @@ describe("Pi OpenAI subscription broker", () => {
     },
   );
 });
+
+describe("SDK subscription request header parity", () => {
+  it("preserves actual SDK user agent and clamped session pair with parent-owned credentials", async () => {
+    let sdkHeaders: Headers | undefined;
+    let sdkBody: unknown;
+    let parentHeaders: Headers | undefined;
+    let parentBody: unknown;
+    let joined: Promise<void> | undefined;
+    const sdkAccountId = "synthetic-worker-account";
+    const sdkCredential = `${part({ alg: "none" })}.${part({ exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_account_id: sdkAccountId } })}.synthetic-worker-signature`;
+    const message = {
+      type: "message",
+      id: "message-1",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "Done", annotations: [] }],
+    };
+    const response =
+      event({
+        type: "response.created",
+        response: { id: "response-1", model, status: "in_progress" },
+      }) +
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { ...message, status: "in_progress", content: [] },
+      }) +
+      event({
+        type: "response.content_part.added",
+        item_id: message.id,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
+      }) +
+      event({
+        type: "response.output_text.delta",
+        item_id: message.id,
+        output_index: 0,
+        content_index: 0,
+        delta: "Done",
+      }) +
+      event({ type: "response.output_item.done", output_index: 0, item: message }) +
+      event({
+        type: "response.completed",
+        response: {
+          id: "response-1",
+          model,
+          status: "completed",
+          output: [message],
+          usage: { input_tokens: 8, output_tokens: 1, total_tokens: 9 },
+        },
+      });
+    const f = fixture({
+      transport: async (_url, init) => {
+        parentHeaders = new Headers(init.headers);
+        parentBody = JSON.parse(init.body);
+        return new Response(response, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    const sdk = streamCodexResponses(
+      sdkModel,
+      normalizeContext({
+        systemPrompt: "Trusted assignment",
+        messages: [{ role: "user", content: "Investigate", timestamp: 1 }],
+        tools: [],
+      }),
+      {
+        apiKey: sdkCredential,
+        sessionId: "sdk-session-" + "x".repeat(80),
+        reasoningEffort: "high",
+        serviceTier: "default",
+        transport: "sse",
+        maxRetries: 0,
+        headers: { "x-worker-only": "must-not-reach-parent-transport" },
+        fetch: async (_url, init) => {
+          sdkHeaders = new Headers(init?.headers);
+          const encoded = init?.body;
+          const request =
+            typeof encoded === "string"
+              ? encoded
+              : encoded instanceof Uint8Array && sdkHeaders.get("content-encoding") === "zstd"
+                ? process
+                    .getBuiltinModule("node:zlib")!
+                    .zstdDecompressSync(encoded, { maxOutputLength: 16384 })
+                    .toString("utf8")
+                : undefined;
+          if (!request) throw Error("Actual SDK request absent");
+          sdkBody = JSON.parse(request);
+          expect(sdkHeaders.get("session-id")).toHaveLength(64);
+          expect(sdkBody).toMatchObject({ prompt_cache_key: sdkHeaders.get("session-id") });
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                joined = f
+                  .invoke(request, (chunk) => controller.enqueue(chunk))
+                  .then(
+                    () => controller.close(),
+                    (error) => controller.error(error),
+                  );
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        },
+      },
+    );
+    const result = await sdk.result();
+    await joined;
+    expect(result.errorMessage).toBeUndefined();
+    expect(result.stopReason).not.toBe("error");
+    expect(sdkHeaders).toBeDefined();
+    expect(parentHeaders).toBeDefined();
+    expect(parentHeaders!.get("user-agent")).toBe(sdkHeaders!.get("user-agent"));
+    expect(parentHeaders!.get("session-id")).toBe(sdkHeaders!.get("session-id"));
+    expect(parentHeaders!.get("x-client-request-id")).toBe(sdkHeaders!.get("x-client-request-id"));
+    expect(parentHeaders!.get("session-id")).toHaveLength(64);
+    expect(parentHeaders!.get("authorization")).toBe(`Bearer ${credential}`);
+    expect(parentHeaders!.get("chatgpt-account-id")).toBe(accountId);
+    expect(parentHeaders!.get("x-worker-only")).toBeNull();
+    expect(parentBody).toEqual(sdkBody);
+    expect(f.reservations).toHaveLength(1);
+    expect(f.settlements).toHaveLength(1);
+  });
+
+  it.each(["absent", "empty"] as const)(
+    "omits both session headers for an %s SDK cache key",
+    async (mode) => {
+      const f = fixture({
+        transport: async (_url, init) => {
+          const headers = new Headers(init.headers);
+          expect(headers.get("user-agent")).toMatch(/^pi \(/);
+          expect(headers.get("session-id")).toBeNull();
+          expect(headers.get("x-client-request-id")).toBeNull();
+          return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+        },
+      });
+      await f.invoke(body(mode === "empty" ? { prompt_cache_key: "" } : {}));
+      expect(f.reservations).toHaveLength(1);
+    },
+  );
+
+  it.each(["x".repeat(65), "line\nbreak", "line\rbreak", "null\0byte", "\u0100"])(
+    "rejects a non-SDK session header before reservation: %j",
+    async (prompt_cache_key) => {
+      const f = fixture();
+      await expect(f.invoke(body({ prompt_cache_key }))).rejects.toMatchObject({
+        code: "REQUEST_MODEL_OR_OUTPUT_INVALID",
+      });
+      expect(f.reservations).toEqual([]);
+      expect(f.transportCalls()).toBe(0);
+    },
+  );
+});

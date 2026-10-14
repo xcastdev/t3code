@@ -1,3 +1,4 @@
+import { OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH } from "@earendil-works/pi-ai/api/openai-prompt-cache";
 import * as Schema from "effect/Schema";
 import { PI_WORKER_MAX_REQUEST_BYTES, PI_WORKER_MAX_RESPONSE_BYTES } from "./PiWorkerProtocol.ts";
 
@@ -99,6 +100,7 @@ const validOutputMessage = (value: Record<string, unknown>) =>
 export interface PiSubscriptionRequest {
   readonly canonicalBody: string;
   readonly normalizedBody: string;
+  readonly sessionId?: string;
 }
 
 // Convert only the Responses fields needed by the shared authorization and tool-history checks.
@@ -146,7 +148,11 @@ export function decodePiSubscriptionRequest(body: string, model: string): PiSubs
     value.reasoning.effort !== "high" ||
     value.reasoning.summary !== "auto" ||
     value.service_tier !== "default" ||
-    (value.prompt_cache_key !== undefined && !text(value.prompt_cache_key))
+    (value.prompt_cache_key !== undefined &&
+      (!text(value.prompt_cache_key) ||
+        value.prompt_cache_key.length > OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH ||
+        !/^[\x20-\x7E\xA0-\xFF]*$/u.test(value.prompt_cache_key) ||
+        /\p{Cf}/u.test(value.prompt_cache_key)))
   )
     throw new Error("REQUEST_MODEL_OR_OUTPUT_INVALID");
   const messages: Array<Record<string, unknown>> = [
@@ -259,7 +265,13 @@ export function decodePiSubscriptionRequest(body: string, model: string): PiSubs
           ? "none"
           : "auto",
   };
-  return { canonicalBody: canonical(Json(value)), normalizedBody: JSON.stringify(normalized) };
+  return {
+    canonicalBody: canonical(Json(value)),
+    normalizedBody: JSON.stringify(normalized),
+    ...(typeof value.prompt_cache_key === "string" && value.prompt_cache_key
+      ? { sessionId: value.prompt_cache_key }
+      : {}),
+  };
 }
 
 export interface PiSubscriptionEvent {

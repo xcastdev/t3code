@@ -13086,6 +13086,11 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_NATIVE_CONCURRENT === "1")(
                 if (index < 0 || signals[index])
                   throw Error("Foreign or duplicate native model request");
                 expect(Buffer.byteLength(init.body)).toBeLessThanOrEqual(16_384);
+                const headers = new Headers(init.headers);
+                expect(headers.get("user-agent")).toMatch(/^pi \(/);
+                expect(body.prompt_cache_key).toEqual(expect.any(String));
+                expect(headers.get("session-id")).toBe(body.prompt_cache_key);
+                expect(headers.get("x-client-request-id")).toBe(body.prompt_cache_key);
                 expect(body).toMatchObject({
                   model: "gpt-6-luna",
                   stream: true,
@@ -13169,15 +13174,13 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_NATIVE_CONCURRENT === "1")(
               if (!controllers || !accountingState)
                 return yield* Effect.die("Production shared state absent");
               const closure = yield* Effect.forEach(factoryOptions.runtimeFiles, (file) =>
-                fs
-                  .readFile(file.source)
-                  .pipe(
-                    Effect.map((bytes) => ({
-                      ...file,
-                      bytes: bytes.length,
-                      sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
-                    })),
-                  ),
+                fs.readFile(file.source).pipe(
+                  Effect.map((bytes) => ({
+                    ...file,
+                    bytes: bytes.length,
+                    sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+                  })),
+                ),
               );
               yield* fs.writeFileString(evidence + "/closure.json", json(closure));
               const initializationTerminals: Array<SessionRuntime.PiSessionTerminal> = [];

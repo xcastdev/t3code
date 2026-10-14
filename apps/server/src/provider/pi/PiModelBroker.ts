@@ -1,3 +1,4 @@
+import { getPiUserAgent } from "@earendil-works/pi-ai/utils/pi-user-agent";
 import * as NodeCrypto from "node:crypto";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -393,6 +394,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
   const request = async (operation: PiModelBrokerRequest): Promise<PiModelAccountingReceipt> => {
     let parsed: typeof Request.Type;
     let outboundBody: string;
+    let subscriptionSessionId: string | undefined;
     try {
       if (Buffer.byteLength(operation.body) > PI_WORKER_MAX_REQUEST_BYTES)
         fail("REQUEST_BYTE_LIMIT");
@@ -400,6 +402,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         const adapted = decodePiSubscriptionRequest(operation.body, cfg.model);
         parsed = decodeRequest(adapted.normalizedBody);
         outboundBody = adapted.canonicalBody;
+        subscriptionSessionId = adapted.sessionId;
       } else {
         parsed = decodeRequest(operation.body);
         outboundBody = encodeRequest({ ...parsed, model: cfg.model });
@@ -599,6 +602,14 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
               ? {
                   "chatgpt-account-id": subscriptionAccountId!,
                   originator: "pi",
+                  "User-Agent": getPiUserAgent(),
+                  // The validated body owns SDK session metadata; arbitrary worker headers stay out.
+                  ...(subscriptionSessionId
+                    ? {
+                        "session-id": subscriptionSessionId,
+                        "x-client-request-id": subscriptionSessionId,
+                      }
+                    : {}),
                   "OpenAI-Beta": "responses=experimental",
                   accept: "text/event-stream",
                 }

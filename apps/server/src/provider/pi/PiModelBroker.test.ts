@@ -98,7 +98,7 @@ function fixture(overrides: Partial<PiModelBrokerConfig> = {}) {
     workerId: "worker",
     generation: 7,
     operationId: "operation",
-    routeId: "ling-free",
+    routeId: "command-code-ling-free",
     provider: "command-code",
     model,
     endpoint,
@@ -161,7 +161,7 @@ it("captures parent route and identity, reserves once before transport, and retu
     requestId: 1,
     reservationId: "reserved-1",
     accountingReceiptId: "accounted-1",
-    routeId: "ling-free",
+    routeId: "command-code-ling-free",
     provider: "command-code",
     model,
     reportedModel: model,
@@ -1337,7 +1337,7 @@ describe("retained dispatch broker operation IDs", () => {
     }
     for (const field of ["workerId", "routeId"] as const)
       expect(() => makePiModelBroker({ ...f.cfg, [field]: guided })).toThrow(
-        "CONFIG_LIMITS_INVALID",
+        field === "routeId" ? "CONFIG_ROUTE_INVALID" : "CONFIG_LIMITS_INVALID",
       );
     expect(f.reservations).toEqual([]);
     expect(f.settlements).toEqual([]);
@@ -1412,6 +1412,7 @@ it("explicit alternate broker freezes matching request and reported model", asyn
   const alias = "inclusionai/ling-3.0-flash-sante";
   const f = fixture({
     model: alternate,
+    routeId: "command-code-ling-sante-free",
     acceptedReportedModels: [alternate, alias],
     transport: async () =>
       response(success().replaceAll(reportedModel, alias).replaceAll(model, alternate)),
@@ -1422,7 +1423,11 @@ it("explicit alternate broker freezes matching request and reported model", asyn
 });
 it("explicit alternate broker denies cross-model response and full-charges unknown usage", async () => {
   const alternate = "inclusionai/ling-3.0-flash-sante:free";
-  const f = fixture({ model: alternate, acceptedReportedModels: [alternate] });
+  const f = fixture({
+    model: alternate,
+    routeId: "command-code-ling-sante-free",
+    acceptedReportedModels: [alternate],
+  });
   await expect(f.invoke(requestBody({ model: alternate }))).rejects.toMatchObject({
     code: "SSE_MODEL_REJECTED",
   });
