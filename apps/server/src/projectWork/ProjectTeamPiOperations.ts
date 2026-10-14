@@ -1261,7 +1261,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       const operation = history.operations.at(-1);
       if (!operation) return undefined;
       const row = operations.find((candidate) => candidate.operation_id === operation.operationId);
-      if (!row || row.status !== "settled" || !row.native_json || !row.terminal_json)
+      if (!row || row.status !== "settled" || !row.terminal_json)
         return yield* deny("Final original Pi operation has no qualified terminal");
       const terminal = yield* decodeTerminal(row.terminal_json).pipe(
         Effect.mapError(() => deny("Original Pi terminal is unavailable")),
@@ -1271,12 +1271,14 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       if (
         !terminal.ownerCaptured ||
         !terminal.drain ||
-        !terminal.native ||
         terminal.identity.workerId !== operation.workerId ||
         terminal.identity.generation !== binding.generation ||
         terminal.operation.operationId !== operation.operationId ||
         terminal.operation.operationKind !== row.operation_kind ||
-        encode(yield* decodeNative(row.native_json)) !== encode(terminal.native)
+        (row.native_json === null) !== (terminal.native === null) ||
+        (row.native_json !== null &&
+          encode(yield* decodeNative(row.native_json)) !== encode(terminal.native)) ||
+        (terminal.outcome === "success" && terminal.native === null)
       )
         return yield* deny("Original Pi terminal owner differs");
       const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
@@ -1323,8 +1325,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           return yield* deny("Successful Pi terminal has unretained accounting receipts");
         return undefined;
       }
-      const requests =
-        yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,
+      const requests = yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,
           run_id,attempt_id,worker_id,generation,operation_id,request_lane,request_scope,request_id,
           route_id,provider,model,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,
           charged_input_tokens,charged_output_tokens,accounting_mode,unknown_maximum_tokens,

@@ -290,292 +290,396 @@ it.effect("uses the actual journal root budget while the operation keeps its sho
   ),
 );
 
-for (const outcome of ["unknown", "reported"] as const)
-  it.effect(`joined failure proof follows original subscription accounting: ${outcome}`, () =>
-    fileTest(
-      Effect.gen(function* () {
-        const f = yield* journalFixture("gpt-6-luna");
-        const fs = yield* FileSystem.FileSystem;
-        const executable = yield* fs.realPath("/usr/bin/true");
-        const allocationFor = () =>
-          preallocatePiManagedProcess({
-            workspaceRoot: f.binding.worktree,
-            workspaceAccess: "readonly",
-            nativeStateRoot: f.allocation.launch.nativeStateRoot,
-            protectedRoots: f.allocation.launch.protectedRoots,
-            runtimeFiles: [{ source: executable, target: "/bin/true" }],
-            argv: ["/bin/true"],
-            memoryBytes: 33554432,
-            runtimeSeconds: 10,
+for (const scenario of [
+  { outcome: "unknown", promptNative: "persisted" },
+  { outcome: "reported", promptNative: "persisted" },
+  { outcome: "unknown", promptNative: "missing" },
+  { outcome: "reported", promptNative: "missing" },
+] as const)
+  it.effect(
+    `joined failure proof follows original subscription accounting: ${scenario.outcome}, ${scenario.promptNative} native`,
+    () =>
+      fileTest(
+        Effect.gen(function* () {
+          const { outcome } = scenario;
+          const f = yield* journalFixture("gpt-6-luna");
+          const fs = yield* FileSystem.FileSystem;
+          const executable = yield* fs.realPath("/usr/bin/true");
+          const allocationFor = () =>
+            preallocatePiManagedProcess({
+              workspaceRoot: f.binding.worktree,
+              workspaceAccess: "readonly",
+              nativeStateRoot: f.allocation.launch.nativeStateRoot,
+              protectedRoots: f.allocation.launch.protectedRoots,
+              runtimeFiles: [{ source: executable, target: "/bin/true" }],
+              argv: ["/bin/true"],
+              memoryBytes: 33554432,
+              runtimeSeconds: 10,
+            });
+          const ownerFor = (allocation: typeof f.allocation) => ({
+            type: "owner" as const,
+            unit: allocation.unit,
+            nonce: allocation.nonce,
+            invocation: "a".repeat(32),
+            cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+            pid: 123,
+            memoryBytes: allocation.policy.memoryBytes,
+            swapBytes: 0 as const,
+            oomGroup: 1 as const,
           });
-        const ownerFor = (allocation: typeof f.allocation) => ({
-          type: "owner" as const,
-          unit: allocation.unit,
-          nonce: allocation.nonce,
-          invocation: "a".repeat(32),
-          cgroup: `/sys/fs/cgroup/${allocation.unit}`,
-          pid: 123,
-          memoryBytes: allocation.policy.memoryBytes,
-          swapBytes: 0 as const,
-          oomGroup: 1 as const,
-        });
-        const drainFor = (owner: ReturnType<typeof ownerFor>) => ({
-          unit: owner.unit,
-          invocation: owner.invocation,
-          cgroup: owner.cgroup,
-          ownerPid: owner.pid,
-          memoryBytes: owner.memoryBytes,
-          swapBytes: 0 as const,
-          oomGroup: 1 as const,
-          launcherPid: 124,
-          childPid: 125,
-          childExitCode: 0,
-          kernel: "populated 0\nfrozen 0",
-        });
-        const initializeAllocation = yield* allocationFor();
-        const initialize = yield* f.operations.prepare(
-          f.identity,
-          { threadId, kind: "initialize" },
-          "joined-failure-initialize",
-          {
-            allocation: initializeAllocation,
-            workerId: "joined-failure-worker",
-            operationId: f.request.initializeOperationId,
-          },
-        );
-        const initializeOwner = ownerFor(initializeAllocation);
-        const initializeDrain = drainFor(initializeOwner);
-        yield* f.operations.persistence(initialize).claimActivation(initializeAllocation);
-        yield* f.operations.persistence(initialize).beforeStart(initializeOwner);
-        yield* f.operations.persistNative(initialize, nativeReference);
-        yield* f.operations.persistTerminal(initialize, {
-          identity: { workerId: initialize.workerId, generation: 0 },
-          operation: initialize.operation,
-          outcome: "success",
-          ownerCaptured: true,
-          native: nativeReference,
-          drain: initializeDrain,
-          accountingReceipts: [],
-        });
-        const request = {
-          threadId,
-          kind: "prompt" as const,
-          operationId: f.request.assignmentOperationId,
-          prompt: f.request.assignment,
-        };
-        const requestHash = NodeCrypto.createHash("sha256")
-          .update(canonicalProjectWorkPayload(request))
-          .digest("hex");
-        const promptAllocation = yield* allocationFor();
-        const prompt = yield* f.operations.prepare(f.identity, request, requestHash, {
-          allocation: promptAllocation,
-          workerId: "joined-failure-worker",
-          operationId: request.operationId,
-          resourceHash: "a".repeat(64),
-        });
-        const promptOwner = ownerFor(promptAllocation);
-        const promptDrain = drainFor(promptOwner);
-        yield* f.operations.persistence(prompt).claimActivation(promptAllocation);
-        yield* f.operations.persistence(prompt).beforeStart(promptOwner);
-        yield* f.operations.persistNative(prompt, nativeReference);
-        const configuration = yield* inspectPiSubscriptionConfiguration({
-          agentDirectory: f.allocation.launch.nativeStateRoot,
-          runtimeVersion: "0.99.1",
-          nodeVersion: "22.19.0",
-          selectedModel: { provider: "openai-codex", model: "gpt-6-luna" },
-          limits: { maxInputTokens: 16_384, maxOutputTokens: 2_048, deadlineMs: 300_000 },
-          reasoningEffort: "high",
-          serviceTier: "default",
-        });
-        const subscriptionTest: ProjectTeamPiSubscriptionTestSelection = {
-          projectId: f.binding.projectId,
-          rootTaskId: f.admitted.intent.limits.rootTaskId,
-          model: configuration.model,
-          maximumTokens: 64_000,
-          maximumDurationMs: 300_000,
-        };
-        const accounting = yield* makeAccounting({
-          environmentId: "environment",
-          routeId: "openai-subscription-luna",
-          model: configuration.model,
-          acceptedReportedModels: [configuration.model],
-          subscriptionTest,
-          resolveOperation: f.operations.resolveOperation,
-        });
-        const reservation = {
-          workerId: prompt.workerId,
-          operationId: prompt.operation.operationId,
-          generation: 0,
-          requestId: 1,
-          routeId: "openai-subscription-luna",
-          provider: "openai-codex" as const,
-          model: configuration.model,
-          maxInputTokens: configuration.maxInputTokens,
-          maxOutputTokens: configuration.maxOutputTokens,
-          callCount: 1 as const,
-          deadlineAtMs: prompt.deadlineAtMs,
-          accountingMode: "openai-subscription-monitored" as const,
-          unknownMaximumTokens: 64_000 as const,
-        };
-        const foreignAccounting = yield* makeAccounting({
-          environmentId: "environment",
-          routeId: "openai-subscription-luna",
-          model: configuration.model,
-          acceptedReportedModels: [configuration.model],
-          subscriptionTest: {
-            ...subscriptionTest,
-            rootTaskId: "foreign-subscription-root",
-          },
-          resolveOperation: f.operations.resolveOperation,
-        });
-        expect(
-          (yield* foreignAccounting.reserve(prompt.principal, reservation).pipe(Effect.result))
-            ._tag,
-        ).toBe("Failure");
-        expect(yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`).toHaveLength(0);
-        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toHaveLength(0);
-        const reserved = yield* accounting.reserve(prompt.principal, reservation);
-        const usage = { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 };
-        const settled = yield* accounting.settle({
-          ...reservation,
-          reservationId: reserved.reservationId,
-          outcome,
-          transportDrained: outcome === "reported",
-          chargedInputTokens: outcome === "reported" ? 10 : reservation.maxInputTokens,
-          chargedOutputTokens: outcome === "reported" ? 20 : 64_000,
-          ...(outcome === "reported"
-            ? { reportedModel: configuration.model, reportedUsage: usage }
-            : {}),
-          accountingMode: "openai-subscription-monitored",
-          unknownMaximumTokens: 64_000,
-        });
-        const failedTerminal = {
-          identity: { workerId: prompt.workerId, generation: 0 },
-          operation: prompt.operation,
-          outcome: outcome === "reported" ? ("success" as const) : ("canceled" as const),
-          ownerCaptured: true,
-          native: nativeReference,
-          drain: promptDrain,
-          accountingReceipts:
-            outcome === "reported"
-              ? [
-                  {
-                    requestId: reservation.requestId,
-                    routeId: reservation.routeId,
-                    provider: reservation.provider,
-                    model: reservation.model,
-                    reportedModel: configuration.model,
-                    usage,
-                    reservationId: reserved.reservationId,
-                    accountingReceiptId: settled.accountingReceiptId,
-                  },
-                ]
-              : [],
-        } satisfies PiSessionTerminal;
-        yield* f.operations.persistTerminal(prompt, failedTerminal);
-        const proof = yield* f.sql.withTransaction(
-          f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted),
-        );
-        if (outcome === "reported") {
-          expect(proof).toBeUndefined();
-          expect(
-            yield* f.sql`SELECT stopped_at_ms,stop_reason FROM project_team_pi_subscription_grant`,
-          ).toEqual([{ stopped_at_ms: null, stop_reason: null }]);
-          expect(
-            yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
-          ).toEqual([
+          const drainFor = (owner: ReturnType<typeof ownerFor>) => ({
+            unit: owner.unit,
+            invocation: owner.invocation,
+            cgroup: owner.cgroup,
+            ownerPid: owner.pid,
+            memoryBytes: owner.memoryBytes,
+            swapBytes: 0 as const,
+            oomGroup: 1 as const,
+            launcherPid: 124,
+            childPid: 125,
+            childExitCode: 0,
+            kernel: "populated 0\nfrozen 0",
+          });
+          const initializeAllocation = yield* allocationFor();
+          const initialize = yield* f.operations.prepare(
+            f.identity,
+            { threadId, kind: "initialize" },
+            "joined-failure-initialize",
             {
-              status: "reported",
-              capacity_state: "released",
-              charged_input_tokens: 10,
-              charged_output_tokens: 20,
+              allocation: initializeAllocation,
+              workerId: "joined-failure-worker",
+              operationId: f.request.initializeOperationId,
             },
-          ]);
-          return;
-        }
-        expect(proof).toMatchObject({ operationId: prompt.operation.operationId });
-        expect(proof?.fingerprint).toMatch(/^[a-f0-9]{64}$/);
-        const originalBudget = yield* f.sql`SELECT maximum_tokens,deadline_at_ms
+          );
+          const initializeOwner = ownerFor(initializeAllocation);
+          const initializeDrain = drainFor(initializeOwner);
+          yield* f.operations.persistence(initialize).claimActivation(initializeAllocation);
+          yield* f.operations.persistence(initialize).beforeStart(initializeOwner);
+          yield* f.operations.persistNative(initialize, nativeReference);
+          yield* f.operations.persistTerminal(initialize, {
+            identity: { workerId: initialize.workerId, generation: 0 },
+            operation: initialize.operation,
+            outcome: "success",
+            ownerCaptured: true,
+            native: nativeReference,
+            drain: initializeDrain,
+            accountingReceipts: [],
+          });
+          const request = {
+            threadId,
+            kind: "prompt" as const,
+            operationId: f.request.assignmentOperationId,
+            prompt: f.request.assignment,
+          };
+          const requestHash = NodeCrypto.createHash("sha256")
+            .update(canonicalProjectWorkPayload(request))
+            .digest("hex");
+          const promptAllocation = yield* allocationFor();
+          const prompt = yield* f.operations.prepare(f.identity, request, requestHash, {
+            allocation: promptAllocation,
+            workerId: "joined-failure-worker",
+            operationId: request.operationId,
+            resourceHash: "a".repeat(64),
+          });
+          const promptOwner = ownerFor(promptAllocation);
+          const promptDrain = drainFor(promptOwner);
+          yield* f.operations.persistence(prompt).claimActivation(promptAllocation);
+          yield* f.operations.persistence(prompt).beforeStart(promptOwner);
+          if (scenario.promptNative === "persisted" || outcome === "reported")
+            yield* f.operations.persistNative(prompt, nativeReference);
+          const configuration = yield* inspectPiSubscriptionConfiguration({
+            agentDirectory: f.allocation.launch.nativeStateRoot,
+            runtimeVersion: "0.99.1",
+            nodeVersion: "22.19.0",
+            selectedModel: { provider: "openai-codex", model: "gpt-6-luna" },
+            limits: { maxInputTokens: 16_384, maxOutputTokens: 2_048, deadlineMs: 300_000 },
+            reasoningEffort: "high",
+            serviceTier: "default",
+          });
+          const subscriptionTest: ProjectTeamPiSubscriptionTestSelection = {
+            projectId: f.binding.projectId,
+            rootTaskId: f.admitted.intent.limits.rootTaskId,
+            model: configuration.model,
+            maximumTokens: 64_000,
+            maximumDurationMs: 300_000,
+          };
+          const accounting = yield* makeAccounting({
+            environmentId: "environment",
+            routeId: "openai-subscription-luna",
+            model: configuration.model,
+            acceptedReportedModels: [configuration.model],
+            subscriptionTest,
+            resolveOperation: f.operations.resolveOperation,
+          });
+          const reservation = {
+            workerId: prompt.workerId,
+            operationId: prompt.operation.operationId,
+            generation: 0,
+            requestId: 1,
+            routeId: "openai-subscription-luna",
+            provider: "openai-codex" as const,
+            model: configuration.model,
+            maxInputTokens: configuration.maxInputTokens,
+            maxOutputTokens: configuration.maxOutputTokens,
+            callCount: 1 as const,
+            deadlineAtMs: prompt.deadlineAtMs,
+            accountingMode: "openai-subscription-monitored" as const,
+            unknownMaximumTokens: 64_000 as const,
+          };
+          const foreignAccounting = yield* makeAccounting({
+            environmentId: "environment",
+            routeId: "openai-subscription-luna",
+            model: configuration.model,
+            acceptedReportedModels: [configuration.model],
+            subscriptionTest: {
+              ...subscriptionTest,
+              rootTaskId: "foreign-subscription-root",
+            },
+            resolveOperation: f.operations.resolveOperation,
+          });
+          expect(
+            (yield* foreignAccounting.reserve(prompt.principal, reservation).pipe(Effect.result))
+              ._tag,
+          ).toBe("Failure");
+          expect(yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`).toHaveLength(0);
+          expect(yield* f.sql`SELECT * FROM project_team_model_request`).toHaveLength(0);
+          const reserved = yield* accounting.reserve(prompt.principal, reservation);
+          const usage = { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 };
+          const settled = yield* accounting.settle({
+            ...reservation,
+            reservationId: reserved.reservationId,
+            outcome,
+            transportDrained: outcome === "reported",
+            chargedInputTokens: outcome === "reported" ? 10 : reservation.maxInputTokens,
+            chargedOutputTokens: outcome === "reported" ? 20 : 64_000,
+            ...(outcome === "reported"
+              ? { reportedModel: configuration.model, reportedUsage: usage }
+              : {}),
+            accountingMode: "openai-subscription-monitored",
+            unknownMaximumTokens: 64_000,
+          });
+          const failedTerminal = {
+            identity: { workerId: prompt.workerId, generation: 0 },
+            operation: prompt.operation,
+            outcome: outcome === "reported" ? ("success" as const) : ("canceled" as const),
+            ownerCaptured: true,
+            native:
+              scenario.promptNative === "persisted" || outcome === "reported"
+                ? nativeReference
+                : null,
+            drain:
+              scenario.promptNative === "missing" && outcome === "unknown"
+                ? { ...promptDrain, kernel: "removed" }
+                : promptDrain,
+            accountingReceipts:
+              outcome === "reported"
+                ? [
+                    {
+                      requestId: reservation.requestId,
+                      routeId: reservation.routeId,
+                      provider: reservation.provider,
+                      model: reservation.model,
+                      reportedModel: configuration.model,
+                      usage,
+                      reservationId: reserved.reservationId,
+                      accountingReceiptId: settled.accountingReceiptId,
+                    },
+                  ]
+                : [],
+          } satisfies PiSessionTerminal;
+          yield* f.operations.persistTerminal(prompt, failedTerminal);
+          if (outcome === "reported" && scenario.promptNative === "missing") {
+            // The successful terminal is first persisted through the real producer, then its
+            // native receipts are removed to prove the reader refuses the incomplete record.
+            yield* f.sql`UPDATE project_team_pi_operation SET native_json=NULL,terminal_json=${encodeJson(
+              {
+                ...failedTerminal,
+                native: null,
+              },
+            )} WHERE operation_id=${prompt.operation.operationId}`;
+            expect(
+              (yield* f.sql
+                .withTransaction(f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted))
+                .pipe(Effect.result))._tag,
+            ).toBe("Failure");
+            return;
+          }
+          const proof = yield* f.sql.withTransaction(
+            f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted),
+          );
+          if (outcome === "reported") {
+            expect(proof).toBeUndefined();
+            expect(
+              yield* f.sql`SELECT stopped_at_ms,stop_reason FROM project_team_pi_subscription_grant`,
+            ).toEqual([{ stopped_at_ms: null, stop_reason: null }]);
+            expect(
+              yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
+            ).toEqual([
+              {
+                status: "reported",
+                capacity_state: "released",
+                charged_input_tokens: 10,
+                charged_output_tokens: 20,
+              },
+            ]);
+            return;
+          }
+          expect(proof).toMatchObject({ operationId: prompt.operation.operationId });
+          expect(proof?.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+          if (scenario.promptNative === "missing") {
+            const tamperedTerminals = [
+              { ...failedTerminal, ownerCaptured: false },
+              { ...failedTerminal, drain: null },
+              {
+                ...failedTerminal,
+                identity: { ...failedTerminal.identity, workerId: "foreign-worker" },
+              },
+              {
+                ...failedTerminal,
+                identity: { ...failedTerminal.identity, generation: 1 },
+              },
+              {
+                ...failedTerminal,
+                operation: { ...failedTerminal.operation, operationId: "foreign-operation" },
+              },
+              {
+                ...failedTerminal,
+                operation: { ...failedTerminal.operation, operationKind: "compact" as const },
+              },
+            ];
+            for (const terminal of tamperedTerminals) {
+              yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson(terminal)}
+              WHERE operation_id=${prompt.operation.operationId}`;
+              expect(
+                (yield* f.sql
+                  .withTransaction(
+                    f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted),
+                  )
+                  .pipe(Effect.result))._tag,
+              ).toBe("Failure");
+            }
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson(failedTerminal)}
+            WHERE operation_id=${prompt.operation.operationId}`;
+            const foreignRoot = {
+              ...f.admitted,
+              intent: {
+                ...f.admitted.intent,
+                limits: {
+                  ...f.admitted.intent.limits,
+                  rootTaskId: ProjectWorkTaskId.make("foreign-root-task"),
+                },
+              },
+            };
+            expect(
+              (yield* f.sql
+                .withTransaction(
+                  f.operations.readJoinedQuarantinedFailureInTransaction(foreignRoot),
+                )
+                .pipe(Effect.result))._tag,
+            ).toBe("Failure");
+            expect(
+              (yield* f.sql`UPDATE project_team_model_request SET root_task_id='foreign-root-task'
+              WHERE operation_id=${prompt.operation.operationId}`.pipe(Effect.result))._tag,
+            ).toBe("Failure");
+            expect(
+              yield* f.sql`SELECT root_task_id FROM project_team_model_request
+              WHERE operation_id=${prompt.operation.operationId}`,
+            ).toEqual([{ root_task_id: f.admitted.intent.limits.rootTaskId }]);
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson({
+              ...failedTerminal,
+              accountingReceipts: [{}],
+            })} WHERE operation_id=${prompt.operation.operationId}`;
+            expect(
+              (yield* f.sql
+                .withTransaction(f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted))
+                .pipe(Effect.result))._tag,
+            ).toBe("Failure");
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson(failedTerminal)}
+            WHERE operation_id=${prompt.operation.operationId}`;
+          }
+          const originalBudget = yield* f.sql`SELECT maximum_tokens,deadline_at_ms
         FROM project_team_model_budget`;
-        const originalGrant = yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`;
-        const originalCapacity =
-          yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+          const originalGrant = yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`;
+          const originalCapacity =
+            yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
         FROM project_team_model_request`;
-        expect(originalGrant).toHaveLength(1);
-        expect(originalGrant[0]).toMatchObject({
-          environment_id: "environment",
-          project_id: f.binding.projectId,
-          root_task_id: f.admitted.intent.limits.rootTaskId,
-          model: configuration.model,
-          route_id: "openai-subscription-luna",
-          maximum_tokens: 64_000,
-          maximum_duration_ms: 300_000,
-          stopped_at_ms: time,
-          stop_reason: "unknown-usage",
-        });
-        expect(
-          (yield* f.sql`UPDATE project_team_pi_subscription_grant SET model='foreign-model'
+          expect(originalGrant).toHaveLength(1);
+          expect(originalGrant[0]).toMatchObject({
+            environment_id: "environment",
+            project_id: f.binding.projectId,
+            root_task_id: f.admitted.intent.limits.rootTaskId,
+            model: configuration.model,
+            route_id: "openai-subscription-luna",
+            maximum_tokens: 64_000,
+            maximum_duration_ms: 300_000,
+            stopped_at_ms: time,
+            stop_reason: "unknown-usage",
+          });
+          expect(
+            (yield* f.sql`UPDATE project_team_pi_subscription_grant SET model='foreign-model'
             WHERE environment_id='environment' AND project_id=${f.binding.projectId}
             AND root_task_id=${f.admitted.intent.limits.rootTaskId}`.pipe(Effect.result))._tag,
-        ).toBe("Failure");
-        expect(originalBudget).toEqual([
-          {
-            maximum_tokens: f.admitted.intent.limits.maximumTokens,
-            deadline_at_ms: f.admitted.intent.limits.rootDeadlineAtMs,
-          },
-        ]);
-        expect(originalCapacity).toEqual([
-          {
-            status: "unknown",
-            capacity_state: "quarantine",
-            charged_input_tokens: configuration.maxInputTokens,
-            charged_output_tokens: 64_000,
-          },
-        ]);
-        yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens='malformed'
+          ).toBe("Failure");
+          expect(originalBudget).toEqual([
+            {
+              maximum_tokens: f.admitted.intent.limits.maximumTokens,
+              deadline_at_ms: f.admitted.intent.limits.rootDeadlineAtMs,
+            },
+          ]);
+          expect(originalCapacity).toEqual([
+            {
+              status: "unknown",
+              capacity_state: "quarantine",
+              charged_input_tokens: configuration.maxInputTokens,
+              charged_output_tokens: 64_000,
+            },
+          ]);
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens='malformed'
         WHERE environment_id='environment' AND project_id=${f.binding.projectId}
         AND root_task_id=${f.admitted.intent.limits.rootTaskId}`;
-        const malformedCeiling = f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted);
-        expect((yield* f.sql.withTransaction(malformedCeiling).pipe(Effect.result))._tag).toBe(
-          "Failure",
-        );
-        yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=${originalBudget[0]!.maximum_tokens}`;
-        yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms='malformed'
+          const malformedCeiling = f.operations.readJoinedQuarantinedFailureInTransaction(
+            f.admitted,
+          );
+          expect((yield* f.sql.withTransaction(malformedCeiling).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=${originalBudget[0]!.maximum_tokens}`;
+          yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms='malformed'
         WHERE environment_id='environment' AND project_id=${f.binding.projectId}
         AND root_task_id=${f.admitted.intent.limits.rootTaskId}`;
-        const malformedDeadline = f.operations.readJoinedQuarantinedFailureInTransaction(
-          f.admitted,
-        );
-        expect((yield* f.sql.withTransaction(malformedDeadline).pipe(Effect.result))._tag).toBe(
-          "Failure",
-        );
-        yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=${originalBudget[0]!.deadline_at_ms}`;
-        const foreign = f.operations.readJoinedQuarantinedFailureInTransaction({
-          ...f.admitted,
-          fence: { ...f.admitted.fence, dispatchId: "foreign-dispatch" },
-        });
-        expect((yield* f.sql.withTransaction(foreign).pipe(Effect.result))._tag).toBe("Failure");
-        yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson({
-          ...failedTerminal,
-          native: { ...nativeReference, leafId: "foreign-native" },
-        })} WHERE operation_id=${prompt.operation.operationId}`;
-        const forged = f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted);
-        expect((yield* f.sql.withTransaction(forged).pipe(Effect.result))._tag).toBe("Failure");
-        yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson({
-          ...failedTerminal,
-          outcome: "success",
-        })} WHERE operation_id=${prompt.operation.operationId}`;
-        expect(
-          (yield* f.sql
-            .withTransaction(f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted))
-            .pipe(Effect.result))._tag,
-        ).toBe("Failure");
-        expect(
-          yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+          const malformedDeadline = f.operations.readJoinedQuarantinedFailureInTransaction(
+            f.admitted,
+          );
+          expect((yield* f.sql.withTransaction(malformedDeadline).pipe(Effect.result))._tag).toBe(
+            "Failure",
+          );
+          yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=${originalBudget[0]!.deadline_at_ms}`;
+          const foreign = f.operations.readJoinedQuarantinedFailureInTransaction({
+            ...f.admitted,
+            fence: { ...f.admitted.fence, dispatchId: "foreign-dispatch" },
+          });
+          expect((yield* f.sql.withTransaction(foreign).pipe(Effect.result))._tag).toBe("Failure");
+          yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson({
+            ...failedTerminal,
+            native: { ...nativeReference, leafId: "foreign-native" },
+          })} WHERE operation_id=${prompt.operation.operationId}`;
+          const forged = f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted);
+          expect((yield* f.sql.withTransaction(forged).pipe(Effect.result))._tag).toBe("Failure");
+          yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson({
+            ...failedTerminal,
+            outcome: "success",
+          })} WHERE operation_id=${prompt.operation.operationId}`;
+          expect(
+            (yield* f.sql
+              .withTransaction(f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted))
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(
+            yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
           FROM project_team_model_request`,
-        ).toEqual(originalCapacity);
-      }),
-    ),
+          ).toEqual(originalCapacity);
+        }),
+      ),
   );
 
 const journalChild = Effect.gen(function* () {
