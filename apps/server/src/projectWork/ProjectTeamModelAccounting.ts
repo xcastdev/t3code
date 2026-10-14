@@ -532,7 +532,7 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           const usage = yield* sql<{
             input: number;
             output: number;
-          }>`SELECT COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_input_tokens ELSE CASE WHEN status='held' THEN maximum_input_tokens ELSE charged_input_tokens END END),0) AS input,COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_output_tokens ELSE CASE WHEN status='held' THEN maximum_output_tokens ELSE charged_output_tokens END END),0) AS output FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND project_id=${binding.projectId} AND root_task_id=${operation.rootTaskId}`;
+          }>`SELECT COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored" ? 1 : 0} THEN charged_input_tokens ELSE CASE WHEN status='held' THEN maximum_input_tokens ELSE charged_input_tokens END END),0) AS input,COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored" ? 1 : 0} THEN charged_output_tokens ELSE CASE WHEN status='held' THEN maximum_output_tokens ELSE charged_output_tokens END END),0) AS output FROM project_team_model_request WHERE environment_id=${policy.environmentId} AND project_id=${binding.projectId} AND root_task_id=${operation.rootTaskId}`;
           const charged = usage[0];
           const used = charged ? sum(charged.input, charged.output) : undefined;
           const total = used === undefined ? undefined : sum(used, maximum);
@@ -570,7 +570,7 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           );
           yield* clockCheck(Math.min(deadline, originalAttempt?.deadline ?? deadline));
           const attemptUsage = yield* sql<{ tokens: number }>`SELECT
-            COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_input_tokens+charged_output_tokens
+            COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored" ? 1 : 0} THEN charged_input_tokens+charged_output_tokens
               WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
               ELSE charged_input_tokens+charged_output_tokens END),0) AS tokens
             FROM project_team_model_request WHERE environment_id=${policy.environmentId}
@@ -591,7 +591,7 @@ export const make = Effect.fn("ProjectTeamModelAccounting.make")(function* (
           )
             return yield* deny("Original attempt model budget exhausted");
           const operationUsage = yield* sql<{ tokens: number }>`SELECT
-            COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored"} THEN charged_input_tokens+charged_output_tokens
+            COALESCE(SUM(CASE WHEN ${reservation.accountingMode === "openai-subscription-monitored" ? 1 : 0} THEN charged_input_tokens+charged_output_tokens
               WHEN status='held' THEN maximum_input_tokens+maximum_output_tokens
               ELSE charged_input_tokens+charged_output_tokens END),0) AS tokens
             FROM project_team_model_request WHERE environment_id=${policy.environmentId}
