@@ -333,8 +333,11 @@ export function decodePiSubscriptionEvent(
       "content_part",
       "part",
       "logprobs",
+      "obfuscation",
     ]) ||
     payload.type !== eventType ||
+    (payload.obfuscation !== undefined &&
+      (!eventType.endsWith(".delta") || !text(payload.obfuscation))) ||
     (payload.sequence_number !== undefined &&
       (!Number.isSafeInteger(payload.sequence_number) || Number(payload.sequence_number) < 0))
   )

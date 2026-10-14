@@ -62,6 +62,11 @@ const success = (outputTokens = 10) =>
       },
     },
   });
+const paddedSuccess = (obfuscation: unknown) =>
+  success().replace(
+    '"delta":"bounded result"',
+    `"delta":"bounded result","obfuscation":${JSON.stringify(obfuscation)}`,
+  );
 const sdkModel = {
   id: model,
   name: "GPT-6 Luna",
@@ -799,6 +804,7 @@ describe("Pi OpenAI subscription broker", () => {
         output_index: 0,
         content_index: 0,
         delta: "Done",
+        obfuscation: "sdk-fixture-padding",
       }) +
       event({ type: "response.output_item.done", output_index: 0, item: message }) +
       event({
@@ -1257,6 +1263,7 @@ describe("SDK subscription request header parity", () => {
         output_index: 0,
         content_index: 0,
         delta: "Done",
+        obfuscation: "actual-sdk-fixture-padding",
       }) +
       event({ type: "response.output_item.done", output_index: 0, item: message }) +
       event({
@@ -1393,6 +1400,67 @@ const prefixFixture = (
   });
   return { ...f, prefixTransportCalls: () => calls };
 };
+
+it.each(["", "fixture-padding", "x".repeat(12_288)])(
+  "accepts bounded Responses delta obfuscation metadata (%#)",
+  async (obfuscation) => {
+    const f = prefixFixture({
+      transport: async () =>
+        new Response(paddedSuccess(obfuscation), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    const receipt = await f.invoke();
+    expect(receipt.usage).toMatchObject({ prompt_tokens: 50, completion_tokens: 10 });
+    expect(f.prefixTransportCalls()).toBe(1);
+    expect(Buffer.concat(f.chunks).toString()).toContain("bounded result");
+    expect(f.settlements).toMatchObject([{ outcome: "reported", transportDrained: true }]);
+  },
+);
+
+it.each([null, 42, {}, "x".repeat(12_289), "😀".repeat(3_073)])(
+  "rejects malformed or oversized delta obfuscation metadata (%#)",
+  async (obfuscation) => {
+    const f = prefixFixture({
+      transport: async () =>
+        new Response(paddedSuccess(obfuscation), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_FRAME_INVALID" });
+    expect(Buffer.concat(f.chunks).toString()).not.toContain("bounded result");
+    expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+  },
+);
+
+it.each([credential, accountId])(
+  "rejects parent credential or account reflection inside delta padding (%#)",
+  async (obfuscation) => {
+    const f = prefixFixture({
+      transport: async () =>
+        new Response(paddedSuccess(obfuscation), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "CREDENTIAL_ECHO_REJECTED" });
+    expect(Buffer.concat(f.chunks).toString()).not.toContain(obfuscation);
+    expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+  },
+);
+
+it("rejects obfuscation metadata outside delta events", async () => {
+  const response = success().replace(
+    '"type":"response.created"',
+    '"type":"response.created","obfuscation":"fixture-padding"',
+  );
+  const f = prefixFixture({
+    transport: async () =>
+      new Response(response, { headers: { "content-type": "text/event-stream" } }),
+  });
+  await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_FRAME_INVALID" });
+  expect(f.chunks).toHaveLength(0);
+  expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+});
 
 it.each([
   "complete",
