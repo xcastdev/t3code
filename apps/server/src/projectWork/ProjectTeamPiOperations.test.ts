@@ -46,8 +46,10 @@ import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts"
 import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import { makeProjectTaskResources } from "./ProjectTaskResources.ts";
 import { make as makeAccounting } from "./ProjectTeamModelAccounting.ts";
+import type { ProjectTeamPiSubscriptionTestSelection } from "./ProjectTeamModelAccounting.ts";
 import { PiManagedRuntimeError } from "../provider/pi/PiManagedRuntime.ts";
 import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
+import { inspectPiSubscriptionConfiguration } from "../provider/pi/PiSubscriptionConfiguration.ts";
 
 const decodeSetup = Schema.decodeUnknownEffect(ProjectTeamEffect);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -122,150 +124,151 @@ const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     Effect.map((result) => expect(result._tag).toBe("Failure")),
   );
 
-const journalFixture = Effect.gen(function* () {
-  const repository = yield* ProjectWorkRepository;
-  const sql = yield* SqlClient.SqlClient;
-  let claim: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
-  yield* seed("investigator", "reserved", {
-    nativeSessionId: null,
-    roleTools: [],
-    toolIds: [],
-    issueCredential: false,
-  }).pipe(
-    Effect.provideService(ProjectWorkRepository, {
-      ...repository,
-      execute: (command) => {
-        if (
-          command.type === "project-work.foundation.commit" &&
-          command.transition?.kind === "claim"
-        ) {
-          claim = command;
-          return Effect.fail(
-            new ProjectWorkPolicyError("invalid-state", "Retain journal fixture claim"),
-          );
-        }
-        return repository.execute(command);
-      },
-    }),
-    Effect.result,
-  );
-  if (!claim || claim.transition?.kind !== "claim")
-    return yield* Effect.die("Missing journal fixture claim");
-  const state = yield* readCurrentState(sql, projectId);
-  const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
-  if (role?.kind !== "role-revision") return yield* Effect.die("Missing journal role");
-  yield* restoreHistoricalBinding({ ...role, model });
-  const fs = yield* FileSystem.FileSystem;
-  const worktree = yield* fs.makeTempDirectoryScoped();
-  const nativeRoot = yield* fs.makeTempDirectoryScoped();
-  const protectedRoot = yield* fs.makeTempDirectoryScoped();
-  const binding = {
-    ...claim.transition.binding,
-    worktree,
-    branch: "refs/heads/assigned",
-    model,
-    configuration: {
-      ...claim.transition.binding.configuration,
-      maxTokens: 20000,
-      maxDurationMs: 300000,
-      runtimeVersion: "0.99.1",
-    },
-  };
-  const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
-  yield* repository.execute(
-    yield* decodeCommit({
-      type: "project-work.foundation.commit",
-      projectId,
-      commandId: "journal-limits",
-      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
-      attribution,
-      committedAt: at,
-      records: [
-        {
-          kind: "limits",
-          projectId,
-          recordId: "limits",
-          revision: 0,
-          generation: 0,
-          updatedAt: at,
-          status: "configured",
-          model,
-          tokenLimit: 20000,
-          durationLimitMs: 300000,
-          environmentModelCalls: 2,
-          modelCalls: 2,
-          projectWritableWorkers: 1,
-          delegationDepth: 2,
-          repairAllowance: 2,
+const journalFixture = (selectedModel: string = model) =>
+  Effect.gen(function* () {
+    const repository = yield* ProjectWorkRepository;
+    const sql = yield* SqlClient.SqlClient;
+    let claim: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+    yield* seed("investigator", "reserved", {
+      nativeSessionId: null,
+      roleTools: [],
+      toolIds: [],
+      issueCredential: false,
+    }).pipe(
+      Effect.provideService(ProjectWorkRepository, {
+        ...repository,
+        execute: (command) => {
+          if (
+            command.type === "project-work.foundation.commit" &&
+            command.transition?.kind === "claim"
+          ) {
+            claim = command;
+            return Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Retain journal fixture claim"),
+            );
+          }
+          return repository.execute(command);
         },
-      ],
-    }),
-  );
-  const request = {
-    dispatchId: "journal-dispatch",
-    claim: {
-      ...claim,
-      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
-      transition: {
-        ...claim.transition,
-        binding,
-        claim: { ...claim.transition.claim, leasedUntil: isoTime(time + 10000) },
+      }),
+      Effect.result,
+    );
+    if (!claim || claim.transition?.kind !== "claim")
+      return yield* Effect.die("Missing journal fixture claim");
+    const state = yield* readCurrentState(sql, projectId);
+    const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
+    if (role?.kind !== "role-revision") return yield* Effect.die("Missing journal role");
+    yield* restoreHistoricalBinding({ ...role, model: selectedModel });
+    const fs = yield* FileSystem.FileSystem;
+    const worktree = yield* fs.makeTempDirectoryScoped();
+    const nativeRoot = yield* fs.makeTempDirectoryScoped();
+    const protectedRoot = yield* fs.makeTempDirectoryScoped();
+    const binding = {
+      ...claim.transition.binding,
+      worktree,
+      branch: "refs/heads/assigned",
+      model: selectedModel,
+      configuration: {
+        ...claim.transition.binding.configuration,
+        maxTokens: 20000,
+        maxDurationMs: 300000,
+        runtimeVersion: "0.99.1",
       },
-    },
-    git: {
-      effectId: "journal-dispatch",
-      runId: binding.recordId,
-      generation: binding.generation,
-      primaryRoot: "/workspace",
-      commonGitDirectory: "/workspace/.git",
-      worktreePath: worktree,
-      branchRef: binding.branch,
-      baseRef: "refs/heads/main",
-      baseOid: "a".repeat(40),
-      ownershipToken: "owner",
-      policyHash: "b".repeat(64),
-    },
-    setupId: "journal-setup",
-    initializeOperationId: "journal-initialize",
-    assignmentOperationId: "journal-assignment",
-    assignment: "Investigate the approved task",
-  };
-  yield* TestClock.setTime(time);
-  const journal = yield* makeProjectTeamDispatchJournal({
-    environmentId: "environment",
-    maximumEnvironmentModelCalls: 2,
+    };
+    const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+    yield* repository.execute(
+      yield* decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "journal-limits",
+        expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+        attribution,
+        committedAt: at,
+        records: [
+          {
+            kind: "limits",
+            projectId,
+            recordId: "limits",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "configured",
+            model: selectedModel,
+            tokenLimit: 20000,
+            durationLimitMs: 300000,
+            environmentModelCalls: 2,
+            modelCalls: 2,
+            projectWritableWorkers: 1,
+            delegationDepth: 2,
+            repairAllowance: 2,
+          },
+        ],
+      }),
+    );
+    const request = {
+      dispatchId: "journal-dispatch",
+      claim: {
+        ...claim,
+        expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+        transition: {
+          ...claim.transition,
+          binding,
+          claim: { ...claim.transition.claim, leasedUntil: isoTime(time + 10000) },
+        },
+      },
+      git: {
+        effectId: "journal-dispatch",
+        runId: binding.recordId,
+        generation: binding.generation,
+        primaryRoot: "/workspace",
+        commonGitDirectory: "/workspace/.git",
+        worktreePath: worktree,
+        branchRef: binding.branch,
+        baseRef: "refs/heads/main",
+        baseOid: "a".repeat(40),
+        ownershipToken: "owner",
+        policyHash: "b".repeat(64),
+      },
+      setupId: "journal-setup",
+      initializeOperationId: "journal-initialize",
+      assignmentOperationId: "journal-assignment",
+      assignment: "Investigate the approved task",
+    };
+    yield* TestClock.setTime(time);
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 2,
+    });
+    const admitted = yield* journal.reserve(request);
+    const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+    const allocation = yield* preallocatePiManagedProcess({
+      workspaceRoot: worktree,
+      workspaceAccess: "readonly",
+      nativeStateRoot: nativeRoot,
+      protectedRoots: [protectedRoot],
+      runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
+      argv: ["/bin/true"],
+      memoryBytes: 33554432,
+      runtimeSeconds: 10,
+    });
+    const identity = { providerInstanceId, threadId };
+    return {
+      sql,
+      journal,
+      admitted,
+      operations,
+      allocation,
+      identity,
+      repository,
+      request,
+      binding,
+      role: { ...role, model: selectedModel },
+    };
   });
-  const admitted = yield* journal.reserve(request);
-  const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
-  const allocation = yield* preallocatePiManagedProcess({
-    workspaceRoot: worktree,
-    workspaceAccess: "readonly",
-    nativeStateRoot: nativeRoot,
-    protectedRoots: [protectedRoot],
-    runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
-    argv: ["/bin/true"],
-    memoryBytes: 33554432,
-    runtimeSeconds: 10,
-  });
-  const identity = { providerInstanceId, threadId };
-  return {
-    sql,
-    journal,
-    admitted,
-    operations,
-    allocation,
-    identity,
-    repository,
-    request,
-    binding,
-    role: { ...role, model },
-  };
-});
 
 it.effect("uses the actual journal root budget while the operation keeps its shorter lease", () =>
   fileTest(
     Effect.gen(function* () {
-      const f = yield* journalFixture;
+      const f = yield* journalFixture();
       const op = yield* f.operations.prepare(
         f.identity,
         { threadId, kind: "initialize" },
@@ -287,8 +290,296 @@ it.effect("uses the actual journal root budget while the operation keeps its sho
   ),
 );
 
+for (const outcome of ["unknown", "reported"] as const)
+  it.effect(`joined failure proof follows original subscription accounting: ${outcome}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* journalFixture("gpt-6-luna");
+        const fs = yield* FileSystem.FileSystem;
+        const executable = yield* fs.realPath("/usr/bin/true");
+        const allocationFor = () =>
+          preallocatePiManagedProcess({
+            workspaceRoot: f.binding.worktree,
+            workspaceAccess: "readonly",
+            nativeStateRoot: f.allocation.launch.nativeStateRoot,
+            protectedRoots: f.allocation.launch.protectedRoots,
+            runtimeFiles: [{ source: executable, target: "/bin/true" }],
+            argv: ["/bin/true"],
+            memoryBytes: 33554432,
+            runtimeSeconds: 10,
+          });
+        const ownerFor = (allocation: typeof f.allocation) => ({
+          type: "owner" as const,
+          unit: allocation.unit,
+          nonce: allocation.nonce,
+          invocation: "a".repeat(32),
+          cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+          pid: 123,
+          memoryBytes: allocation.policy.memoryBytes,
+          swapBytes: 0 as const,
+          oomGroup: 1 as const,
+        });
+        const drainFor = (owner: ReturnType<typeof ownerFor>) => ({
+          unit: owner.unit,
+          invocation: owner.invocation,
+          cgroup: owner.cgroup,
+          ownerPid: owner.pid,
+          memoryBytes: owner.memoryBytes,
+          swapBytes: 0 as const,
+          oomGroup: 1 as const,
+          launcherPid: 124,
+          childPid: 125,
+          childExitCode: 0,
+          kernel: "populated 0\nfrozen 0",
+        });
+        const initializeAllocation = yield* allocationFor();
+        const initialize = yield* f.operations.prepare(
+          f.identity,
+          { threadId, kind: "initialize" },
+          "joined-failure-initialize",
+          {
+            allocation: initializeAllocation,
+            workerId: "joined-failure-worker",
+            operationId: f.request.initializeOperationId,
+          },
+        );
+        const initializeOwner = ownerFor(initializeAllocation);
+        const initializeDrain = drainFor(initializeOwner);
+        yield* f.operations.persistence(initialize).claimActivation(initializeAllocation);
+        yield* f.operations.persistence(initialize).beforeStart(initializeOwner);
+        yield* f.operations.persistNative(initialize, nativeReference);
+        yield* f.operations.persistTerminal(initialize, {
+          identity: { workerId: initialize.workerId, generation: 0 },
+          operation: initialize.operation,
+          outcome: "success",
+          ownerCaptured: true,
+          native: nativeReference,
+          drain: initializeDrain,
+          accountingReceipts: [],
+        });
+        const request = {
+          threadId,
+          kind: "prompt" as const,
+          operationId: f.request.assignmentOperationId,
+          prompt: f.request.assignment,
+        };
+        const requestHash = NodeCrypto.createHash("sha256")
+          .update(canonicalProjectWorkPayload(request))
+          .digest("hex");
+        const promptAllocation = yield* allocationFor();
+        const prompt = yield* f.operations.prepare(f.identity, request, requestHash, {
+          allocation: promptAllocation,
+          workerId: "joined-failure-worker",
+          operationId: request.operationId,
+          resourceHash: "a".repeat(64),
+        });
+        const promptOwner = ownerFor(promptAllocation);
+        const promptDrain = drainFor(promptOwner);
+        yield* f.operations.persistence(prompt).claimActivation(promptAllocation);
+        yield* f.operations.persistence(prompt).beforeStart(promptOwner);
+        yield* f.operations.persistNative(prompt, nativeReference);
+        const configuration = yield* inspectPiSubscriptionConfiguration({
+          agentDirectory: f.allocation.launch.nativeStateRoot,
+          runtimeVersion: "0.99.1",
+          nodeVersion: "22.19.0",
+          selectedModel: { provider: "openai-codex", model: "gpt-6-luna" },
+          limits: { maxInputTokens: 16_384, maxOutputTokens: 2_048, deadlineMs: 300_000 },
+          reasoningEffort: "high",
+          serviceTier: "default",
+        });
+        const subscriptionTest: ProjectTeamPiSubscriptionTestSelection = {
+          projectId: f.binding.projectId,
+          rootTaskId: f.admitted.intent.limits.rootTaskId,
+          model: configuration.model,
+          maximumTokens: 64_000,
+          maximumDurationMs: 300_000,
+        };
+        const accounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "openai-subscription-luna",
+          model: configuration.model,
+          acceptedReportedModels: [configuration.model],
+          subscriptionTest,
+          resolveOperation: f.operations.resolveOperation,
+        });
+        const reservation = {
+          workerId: prompt.workerId,
+          operationId: prompt.operation.operationId,
+          generation: 0,
+          requestId: 1,
+          routeId: "openai-subscription-luna",
+          provider: "openai-codex" as const,
+          model: configuration.model,
+          maxInputTokens: configuration.maxInputTokens,
+          maxOutputTokens: configuration.maxOutputTokens,
+          callCount: 1 as const,
+          deadlineAtMs: prompt.deadlineAtMs,
+          accountingMode: "openai-subscription-monitored" as const,
+          unknownMaximumTokens: 64_000 as const,
+        };
+        const foreignAccounting = yield* makeAccounting({
+          environmentId: "environment",
+          routeId: "openai-subscription-luna",
+          model: configuration.model,
+          acceptedReportedModels: [configuration.model],
+          subscriptionTest: {
+            ...subscriptionTest,
+            rootTaskId: "foreign-subscription-root",
+          },
+          resolveOperation: f.operations.resolveOperation,
+        });
+        expect(
+          (yield* foreignAccounting.reserve(prompt.principal, reservation).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+        expect(yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`).toHaveLength(0);
+        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toHaveLength(0);
+        const reserved = yield* accounting.reserve(prompt.principal, reservation);
+        const usage = { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 };
+        const settled = yield* accounting.settle({
+          ...reservation,
+          reservationId: reserved.reservationId,
+          outcome,
+          transportDrained: outcome === "reported",
+          chargedInputTokens: outcome === "reported" ? 10 : reservation.maxInputTokens,
+          chargedOutputTokens: outcome === "reported" ? 20 : 64_000,
+          ...(outcome === "reported"
+            ? { reportedModel: configuration.model, reportedUsage: usage }
+            : {}),
+          accountingMode: "openai-subscription-monitored",
+          unknownMaximumTokens: 64_000,
+        });
+        const failedTerminal = {
+          identity: { workerId: prompt.workerId, generation: 0 },
+          operation: prompt.operation,
+          outcome: outcome === "reported" ? ("success" as const) : ("canceled" as const),
+          ownerCaptured: true,
+          native: nativeReference,
+          drain: promptDrain,
+          accountingReceipts:
+            outcome === "reported"
+              ? [
+                  {
+                    requestId: reservation.requestId,
+                    routeId: reservation.routeId,
+                    provider: reservation.provider,
+                    model: reservation.model,
+                    reportedModel: configuration.model,
+                    usage,
+                    reservationId: reserved.reservationId,
+                    accountingReceiptId: settled.accountingReceiptId,
+                  },
+                ]
+              : [],
+        } satisfies PiSessionTerminal;
+        yield* f.operations.persistTerminal(prompt, failedTerminal);
+        const proof = yield* f.sql.withTransaction(
+          f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted),
+        );
+        if (outcome === "reported") {
+          expect(proof).toBeUndefined();
+          expect(
+            yield* f.sql`SELECT stopped_at_ms,stop_reason FROM project_team_pi_subscription_grant`,
+          ).toEqual([{ stopped_at_ms: null, stop_reason: null }]);
+          expect(
+            yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
+          ).toEqual([
+            {
+              status: "reported",
+              capacity_state: "released",
+              charged_input_tokens: 10,
+              charged_output_tokens: 20,
+            },
+          ]);
+          return;
+        }
+        expect(proof).toMatchObject({ operationId: prompt.operation.operationId });
+        expect(proof?.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+        const originalBudget = yield* f.sql`SELECT maximum_tokens,deadline_at_ms
+        FROM project_team_model_budget`;
+        const originalGrant = yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`;
+        const originalCapacity =
+          yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+        FROM project_team_model_request`;
+        expect(originalGrant).toHaveLength(1);
+        expect(originalGrant[0]).toMatchObject({
+          environment_id: "environment",
+          project_id: f.binding.projectId,
+          root_task_id: f.admitted.intent.limits.rootTaskId,
+          model: configuration.model,
+          route_id: "openai-subscription-luna",
+          maximum_tokens: 64_000,
+          maximum_duration_ms: 300_000,
+          stopped_at_ms: time,
+          stop_reason: "unknown-usage",
+        });
+        expect(
+          (yield* f.sql`UPDATE project_team_pi_subscription_grant SET model='foreign-model'
+            WHERE environment_id='environment' AND project_id=${f.binding.projectId}
+            AND root_task_id=${f.admitted.intent.limits.rootTaskId}`.pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(originalBudget).toEqual([
+          {
+            maximum_tokens: f.admitted.intent.limits.maximumTokens,
+            deadline_at_ms: f.admitted.intent.limits.rootDeadlineAtMs,
+          },
+        ]);
+        expect(originalCapacity).toEqual([
+          {
+            status: "unknown",
+            capacity_state: "quarantine",
+            charged_input_tokens: configuration.maxInputTokens,
+            charged_output_tokens: 64_000,
+          },
+        ]);
+        yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens='malformed'
+        WHERE environment_id='environment' AND project_id=${f.binding.projectId}
+        AND root_task_id=${f.admitted.intent.limits.rootTaskId}`;
+        const malformedCeiling = f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted);
+        expect((yield* f.sql.withTransaction(malformedCeiling).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=${originalBudget[0]!.maximum_tokens}`;
+        yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms='malformed'
+        WHERE environment_id='environment' AND project_id=${f.binding.projectId}
+        AND root_task_id=${f.admitted.intent.limits.rootTaskId}`;
+        const malformedDeadline = f.operations.readJoinedQuarantinedFailureInTransaction(
+          f.admitted,
+        );
+        expect((yield* f.sql.withTransaction(malformedDeadline).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=${originalBudget[0]!.deadline_at_ms}`;
+        const foreign = f.operations.readJoinedQuarantinedFailureInTransaction({
+          ...f.admitted,
+          fence: { ...f.admitted.fence, dispatchId: "foreign-dispatch" },
+        });
+        expect((yield* f.sql.withTransaction(foreign).pipe(Effect.result))._tag).toBe("Failure");
+        yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson({
+          ...failedTerminal,
+          native: { ...nativeReference, leafId: "foreign-native" },
+        })} WHERE operation_id=${prompt.operation.operationId}`;
+        const forged = f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted);
+        expect((yield* f.sql.withTransaction(forged).pipe(Effect.result))._tag).toBe("Failure");
+        yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${encodeJson({
+          ...failedTerminal,
+          outcome: "success",
+        })} WHERE operation_id=${prompt.operation.operationId}`;
+        expect(
+          (yield* f.sql
+            .withTransaction(f.operations.readJoinedQuarantinedFailureInTransaction(f.admitted))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+          FROM project_team_model_request`,
+        ).toEqual(originalCapacity);
+      }),
+    ),
+  );
+
 const journalChild = Effect.gen(function* () {
-  const f = yield* journalFixture;
+  const f = yield* journalFixture();
   const rootOperation = yield* f.operations.prepare(
     f.identity,
     { threadId, kind: "initialize" },
@@ -653,7 +944,7 @@ it.effect(
   () =>
     fileTest(
       Effect.gen(function* () {
-        const f = yield* journalFixture;
+        const f = yield* journalFixture();
         yield* f.journal.claimEffect(f.admitted.fence);
         const op = yield* f.operations.prepare(
           f.identity,
@@ -1523,6 +1814,7 @@ for (const mode of [
             ...request,
             reservationId: reservation.reservationId,
             outcome: reported ? "reported" : mode,
+            ...(reported ? { transportDrained: true } : {}),
             chargedInputTokens: reported ? 10 : 100,
             chargedOutputTokens: reported ? 20 : 100,
             ...(reported
@@ -2156,6 +2448,20 @@ for (const mode of [
             },
           ],
         };
+        if (mode === "transport-missing" || mode === "transport-false") {
+          const before = yield* f.sql`SELECT * FROM project_team_model_request`;
+          expect(before[0]).toMatchObject({ status: "reported", capacity_state: "quarantine" });
+          yield* typedDenial(f.operations.persistTerminal(f.op, terminal), "uncertain");
+          yield* typedDenial(
+            f.operations.lookup(f.identity, f.request, f.requestHash, f.resourceHash),
+            "uncertain",
+          );
+          expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(before);
+          expect(yield* f.sql`SELECT status FROM project_team_pi_operation`).toEqual([
+            { status: "running" },
+          ]);
+          return;
+        }
         yield* f.operations.persistTerminal(f.op, terminal);
         if (mode.startsWith("receipt-")) {
           const snapshot = Effect.fn("snapshotPiReplayDatabase")(function* () {
@@ -2739,7 +3045,7 @@ it.effect(
   () =>
     fileTest(
       Effect.gen(function* () {
-        const f = yield* journalFixture;
+        const f = yield* journalFixture();
         const op = yield* f.operations.prepare(
           f.identity,
           { threadId, kind: "initialize" },

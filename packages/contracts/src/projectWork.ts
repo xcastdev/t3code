@@ -1457,6 +1457,12 @@ const ReviewParentAssessments = Schema.Struct({
   }),
 });
 /** Private joined settlement carries retained child proof, never an approval grant. */
+export const ProjectTeamJoinedFailureProof = Schema.Struct({
+  fingerprint: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  operationId: GuidedId,
+  repairAllowance: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 16 })),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamJoinedFailureProof = typeof ProjectTeamJoinedFailureProof.Type;
 export const ProjectTeamReviewCompletionProof = Schema.Union([
   Schema.Struct({
     status: Schema.Literal("completed"),
@@ -1703,6 +1709,7 @@ export const ProjectWorkTeamTransition = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("run.settle"),
     reviewCompletion: Schema.optionalKey(ProjectTeamReviewCompletionProof),
+    failure: Schema.optionalKey(ProjectTeamJoinedFailureProof),
     bindingId: GuidedId,
     generation: JoinedRunCounter,
     expectedBindingRevision: JoinedRunCounter,

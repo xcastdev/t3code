@@ -1,6 +1,7 @@
 import {
   canonicalProjectWorkPayload,
   ProjectTeamIntegrationSources,
+  type ProjectTeamJoinedFailureProof,
   type ProjectTeamReviewCompletionProof,
   projectWorkPayloadFingerprint,
   CommandId,
@@ -325,6 +326,15 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       snapshot: ProjectTeamDispatchSnapshot,
       receipt: ProjectTeamDispatchStageReceipt,
     ) => Effect.Effect<ProjectTeamReviewCompletionProof | undefined, E, R>;
+    /** Qualifies only a joined failed Pi operation with retained quarantined model accounting. */
+    readonly prepareFailure?: (
+      snapshot: ProjectTeamDispatchSnapshot,
+      receipt: ProjectTeamDispatchStageReceipt,
+    ) => Effect.Effect<
+      Pick<ProjectTeamJoinedFailureProof, "fingerprint" | "operationId"> | undefined,
+      E,
+      R
+    >;
     /** Recheck the original assessment target after domain projection, before COMMIT. */
     readonly verifyReviewTarget?: (
       snapshot: ProjectTeamDispatchSnapshot,
@@ -335,6 +345,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
     const repository = yield* ProjectWorkRepository;
     const settings = yield* Effect.serviceOption(ServerSettingsService);
     const prepareReviewCompletion = options.prepareReviewCompletion;
+    const prepareFailure = options.prepareFailure;
     const verifyReviewTarget = options.verifyReviewTarget;
     const verifyAdmission = options.verifyAdmission;
     const verifyStageFinal = options.verifyStageFinal;
@@ -1937,6 +1948,45 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
                   { fence: fence(original.row), intent: original.intent },
                   receipt,
                 );
+          const membership = state.foundationRecords?.filter(
+            (record) => record.kind === "task-membership" && record.taskId === task.taskId,
+          );
+          const owner = state.foundationRecords?.find(
+            (record) => record.kind === "member" && record.recordId === binding.memberId,
+          );
+          const mayReflectFailure =
+            reviewCompletion === undefined &&
+            task.state === "in-progress" &&
+            task.activeAttemptId === attempt.attemptId &&
+            (attempt.state === "leased" || attempt.state === "running") &&
+            binding.status === "running" &&
+            membership?.length === 1 &&
+            membership[0]?.kind === "task-membership" &&
+            membership[0].status === "active" &&
+            (membership[0].controlState === undefined || membership[0].controlState === "active") &&
+            membership[0].requestedSuccessorMemberId === undefined &&
+            owner?.kind === "member" &&
+            owner.status === "active" &&
+            !state.blockers.some(
+              (blocker) => blocker.taskId === task.taskId && blocker.resolvedAt === undefined,
+            );
+          const failureEvidence =
+            prepareFailure === undefined || !mayReflectFailure
+              ? undefined
+              : yield* prepareFailure(
+                  { fence: fence(original.row), intent: original.intent },
+                  receipt,
+                );
+          const failure =
+            failureEvidence === undefined
+              ? undefined
+              : {
+                  ...failureEvidence,
+                  repairAllowance: Math.min(
+                    original.intent.limits.repairAllowance,
+                    original.intent.rootCaps.repairAllowance,
+                  ),
+                };
           if (
             reviewCompletion?.status === "completed" &&
             reviewCompletion.report.type === "project-team.assignment.report" &&
@@ -1965,6 +2015,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
             transition: {
               kind: "run.settle",
               ...(reviewCompletion === undefined ? {} : { reviewCompletion }),
+              ...(failure === undefined ? {} : { failure }),
               bindingId: binding.recordId,
               generation: binding.generation,
               expectedBindingRevision: binding.revision,

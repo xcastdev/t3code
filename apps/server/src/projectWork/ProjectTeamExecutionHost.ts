@@ -400,6 +400,8 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
     const journal: Journal = yield* makeProjectTeamDispatchJournal({
       ...options,
       prepareReviewCompletion: reviewCompletion.prepare,
+      prepareFailure: (snapshot) =>
+        boundary(operations.readJoinedQuarantinedFailureInTransaction(snapshot)),
       verifyReviewTarget: currentTarget.assertOriginalInTransaction,
       verifyStage: (receipt, snapshot) =>
         boundary(verifyStage(receipt, snapshot)).pipe(Effect.provideService(Scope.Scope, scope)),

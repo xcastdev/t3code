@@ -41,7 +41,11 @@ import {
 } from "../provider/pi/PiWorkerProtocol.ts";
 import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 import type { PiModelRequestReservation } from "../provider/pi/PiModelBroker.ts";
-import { ModelAccountingError } from "./ProjectTeamModelAccounting.ts";
+import {
+  auditProjectTeamRecordedPiModelRow,
+  decodeProjectTeamRecordedModelRow,
+  ModelAccountingError,
+} from "./ProjectTeamModelAccounting.ts";
 import {
   ProjectMemoryOperationIdentity,
   ProjectMemoryTaskOwner,
@@ -1184,6 +1188,279 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           yield* readUsageHistoryInTransaction(owner.bindingId, owner.generation, state),
         );
       return histories;
+    });
+    const readJoinedQuarantinedFailureInTransaction = Effect.fn(
+      "ProjectTeamPiOperations.readJoinedQuarantinedFailureInTransaction",
+    )(function* (snapshot: ProjectTeamDispatchSnapshot) {
+      const suppliedSql = yield* Effect.serviceOption(SqlClient.SqlClient);
+      const suppliedRepository = yield* Effect.serviceOption(ProjectWorkRepository);
+      if (
+        Option.isNone(suppliedSql) ||
+        suppliedSql.value !== sql ||
+        Option.isNone(suppliedRepository) ||
+        suppliedRepository.value !== repository ||
+        Option.isNone(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny("Pi failure proof requires its captured transaction");
+      const transition = snapshot.intent.compiledClaim.transition;
+      if (transition?.kind !== "claim") return yield* deny("Original Pi binding is unavailable");
+      const binding = transition.binding;
+      const dispatches = yield* sql<{
+        dispatch_id: string | null;
+        project_id: string | null;
+        task_id: string | null;
+        root_task_id: string | null;
+      }>`SELECT
+        CASE WHEN typeof(dispatch_id)='text' AND length(CAST(dispatch_id AS BLOB)) BETWEEN 1 AND 256 THEN dispatch_id END AS dispatch_id,
+        CASE WHEN typeof(project_id)='text' AND length(CAST(project_id AS BLOB)) BETWEEN 1 AND 256 THEN project_id END AS project_id,
+        CASE WHEN typeof(task_id)='text' AND length(CAST(task_id AS BLOB)) BETWEEN 1 AND 256 THEN task_id END AS task_id,
+        CASE WHEN typeof(root_task_id)='text' AND length(CAST(root_task_id AS BLOB)) BETWEEN 1 AND 256 THEN root_task_id END AS root_task_id
+        FROM project_team_dispatch WHERE environment_id=${options.environmentId}
+        AND dispatch_id=${snapshot.fence.dispatchId} AND binding_id=${binding.recordId}
+        AND generation=${binding.generation} LIMIT 2`;
+      if (
+        dispatches.length !== 1 ||
+        dispatches[0]?.dispatch_id !== snapshot.fence.dispatchId ||
+        dispatches[0].project_id !== binding.projectId ||
+        dispatches[0].task_id !== binding.taskId ||
+        dispatches[0].root_task_id !== snapshot.intent.limits.rootTaskId
+      )
+        return yield* deny("Original Pi dispatch identity differs");
+      const operationCount = yield* sql<{ count: number }>`SELECT COUNT(*) AS count
+        FROM project_team_pi_operation WHERE environment_id=${options.environmentId}
+        AND binding_id=${binding.recordId} AND generation=${binding.generation}`;
+      if (
+        operationCount.length !== 1 ||
+        !Number.isSafeInteger(operationCount[0]?.count) ||
+        operationCount[0]!.count < 0
+      )
+        return yield* deny("Original Pi operation count is unavailable");
+      if (operationCount[0]!.count === 0) return undefined;
+      if (operationCount[0]!.count > 130)
+        return yield* deny("Original Pi failure history exceeds its bound");
+      const history = yield* readUsageHistoryInTransaction(binding.recordId, binding.generation);
+      if (
+        history.taskId !== binding.taskId ||
+        history.attemptId !== binding.attemptId ||
+        history.rootTaskId !== snapshot.intent.limits.rootTaskId
+      )
+        return yield* deny("Original Pi task owner differs");
+      const operations = yield* sql<{
+        operation_id: string;
+        operation_kind: string;
+        status: string;
+        native_json: string | null;
+        terminal_json: string | null;
+      }>`SELECT operation_id,operation_kind,status,native_json,terminal_json FROM project_team_pi_operation
+        WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId}
+        AND generation=${binding.generation} ORDER BY operation_ordinal LIMIT 131`;
+      if (operations.length !== operationCount[0]!.count || operations.length > 130)
+        return yield* deny("Original Pi failure history changed");
+      if (operations.length !== history.operations.length)
+        return yield* deny("Original Pi operation history differs");
+      const operation = history.operations.at(-1);
+      if (!operation) return undefined;
+      const row = operations.find((candidate) => candidate.operation_id === operation.operationId);
+      if (!row || row.status !== "settled" || !row.native_json || !row.terminal_json)
+        return yield* deny("Final original Pi operation has no qualified terminal");
+      const terminal = yield* decodeTerminal(row.terminal_json).pipe(
+        Effect.mapError(() => deny("Original Pi terminal is unavailable")),
+      );
+      if (terminal.outcome === "quarantine")
+        return yield* deny("Final original Pi terminal is not authoritatively joined");
+      if (
+        !terminal.ownerCaptured ||
+        !terminal.drain ||
+        !terminal.native ||
+        terminal.identity.workerId !== operation.workerId ||
+        terminal.identity.generation !== binding.generation ||
+        terminal.operation.operationId !== operation.operationId ||
+        terminal.operation.operationKind !== row.operation_kind ||
+        encode(yield* decodeNative(row.native_json)) !== encode(terminal.native)
+      )
+        return yield* deny("Original Pi terminal owner differs");
+      const memoryLedger = yield* auditProjectMemoryOperationLedger(sql, {
+        environmentId: options.environmentId,
+        projectId: binding.projectId,
+        bindingId: binding.recordId,
+        generation: binding.generation,
+        operationId: operation.operationId,
+      });
+      if (!memoryLedger.settled) return yield* deny("Original Pi memory transport is not settled");
+      const bounds = yield* sql<{ count: number; bytes: number }>`SELECT COUNT(*) AS count,
+          COALESCE(SUM(
+            length(CAST(reservation_id AS BLOB))+length(CAST(environment_id AS BLOB))+
+            length(CAST(project_id AS BLOB))+length(CAST(root_task_id AS BLOB))+
+            length(CAST(run_id AS BLOB))+length(CAST(attempt_id AS BLOB))+
+            length(CAST(worker_id AS BLOB))+length(CAST(generation AS BLOB))+
+            length(CAST(operation_id AS BLOB))+length(CAST(request_lane AS BLOB))+
+            length(CAST(request_scope AS BLOB))+length(CAST(request_id AS BLOB))+
+            length(CAST(route_id AS BLOB))+length(CAST(provider AS BLOB))+
+            length(CAST(model AS BLOB))+length(CAST(environment_slot AS BLOB))+
+            length(CAST(model_slot AS BLOB))+length(CAST(maximum_input_tokens AS BLOB))+
+            length(CAST(maximum_output_tokens AS BLOB))+length(CAST(deadline_at_ms AS BLOB))+
+            length(CAST(status AS BLOB))+length(CAST(capacity_state AS BLOB))+
+            length(CAST(charged_input_tokens AS BLOB))+length(CAST(charged_output_tokens AS BLOB))+
+            COALESCE(length(CAST(accounting_receipt_id AS BLOB)),0)+
+            length(CAST(accounting_mode AS BLOB))+
+            COALESCE(length(CAST(unknown_maximum_tokens AS BLOB)),0)+
+            length(CAST(reservation_json AS BLOB))+
+            COALESCE(length(CAST(settlement_json AS BLOB)),0)
+          ),0) AS bytes FROM project_team_model_request
+          WHERE operation_id=${operation.operationId} AND request_lane='pi' AND request_scope=''`;
+      if (
+        bounds.length !== 1 ||
+        !Number.isSafeInteger(bounds[0]?.count) ||
+        bounds[0]!.count < 0 ||
+        bounds[0]!.count > 256 ||
+        !Number.isSafeInteger(bounds[0]?.bytes) ||
+        bounds[0]!.bytes < 0 ||
+        bounds[0]!.bytes > 4_194_304
+      )
+        return yield* deny("Original Pi accounting exceeds its retained bound");
+      if (bounds[0]!.count === 0) {
+        if (terminal.outcome === "success" && terminal.accountingReceipts.length > 0)
+          return yield* deny("Successful Pi terminal has unretained accounting receipts");
+        return undefined;
+      }
+      const requests =
+        yield* sql`SELECT reservation_id,environment_id,project_id,root_task_id,
+          run_id,attempt_id,worker_id,generation,operation_id,request_lane,request_scope,request_id,
+          route_id,provider,model,maximum_input_tokens,maximum_output_tokens,deadline_at_ms,status,capacity_state,
+          charged_input_tokens,charged_output_tokens,accounting_mode,unknown_maximum_tokens,
+          accounting_receipt_id,reservation_json,settlement_json FROM project_team_model_request
+          WHERE operation_id=${operation.operationId} AND request_lane='pi' AND request_scope=''
+          ORDER BY request_id LIMIT 257`;
+      if (requests.length !== bounds[0]!.count || requests.length > 256)
+        return yield* deny("Original Pi accounting rows changed");
+      let quarantined = false;
+      const requestReferences: Array<{ reservationId: string; requestId: number }> = [];
+      const requestStatuses: Array<string> = [];
+      for (const value of requests) {
+        const request = yield* decodeProjectTeamRecordedModelRow(value).pipe(
+          Effect.mapError(() => deny("Original Pi accounting row is invalid")),
+        );
+        if (
+          request.environment_id !== options.environmentId ||
+          request.project_id !== binding.projectId ||
+          request.root_task_id !== history.rootTaskId ||
+          request.run_id !== binding.recordId ||
+          request.attempt_id !== binding.attemptId ||
+          request.worker_id !== operation.workerId ||
+          request.generation !== binding.generation ||
+          request.operation_id !== operation.operationId
+        )
+          return yield* deny("Original Pi accounting owner differs");
+        if (request.status === "held")
+          return yield* deny("Original Pi accounting still has a held request");
+        if (request.accounting_mode === "openai-subscription-monitored") {
+          const budgets = yield* sql<{
+            maximum_tokens: number | null;
+            deadline_at_ms: number | null;
+          }>`SELECT
+                CASE WHEN typeof(maximum_tokens)='integer' AND maximum_tokens BETWEEN 1 AND 64000 THEN maximum_tokens END AS maximum_tokens,
+                CASE WHEN typeof(deadline_at_ms)='integer' AND deadline_at_ms BETWEEN 1 AND 9007199254740991 THEN deadline_at_ms END AS deadline_at_ms
+              FROM project_team_model_budget
+              WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId}
+              AND root_task_id=${history.rootTaskId} LIMIT 2`;
+          const grants = yield* sql<{
+            model: string | null;
+            route_id: string | null;
+            maximum_tokens: number | null;
+            maximum_duration_ms: number | null;
+            deadline_at_ms: number | null;
+            stopped_at_ms: number | null;
+            stopped_at_valid: number;
+            stop_reason: string | null;
+            stop_reason_valid: number;
+          }>`SELECT
+                CASE WHEN typeof(model)='text' AND length(CAST(model AS BLOB)) BETWEEN 1 AND 256 THEN model END AS model,
+                CASE WHEN typeof(route_id)='text' AND length(CAST(route_id AS BLOB)) BETWEEN 1 AND 256 THEN route_id END AS route_id,
+                CASE WHEN typeof(maximum_tokens)='integer' AND maximum_tokens BETWEEN 1 AND 9007199254740991 THEN maximum_tokens END AS maximum_tokens,
+                CASE WHEN typeof(maximum_duration_ms)='integer' AND maximum_duration_ms BETWEEN 1 AND 9007199254740991 THEN maximum_duration_ms END AS maximum_duration_ms,
+                CASE WHEN typeof(deadline_at_ms)='integer' AND deadline_at_ms BETWEEN 1 AND 9007199254740991 THEN deadline_at_ms END AS deadline_at_ms,
+                CASE WHEN stopped_at_ms IS NULL THEN NULL
+                  WHEN typeof(stopped_at_ms)='integer' AND stopped_at_ms BETWEEN 1 AND 9007199254740991 THEN stopped_at_ms END AS stopped_at_ms,
+                CASE WHEN stopped_at_ms IS NULL OR
+                  (typeof(stopped_at_ms)='integer' AND stopped_at_ms BETWEEN 1 AND 9007199254740991)
+                  THEN 1 ELSE 0 END AS stopped_at_valid,
+                CASE WHEN typeof(stop_reason)='text' AND length(CAST(stop_reason AS BLOB)) BETWEEN 1 AND 64 THEN stop_reason END AS stop_reason,
+                CASE WHEN stop_reason IS NULL OR
+                  (typeof(stop_reason)='text' AND length(CAST(stop_reason AS BLOB)) BETWEEN 1 AND 64
+                    AND stop_reason IN ('unknown-usage','threshold-reached'))
+                  THEN 1 ELSE 0 END AS stop_reason_valid
+              FROM project_team_pi_subscription_grant WHERE environment_id=${options.environmentId}
+              AND project_id=${binding.projectId} AND root_task_id=${history.rootTaskId} LIMIT 2`;
+          if (
+            budgets.length !== 1 ||
+            grants.length !== 1 ||
+            !budgets[0] ||
+            !grants[0] ||
+            budgets[0].maximum_tokens === null ||
+            !Number.isSafeInteger(budgets[0].maximum_tokens) ||
+            budgets[0].maximum_tokens <= 0 ||
+            budgets[0].maximum_tokens > 64_000 ||
+            budgets[0].deadline_at_ms === null ||
+            !Number.isSafeInteger(budgets[0].deadline_at_ms) ||
+            budgets[0].deadline_at_ms <= 0 ||
+            grants[0].model !== "gpt-6-luna" ||
+            grants[0].route_id !== "openai-subscription-luna" ||
+            grants[0].maximum_tokens === null ||
+            !Number.isSafeInteger(grants[0].maximum_tokens) ||
+            grants[0].maximum_tokens !== 64_000 ||
+            grants[0].maximum_duration_ms === null ||
+            !Number.isSafeInteger(grants[0].maximum_duration_ms) ||
+            grants[0].maximum_duration_ms !== 300_000 ||
+            grants[0].deadline_at_ms === null ||
+            !Number.isSafeInteger(grants[0].deadline_at_ms) ||
+            grants[0].deadline_at_ms <= 0 ||
+            grants[0].deadline_at_ms !== budgets[0].deadline_at_ms ||
+            grants[0].stopped_at_valid !== 1 ||
+            grants[0].stop_reason_valid !== 1 ||
+            (grants[0].stopped_at_ms === null) !== (grants[0].stop_reason === null) ||
+            (grants[0].stopped_at_ms !== null &&
+              (!Number.isSafeInteger(grants[0].stopped_at_ms) || grants[0].stopped_at_ms <= 0)) ||
+            (request.status === "unknown" &&
+              (grants[0].stopped_at_ms === null || grants[0].stop_reason !== "unknown-usage")) ||
+            request.model !== grants[0].model ||
+            request.route_id !== grants[0].route_id ||
+            request.unknown_maximum_tokens !== 64_000
+          )
+            return yield* deny("Original Pi subscription accounting grant differs");
+        }
+        requestReferences.push({
+          reservationId: request.reservation_id,
+          requestId: request.request_id,
+        });
+        requestStatuses.push(request.status);
+        yield* auditProjectTeamRecordedPiModelRow(request, terminal.accountingReceipts).pipe(
+          Effect.mapError(() => deny("Original Pi accounting proof is unavailable")),
+        );
+        quarantined ||= request.status === "unknown" && request.capacity_state === "quarantine";
+      }
+      if (terminal.outcome === "success") {
+        if (
+          requests.length !== terminal.accountingReceipts.length ||
+          requestStatuses.some((status) => status !== "reported")
+        )
+          return yield* deny("Successful Pi terminal has incomplete original accounting");
+        return undefined;
+      }
+      if (terminal.outcome !== "failed" && terminal.outcome !== "canceled") return undefined;
+      if (!quarantined) return undefined;
+      const fingerprint = NodeCrypto.createHash("sha256")
+        .update(
+          encode({
+            rootTaskId: history.rootTaskId,
+            bindingId: binding.recordId,
+            generation: binding.generation,
+            operationId: operation.operationId,
+            outcome: terminal.outcome,
+            requests: requestReferences,
+          }),
+        )
+        .digest("hex");
+      return { fingerprint, operationId: operation.operationId };
     });
     const rootBudget = Effect.fn("ProjectTeamPiOperations.rootBudget")(function* (
       authority: ProjectTeamAuthority,
@@ -3043,6 +3320,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       resolveOperation,
       readUsageHistoryInTransaction: (bindingId: string, generation: number) =>
         guard(readUsageHistoryInTransaction(bindingId, generation)),
+      readJoinedQuarantinedFailureInTransaction: (snapshot: ProjectTeamDispatchSnapshot) =>
+        guard(readJoinedQuarantinedFailureInTransaction(snapshot)),
       readUsageHistoryBatchInTransaction: (
         ...args: Parameters<typeof readUsageHistoryBatchInTransaction>
       ) => guard(readUsageHistoryBatchInTransaction(...args)),

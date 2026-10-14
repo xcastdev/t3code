@@ -333,6 +333,8 @@ export const decideProjectTeamGuidedTransition = (
       const completion = t.reviewCompletion;
       if (completion !== undefined && !isReviewCompletionProof(completion))
         reject("Joined review completion proof is malformed");
+      if (t.failure !== undefined && completion?.status === "completed")
+        reject("A completed review cannot carry a failed Pi settlement");
       const memberships = records().filter(
         (r) => r.kind === "task-membership" && r.taskId === task.taskId,
       );
@@ -350,6 +352,68 @@ export const decideProjectTeamGuidedTransition = (
         member?.kind === "member" &&
         member.status === "active" &&
         !state.blockers.some((b) => b.taskId === task.taskId && b.resolvedAt === undefined);
+      const failureAttention =
+        t.failure !== undefined &&
+        task.state === "in-progress" &&
+        task.activeAttemptId === attempt.attemptId &&
+        (attempt.state === "leased" || attempt.state === "running") &&
+        run.status === "running" &&
+        memberships.length === 1 &&
+        membership?.kind === "task-membership" &&
+        membership.status === "active" &&
+        (membership.controlState === undefined || membership.controlState === "active") &&
+        membership.requestedSuccessorMemberId === undefined &&
+        member?.kind === "member" &&
+        member.status === "active" &&
+        !state.blockers.some((b) => b.taskId === task.taskId && b.resolvedAt === undefined);
+      let failureEpisode: Episode | undefined;
+      if (failureAttention && t.failure !== undefined) {
+        const root = canonicalRoot(run.taskId);
+        const old = records().find(
+          (r): r is Episode =>
+            r.kind === "repair-episode" &&
+            (r.rootTaskId ?? r.taskId) === root &&
+            r.failureFingerprint === t.failure!.fingerprint,
+        );
+        const attemptIds = old?.attemptIds.includes(run.attemptId)
+          ? old.attemptIds
+          : [...(old?.attemptIds ?? []), run.attemptId];
+        if (
+          (old !== undefined && old.allowance !== t.failure.repairAllowance) ||
+          (old !== undefined && old.revision >= Number.MAX_SAFE_INTEGER) ||
+          attemptIds.length > 128
+        )
+          reject("Joined Pi failure episode authority or revision changed");
+        const plans = records()
+          .filter(
+            (r): r is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+              r.kind === "plan-revision" && r.taskId === task.taskId && r.status === "proposed",
+          )
+          .sort((a, b) => b.planRevision - a.planRevision);
+        failureEpisode = old
+          ? {
+              ...old,
+              taskId: run.taskId,
+              revision: old.revision + 1,
+              updatedAt: at,
+              attemptIds,
+            }
+          : {
+              ...fields("repair-episode"),
+              kind: "repair-episode",
+              status: "active",
+              taskId: run.taskId,
+              rootTaskId: ProjectWorkTaskId.make(root),
+              failureFingerprint: t.failure.fingerprint,
+              relevantRevision: run.scopeHash ?? projectTeamScopeHash(state, task.taskId, plans[0]),
+              allowance: t.failure.repairAllowance,
+              semanticRepairs: 0,
+              pendingSemanticRepair: false,
+              transportRetries: 0,
+              timeoutCount: 0,
+              attemptIds,
+            };
+      }
       const hash = (value: unknown) =>
         NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
       const same = (left: unknown, right: unknown) =>
@@ -542,6 +606,14 @@ export const decideProjectTeamGuidedTransition = (
           draft.type === "project-work.criterion.upserted" ? [draft.criterion.revision - 1] : [],
         ),
         run!.revision,
+        ...(failureEpisode === undefined
+          ? []
+          : [
+              records().find(
+                (r): r is Episode =>
+                  r.kind === "repair-episode" && r.recordId === failureEpisode!.recordId,
+              )?.revision ?? 0,
+            ]),
         ...effects.map((r) => r.revision),
         ...writers.map((r) => r.revision),
         ...(completion?.status === "completed"
@@ -556,6 +628,8 @@ export const decideProjectTeamGuidedTransition = (
         reject("Joined run settlement revision is exhausted");
       if (attention && task.revision > Number.MAX_SAFE_INTEGER - 2)
         reject("Joined review attention task revision is exhausted");
+      if (failureAttention && task.revision > Number.MAX_SAFE_INTEGER - 2)
+        reject("Joined Pi failure attention task revision is exhausted");
       const eventCount =
         1 +
         parentProgress.length +
@@ -563,10 +637,13 @@ export const decideProjectTeamGuidedTransition = (
         effects.length +
         (completion?.status === "completed"
           ? completion.outputs.length + 3
-          : attempt!.state === "leased" || attempt!.state === "running"
-            ? 1
-            : 0) +
-        (attention ? 1 : 0);
+          : failureAttention
+            ? 0
+            : attempt!.state === "leased" || attempt!.state === "running"
+              ? 1
+              : 0) +
+        (attention ? 1 : 0) +
+        (failureAttention ? 3 : 0);
       if (
         !Number.isSafeInteger(state.revision) ||
         state.revision < 0 ||
@@ -647,6 +724,19 @@ export const decideProjectTeamGuidedTransition = (
           occurredAt: at,
         });
       }
+      if (failureEpisode !== undefined) record(failureEpisode);
+      if (failureAttention && t.failure !== undefined)
+        emit({
+          type: "project-work.task.failed",
+          taskId: task.taskId,
+          attemptId: attempt!.attemptId,
+          failureKind: "manual-triage",
+          reason: "Pi execution ended with quarantined model accounting.",
+          evidenceIds: [],
+          failedAt: at,
+          occurredAt: at,
+          attribution: command.attribution,
+        });
       record({ ...run!, status: "settled", revision: run!.revision + 1, updatedAt: at });
       for (const writer of writers)
         record(
@@ -690,6 +780,24 @@ export const decideProjectTeamGuidedTransition = (
               "The saved review report could not complete this assignment. Check the current review evidence before assigning another review.",
             resolver: "Review current evidence and decide whether another review is needed",
             referenceIds: [completion.proposalCommandId],
+            attention: true,
+            revision: 0,
+            attribution: command.attribution,
+          },
+        });
+      if (failureAttention && failureEpisode !== undefined)
+        emit({
+          type: "project-work.task.blocked",
+          taskId: task.taskId,
+          blockedAt: at,
+          occurredAt: at,
+          blocker: {
+            blockerId: ProjectWorkBlockerId.make(id("pi-failure-blocker")),
+            taskId: task.taskId,
+            reason:
+              "Pi execution ended with quarantined model accounting. Human attention required.",
+            resolver: "Review the failed Pi operation and decide the next authorized action",
+            referenceIds: [failureEpisode.recordId, t.failure.operationId],
             attention: true,
             revision: 0,
             attribution: command.attribution,

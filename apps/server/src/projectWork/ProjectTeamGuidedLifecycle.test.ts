@@ -2929,6 +2929,134 @@ it("trusted review settlement retains denied child attention after stopping with
   expect(next.tasks.find((task) => task.taskId === taskId)).toEqual(f.parent);
 });
 
+it("joined quarantined Pi failure blocks only the original active task with its frozen allowance", () => {
+  const f = reviewSettlementFixture();
+  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+  const transition = { ...f.command.transition };
+  delete transition.reviewCompletion;
+  const next = applyProjectWorkEvents(
+    f.state,
+    decideProjectWorkCommand(f.state, {
+      ...f.command,
+      transition: {
+        ...transition,
+        failure: {
+          fingerprint: "c".repeat(64),
+          operationId: "original-pi-prompt",
+          repairAllowance: 1,
+        },
+      },
+    }),
+  );
+  const episode = next.foundationRecords!.find(
+    (record): record is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+      record.kind === "repair-episode",
+  );
+  expect(episode).toMatchObject({
+    rootTaskId: f.parent.taskId,
+    failureFingerprint: "c".repeat(64),
+    allowance: 1,
+    semanticRepairs: 0,
+    pendingSemanticRepair: false,
+    transportRetries: 0,
+    timeoutCount: 0,
+  });
+  expect(next.tasks.find((task) => task.taskId === f.binding.taskId)).toMatchObject({
+    state: "blocked",
+    failureKind: "manual-triage",
+  });
+  expect(
+    next.tasks.find((task) => task.taskId === f.binding.taskId)?.activeAttemptId,
+  ).toBeUndefined();
+  expect(next.attempts.find((attempt) => attempt.attemptId === f.binding.attemptId)?.state).toBe(
+    "failed",
+  );
+  expect(next.blockers).toContainEqual(
+    expect.objectContaining({
+      taskId: f.binding.taskId,
+      attention: true,
+      referenceIds: [episode!.recordId, "original-pi-prompt"],
+    }),
+  );
+  expect(
+    next.foundationRecords!.some(
+      (record) => record.kind === "effect" && record.effectKind === "stop",
+    ),
+  ).toBe(false);
+  expect(
+    next.foundationRecords!.find((record) => record.recordId === f.binding.recordId)?.status,
+  ).toBe("settled");
+});
+
+it("joined Pi failure rejects aggregate revision overflow before recording any settlement", () => {
+  const f = reviewSettlementFixture();
+  if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+  const transition = { ...f.command.transition };
+  delete transition.reviewCompletion;
+  const failure = {
+    fingerprint: "c".repeat(64),
+    operationId: "original-pi-prompt",
+    repairAllowance: 1,
+  };
+  const events = decideProjectWorkCommand(f.state, {
+    ...f.command,
+    transition: { ...transition, failure },
+  });
+  const state = { ...f.state, revision: Number.MAX_SAFE_INTEGER - events.length + 1 };
+  const before = canonicalProjectWorkPayload(state);
+  expect(() =>
+    decideProjectWorkCommand(state, {
+      ...f.command,
+      expectedRevision: state.revision,
+      transition: {
+        ...transition,
+        failure,
+      },
+    }),
+  ).toThrow("aggregate revision is exhausted");
+  expect(canonicalProjectWorkPayload(state)).toBe(before);
+});
+
+for (const controlState of ["paused", "canceled"] as const)
+  it(`joined quarantined Pi failure does not override intentional ${controlState} control`, () => {
+    const f = reviewSettlementFixture();
+    if (f.command.transition?.kind !== "run.settle") throw new Error("Settlement fixture required");
+    const transition = { ...f.command.transition };
+    delete transition.reviewCompletion;
+    const membership = f.state.foundationRecords!.find(
+      (record) => record.kind === "task-membership" && record.taskId === f.binding.taskId,
+    );
+    if (membership?.kind !== "task-membership") throw new Error("Membership fixture required");
+    const state = {
+      ...f.state,
+      foundationRecords: f.state.foundationRecords!.map((record) =>
+        record.recordId === membership.recordId ? { ...membership, controlState } : record,
+      ),
+    };
+    const next = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        ...f.command,
+        expectedRevision: state.revision,
+        transition: {
+          ...transition,
+          failure: {
+            fingerprint: "d".repeat(64),
+            operationId: "original-pi-prompt",
+            repairAllowance: 1,
+          },
+        },
+      }),
+    );
+    expect(next.foundationRecords!.some((record) => record.kind === "repair-episode")).toBe(false);
+    expect(
+      next.blockers.some((blocker) => blocker.taskId === f.binding.taskId && blocker.attention),
+    ).toBe(false);
+    expect(next.tasks.find((task) => task.taskId === f.binding.taskId)?.failureKind).not.toBe(
+      "manual-triage",
+    );
+  });
+
 it("trusted review settlement rejects an unfinished child deliverable of the review task", () => {
   const f = reviewSettlementFixture();
   const nestedId = ProjectWorkTaskId.make("nested-review-deliverable");
