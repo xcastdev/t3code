@@ -20,12 +20,14 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import { commitIssueRepositoryPage } from "./ProjectIssueIntakeService.ts";
+import * as IssueWorker from "./ProjectIssueSyncWorker.ts";
 import {
   bindIssueRepositoryProject,
   claimIssueRepositoryRead,
@@ -45,6 +47,7 @@ import {
   type ProjectWorkCommittedEvent,
 } from "./ProjectWorkEventBus.ts";
 import { PROJECT_TEAM_TABLES } from "./ProjectTeamsPersistence.ts";
+import * as IssueClient from "./github/GitHubIssueClient.ts";
 import { writeCommittedIssuePage } from "./github/GitHubIssuePageStore.ts";
 import type { IssuePageSnapshot, IssueSyncRequest } from "./github/GitHubIssueSync.ts";
 
@@ -743,6 +746,308 @@ it.effect(
           yield* assertManagedScope();
         }
       }),
+    ),
+);
+
+it.effect(
+  "held issue reads apply the latest human-approved linked task scope and replay idempotently",
+  () =>
+    memory(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* setup();
+          yield* f.bind();
+          const linked = yield* seedLinked(f);
+          const taskId = ProjectWorkTaskId.make("local-task");
+          const criterionId = ProjectWorkCriterionId.make("held-read-criterion");
+          const human = {
+            actor: { kind: "human" as const, id: "maintainer" },
+            source: { kind: "web" as const, id: "held-read-intake-regression" },
+            recordedAt: now,
+          };
+          const envelope = Effect.fn("intakeTest.heldReadEnvelope")(function* (command: string) {
+            const state = yield* readCurrentState(f.sql, "a");
+            const task = state.tasks.find((entry) => entry.taskId === taskId);
+            if (task === undefined) throw new Error("Missing linked task");
+            return {
+              projectId: ProjectId.make("a"),
+              taskId,
+              commandId: CommandId.make(command),
+              expectedRevision: state.revision,
+              expectedTaskRevision: task.revision,
+            };
+          });
+          const guided = (intent: ProjectTeamGuidedIntent) =>
+            f.repo.execute({
+              type: "project-work.foundation.commit",
+              projectId: ProjectId.make("a"),
+              commandId: intent.commandId,
+              expectedRevision: intent.expectedRevision,
+              records: [],
+              committedAt: now,
+              attribution: human,
+              guided: { intent },
+            });
+          const approveGates = Effect.fn("intakeTest.heldReadApproveGates")(function* () {
+            const state = yield* readCurrentState(f.sql, "a");
+            const pending =
+              state.foundationRecords?.flatMap((record) =>
+                record.kind === "gate" && record.taskId === taskId && record.status === "pending"
+                  ? [record]
+                  : [],
+              ) ?? [];
+            yield* f.repo.execute({
+              type: "project-work.foundation.commit",
+              projectId: ProjectId.make("a"),
+              commandId: CommandId.make(`held-read-approve-${state.revision}`),
+              expectedRevision: state.revision,
+              records: pending.map((gate) => ({
+                ...gate,
+                status: "approved" as const,
+                revision: gate.revision + 1,
+              })),
+              committedAt: now,
+              attribution: human,
+            });
+          });
+          const criterion = {
+            criterionId,
+            taskId,
+            description: "Initially approved issue synchronization scope",
+            required: true,
+            status: "unsatisfied" as const,
+            satisfiedByEvidenceIds: [],
+            revision: 0,
+            updatedAt: now,
+          };
+          yield* guided({
+            ...(yield* envelope("held-read-spec-1")),
+            type: "project-team.specification.propose",
+            expectedSpecRevision: 0,
+            specification: {
+              objective: "Retain the linked issue while synchronizing its approved task",
+              scopeIn: "Preserve the current task scope and issue identity",
+              scopeOut: "Changing task or repository ownership",
+              criterionIds: [criterionId],
+              revision: 1,
+              protected: false,
+            },
+            criterionSnapshots: [criterion],
+          });
+          yield* approveGates();
+          yield* guided({
+            ...(yield* envelope("held-read-plan-1")),
+            type: "project-team.plan.propose",
+            specRevision: 1,
+            content: "Preserve the linked task scope during issue synchronization",
+            dependencyTaskIds: [],
+          });
+          yield* approveGates();
+
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const leaseIds: Array<string> = [];
+          const newer = {
+            ...issue,
+            title: "Remote issue read result",
+            updatedAt: "2026-10-01T00:20:00Z",
+          };
+          const client = IssueClient.GitHubIssueClient.of({
+            lookupRepository: () => Effect.die(new Error("unused repository lookup")),
+            readIssuesPage: () =>
+              Effect.gen(function* () {
+                const state = yield* readIssueRepositoryState(f.sql, key).pipe(Effect.orDie);
+                const leaseId = state?.lease?.id;
+                if (leaseId === undefined)
+                  throw new Error("Remote read started without an import lease");
+                leaseIds.push(leaseId);
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+                return response([newer]);
+              }),
+            readCommentsPage: () => Effect.die(new Error("unused comment read")),
+          });
+          const makeWorker = () =>
+            IssueWorker.make({
+              resolveCredential: (state) =>
+                Effect.succeed({
+                  cwd: "/unused",
+                  host: state.host,
+                  accountNodeId: state.accountNodeId,
+                  credentialEpoch: state.credentialEpoch,
+                  token: Redacted.make("synthetic-token"),
+                }),
+            }).pipe(
+              Effect.provideService(ProjectWorkRepository, f.repo),
+              Effect.provideService(IssueClient.GitHubIssueClient, client),
+            );
+          const worker = yield* makeWorker();
+          const pendingRead = yield* Effect.forkScoped(worker.readOnce(key));
+          yield* Deferred.await(held);
+          const leased = yield* readIssueRepositoryState(f.sql, key);
+          const capturedLease = leased?.lease;
+          if (capturedLease === undefined || capturedLease === null)
+            throw new Error("Held read lost its import lease");
+          expect(capturedLease.expiresAt).toBeGreaterThan(nowMillis);
+          expect(leaseIds).toEqual([capturedLease.id]);
+
+          yield* guided({
+            ...(yield* envelope("held-read-spec-2")),
+            type: "project-team.specification.propose",
+            expectedSpecRevision: 1,
+            specification: {
+              objective: "Preserve the human-updated scope while applying a held issue read",
+              scopeIn: "Retain the current issue identity, linked task, and revised criterion",
+              scopeOut: "Changing task or repository ownership",
+              criterionIds: [criterionId],
+              revision: 2,
+              protected: false,
+            },
+            criterionSnapshots: [
+              { ...criterion, description: "Human-approved revised intake criterion" },
+            ],
+          });
+          yield* approveGates();
+          const beforePlan = yield* readCurrentState(f.sql, "a");
+          const previousPlan = beforePlan.foundationRecords?.find(
+            (record) =>
+              record.kind === "plan-revision" &&
+              record.taskId === taskId &&
+              record.status === "proposed",
+          );
+          if (previousPlan?.kind !== "plan-revision")
+            throw new Error("Missing current plan revision");
+          yield* guided({
+            ...(yield* envelope("held-read-plan-2")),
+            type: "project-team.plan.propose",
+            specRevision: 2,
+            previousPlanId: previousPlan.recordId,
+            expectedPreviousPlanRevision: previousPlan.revision,
+            content: "Apply the fetched issue while preserving the revised approved task scope",
+            dependencyTaskIds: [],
+          });
+          yield* approveGates();
+
+          const approved = yield* readCurrentState(f.sql, "a");
+          const tasks = approved.tasks;
+          const criteria = approved.criteria.filter((entry) => entry.taskId === taskId);
+          const taskRecords =
+            approved.foundationRecords?.filter(
+              (entry) => "taskId" in entry && entry.kind !== "issue" && entry.taskId === taskId,
+            ) ?? [];
+          const approvedTask = tasks.find((entry) => entry.taskId === taskId);
+          if (approvedTask === undefined) throw new Error("Missing approved linked task");
+          expect(approvedTask.specRevision).toBe(2);
+          expect(criteria).toMatchObject([
+            { criterionId, description: "Human-approved revised intake criterion", revision: 1 },
+          ]);
+          expect(
+            taskRecords.some(
+              (record) =>
+                record.kind === "gate" &&
+                record.gate === "specification" &&
+                record.specRevision === 2 &&
+                record.status === "approved",
+            ),
+          ).toBe(true);
+          expect(
+            taskRecords.some(
+              (record) =>
+                record.kind === "gate" &&
+                record.gate === "plan" &&
+                record.planRevision === 2 &&
+                record.status === "approved",
+            ),
+          ).toBe(true);
+          expect(
+            taskRecords.some(
+              (record) =>
+                record.kind === "plan-revision" &&
+                record.planRevision === 2 &&
+                record.content ===
+                  "Apply the fetched issue while preserving the revised approved task scope",
+            ),
+          ).toBe(true);
+          const history = yield* f.repo.replay("a");
+          const taskHistory = history.filter(
+            (event) =>
+              ("taskId" in event && event.taskId === taskId) ||
+              ("task" in event && event.task.taskId === taskId) ||
+              ("criterion" in event && event.criterion.taskId === taskId) ||
+              ("record" in event &&
+                event.record.kind !== "issue" &&
+                "taskId" in event.record &&
+                event.record.taskId === taskId),
+          );
+          const issueBefore = (yield* issues(f.sql)).find(
+            (entry) => entry.recordId === linked.recordId,
+          );
+          if (issueBefore === undefined)
+            throw new Error("Missing issue identity before page application");
+          const assertApprovedScope = Effect.fn("intakeTest.assertHeldReadScope")(function* () {
+            const current = yield* readCurrentState(f.sql, "a");
+            expect(current.tasks).toEqual(tasks);
+            expect(current.criteria.filter((entry) => entry.taskId === taskId)).toEqual(criteria);
+            expect(
+              current.foundationRecords?.filter(
+                (entry) => "taskId" in entry && entry.kind !== "issue" && entry.taskId === taskId,
+              ) ?? [],
+            ).toEqual(taskRecords);
+            expect(
+              (yield* f.repo.replay("a")).filter(
+                (event) =>
+                  ("taskId" in event && event.taskId === taskId) ||
+                  ("task" in event && event.task.taskId === taskId) ||
+                  ("criterion" in event && event.criterion.taskId === taskId) ||
+                  ("record" in event &&
+                    event.record.kind !== "issue" &&
+                    "taskId" in event.record &&
+                    event.record.taskId === taskId),
+              ),
+            ).toEqual(taskHistory);
+          });
+
+          yield* Deferred.succeed(release, undefined);
+          expect((yield* Fiber.join(pendingRead)).status).toBe("committed");
+          yield* assertApprovedScope();
+          const issueAfter = (yield* issues(f.sql)).find(
+            (entry) => entry.recordId === linked.recordId,
+          );
+          expect(issueAfter).toMatchObject({
+            recordId: issueBefore.recordId,
+            taskId,
+            missionId: issueBefore.missionId,
+            identity: issueBefore.identity,
+            title: newer.title,
+          });
+          expect(yield* issues(f.sql)).toHaveLength(1);
+
+          const firstReplay = yield* f.repo.replay("a");
+          const afterFirstRead = yield* readIssueRepositoryState(f.sql, key);
+          if (afterFirstRead === undefined)
+            throw new Error("Missing repository state after page commit");
+          yield* worker.stop;
+          yield* TestClock.setTime(afterFirstRead.retryAt);
+          const replayWorker = yield* makeWorker();
+          expect((yield* replayWorker.readOnce(key)).status).toBe("committed");
+          expect(leaseIds).toHaveLength(2);
+          expect(new Set(leaseIds).size).toBe(2);
+          expect(yield* f.repo.replay("a")).toEqual(firstReplay);
+          yield* assertApprovedScope();
+          expect(yield* issues(f.sql)).toHaveLength(1);
+          const issueAfterReplay = (yield* issues(f.sql)).find(
+            (entry) => entry.recordId === linked.recordId,
+          );
+          expect(issueAfterReplay).toMatchObject({
+            recordId: issueBefore.recordId,
+            taskId,
+            missionId: issueBefore.missionId,
+            identity: issueBefore.identity,
+            title: newer.title,
+          });
+          yield* replayWorker.stop;
+        }),
+      ),
     ),
 );
 
