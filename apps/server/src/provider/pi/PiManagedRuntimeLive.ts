@@ -3,6 +3,7 @@ import { ProjectMemoryOperation } from "../../projectWork/memory/ProjectMemoryMo
 import { ProjectMemoryServiceError } from "../../projectWork/memory/ProjectMemoryService.ts";
 import * as NodeCrypto from "node:crypto";
 import {
+  CommandId,
   IsoDateTime,
   canonicalProjectWorkPayload,
   ManagedSkillKey,
@@ -79,6 +80,7 @@ import {
   executePiProjectWorkBridgeTool,
   preparePiProjectWorkTools,
   piProjectWorkToolCapabilities,
+  type PiProjectWorkReportContext,
 } from "./PiProjectWorkTools.ts";
 import type { PiModelBrokerConfig, PiModelTool } from "./PiModelBroker.ts";
 import {
@@ -1895,11 +1897,36 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 const tools: PiModelTool[] = [];
                 const toolCapabilities: import("./PiSessionRuntime.ts").PiSessionToolCapability[] =
                   [];
+                let reportContext: PiProjectWorkReportContext | undefined;
+                if (request.kind === "prompt") {
+                  const currentTask = required.required.tasks[0];
+                  if (
+                    currentTask === undefined ||
+                    currentTask.task.projectId !== required.required.projectId ||
+                    currentTask.task.taskId !== required.required.taskId ||
+                    currentTask.membership.taskId !== currentTask.task.taskId
+                  )
+                    return yield* deny(
+                      "Pi report context differs from verified required assignment",
+                    );
+                  reportContext = {
+                    projectId: required.required.projectId,
+                    taskId: required.required.taskId,
+                    sourceRevision: required.required.sourceRevision,
+                    taskRevision: currentTask.task.revision,
+                    specRevision: currentTask.task.specRevision,
+                    planRevision: currentTask.plan?.planRevision ?? 0,
+                    assignmentId: currentTask.membership.recordId,
+                    assignmentRevision: currentTask.membership.revision,
+                    commandId: CommandId.make(operation.operationId),
+                  };
+                }
                 const bridgeTools = yield* Effect.try({
                   try: () =>
                     preparePiProjectWorkTools({
                       roleTools: authority.role.tools,
                       bindingTools: binding.configuration.toolIds,
+                      ...(reportContext === undefined ? {} : { reportContext }),
                     }),
                   catch: () => deny("Pi frozen bridge tool configuration is invalid"),
                 });

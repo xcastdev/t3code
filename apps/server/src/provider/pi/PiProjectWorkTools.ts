@@ -1,6 +1,10 @@
 import {
+  CommandId,
+  ProjectId,
   ProjectWorkReadIntent,
+  ProjectWorkTaskId,
   ProjectWorkWriteIntent,
+  type ProjectTeamGuidedIntent,
   type ProjectWorkAttribution,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -24,6 +28,7 @@ export class PiProjectWorkToolValidationError extends Schema.TaggedError<PiProje
   {
     reason: Schema.Literals([
       "invalid-tool-lists",
+      "invalid-report-context",
       "unknown-tool",
       "invalid-arguments",
       "invalid-intent",
@@ -37,9 +42,33 @@ const toolIds = Schema.Array(
   Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(256), Schema.isTrimmed()),
 ).check(Schema.isMaxLength(64));
 const decodeToolLists = Schema.decodeUnknownSync(
-  Schema.Struct({ roleTools: toolIds, bindingTools: toolIds }),
+  Schema.Struct({
+    roleTools: toolIds,
+    bindingTools: toolIds,
+    reportContext: Schema.optionalKey(Schema.Unknown),
+  }),
   strict,
 );
+const NonNegativeRevision = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+);
+const ReportContext = Schema.Struct({
+  projectId: ProjectId,
+  taskId: ProjectWorkTaskId,
+  sourceRevision: NonNegativeRevision,
+  taskRevision: NonNegativeRevision,
+  specRevision: NonNegativeRevision,
+  planRevision: NonNegativeRevision,
+  assignmentId: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(256),
+    Schema.isTrimmed(),
+  ),
+  assignmentRevision: NonNegativeRevision,
+  commandId: CommandId,
+});
+export type PiProjectWorkReportContext = typeof ReportContext.Type;
+const decodeReportContext = Schema.decodeUnknownSync(ReportContext, strict);
 const writeEnvelope = Schema.Struct({
   intentJSON: Schema.String.check(Schema.isMaxLength(262144)),
 });
@@ -53,6 +82,8 @@ const decodeWriteIntentJSON = Schema.decodeEffect(
   strict,
 );
 const decodeJsonObject = Schema.decodeUnknownSync(Schema.JsonObject);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
 
 const freezeTree = (value: unknown): void => {
   if (!Predicate.isObjectOrArray(value)) return;
@@ -64,10 +95,40 @@ const writeParameters = decodeJsonObject(Schema.toJsonSchemaDocument(writeEnvelo
 freezeTree(readParameters);
 freezeTree(writeParameters);
 
+const reportParametersFor = (context: PiProjectWorkReportContext) => {
+  const template = {
+    type: "project-team.assignment.report",
+    projectId: context.projectId,
+    taskId: context.taskId,
+    commandId: context.commandId,
+    expectedRevision: context.sourceRevision,
+    expectedTaskRevision: context.taskRevision,
+    specRevision: context.specRevision,
+    planRevision: context.planRevision,
+    assignmentId: context.assignmentId,
+    expectedAssignmentRevision: context.assignmentRevision,
+    summary: "<summary>",
+    evidenceIds: [],
+    outputArtifactIds: [],
+    outcome: "findings",
+  } satisfies ProjectTeamGuidedIntent;
+  const parameters: unknown = JSON.parse(JSON.stringify(writeParameters));
+  if (!isRecord(parameters) || !isRecord(parameters.properties))
+    throw new Error("Pi report parameter schema is invalid");
+  const intentJSON = parameters.properties.intentJSON;
+  if (!isRecord(intentJSON)) throw new Error("Pi report intent parameter is invalid");
+  intentJSON.description = JSON.stringify(template);
+  return decodeJsonObject(parameters);
+};
+
+const reportDescription =
+  "Report findings for the authorized assignment. Do not claim verification that was not performed. review-ready requires retained evidence. complete requires existing completion proof.";
+
 /** Advertise only the intersection of the two frozen run configurations. */
 export const preparePiProjectWorkTools = (input: {
   readonly roleTools: readonly string[];
   readonly bindingTools: readonly string[];
+  readonly reportContext?: PiProjectWorkReportContext;
 }): readonly { readonly tool: PiModelTool; readonly capability: Capability }[] => {
   const snapshot = (() => {
     try {
@@ -76,6 +137,14 @@ export const preparePiProjectWorkTools = (input: {
       throw new PiProjectWorkToolValidationError({ reason: "invalid-tool-lists" });
     }
   })();
+  let reportContext: PiProjectWorkReportContext | undefined;
+  if (snapshot.reportContext !== undefined) {
+    try {
+      reportContext = decodeReportContext(snapshot.reportContext);
+    } catch {
+      throw new PiProjectWorkToolValidationError({ reason: "invalid-report-context" });
+    }
+  }
   const roleTools = Object.freeze([...snapshot.roleTools]);
   const bindingTools = Object.freeze([...snapshot.bindingTools]);
   const allowed = (capability: Capability) =>
@@ -105,8 +174,16 @@ export const preparePiProjectWorkTools = (input: {
         type: "function" as const,
         function: {
           name,
-          description,
-          parameters: name === "project_work_read" ? readParameters : writeParameters,
+          description:
+            name === "project_work_report" && reportContext !== undefined
+              ? reportDescription
+              : description,
+          parameters:
+            name === "project_work_read"
+              ? readParameters
+              : name === "project_work_report" && reportContext !== undefined
+                ? reportParametersFor(reportContext)
+                : writeParameters,
         },
       },
     }));

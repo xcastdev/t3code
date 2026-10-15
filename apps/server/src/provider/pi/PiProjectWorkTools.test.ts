@@ -7,9 +7,9 @@ import {
   ProjectWorkReadIntent,
   ProjectWorkTaskId,
   ProjectTeamRecord,
+  ProjectTeamGuidedIntent,
   ProviderInstanceId,
   ThreadId,
-  type ProjectTeamGuidedIntent,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -44,6 +44,26 @@ const attribution = { actor: human.actor, source: humanSource, recordedAt: at };
 const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const encodeJSON = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const parameters = (intent: unknown) => ({ intentJSON: encodeJSON(intent) });
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const decodeReportSchemaObject = Schema.decodeUnknownSync(Schema.JsonObject);
+const decodeReportGuidedIntent = Schema.decodeUnknownSync(
+  Schema.fromJsonString(ProjectTeamGuidedIntent),
+);
+const reportTemplateDescription = (parameters: unknown): string | undefined => {
+  const schema = decodeReportSchemaObject(parameters);
+  if (!isRecord(schema.properties) || !isRecord(schema.properties.intentJSON)) return undefined;
+  return typeof schema.properties.intentJSON.description === "string"
+    ? schema.properties.intentJSON.description
+    : undefined;
+};
+const decodeReportTemplate = (description: string) => {
+  try {
+    return decodeReportGuidedIntent(description);
+  } catch {
+    return undefined;
+  }
+};
 const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
 
@@ -646,6 +666,140 @@ it.effect("investigator reports persist exact managed attribution and replay one
       ).toMatchObject({ taskId: f.child.taskId });
     }),
   ),
+);
+
+it.effect(
+  "advertises the current report template and preserves report authority and revision checks",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const reportOnly = ["project-work.report"];
+        const f = yield* assignment("investigation", reportOnly, reportOnly);
+        const authorization = yield* Authorization.ProjectTeamAuthorization;
+        const authority = yield* authorization.resolve(f.principal);
+        if (authority === undefined) return yield* Effect.die("Missing current report authority");
+        const current = yield* f.state();
+        const task = current.tasks.find((entry) => entry.taskId === f.child.taskId);
+        const membership = current.foundationRecords?.find(
+          (record): record is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+            record.kind === "task-membership" && record.taskId === f.child.taskId,
+        );
+        if (!task || !membership) return yield* Effect.die("Missing current report scope");
+        const reportContext = {
+          projectId: task.projectId,
+          taskId: task.taskId,
+          sourceRevision: current.revision,
+          taskRevision: task.revision,
+          specRevision: task.specRevision,
+          planRevision: authority.binding.planRevision,
+          assignmentId: membership.recordId,
+          assignmentRevision: membership.revision,
+          commandId: CommandId.make("report-only-operation"),
+        };
+        const toolInput = {
+          roleTools: reportOnly,
+          bindingTools: reportOnly,
+          reportContext,
+        };
+        const tools = preparePiProjectWorkTools(toolInput);
+        expect(tools.map((entry) => entry.tool.function.name)).toEqual(["project_work_report"]);
+        const advertised = tools[0]!.tool.function;
+        const description = reportTemplateDescription(advertised.parameters);
+        if (!description) return yield* Effect.die("Report template was not advertised");
+        const template = decodeReportTemplate(description);
+        if (template?.type !== "project-team.assignment.report")
+          return yield* Effect.die("Advertised report template was invalid");
+        expect(template).toMatchObject({
+          projectId: reportContext.projectId,
+          taskId: reportContext.taskId,
+          commandId: reportContext.commandId,
+          expectedRevision: reportContext.sourceRevision,
+          expectedTaskRevision: reportContext.taskRevision,
+          specRevision: reportContext.specRevision,
+          planRevision: reportContext.planRevision,
+          assignmentId: reportContext.assignmentId,
+          expectedAssignmentRevision: reportContext.assignmentRevision,
+          summary: "<summary>",
+          evidenceIds: [],
+          outputArtifactIds: [],
+          outcome: "findings",
+        });
+        const intent = {
+          ...template,
+          summary: "The current report template is usable for retained findings",
+        };
+        const accepted = yield* executePiProjectWorkBridgeTool({
+          toolName: "project_work_report",
+          arguments: parameters(intent),
+          principal: f.principal,
+          source,
+        });
+        expect(accepted).toMatchObject({ receipt: { status: "accepted" } });
+        const after = yield* f.state();
+        expect(after.evidence.some((entry) => entry.summary === intent.summary)).toBe(true);
+        expect((after.comments ?? []).some((entry) => entry.body === intent.summary)).toBe(true);
+        const afterTask = after.tasks.find((entry) => entry.taskId === template.taskId);
+        const afterMembership = after.foundationRecords?.find(
+          (record): record is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+            record.kind === "task-membership" && record.taskId === template.taskId,
+        );
+        if (!afterTask || !afterMembership)
+          return yield* Effect.die("Current report scope disappeared after persistence");
+
+        expect(after.revision).toBeGreaterThan(template.expectedRevision);
+        const staleRevision = yield* executePiProjectWorkBridgeTool({
+          toolName: "project_work_report",
+          arguments: parameters({
+            ...intent,
+            commandId: CommandId.make("stale-report-operation"),
+            expectedRevision: template.expectedRevision,
+          }),
+          principal: f.principal,
+          source,
+        }).pipe(Effect.result);
+        expect(staleRevision._tag).toBe("Failure");
+        const changedScope = yield* executePiProjectWorkBridgeTool({
+          toolName: "project_work_report",
+          arguments: parameters({
+            ...intent,
+            commandId: CommandId.make("changed-scope-report-operation"),
+            expectedRevision: after.revision,
+            expectedTaskRevision: afterTask.revision,
+            expectedAssignmentRevision: afterMembership.revision,
+            specRevision: template.specRevision + 1,
+          }),
+          principal: f.principal,
+          source,
+        }).pipe(Effect.result);
+        expect(changedScope._tag).toBe("Failure");
+        const malformed = yield* executePiProjectWorkBridgeTool({
+          toolName: "project_work_report",
+          arguments: {
+            intentJSON: encodeJSON({
+              taskId: intent.taskId,
+              summary: "A report without the guided intent envelope",
+              changes: [],
+              verification: { status: "not_run" },
+              review: { status: "not_performed" },
+              remaining: "None",
+            }),
+          },
+          principal: f.principal,
+          source,
+        }).pipe(Effect.result);
+        expect(malformed).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "PiProjectWorkToolValidationError", reason: "invalid-intent" },
+        });
+        expect(yield* f.state()).toEqual(after);
+
+        expect(advertised.description).toContain(
+          "Do not claim verification that was not performed",
+        );
+        expect(advertised.description).toContain("review-ready requires retained evidence");
+        expect(advertised.description).toContain("complete requires existing completion proof");
+      }),
+    ),
 );
 
 it.effect("planner proposes the inherited parent plan without broad write authority", () =>

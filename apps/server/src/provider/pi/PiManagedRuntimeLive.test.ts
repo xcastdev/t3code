@@ -29,6 +29,7 @@ import {
   ProjectTeamMemoryQueryIntent,
   ManagedSkillKey,
   SkillCatalogRevision,
+  ProjectTeamGuidedIntent,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamWriteIntent,
   ProjectWorkTaskId,
@@ -264,6 +265,26 @@ const isControlledProcessError = Schema.is(ManagedProcess.PiManagedProcessError)
 const isControlledBackendError = Schema.is(MemoryBackendError);
 
 const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const decodeReportSchemaObject = Schema.decodeUnknownSync(Schema.JsonObject);
+const decodeReportGuidedIntent = Schema.decodeUnknownSync(
+  Schema.fromJsonString(ProjectTeamGuidedIntent),
+);
+const reportTemplateDescription = (schemaInput: unknown): string | undefined => {
+  const schema = decodeReportSchemaObject(schemaInput);
+  if (!isRecord(schema.properties) || !isRecord(schema.properties.intentJSON)) return undefined;
+  return typeof schema.properties.intentJSON.description === "string"
+    ? schema.properties.intentJSON.description
+    : undefined;
+};
+const decodeReportTemplate = (description: string) => {
+  try {
+    return decodeReportGuidedIntent(description);
+  } catch {
+    return undefined;
+  }
+};
 const parseOwner = Schema.decodeSync(
   Schema.fromJsonString(
     Schema.Struct({ unit: Schema.String, invocation: Schema.String, pid: Schema.Int }),
@@ -3821,20 +3842,48 @@ for (const outcome of ["findings", "complete"] as const)
           (record) => record.kind === "task-membership" && record.taskId === task.taskId,
         )!;
         expect(assignment).toMatchObject({ kind: "task-membership", deliverableKind: "non-code" });
-        const intent = {
-          type: "project-team.assignment.report",
+        const reportTool = captured.bootstrap.allowedTools.find(
+          (tool) => tool.name === "project_work_report",
+        );
+        if (!reportTool) return yield* Effect.die("Current report tool was not passed to Pi");
+        expect(
+          captured.bootstrap.allowedTools
+            .filter((tool) => tool.execution === "bridge")
+            .map((tool) => tool.name),
+        ).toEqual(["project_work_report"]);
+        const reportSchema = captured.transferTexts.find(
+          (entry) => entry.transferId === reportTool.name,
+        )?.text;
+        if (reportSchema === undefined)
+          return yield* Effect.die("Current report schema was not passed to Pi");
+        const parsedReportSchema = decodeNativeJsonEvidence(reportSchema);
+        const templateDescription = reportTemplateDescription(parsedReportSchema);
+        if (!templateDescription)
+          return yield* Effect.die("Report intent template was not passed to Pi");
+        expect(reportTool.description).toContain(
+          "Do not claim verification that was not performed",
+        );
+        const template = decodeReportTemplate(templateDescription);
+        if (template?.type !== "project-team.assignment.report")
+          return yield* Effect.die("Transferred report template was invalid");
+        expect(template).toMatchObject({
           projectId: task.projectId,
           taskId: task.taskId,
-          commandId: CommandId.make(`controlled-report-${outcome}`),
+          commandId: captured.operation.operationId,
           expectedRevision: before.revision,
           expectedTaskRevision: task.revision,
+          specRevision: task.specRevision,
+          planRevision: f.binding.planRevision,
           assignmentId: assignment.recordId,
           expectedAssignmentRevision: assignment.revision,
-          specRevision: 1,
-          planRevision: 1,
-          summary: "The retained source supports the non-code deliverable",
+          summary: "<summary>",
           evidenceIds: [],
           outputArtifactIds: [],
+          outcome: "findings",
+        });
+        const intent = {
+          ...template,
+          summary: "The retained source supports the non-code deliverable",
           outputs: before.criteria
             .filter((entry) => entry.taskId === task.taskId)
             .map((entry) => ({
