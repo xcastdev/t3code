@@ -32,6 +32,18 @@ const body = (extra: object = {}) =>
     service_tier: "default",
     ...extra,
   });
+const reasoningInput = (
+  summary: readonly string[],
+  content: readonly string[] = [],
+  encryptedContent = "synthetic-opaque-reasoning",
+  id = "reasoning-1",
+) => ({
+  id,
+  type: "reasoning",
+  summary: summary.map((text) => ({ type: "summary_text", text })),
+  content: content.map((text) => ({ type: "reasoning_text", text })),
+  encrypted_content: encryptedContent,
+});
 const event = <T extends { type: string }>(value: T) =>
   `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`;
 const success = (outputTokens = 10) =>
@@ -732,11 +744,191 @@ describe("Pi OpenAI subscription broker", () => {
     await expect(
       f.invoke(
         body({
-          input: [{ role: "user", content: [{ type: "input_text", text: "x".repeat(16384) }] }],
+          input: [{ role: "user", content: [{ type: "input_text", text: "x".repeat(65_537) }] }],
         }),
       ),
     ).rejects.toMatchObject({ code: "REQUEST_BYTE_LIMIT" });
     expect(transportCalls).toBe(1);
+  });
+
+  it("admits bounded subscription history over the request-body boundary and keeps text parts bounded", async () => {
+    const parameters = {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    };
+    const declaredTools = [
+      { type: "function" as const, function: { name: "read", description: "Read", parameters } },
+      { type: "function" as const, function: { name: "write", description: "Write", parameters } },
+    ];
+    const request = body({
+      tools: declaredTools.map(({ function: definition }) => ({
+        type: "function",
+        name: definition.name,
+        description: definition.description,
+        parameters: definition.parameters,
+      })),
+      input: [
+        { role: "assistant", content: [{ type: "output_text", text: "r".repeat(4_000) }] },
+        {
+          type: "reasoning",
+          id: "reasoning-1",
+          summary: [],
+          encrypted_content: `synthetic-${"s".repeat(10_000)}`,
+        },
+        { type: "function_call", call_id: "call-1", name: "read", arguments: "{}" },
+        { type: "function_call_output", call_id: "call-1", output: "d".repeat(4_000) },
+        { type: "function_call", call_id: "call-2", name: "write", arguments: "{}" },
+        { type: "function_call_output", call_id: "call-2", output: "written" },
+        { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+      ],
+    });
+    expect(Buffer.byteLength(request)).toBeGreaterThan(16_384);
+    expect(Buffer.byteLength(request)).toBeLessThanOrEqual(65_536);
+    let transportCalls = 0;
+    const f = fixture({
+      tools: declaredTools,
+      transport: async () => {
+        transportCalls++;
+        return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    await f.invoke(request);
+    expect(f.reservations).toHaveLength(1);
+    expect(transportCalls).toBe(1);
+    expect(f.reservations[0]?.maxInputTokens).toBe(16_384);
+    const inputBounded = fixture({
+      tools: declaredTools,
+      transport: async () => {
+        transportCalls++;
+        return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    await expect(
+      inputBounded.invoke(
+        body({
+          tools: declaredTools.map(({ function: definition }) => ({
+            type: "function",
+            name: definition.name,
+            description: definition.description,
+            parameters: definition.parameters,
+          })),
+          input: [
+            { role: "assistant", content: [{ type: "output_text", text: "r".repeat(9_000) }] },
+            { type: "function_call", call_id: "call-1", name: "read", arguments: "{}" },
+            { type: "function_call_output", call_id: "call-1", output: "d".repeat(9_000) },
+            { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+          ],
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "REQUEST_INPUT_LIMIT" });
+    expect(inputBounded.reservations).toEqual([]);
+    await expect(
+      f.invoke(
+        body({
+          input: [{ role: "user", content: [{ type: "input_text", text: "x".repeat(16_385) }] }],
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "REQUEST_INVALID" });
+    expect(transportCalls).toBe(1);
+  });
+
+  it.each([
+    [
+      "oversized summary part",
+      body({ input: [reasoningInput(["s".repeat(16_385)])] }),
+      "REQUEST_INVALID",
+    ],
+    [
+      "oversized content part",
+      body({ input: [reasoningInput([], ["r".repeat(16_385)])] }),
+      "REQUEST_INVALID",
+    ],
+    [
+      "aggregate readable reasoning",
+      body({
+        input: [
+          reasoningInput(["s".repeat(9_000)]),
+          reasoningInput(["t".repeat(9_000)], [], "synthetic-opaque-reasoning", "reasoning-2"),
+        ],
+      }),
+      "REQUEST_INPUT_LIMIT",
+    ],
+    [
+      "readable reasoning plus ordinary history",
+      body({
+        input: [
+          reasoningInput(["s".repeat(9_000)], ["r".repeat(4_000)]),
+          { role: "user", content: [{ type: "input_text", text: "u".repeat(4_000) }] },
+        ],
+      }),
+      "REQUEST_INPUT_LIMIT",
+    ],
+  ] as const)("refuses %s before reservation or transport", async (_case, request, code) => {
+    let transportCalls = 0;
+    const f = fixture({
+      transport: async () => {
+        transportCalls++;
+        return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    await expect(f.invoke(request)).rejects.toMatchObject({ code });
+    expect(f.reservations).toEqual([]);
+    expect(transportCalls).toBe(0);
+  });
+
+  it("budgets readable reasoning while preserving a large opaque signature in transport history", async () => {
+    const request = body({
+      input: [
+        reasoningInput(["short summary"], ["short reasoning"], `synthetic-${"e".repeat(20_000)}`),
+        { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+      ],
+    });
+    expect(Buffer.byteLength(request)).toBeGreaterThan(16_384);
+    expect(Buffer.byteLength(request)).toBeLessThanOrEqual(65_536);
+    let transportedBody: string | undefined;
+    const f = fixture({
+      transport: async (_url, init) => {
+        transportedBody = init.body;
+        return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    await f.invoke(request);
+    expect(f.reservations).toHaveLength(1);
+    expect(f.reservations[0]?.maxInputTokens).toBe(16_384);
+    if (!transportedBody) throw Error("Missing canonical subscription request");
+    expect(JSON.parse(transportedBody)).toEqual(JSON.parse(request));
+  });
+
+  it("accepts readable response reasoning larger than the request text-part limit", async () => {
+    const item = {
+      id: "reasoning-response-1",
+      type: "reasoning",
+      summary: [{ type: "summary_text", text: "r".repeat(16_385) }],
+      encrypted_content: null,
+    };
+    const stream =
+      event({
+        type: "response.created",
+        response: { id: "response-1", model, status: "in_progress" },
+      }) +
+      event({ type: "response.output_item.done", output_index: 0, item }) +
+      event({
+        type: "response.completed",
+        response: {
+          id: "response-1",
+          model,
+          status: "completed",
+          output: [item],
+          usage: { input_tokens: 50, output_tokens: 10, total_tokens: 60 },
+        },
+      });
+    const f = fixture({
+      transport: async () =>
+        new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+    });
+    expect((await f.invoke()).usage.total_tokens).toBe(60);
+    expect(f.settlements).toMatchObject([{ outcome: "reported", transportDrained: true }]);
   });
 
   it("review R6 handles fragmented complete reasoning items within the response budget", async () => {

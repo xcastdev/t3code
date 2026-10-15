@@ -1,7 +1,10 @@
 // @effect-diagnostics nodeBuiltinImport:off - Native wrappers expose close receipts around borrowed process stdio.
 import * as NodeStream from "node:stream";
 
-import { PI_WORKER_MAX_FRAME_BYTES, PI_WORKER_MAX_QUEUE_BYTES } from "./PiWorkerProtocol.ts";
+import { PI_WORKER_MAX_QUEUE_BYTES } from "./PiWorkerProtocol.ts";
+
+// Pipe backpressure stays fixed when the maximum serialized frame grows.
+const STDIO_HIGH_WATER_BYTES = 32_768;
 
 /**
  * Borrow one child process's stdio for its protocol. The wrappers own forwarding
@@ -45,7 +48,7 @@ export function makePiWorkerStdioTransport(
   let disposal: Promise<void> | undefined;
   let detached = false;
   const input = new NodeStream.PassThrough({
-    highWaterMark: PI_WORKER_MAX_FRAME_BYTES,
+    highWaterMark: STDIO_HIGH_WATER_BYTES,
     emitClose: true,
     autoDestroy: true,
     transform(bytes: Buffer, _encoding, callback) {
@@ -59,7 +62,7 @@ export function makePiWorkerStdioTransport(
     },
   });
   const output = new NodeStream.Writable({
-    highWaterMark: PI_WORKER_MAX_FRAME_BYTES,
+    highWaterMark: STDIO_HIGH_WATER_BYTES,
     emitClose: true,
     autoDestroy: true,
     write(bytes: Buffer, _encoding, callback) {

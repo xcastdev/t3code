@@ -234,6 +234,59 @@ it("admits the approved larger body while retaining a smaller frozen input allow
   expect(frozen.reservations).toEqual([]);
 });
 
+it("keeps the generic input-byte guard at its frozen 16 KiB allowance", async () => {
+  const body = requestBody({
+    messages: [
+      { role: "user", content: "a".repeat(9_000) },
+      { role: "assistant", content: "b".repeat(9_000) },
+    ],
+  });
+  expect(Buffer.byteLength(body)).toBeGreaterThan(16_384);
+  expect(Buffer.byteLength(body)).toBeLessThanOrEqual(65_536);
+  const f = fixture({ maxInputTokens: 16_384 });
+  await expect(f.invoke(body)).rejects.toThrow("REQUEST_INPUT_LIMIT");
+  expect(f.transports).toEqual([]);
+  expect(f.reservations).toEqual([]);
+});
+
+it.each([
+  ["normalized message text", { messages: [{ role: "user", content: "x".repeat(16_385) }] }],
+  [
+    "function tool description",
+    {
+      tools: [
+        { type: "function", function: { ...tool.function, description: "x".repeat(16_385) } },
+      ],
+    },
+  ],
+  [
+    "function call arguments",
+    {
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call-1",
+              type: "function",
+              function: { name: "echo_assignment", arguments: "x".repeat(16_385) },
+            },
+          ],
+        },
+        { role: "tool", content: "ok", tool_call_id: "call-1" },
+      ],
+    },
+  ],
+] as const)("keeps generic Text capped at 16 KiB for %s", async (_field, extra) => {
+  const f = fixture();
+  const body = requestBody(extra);
+  expect(Buffer.byteLength(body)).toBeLessThanOrEqual(65_536);
+  await expect(f.invoke(body)).rejects.toThrow("REQUEST_INVALID");
+  expect(f.reservations).toEqual([]);
+  expect(f.transports).toEqual([]);
+});
+
 it("checks bytes before JSON decode and conservative input token reservation", async () => {
   const f = fixture();
   await expect(f.invoke("x".repeat(PI_WORKER_MAX_REQUEST_BYTES + 1))).rejects.toThrow(

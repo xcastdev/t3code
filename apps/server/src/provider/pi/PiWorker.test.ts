@@ -1112,6 +1112,43 @@ describe("Pi worker parent model stream", () => {
     expect(frames).toEqual([]);
   });
 
+  it("forwards a bounded Codex history with its retained reasoning signature intact", async () => {
+    const frames: PiWorkerFrame["message"][] = [];
+    const bridge = makePiWorkerModelBridge({
+      api: "openai-codex-responses",
+      emit: async (message) => {
+        frames.push(message);
+        if (message.type === "request") throw Error("LOCAL_REPLAY_CAPTURED");
+      },
+      lifecycleId: () => 1,
+    });
+    const body = JSON.stringify({
+      model: "gpt-6-luna",
+      input: [
+        { role: "assistant", content: [{ type: "output_text", text: "r".repeat(9_000) }] },
+        { type: "reasoning", encrypted_content: "synthetic-retained-signature" },
+        { type: "function_call", call_id: "call-1", name: "read", arguments: "{}" },
+        { type: "function_call_output", call_id: "call-1", output: "d".repeat(9_000) },
+        { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+      ],
+    });
+    expect(Buffer.byteLength(body)).toBeGreaterThan(16_384);
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(65_536);
+    await expect(
+      bridge.fetch("https://t3-worker.invalid/codex/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "text/event-stream" },
+        body,
+      }),
+    ).rejects.toThrow("LOCAL_REPLAY_CAPTURED");
+    const requests = frames.filter((frame) => frame.type === "request");
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    if (request?.type !== "request") throw Error("Missing captured model request");
+    expect(JSON.parse(request.body)).toEqual(JSON.parse(body));
+    expect(request.body).toContain("synthetic-retained-signature");
+  });
+
   it("rejects an external URL before emitting a parent request", async () => {
     const frames: unknown[] = [];
     const bridge = makePiWorkerModelBridge({

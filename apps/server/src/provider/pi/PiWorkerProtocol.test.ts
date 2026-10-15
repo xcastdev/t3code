@@ -548,6 +548,25 @@ it("roundtrips the approved model request through an escaped frame larger than t
   expect(decodePiWorkerFrame(wire.toString().slice(0, -1))).toEqual(frame);
 });
 
+it("roundtrips a retained subscription history body within the approved request and frame limits", () => {
+  const body = JSON.stringify({
+    input: [
+      { role: "assistant", content: [{ type: "output_text", text: "r".repeat(20_000) }] },
+      { type: "reasoning", encrypted_content: "synthetic-retained-signature" },
+      { type: "function_call", call_id: "call-1", name: "read", arguments: "{}" },
+      { type: "function_call_output", call_id: "call-1", output: "d".repeat(20_000) },
+      { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+    ],
+  });
+  expect(Buffer.byteLength(body)).toBeGreaterThan(16_384);
+  expect(Buffer.byteLength(body)).toBeLessThanOrEqual(65_536);
+  const frame = workerFrame({ type: "request", requestId: 1, lifecycleId: 1, body });
+  const wire = encodePiWorkerFrame(frame);
+  expect(wire.byteLength).toBeGreaterThan(32_768);
+  expect(wire.byteLength).toBeLessThanOrEqual(131_072);
+  expect(decodePiWorkerFrame(wire.toString().slice(0, -1))).toEqual(frame);
+});
+
 it("keeps the original control-text limit after expanding model request frames", () => {
   const control = parentFrame({
     type: "control",

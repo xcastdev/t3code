@@ -3,8 +3,9 @@ import * as Schema from "effect/Schema";
 export const PI_WORKER_PROTOCOL_VERSION = 1;
 // Requests and their escaped JSON envelopes have separate byte budgets.
 // The frame limit includes LF; JSON escaping and the envelope share that budget.
-export const PI_WORKER_MAX_FRAME_BYTES = 32_768;
-export const PI_WORKER_MAX_REQUEST_BYTES = 16_384;
+export const PI_WORKER_MAX_FRAME_BYTES = 131_072;
+export const PI_WORKER_MAX_REQUEST_BYTES = 65_536;
+export const PI_WORKER_MAX_TEXT_PART_BYTES = 16_384;
 const PI_WORKER_MAX_CONTROL_BYTES = 12_288;
 export const PI_WORKER_MAX_RESPONSE_BYTES = 2_097_152;
 export const PI_WORKER_MAX_CHUNK_BYTES = 8_192;

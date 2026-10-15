@@ -18,6 +18,7 @@ import {
   PI_WORKER_MAX_CHUNK_BYTES,
   PI_WORKER_MAX_REQUEST_BYTES,
   PI_WORKER_MAX_RESPONSE_BYTES,
+  PI_WORKER_MAX_TEXT_PART_BYTES,
   PiWorkerOperation,
 } from "./PiWorkerProtocol.ts";
 
@@ -30,7 +31,7 @@ const Integer = Schema.Int.check(
 const Positive = Integer.check(Schema.isGreaterThan(0));
 const Name = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,128}$/));
 const Text = Schema.String.check(
-  Schema.makeFilter((s) => Buffer.byteLength(s) <= PI_WORKER_MAX_REQUEST_BYTES),
+  Schema.makeFilter((s) => Buffer.byteLength(s) <= PI_WORKER_MAX_TEXT_PART_BYTES),
 );
 const Content = Schema.Union([
   Text,
@@ -403,6 +404,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
   const request = async (operation: PiModelBrokerRequest): Promise<PiModelAccountingReceipt> => {
     let parsed: typeof Request.Type;
     let outboundBody: string;
+    let inputBudgetBody = operation.body;
     let subscriptionSessionId: string | undefined;
     try {
       if (Buffer.byteLength(operation.body) > PI_WORKER_MAX_REQUEST_BYTES)
@@ -410,6 +412,8 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       if (subscription) {
         const adapted = decodePiSubscriptionRequest(operation.body, cfg.model);
         parsed = decodeRequest(adapted.normalizedBody);
+        // Opaque reasoning stays in the transport envelope, outside the normalized text input.
+        inputBudgetBody = adapted.normalizedBody;
         outboundBody = adapted.canonicalBody;
         subscriptionSessionId = adapted.sessionId;
       } else {
@@ -446,7 +450,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
     if (parsed.model !== cfg.model || (!subscription && parsed.max_tokens > cfg.maxOutputTokens))
       fail("REQUEST_MODEL_OR_OUTPUT_INVALID");
     // UTF-8 bytes conservatively bound the plain text tokenizer's input, including the serialized overhead.
-    if (Buffer.byteLength(operation.body) > cfg.maxInputTokens) fail("REQUEST_INPUT_LIMIT");
+    if (Buffer.byteLength(inputBudgetBody) > cfg.maxInputTokens) fail("REQUEST_INPUT_LIMIT");
     const advertised = new Set<string>();
     for (const tool of parsed.tools ?? []) {
       if (

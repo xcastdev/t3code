@@ -1,6 +1,6 @@
 import { OPENAI_PROMPT_CACHE_KEY_MAX_LENGTH } from "@earendil-works/pi-ai/api/openai-prompt-cache";
 import * as Schema from "effect/Schema";
-import { PI_WORKER_MAX_REQUEST_BYTES, PI_WORKER_MAX_RESPONSE_BYTES } from "./PiWorkerProtocol.ts";
+import { PI_WORKER_MAX_RESPONSE_BYTES, PI_WORKER_MAX_TEXT_PART_BYTES } from "./PiWorkerProtocol.ts";
 
 const Json = Schema.decodeUnknownSync(Schema.Json);
 const UnknownRecord = Schema.Record(Schema.String, Schema.Unknown);
@@ -46,7 +46,7 @@ const isTextContent = (value: unknown): value is Record<string, unknown> =>
   only(value, ["type", "text", "annotations"]) &&
   (value.type === "input_text" || value.type === "output_text") &&
   typeof value.text === "string" &&
-  Buffer.byteLength(value.text) <= PI_WORKER_MAX_REQUEST_BYTES &&
+  Buffer.byteLength(value.text) <= PI_WORKER_MAX_TEXT_PART_BYTES &&
   (value.type === "input_text"
     ? value.annotations === undefined
     : value.annotations === undefined || Array.isArray(value.annotations));
@@ -107,6 +107,37 @@ const validReasoningItem = (value: Record<string, unknown>) =>
     modelText(value.encrypted_content)) &&
   (value.status === undefined ||
     ["in_progress", "completed", "incomplete"].includes(String(value.status)));
+const requestReasoningPartText = (
+  value: unknown,
+  type: "summary_text" | "reasoning_text",
+): string | undefined =>
+  isRecord(value) &&
+  only(value, ["type", "text"]) &&
+  value.type === type &&
+  typeof value.text === "string" &&
+  Buffer.byteLength(value.text) <= PI_WORKER_MAX_TEXT_PART_BYTES
+    ? value.text
+    : undefined;
+const requestReasoningText = (item: Record<string, unknown>): string[] | undefined => {
+  if (!validReasoningItem(item) || !Array.isArray(item.summary)) return undefined;
+  const summary: readonly unknown[] = item.summary;
+  const texts: string[] = [];
+  for (const part of summary) {
+    const text = requestReasoningPartText(part, "summary_text");
+    if (text === undefined) return undefined;
+    texts.push(text);
+  }
+  if (item.content !== undefined) {
+    if (!Array.isArray(item.content)) return undefined;
+    const content: readonly unknown[] = item.content;
+    for (const part of content) {
+      const text = requestReasoningPartText(part, "reasoning_text");
+      if (text === undefined) return undefined;
+      texts.push(text);
+    }
+  }
+  return texts;
+};
 const validOutputMessage = (value: Record<string, unknown>) =>
   only(value, ["id", "type", "role", "content", "status", "phase"]) &&
   text(value.id) &&
@@ -236,7 +267,13 @@ export function decodePiSubscriptionRequest(body: string, model: string): PiSubs
         content: typeof item.output === "string" ? item.output : canonical(Json(item.output)),
       });
     } else if (item.type === "reasoning") {
-      if (!validReasoningItem(item)) throw new Error("REQUEST_INVALID");
+      const reasoningText = requestReasoningText(item);
+      if (reasoningText === undefined) throw new Error("REQUEST_INVALID");
+      if (reasoningText.length > 0)
+        messages.push({
+          role: "assistant",
+          content: reasoningText.map((text) => ({ type: "text", text })),
+        });
     } else throw new Error("REQUEST_INVALID");
   }
   const tools =
