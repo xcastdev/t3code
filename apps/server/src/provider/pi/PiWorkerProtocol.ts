@@ -225,6 +225,7 @@ export const PiWorkerToolInput = Schema.Struct({
 export const PiWorkerToolOutput = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("text"), text: boundedText(PI_WORKER_MAX_TOOL_BYTES) }),
   Schema.Struct({ kind: Schema.Literal("json"), value: ToolJson }),
+  Schema.Struct({ kind: Schema.Literal("error"), code: Schema.Literal("FILE_NOT_FOUND") }),
 ]).check(Schema.makeFilter(validToolJson));
 export type PiWorkerTransfer =
   | { readonly purpose: "context" | "prompt"; readonly text: string }
@@ -550,6 +551,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
         inputDone: boolean;
         outputDone: boolean;
         outputId?: string;
+        outputValue?: typeof PiWorkerToolOutput.Type;
       }
     | undefined;
   let initialTransfers = 0;
@@ -674,11 +676,23 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
             if (tool?.call.input.transferId === message.transferId) tool.inputDone = true;
             break;
           case "tool-result":
-            transfer.value = {
-              purpose: "tool-result",
-              value: decodeToolOutput(text),
-            };
-            if (tool?.outputId === message.transferId) tool.outputDone = true;
+            {
+              const value = decodeToolOutput(text);
+              const active = tool;
+              if (
+                value.kind === "error" &&
+                (!active ||
+                  active.outputId !== message.transferId ||
+                  active.call.execution !== "local" ||
+                  active.call.toolName !== "read")
+              )
+                fail("INVALID_TOOL_JSON");
+              transfer.value = { purpose: "tool-result", value };
+              if (active?.outputId === message.transferId) {
+                active.outputValue = value;
+                active.outputDone = true;
+              }
+            }
             break;
         }
       } catch {
@@ -1101,7 +1115,17 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
               const active = activeTool(event.callId);
               if (!active.started || !active.outputDone || event.toolName !== active.call.toolName)
                 fail("TOOL_END_BARRIER");
-              if (event.isError) operationFailed = true;
+              const missingRead =
+                active.call.execution === "local" &&
+                active.call.toolName === "read" &&
+                active.outputValue?.kind === "error" &&
+                active.outputValue.code === "FILE_NOT_FOUND";
+              if (
+                active.outputValue?.kind === "error"
+                  ? !missingRead || !event.isError
+                  : event.isError
+              )
+                operationFailed = true;
               closeTool();
             }
             break;

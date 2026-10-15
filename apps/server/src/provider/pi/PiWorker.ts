@@ -518,14 +518,16 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
                   await transfer(`tool-output-${active.id}`, outputText);
                   protocol.takeTransfer(`tool-output-${active.id}`);
                 }
+                const resultText =
+                  result.kind === "text"
+                    ? result.text
+                    : result.kind === "error"
+                      ? "File not found."
+                      : (JSON.stringify(result.value) ?? "null");
                 return {
-                  content: [
-                    {
-                      type: "text" as const,
-                      text: result.kind === "text" ? result.text : JSON.stringify(result.value),
-                    },
-                  ],
+                  content: [{ type: "text" as const, text: resultText }],
                   details: {},
+                  ...(result.kind === "error" ? { isError: true } : {}),
                 };
               } catch (error) {
                 recordFailure(error);

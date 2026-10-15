@@ -627,9 +627,11 @@ describe("bounded synchronous frame intake", () => {
 });
 
 describe("frozen tool manifest and bounded payloads", () => {
-  function toolPeer(execution: "local" | "bridge" = "local") {
+  function toolPeer(execution: "local" | "bridge" = "local", toolName: "read" | "write" = "read") {
     const peer = runtimePeers();
-    peer.bootstrap({ allowedTools: [{ name: "read", execution, description: "read text" }] });
+    peer.bootstrap({
+      allowedTools: [{ name: toolName, execution, description: "workspace tool" }],
+    });
     peer.worker({ type: "agent_start", lifecycleId: 1 });
     return peer;
   }
@@ -644,7 +646,7 @@ describe("frozen tool manifest and bounded payloads", () => {
       lifecycleId: 1,
       callId,
       nativeCallId,
-      toolName: "read",
+      toolName: peer.protocol.bootstrap!.allowedTools[0]!.name,
       execution: peer.protocol.bootstrap!.allowedTools[0]!.execution,
       input: { transferId: `input-${callId}`, totalBytes: Buffer.byteLength(text) },
     });
@@ -797,6 +799,202 @@ describe("frozen tool manifest and bounded payloads", () => {
     });
     input(peer, '{"arguments":{}}', 2);
     expect(peer.protocol.successful).toBe(false);
+  });
+  it("allows a complete classified local read error result to continue the same operation", () => {
+    const peer = toolPeer("local");
+    input(peer, '{"arguments":{"path":"missing-leaf"}}');
+    peer.parent({ type: "tool-authorized", callId: 1, allowed: true });
+    peer.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_start", callId: 1, toolName: "read" },
+    });
+
+    const output = '{"kind":"error","code":"FILE_NOT_FOUND"}';
+    peer.worker({
+      type: "tool-result",
+      callId: 1,
+      output: { transferId: "output-1", totalBytes: Buffer.byteLength(output) },
+    });
+    peer.worker({
+      type: "transfer-chunk",
+      transferId: "output-1",
+      index: 0,
+      offset: 0,
+      data: Buffer.from(output).toString("base64"),
+    });
+    peer.worker({ type: "transfer-end", transferId: "output-1" });
+    expect(peer.protocol.takeTransfer("output-1")).toEqual({
+      purpose: "tool-result",
+      value: { kind: "error", code: "FILE_NOT_FOUND" },
+    });
+    peer.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_end", callId: 1, toolName: "read", isError: true },
+    });
+
+    peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+    peer.parent({ type: "headers", requestId: 1, status: 200 });
+    peer.parent({ type: "end", requestId: 1 });
+    peer.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "assistant_result", stopReason: "stop" },
+    });
+    peer.worker({ type: "native", lifecycleId: 1, native: { ...native, leafId: "leaf-2" } });
+    peer.worker({ type: "agent_end", lifecycleId: 1 });
+    peer.worker({ type: "agent_settled", lifecycleId: 1 });
+    peer.worker({ type: "operation_settled", lifecycleId: 1, outcome: "success" });
+    peer.worker({ type: "done" });
+    expect(peer.protocol.successful).toBe(true);
+  });
+  it("rejects unknown classified read errors and error results from bridge tools", () => {
+    const invalid = toolPeer("local");
+    input(invalid);
+    invalid.parent({ type: "tool-authorized", callId: 1, allowed: true });
+    invalid.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_start", callId: 1, toolName: "read" },
+    });
+    const unknownOutput = '{"kind":"error","code":"UNCLASSIFIED"}';
+    invalid.worker({
+      type: "tool-result",
+      callId: 1,
+      output: { transferId: "unknown-output", totalBytes: Buffer.byteLength(unknownOutput) },
+    });
+    invalid.worker({
+      type: "transfer-chunk",
+      transferId: "unknown-output",
+      index: 0,
+      offset: 0,
+      data: Buffer.from(unknownOutput).toString("base64"),
+    });
+    expect(() => invalid.worker({ type: "transfer-end", transferId: "unknown-output" })).toThrow(
+      "INVALID_TOOL_JSON",
+    );
+
+    const bridge = toolPeer("bridge");
+    input(bridge);
+    bridge.parent({ type: "tool-authorized", callId: 1, allowed: true });
+    bridge.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_start", callId: 1, toolName: "read" },
+    });
+    const output = '{"kind":"error","code":"FILE_NOT_FOUND"}';
+    bridge.parent({
+      type: "tool-result",
+      callId: 1,
+      output: { transferId: "bridge-output", totalBytes: Buffer.byteLength(output) },
+    });
+    bridge.parent({
+      type: "transfer-chunk",
+      transferId: "bridge-output",
+      index: 0,
+      offset: 0,
+      data: Buffer.from(output).toString("base64"),
+    });
+    let bridgeStartedContinuation = false;
+    try {
+      bridge.parent({ type: "transfer-end", transferId: "bridge-output" });
+      bridge.protocol.takeTransfer("bridge-output");
+      bridge.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_end", callId: 1, toolName: "read", isError: true },
+      });
+      bridge.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+      bridgeStartedContinuation = true;
+    } catch {
+      // Denial may occur while decoding the output or closing the classified lifecycle.
+    }
+    expect(bridgeStartedContinuation).toBe(false);
+  });
+  it("keeps generic SDK errors, non-read errors, denied calls, and tool-failure fatal", () => {
+    const genericSdkError = toolPeer();
+    input(genericSdkError);
+    genericSdkError.parent({ type: "tool-authorized", callId: 1, allowed: true });
+    genericSdkError.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_start", callId: 1, toolName: "read" },
+    });
+    const ordinary = '{"kind":"text","text":"ordinary result"}';
+    genericSdkError.worker({
+      type: "tool-result",
+      callId: 1,
+      output: { transferId: "ordinary-output", totalBytes: Buffer.byteLength(ordinary) },
+    });
+    genericSdkError.worker({
+      type: "transfer-chunk",
+      transferId: "ordinary-output",
+      index: 0,
+      offset: 0,
+      data: Buffer.from(ordinary).toString("base64"),
+    });
+    genericSdkError.worker({ type: "transfer-end", transferId: "ordinary-output" });
+    genericSdkError.protocol.takeTransfer("ordinary-output");
+    genericSdkError.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_end", callId: 1, toolName: "read", isError: true },
+    });
+    expect(() =>
+      genericSdkError.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }),
+    ).toThrow("OPERATION_FAILED");
+
+    const writeError = toolPeer("local", "write");
+    input(writeError, '{"arguments":{"path":"missing-leaf","content":"value"}}');
+    writeError.parent({ type: "tool-authorized", callId: 1, allowed: true });
+    writeError.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_start", callId: 1, toolName: "write" },
+    });
+    const classified = '{"kind":"error","code":"FILE_NOT_FOUND"}';
+    writeError.worker({
+      type: "tool-result",
+      callId: 1,
+      output: { transferId: "write-output", totalBytes: Buffer.byteLength(classified) },
+    });
+    writeError.worker({
+      type: "transfer-chunk",
+      transferId: "write-output",
+      index: 0,
+      offset: 0,
+      data: Buffer.from(classified).toString("base64"),
+    });
+    let writeStartedContinuation = false;
+    try {
+      writeError.worker({ type: "transfer-end", transferId: "write-output" });
+      writeError.protocol.takeTransfer("write-output");
+      writeError.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_end", callId: 1, toolName: "write", isError: true },
+      });
+      writeError.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+      writeStartedContinuation = true;
+    } catch {
+      // The write variant is refused before model continuation at either boundary.
+    }
+    expect(writeStartedContinuation).toBe(false);
+
+    const denied = toolPeer();
+    input(denied);
+    denied.parent({ type: "tool-authorized", callId: 1, allowed: false });
+    expect(() =>
+      denied.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }),
+    ).toThrow("OPERATION_FAILED");
+
+    const failed = toolPeer();
+    input(failed);
+    failed.worker({ type: "tool-failure", callId: 1, code: "TOOL_FAILURE" });
+    expect(() =>
+      failed.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }),
+    ).toThrow("OPERATION_FAILED");
   });
   it("rejects an unadvertised tool instead of granting authority from worker text", () => {
     const peer = toolPeer();

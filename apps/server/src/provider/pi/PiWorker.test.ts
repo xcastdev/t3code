@@ -19,8 +19,11 @@ import {
   type PiWorkerFrame,
   type PiWorkerBootstrap,
 } from "./PiWorkerProtocol.ts";
+import { makePiLocalTools, piLocalToolDefinitions } from "./PiLocalTools.ts";
 
 const decodeWorkerBody = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.JsonObject));
+const workerSdkDirectory = new URL("../", import.meta.resolve("@earendil-works/pi-coding-agent"))
+  .pathname;
 const decodeDiagnosticSessions = Schema.decodeSync(
   Schema.fromJsonString(
     Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
@@ -338,6 +341,192 @@ describe("Pinned Pi worker effective settings", () => {
       await running.catch(() => {});
       await worker.dispose();
       await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a missing-read SDK error and continues the same approved operation", async () => {
+    const fs = process.getBuiltinModule("fs").promises;
+    const directory = await fs.mkdtemp(
+      process.getBuiltinModule("os").tmpdir() + "/pi-worker-missing-read-",
+    );
+    const previousPackageDirectory = process.env.PI_PACKAGE_DIR;
+    process.env.PI_PACKAGE_DIR = workerSdkDirectory;
+    const identity = { workerId: "missing-read-continuation", generation: 1 };
+    const operation = {
+      operationId: "missing-read-continuation",
+      operationKind: "prompt",
+    } as const;
+    const context = "Use the approved read capability and continue after ordinary file errors.";
+    const prompt = "Read a file that does not exist, then continue.";
+    const missingPath = "pi-worker-missing-" + process.getBuiltinModule("crypto").randomUUID();
+    expect(process.getBuiltinModule("fs").existsSync(process.cwd() + "/" + missingPath)).toBe(
+      false,
+    );
+    const readTool = piLocalToolDefinitions.find((tool) => tool.name === "read");
+    if (!readTool) throw Error("Missing fixed local read capability");
+    const schema = JSON.stringify(readTool.parameters);
+    let localTools: Awaited<ReturnType<typeof makePiLocalTools>>["localTools"];
+    try {
+      localTools = (await makePiLocalTools(process.cwd())).localTools;
+    } catch (error) {
+      if (previousPackageDirectory === undefined) delete process.env.PI_PACKAGE_DIR;
+      else process.env.PI_PACKAGE_DIR = previousPackageDirectory;
+      await fs.rm(directory, { recursive: true, force: true });
+      throw error;
+    }
+    const frames: PiWorkerFrame["message"][] = [];
+    const requests: string[] = [];
+    let parentSequence = 0;
+    let requestCount = 0;
+    let activeToolCallId: number | undefined;
+    let worker: ReturnType<typeof makePiSdkWorker> | undefined;
+    const parent = (message: Parameters<typeof encodePiParentFrame>[0]["message"]) => {
+      if (!worker) throw Error("Worker not initialized");
+      worker.acceptParent(
+        encodePiParentFrame({
+          version: 1,
+          ...identity,
+          ...operation,
+          sequence: parentSequence++,
+          message,
+        })
+          .toString()
+          .slice(0, -1),
+      );
+    };
+    const responseEvents = (call: boolean) => {
+      const delta = call
+        ? {
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id: "missing-read-call",
+                type: "function",
+                function: {
+                  name: "read",
+                  arguments: JSON.stringify({ path: missingPath }),
+                },
+              },
+            ],
+          }
+        : { role: "assistant", content: "The read failed safely; I can continue." };
+      const events = [
+        { model: "synthetic", choices: [{ index: 0, delta, finish_reason: null }] },
+        {
+          model: "synthetic",
+          choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }],
+        },
+        {
+          model: "synthetic",
+          choices: [],
+          usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
+        },
+      ];
+      return (
+        events.map((event) => "data: " + JSON.stringify(event) + "\n\n").join("") +
+        "data: [DONE]\n\n"
+      );
+    };
+    const promptWorker = makePiSdkWorker({
+      identity,
+      operation,
+      sessionDirectory: directory,
+      localTools,
+      emit: async (bytes) => {
+        const message = decodePiWorkerFrame(bytes.toString().slice(0, -1)).message;
+        frames.push(message);
+        if (message.type === "tool-call") activeToolCallId = message.callId;
+        if (
+          message.type === "transfer-end" &&
+          activeToolCallId !== undefined &&
+          message.transferId === "tool-input-" + activeToolCallId
+        )
+          parent({ type: "tool-authorized", callId: activeToolCallId, allowed: true });
+        if (message.type === "request") {
+          requests.push(message.body);
+          const body = responseEvents(requestCount === 0);
+          requestCount++;
+          parent({ type: "headers", requestId: message.requestId, status: 200 });
+          parent({
+            type: "chunk",
+            requestId: message.requestId,
+            data: Buffer.from(body).toString("base64"),
+          });
+        } else if (message.type === "ack") {
+          parent({ type: "end", requestId: message.requestId });
+        }
+      },
+    });
+    worker = promptWorker;
+    const running = promptWorker.run();
+    try {
+      parent({
+        type: "bootstrap",
+        executionMode: "ordinary",
+        expectedCwd: process.cwd(),
+        native: null,
+        context: { transferId: "context", totalBytes: Buffer.byteLength(context) },
+        prompt: { transferId: "prompt", totalBytes: Buffer.byteLength(prompt) },
+        model: {
+          provider: "synthetic",
+          modelId: "synthetic",
+          api: "openai-completions",
+          contextWindow: 32768,
+          maxTokens: 512,
+          reasoning: false,
+        },
+        allowedTools: [
+          {
+            name: "read",
+            description: readTool.description,
+            execution: "local",
+            inputSchema: { transferId: "read-schema", totalBytes: Buffer.byteLength(schema) },
+          },
+        ],
+      });
+      for (const [transferId, text] of [
+        ["context", context],
+        ["prompt", prompt],
+        ["read-schema", schema],
+      ] as const) {
+        parent({
+          type: "transfer-chunk",
+          transferId,
+          index: 0,
+          offset: 0,
+          data: Buffer.from(text).toString("base64"),
+        });
+        parent({ type: "transfer-end", transferId });
+      }
+      await running;
+      expect(requests).toHaveLength(2);
+      const completedErrorOutput = frames.findIndex(
+        (message) =>
+          message.type === "transfer-end" &&
+          message.transferId === `tool-output-${activeToolCallId}`,
+      );
+      const sdkErrorEnd = frames.findIndex(
+        (message) =>
+          message.type === "sdk-event" &&
+          message.event.type === "tool_end" &&
+          message.event.toolName === "read" &&
+          message.event.isError,
+      );
+      expect(completedErrorOutput).toBeGreaterThanOrEqual(0);
+      expect(sdkErrorEnd).toBeGreaterThan(completedErrorOutput);
+      const continuation = decodeWorkerBody(requests[1]!);
+      expect(continuation.messages).toEqual(
+        expect.arrayContaining([expect.objectContaining({ role: "tool" })]),
+      );
+      expect(frames.at(-1)?.type).toBe("done");
+    } finally {
+      promptWorker.abort();
+      await running.catch(() => {});
+      await promptWorker.dispose();
+      await fs.rm(directory, { recursive: true, force: true });
+      if (previousPackageDirectory === undefined) delete process.env.PI_PACKAGE_DIR;
+      else process.env.PI_PACKAGE_DIR = previousPackageDirectory;
     }
   });
 

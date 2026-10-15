@@ -42,6 +42,8 @@ const decodeCwd = Schema.decodeSync(Cwd);
 const parseObject = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.JsonObject));
 const parseOutput = Schema.decodeUnknownSync(Schema.fromJsonString(PiWorkerToolOutput));
 
+class MissingReadLeafError extends Error {}
+
 function boundedJson(value: unknown, maximum: number) {
   const json = JSON.stringify(value);
   if (json === undefined || Buffer.byteLength(json) > maximum) throw Error("TOOL_FAILURE");
@@ -94,8 +96,8 @@ export const piLocalToolDefinitions = Object.freeze([
 ]);
 
 function output(result: AgentToolResult<unknown>) {
-  // The frozen worker cannot preserve an SDK error flag or image attachment. Reject
-  // either instead of silently converting it to a successful text-only result.
+  // Local SDK error flags are reserved for the separately classified missing-leaf
+  // result; reject other flags and image attachments rather than losing their meaning.
   if (result.isError || result.content.some((part) => part.type !== "text"))
     throw Error("TOOL_FAILURE");
   return parseOutput(
@@ -137,6 +139,10 @@ function adapt<S extends Schema.ConstraintDecoder<unknown, never>>(
       return output(result);
     } catch (error) {
       if (signal.aborted) throw Error("CANCELED");
+      if (error instanceof MissingReadLeafError)
+        return parseOutput(
+          boundedJson({ kind: "error", code: "FILE_NOT_FOUND" }, PI_WORKER_MAX_TOOL_BYTES),
+        );
       if (error instanceof Error && error.message === "UNAVAILABLE") throw Error("UNAVAILABLE");
       throw Error("TOOL_FAILURE");
     }
@@ -229,6 +235,7 @@ async function workspaceFiles(cwd: string) {
       }
       const target = `${fdPath(parent.fd)}/${components.at(-1)!}`;
       let file: Handle | undefined;
+      let missingReadLeaf = false;
       try {
         file = await files.open(
           target,
@@ -242,7 +249,8 @@ async function workspaceFiles(cwd: string) {
         );
         handles.push(file);
       } catch (error) {
-        if (kind !== "write" || !missing(error)) throw error;
+        if (kind === "read" && missing(error)) missingReadLeaf = true;
+        else if (kind !== "write" || !missing(error)) throw error;
       }
       const identity = file ? await file.stat({ bigint: true }) : undefined;
       if (identity && (!identity.isFile() || identity.nlink !== 1n)) throw Error("TOOL_FAILURE");
@@ -272,6 +280,7 @@ async function workspaceFiles(cwd: string) {
           throw Error("TOOL_FAILURE");
       };
       await verify();
+      if (missingReadLeaf) throw new MissingReadLeafError();
       return { parent, target, file, identity, verify };
     };
     // Bind after the SDK's mutation queue is acquired, so successive writes to the

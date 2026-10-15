@@ -450,13 +450,25 @@ describe("Pi child-local native SDK tools", () => {
     }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
   );
 
-  it.effect("redacts native filesystem failures", () =>
+  it.effect("classifies only a missing read leaf and keeps other filesystem failures fatal", () =>
     Effect.gen(function* () {
-      const { tools } = yield* fixture;
+      const { fs, cwd, tools } = yield* fixture;
+      expect(
+        yield* Effect.promise(() => tools.localTools.read({ path: "absent" }, signal())),
+      ).toEqual({ kind: "error", code: "FILE_NOT_FOUND" });
       yield* Effect.promise(() =>
-        expect(tools.localTools.read({ path: "absent" }, signal())).rejects.toThrow(
+        expect(tools.localTools.read({ path: "absent-parent/leaf" }, signal())).rejects.toThrow(
           /^TOOL_FAILURE$/,
         ),
+      );
+      const outside = yield* fs.makeTempDirectoryScoped({ prefix: "pi-missing-read-outside-" });
+      const nodeFS = process.getBuiltinModule("fs").promises;
+      yield* Effect.promise(() => nodeFS.writeFile(outside + "/private.txt", "private"));
+      yield* Effect.promise(() => nodeFS.symlink(outside, cwd + "/outside-alias"));
+      yield* Effect.promise(() =>
+        expect(
+          tools.localTools.read({ path: "outside-alias/private.txt" }, signal()),
+        ).rejects.toThrow(/^TOOL_FAILURE$/),
       );
       yield* Effect.promise(() =>
         expect(
