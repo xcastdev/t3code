@@ -68,7 +68,7 @@ const runtimeFacts = Schema.Struct({
         api: Schema.Literal("openai-codex-responses"),
         endpoint: Schema.Literal("https://chatgpt.com/backend-api/codex/responses"),
         contextWindow: positive,
-        maxInputTokens: positive.check(Schema.isLessThanOrEqualTo(16_384)),
+        maxInputTokens: positive.check(Schema.isLessThanOrEqualTo(32_768)),
         maxOutputTokens: Schema.Literal(2_048),
         advertisedMaxOutputTokens: positive,
         deadlineMs: Schema.Literal(300_000),

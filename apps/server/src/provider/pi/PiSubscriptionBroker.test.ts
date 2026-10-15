@@ -769,7 +769,7 @@ describe("Pi OpenAI subscription broker", () => {
         parameters: definition.parameters,
       })),
       input: [
-        { role: "assistant", content: [{ type: "output_text", text: "r".repeat(4_000) }] },
+        { role: "assistant", content: [{ type: "output_text", text: "r".repeat(9_000) }] },
         {
           type: "reasoning",
           id: "reasoning-1",
@@ -777,7 +777,7 @@ describe("Pi OpenAI subscription broker", () => {
           encrypted_content: `synthetic-${"s".repeat(10_000)}`,
         },
         { type: "function_call", call_id: "call-1", name: "read", arguments: "{}" },
-        { type: "function_call_output", call_id: "call-1", output: "d".repeat(4_000) },
+        { type: "function_call_output", call_id: "call-1", output: "d".repeat(9_000) },
         { type: "function_call", call_id: "call-2", name: "write", arguments: "{}" },
         { type: "function_call_output", call_id: "call-2", output: "written" },
         { role: "user", content: [{ type: "input_text", text: "Continue" }] },
@@ -787,6 +787,7 @@ describe("Pi OpenAI subscription broker", () => {
     expect(Buffer.byteLength(request)).toBeLessThanOrEqual(65_536);
     let transportCalls = 0;
     const f = fixture({
+      maxInputTokens: 32_768,
       tools: declaredTools,
       transport: async () => {
         transportCalls++;
@@ -796,7 +797,23 @@ describe("Pi OpenAI subscription broker", () => {
     await f.invoke(request);
     expect(f.reservations).toHaveLength(1);
     expect(transportCalls).toBe(1);
-    expect(f.reservations[0]?.maxInputTokens).toBe(16_384);
+    expect(f.reservations[0]).toMatchObject({
+      maxInputTokens: 32_768,
+      maxOutputTokens: 2_048,
+    });
+
+    let frozenTransportCalls = 0;
+    const frozen = fixture({
+      maxInputTokens: 16_384,
+      tools: declaredTools,
+      transport: async () => {
+        frozenTransportCalls++;
+        return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    await expect(frozen.invoke(request)).rejects.toMatchObject({ code: "REQUEST_INPUT_LIMIT" });
+    expect(frozen.reservations).toEqual([]);
+    expect(frozenTransportCalls).toBe(0);
     const inputBounded = fixture({
       tools: declaredTools,
       transport: async () => {
@@ -831,6 +848,29 @@ describe("Pi OpenAI subscription broker", () => {
       ),
     ).rejects.toMatchObject({ code: "REQUEST_INVALID" });
     expect(transportCalls).toBe(1);
+  });
+
+  it("refuses normalized subscription input above 32 KiB before reservation or transport", async () => {
+    const request = body({
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "a".repeat(12_000) }] },
+        { role: "user", content: [{ type: "input_text", text: "b".repeat(12_000) }] },
+        { role: "user", content: [{ type: "input_text", text: "c".repeat(12_000) }] },
+      ],
+    });
+    expect(Buffer.byteLength(request)).toBeGreaterThan(32_768);
+    expect(Buffer.byteLength(request)).toBeLessThanOrEqual(65_536);
+    let transportCalls = 0;
+    const f = fixture({
+      maxInputTokens: 32_768,
+      transport: async () => {
+        transportCalls++;
+        return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    await expect(f.invoke(request)).rejects.toMatchObject({ code: "REQUEST_INPUT_LIMIT" });
+    expect(f.reservations).toEqual([]);
+    expect(transportCalls).toBe(0);
   });
 
   it.each([

@@ -370,7 +370,11 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
   }
   if (cfg.deadlineMs > 300_000 || cfg.maxInputTokens > 1_000_000 || cfg.maxOutputTokens > 65_536)
     fail("CONFIG_LIMITS_INVALID");
-  if (subscription && (cfg.maxInputTokens !== 16_384 || cfg.maxOutputTokens !== 2_048))
+  if (
+    subscription &&
+    ((cfg.maxInputTokens !== 16_384 && cfg.maxInputTokens !== 32_768) ||
+      cfg.maxOutputTokens !== 2_048)
+  )
     fail("CONFIG_LIMITS_INVALID");
   if (
     [

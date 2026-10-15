@@ -117,6 +117,7 @@ const subscriptionFacts = (
   selection: NonNullable<
     ProjectTeamConfiguredAdmissionFacts["provider"]["subscription"]
   >["selection"],
+  maxInputTokens = 32_768,
 ): ProjectTeamConfiguredAdmissionFacts => ({
   environmentId: facts.environmentId,
   provider: {
@@ -124,7 +125,7 @@ const subscriptionFacts = (
     driverKind: facts.provider.driverKind,
     enabled: facts.provider.enabled,
     runtimeVersion: facts.provider.runtimeVersion,
-    maxInputTokens: 16_384,
+    maxInputTokens,
     maxOutputTokens: 2_048,
     catalogue: {
       source: "pi-sdk:0.99.1/openai-codex",
@@ -144,7 +145,7 @@ const subscriptionFacts = (
         api: "openai-codex-responses",
         endpoint: "https://chatgpt.com/backend-api/codex/responses",
         contextWindow: 272_000,
-        maxInputTokens: 16_384,
+        maxInputTokens,
         maxOutputTokens: 2_048,
         advertisedMaxOutputTokens: 16_384,
         deadlineMs: 300_000,
@@ -628,7 +629,7 @@ it.effect("admits Code from the exact private subscription facts with nominal ro
       expect(selected.provider.subscription?.configuration).toMatchObject({
         reasoningEffort: "high",
         serviceTier: "default",
-        maxInputTokens: 16_384,
+        maxInputTokens: 32_768,
         maxOutputTokens: 2_048,
       });
       const prepared = prepareProjectTeamConfiguredAdmission({
@@ -649,6 +650,33 @@ it.effect("admits Code from the exact private subscription facts with nominal ro
       expect("maxOutputTokens" in prepared.request.claim.transition.binding.configuration).toBe(
         false,
       );
+    }),
+  ),
+);
+
+it.effect("refuses subscription admission above the approved input allowance", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture("code", subscriptionModel);
+      const selected = subscriptionFacts(
+        {
+          projectId: String(projectId),
+          rootTaskId: parentId,
+          model: subscriptionModel,
+          maximumTokens: 64_000,
+          maximumDurationMs: 300_000,
+        },
+        32_769,
+      );
+      const prepared = prepareProjectTeamConfiguredAdmission({
+        state: f.state,
+        taskId: f.taskId,
+        nowMs,
+        facts: { ...selected, git: { ...selected.git, writable: true } },
+      });
+      expect(prepared._tag).toBe("Blocked");
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
+      expect(yield* f.sql`SELECT * FROM project_team_reservation`).toEqual([]);
     }),
   ),
 );

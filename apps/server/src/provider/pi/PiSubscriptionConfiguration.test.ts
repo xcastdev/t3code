@@ -47,6 +47,39 @@ it.effect("uses the installed Pi subscription model metadata without reading cre
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.effect(
+  "accepts the approved subscription input allowance without changing its other limits",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const result = yield* inspectPiSubscriptionConfiguration({
+        ...f.input,
+        limits: { ...f.input.limits, maxInputTokens: 32_768 },
+      });
+      expect(result).toMatchObject({
+        model: "gpt-6-luna",
+        maxInputTokens: 32_768,
+        maxOutputTokens: 2_048,
+        deadlineMs: 300_000,
+        reasoningEffort: "high",
+        serviceTier: "default",
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("refuses subscription input allowance above the approved bound", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const error = yield* Effect.flip(
+      inspectPiSubscriptionConfiguration({
+        ...f.input,
+        limits: { ...f.input.limits, maxInputTokens: 32_769 },
+      }),
+    );
+    expect(error.reason).toBe("configuration");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("refuses a subscription route, effort, tier or runtime change", () =>
   Effect.gen(function* () {
     const f = yield* fixture;

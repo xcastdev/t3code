@@ -964,7 +964,7 @@ const PiProductionRuntimeLayerLive = Layer.effect(
         protectedRoots: [config.stateDir, config.secretsDir],
         memoryBytes: 536870912,
         cleanupDeadlineMs: 3000,
-        maxInputTokens: 16384,
+        maxInputTokens: subscriptionTest === undefined ? 16384 : 32768,
         maxOutputTokens: 2048,
       },
       { ...teamRuntime, ...(subscriptionTest === undefined ? {} : { subscriptionTest }) },

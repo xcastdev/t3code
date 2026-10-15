@@ -35,7 +35,7 @@ const Input = Schema.Struct({
     model: Schema.Literal(modelId),
   }),
   limits: Schema.Struct({
-    maxInputTokens: Positive.check(Schema.isLessThanOrEqualTo(16_384)),
+    maxInputTokens: Positive.check(Schema.isLessThanOrEqualTo(32_768)),
     maxOutputTokens: Schema.Literal(2_048),
     deadlineMs: Positive.check(Schema.isLessThanOrEqualTo(300_000)),
   }),

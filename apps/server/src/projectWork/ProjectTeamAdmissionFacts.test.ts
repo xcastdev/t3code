@@ -474,7 +474,7 @@ const privateSubscriptionConfiguration = {
   api: "openai-codex-responses" as const,
   endpoint: "https://chatgpt.com/backend-api/codex/responses" as const,
   contextWindow: 272_000,
-  maxInputTokens: 16_384,
+  maxInputTokens: 32_768,
   maxOutputTokens: 2_048 as const,
   advertisedMaxOutputTokens: 16_384,
   deadlineMs: 300_000,
@@ -528,7 +528,7 @@ it.effect(
           catalogueReadForbidden: true,
           runtimeFacts: {
             runtimeVersion: "0.99.1",
-            maxInputTokens: 16_384,
+            maxInputTokens: 32_768,
             maxOutputTokens: 2_048,
             subscription: {
               selection: privateSubscriptionSelection("parent"),
@@ -572,6 +572,29 @@ it.effect(
     ),
 );
 
+it.effect("blocks private subscription runtime facts above the approved input allowance", () =>
+  withServices(
+    Effect.gen(function* () {
+      const f = yield* fixture({
+        role: "implementer",
+        selectedModel: subscriptionModel,
+        catalogueReadForbidden: true,
+        runtimeFacts: {
+          runtimeVersion: "0.99.1",
+          maxInputTokens: 32_769,
+          maxOutputTokens: 2_048,
+          subscription: {
+            selection: privateSubscriptionSelection("parent"),
+            configuration: { ...privateSubscriptionConfiguration, maxInputTokens: 32_769 },
+          },
+        },
+      });
+      expect((yield* f.service.read({ state: f.state, taskId: f.taskId }))._tag).toBe("Blocked");
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual([]);
+    }),
+  ),
+);
+
 it.effect("refuses Code when the actual private subscription hook is absent", () =>
   withServices(
     Effect.gen(function* () {
@@ -595,7 +618,7 @@ it.effect("refuses Code when private subscription metadata belongs to a foreign 
         catalogueReadForbidden: true,
         runtimeFacts: {
           runtimeVersion: "0.99.1",
-          maxInputTokens: 16_384,
+          maxInputTokens: 32_768,
           maxOutputTokens: 2_048,
           subscription: {
             selection: privateSubscriptionSelection("foreign-root"),

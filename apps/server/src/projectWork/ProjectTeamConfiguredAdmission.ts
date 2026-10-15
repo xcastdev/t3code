@@ -67,7 +67,7 @@ const SubscriptionConfiguration = Schema.Struct({
   api: Schema.Literal("openai-codex-responses"),
   endpoint: Schema.Literal("https://chatgpt.com/backend-api/codex/responses"),
   contextWindow: Positive,
-  maxInputTokens: Positive.check(Schema.isLessThanOrEqualTo(16_384)),
+  maxInputTokens: Positive.check(Schema.isLessThanOrEqualTo(32_768)),
   maxOutputTokens: Schema.Literal(2_048),
   advertisedMaxOutputTokens: Positive,
   deadlineMs: Schema.Literal(300_000),
@@ -248,7 +248,7 @@ export const prepareProjectTeamConfiguredAdmission = (input: {
         inspected.deadlineMs !== 300_000 ||
         inspected.reasoningEffort !== "high" ||
         inspected.serviceTier !== "default" ||
-        inspected.maxInputTokens > 16_384 ||
+        inspected.maxInputTokens > 32_768 ||
         inspected.maxInputTokens + inspected.maxOutputTokens > inspected.contextWindow
       )
         reject("Current actual OpenAI subscription SDK metadata is required");
