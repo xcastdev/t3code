@@ -713,6 +713,12 @@ function PromoteKnowledge({
       records.push(...page.records);
       if (records.length > 256) break;
       if (page.hasNext) continue;
+      if (records.length === 256) {
+        setValidationError(
+          "No capacity for a replacement: retained history is at the 256-record limit.",
+        );
+        return false;
+      }
       const byId = new Map(records.map((entry) => [entry.knowledgeId, entry]));
       const replaced = new Set<ProjectWorkKnowledgeId>();
       if (byId.size !== records.length) break;
@@ -819,6 +825,51 @@ function PromoteKnowledge({
       onDone();
     }
   };
+  const discard = () => {
+    setRetryCommand(null);
+    setRebasedRevision(null);
+    setFailure(null);
+    setValidationError(null);
+  };
+  const rebase = () => {
+    if (
+      !allowed() ||
+      inFlight.current ||
+      !retryCommand ||
+      (failure !== null && !failure.staleRevision)
+    )
+      return;
+    inFlight.current = true;
+    setPending(true);
+    const generation = authority.current.generation;
+    const observedRevision = authority.current.projectRevision;
+    void (async () => {
+      const fresh = await refreshBriefing({ environmentId, projectId });
+      if (!allowed(generation) || fresh._tag !== "Success") return;
+      const briefing = asProjectWorkBriefing(fresh.value);
+      if (
+        !briefing ||
+        !(await validateReplacement(briefing.sourceRevision)) ||
+        !allowed(generation) ||
+        (authority.current.projectRevision !== observedRevision &&
+          authority.current.projectRevision !== briefing.sourceRevision)
+      )
+        return;
+      if (retryCommand) {
+        setRetryCommand({
+          ...retryCommand,
+          commandId: CommandId.make(randomUUID()),
+          expectedRevision: briefing.sourceRevision,
+        });
+      }
+      setRebasedRevision(briefing.sourceRevision);
+      setFailure(null);
+      setValidationError(null);
+    })().finally(() => {
+      inFlight.current = false;
+      setPending(false);
+    });
+  };
   return (
     <WorkCard>
       <h3 className="font-medium">
@@ -889,48 +940,26 @@ function PromoteKnowledge({
         >
           {replacement ? "Save replacement" : "Promote"}
         </Button>
+        {retryCommand && failure === null && !pending ? (
+          <fieldset disabled={!canWrite || pending}>
+            <p className="text-sm text-muted-foreground">These changes have not been saved.</p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" onClick={rebase}>
+                Rebase on latest
+              </Button>
+              <Button size="sm" variant="ghost" onClick={discard}>
+                Discard
+              </Button>
+            </div>
+          </fieldset>
+        ) : null}
         {failure ? (
           <fieldset disabled={!canWrite || pending}>
             <WorkCommandFailureNotice
               failure={failure}
               onRetry={() => void submit()}
-              onDiscard={() => {
-                setRetryCommand(null);
-                setRebasedRevision(null);
-                setFailure(null);
-              }}
-              onRebase={() => {
-                if (!allowed() || inFlight.current || !failure?.staleRevision) return;
-                inFlight.current = true;
-                setPending(true);
-                const generation = authority.current.generation;
-                const observedRevision = authority.current.projectRevision;
-                void (async () => {
-                  const fresh = await refreshBriefing({ environmentId, projectId });
-                  if (!allowed(generation) || fresh._tag !== "Success") return;
-                  const briefing = asProjectWorkBriefing(fresh.value);
-                  if (
-                    !briefing ||
-                    !(await validateReplacement(briefing.sourceRevision)) ||
-                    !allowed(generation) ||
-                    (authority.current.projectRevision !== observedRevision &&
-                      authority.current.projectRevision !== briefing.sourceRevision)
-                  )
-                    return;
-                  if (retryCommand) {
-                    setRetryCommand({
-                      ...retryCommand,
-                      commandId: CommandId.make(randomUUID()),
-                      expectedRevision: briefing.sourceRevision,
-                    });
-                  }
-                  setRebasedRevision(briefing.sourceRevision);
-                  setFailure(null);
-                })().finally(() => {
-                  inFlight.current = false;
-                  setPending(false);
-                });
-              }}
+              onDiscard={discard}
+              onRebase={rebase}
             />
           </fieldset>
         ) : null}

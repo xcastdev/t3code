@@ -209,6 +209,97 @@ describe("retained knowledge correction", () => {
     expect(rebased.commandId).not.toBe(original.commandId);
     expect(rebased.knowledge).toEqual(original.knowledge);
   });
+  it.each(["rebase", "discard"])(
+    "recovers an unsent rebased command after another revision via %s",
+    async (recovery) => {
+      state.write.mockResolvedValueOnce({ _tag: "Failure", cause: { code: "stale-revision" } });
+      await edit();
+      await click("Save replacement");
+      const original = structuredClone(state.write.mock.calls[0]![0].input);
+      state.refresh
+        .mockResolvedValueOnce({ _tag: "Success", value: briefing(9) })
+        .mockResolvedValue({ _tag: "Success", value: page([previous], 9) });
+      await click("Rebase on latest");
+      state.briefing = AsyncResult.success(briefing(10));
+      await render();
+      state.refresh.mockResolvedValue({ _tag: "Success", value: page([previous], 10) });
+      await click("Save replacement");
+      expect(state.write).toHaveBeenCalledTimes(1);
+      expect(host.textContent).toContain("Cannot confirm");
+      expect(button("Retry exact command")).toBeUndefined();
+      expect(button("Rebase on latest")).toBeDefined();
+      expect(button("Discard")).toBeDefined();
+      expect(state.write.mock.calls[0]![0].input).toEqual(original);
+      if (recovery === "discard") {
+        await click("Discard");
+        expect(host.querySelector<HTMLInputElement>('[placeholder="Title"]')!.disabled).toBe(false);
+        expect(button("Promote knowledge")!.disabled).toBe(false);
+        expect(host.textContent).not.toContain("Cannot confirm");
+        return;
+      }
+      state.refresh
+        .mockResolvedValueOnce({ _tag: "Success", value: briefing(10) })
+        .mockResolvedValue({ _tag: "Success", value: page([previous], 10) });
+      state.write.mockResolvedValueOnce({ _tag: "Failure" });
+      await click("Rebase on latest");
+      expect(host.textContent).not.toContain("Cannot confirm");
+      await click("Save replacement");
+      expect(state.write).toHaveBeenCalledTimes(2);
+      const sent = state.write.mock.calls[1]![0].input;
+      expect(sent.expectedRevision).toBe(10);
+      expect(sent.commandId).not.toBe(original.commandId);
+      expect(sent.knowledge).toEqual(original.knowledge);
+      expect(button("Rebase on latest")).toBeUndefined();
+      await click("Retry exact command");
+      expect(state.write).toHaveBeenCalledTimes(3);
+      expect(state.write.mock.calls[2]![0].input).toEqual(sent);
+      expect(state.write.mock.calls[0]![0].input).toEqual(original);
+    },
+  );
+  it.each([255, 256])(
+    "reserves space before replacing within a complete %i-record history",
+    async (count) => {
+      const history = Object.freeze(
+        Array.from({ length: count }, (_, index) =>
+          Object.freeze(
+            index === 0 ? { ...previous } : { ...previous, knowledgeId: `sibling-${index}` },
+          ),
+        ),
+      );
+      const original = structuredClone(history);
+      await edit();
+      state.refresh.mockImplementation(async (target: { offset: number }) => ({
+        _tag: "Success",
+        value: page(
+          history.slice(target.offset, target.offset + 50),
+          4,
+          target.offset + 50 < history.length,
+        ),
+      }));
+      await click("Save replacement");
+      expect(state.write).toHaveBeenCalledTimes(count === 255 ? 1 : 0);
+      expect(history).toEqual(original);
+      if (count === 256) expect(host.textContent).toContain("No capacity for a replacement");
+      else expect(state.write.mock.calls[0]![0].input.knowledge.supersedesKnowledgeId).toBe("old");
+    },
+  );
+  it("keeps fresh promotion independent of replacement history validation", async () => {
+    await render();
+    await click("Promote knowledge");
+    await fill('[placeholder="Title"]', "Fresh context");
+    await fill('[placeholder="Durable project context"]', "New procedure");
+    await fill('[placeholder="Source record ID"]', "human-note");
+    await act(async () =>
+      [...host.querySelectorAll<HTMLButtonElement>("button")]
+        .find((entry) => entry.textContent === "Promote")!
+        .click(),
+    );
+    expect(state.refresh).not.toHaveBeenCalled();
+    expect(state.write).toHaveBeenCalledTimes(1);
+    expect(state.write.mock.calls[0]![0].input.knowledge).not.toHaveProperty(
+      "supersedesKnowledgeId",
+    );
+  });
   it("does not rebase onto a superseded predecessor", async () => {
     state.write.mockResolvedValueOnce({ _tag: "Failure", cause: { code: "stale-revision" } });
     await edit();
