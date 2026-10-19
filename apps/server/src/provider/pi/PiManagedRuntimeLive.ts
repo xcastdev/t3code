@@ -1693,7 +1693,6 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     return yield* deny("Original review workspace is unavailable");
                   const receipt = yield* decodeReviewWorkspace(rows[0].receipt_json);
                   if (
-                    canonicalProjectWorkPayload(receipt) !== rows[0].receipt_json ||
                     digest(canonicalProjectWorkPayload(receipt)) !== job.workspaceReceiptHash ||
                     canonicalProjectWorkPayload(receipt.assignment) !==
                       canonicalProjectWorkPayload(implementation.intent.request.git)

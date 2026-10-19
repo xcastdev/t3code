@@ -266,6 +266,9 @@ const decodeReviewNativeRequest = Schema.decodeSync(
 const decodeNativeAllocation = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ManagedProcess.PiManagedProcessAllocationSchema),
 );
+const encodeFixtureWorkspaceReceipt = Schema.encodeSync(
+  Schema.fromJsonString(DispatchJournal.ProjectTeamWorkspaceReceipt),
+);
 const decodeNativeOwner = Schema.decodeUnknownSync(
   Schema.fromJsonString(
     Schema.Struct({
@@ -6538,7 +6541,7 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
     });
     if (!implementationReceipt) return yield* Effect.die("Missing physical workspace receipt");
     const receipt = implementationReceipt;
-    yield* sql`INSERT INTO project_team_workspace_receipt VALUES (${request.dispatchId},'environment','binding',0,${snapshot.fence.claimGeneration},${canonicalProjectWorkPayload(receipt.assignment)},${canonicalProjectWorkPayload(receipt)})`;
+    yield* sql`INSERT INTO project_team_workspace_receipt VALUES (${request.dispatchId},'environment','binding',0,${snapshot.fence.claimGeneration},${canonicalProjectWorkPayload(receipt.assignment)},${encodeFixtureWorkspaceReceipt(receipt)})`;
     const state = yield* readCurrentState(f.sql, projectId);
     const binding = state.foundationRecords?.find(
       (r) => r.kind === "run-binding" && r.recordId === key("binding"),
@@ -16238,3 +16241,107 @@ it.effect(
       }),
     ),
 );
+
+for (const boundary of ["fresh", "replay-prepare", "replay-run"] as const)
+  it.effect(`schema-encoded review workspace receipt permits ${boundary}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture();
+        const receipt = f.implementationReceipt;
+        if (!receipt) return yield* Effect.die("Missing physical implementation receipt");
+        const rows = yield* f.sql<{
+          receipt_json: string;
+          assignment_json: string;
+        }>`SELECT receipt_json,assignment_json FROM project_team_workspace_receipt WHERE binding_id=${f.root.bindingId}`;
+        expect(rows.length).toBe(1);
+        expect(rows[0]?.receipt_json).toBe(encodeFixtureWorkspaceReceipt(receipt));
+        expect(rows[0]?.receipt_json).not.toBe(canonicalProjectWorkPayload(receipt));
+        expect(rows[0]?.assignment_json).toBe(canonicalProjectWorkPayload(receipt.assignment));
+        const required = yield* f.reader.readRequired(f.snapshot);
+        expect(required.required.reviewTarget?.prepared.manifest.workspaceReceiptHash).toBe(
+          NodeCrypto.createHash("sha256")
+            .update(canonicalProjectWorkPayload(receipt))
+            .digest("hex"),
+        );
+        yield* initializeRequiredContext(f);
+        const allocations = f.allocations;
+        if (boundary !== "fresh") {
+          const replay = yield* f.instance.prepareOperation(
+            {
+              threadId: f.binding.threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+            },
+            () => Effect.die("Unexpected schema receipt replay emission"),
+          );
+          if (boundary === "replay-run")
+            expect((yield* replay.run).terminal.outcome).toBe("success");
+        }
+        expect(f.allocations).toBe(allocations);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+
+for (const boundary of ["fresh", "replay-prepare", "replay-run"] as const)
+  for (const mutation of ["semantic", "assignment", "invalid", "excess"] as const)
+    it.effect(`schema-encoded review workspace receipt denies ${mutation} at ${boundary}`, () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* requiredReviewTransferFixture();
+          const receipt = f.implementationReceipt;
+          if (!receipt) return yield* Effect.die("Missing physical implementation receipt");
+          const request = {
+            threadId: f.binding.threadId,
+            kind: "initialize" as const,
+            operationId: f.request.initializeOperationId,
+          };
+          if (boundary !== "fresh") yield* initializeRequiredContext(f);
+          const prepared =
+            boundary === "replay-run"
+              ? yield* f.instance.prepareOperation(request, () =>
+                  Effect.die("Unexpected invalid receipt replay emission"),
+                )
+              : undefined;
+          const encoded =
+            mutation === "semantic"
+              ? encodeFixtureWorkspaceReceipt({ ...receipt, initialHeadOid: "0".repeat(40) })
+              : mutation === "assignment"
+                ? encodeFixtureWorkspaceReceipt({
+                    ...receipt,
+                    assignment: { ...receipt.assignment, ownershipToken: "changed-receipt-owner" },
+                  })
+                : mutation === "invalid"
+                  ? json({ ...receipt, initialHeadOid: 42 })
+                  : json({ ...receipt, unexpected: "denied" });
+          const retained = yield* f.sql<{
+            dispatch_id: string;
+            environment_id: string;
+            binding_id: string;
+            generation: number;
+            claim_generation: number;
+            assignment_json: string;
+          }>`SELECT dispatch_id,environment_id,binding_id,generation,claim_generation,assignment_json FROM project_team_workspace_receipt WHERE binding_id=${f.root.bindingId}`;
+          const row = retained[0];
+          if (retained.length !== 1 || !row)
+            return yield* Effect.die("Missing original workspace receipt owner");
+          // The retained row rejects UPDATE. Reinsert malformed/corrupt storage
+          // in this disposable database without weakening that production trigger.
+          yield* f.sql`DELETE FROM project_team_workspace_receipt WHERE dispatch_id=${row.dispatch_id}`;
+          yield* f.sql`INSERT INTO project_team_workspace_receipt VALUES (${row.dispatch_id},${row.environment_id},${row.binding_id},${row.generation},${row.claim_generation},${row.assignment_json},${encoded})`;
+          const allocations = f.allocations;
+          const result = yield* (
+            prepared
+              ? prepared.run.pipe(Effect.asVoid)
+              : f.instance
+                  .prepareOperation(request, () =>
+                    Effect.die("Unexpected invalid receipt emission"),
+                  )
+                  .pipe(Effect.asVoid)
+          ).pipe(Effect.result);
+          expect(result._tag).toBe("Failure");
+          expect(f.allocations).toBe(allocations);
+          expect(f.transports).toBe(0);
+        }),
+      ),
+    );

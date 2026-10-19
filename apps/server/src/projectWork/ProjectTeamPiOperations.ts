@@ -1942,7 +1942,6 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         return yield* deny("Stable review implementation workspace is unavailable", "conflict");
       const receipt = yield* decodeReviewWorkspace(rows[0].receipt_json);
       if (
-        encode(receipt) !== rows[0].receipt_json ||
         digest(receipt) !== job.workspaceReceiptHash ||
         encode(receipt.assignment) !== encode(implementation.intent.request.git)
       )
