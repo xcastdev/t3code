@@ -89,7 +89,15 @@ const digest = (value: unknown) =>
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
 const one = <T,>(items: ReadonlyArray<T>) => (items.length === 1 ? items[0] : undefined);
-const controls = ["defer", "reopen", "pause", "resume", "cancel", "reassign"] as const;
+const controls = [
+  "defer",
+  "reopen",
+  "pause",
+  "resume",
+  "resolve-failure",
+  "cancel",
+  "reassign",
+] as const;
 
 /** Ownership changes remount local drafts and fence callbacks from the previous task. */
 export function GuidedTaskDetail(props: GuidedTaskDetailProps) {
@@ -295,6 +303,17 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     exhaustedEpisodes.length === 1 && linkedRepairBlockers.length === 1
       ? exhaustedEpisode
       : undefined;
+
+  const repairFailureResolvable =
+    (task?.state === "blocked" || task?.state === "failed") &&
+    repairDecisionEpisode !== undefined &&
+    !writer &&
+    gates.some(
+      (gate) =>
+        gate.recordId === repairDecisionEpisode.exceptionGrantId &&
+        gate.gate === "repair" &&
+        gate.status === "approved",
+    );
 
   const update = (next: typeof drafts) => {
     state.current = next;
@@ -523,6 +542,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             }
           : null;
       case "project-team.task.control":
+        if (controlAction === "resolve-failure" && !repairFailureResolvable) return null;
         if (
           (controlAction === "resume" || controlAction === "reopen") &&
           (writer || repair || (requestedSuccessor !== undefined && successor?.status !== "active"))
@@ -699,7 +719,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     )
       return;
     const key = keyFor(kind);
-    const existing = draftFor(kind);
+    const existing = state.current.entries.find((draft) => draft.key.kind === kind);
     const fields = { ...defaultFields(kind), ...existing?.fields, ...patch };
     if (
       kind === "project-team.specification.propose" &&
@@ -983,6 +1003,11 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
                   Resolve repair decision
                 </Button>
                 {status("project-team.repair.resolve")}
+                <p className="text-xs text-muted-foreground">
+                  Approving one repair leaves the task blocked. After the exact repair grant is
+                  saved and prior owners drain, select resolve-failure in Task controls to continue.
+                  The repair allowance stays unchanged.
+                </p>
               </div>
             </>
           ) : (
@@ -1579,6 +1604,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             variant="outline"
             disabled={
               !canWrite ||
+              (controlAction === "resolve-failure" && !repairFailureResolvable) ||
               blockedDraft("project-team.task.control") ||
               !draftFor("project-team.task.control")?.fields.reason?.trim() ||
               ((controlAction === "defer" ||

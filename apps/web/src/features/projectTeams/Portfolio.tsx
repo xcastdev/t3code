@@ -172,7 +172,7 @@ function nextActions(data: Summary) {
               category: "questions" as const,
               recordId: question.recordId,
               taskId: question.taskId,
-              label: `Answer question for ${question.taskId} · Gate ${question.targetGateId}`,
+              label: `Inspect task with pending question for ${question.taskId} · Gate ${question.targetGateId}`,
             },
           ]
         : [],
@@ -360,6 +360,9 @@ function PortfolioEntry({
       </Button>
       <div className="mt-3 space-y-2 text-sm">
         <h4 className="font-medium">Next action</h4>
+        {view.current && actions.some((action) => action.category === "questions") ? (
+          <p>To answer pending questions, open the project Inbox.</p>
+        ) : null}
         {!view.current ? (
           <p>Refresh the portfolio for current next actions.</p>
         ) : actions.length > 0 ? (

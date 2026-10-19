@@ -421,6 +421,108 @@ describe("GuidedTaskDetail human interactions", () => {
     },
   );
 
+  it("uses the latest repair choice and reason when a callback survives local draft edits", async () => {
+    current = decodeContext({ ...current, blockers: [linkedRepairBlocker()] });
+    foundation = [...records(current), repairEpisode()];
+    await render();
+    await repairDecision("abandon");
+    await fill("Repair reason", "Abandon the task");
+    const retained = callbacks.get("Resolve repair decision");
+    expect(retained).toBeDefined();
+    await repairDecision("diagnose");
+    await fill("Repair reason", "Investigate the failing reconnect check first");
+    await act(async () => retained?.());
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.repair.resolve",
+      decision: "diagnose",
+      reason: "Investigate the failing reconnect check first",
+    });
+  });
+
+  it("requires an exact approved repair exception and drained owners before explicit failure resolution", async () => {
+    current = decodeContext({
+      ...current,
+      task: { ...current.task, state: "blocked" },
+      blockers: [linkedRepairBlocker()],
+    });
+    const episode = repairEpisode({ exceptionGrantId: "repair-grant" });
+    const grant = decodeRecord({
+      ...records(current, "approved")[2],
+      recordId: "repair-grant",
+      gate: "repair",
+      status: "approved",
+    });
+    foundation = [...records(current, "approved"), episode];
+    await render();
+    await action("resolve-failure");
+    await fill("Control reason", "Continue with the approved single repair");
+    expect(button("Apply resolve-failure").disabled).toBe(true);
+    await act(async () => callbacks.get("Apply resolve-failure")?.());
+    expect(emitted).toEqual([]);
+    foundation = [...foundation, grant, ...workerRecords()];
+    await render();
+    expect(button("Apply resolve-failure").disabled).toBe(true);
+    await act(async () => callbacks.get("Apply resolve-failure")?.());
+    expect(emitted).toEqual([]);
+    foundation = [
+      ...records(current, "approved"),
+      episode,
+      grant,
+      ...workerRecords({ status: "settled" }),
+    ];
+    await render();
+    await fill("Control reason", "Continue with the approved single repair");
+    expect(button("Apply resolve-failure").disabled).toBe(false);
+    expect(emitted).toEqual([]);
+    const retained = callbacks.get("Apply resolve-failure");
+    foundation = [
+      ...records(current, "approved"),
+      repairEpisode({ revision: 7, exceptionGrantId: "new-grant" }),
+      grant,
+    ];
+    await render();
+    await act(async () => retained?.());
+    expect(emitted).toEqual([]);
+    foundation = [...records(current, "approved"), episode, grant];
+    await render();
+    await click("Apply resolve-failure");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.task.control",
+      expectedRevision: current.revision,
+      expectedTaskRevision: current.task.revision,
+      control: { action: "resolve-failure", reason: "Continue with the approved single repair" },
+    });
+  });
+
+  it.each([{ recordId: "another-grant" }, { status: "consumed" }, { gate: "execution" }])(
+    "withholds failure resolution for a noncurrent repair grant %j",
+    async (patch) => {
+      current = decodeContext({
+        ...current,
+        task: { ...current.task, state: "blocked" },
+        blockers: [linkedRepairBlocker()],
+      });
+      foundation = [
+        ...records(current, "approved"),
+        repairEpisode({ exceptionGrantId: "repair-grant" }),
+        decodeRecord({
+          ...records(current, "approved")[2],
+          recordId: "repair-grant",
+          gate: "repair",
+          ...patch,
+        }),
+      ];
+      await render();
+      await action("resolve-failure");
+      await fill("Control reason", "Continue with one repair");
+      expect(button("Apply resolve-failure").disabled).toBe(true);
+      await act(async () => callbacks.get("Apply resolve-failure")?.());
+      expect(emitted).toEqual([]);
+    },
+  );
+
   it("withholds repair decisions when linked blockers are ambiguous", async () => {
     const blocker = linkedRepairBlocker();
     current = decodeContext({

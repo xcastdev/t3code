@@ -206,10 +206,11 @@ describe("Portfolio mounted read-only presentation", () => {
     { ...entry, ...patch },
   ];
 
-  it("links next actions to recorded blockers and pending question targets", async () => {
+  it("opens task inspection for pending questions and directs answering to Inbox", async () => {
     await render();
     await click("Review blocker for task-blocked: Waiting for a decision · Resolver human");
-    await click("Answer question for task-question · Gate gate-1");
+    expect(host.textContent).toContain("To answer pending questions, open the project Inbox.");
+    await click("Inspect task with pending question for task-question · Gate gate-1");
     expect(props.onOpenTask).toHaveBeenNthCalledWith(1, {
       environmentId,
       projectId,
@@ -237,19 +238,19 @@ describe("Portfolio mounted read-only presentation", () => {
         },
       }),
     });
-    expect(host.textContent).not.toContain("Answer question for");
+    expect(host.textContent).not.toContain("Inspect task with pending question for");
     await click("Inspect task workflow and approvals");
     expect(props.onOpenProject).toHaveBeenCalledWith({ environmentId, projectId });
   });
 
   it("withdraws next actions when summaries become stale", async () => {
     await render();
-    const held = button("Answer question for task-question · Gate gate-1");
+    const held = button("Inspect task with pending question for task-question · Gate gate-1");
     await render({ entries: changeEntry({ current: false }) });
     await act(async () => held.click());
     expect(props.onOpenTask).not.toHaveBeenCalled();
     expect(host.textContent).toContain("Refresh the portfolio for current next actions");
-    expect(host.textContent).not.toContain("Answer question for");
+    expect(host.textContent).not.toContain("Inspect task with pending question for");
   });
 
   it("shows recorded counts, deterministic missions, coordinator and separate frozen/profile models", async () => {
