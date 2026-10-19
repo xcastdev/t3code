@@ -148,7 +148,7 @@ vi.mock("./workEnvironment", () => ({
   },
 }));
 
-import { WorkTaskScreen } from "./WorkScreens";
+import { ProjectWorkScreen, WorkTaskScreen } from "./WorkScreens";
 const environmentId = EnvironmentId.make("environment-1");
 const projectId = ProjectId.make("project-1");
 const at = "2026-10-01T10:00:00.000Z";
@@ -935,4 +935,95 @@ it("mounted independent review withholds the action without approved parent targ
   expect(button("Start independent review").disabled).toBe(true);
   await click("Start independent review");
   expect(emitted).toHaveLength(0);
+});
+
+it.each(["Pause task", "Cancel task"])("sends %s from the actual task screen", async (label) => {
+  await render();
+  await fill("Task control reason", "Stop this work for review");
+  await click(label);
+  expect(emitted[0]).toMatchObject({
+    type: "project-team.task.control",
+    expectedRevision: 10,
+    expectedTaskRevision: 4,
+    control: {
+      action: label === "Pause task" ? "pause" : "cancel",
+      reason: "Stop this work for review",
+    },
+  });
+  expect(button(label).disabled).toBe(true);
+});
+
+it("reopens terminal work and blocks a held reopen after a worker becomes active", async () => {
+  current = decodeContext({ ...current, task: { ...current.task, state: "canceled" } });
+  fixture.query.data = current;
+  registry.set(task, AsyncResult.success(current));
+  await render();
+  await fill("Task control reason", "Return this task to review");
+  expect(button("Reopen task").disabled).toBe(false);
+  const held = fixture.callbacks.get("Reopen task");
+  expect(held).toBeDefined();
+  await snapshot([...records, ...workerRecords()]);
+  await act(async () => held?.());
+  expect(emitted).toEqual([]);
+  await snapshot(
+    records.filter((record) => record.kind !== "run-binding" && record.kind !== "role-revision"),
+  );
+  await click("Reopen task");
+  expect(emitted[0]).toMatchObject({
+    type: "project-team.task.control",
+    control: { action: "reopen", reason: "Return this task to review" },
+  });
+});
+
+it("creates a project-scoped draft and retains an exact uncertain request across disconnect", async () => {
+  let first = true;
+  fixture.command.mockImplementation(async ({ input }: { input: ProjectWorkWriteIntent }) => {
+    emitted.push(decodeWrite(input));
+    if (first) {
+      first = false;
+      throw Error("response lost");
+    }
+    return { _tag: "Success" };
+  });
+  const show = async () =>
+    act(async () =>
+      root.render(
+        <RegistryContext.Provider value={registry}>
+          <ProjectWorkScreen route={{ params: { environmentId, projectId } }} />
+        </RegistryContext.Provider>,
+      ),
+    );
+  await show();
+  await fill("Requested task title", "Review remote supervision");
+  await click("Create draft task");
+  expect(emitted[0]).toMatchObject({
+    type: "project-work.task.create",
+    projectId,
+    expectedRevision: 10,
+    title: "Review remote supervision",
+  });
+  expect(emitted[0]).not.toHaveProperty("attribution");
+  await click("Show evidence");
+  expect(button("Retry exact work request").disabled).toBe(false);
+  await click("Show project work");
+  fixture.connected = false;
+  registry.set(presentation, {
+    entry: { enabled: true },
+    connection: { phase: "disconnected" },
+    serverConfig: config(),
+  });
+  await show();
+  await act(async () => fixture.callbacks.get("Retry exact work request")?.());
+  expect(emitted).toHaveLength(1);
+  fixture.connected = true;
+  registry.set(presentation, {
+    entry: { enabled: true },
+    connection: { phase: "connected" },
+    serverConfig: config(),
+  });
+  await show();
+  await click("Retry exact work request");
+  expect(emitted).toHaveLength(2);
+  expect(emitted[1]).toEqual(emitted[0]);
+  expect(host.textContent).toContain("Draft task recorded");
 });

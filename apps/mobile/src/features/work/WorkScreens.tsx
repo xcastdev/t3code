@@ -49,6 +49,12 @@ import {
   type MobileVerificationRequest,
   type MobileVerificationStore,
 } from "./WorkVerification";
+import {
+  WorkMergeApprovalSource,
+  type MobileMergeRequest,
+  type MobileMergeStore,
+} from "./WorkMergeApproval";
+import { WorkRequest } from "./WorkRequest";
 import { WorkAttention } from "./WorkAttention";
 import { WorkSupervisionSource } from "./WorkSupervisionSource";
 
@@ -132,35 +138,74 @@ export function WorkEntryRow() {
 }
 export function WorkProjectsScreen() {
   const projects = useProjects();
-  const { savedConnectionsById } = useSavedRemoteConnections();
-  const navigation = useNavigation();
+  const [page, setPage] = useState(0);
+  const lastPage = Math.max(0, Math.ceil(projects.length / 5) - 1);
+  const visible = Math.min(page, lastPage);
   return (
     <WorkSurface title="Project Work">
-      <Notice>Review issues and tasks in a specific environment and project.</Notice>
+      <Notice>
+        Review ownership, blockers and requests across your environments. Open a task to answer
+        questions or review approvals.
+      </Notice>
       {projects.length === 0 ? (
         <Notice>No projects are available. Connect an environment and add a project first.</Notice>
       ) : null}
-      {projects.map((project) => (
-        <Pressable
+      {projects.slice(visible * 5, visible * 5 + 5).map((project) => (
+        <WorkPortfolioProject
           key={JSON.stringify([project.environmentId, project.id])}
-          accessibilityRole="button"
-          onPress={() =>
-            navigation.navigate("ProjectWork", {
-              environmentId: String(project.environmentId),
-              projectId: String(project.id),
-            })
-          }
-          className="gap-1 rounded-2xl border border-border bg-card p-4"
-        >
-          <Text className="font-t3-semibold text-foreground">{project.title}</Text>
-          <Text className="text-xs text-foreground-muted">
-            {savedConnectionsById[project.environmentId]?.environmentLabel ?? project.environmentId}{" "}
-            · {project.environmentId}
-          </Text>
-          <Text className="text-xs text-foreground-muted">{project.id}</Text>
-        </Pressable>
+          target={{ environmentId: project.environmentId, projectId: project.id }}
+          title={project.title}
+        />
       ))}
+      {lastPage > 0 ? (
+        <View className="gap-2">
+          <WorkButton disabled={visible === 0} onPress={() => setPage(visible - 1)}>
+            Previous projects
+          </WorkButton>
+          <WorkButton disabled={visible === lastPage} onPress={() => setPage(visible + 1)}>
+            Next projects
+          </WorkButton>
+          <Notice>
+            Project page {visible + 1} of {lastPage + 1}
+          </Notice>
+        </View>
+      ) : null}
     </WorkSurface>
+  );
+}
+function WorkPortfolioProject({
+  target,
+  title,
+}: {
+  readonly target: { readonly environmentId: EnvironmentId; readonly projectId: ProjectId };
+  readonly title: string;
+}) {
+  const config = useEnvironmentServerConfig(target.environmentId);
+  const runtime = useRemoteEnvironmentRuntime(target.environmentId);
+  const focused = useIsFocused();
+  const navigation = useNavigation();
+  const { savedConnectionsById } = useSavedRemoteConnections();
+  return (
+    <View className="gap-2">
+      <Notice>
+        {savedConnectionsById[target.environmentId]?.environmentLabel ?? target.environmentId}
+      </Notice>
+      <WorkSupervisionSource
+        {...target}
+        title={title}
+        enabled={config?.settings.projectWorkEnabled === true}
+        supported={config?.environment.capabilities.projectTeamSupervisionReads === true}
+        connected={focused && runtime?.connectionState === "connected"}
+        onInspectProject={() => navigation.navigate("ProjectWork", target)}
+        onOpenTask={(owner) => navigation.navigate("WorkTask", owner)}
+        onOpenWorker={(owner) =>
+          navigation.navigate("Thread", {
+            environmentId: owner.environmentId,
+            threadId: owner.threadId,
+          })
+        }
+      />
+    </View>
   );
 }
 
@@ -282,6 +327,39 @@ function ProjectWorkSession({
         connected={focused && runtime?.connectionState === "connected"}
         supported={foundationSupported}
         writesSupported={config?.environment.capabilities.projectTeamGuidedWrites === true}
+      />
+      <WorkRequest
+        target={target}
+        readRevision={() => {
+          const presentation = appAtomRegistry.get(
+            environmentPresentations.presentationAtom(target.environmentId),
+          );
+          const ownProject = appAtomRegistry.get(environmentProjects.projectAtom(target));
+          const verified = foundation.verify();
+          return navigation.isFocused() &&
+            ownProject?.id === target.projectId &&
+            ownProject.environmentId === target.environmentId &&
+            presentation?.entry.enabled === true &&
+            presentation.connection.phase === "connected" &&
+            presentation.serverConfig?.settings.projectWorkEnabled === true &&
+            presentation.serverConfig.environment.capabilities.projectTeamFoundationReads ===
+              true &&
+            presentation.serverConfig.environment.capabilities.projectTeamGuidedWrites === true &&
+            verified.current
+            ? verified.snapshot.revision
+            : null;
+        }}
+        available={
+          supported &&
+          foundation.current &&
+          focused &&
+          runtime?.connectionState === "connected" &&
+          config?.environment.capabilities.projectTeamGuidedWrites === true
+        }
+        onRefresh={() => {
+          query.refresh();
+          foundation.refresh();
+        }}
       />
       {showSupervision ? (
         <WorkSupervisionSource
@@ -448,6 +526,19 @@ export function WorkTaskScreen({
     }),
     [verificationSnapshot],
   );
+  const [mergeSnapshot, saveMerge] = useState<ReadonlyArray<MobileMergeRequest>>([]);
+  const mergeState = useRef(mergeSnapshot);
+  const mergeStore = useMemo<MobileMergeStore>(
+    () => ({
+      snapshot: mergeSnapshot,
+      read: () => mergeState.current,
+      write: (entries) => {
+        mergeState.current = entries;
+        saveMerge(entries);
+      },
+    }),
+    [mergeSnapshot],
+  );
   const target = decodeWorkRoute(route.params);
   const taskId = Option.getOrNull(decodeTaskId(route.params.taskId));
   return target && taskId ? (
@@ -456,6 +547,7 @@ export function WorkTaskScreen({
       target={target}
       taskId={taskId}
       verificationStore={verificationStore}
+      mergeStore={mergeStore}
     />
   ) : (
     <WorkSurface title="Task">
@@ -467,10 +559,12 @@ function WorkTaskSession({
   target,
   taskId,
   verificationStore,
+  mergeStore,
 }: {
   readonly target: { readonly environmentId: EnvironmentId; readonly projectId: ProjectId };
   readonly taskId: ProjectWorkTaskId;
   readonly verificationStore: MobileVerificationStore;
+  readonly mergeStore: MobileMergeStore;
 }) {
   const navigation = useNavigation();
   const focused = useIsFocused();
@@ -730,6 +824,12 @@ function WorkTaskSession({
               if (result._tag === "Failure") throw squashAtomCommandFailure(result);
             }}
           />
+          <WorkMergeApprovalSource
+            current={current}
+            readCurrent={readCurrent}
+            store={mergeStore}
+            onRefresh={refresh}
+          />
           <WorkCard title={`Specification ${ownContext.task.specRevision}`}>
             <Text selectable>
               {ownContext.task.specification?.objective ?? "No specification proposed."}
@@ -957,6 +1057,25 @@ function WorkTaskSession({
             >
               Request reassignment
             </WorkButton>
+            {(
+              [
+                ["pause", "Pause task", control.canPause],
+                ["cancel", "Cancel task", control.canCancel],
+                ["reopen", "Reopen task", control.canReopen],
+              ] as const
+            ).map(([action, label, available]) => (
+              <WorkButton
+                key={action}
+                disabled={controlLocked || !available || !state.reason.trim()}
+                onPress={() => void session.submit({ kind: "control", action })}
+              >
+                {label}
+              </WorkButton>
+            ))}
+            <Notice>
+              Pause and cancel stop owned work. Reopen rechecks the prior worker drain and approvals
+              on the server.
+            </Notice>
             {control.resumeReason ? <Notice>{control.resumeReason}</Notice> : null}
             <WorkButton
               disabled={controlLocked || !control.canResume || !state.reason.trim()}

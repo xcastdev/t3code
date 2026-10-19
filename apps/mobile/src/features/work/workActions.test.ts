@@ -950,3 +950,66 @@ it("mobile independent review refuses changed targets and pending approvals with
   expect(session.state.reviewObjective).toBe("Inspect old approved targets");
   expect(reviewMobileWork(current()).canReview).toBe(false);
 });
+
+it.each(["pause", "cancel"] as const)(
+  "sends the scoped %s command and retries its exact identity",
+  async (action) => {
+    let value = current();
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      () => value,
+      async (input) => {
+        sent.push(decodeWrite(input));
+        if (sent.length === 1) throw Error("lost response");
+      },
+      () => CommandId.make("control-" + action),
+    );
+    session.editControl("Supervisor requested a stop");
+    await session.submit({ kind: "control", action });
+    expect(sent[0]).toMatchObject({
+      type: "project-team.task.control",
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      control: { action, reason: "Supervisor requested a stop" },
+    });
+    value = { ...value, connected: false };
+    await session.retry();
+    expect(sent).toHaveLength(1);
+    value = { ...value, connected: true };
+    await session.retry();
+    expect(sent[1]).toEqual(sent[0]);
+  },
+);
+
+it.each(["completed", "canceled"] as const)(
+  "reopens %s work without allowing stopped approvals or resume",
+  async (state) => {
+    const value = {
+      ...current(),
+      context: decodeContext({ ...context, task: { ...context.task, state } }),
+    };
+    const sent: ProjectWorkWriteIntent[] = [];
+    const session = createWorkActionSession(
+      { environmentId, projectId, taskId: context.task.taskId },
+      () => value,
+      async (input) => {
+        sent.push(decodeWrite(input));
+      },
+      () => CommandId.make("reopen"),
+    );
+    session.editControl("Review the task again");
+    await session.submit({ kind: "control", action: "pause" });
+    await session.submit({ kind: "control", action: "cancel" });
+    await session.submit({ kind: "control", action: "resume" });
+    await session.submit({ kind: "gate", gateId: "spec", response: "approved" });
+    expect(sent).toEqual([]);
+    await session.submit({ kind: "control", action: "reopen" });
+    expect(sent[0]).toMatchObject({
+      type: "project-team.task.control",
+      control: { action: "reopen" },
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+    });
+  },
+);

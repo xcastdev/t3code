@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 const fixture = vi.hoisted(() => ({
   registry: undefined as unknown,
+  projects: [] as Array<{ environmentId: EnvironmentId; id: ProjectId; title: string }>,
   foundationPage: vi.fn(),
   supervision: vi.fn(),
   supervisionSupported: true,
@@ -59,7 +60,7 @@ vi.mock("../../native/StackHeader", () => ({ NativeStackScreenOptions: () => nul
 vi.mock("../../state/entities", () => ({
   useProject: ({ projectId }: { projectId: string }) =>
     fixture.available ? { title: projectId } : null,
-  useProjects: () => [],
+  useProjects: () => fixture.projects,
   useEnvironmentServerConfig: () => ({
     settings: { projectWorkEnabled: fixture.enabled },
     environment: {
@@ -98,7 +99,7 @@ vi.mock("./workEnvironment", () => ({
 }));
 
 // Actual screen, foundation hook/cache, shared decoder, Team and Evidence remain mounted.
-import { ProjectWorkScreen } from "./WorkScreens";
+import { ProjectWorkScreen, WorkProjectsScreen } from "./WorkScreens";
 
 const environmentId = EnvironmentId.make("environment-1");
 const projectId = ProjectId.make("project-1");
@@ -226,6 +227,7 @@ beforeEach(() => {
   vi.spyOn(Date, "now").mockReturnValue(1_000_000);
   registry = AtomRegistry.make();
   fixture.registry = registry;
+  fixture.projects = [];
   fixture.enabled = fixture.supported = fixture.connected = fixture.available = true;
   fixture.foundationPage.mockReset();
   fixture.page.mockReset();
@@ -329,7 +331,7 @@ describe("actual project screen supervision read", () => {
     await render();
     expect(host.textContent).toContain("Task task-1 · attempt attempt-1");
     expect(host.textContent).toContain(
-      "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+      "Shared root: 200 charged (40 conservatively charged for unknown usage), 50 held; 750/1,000 tokens remaining.",
     );
     expect(host.textContent).toContain("Original deadline");
     expect(fixture.supervision).not.toHaveBeenCalled();
@@ -361,10 +363,10 @@ describe("actual project screen supervision read", () => {
     expect(host.textContent).toContain("Received 60 seconds ago.");
     expect(host.textContent).toContain("Binding model: frozen-model");
     expect(host.textContent).toContain(
-      "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+      "Shared root: 200 charged (40 conservatively charged for unknown usage), 50 held; 750/1,000 tokens remaining.",
     );
     expect(host.textContent).toContain(
-      "This attempt: 150 charged (40 unknown), 10 held; 240/400 tokens remaining.",
+      "This attempt: 150 charged (40 conservatively charged for unknown usage), 10 held; 240/400 tokens remaining.",
     );
     expect(host.textContent).not.toContain("Issue intake");
     expect(fixture.command).not.toHaveBeenCalled();
@@ -564,5 +566,52 @@ describe("actual project screen supervision read", () => {
     await click("Show supervision");
     expect(host.textContent).not.toContain("Coordinator Alpha");
     expect(host.textContent).not.toContain("Current recorded summary");
+  });
+});
+
+it("shows portfolio ownership and pending requests and opens their exact environment/task", async () => {
+  fixture.projects = [{ environmentId, id: projectId, title: "Portfolio Alpha" }];
+  await act(async () =>
+    root.render(
+      <RegistryContext.Provider value={registry}>
+        <WorkProjectsScreen />
+      </RegistryContext.Provider>,
+    ),
+  );
+  expect(host.textContent).toContain("Coordinator Alpha");
+  expect(host.textContent).toContain("Waiting for a decision");
+  expect(host.textContent).toContain("question-1");
+  await click("Inspect task task-question");
+  expect(fixture.navigate).toHaveBeenCalledWith("WorkTask", {
+    environmentId,
+    projectId,
+    taskId: "task-question",
+  });
+  await click("Inspect project Portfolio Alpha");
+  expect(fixture.navigate).toHaveBeenCalledWith("ProjectWork", { environmentId, projectId });
+});
+
+it("bounds portfolio reads and pages projects without losing their owners", async () => {
+  fixture.projects = Array.from({ length: 6 }, (_, index) => ({
+    environmentId,
+    id: ProjectId.make("page-" + index),
+    title: "Project " + index,
+  }));
+  await act(async () =>
+    root.render(
+      <RegistryContext.Provider value={registry}>
+        <WorkProjectsScreen />
+      </RegistryContext.Provider>,
+    ),
+  );
+  expect(host.textContent).toContain("Project 4");
+  expect(host.textContent).not.toContain("Project 5");
+  await click("Next projects");
+  expect(host.textContent).toContain("Project 5");
+  expect(host.textContent).not.toContain("Project 4");
+  await click("Inspect project Project 5");
+  expect(fixture.navigate).toHaveBeenCalledWith("ProjectWork", {
+    environmentId,
+    projectId: "page-5",
   });
 });

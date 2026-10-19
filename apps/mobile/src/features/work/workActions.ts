@@ -76,6 +76,8 @@ function reviewWork(current: MobileWorkCurrent, controls = false) {
   )
     reason = "This task does not belong to the selected project.";
   else if (
+    new Set(foundation.records.map((record) => record.recordId)).size !==
+      foundation.records.length ||
     !knownTask(context.task) ||
     [context.activeAttempt, context.reclaimableAttempt].some(
       (attempt) =>
@@ -105,8 +107,7 @@ function reviewWork(current: MobileWorkCurrent, controls = false) {
     reason = "Guided actions are unavailable for this task.";
   if (
     reason === null &&
-    (context?.task.state === "completed" ||
-      context?.task.state === "canceled" ||
+    ((!controls && (context?.task.state === "completed" || context?.task.state === "canceled")) ||
       (!controls && membership?.controlState !== undefined && membership.controlState !== "active"))
   )
     reason = "This task is stopped. Review its recorded state before continuing.";
@@ -224,8 +225,12 @@ export function reviewMobileTaskControl(current: MobileWorkCurrent) {
     .filter(
       (record) => record.projectId === current.projectId && counts.get(record.recordId) === 1,
     );
+  const terminal =
+    current.context?.task.state === "completed" || current.context?.task.state === "canceled";
   const recipients =
-    review.reason === null ? members.filter((member) => member.status === "active") : [];
+    review.reason === null && !terminal
+      ? members.filter((member) => member.status === "active")
+      : [];
   const requested = review.membership?.requestedSuccessorMemberId;
   const successor = members.find((member) => member.recordId === requested);
   const undrainedAttempt =
@@ -255,15 +260,17 @@ export function reviewMobileTaskControl(current: MobileWorkCurrent) {
   const ownership = requested === undefined || successor?.status === "active";
   const resumeReason =
     review.reason ??
-    (!stopped
-      ? "Resume is available for paused or deferred work."
-      : !ownership
-        ? "Resolve the requested successor before resuming."
-        : writer
-          ? "Wait for the prior worker to authoritatively drain."
-          : repair
-            ? "Resolve the recorded failure or repair before resuming."
-            : null);
+    (terminal
+      ? "Reopen a terminal task before resuming work."
+      : !stopped
+        ? "Resume is available for paused or deferred work."
+        : !ownership
+          ? "Resolve the requested successor before resuming."
+          : writer
+            ? "Wait for the prior worker to authoritatively drain."
+            : repair
+              ? "Resolve the recorded failure or repair before resuming."
+              : null);
   return {
     ...review,
     members,
@@ -271,7 +278,10 @@ export function reviewMobileTaskControl(current: MobileWorkCurrent) {
     successor,
     resumeReason,
     canResume: resumeReason === null,
-    canReassign: review.reason === null,
+    canReassign: review.reason === null && !terminal,
+    canPause: review.reason === null && !terminal && !stopped,
+    canCancel: review.reason === null && !terminal,
+    canReopen: review.reason === null && terminal && !writer && !repair,
   };
 }
 
@@ -279,7 +289,10 @@ export type MobileWorkAction =
   | { readonly kind: "investigate" }
   | { readonly kind: "review" }
   | { readonly kind: "waiver"; readonly action: "waive" | "revoke" }
-  | { readonly kind: "control"; readonly action: "reassign" | "resume" }
+  | {
+      readonly kind: "control";
+      readonly action: "reassign" | "resume" | "pause" | "cancel" | "reopen";
+    }
   | { readonly kind: "gate"; readonly gateId: string; readonly response: "approved" | "rejected" };
 export interface MobileWorkActionState {
   readonly waiver: {
@@ -644,6 +657,8 @@ export function createWorkActionSession(
             (entry) => entry.criterionId === captured?.criterionId,
           );
           if (
+            value.context.task.state === "completed" ||
+            value.context.task.state === "canceled" ||
             !captured ||
             captured.specificationHash === null ||
             captured.scopeHash === null ||
@@ -686,6 +701,9 @@ export function createWorkActionSession(
           const recipient = state.recipient;
           if (
             !state.reason.trim() ||
+            (action.action === "pause" && !control.canPause) ||
+            (action.action === "cancel" && !control.canCancel) ||
+            (action.action === "reopen" && !control.canReopen) ||
             (action.action === "resume" && !control.canResume) ||
             (action.action === "reassign" &&
               (!recipient ||
@@ -710,7 +728,7 @@ export function createWorkActionSession(
                     recipientMemberId: recipient.id,
                     expectedMemberRevision: recipient.revision,
                   }
-                : { action: "resume", reason: state.reason },
+                : { action: action.action, reason: state.reason },
           });
         } else if (action.kind === "review") {
           const target = reviewRequestTarget(value);
