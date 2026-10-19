@@ -62,11 +62,6 @@ describe("Pi OpenAI subscription broker", () => {
       code: "REQUEST_MODEL_OR_OUTPUT_INVALID",
     },
     {
-      name: "normalized input budget",
-      extra: { instructions: "x".repeat(32768) },
-      code: "REQUEST_INPUT_LIMIT",
-    },
-    {
       name: "whole request budget",
       extra: { instructions: "x".repeat(65536) },
       code: "REQUEST_BYTE_LIMIT",
@@ -99,6 +94,57 @@ describe("Pi OpenAI subscription broker", () => {
     expect(f.reservations).toHaveLength(0);
     expect(f.transportCalls()).toBe(0);
   });
+
+  it.each([16_384, 32_768])(
+    "bounds normalized subscription bytes separately from the %s token reservation",
+    async (maxInputTokens) => {
+      // Tool wrappers make the normalized form larger than the wire envelope,
+      // so the normalized boundary is reachable below the independent body cap.
+      const tools = Array.from({ length: 32 }, (_, index) => ({
+        type: "function" as const,
+        function: { name: `tool_${index}`, description: "Read", parameters: {} },
+      }));
+      const request = (padding: string) =>
+        body({
+          instructions: "x".repeat(48_000),
+          tools: tools.map(({ function: definition }) => ({ type: "function", ...definition })),
+          input: [{ role: "user", content: [{ type: "input_text", text: padding }] }],
+        });
+      const base = Buffer.byteLength(
+        decodePiSubscriptionRequest(request(""), model).normalizedBody,
+      );
+      const remaining = 65_536 - base;
+      const padding = "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2);
+      const accepted = request(padding);
+      const rejected = request(padding + "x");
+      expect(Buffer.byteLength(decodePiSubscriptionRequest(accepted, model).normalizedBody)).toBe(
+        65_536,
+      );
+      expect(Buffer.byteLength(decodePiSubscriptionRequest(rejected, model).normalizedBody)).toBe(
+        65_537,
+      );
+      expect(Buffer.byteLength(rejected)).toBeLessThanOrEqual(65_536);
+      let calls = 0;
+      const f = fixture({
+        maxInputTokens,
+        tools,
+        requiredSystemText: "x".repeat(48_000),
+        transport: async () => {
+          calls++;
+          return new Response(success(), { headers: { "content-type": "text/event-stream" } });
+        },
+      });
+      await expect(f.invoke(rejected)).rejects.toMatchObject({ code: "REQUEST_INPUT_LIMIT" });
+      expect(f.reservations).toEqual([]);
+      expect(calls).toBe(0);
+      await f.invoke(accepted);
+      expect(calls).toBe(1);
+      expect(f.reservations).toMatchObject([
+        { maxInputTokens, maxOutputTokens: 2_048, accountingMode: "openai-subscription-monitored" },
+      ]);
+      expect(f.settlements).toMatchObject([{ outcome: "reported", chargedInputTokens: 50 }]);
+    },
+  );
 
   it("bounds instructions in UTF-8 bytes and retains exact system authority", async () => {
     expect(() =>
@@ -1021,9 +1067,9 @@ describe("Pi OpenAI subscription broker", () => {
         return new Response(success(), { headers: { "content-type": "text/event-stream" } });
       },
     });
-    await expect(frozen.invoke(request)).rejects.toMatchObject({ code: "REQUEST_INPUT_LIMIT" });
-    expect(frozen.reservations).toEqual([]);
-    expect(frozenTransportCalls).toBe(0);
+    await frozen.invoke(request);
+    expect(frozen.reservations).toMatchObject([{ maxInputTokens: 16_384, maxOutputTokens: 2_048 }]);
+    expect(frozenTransportCalls).toBe(1);
     const inputBounded = fixture({
       tools: declaredTools,
       transport: async () => {
@@ -1048,8 +1094,10 @@ describe("Pi OpenAI subscription broker", () => {
           ],
         }),
       ),
-    ).rejects.toMatchObject({ code: "REQUEST_INPUT_LIMIT" });
-    expect(inputBounded.reservations).toEqual([]);
+    ).resolves.toMatchObject({ usage: { prompt_tokens: 50 } });
+    expect(inputBounded.reservations).toMatchObject([
+      { maxInputTokens: 16_384, maxOutputTokens: 2_048 },
+    ]);
     await expect(
       f.invoke(
         body({
@@ -1057,10 +1105,10 @@ describe("Pi OpenAI subscription broker", () => {
         }),
       ),
     ).rejects.toMatchObject({ code: "REQUEST_INVALID" });
-    expect(transportCalls).toBe(1);
+    expect(transportCalls).toBe(2);
   });
 
-  it("refuses normalized subscription input above 32 KiB before reservation or transport", async () => {
+  it("admits normalized subscription input above 32 KiB with unchanged nominal reservation", async () => {
     const request = body({
       input: [
         { role: "user", content: [{ type: "input_text", text: "a".repeat(12_000) }] },
@@ -1078,9 +1126,9 @@ describe("Pi OpenAI subscription broker", () => {
         return new Response(success(), { headers: { "content-type": "text/event-stream" } });
       },
     });
-    await expect(f.invoke(request)).rejects.toMatchObject({ code: "REQUEST_INPUT_LIMIT" });
-    expect(f.reservations).toEqual([]);
-    expect(transportCalls).toBe(0);
+    await f.invoke(request);
+    expect(f.reservations).toMatchObject([{ maxInputTokens: 32_768, maxOutputTokens: 2_048 }]);
+    expect(transportCalls).toBe(1);
   });
 
   it.each([
@@ -1094,26 +1142,6 @@ describe("Pi OpenAI subscription broker", () => {
       body({ input: [reasoningInput([], ["r".repeat(16_385)])] }),
       "REQUEST_INVALID",
     ],
-    [
-      "aggregate readable reasoning",
-      body({
-        input: [
-          reasoningInput(["s".repeat(9_000)]),
-          reasoningInput(["t".repeat(9_000)], [], "synthetic-opaque-reasoning", "reasoning-2"),
-        ],
-      }),
-      "REQUEST_INPUT_LIMIT",
-    ],
-    [
-      "readable reasoning plus ordinary history",
-      body({
-        input: [
-          reasoningInput(["s".repeat(9_000)], ["r".repeat(4_000)]),
-          { role: "user", content: [{ type: "input_text", text: "u".repeat(4_000) }] },
-        ],
-      }),
-      "REQUEST_INPUT_LIMIT",
-    ],
   ] as const)("refuses %s before reservation or transport", async (_case, request, code) => {
     let transportCalls = 0;
     const f = fixture({
@@ -1125,6 +1153,37 @@ describe("Pi OpenAI subscription broker", () => {
     await expect(f.invoke(request)).rejects.toMatchObject({ code });
     expect(f.reservations).toEqual([]);
     expect(transportCalls).toBe(0);
+  });
+
+  it.each([
+    [
+      "aggregate readable reasoning",
+      body({
+        input: [
+          reasoningInput(["s".repeat(9_000)]),
+          reasoningInput(["t".repeat(9_000)], [], "synthetic-opaque-reasoning", "reasoning-2"),
+        ],
+      }),
+    ],
+    [
+      "readable reasoning plus ordinary history",
+      body({
+        input: [
+          reasoningInput(["s".repeat(9_000)], ["r".repeat(4_000)]),
+          { role: "user", content: [{ type: "input_text", text: "u".repeat(4_000) }] },
+        ],
+      }),
+    ],
+  ] as const)("admits %s above the nominal token reservation", async (_case, request) => {
+    const f = fixture({
+      transport: async () =>
+        new Response(success(), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    await f.invoke(request);
+    expect(f.reservations).toMatchObject([{ maxInputTokens: 16_384, maxOutputTokens: 2_048 }]);
+    expect(f.settlements).toMatchObject([{ outcome: "reported", chargedInputTokens: 50 }]);
   });
 
   it("budgets readable reasoning while preserving a large opaque signature in transport history", async () => {

@@ -24,6 +24,9 @@ import {
   PiWorkerOperation,
 } from "./PiWorkerProtocol.ts";
 
+// Monitored subscription input bytes are independent of nominal token reservations.
+const PI_SUBSCRIPTION_MAX_NORMALIZED_INPUT_BYTES = 65_536;
+
 const strict = { onExcessProperty: "error" } as const;
 const decodeManagedModel = Schema.decodeUnknownSync(PiManagedModel);
 const decodeSubscriptionModel = Schema.decodeUnknownSync(PiSubscriptionManagedModel);
@@ -521,8 +524,12 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
     if (usedRequestIds.size >= 1_024) fail("REQUEST_COUNT_LIMIT");
     if (parsed.model !== cfg.model || (!subscription && parsed.max_tokens > cfg.maxOutputTokens))
       fail("REQUEST_MODEL_OR_OUTPUT_INVALID");
-    // UTF-8 bytes conservatively bound the plain text tokenizer's input, including the serialized overhead.
-    if (Buffer.byteLength(inputBudgetBody) > cfg.maxInputTokens) fail("REQUEST_INPUT_LIMIT");
+    // CommandCode conservatively bounds tokens with UTF-8 bytes; monitored subscription
+    // requests have a separate normalized-input byte ceiling.
+    const maxInputBytes = subscription
+      ? PI_SUBSCRIPTION_MAX_NORMALIZED_INPUT_BYTES
+      : cfg.maxInputTokens;
+    if (Buffer.byteLength(inputBudgetBody) > maxInputBytes) fail("REQUEST_INPUT_LIMIT");
     const advertised = new Set<string>();
     for (const tool of parsed.tools ?? []) {
       if (

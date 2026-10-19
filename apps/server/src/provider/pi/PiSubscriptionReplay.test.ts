@@ -1,3 +1,6 @@
+import { CommandId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
+import { piLocalToolDefinitions } from "./PiLocalTools.ts";
+import { preparePiProjectWorkTools } from "./PiProjectWorkTools.ts";
 import * as NodeZlib from "node:zlib";
 import { Type, type Message } from "@earendil-works/pi-ai";
 import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
@@ -179,6 +182,7 @@ const successiveRequests = async (
   instructionsBytes: number,
   firstWire: string,
   toolError = false,
+  reviewerHistory = false,
 ) => {
   const workerModel = {
     ...sdkModel,
@@ -186,12 +190,109 @@ const successiveRequests = async (
   };
   const instructions = "x\n".repeat(1708) + "x".repeat(instructionsBytes - 3416);
   const cwdSection = "Synthetic current directory";
-  const tools = [
+  const lookupTools = [
     {
       name: "lookup",
       description: declaredTool.function.description,
       parameters: Type.Unsafe<{ key: string }>(parameters),
     },
+  ];
+  const read = piLocalToolDefinitions.find((tool) => tool.name === "read")!;
+  const report = preparePiProjectWorkTools({
+    roleTools: ["project-work.report"],
+    bindingTools: ["project-work.report"],
+    reportContext: {
+      projectId: ProjectId.make("synthetic-project"),
+      taskId: ProjectWorkTaskId.make("synthetic-task"),
+      commandId: CommandId.make("synthetic-command"),
+      sourceRevision: 1,
+      taskRevision: 1,
+      specRevision: 1,
+      planRevision: 1,
+      assignmentId: "synthetic-assignment",
+      assignmentRevision: 1,
+    },
+  })[0]!.tool;
+  const tools = reviewerHistory
+    ? [
+        {
+          name: read.name,
+          description: read.description,
+          parameters: Type.Unsafe(read.parameters),
+        },
+        { ...report.function, parameters: Type.Unsafe(report.function.parameters) },
+      ]
+    : lookupTools;
+  const declared = reviewerHistory
+    ? [
+        {
+          type: "function" as const,
+          function: { name: read.name, description: read.description, parameters: read.parameters },
+        },
+        report,
+      ]
+    : [declaredTool];
+  const files = [
+    { path: "README.md", text: "r".repeat(106) },
+    { path: "greeting.mjs", text: "g".repeat(322) },
+    { path: "greeting.test.mjs", text: "t".repeat(322) },
+  ];
+  const callStream = (name: string, args: object, index: number) => {
+    const item = {
+      id: `fc_${index}`,
+      type: "function_call",
+      call_id: `call-00${index}`,
+      name,
+      arguments: JSON.stringify(args),
+    };
+    return (
+      created +
+      event({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { ...item, arguments: "" },
+      }) +
+      event({
+        type: "response.function_call_arguments.delta",
+        output_index: 0,
+        item_id: item.id,
+        delta: item.arguments,
+      }) +
+      event({
+        type: "response.function_call_arguments.done",
+        output_index: 0,
+        item_id: item.id,
+        arguments: item.arguments,
+      }) +
+      event({ type: "response.output_item.done", output_index: 0, item }) +
+      completed([item])
+    );
+  };
+  const reviewerWires = [
+    ...files.map((file, index) => callStream("read", { path: file.path }, index + 1)),
+    callStream(
+      "project_work_report",
+      {
+        intentJSON: JSON.stringify({
+          type: "project-team.assignment.report",
+          projectId: "synthetic-project",
+          taskId: "synthetic-task",
+          commandId: "synthetic-command",
+          expectedRevision: 1,
+          expectedTaskRevision: 1,
+          specRevision: 1,
+          planRevision: 1,
+          assignmentId: "synthetic-assignment",
+          expectedAssignmentRevision: 1,
+          summary: "Synthetic review complete",
+          evidenceIds: [],
+          outputArtifactIds: [],
+          outcome: "findings",
+        }),
+      },
+      4,
+    ),
+    textStream,
   ];
   const shapes: {
     fields: string[];
@@ -201,6 +302,7 @@ const successiveRequests = async (
     normalizedBytes: number;
   }[] = [];
   const settlements: string[] = [];
+  const reservations: { maxInputTokens: number; maxOutputTokens: number }[] = [];
   let transports = 0;
   let fetches = 0;
   const broker = makePiModelBroker({
@@ -211,7 +313,7 @@ const successiveRequests = async (
     provider: "openai-codex",
     model,
     endpoint,
-    tools: [declaredTool],
+    tools: declared,
     acceptedReportedModels: [model],
     maxInputTokens: 32768,
     maxOutputTokens: 2048,
@@ -221,14 +323,23 @@ const successiveRequests = async (
     authorizeCurrent: async () => {},
     authorizeSubscriptionTest: async () => {},
     getCredential: async () => credential,
-    reserveRequest: async () => ({ reservationId: `reservation-${fetches}` }),
+    reserveRequest: async (reservation) => {
+      reservations.push(reservation);
+      return { reservationId: `reservation-${fetches}` };
+    },
     settleRequest: async (settlement) => {
       settlements.push(settlement.outcome);
       return { accountingReceiptId: `accounted-${fetches}` };
     },
     transport: async (url) => {
       expect(url).toBe(endpoint);
-      return response(transports++ === 0 ? firstWire : textStream);
+      return response(
+        reviewerHistory
+          ? reviewerWires[transports++]!
+          : transports++ === 0
+            ? firstWire
+            : textStream,
+      );
     },
   });
   const messages: Message[] = [
@@ -246,7 +357,11 @@ const successiveRequests = async (
       toolsAdded: tools,
       timestamp: 2,
     },
-    { role: "user", content: "Review the assignment. " + "p".repeat(4507), timestamp: 3 },
+    {
+      role: "user",
+      content: "Review the assignment. " + "p".repeat(reviewerHistory ? 4863 : 4507),
+      timestamp: 3,
+    },
   ];
   const run = async () => {
     let joined: Promise<void> | undefined;
@@ -272,6 +387,7 @@ const successiveRequests = async (
         if (request === undefined) throw Error("SDK request body absent");
         const adapted = decodePiSubscriptionRequest(request, model);
         const value = JSON.parse(request);
+        if (reviewerHistory) expect(JSON.parse(adapted.normalizedBody).tools).toEqual(declared);
         shapes.push({
           fields: Object.keys(value).sort(),
           inputTypes: value.input.map((item: { type?: string }) => item.type ?? "message"),
@@ -315,6 +431,30 @@ const successiveRequests = async (
     return result;
   };
   const first = await run();
+  if (reviewerHistory) {
+    let result = first;
+    for (let index = 0; index < 4; index++) {
+      expect(result.errorMessage).toBeUndefined();
+      expect(result.stopReason).toBe("toolUse");
+      messages.push(result);
+      const call = result.content.find((part) => part.type === "toolCall");
+      if (!call || call.type !== "toolCall") throw Error("synthetic call absent");
+      expect(call.name).toBe(index < 3 ? "read" : "project_work_report");
+      messages.push({
+        role: "toolResult",
+        toolCallId: call.id,
+        toolName: call.name,
+        content: [{ type: "text", text: files[index]?.text ?? "Synthetic report accepted" }],
+        isError: false,
+        timestamp: index + 4,
+      });
+      result = await run();
+    }
+    expect(result.stopReason).toBe("stop");
+    expect(fetches).toBe(5);
+    expect(transports).toBe(5);
+    return { first, shapes, settlements, reservations };
+  }
   messages.push(first);
   for (const call of first.content)
     if (first.stopReason === "toolUse" && call.type === "toolCall")
@@ -338,7 +478,7 @@ const successiveRequests = async (
     expect(shape.normalizedBytes).toBeLessThanOrEqual(32768);
   }
   expect(shapes[1]?.fields).toEqual(shapes[0]?.fields);
-  return { first, shapes, settlements };
+  return { first, shapes, settlements, reservations };
 };
 
 const compatibilityCases = [
@@ -385,6 +525,34 @@ const compatibilityCases = [
 ];
 
 describe("synthetic subscription SSE replay through pinned SDK", () => {
+  it("replays same-size synthetic reviewer context, three file reads and report continuation", async () => {
+    const r = await successiveRequests(24071, "", false, true);
+    expect(r.shapes[0]).toMatchObject({
+      normalizedBytes: 32335,
+      bodyBytes: 32541,
+      inputCount: 2,
+      inputTypes: ["message", "message"],
+    });
+    for (const [index, shape] of r.shapes.entries()) {
+      expect(shape.fields).toEqual(r.shapes[0]!.fields);
+      expect(shape.inputTypes).toEqual([
+        "message",
+        "message",
+        ...Array.from({ length: index }, () => ["function_call", "function_call_output"]).flat(),
+      ]);
+      expect(shape.bodyBytes).toBeLessThan(65536);
+      expect(shape.normalizedBytes).toBeLessThan(65536);
+    }
+    expect(r.shapes.map((shape) => shape.normalizedBytes)).toEqual([
+      32335, 32649, 33182, 33720, 34470,
+    ]);
+    expect(r.shapes[3]!.normalizedBytes).toBeGreaterThan(32768);
+    expect(r.shapes[4]!.normalizedBytes).toBeGreaterThan(r.shapes[3]!.normalizedBytes);
+    expect(r.settlements).toEqual(Array(5).fill("reported"));
+    expect(r.reservations).toHaveLength(5);
+    for (const reservation of r.reservations)
+      expect(reservation).toMatchObject({ maxInputTokens: 32768, maxOutputTokens: 2048 });
+  });
   it.each([10658, 24071])(
     "actual SDK initial context and tool-result followup with %s instruction bytes",
     async (size) => {
