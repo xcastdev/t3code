@@ -385,6 +385,48 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
       availableAt: at,
     };
   };
+  /** Suppress an accepted source as soon as its decision is superseded, even
+   * while the replacement is still proposed. Replay never changes it again.
+   */
+  const supersedeDecision = Effect.fn("ProjectMemoryService.supersedeDecision")(function* (
+    projectId: string,
+    decisionId: string,
+  ) {
+    yield* repository.executeAtomic(
+      Effect.gen(function* () {
+        yield* authorizeCapture(projectId);
+        yield* requireProject(projectId);
+        const state = yield* readCurrentState(sql, projectId);
+        if (
+          !state.decisions?.some(
+            (decision) => decision.decisionId === decisionId && decision.state === "superseded",
+          )
+        )
+          return yield* deny("Decision is not superseded");
+        const at = yield* now;
+        const changed: Array<ProjectTeamRecord> = [];
+        for (const source of records(state)) {
+          if (
+            source.kind !== "memory-source" ||
+            source.sourceKind !== "decision" ||
+            source.status !== "current"
+          )
+            continue;
+          const selector = yield* selectorForSource(source);
+          if (selector.kind !== "decision" || selector.retainedId !== decisionId) continue;
+          changed.push(
+            { ...source, status: "superseded", revision: source.revision + 1, updatedAt: at },
+            intent(source, "memory-delete", at),
+          );
+        }
+        return yield* commit(state, changed, at);
+      }),
+      Effect.gen(function* () {
+        yield* requireProject(projectId);
+        yield* authorizeCapture(projectId);
+      }),
+    );
+  });
   /** Root-owned retained-event hook. Agent requests use capture instead. */
   const captureRetained = Effect.fn("ProjectMemoryService.captureRetained")(function* (
     projectId: string,
@@ -465,7 +507,11 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
           versions.filter((entry) => entry.status === "current").length > 1
         )
           return yield* deny("Memory source history is conflicted or exceeds budget");
-        const old = versions.find((entry) => entry.status === "current");
+        const old =
+          versions.find((entry) => entry.status === "current") ??
+          versions
+            .filter((entry) => entry.status === "superseded")
+            .sort((left, right) => right.generation - left.generation)[0];
         const contentHash = projectMemoryHash(content);
         if (
           old !== undefined &&
@@ -521,7 +567,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
           completedObservationIds: [],
         });
         const changed: Array<ProjectTeamRecord> =
-          old === undefined
+          old === undefined || old.status !== "current"
             ? []
             : [
                 { ...old, status: "superseded", revision: old.revision + 1, updatedAt: at },
@@ -1093,6 +1139,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     modelsEnabled: dependencies.models !== undefined,
     capture,
     captureRetained,
+    supersedeDecision,
     retract,
     prepareRetractionInTransaction,
     replaceShares,

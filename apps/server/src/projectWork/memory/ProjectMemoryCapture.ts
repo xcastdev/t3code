@@ -36,7 +36,7 @@ const selectors = Schema.fromJsonString(
     }),
     Schema.Struct({
       type: Schema.Literal("project-work.decision.superseded"),
-      replacement: Schema.Struct({ decisionId: Schema.String }),
+      decisionId: Schema.String,
     }),
   ]),
 );
@@ -132,6 +132,14 @@ export const makeProjectMemoryCapture = Effect.fn("makeProjectMemoryCapture")(fu
         const decoded = decodeSelector(row.payload);
         if (decoded._tag === "None") continue;
         const event = decoded.value;
+        if (event.type === "project-work.decision.superseded") {
+          yield* service
+            .supersedeDecision(row.projectId, event.decisionId)
+            .pipe(
+              Effect.catch((error) => (deniedCapture(error) ? Effect.void : Effect.fail(error))),
+            );
+          continue;
+        }
         const selector =
           event.type === "project-work.comment.added"
             ? { kind: "comment", retainedId: event.comment.commentId }
@@ -139,10 +147,7 @@ export const makeProjectMemoryCapture = Effect.fn("makeProjectMemoryCapture")(fu
               ? { kind: "evidence", retainedId: event.evidence.evidenceId }
               : {
                   kind: "decision",
-                  retainedId:
-                    event.type === "project-work.decision.accepted"
-                      ? event.decisionId
-                      : event.replacement.decisionId,
+                  retainedId: event.decisionId,
                 };
         // Re-read attribution, lifecycle and content in the service's owning transaction.
         yield* service
