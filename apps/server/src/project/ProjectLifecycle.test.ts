@@ -1,3 +1,6 @@
+import * as NodeCrypto from "node:crypto";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import { coreLayer } from "../projectWork/ProjectWorkRuntime.ts";
 import { ProjectWorkStream } from "../projectWork/ProjectWorkStream.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -30,6 +33,7 @@ import {
   ProjectWorkAttemptId,
   ProjectWorkCommentId,
   EnvironmentId,
+  canonicalProjectWorkPayload,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -43,7 +47,19 @@ import { runForkMigrations, runMigrations } from "../persistence/Migrations.ts";
 import { bindIssueRepositoryProject } from "../projectWork/ProjectIssueRepositoryState.ts";
 import * as ContentGuard from "../projectWork/ProjectWorkContentGuard.ts";
 import * as TeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
-import { makeProjectMemoryService } from "../projectWork/memory/ProjectMemoryService.ts";
+import {
+  makeProjectMemoryService,
+  projectMemoryHash,
+} from "../projectWork/memory/ProjectMemoryService.ts";
+import { seed as seedAssignment } from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import { MemoryIndexManifest, type MemoryBackend } from "../projectWork/memory/MemoryBackend.ts";
+import { makeProjectMemoryIndexReactor } from "../projectWork/memory/ProjectMemoryIndexReactor.ts";
+import {
+  makeProjectMemoryOutcome,
+  readProjectMemoryCompletedDeletionInTransaction,
+} from "../projectWork/memory/ProjectMemoryOutcome.ts";
+import { ProjectMemoryJobOwner } from "../projectWork/memory/ProjectMemoryModelAccounting.ts";
+import { readProjectMemoryObservations } from "../projectWork/memory/ProjectMemoryRetrieval.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 
 import {
@@ -56,6 +72,7 @@ import {
 const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeTeamRecordEffect = Schema.decodeUnknownEffect(ProjectTeamRecord);
 const decodeCommitEffect = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const decodeMemoryOwner = Schema.decodeUnknownEffect(ProjectMemoryJobOwner);
 const bindRepository = (
   sql: SqlClient.SqlClient,
   projectId: string,
@@ -202,6 +219,423 @@ describe("ProjectLifecycle", () => {
             Layer.provideMerge(
               Layer.succeed(ServerEnvironmentIdentity, {
                 getEnvironmentId: Effect.succeed(EnvironmentId.make("deletion-environment")),
+              }),
+            ),
+            Layer.provideMerge(NodeSqliteClient.layerMemory()),
+            Layer.provideMerge(FileSystem.layerNoop({})),
+          ),
+        ),
+      ),
+  );
+  effectIt.effect(
+    "deletes a memory-bearing project only after every exact source cleanup receipt completes",
+    () =>
+      Effect.gen(function* () {
+        // Real migrated SQLite, repository, reactor, outcome verifier and lifecycle.
+        // Frozen operation history and model/backend ports are controlled fixtures;
+        // this does not launch a managed worker or certify Mem0 storage behavior.
+        const f = yield* seedAssignment("investigator", "running", { issueCredential: false });
+        const { sql, repo: repository, binding, role } = f;
+        const projectId = binding.projectId;
+        const environmentId = binding.environmentId;
+        const at = "2026-01-01T00:00:00.000Z";
+        const lifecycle = yield* ProjectLifecycle;
+        const contentGuard = yield* ContentGuard.ProjectWorkContentGuard;
+        const authorization = yield* TeamAuthorization.ProjectTeamAuthorization;
+        const dependencies = { sql, repository, contentGuard, authorization, environmentId };
+        const vector = Array.from({ length: 2048 }, () => 0.125);
+        const service = makeProjectMemoryService({
+          ...dependencies,
+          models: {
+            extract: () =>
+              Effect.succeed([
+                { key: "provenance", body: "Source provenance persists.", quote: "provenance" },
+                { key: "cleanup", body: "Cleanup requires receipts.", quote: "receipts" },
+              ]),
+            embed: ({ bodies }) => Effect.succeed(bodies.map(() => vector)),
+          },
+        });
+        const indexed = new Map<string, typeof MemoryIndexManifest.Type>();
+        const cleanupEntered = yield* Deferred.make<void>();
+        const releaseCleanup = yield* Deferred.make<void>();
+        const backend: MemoryBackend = {
+          health: () =>
+            Effect.succeed({
+              engine: "mem0",
+              engineVersion: "2.2.1",
+              qdrantVersion: "1.19.1",
+              embeddingDimensions: 2048,
+            }),
+          index: (_, manifest) =>
+            Effect.sync(() => {
+              indexed.set(manifest.extractionId, manifest);
+              return {
+                writtenObservationIds: manifest.observations.map((entry) => entry.observationId),
+              };
+            }),
+          reconcile: (_, manifest) =>
+            Effect.sync(() => {
+              const saved = indexed.get(manifest.extractionId);
+              const missingObservationIds = manifest.observations
+                .filter(
+                  (entry) =>
+                    !saved?.observations.some((item) => item.observationId === entry.observationId),
+                )
+                .map((entry) => entry.observationId);
+              return {
+                complete: missingObservationIds.length === 0,
+                missingObservationIds,
+                invalidObservationIds: [],
+                unexpectedBackendIds: [],
+              };
+            }),
+          search: (_, scope) =>
+            Effect.succeed({
+              candidates: [...indexed.values()]
+                .filter(
+                  (manifest) =>
+                    manifest.projectId === scope.projectId &&
+                    manifest.environmentId === scope.environmentId,
+                )
+                .flatMap((manifest) =>
+                  manifest.observations.map((observation) => ({
+                    environmentId: manifest.environmentId,
+                    projectId: manifest.projectId,
+                    sourceRecordId: manifest.sourceRecordId,
+                    sourceRevision: manifest.sourceRevision,
+                    sourceGeneration: manifest.sourceGeneration,
+                    extractionId: manifest.extractionId,
+                    observationId: observation.observationId,
+                    score: 1,
+                  })),
+                ),
+            }),
+          deleteSource: (_, source) =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(cleanupEntered, undefined);
+              yield* Deferred.await(releaseCleanup);
+              for (const [id, manifest] of indexed)
+                if (
+                  manifest.environmentId === source.environmentId &&
+                  manifest.projectId === source.projectId &&
+                  manifest.sourceRecordId === source.sourceRecordId
+                )
+                  indexed.delete(id);
+              return { cleanupComplete: true as const };
+            }),
+          deleteProject: () =>
+            Effect.die("Per-source receipts must cover cleanup without project-wide deletion"),
+        };
+        const reactor = makeProjectMemoryIndexReactor({
+          ...dependencies,
+          service,
+          backend,
+          outcomes: makeProjectMemoryOutcome(dependencies),
+        });
+        const capture = Effect.fn("lifecycle.test.capture")(function* (
+          ownerProjectId: ProjectId,
+          taskId: ProjectWorkTaskId,
+          id: string,
+        ) {
+          yield* repository.execute({
+            type: "project-work.comment.add",
+            commandId: CommandId.make(id),
+            projectId: ownerProjectId,
+            comment: {
+              commentId: ProjectWorkCommentId.make(id),
+              projectId: ownerProjectId,
+              taskId,
+              body: "Source provenance persists; cleanup requires receipts.",
+              revision: 0,
+              createdAt: at,
+            },
+            addedAt: at,
+            attribution: {
+              actor: { kind: "human", id: "memory-human" },
+              source: { kind: "web", id: "memory-panel" },
+              recordedAt: at,
+            },
+          });
+          const source = yield* service.captureRetained(ownerProjectId, {
+            kind: "comment",
+            retainedId: id,
+          });
+          const state = yield* readCurrentState(sql, ownerProjectId);
+          const effect = state.foundationRecords?.find(
+            (record) =>
+              record.kind === "effect" &&
+              record.effectKind === "memory-index" &&
+              record.targetId === source.recordId,
+          );
+          if (effect?.kind !== "effect") return yield* Effect.die("Missing index intent");
+          expect((yield* reactor.consume(ownerProjectId, effect.recordId)).status).toBe(
+            "reflected",
+          );
+          return source;
+        });
+        const sources = [
+          yield* capture(projectId, binding.taskId, "cleanup-first"),
+          yield* capture(projectId, binding.taskId, "cleanup-second"),
+        ];
+        const otherProjectId = ProjectId.make("unrelated-memory-project");
+        const otherTaskId = ProjectWorkTaskId.make("unrelated-memory-task");
+        yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (${otherProjectId},'Unrelated','/workspace/unrelated','[]',${at},${at})`;
+        yield* repository.execute({
+          type: "project-work.task.create",
+          commandId: CommandId.make("unrelated-task"),
+          projectId: otherProjectId,
+          taskId: otherTaskId,
+          title: "Unrelated task",
+          createdAt: at,
+        });
+        yield* capture(otherProjectId, otherTaskId, "unrelated-comment");
+        const search = (id: ProjectId) =>
+          backend.search("lifecycle-proof", { environmentId, projectId: id, vector, limit: 100 });
+        const originalHits = (yield* search(projectId)).candidates;
+        expect(originalHits).toHaveLength(4);
+        expect(
+          (yield* readProjectMemoryObservations(sql, projectId, "provenance receipts")).records,
+        ).toHaveLength(4);
+        const unrelatedSnapshot = Effect.gen(function* () {
+          return {
+            state: yield* readCurrentState(sql, otherProjectId),
+            project:
+              yield* sql`SELECT * FROM projection_projects WHERE project_id=${otherProjectId}`,
+            jobs: yield* sql`SELECT * FROM project_team_memory_job WHERE project_id=${otherProjectId} ORDER BY effect_id`,
+            manifests:
+              yield* sql`SELECT * FROM project_team_memory_manifest WHERE project_id=${otherProjectId} ORDER BY extraction_id`,
+            outcomes:
+              yield* sql`SELECT * FROM project_team_memory_outcome WHERE project_id=${otherProjectId} ORDER BY effect_id`,
+            hits: yield* search(otherProjectId),
+            retrieval: yield* readProjectMemoryObservations(
+              sql,
+              otherProjectId,
+              "provenance receipts",
+            ),
+          };
+        });
+        const unrelatedBefore = yield* unrelatedSnapshot;
+        expect(unrelatedBefore.retrieval.records).toHaveLength(2);
+        for (const source of sources) yield* service.retract(projectId, source.recordId);
+        const state = yield* readCurrentState(sql, projectId);
+        const deletes =
+          state.foundationRecords
+            ?.filter((record) => record.kind === "effect")
+            .filter((record) => record.effectKind === "memory-delete") ?? [];
+        expect(deletes).toHaveLength(2);
+        const deleteInput = {
+          projectId,
+          commandId: CommandId.make("delete-after-exact-memory-cleanup"),
+          workspaceRoot: "/workspace",
+          confirmation: "permanent-local-delete" as const,
+        };
+        const assertBlocked = Effect.gen(function* () {
+          const before = yield* readCurrentState(sql, projectId);
+          expect(yield* lifecycle.permanentDelete(deleteInput).pipe(Effect.result)).toMatchObject({
+            _tag: "Failure",
+            failure: { reason: "memory-cleanup-required" },
+          });
+          expect(yield* readCurrentState(sql, projectId)).toEqual(before);
+          expect((yield* lifecycle.get(projectId))?.state).toBe("active");
+          expect(
+            yield* sql`SELECT * FROM project_lifecycle_operations WHERE project_id=${projectId}`,
+          ).toEqual([]);
+        });
+        // Seed frozen historical operation authority, then persist each admission
+        // event and command receipt through the actual repository. No live runtime.
+        const allocation = {
+          version: 1,
+          unit: "cleanup-unit",
+          nonce: "cleanup-nonce",
+          policy: { memoryBytes: 16777216, runtimeSeconds: 1 },
+          launch: {
+            workspaceRoot: "/fixture/unexecuted",
+            workspace: { path: "/fixture/unexecuted", dev: 0, ino: 0 },
+            protectedRoots: [],
+            protectedWorkspaceEntries: [],
+            runtimeFiles: [],
+            argv: [],
+            memoryBytes: 16777216,
+            runtimeSeconds: 1,
+          },
+        };
+        const operation = {
+          version: 1,
+          environmentId,
+          projectId,
+          taskId: binding.taskId,
+          bindingId: binding.recordId,
+          generation: binding.generation,
+          providerInstanceId: binding.providerInstanceId,
+          threadId: binding.threadId,
+          operationId: "cleanup-operation",
+          workerId: "cleanup-worker",
+          ordinal: 0,
+          attemptId: binding.attemptId,
+          rootBindingId: binding.recordId,
+          rootTaskId: binding.taskId,
+          rootMaximumTokens: 1000,
+          rootDeadlineAtMs: 1000,
+          attemptMaximumTokens: binding.configuration.maxTokens,
+          attemptDeadlineAtMs: 1000,
+          operationMaximumTokens: 1000,
+          operationDeadlineAtMs: 1000,
+          leaseDeadlineAtMs: 1000,
+          roleSha256: projectMemoryHash(role),
+          configurationSha256: projectMemoryHash(binding.configuration),
+          requestSha256: "0".repeat(64),
+          allocation,
+        };
+        const intent = {
+          binding,
+          role,
+          allocation,
+          rootBudget: { rootTaskId: binding.taskId, maximumTokens: 1000, deadlineAtMs: 1000 },
+          operationLimits: { maximumTokens: 1000, deadlineAtMs: 1000 },
+        };
+        yield* sql`INSERT INTO project_team_pi_operation VALUES (${operation.operationId},${environmentId},${projectId},${binding.recordId},${binding.generation},${binding.providerInstanceId},${binding.threadId},${operation.workerId},0,'prompt',${operation.requestSha256},${binding.recordId},${binding.taskId},1000,1000,'settled',${canonicalProjectWorkPayload(intent)},NULL,NULL)`;
+        for (const effect of deletes) {
+          const source = (yield* readCurrentState(sql, projectId)).foundationRecords?.find(
+            (entry) => entry.recordId === effect.targetId,
+          );
+          if (source?.kind !== "memory-source") return yield* Effect.die("Missing cleanup source");
+          const current = yield* readCurrentState(sql, projectId);
+          const task = current.tasks.find((entry) => entry.taskId === binding.taskId)!;
+          const request = {
+            type: "project-team.memory.process",
+            commandId: `admit-${effect.recordId}`,
+            projectId,
+            taskId: binding.taskId,
+            expectedRevision: current.revision,
+            expectedTaskRevision: task.revision,
+            specRevision: task.specRevision,
+            planRevision: binding.planRevision,
+            selection: {
+              kind: "comment",
+              retainedId: source.sourceId,
+              retainedRevision: source.sourceRevision,
+              sourceRecordId: source.recordId,
+              expectedSourceRecordRevision: source.revision,
+              sourceRevision: source.sourceRevision,
+              sourceGeneration: source.generation,
+              contentHash: source.contentHash,
+              effectId: effect.recordId,
+              expectedEffectRevision: effect.revision,
+              expectedClaimGeneration: 0,
+            },
+          };
+          const attribution = {
+            actor: { kind: "agent", id: operation.workerId },
+            source: { kind: "mcp", id: operation.workerId },
+            recordedAt: at,
+          };
+          const fingerprint =
+            "project-team-intent:" +
+            NodeCrypto.createHash("sha256")
+              .update(
+                canonicalProjectWorkPayload({
+                  intent: request,
+                  actor: attribution.actor,
+                  source: attribution.source,
+                  managed: {
+                    projectId,
+                    bindingId: binding.recordId,
+                    generation: binding.generation,
+                    providerInstanceId: binding.providerInstanceId,
+                    threadId: binding.threadId,
+                  },
+                }),
+              )
+              .digest("hex");
+          const owner = yield* decodeMemoryOwner({
+            version: 1,
+            operation,
+            request,
+            selection: request.selection,
+            commandId: request.commandId,
+            intentFingerprint: fingerprint,
+            actorId: operation.workerId,
+            sourceKind: "mcp",
+            sourceId: operation.workerId,
+            admittedAt: at,
+            admittedEffect: { ...effect, revision: effect.revision + 1, updatedAt: at },
+          });
+          const command = yield* decodeCommitEffect({
+            type: "project-work.foundation.commit",
+            commandId: request.commandId,
+            projectId,
+            expectedRevision: current.revision,
+            attribution,
+            records: [owner.admittedEffect],
+            committedAt: at,
+          });
+          yield* repository.executeAuthorized(
+            command,
+            () => Effect.succeed(command),
+            undefined,
+            fingerprint,
+          );
+          yield* sql`UPDATE project_team_memory_job SET owner_json=${canonicalProjectWorkPayload(owner)} WHERE effect_id=${effect.recordId}`;
+        }
+        yield* assertBlocked;
+        const first = deletes[0]!;
+        const cleanup = yield* reactor.consume(projectId, first.recordId).pipe(Effect.forkChild);
+        yield* Deferred.await(cleanupEntered);
+        expect((yield* reactor.load(first.recordId))?.status).toBe("claimed");
+        expect((yield* search(projectId)).candidates).toEqual(originalHits);
+        yield* assertBlocked;
+        yield* Deferred.succeed(releaseCleanup, undefined);
+        expect((yield* Fiber.join(cleanup)).status).toBe("reflected");
+        expect((yield* search(projectId)).candidates).toHaveLength(2);
+        yield* assertBlocked;
+        expect((yield* reactor.consume(projectId, deletes[1]!.recordId)).status).toBe("reflected");
+        for (const effect of deletes) {
+          const proof = yield* sql.withTransaction(
+            readProjectMemoryCompletedDeletionInTransaction(sql, environmentId, effect.recordId),
+          );
+          expect(proof.receipt).toMatchObject({
+            kind: "delete-source-complete",
+            effectId: effect.recordId,
+            sourceId: effect.targetId,
+            observationIds: [],
+          });
+        }
+        expect((yield* search(projectId)).candidates).toEqual([]);
+        const deleted = yield* lifecycle.permanentDelete(deleteInput);
+        expect(deleted.project.state).toBe("tombstoned");
+        expect(yield* lifecycle.permanentDelete(deleteInput)).toEqual(deleted);
+        expect((yield* readCurrentState(sql, projectId)).foundationRecords).toEqual([]);
+        for (const table of [
+          ...PROJECT_TEAM_TABLES,
+          "project_work_search_fts",
+          "project_work_comments",
+          "project_work_events",
+        ])
+          expect(yield* sql`SELECT * FROM ${sql(table)} WHERE project_id=${projectId}`).toEqual([]);
+        expect(
+          (yield* readProjectMemoryObservations(sql, projectId, "provenance receipts")).records,
+        ).toEqual([]);
+        expect(
+          (yield* readProjectMemoryObservations(
+            sql,
+            projectId,
+            "provenance receipts",
+            originalHits.map((hit) => hit.observationId),
+          )).records,
+        ).toEqual([]);
+        expect(yield* unrelatedSnapshot).toEqual(unrelatedBefore);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          ProjectLifecycleLive.pipe(
+            Layer.provideMerge(ProjectWorkRepositoryLive),
+            Layer.provideMerge(ProjectWorkProjectionLive),
+            Layer.provideMerge(TeamAuthorization.layer),
+            Layer.provideMerge(ContentGuard.layer),
+            Layer.provideMerge(
+              Layer.succeed(ServerEnvironmentIdentity, {
+                getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
               }),
             ),
             Layer.provideMerge(NodeSqliteClient.layerMemory()),
