@@ -25,6 +25,7 @@ import { PiWorkerIdentity, PiWorkerOperation } from "./PiWorkerProtocol.ts";
 // Native descriptor operations below need nofollow flags and pinned directory handles,
 // which Effect FileSystem cannot expose. This fixed builtin is also available in SEA.
 const NodeFS = process.getBuiltinModule("fs");
+const NodeCrypto = process.getBuiltinModule("crypto");
 const NodeFSP = NodeFS.promises;
 const nativeStat = (source: string) => NodeFSP.lstat(source, { bigint: true });
 type BigIntStats = Awaited<ReturnType<typeof nativeStat>>;
@@ -297,6 +298,98 @@ async function inspectStage(
       throw invalid();
     return stat;
   });
+}
+
+async function validatePinnedDirectory(
+  directory: string,
+  handle: FileHandle,
+  expected: BigIntStats,
+) {
+  const pinned = await handle.stat({ bigint: true });
+  const entry = await nativeStat(directory);
+  if (
+    !pinned.isDirectory() ||
+    !sameIdentity(pinned, expected) ||
+    !sameIdentity(entry, expected) ||
+    (await NodeFSP.realpath(directory)) !== directory ||
+    (await NodeFSP.realpath(fdPath(handle))) !== directory
+  )
+    throw invalid();
+}
+
+async function inspectStageAt(
+  directory: string,
+  handle: FileHandle,
+  expected: BigIntStats,
+  names: ReadonlyArray<string>,
+) {
+  await validatePinnedDirectory(directory, handle, expected);
+  const stat = await handle.stat({ bigint: true });
+  if (!sameFile(stat, expected)) throw invalid();
+  const actual = (await readEntries(handle, names.length)).sort();
+  const sortedNames = [...names].sort();
+  if (actual.length !== sortedNames.length || actual.some((name, i) => name !== sortedNames[i]))
+    throw invalid();
+  await validatePinnedDirectory(directory, handle, expected);
+  return stat;
+}
+
+async function inspectFileAt(
+  directory: string,
+  handle: FileHandle,
+  source: string,
+  path: Path.Path,
+  expectedDirectory: BigIntStats,
+) {
+  if (path.dirname(source) !== directory) throw invalid();
+  await validatePinnedDirectory(directory, handle, expectedDirectory);
+  const stat = await nativeStat(fdPath(handle) + "/" + path.basename(source));
+  if (!stat.isFile() || stat.size < 0n || stat.size > BigInt(maxBytes) || stat.ino < 1n)
+    throw invalid();
+  await validatePinnedDirectory(directory, handle, expectedDirectory);
+  return stat;
+}
+
+async function readFileAt(
+  directory: string,
+  handle: FileHandle,
+  source: string,
+  expected: BigIntStats,
+  path: Path.Path,
+  expectedDirectory: BigIntStats,
+) {
+  if (path.dirname(source) !== directory) throw invalid();
+  await validatePinnedDirectory(directory, handle, expectedDirectory);
+  const entry = fdPath(handle) + "/" + path.basename(source);
+  const before = await NodeFSP.lstat(entry, { bigint: true });
+  if (!before.isFile() || !sameFile(before, expected) || before.size > BigInt(maxBytes))
+    throw invalid();
+  const file = await NodeFSP.open(entry, readFlags);
+  try {
+    if (
+      !sameFile(before, await file.stat({ bigint: true })) ||
+      (await NodeFSP.realpath(fdPath(file))) !== source
+    )
+      throw invalid();
+    const bytes = Buffer.alloc(Number(before.size) + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const read = await file.read(bytes, length, bytes.length - length, length);
+      if (read.bytesRead === 0) break;
+      length += read.bytesRead;
+    }
+    if (
+      length !== Number(before.size) ||
+      !sameFile(before, await file.stat({ bigint: true })) ||
+      !sameFile(before, await NodeFSP.lstat(entry, { bigint: true })) ||
+      (await NodeFSP.realpath(fdPath(file))) !== source
+    )
+      throw invalid();
+    await validatePinnedDirectory(directory, handle, expectedDirectory);
+    return bytes.subarray(0, length);
+  } finally {
+    await file.close();
+  }
 }
 
 function workerArgv(
@@ -613,31 +706,41 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
       }),
     );
     const revalidate = Effect.gen(function* () {
-      const current = yield* native(() =>
-        inspectStage(
-          value.stagingDirectory,
-          frozenStage,
-          copied.map((file) => file.name),
-        ),
+      yield* native(() =>
+        withDirectory(value.stagingDirectory, async (directory) => {
+          const names = copied.map((file) => file.name);
+          await inspectStageAt(value.stagingDirectory, directory, frozenStage, names);
+          for (const file of copied) {
+            const bytes = await readFileAt(
+              value.stagingDirectory,
+              directory,
+              file.source,
+              file.stat,
+              path,
+              frozenStage,
+            );
+            const digest = NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+            if (digest !== file.digest) throw invalid();
+          }
+          for (const file of copied) {
+            if (
+              !sameFile(
+                file.stat,
+                await inspectFileAt(
+                  value.stagingDirectory,
+                  directory,
+                  file.source,
+                  path,
+                  frozenStage,
+                ),
+              )
+            )
+              throw invalid();
+          }
+          const after = await inspectStageAt(value.stagingDirectory, directory, frozenStage, names);
+          if (!sameFile(after, frozenStage)) throw invalid();
+        }),
       );
-      if (!sameFile(current, frozenStage)) return yield* invalid();
-      for (const file of copied) {
-        const bytes = yield* native(() => readFile(file.source, file.stat, path));
-        const digest = Buffer.from(yield* crypto.digest("SHA-256", bytes)).toString("hex");
-        if (digest !== file.digest) return yield* invalid();
-      }
-      for (const file of copied) {
-        if (!sameFile(file.stat, yield* native(() => inspectFile(file.source, path))))
-          return yield* invalid();
-      }
-      const after = yield* native(() =>
-        inspectStage(
-          value.stagingDirectory,
-          frozenStage,
-          copied.map((file) => file.name),
-        ),
-      );
-      if (!sameFile(after, frozenStage)) return yield* invalid();
     }).pipe(Effect.mapError((cause) => (isAssetsError(cause) ? cause : invalid())));
     yield* revalidate;
     const runtimeFiles: PiManagedLaunch["runtimeFiles"] = Object.freeze(
