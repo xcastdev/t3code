@@ -73,7 +73,7 @@ const fixture = Effect.fn("fixture")(function* (runtimeSeconds = 30) {
     Effect.gen(function* () {
       if (command._tag !== "StandardCommand")
         return yield* Effect.die("Unexpected controlled command");
-      if (command.command === "/usr/bin/bwrap") return text("bubblewrap 0.12.0\n");
+      if (command.command === "/usr/bin/python3" && command.args[0] === "-c") return text("");
       if (command.command === "/usr/bin/systemd-run") {
         args = command.args;
         yield* Queue.offer(frames, Buffer.from(canonicalProjectWorkPayload(owner) + "\n"));

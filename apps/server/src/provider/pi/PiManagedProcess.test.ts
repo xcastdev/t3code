@@ -7,6 +7,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
 import * as Stream from "effect/Stream";
+import * as Sink from "effect/Sink";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
@@ -273,39 +274,64 @@ describe("managed runtime mount validation", () => {
 
 describe("managed bubblewrap compatibility", () => {
   for (const [label, response, code, accepted] of [
-    ["0.12.0", "bubblewrap 0.12.0\n", 0, true],
-    ["0.13.0", "bubblewrap 0.13.0\n", 0, true],
-    ["0.13.1", "bubblewrap 0.13.1\n", 0, true],
-    ["older version", "bubblewrap 0.11.0\n", 0, false],
-    ["unproven patch version", "bubblewrap 0.13.2\n", 0, false],
-    ["unproven newer version", "bubblewrap 0.14.0\n", 0, false],
-    ["modified version", "bubblewrap 0.13.0-custom\n", 0, false],
-    ["additional output", "bubblewrap 0.13.0\nforeign", 0, false],
-    ["nonzero status", "bubblewrap 0.13.0\n", 1, false],
+    ["capable unfamiliar release", "bubblewrap 9.99-custom\n", 0, true],
+    ["capable older release", "bubblewrap 0.11.0\n", 0, true],
+    ["missing FD-bind capability", "unknown option --bind-fd\n", 1, false],
+    ["nonzero status", "", 2, false],
+    ["timeout", "", -1, false],
   ] as const)
     check(`fences ${label} before native activation`, () =>
       Effect.scoped(
         Effect.gen(function* () {
           const allocation = yield* preallocatePiManagedProcess(input);
-          const original = yield* ChildProcessSpawner.ChildProcessSpawner;
           let claims = 0;
+          let probeCalls = 0;
           let unitLaunches = 0;
+          let probeClosed = false;
           const spawner = ChildProcessSpawner.make((command) => {
-            if (command._tag === "StandardCommand" && command.command === "/usr/bin/bwrap") {
-              expect(command.args).toEqual(["--version"]);
-              return original.spawn(
-                ChildProcess.make("/usr/bin/bash", [
-                  "-c",
-                  'printf "%s" "$1"; exit "$2"',
-                  "version-control",
-                  response,
-                  String(code),
-                ]),
-              );
+            if (command._tag === "StandardCommand" && command.command === "/usr/bin/python3") {
+              probeCalls++;
+              expect(command.args).toHaveLength(2);
+              expect(command.args[0]).toBe("-c");
+              for (const option of [
+                "--unshare-all",
+                "--die-with-parent",
+                "--new-session",
+                "--cap-drop",
+                "--ro-bind-fd",
+                "--bind-fd",
+                "--clearenv",
+                "--setenv",
+                "--remount-ro",
+                "/usr/bin/true",
+              ])
+                expect(command.args[1]).toContain(`"${option}"`);
+              expect(command.args[1]).not.toContain(input.workspaceRoot);
+              return Effect.gen(function* () {
+                yield* Effect.addFinalizer(() =>
+                  Effect.sync(() => {
+                    probeClosed = true;
+                  }),
+                );
+                return ChildProcessSpawner.makeHandle({
+                  pid: ChildProcessSpawner.ProcessId(100),
+                  exitCode:
+                    code === -1 ? Effect.never : Effect.succeed(ChildProcessSpawner.ExitCode(code)),
+                  isRunning: Effect.succeed(code === -1),
+                  kill: () => Effect.void,
+                  stdin: Sink.drain,
+                  stdout: Stream.make(Buffer.from(response)),
+                  stderr: Stream.empty,
+                  all: Stream.empty,
+                  getInputFd: () => Sink.drain,
+                  getOutputFd: () => Stream.empty,
+                  unref: Effect.succeed(Effect.void),
+                });
+              });
             }
             if (command._tag === "StandardCommand" && command.command === "/usr/bin/systemd-run")
               unitLaunches++;
-            return original.spawn(command);
+            return Effect.die("Unexpected native command");
           });
           const error = yield* acquirePiManagedProcess(input, {
             allocation,
@@ -315,20 +341,22 @@ describe("managed bubblewrap compatibility", () => {
               return Effect.fail(
                 new PiManagedProcessError({
                   phase: "startup",
-                  message: "Accepted version stopped before unit activation",
+                  message: "Accepted capabilities stopped before unit activation",
                 }),
               );
             },
-            beforeStart: () => Effect.die("Version control must not acquire a native owner"),
+            beforeStart: () => Effect.die("Capability control must not acquire a native owner"),
           }).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
             Effect.flip,
           );
           expect(error.phase).toBe(accepted ? "startup" : "unavailable");
           if (accepted)
-            expect(error.message).toBe("Accepted version stopped before unit activation");
+            expect(error.message).toBe("Accepted capabilities stopped before unit activation");
           expect(claims).toBe(accepted ? 1 : 0);
           expect(unitLaunches).toBe(0);
+          expect(probeCalls).toBe(1);
+          expect(probeClosed).toBe(true);
         }),
       ),
     );

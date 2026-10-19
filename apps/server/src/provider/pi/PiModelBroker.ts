@@ -12,6 +12,7 @@ import {
 import {
   decodePiSubscriptionEvent,
   decodePiSubscriptionRequest,
+  isPiSubscriptionCallId,
 } from "./PiSubscriptionProtocol.ts";
 
 import {
@@ -137,6 +138,60 @@ const Native = Schema.Struct({
   ).check(Schema.isMaxLength(1)),
   usage: Schema.optional(Schema.NullOr(Usage)),
 });
+// Subscription call identities are opaque; CommandCode retains its identifier grammar.
+const SubscriptionCallId = Schema.String.check(Schema.makeFilter(isPiSubscriptionCallId));
+const SubscriptionMessage = Schema.Union([
+  Message.members[0],
+  Schema.Struct({
+    ...Message.members[1].fields,
+    tool_calls: Schema.optional(
+      Schema.Array(Schema.Struct({ ...FunctionCall.fields, id: SubscriptionCallId })).check(
+        Schema.isMaxLength(32),
+      ),
+    ),
+  }),
+  Schema.Struct({ ...Message.members[2].fields, tool_call_id: SubscriptionCallId }),
+]);
+const decodeSubscriptionRequest = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      ...Request.fields,
+      messages: Schema.Array(SubscriptionMessage).check(
+        Schema.isMinLength(1),
+        Schema.isMaxLength(128),
+      ),
+    }),
+  ),
+  strict,
+);
+const SubscriptionDelta = Schema.Struct({
+  ...Delta.fields,
+  tool_calls: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        index: Integer,
+        id: Schema.optional(SubscriptionCallId),
+        type: Schema.optional(Schema.Literal("function")),
+        function: Schema.Struct({ name: Schema.optional(Name), arguments: Schema.optional(Text) }),
+      }),
+    ).check(Schema.isMaxLength(32)),
+  ),
+});
+const decodeSubscriptionNative = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      ...Native.fields,
+      choices: Schema.Array(
+        Schema.Struct({
+          index: Schema.Literal(0),
+          delta: SubscriptionDelta,
+          finish_reason: Schema.NullOr(Schema.Literals(["stop", "tool_calls", "length"])),
+        }),
+      ).check(Schema.isMaxLength(1)),
+    }),
+  ),
+  strict,
+);
 const decodeRequest = Schema.decodeSync(Schema.fromJsonString(Request), strict);
 const decodeNative = Schema.decodeSync(Schema.fromJsonString(Native), strict);
 const encodeNative = Schema.encodeSync(Schema.fromJsonString(Native));
@@ -194,6 +249,7 @@ export type PiModelBrokerErrorCode =
   | "SSE_OUTPUT_LIMIT"
   | "SSE_PRELIMINARY_INVALID"
   | "SSE_TOOL_INVALID"
+  | "SSE_UPSTREAM_ERROR"
   | "SSE_USAGE_INVALID"
   | "SSE_USAGE_OVER_RESERVATION"
   | "TRANSPORT_DRAIN_FAILED"
@@ -415,7 +471,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         fail("REQUEST_BYTE_LIMIT");
       if (subscription) {
         const adapted = decodePiSubscriptionRequest(operation.body, cfg.model);
-        parsed = decodeRequest(adapted.normalizedBody);
+        parsed = decodeSubscriptionRequest(adapted.normalizedBody);
         // Opaque reasoning stays in the transport envelope, outside the normalized text input.
         inputBudgetBody = adapted.normalizedBody;
         outboundBody = adapted.canonicalBody;
@@ -660,7 +716,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       }
       if (!reader) fail("TRANSPORT_RESPONSE_BODY_MISSING");
       const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
-      if (contentType !== "text/event-stream") {
+      if (contentType !== "text/event-stream" && (!subscription || !contentType)) {
         // Retain fixed categories so failed requests can be diagnosed without provider headers/bodies.
         if (!contentType) {
           if (!subscription) fail("TRANSPORT_RESPONSE_CONTENT_TYPE_MISSING");
@@ -747,7 +803,9 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       let outputBytes = 0;
       let frameCount = 0;
       let subscriptionEvent = "";
-      let subscriptionEventLine = "";
+      let subscriptionData: string[] = [];
+      let subscriptionFrameBytes = 0;
+      let upstreamFailed = false;
       let subscriptionResponseId: string | undefined;
       let subscriptionStarted = false;
       const enqueue = (bytes: Uint8Array, semanticBytes: number) => {
@@ -786,41 +844,21 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       };
       const line = Buffer.alloc(subscription ? PI_WORKER_MAX_RESPONSE_BYTES : 65_536);
       let length = 0;
-      const consume = async (bytes: Uint8Array) => {
-        const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r?\n$/, "");
-        if (text === "") return;
-        if (++frameCount > 16_384) fail("SSE_FRAME_INVALID");
-        if (subscription && text.startsWith(":")) return;
-        if (done) fail("SSE_FRAME_INVALID");
-        if (subscription && text.startsWith("event:")) {
-          if (subscriptionEvent) fail("SSE_FRAME_INVALID");
-          subscriptionEvent = text.slice(6).replace(/^ /, "");
-          subscriptionEventLine = text + "\n";
-          if (!/^[a-z][a-z0-9_.]{1,80}$/.test(subscriptionEvent)) fail("SSE_FRAME_INVALID");
-          return;
-        }
-        if (!text.startsWith(subscription ? "data:" : "data: ")) fail("SSE_FRAME_INVALID");
-        const data = subscription ? text.slice(5).replace(/^ /, "") : text.slice(6);
+      const consumeData = async (data: string, bytes: Uint8Array) => {
         if (data === "[DONE]") {
-          if (subscription) fail("SSE_ACCOUNTING_REQUIRED");
+          if (subscription) return;
           if (!usage || !contentSeen || !finishSeen) fail("SSE_ACCOUNTING_REQUIRED");
           done = true;
           enqueue(Buffer.from("data: [DONE]\n\n"), 0);
           return;
         }
-        if (usage) fail("SSE_AFTER_ACCOUNTING");
+        if (!subscription && usage) fail("SSE_AFTER_ACCOUNTING");
+        let normalizedFrame = "";
+        let terminalFailure = false;
         let native: typeof Native.Type;
         try {
           if (subscription) {
             const responsePayload: unknown = JSON.parse(data);
-            if (
-              !subscriptionEvent &&
-              responsePayload !== null &&
-              typeof responsePayload === "object" &&
-              "type" in responsePayload &&
-              typeof responsePayload.type === "string"
-            )
-              subscriptionEvent = responsePayload.type;
             const scanValue = (value: unknown): void => {
               if (typeof value === "string") {
                 if (
@@ -830,14 +868,45 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
                 )
                   fail("CREDENTIAL_ECHO_REJECTED");
               } else if (Array.isArray(value)) value.forEach(scanValue);
-              else if (value && typeof value === "object") Object.values(value).forEach(scanValue);
+              else if (value && typeof value === "object")
+                for (const [key, entry] of Object.entries(value)) {
+                  scanValue(key);
+                  scanValue(entry);
+                }
             };
             scanValue(responsePayload);
+            if (done) return;
+            if (
+              responsePayload === null ||
+              typeof responsePayload !== "object" ||
+              !("type" in responsePayload) ||
+              typeof responsePayload.type !== "string"
+            )
+              fail("SSE_FRAME_INVALID");
+            subscriptionEvent = responsePayload.type;
+            const scanToolNames = (value: unknown): void => {
+              if (Array.isArray(value)) value.forEach(scanToolNames);
+              else if (value && typeof value === "object") {
+                if (
+                  "type" in value &&
+                  value.type === "function_call" &&
+                  (!("name" in value) ||
+                    typeof value.name !== "string" ||
+                    !advertised.has(value.name))
+                )
+                  fail("SSE_TOOL_INVALID");
+                Object.values(value).forEach(scanToolNames);
+              }
+            };
+            scanToolNames(responsePayload);
+            normalizedFrame = `event: ${subscriptionEvent}\ndata: ${JSON.stringify(responsePayload)}\n\n`;
             const adapted = decodePiSubscriptionEvent(
               subscriptionEvent,
               responsePayload,
               cfg.model,
             );
+            if (!adapted) return;
+            terminalFailure = adapted.failed === true;
             for (const name of adapted.toolNames ?? [])
               if (!advertised.has(name)) fail("SSE_TOOL_INVALID");
             const item = adapted.toolItem;
@@ -906,27 +975,29 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
                 prior.argumentsDone = true;
               } else {
                 prior.hasArgumentDelta = true;
+                if (
+                  Buffer.byteLength(prior.arguments) + Buffer.byteLength(argument.arguments) >
+                  PI_WORKER_MAX_TEXT_PART_BYTES
+                )
+                  fail("SSE_TOOL_INVALID");
                 prior.arguments += argument.arguments;
               }
             }
             if (adapted.terminal) {
-              const calls = adapted.toolCalls ?? [];
-              if (calls.length !== subscriptionCalls.size) fail("SSE_TOOL_INVALID");
-              const seen = new Set<number>();
-              for (const call of calls) {
-                const prior = subscriptionCalls.get(call.index);
+              for (const call of adapted.toolCalls ?? []) {
                 if (
-                  !prior ||
-                  !prior.finalized ||
-                  seen.has(call.index) ||
-                  prior.name !== call.name ||
-                  prior.callId !== call.callId ||
-                  prior.itemId !== call.itemId ||
-                  prior.arguments !== call.arguments
+                  !isPiSubscriptionCallId(call.callId) ||
+                  Buffer.byteLength(call.arguments) > PI_WORKER_MAX_TEXT_PART_BYTES
                 )
                   fail("SSE_TOOL_INVALID");
-                seen.add(call.index);
+                try {
+                  decodeArguments(call.arguments);
+                } catch {
+                  fail("SSE_TOOL_INVALID");
+                }
               }
+              if ([...subscriptionCalls.values()].some((call) => !call.finalized))
+                fail("SSE_TOOL_INVALID");
             }
             if (
               subscriptionEvent === "response.created" ||
@@ -938,7 +1009,12 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
                 fail("SSE_MODEL_REJECTED");
               subscriptionResponseId = adapted.responseId;
             }
-            native = decodeNative(
+            if (terminalFailure && !adapted.usage) {
+              upstreamFailed = true;
+              done = true;
+              return;
+            }
+            native = decodeSubscriptionNative(
               JSON.stringify({
                 ...adapted.chunk,
                 ...(adapted.usage === undefined ? {} : { usage: adapted.usage }),
@@ -994,7 +1070,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         if (accountSecret.length > 0)
           semanticAccountTail = scanSecret(semanticAccountTail, semantic, accountSecret);
         // Decode JSON escapes before checking arbitrary strings too, without retaining diagnostics.
-        const nativeText = encodeNative(native);
+        const nativeText = subscription ? JSON.stringify(native) : encodeNative(native);
         if (
           nativeText.includes(credential) ||
           nativeText.includes(encodeJson(credential).slice(1, -1))
@@ -1067,24 +1143,36 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
           }
         }
         if (subscription) {
-          // SSE payload is a string; these checks search for credential substrings.
-          // oxlint-disable-next-line unicorn/prefer-set-has
-          const rawPayload = text.slice(6);
-          if (
-            rawPayload.includes(credential) ||
-            rawPayload.includes(encodeJson(credential).slice(1, -1)) ||
-            (subscriptionAccountId && rawPayload.includes(subscriptionAccountId))
-          )
-            fail("CREDENTIAL_ECHO_REJECTED");
-          enqueue(Buffer.from(`${subscriptionEventLine}${text}\n\n`), semantic.length);
-          subscriptionEvent = "";
-          subscriptionEventLine = "";
+          if (terminalFailure) upstreamFailed = true;
+          else enqueue(Buffer.from(normalizedFrame), semantic.length);
         } else {
           enqueue(bytes, semantic.length);
           enqueue(Buffer.from("\n"), 0);
         }
         if (subscription && finishSeen && usage) done = true;
         await flush(false);
+      };
+      // Retain one bounded SSE frame; only the blank delimiter dispatches its joined data.
+      const consume = async (bytes: Uint8Array) => {
+        const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r?\n$/, "");
+        if (subscription) {
+          if (text === "") {
+            const data = subscriptionData.join("\n");
+            const hasData = subscriptionData.length > 0;
+            subscriptionData = [];
+            subscriptionFrameBytes = 0;
+            if (hasData) await consumeData(data, bytes);
+            return;
+          }
+          if (++frameCount > 16_384) fail("SSE_FRAME_INVALID");
+          subscriptionFrameBytes += bytes.length;
+          if (subscriptionFrameBytes > PI_WORKER_MAX_RESPONSE_BYTES) fail("SSE_FRAME_BYTE_LIMIT");
+          if (text.startsWith("data:")) subscriptionData.push(text.slice(5).replace(/^ /, ""));
+          return;
+        }
+        if (text === "") return;
+        if (++frameCount > 16_384 || done || !text.startsWith("data: ")) fail("SSE_FRAME_INVALID");
+        await consumeData(text.slice(6), bytes);
       };
       while (true) {
         check();
@@ -1122,7 +1210,15 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         }
         if (read.done) break;
       }
-      if (length !== 0 || !done || !usage || !reportedModel) fail("SSE_ACCOUNTING_REQUIRED");
+      if (subscription && done) {
+        // Even an unterminated trailing frame is scanned after completion; it cannot replace accounting.
+        if (length > 0) await consume(line.subarray(0, length));
+        if (subscriptionData.length > 0)
+          await consumeData(subscriptionData.join("\n"), Buffer.alloc(0));
+      }
+      if (upstreamFailed) fail("SSE_UPSTREAM_ERROR");
+      if ((!subscription && length !== 0) || !done || !usage || !reportedModel)
+        fail("SSE_ACCOUNTING_REQUIRED");
       await flush(true);
     } catch (error) {
       controller.abort();

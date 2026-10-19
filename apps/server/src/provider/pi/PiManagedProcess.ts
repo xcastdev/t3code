@@ -703,17 +703,33 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
   const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const { control, managerEnv } = yield* makeManagedControl();
-  const version = yield* control("/usr/bin/bwrap", ["--version"]);
-  const release = version.stdout.trim();
-  if (
-    version.code !== 0 ||
-    (release !== "bubblewrap 0.12.0" &&
-      release !== "bubblewrap 0.13.0" &&
-      release !== "bubblewrap 0.13.1")
-  )
+  // Fixed no-op exercises the actual launch options, independent of release labels.
+  // Private scratch is the only writable host bind; the inherited root is read-only.
+  const capability = yield* control("/usr/bin/python3", [
+    "-c",
+    `import os, subprocess, sys, tempfile
+with tempfile.TemporaryDirectory(prefix="t3-bwrap-probe-") as scratch:
+    root = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    writable = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        sys.exit(subprocess.call(["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv", "--ro-bind-fd", str(root), "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind-fd", str(writable), "/tmp/probe", "--ro-bind-fd", str(writable), "/tmp/probe-readonly", "--setenv", "HOME", "/tmp/probe", "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "LANG", "C.UTF-8", "--remount-ro", "/", "--chdir", "/tmp/probe", "--", "/usr/bin/true"], pass_fds=(root, writable), env={}))
+    finally:
+        os.close(writable)
+        os.close(root)
+`,
+  ]).pipe(
+    Effect.mapError(
+      () =>
+        new PiManagedProcessError({
+          phase: "unavailable",
+          message: "Managed bubblewrap capabilities are unavailable or unconfirmed.",
+        }),
+    ),
+  );
+  if (capability.code !== 0)
     return yield* fail(
       "unavailable",
-      "Managed execution requires bubblewrap 0.12.0, 0.13.0 or 0.13.1.",
+      "Managed bubblewrap capabilities are unavailable or unconfirmed.",
     );
   const helper = yield* path
     .fromFileUrl(new URL("./pi-managed-process-owner.py", import.meta.url))

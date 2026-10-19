@@ -18,6 +18,11 @@ const only = (value: Record<string, unknown>, keys: readonly string[]) =>
   Object.keys(value).every((key) => keys.includes(key));
 const text = (value: unknown): value is string =>
   typeof value === "string" && Buffer.byteLength(value) <= 12_288;
+export const isPiSubscriptionCallId = (value: unknown): value is string =>
+  typeof value === "string" &&
+  Buffer.byteLength(value) > 0 &&
+  Buffer.byteLength(value) <= 128 &&
+  !/[\s\p{Cc}\p{Cf}]/u.test(value);
 const functionCallFields = [
   "id",
   "type",
@@ -232,9 +237,10 @@ export function decodePiSubscriptionRequest(body: string, model: string): PiSubs
       messages.push({ role: item.role, content });
     } else if (item.type === "function_call") {
       if (
-        !only(item, ["type", "name", "call_id", "id", "arguments"]) ||
+        !only(item, ["type", "name", "call_id", "id", "arguments", "namespace"]) ||
+        !validFunctionCallMetadata(item) ||
         !text(item.name) ||
-        !text(item.call_id) ||
+        !isPiSubscriptionCallId(item.call_id) ||
         !text(item.arguments)
       )
         throw new Error("REQUEST_INVALID");
@@ -258,7 +264,7 @@ export function decodePiSubscriptionRequest(body: string, model: string): PiSubs
     } else if (item.type === "function_call_output") {
       if (
         !only(item, ["type", "call_id", "output"]) ||
-        !text(item.call_id) ||
+        !isPiSubscriptionCallId(item.call_id) ||
         !(text(item.output) || isRecord(item.output) || Array.isArray(item.output))
       )
         throw new Error("REQUEST_INVALID");
@@ -336,6 +342,7 @@ export interface PiSubscriptionEvent {
   readonly responseId?: string;
   readonly model?: string;
   readonly terminal?: boolean;
+  readonly failed?: boolean;
   readonly usage?: {
     readonly prompt_tokens: number;
     readonly completion_tokens: number;
@@ -369,42 +376,51 @@ export interface PiSubscriptionEvent {
   }[];
 }
 
+const subscriptionEventTypes = new Set([
+  "error",
+  "response.failed",
+  "response.metadata",
+  "response.created",
+  "response.in_progress",
+  "response.completed",
+  "response.done",
+  "response.incomplete",
+  "response.output_item.added",
+  "response.output_text.delta",
+  "response.refusal.delta",
+  "response.reasoning_summary_text.delta",
+  "response.reasoning_text.delta",
+  "response.function_call_arguments.delta",
+  "response.output_text.done",
+  "response.refusal.done",
+  "response.reasoning_summary_text.done",
+  "response.reasoning_text.done",
+  "response.reasoning_summary_part.added",
+  "response.reasoning_summary_part.done",
+  "response.function_call_arguments.done",
+  "response.output_item.done",
+  "response.content_part.added",
+  "response.content_part.done",
+]);
+
 export function decodePiSubscriptionEvent(
   eventType: string,
   payload: unknown,
   expectedModel: string,
-): PiSubscriptionEvent {
+): PiSubscriptionEvent | undefined {
   if (
     !isRecord(payload) ||
-    !only(
-      payload,
-      eventType === "response.metadata"
-        ? ["type", "sequence_number", "response_id", "metadata"]
-        : [
-            "type",
-            "sequence_number",
-            "response",
-            "item_id",
-            "output_index",
-            "content_index",
-            "summary_index",
-            "delta",
-            "item",
-            "arguments",
-            "text",
-            "content_part",
-            "part",
-            "logprobs",
-            "obfuscation",
-          ],
-    ) ||
     payload.type !== eventType ||
-    (payload.obfuscation !== undefined &&
-      (!eventType.endsWith(".delta") || !text(payload.obfuscation))) ||
     (payload.sequence_number !== undefined &&
       (!Number.isSafeInteger(payload.sequence_number) || Number(payload.sequence_number) < 0))
   )
     throw new Error("SSE_FRAME_INVALID");
+  if (
+    payload.obfuscation !== undefined &&
+    (!eventType.endsWith(".delta") || !text(payload.obfuscation))
+  )
+    throw new Error("SSE_FRAME_INVALID");
+  if (!subscriptionEventTypes.has(eventType)) return undefined;
   if (eventType === "response.metadata") {
     if (
       !text(payload.response_id) ||
@@ -485,7 +501,7 @@ export function decodePiSubscriptionEvent(
       !validFunctionCallMetadata(item) ||
       item.type !== "function_call" ||
       !text(item.name) ||
-      !text(item.call_id) ||
+      !isPiSubscriptionCallId(item.call_id) ||
       !Number.isSafeInteger(payload.output_index) ||
       (item.id !== undefined && !text(item.id)) ||
       (item.status !== undefined &&
@@ -543,20 +559,32 @@ export function decodePiSubscriptionEvent(
   if (
     eventType === "response.completed" ||
     eventType === "response.done" ||
-    eventType === "response.incomplete"
+    eventType === "response.incomplete" ||
+    eventType === "response.failed" ||
+    eventType === "error"
   ) {
+    const failed = eventType === "response.failed" || eventType === "error";
     const response = payload.response;
+    if (eventType === "error" && response === undefined)
+      return {
+        failed: true,
+        terminal: true,
+        semanticText: "",
+        chunk: { model: expectedModel, choices: [] },
+      };
     if (!isRecord(response) || !text(response.id)) throw new Error("SSE_ACCOUNTING_REQUIRED");
     if (response.model !== expectedModel) throw new Error("SSE_MODEL_REJECTED");
     if (
       (eventType === "response.done"
         ? response.status !== "completed" && response.status !== "incomplete"
-        : response.status !== (eventType === "response.incomplete" ? "incomplete" : "completed")) ||
-      !isRecord(response.usage) ||
-      !Array.isArray(response.output)
+        : response.status !==
+          (failed ? "failed" : eventType === "response.incomplete" ? "incomplete" : "completed")) ||
+      (!Array.isArray(response.output) && !(failed && response.output === undefined))
     )
       throw new Error("SSE_ACCOUNTING_REQUIRED");
-    for (const item of response.output) {
+    const output = Array.isArray(response.output) ? response.output : [];
+    if (output.length > 128) throw new Error("SSE_TOOL_INVALID");
+    for (const item of output) {
       if (!isRecord(item) || !["message", "function_call", "reasoning"].includes(String(item.type)))
         throw new Error("SSE_FRAME_INVALID");
       if (item.type === "function_call") {
@@ -564,7 +592,7 @@ export function decodePiSubscriptionEvent(
           !only(item, functionCallFields) ||
           !validFunctionCallMetadata(item) ||
           !text(item.name) ||
-          !text(item.call_id) ||
+          !isPiSubscriptionCallId(item.call_id) ||
           !text(item.arguments) ||
           (item.id !== undefined && !text(item.id)) ||
           (item.status !== undefined &&
@@ -572,7 +600,7 @@ export function decodePiSubscriptionEvent(
         )
           throw new Error("SSE_TOOL_INVALID");
         try {
-          Json(JSON.stringify(JSON.parse(item.arguments)));
+          if (!isJsonObject(JSON.parse(item.arguments))) throw new Error("SSE_TOOL_INVALID");
         } catch {
           throw new Error("SSE_TOOL_INVALID");
         }
@@ -582,21 +610,13 @@ export function decodePiSubscriptionEvent(
       if (item.type === "reasoning" && !validReasoningItem(item))
         throw new Error("SSE_FRAME_INVALID");
     }
-    const u = response.usage;
-    if (
-      !isRecord(u) ||
-      ![u.input_tokens, u.output_tokens, u.total_tokens].every(
-        (n) => Number.isSafeInteger(n) && Number(n) >= 0,
-      )
-    )
-      throw new Error("SSE_USAGE_INVALID");
     const toolCalls: NonNullable<PiSubscriptionEvent["toolCalls"]>[number][] = [];
-    for (const [index, item] of response.output.entries()) {
+    for (const [index, item] of output.entries()) {
       if (
         isRecord(item) &&
         item.type === "function_call" &&
         text(item.name) &&
-        text(item.call_id) &&
+        isPiSubscriptionCallId(item.call_id) &&
         text(item.arguments)
       ) {
         toolCalls.push({
@@ -608,12 +628,48 @@ export function decodePiSubscriptionEvent(
         });
       }
     }
+    if (toolCalls.length > 32) throw new Error("SSE_TOOL_INVALID");
+    if (failed && response.usage === undefined)
+      return {
+        responseId: response.id,
+        model: response.model,
+        failed: true,
+        terminal: true,
+        toolNames: toolCalls.map((call) => call.name),
+        toolCalls,
+        semanticText: "",
+        chunk: { model: expectedModel, choices: [] },
+      };
+    const u = response.usage;
+    if (
+      !isRecord(u) ||
+      ![u.input_tokens, u.output_tokens, u.total_tokens].every(
+        (n) => Number.isSafeInteger(n) && Number(n) >= 0,
+      )
+    )
+      throw new Error("SSE_USAGE_INVALID");
+    for (const [details, key, limit] of [
+      [u.input_tokens_details, "cached_tokens", u.input_tokens],
+      [u.output_tokens_details, "reasoning_tokens", u.output_tokens],
+    ] as const) {
+      if (
+        details !== undefined &&
+        details !== null &&
+        (!isRecord(details) ||
+          (details[key] !== undefined &&
+            (!Number.isSafeInteger(details[key]) ||
+              Number(details[key]) < 0 ||
+              Number(details[key]) > Number(limit))))
+      )
+        throw new Error("SSE_USAGE_INVALID");
+    }
     const inputDetails = isRecord(u.input_tokens_details) ? u.input_tokens_details : undefined;
     const outputDetails = isRecord(u.output_tokens_details) ? u.output_tokens_details : undefined;
     return {
       responseId: response.id,
       model: response.model,
       terminal: true,
+      failed,
       toolNames: toolCalls.map((call) => call.name),
       toolCalls,
       usage: {
@@ -646,6 +702,7 @@ export function decodePiSubscriptionEvent(
   if (
     [
       "response.output_text.done",
+      "response.refusal.done",
       "response.reasoning_summary_text.done",
       "response.reasoning_text.done",
       "response.reasoning_summary_part.added",
@@ -699,8 +756,11 @@ export function decodePiSubscriptionEvent(
         semanticText: payload.arguments,
       };
     }
+    if (eventType === "response.refusal.done" && !modelText(payload.refusal))
+      throw new Error("SSE_FRAME_INVALID");
     if (
       eventType.endsWith(".done") &&
+      eventType !== "response.refusal.done" &&
       eventType !== "response.output_item.done" &&
       eventType !== "response.content_part.done" &&
       eventType !== "response.function_call_arguments.done" &&
@@ -729,7 +789,7 @@ export function decodePiSubscriptionEvent(
         (!only(payload.item, functionCallFields) ||
           !validFunctionCallMetadata(payload.item) ||
           !text(payload.item.name) ||
-          !text(payload.item.call_id) ||
+          !isPiSubscriptionCallId(payload.item.call_id) ||
           !text(payload.item.arguments) ||
           (payload.item.id !== undefined && !text(payload.item.id)))
       )
@@ -738,7 +798,7 @@ export function decodePiSubscriptionEvent(
         if (
           !Number.isSafeInteger(payload.output_index) ||
           !text(payload.item.name) ||
-          !text(payload.item.call_id) ||
+          !isPiSubscriptionCallId(payload.item.call_id) ||
           !text(payload.item.arguments) ||
           (payload.item.status !== undefined &&
             !["in_progress", "completed", "incomplete"].includes(String(payload.item.status)))

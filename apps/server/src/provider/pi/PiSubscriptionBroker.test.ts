@@ -224,22 +224,19 @@ describe("Pi OpenAI subscription broker", () => {
   );
 
   it.each([
-    ["unsupported field", "retry: 1000\n"],
+    ["control fields", "retry: 1000\nid: ignored\n" + success()],
     [
       "semantic frame after terminal usage",
       `${success()}: keepalive after terminal\ndata: {"type":"response.output_text.delta","delta":"late"}\n\n`,
     ],
-  ] as const)("continues rejecting subscription %s around comments", async (_name, stream) => {
+  ] as const)("ignores subscription %s around comments", async (_name, stream) => {
     const f = fixture({
       transport: async () =>
         new Response(stream, { headers: { "content-type": "text/event-stream" } }),
     });
-
-    await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_FRAME_INVALID" });
+    await f.invoke();
     expect(Buffer.concat(f.chunks).toString()).not.toContain("late");
-    expect(f.settlements).toMatchObject([
-      { outcome: _name === "semantic frame after terminal usage" ? "failed" : "unknown" },
-    ]);
+    expect(f.settlements).toMatchObject([{ outcome: "reported" }]);
   });
 
   it("retains the existing subscription response byte limit for an oversized comment line", async () => {
@@ -464,7 +461,8 @@ describe("Pi OpenAI subscription broker", () => {
       mutation === "valid" ||
       mutation === "sdk-metadata" ||
       mutation === "sdk-null-caller" ||
-      mutation === "response-metadata"
+      mutation === "response-metadata" ||
+      mutation === "missing-terminal"
     ) {
       expect(brokerFailure).toBeUndefined();
       expect(result.stopReason).toBe("toolUse");
@@ -536,7 +534,6 @@ describe("Pi OpenAI subscription broker", () => {
     ["array metadata", { metadata: [] }, "SSE_FRAME_INVALID"],
     ["text metadata", { metadata: "annotation" }, "SSE_FRAME_INVALID"],
     ["negative sequence", { sequence_number: -1 }, "SSE_FRAME_INVALID"],
-    ["extra field", { unexpected: true }, "SSE_FRAME_INVALID"],
     ["credential echo", { metadata: { annotation: credential } }, "CREDENTIAL_ECHO_REJECTED"],
     ["account echo", { metadata: { annotation: accountId } }, "CREDENTIAL_ECHO_REJECTED"],
   ] as const)("rejects response metadata with %s", async (_label, fields, code) => {
@@ -1766,8 +1763,9 @@ describe("Pi OpenAI subscription broker", () => {
         },
         {
           type: "toolCall",
-          id: "lookup-call|fc_lookup",
+          id: "lookup.call:1/2+3=4|fc_lookup",
           name: "lookup",
+          namespace: "fixture",
           arguments: { key: "answer" },
         },
         {
@@ -1788,7 +1786,7 @@ describe("Pi OpenAI subscription broker", () => {
           assistant,
           {
             role: "toolResult",
-            toolCallId: "lookup-call|fc_lookup",
+            toolCallId: "lookup.call:1/2+3=4|fc_lookup",
             toolName: "lookup",
             content: [{ type: "text", text: "value=42" }],
             isError: false,
@@ -1830,13 +1828,14 @@ describe("Pi OpenAI subscription broker", () => {
     expect(serializedInput).toContainEqual({
       type: "function_call",
       id: "fc_lookup",
-      call_id: "lookup-call",
+      call_id: "lookup.call:1/2+3=4",
       name: "lookup",
+      namespace: "fixture",
       arguments: '{"key":"answer"}',
     });
     expect(serializedInput).toContainEqual({
       type: "function_call_output",
-      call_id: "lookup-call",
+      call_id: "lookup.call:1/2+3=4",
       output: "value=42",
     });
   });
@@ -2337,20 +2336,16 @@ it.each([
   },
 );
 
-it("continues to reject a nonempty wrong MIME type", async () => {
-  const f = prefixFixture({
-    transport: async () => new Response(success(), { headers: { "content-type": "text/plain" } }),
-  });
-  await expect(f.invoke()).rejects.toMatchObject({ code: "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT" });
-  expect(f.chunks).toHaveLength(0);
-  expect(f.settlements).toMatchObject([
-    {
-      failureCode: "TRANSPORT_RESPONSE_CONTENT_TYPE_TEXT",
-      outcome: "unknown",
-      transportDrained: true,
-    },
-  ]);
-});
+it.each(["text/plain", "application/json", "text/html", "application/octet-stream"])(
+  "accepts valid subscription SSE with wrong MIME %s",
+  async (mime) => {
+    const f = prefixFixture({
+      transport: async () => new Response(success(), { headers: { "content-type": mime } }),
+    });
+    await f.invoke();
+    expect(f.settlements).toMatchObject([{ outcome: "reported", transportDrained: true }]);
+  },
+);
 
 it.each(missingMimePrefixes)(
   "retains only the bounded missing-MIME %s prefix category",
@@ -2429,7 +2424,7 @@ it("retains the fixed diagnostic when the initial missing-MIME body read fails",
 
 it.each([
   ["malformed UTF-8", new Uint8Array([0xff, 0xfe]), "SSE_ACCOUNTING_REQUIRED"],
-  ["whitespace only", new TextEncoder().encode(" \n\t"), "SSE_FRAME_INVALID"],
+  ["whitespace only", new TextEncoder().encode(" \n\t"), "SSE_ACCOUNTING_REQUIRED"],
   ["malformed data marker", new TextEncoder().encode("data: {"), "SSE_ACCOUNTING_REQUIRED"],
   ["fragmented data marker", new TextEncoder().encode("da"), "SSE_ACCOUNTING_REQUIRED"],
   ["incomplete HTML marker", new TextEncoder().encode("<!doctype htm"), "SSE_ACCOUNTING_REQUIRED"],

@@ -1,76 +1,56 @@
 # Synthetic subscription SSE replay fixtures
 
-Every stream in `streams.ts` is synthetic. These are protocol probes, not raw provider
-captures. No reusable historical SSE bytes were found in the retained fixture 18–25
+Every stream in `streams.ts` is synthetic. These are protocol probes, not provider
+captures. No reusable historical SSE bytes were found in retained fixture 18–25
 homes; their summaries and database records cannot establish capture provenance.
-The older subscription broker test streams are synthetic too.
 
-`PiSubscriptionReplay.test.ts` injects fetch into the installed, pinned
+`PiSubscriptionReplay.test.ts` injects fetch into the pinned
 `@earendil-works/pi-ai@0.99.1` Codex Responses SDK (OpenAI dependency `7.19.0`).
-Each broker replay passes the SDK-generated request to the existing broker and feeds
-its forwarded bytes back into the SDK. No network, provider CLI, server, or model
-is used. Responses are rebuilt for every invocation; fragmentation is deterministic,
-including one-byte reads through emoji and line boundaries. Completion waits for
-both the SDK and broker, including settlement and transport drain.
+Broker replays pass the SDK-generated request to the broker and feed validated
+bytes back into that SDK. No network, provider CLI, server or model is used.
+Fragmentation is deterministic, including single-byte UTF-8 and line boundaries.
+Completion joins the SDK, broker, settlement and transport cleanup.
 
-The shared `PiSubscriptionTestKit.ts` extracts the original event/success/model and
-broker fixture without changing their defaults, returned handles, or accounting.
-The existing 124 broker cases remain behaviorally unchanged.
+## Compatibility
 
-## Current compatibility baseline
+All 11 original acceptance gaps now have successful broker/SDK parity: unknown
+non-tool events and extra event fields, JSON `type` overriding SSE `event:`, `id:`
+and `retry:`, multiline `data:` joined with LF, DONE before and after completion,
+postterminal events, refusal done without duplicate text, and punctuated call IDs.
+Valid subscription SSE also accepts missing or incorrect MIME types. DONE alone
+never proves completion or usage. Validated namespace survives SDK history replay.
 
-There are **13 explicitly qualified broker parity-gap scenarios**: 11 acceptance
-mismatches and two upstream-error classification mismatches. They pass as assertions
-of the current typed rejection, not skipped tests or production fixes.
+Both upstream errors remain failures, now classified locally as
+`SSE_UPSTREAM_ERROR`. Private provider diagnostics never enter forwarded output,
+errors or settlements. Validated failure usage retains the reported model and
+usage, settles `failed`, and charges the greater of reservation and report in each
+dimension. Without validated usage it settles `unknown`, omits reported usage and
+model, and charges reserved input plus 64,000 output. Malformed supplied usage is
+rejected; zero usage is never synthesized.
 
-| Synthetic probe                        | Pinned SDK oracle                      | Current broker                          |
-| -------------------------------------- | -------------------------------------- | --------------------------------------- |
-| Unknown non-tool event                 | Completion, text, usage                | `SSE_FRAME_INVALID`                     |
-| Extra non-tool event fields            | Completion, text, usage                | `SSE_FRAME_INVALID`                     |
-| Conflicting SSE `event:` / JSON `type` | JSON `type` wins                       | `SSE_FRAME_INVALID`                     |
-| `id:` control                          | Ignored                                | `SSE_FRAME_INVALID`                     |
-| `retry:` control                       | Ignored                                | `SSE_FRAME_INVALID`                     |
-| Multiline `data:` JSON                 | Lines joined with LF                   | `SSE_FRAME_INVALID`                     |
-| `[DONE]` before completion             | Ignored                                | `SSE_ACCOUNTING_REQUIRED`               |
-| `[DONE]` after completion              | Ignored after terminal                 | `SSE_FRAME_INVALID`                     |
-| Postterminal event                     | Ignored after terminal                 | `SSE_FRAME_INVALID`                     |
-| Refusal with `response.refusal.done`   | Delta is text; done ignored            | `SSE_FRAME_INVALID`                     |
-| Punctuation in `call_id`               | Composite `call_id\|item.id` preserved | `SSE_FRAME_INVALID`                     |
-| `error` after creation                 | Upstream failure, zero usage           | `SSE_FRAME_INVALID`, unknown accounting |
-| `response.failed` after creation       | Upstream failure, zero usage           | `SSE_FRAME_INVALID`, unknown accounting |
+The pinned SDK still has an LF-only multi-frame delimiter limitation: direct CRLF
+replay fails with invalid SSE JSON, while broker LF normalization succeeds. This
+qualification remains separate from the closed broker gaps. These tests establish
+synthetic replay compatibility, not live provider or packaged-worker qualification.
 
-For the two upstream errors, rejection and lack of reported usage already agree;
-the gap is classification. The broker omits provider messages from its error and
-settlement, and charges the existing 64k output unknown maximum. Trailing-frame
-rejections after validated completion instead settle as failed with reported usage;
-they are not unknown-usage cases.
+## Tool and safety controls
 
-One separate **SDK limitation** is recorded: multi-frame CRLF is not delimited by
-this pinned SDK's LF-only parser. The direct oracle fails with invalid SSE JSON,
-while broker normalization lets the same fragmented bytes complete through the SDK.
-It is not counted in the 13 broker gaps.
+Ten of the 20 tool probes succeed through both broker and SDK: ordinary calls,
+namespace, punctuated call IDs, done-only arguments, deltas without arguments.done,
+missing/extra/duplicate/swapped terminal sets, and changed terminal arguments.
+Terminal calls are independently validated for advertised names, bounded identities
+and object JSON arguments. They never create executable streamed calls.
 
-## Reconciliation observations and retained guards
+Unfinished and duplicate live calls still fail in both paths. Eight intentional
+SDK differentials remain rejected by the broker: wrong delta index/item identity,
+changed arguments.done, changed live final item ID/call ID/name/arguments, and an
+unadvertised tool name. SDK permissiveness does not authorize those changes.
 
-The 20 tool probes include four successful broker/SDK controls: ordinary calls,
-namespace preservation, arguments supplied by `arguments.done` without deltas, and
-deltas/finalization without `arguments.done`. Punctuation is the compatibility gap
-above. Two malformed streams fail in both paths: unfinished calls and duplicate
-added calls that leave an unfinished SDK slot.
-
-The other **13 tool differential probes** record SDK success versus current broker
-`SSE_TOOL_INVALID`: missing/extra/duplicate/swapped terminal calls, wrong delta
-index/item ID, changed arguments.done, changed final item ID/call ID/name/arguments,
-changed terminal arguments, and undeclared tool name. These mix reconciliation
-observations with authority controls. They are not counted as 13 additional defects
-or an instruction to adopt SDK permissiveness. In particular, terminal set equality
-is only today's behavior. S1b separately owns its accept/ignore/reject design, and
-the user plan calls for relaxing exact terminal-set matching.
-
-Positive controls accompany the retained guards: valid declared tools, normal usage,
-comments and split UTF-8, a harmless trailing comment, and a stream exactly at the
-kept-byte budget. Negative controls exercise undeclared names, inconsistent/negative/
-missing usage, absent terminal usage, one byte over the kept-byte budget, escaped
-credential/account echoes in unknown fields, and raw trailing echoes split across
-reads. Trailing echo checks omit the final LF to exercise raw scanning before line
-parsing. The SDK may ignore trailing frames; the broker must still scan their bytes.
+Replay controls retain response/frame/count caps, accumulated argument bounds,
+usage arithmetic and detail bounds, exact model/request/tool authority, and raw
+and decoded credential/account scans. After the first validated terminal, later
+output, tools and accounting are ignored, but bounded reading and secret scanning
+continue through EOF. Raw trailing echoes span reads; escaped echoes are checked
+in complete JSON frames even when the trailing frame lacks its delimiter. A
+harmless trailing comment and an exactly-at-budget stream accompany the rejection
+controls. Existing broker tests retain authorization and transport cleanup checks.

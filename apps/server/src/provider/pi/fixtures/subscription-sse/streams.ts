@@ -48,7 +48,7 @@ export const textEvents = (text = "bounded result 🛰", refusal = false) => {
 export const textStream = textEvents().join("");
 export const done = "data: [DONE]\n\n";
 export const privateErrorMessage = "synthetic upstream private diagnostic";
-export const upstreamError = (kind: "error" | "response.failed") =>
+export const upstreamError = (kind: "error" | "response.failed", reportedUsage?: object) =>
   created +
   event(
     kind === "error"
@@ -60,6 +60,7 @@ export const upstreamError = (kind: "error" | "response.failed") =>
             model,
             status: "failed",
             error: { code: "synthetic_failure", message: privateErrorMessage },
+            ...(reportedUsage === undefined ? {} : { usage: reportedUsage }),
           },
         },
   );

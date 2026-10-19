@@ -17,6 +17,7 @@ import {
   toolMutations,
   toolStream,
   upstreamError,
+  usage,
 } from "./fixtures/subscription-sse/streams.ts";
 
 type Wire = string | readonly Uint8Array[];
@@ -27,7 +28,7 @@ const fragmented = (wire: string, width = 1) => {
     encoded.slice(index * width, (index + 1) * width),
   );
 };
-const response = (wire: Wire) => {
+const response = (wire: Wire, mime: string | null = "text/event-stream") => {
   const chunks = bytes(wire);
   let index = 0;
   return new Response(
@@ -38,13 +39,18 @@ const response = (wire: Wire) => {
         else controller.close();
       },
     }),
-    { headers: { "content-type": "text/event-stream" } },
+    { headers: mime === null ? {} : { "content-type": mime } },
   );
 };
 
 // Always call the pinned SDK with an injected fetch. With a broker, forward its
 // validated chunks into that same SDK; the request is the SDK's actual JSON body.
-const replay = async (wire: Wire, throughBroker = false, tools = false) => {
+const replay = async (
+  wire: Wire,
+  throughBroker = false,
+  tools = false,
+  mime: string | null = "text/event-stream",
+) => {
   let transportCalls = 0;
   let fetchCalls = 0;
   let brokerFailure: unknown;
@@ -54,7 +60,7 @@ const replay = async (wire: Wire, throughBroker = false, tools = false) => {
     tools: tools ? [declaredTool] : [],
     transport: async () => {
       transportCalls++;
-      return response(wire);
+      return response(wire, mime);
     },
   });
   const providerEvents: unknown[] = [];
@@ -164,39 +170,33 @@ const compatibilityCases = [
       created +
       event({ type: "response.future_annotation", annotation: "synthetic" }) +
       textStream.slice(created.length),
-    code: "SSE_FRAME_INVALID",
   },
   {
     name: "extra non-tool fields",
     wire: textStream.replace('"delta":"bounded', '"future_annotation":true,"delta":"bounded'),
-    code: "SSE_FRAME_INVALID",
   },
   {
     name: "JSON type overrides SSE event identity",
     wire: textStream.replaceAll("event: response.", "event: synthetic."),
-    code: "SSE_FRAME_INVALID",
   },
-  { name: "id control", wire: "id: synthetic-1\n" + textStream, code: "SSE_FRAME_INVALID" },
-  { name: "retry control", wire: "retry: 1000\n" + textStream, code: "SSE_FRAME_INVALID" },
+  { name: "id control", wire: "id: synthetic-1\n" + textStream },
+  { name: "retry control", wire: "retry: 1000\n" + textStream },
   {
     name: "multiline data",
     wire: textStream.replace(
       'data: {"type":"response.created",',
       'data: {"type":"response.created",\ndata: ',
     ),
-    code: "SSE_FRAME_INVALID",
   },
-  { name: "DONE before completion", wire: done + textStream, code: "SSE_ACCOUNTING_REQUIRED" },
-  { name: "DONE after completion", wire: textStream + done, code: "SSE_FRAME_INVALID" },
+  { name: "DONE before completion", wire: done + textStream },
+  { name: "DONE after completion", wire: textStream + done },
   {
     name: "postterminal event",
     wire: textStream + event({ type: "response.future_annotation" }),
-    code: "SSE_FRAME_INVALID",
   },
   {
     name: "refusal done",
     wire: textEvents("I cannot do that", true).join(""),
-    code: "SSE_FRAME_INVALID",
   },
 ];
 
@@ -221,19 +221,14 @@ describe("synthetic subscription SSE replay through pinned SDK", () => {
     if (name === "postterminal event") expect(r.providerEvents).toHaveLength(textEvents().length);
   });
 
-  // S1a observations only: these rejections expose parity gaps, not S1b policy.
-  it.each(compatibilityCases)(
-    "current broker parity gap: $name -> $code",
-    async ({ wire, code, name }) => {
-      const r = await replay(wire, true);
-      expect(r.brokerFailure).toMatchObject({ code });
-      expect(r.receipt).toBeUndefined();
-      expect(r.settlements[0]?.outcome).toBe(
-        ["DONE after completion", "postterminal event"].includes(name) ? "failed" : "unknown",
-      );
-      if (r.settlements[0]?.outcome === "unknown") unknownRejection(r, code);
-    },
-  );
+  it.each(compatibilityCases)("broker/SDK parity: $name", async ({ wire, name }) => {
+    const r = await replay(wire, true);
+    reported(r);
+    expect(r.result.content).toMatchObject([
+      { type: "text", text: name === "refusal done" ? "I cannot do that" : "bounded result 🛰" },
+    ]);
+    if (name === "refusal done") expect(r.textDeltas).toEqual(["I cannot do that"]);
+  });
 
   it.each(["error", "response.failed"] as const)(
     "upstream %s fails without usage or private receipt diagnostics",
@@ -244,17 +239,67 @@ describe("synthetic subscription SSE replay through pinned SDK", () => {
       expect(oracle.result.errorMessage).toContain(privateErrorMessage);
       expect(oracle.result.usage.totalTokens).toBe(0);
       const r = await replay(wire, true);
-      // Current classification gap: fail closed as an invalid frame, not an upstream error.
-      unknownRejection(r, "SSE_FRAME_INVALID");
+      unknownRejection(r, "SSE_UPSTREAM_ERROR");
       expect(JSON.stringify(r.settlements)).not.toContain(privateErrorMessage);
       expect(r.result.errorMessage).not.toContain(privateErrorMessage);
     },
   );
 
-  it("refusal delta becomes text; removing the unsupported done event gives broker parity", async () => {
-    const wire = textEvents("I cannot do that", true)
-      .filter((frame) => !frame.startsWith("event: response.refusal.done\n"))
-      .join("");
+  it.each([null, "text/plain", "application/json", "text/html"])(
+    "replays valid SSE with MIME %s",
+    async (mime) => {
+      reported(await replay(fragmented(textStream, 7), true, false, mime));
+    },
+  );
+
+  it.each([
+    { reportedUsage: usage, input: 16384, output: 2048 },
+    {
+      reportedUsage: { ...usage, input_tokens: 20000, output_tokens: 3000, total_tokens: 23000 },
+      input: 20000,
+      output: 3000,
+    },
+  ])(
+    "retains validated upstream failure usage and existing maximum charges (%#)",
+    async ({ reportedUsage, input, output }) => {
+      const r = await replay(upstreamError("response.failed", reportedUsage), true);
+      expect(r.brokerFailure).toMatchObject({ code: "SSE_UPSTREAM_ERROR" });
+      expect(r.result.stopReason).toBe("error");
+      expect(r.settlements).toMatchObject([
+        {
+          outcome: "failed",
+          reportedModel: sdkModel.id,
+          chargedInputTokens: input,
+          chargedOutputTokens: output,
+          reportedUsage: {
+            prompt_tokens: reportedUsage.input_tokens,
+            completion_tokens: reportedUsage.output_tokens,
+            total_tokens: reportedUsage.total_tokens,
+          },
+          failureCode: "SSE_UPSTREAM_ERROR",
+          transportDrained: true,
+        },
+      ]);
+      expect(JSON.stringify(r.settlements)).not.toContain(privateErrorMessage);
+      expect(Buffer.concat(r.chunks).toString()).not.toContain(privateErrorMessage);
+    },
+  );
+
+  it.each([
+    { ...usage, total_tokens: 59 },
+    { ...usage, input_tokens_details: { cached_tokens: -1 } },
+    { ...usage, input_tokens_details: { cached_tokens: 51 } },
+    { ...usage, output_tokens_details: { reasoning_tokens: 11 } },
+    { ...usage, output_tokens_details: { reasoning_tokens: "invalid" } },
+  ])("rejects malformed supplied upstream failure usage (%#)", async (invalid) => {
+    unknownRejection(
+      await replay(upstreamError("response.failed", invalid), true),
+      "SSE_USAGE_INVALID",
+    );
+  });
+
+  it("refusal delta becomes text without duplicating refusal done", async () => {
+    const wire = textEvents("I cannot do that", true).join("");
     const r = await replay(wire, true);
     reported(r);
     expect(r.result.content).toMatchObject([{ type: "text", text: "I cannot do that" }]);
@@ -299,7 +344,18 @@ describe("synthetic subscription SSE replay through pinned SDK", () => {
 });
 
 describe("synthetic tool identity and reconciliation baseline", () => {
-  const accepted = new Set(["valid", "namespace", "done-only-arguments", "no-arguments-done"]);
+  const accepted = new Set([
+    "valid",
+    "namespace",
+    "punctuation",
+    "done-only-arguments",
+    "no-arguments-done",
+    "missing-terminal-call",
+    "extra-terminal-call",
+    "duplicate-terminal-call",
+    "swapped-terminal-calls",
+    "changed-terminal-arguments",
+  ]);
   it.each(toolMutations)("SDK oracle and current broker: %s", async (mutation) => {
     const wire = toolStream(mutation);
     const oracle = await replay(wire, false, true);
@@ -322,21 +378,22 @@ describe("synthetic tool identity and reconciliation baseline", () => {
       ]);
     if (mutation === "undeclared-tool")
       expect(oracle.result.content).toMatchObject([{ type: "toolCall", name: "delete_project" }]);
-    // Terminal output reconciliation below records today's behavior. In particular,
-    // missing/extra/duplicate/swapped terminal sets do not prescribe future policy.
+    // Only live calls supply executable tool output; terminal calls are validated independently.
     const r = await replay(wire, true, true);
     if (accepted.has(mutation)) {
       reported(r);
       expect(r.result.content.filter((part) => part.type === "toolCall")).toMatchObject([
         {
-          id: "call-1|fc_1",
+          id: mutation === "punctuation" ? "call.a:b/c+1=2-3_4|fc_1" : "call-1|fc_1",
           name: "lookup",
           arguments: { key: "A" },
           ...(mutation === "namespace" ? { namespace: "fixture" } : {}),
         },
+        ...(mutation === "swapped-terminal-calls"
+          ? [{ id: "call-2|fc_2", name: "lookup", arguments: { key: "B" } }]
+          : []),
       ]);
-    } else
-      unknownRejection(r, mutation === "punctuation" ? "SSE_FRAME_INVALID" : "SSE_TOOL_INVALID");
+    } else unknownRejection(r, "SSE_TOOL_INVALID");
   });
 });
 
@@ -368,6 +425,113 @@ describe("retained safety controls on replayed streams", () => {
       unknownRejection(await replay(fragmented(wire, 7), true), "CREDENTIAL_ECHO_REJECTED");
     },
   );
+
+  it.each([credential, accountId])(
+    "scans escaped echoes in ignored trailing JSON, including EOF (%#)",
+    async (secret) => {
+      const escaped = [...secret]
+        .map((char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`)
+        .join("");
+      for (const payload of [
+        `{"type":"response.future_annotation","value":"${escaped}"}`,
+        `"${escaped}"`,
+        `{"${escaped}":"ignored"}`,
+      ]) {
+        for (const suffix of ["\n\n", ""]) {
+          const r = await replay(fragmented(textStream + `data: ${payload}` + suffix, 7), true);
+          expect(r.brokerFailure).toMatchObject({ code: "CREDENTIAL_ECHO_REJECTED" });
+          expect(r.settlements).toMatchObject([
+            { outcome: "failed", reportedUsage: { total_tokens: 60 } },
+          ]);
+          expect(Buffer.concat(r.chunks).toString()).not.toContain(secret);
+        }
+      }
+    },
+  );
+
+  it("ignores trailing output, tools and replacement accounting after the first terminal", async () => {
+    const trailing =
+      event({ type: "response.output_text.delta", delta: "late-output" }) +
+      toolStream("undeclared-tool") +
+      completed([], { input_tokens: -1 });
+    const r = await replay(fragmented(textStream + trailing, 7), true);
+    reported(r);
+    expect(r.result.content).toMatchObject([{ type: "text", text: "bounded result 🛰" }]);
+    expect(Buffer.concat(r.chunks).toString()).not.toContain("late-output");
+    expect(Buffer.concat(r.chunks).toString()).not.toContain("delete_project");
+  });
+
+  it("bounds accumulated arguments before live finalization", async () => {
+    const added = event({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "fc_1", type: "function_call", call_id: "call-1", name: "lookup", arguments: "" },
+    });
+    const delta = event({
+      type: "response.function_call_arguments.delta",
+      output_index: 0,
+      item_id: "fc_1",
+      delta: "x".repeat(8192),
+    });
+    unknownRejection(
+      await replay(created + added + delta.repeat(3), true, true),
+      "SSE_TOOL_INVALID",
+    );
+  });
+
+  it.each(["[]", "null", "{", '{"key":"A"'])(
+    "independently rejects invalid terminal-only arguments %s",
+    async (argumentsText) => {
+      unknownRejection(
+        await replay(
+          created +
+            completed([
+              {
+                type: "function_call",
+                name: "lookup",
+                call_id: "opaque.id:1",
+                arguments: argumentsText,
+              },
+            ]),
+          true,
+          true,
+        ),
+        "SSE_TOOL_INVALID",
+      );
+    },
+  );
+
+  it("never creates an executable call from a terminal-only tool", async () => {
+    const r = await replay(
+      created +
+        completed([
+          { type: "function_call", name: "lookup", call_id: "opaque.id:1", arguments: "{}" },
+        ]),
+      true,
+      true,
+    );
+    reported(r);
+    expect(r.result.content.filter((part) => part.type === "toolCall")).toEqual([]);
+  });
+
+  it("rejects unadvertised terminal-only tools", async () => {
+    unknownRejection(
+      await replay(
+        created +
+          completed([
+            {
+              type: "function_call",
+              name: "delete_project",
+              call_id: "opaque.id:1",
+              arguments: "{}",
+            },
+          ]),
+        true,
+        true,
+      ),
+      "SSE_TOOL_INVALID",
+    );
+  });
 
   it.each([
     ["negative", { input_tokens: -1, output_tokens: 10, total_tokens: 9 }, "SSE_USAGE_INVALID"],

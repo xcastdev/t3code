@@ -1525,3 +1525,31 @@ it.each([
   expect(JSON.stringify(f.settlements)).not.toContain(secret);
   expect(JSON.stringify(f.settlements)).not.toContain(contentType ?? "content-type");
 });
+
+it("keeps CommandCode call identifiers separate from opaque subscription identifiers", async () => {
+  const f = fixture();
+  const request = JSON.stringify({
+    model,
+    stream: true,
+    stream_options: { include_usage: true },
+    max_tokens: 512,
+    messages: [
+      { role: "system", content: "Trusted assignment" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call.a:b/c+1=2",
+            type: "function",
+            function: { name: tool.function.name, arguments: "{}" },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "call.a:b/c+1=2", content: "result" },
+    ],
+  });
+  await expect(f.invoke(request)).rejects.toMatchObject({ code: "REQUEST_INVALID" });
+  expect(f.reservations).toHaveLength(0);
+  expect(f.transports).toHaveLength(0);
+});
