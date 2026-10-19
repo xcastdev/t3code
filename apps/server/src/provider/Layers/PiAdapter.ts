@@ -901,8 +901,11 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             "startSession",
             "Pi requires an explicit skill plan for this instance and a new session.",
           );
-        if (existing) {
-          const context = yield* owned(hints.threadId);
+        // A cursor requests restoration; only the runtime's current authority read admits it.
+        if (existing || hints.resumeCursor !== undefined) {
+          const context: SessionContext = existing
+            ? yield* owned(hints.threadId)
+            : { threadId: hints.threadId, closing: false };
           if (context.active)
             return yield* invalid(
               "startSession",
@@ -917,6 +920,8 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             Effect.flatMap((session) => validateSession(session, hints.threadId)),
           );
           yield* checkHints(session, hints);
+          if (!existing && (session.status !== "ready" || session.activeTurnId !== undefined))
+            return yield* invalid("startSession", "Only a settled Pi session can be restored.");
           // Check ownership and publish together: even a synchronous Effect helper can auto-yield.
           return yield* Effect.suspend(() => {
             if (shuttingDown)
@@ -924,17 +929,17 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
                 new ProviderAdapterSessionClosedError({ provider, threadId: hints.threadId }),
               );
             const current = sessions.get(hints.threadId);
-            if (!current)
+            if (existing && !current)
               return Effect.fail(
                 new ProviderAdapterSessionNotFoundError({ provider, threadId: hints.threadId }),
               );
-            if (current.closing)
+            if (current?.closing)
               return Effect.fail(
                 new ProviderAdapterSessionClosedError({ provider, threadId: hints.threadId }),
               );
-            if (current.failure) return Effect.fail(current.failure);
+            if (current?.failure) return Effect.fail(current.failure);
             if (
-              current !== context ||
+              current !== existing ||
               context.active ||
               context.session !== previousSession ||
               context.lastOperationId !== previousOperationId ||
@@ -948,6 +953,7 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
               );
             context.session = session;
             context.skillPlan = skillPlan;
+            if (!existing) sessions.set(hints.threadId, context);
             return Effect.succeed(session);
           });
         }

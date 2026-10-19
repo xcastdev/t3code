@@ -135,6 +135,142 @@ const initialSession = (instance = instanceId): ProviderSession => ({
 });
 const startInput = { threadId, runtimeMode: "full-access" as const };
 
+it.effect("replacement adapter restores the authorized cursor without initializing again", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const scope = yield* Scope.make();
+    const original = yield* makePiAdapter({ instanceId, runtime: fake.runtime }).pipe(
+      Scope.provide(scope),
+    );
+    const plan = readyPlan();
+    const committed = yield* original.startSession({ ...startInput, skillPlan: plan });
+    yield* Scope.close(scope, Exit.void);
+    const replacement = yield* makePiAdapter({
+      instanceId,
+      runtime: fake.runtime,
+      resolveOperationId: (request) =>
+        request.kind === "initialize" ? Effect.fail(denied) : Effect.succeed("replacement-prompt"),
+    });
+    const events = yield* subscribe(replacement.streamEvents);
+    expect(
+      yield* replacement.startSession({
+        ...startInput,
+        cwd: committed.cwd,
+        modelSelection: { instanceId, model: "frozen-model" },
+        resumeCursor: committed.resumeCursor,
+        skillPlan: plan,
+      }),
+    ).toEqual(committed);
+    expect(yield* replacement.listSessions()).toEqual([committed]);
+    expect(fake.readPlans).toEqual([plan]);
+    expect(fake.requests).toHaveLength(1);
+    expect(yield* Queue.size(events)).toBe(0);
+    yield* replacement.sendTurn({ threadId, input: "continue the retained assignment" });
+    expect(fake.requests[1]).toMatchObject({
+      kind: "prompt",
+      operationId: "replacement-prompt",
+      skillPlan: plan,
+    });
+    yield* fake.settle(fake.operations[1]!, "success");
+    yield* nextType(events, "turn.completed");
+  }),
+);
+
+for (const code of ["denied", "conflict", "unavailable", "uncertain"] as const)
+  it.effect(`replacement restoration never initializes after a ${code} authority read`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      fake.state.readError = new PiManagedRuntimeError({ code, detail: "private-authority-read" });
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      const events = yield* subscribe(adapter.streamEvents);
+      const result = yield* Effect.exit(
+        adapter.startSession({ ...startInput, resumeCursor: initialSession().resumeCursor }),
+      );
+      expect(json(result)).toContain("ProviderAdapterRequestError");
+      expect(json(result)).not.toContain("private-authority-read");
+      expect(yield* adapter.hasSession(threadId)).toBe(false);
+      expect(yield* Queue.size(events)).toBe(0);
+      expect(fake.requests).toHaveLength(0);
+    }),
+  );
+
+it.effect(
+  "replacement restoration rejects stale hints, foreign identities and native aliases",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      const resume = { ...startInput, resumeCursor: initialSession().resumeCursor };
+      for (const hints of [
+        { cwd: "/stale/worktree" },
+        { runtimeMode: "approval-required" as const },
+        { modelSelection: { instanceId, model: "stale-model" } },
+        { resumeCursor: { sessionId: "native-one", leafId: "stale-leaf" } },
+        { resumeCursor: "native-one" },
+      ]) {
+        expect(
+          Exit.isFailure(yield* Effect.exit(adapter.startSession({ ...resume, ...hints }))),
+        ).toBe(true);
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+      }
+      for (const session of [
+        { ...initialSession(), providerInstanceId: ProviderInstanceId.make("foreign") },
+        { ...initialSession(), threadId: ThreadId.make("foreign") },
+        { ...initialSession(), provider: ProviderDriverKind.make("codex") },
+        { ...initialSession(), status: "running" as const },
+        { ...initialSession(), activeTurnId: TurnId.make("unsettled") },
+      ]) {
+        fake.state.session = session;
+        expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(resume)))).toBe(true);
+        expect(yield* adapter.listSessions()).toEqual([]);
+      }
+      expect(fake.requests).toHaveLength(0);
+    }),
+);
+
+it.effect(
+  "replacement restoration isolates held caller hints and cannot replace a newer context",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const plan = readyPlan();
+      const expected = structuredClone(plan);
+      const cursor = { sessionId: "native-one", leafId: "leaf-0" };
+      const adapter = yield* makePiAdapter({
+        instanceId,
+        runtime: {
+          ...fake.runtime,
+          readSession: Effect.fn("PiAdapter.test.heldRestoration")(function* (thread, skillPlan) {
+            const session = yield* fake.runtime.readSession(thread, skillPlan);
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return session;
+          }),
+        },
+      });
+      const starting = yield* Effect.forkScoped(
+        Effect.exit(adapter.startSession({ ...startInput, resumeCursor: cursor, skillPlan: plan })),
+      );
+      yield* Deferred.await(entered);
+      cursor.leafId = "caller-replaced";
+      plan.payload.skills[0]!.path = "/caller/replaced";
+      const newer = {
+        ...initialSession(),
+        resumeCursor: { sessionId: "new-native", leafId: "new" },
+      };
+      // A concurrent fresh start owns the local context before the older read can publish.
+      yield* adapter.startSession(startInput);
+      fake.state.session = newer;
+      yield* Deferred.succeed(release, undefined);
+      expect(json(yield* Fiber.join(starting))).toContain("Pi session changed while");
+      expect(fake.readPlans).toEqual([expected]);
+      expect(yield* adapter.listSessions()).toEqual([initialSession()]);
+      expect(fake.requests).toHaveLength(1);
+    }),
+);
+
 it.effect(
   "the actual adapter exposes an eager owned event subscription before initialization",
   () =>
@@ -681,6 +817,26 @@ it.effect("retained compact receipt keeps the adapter at its audited successor s
     });
     expect(yield* adapter.listSessions()).toEqual(latest);
     expect(fake.operations).toHaveLength(3);
+    expect(yield* Queue.size(events)).toBe(0);
+    const replacement = yield* makePiAdapter({
+      instanceId,
+      runtime,
+      resolveOperationId: (request) =>
+        request.kind === "initialize" ? Effect.fail(denied) : Effect.succeed(undefined),
+    });
+    const replacementEvents = yield* subscribe(replacement.streamEvents);
+    yield* replacement.startSession({
+      ...startInput,
+      resumeCursor: fake.state.session.resumeCursor,
+    });
+    const replay = replacement.compaction;
+    if (replay?.type !== "native") return yield* Effect.die("Missing replacement compact port");
+    expect(yield* replay.start(threadId, undefined, MessageId.make("adapter-first"))).toEqual({
+      kind: "retained",
+    });
+    expect(yield* replacement.listSessions()).toEqual(latest);
+    expect(fake.operations).toHaveLength(3);
+    expect(yield* Queue.size(replacementEvents)).toBe(0);
     yield* adapter.stopSession(threadId);
     const closed = yield* Queue.take(events);
     expect(closed.type).toBe("session.exited");
@@ -1935,7 +2091,6 @@ it.effect("keeps the held resolver request immutable and isolated from caller hi
     const release = yield* Deferred.make<void>();
     const callerPlan = readyPlan();
     const expected = structuredClone(callerPlan);
-    const cursor = { sessionId: "native-one", leafId: "leaf-0" };
     const adapter = yield* makePiAdapter({
       instanceId,
       runtime: fake.runtime,
@@ -1950,13 +2105,11 @@ it.effect("keeps the held resolver request immutable and isolated from caller hi
         adapter.startSession({
           ...startInput,
           skillPlan: callerPlan,
-          resumeCursor: cursor,
         }),
       ),
     );
     const snapshot = yield* Deferred.await(entered);
     callerPlan.payload.skills[0]!.path = "/caller/replaced";
-    cursor.leafId = "caller-replaced";
     expect(() =>
       Object.assign(snapshot, { threadId: ThreadId.make("resolver-replaced") }),
     ).toThrow();
@@ -1968,7 +2121,6 @@ it.effect("keeps the held resolver request immutable and isolated from caller hi
     yield* Deferred.succeed(release, undefined);
     expect(Exit.isSuccess(yield* Fiber.join(starting))).toBe(true);
     expect(fake.requests[0]?.skillPlan).toEqual(expected);
-    expect(fake.requests[0]?.resumeCursor).toEqual({ sessionId: "native-one", leafId: "leaf-0" });
     expect(fake.requests[0]?.operationId).toBe("immutable_root_id");
   }),
 );
@@ -3243,7 +3395,6 @@ it.effect(
           threadId,
           cwd: fake.state.session.cwd,
           modelSelection: { instanceId, model: "frozen-model" },
-          resumeCursor: fake.state.session.resumeCursor,
           runtimeMode: "approval-required",
           skillPlan: plan,
         }),
