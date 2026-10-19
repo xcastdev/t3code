@@ -183,6 +183,12 @@ const EntryFields = { id: Token, parentId: Schema.NullOr(Token), timestamp: Time
 const Entry = Schema.Union([
   Schema.Struct({
     ...EntryFields,
+    type: Schema.Literal("custom"),
+    customType: Schema.Literal("t3-approved-initial-context"),
+    data: Schema.Struct({ text: bounded(131072).check(Schema.isMinLength(1)) }),
+  }),
+  Schema.Struct({
+    ...EntryFields,
     type: Schema.Literal("message"),
     message: Schema.Struct({
       role: Schema.Literal("user"),
@@ -233,18 +239,33 @@ function qualifyRaw(raw: string, manifest: ProjectTeamReviewFreshnessReceipt) {
   let previous: string | null = null;
   const ids = new Set<string>();
   let briefing: string | undefined;
+  let hasMessage = false;
   for (const line of lines.slice(1)) {
     const entry = decodeEntry(parseJson(line));
     if (entry.parentId !== previous || ids.has(entry.id)) throw deny("not-fresh");
     ids.add(entry.id);
     previous = entry.id;
+    if (entry.type === "custom") {
+      if (briefing !== undefined || hasMessage) throw deny("not-fresh");
+      briefing = entry.data.text;
+    }
     if (entry.type === "message") {
-      if (briefing !== undefined) throw deny("not-fresh");
-      briefing = entry.message.content[0]!.text;
+      if (hasMessage) throw deny("not-fresh");
+      const text = entry.message.content[0]!.text;
+      if (briefing !== undefined) {
+        if (text !== "Session initialized. Approved context is supplied separately.")
+          throw deny("not-fresh");
+      } else {
+        // Older initialized journals retained the briefing in a single user message.
+        // Keep those immutable freshness receipts readable.
+        briefing = text;
+      }
+      hasMessage = true;
     }
   }
   if (
     previous !== manifest.native.leafId ||
+    !hasMessage ||
     briefing === undefined ||
     digest(briefing) !== manifest.briefingSHA256
   )

@@ -46,9 +46,12 @@ const fixture = Effect.gen(function* () {
   manager.appendModelChange("synthetic", "fixture-only");
   manager.appendThinkingLevelChange("off");
   manager.appendSessionInfo("Independent review");
+  manager.appendCustomEntry("t3-approved-initial-context", { text: expectedBriefing });
   const leafId = manager.appendMessage({
     role: "user",
-    content: [{ type: "text", text: expectedBriefing }],
+    content: [
+      { type: "text", text: "Session initialized. Approved context is supplied separately." },
+    ],
     timestamp: 1,
   });
   const file = manager.getSessionFile();
@@ -397,6 +400,123 @@ it.effect("retains the actual fresh initialized SDK journal and immutable owners
         raw: string;
       }>`SELECT native_jsonl AS raw FROM project_team_review_freshness`;
       expect(rows).toEqual([{ raw }]);
+    }),
+  ),
+);
+
+for (const kind of [
+  "foreign-custom-type",
+  "mismatched-custom-briefing",
+  "extra-custom-data",
+  "duplicate-custom",
+  "missing-marker",
+  "wrong-marker",
+  "message-before-custom",
+  "extra-conversation",
+  "broken-chain",
+  "duplicate-id",
+] as const) {
+  it.effect(`rejects ${kind} in the approved custom context journal`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const entries = f.manager.getEntries();
+        const custom = entries.find((entry) => entry.type === "custom");
+        const message = entries.find((entry) => entry.type === "message");
+        if (!custom || !message) return yield* Effect.die("Missing SDK initialization entries");
+        const changed = entries.map((entry) => {
+          if (entry.type === "custom") {
+            if (kind === "foreign-custom-type") return { ...entry, customType: "unapproved" };
+            if (kind === "mismatched-custom-briefing")
+              return { ...entry, data: { text: "Unapproved context" } };
+            if (kind === "extra-custom-data")
+              return { ...entry, data: { text: f.input.expectedBriefing, extra: "injected" } };
+          }
+          if (entry.type === "message") {
+            if (kind === "missing-marker")
+              return {
+                type: "session_info",
+                id: entry.id,
+                parentId: entry.parentId,
+                timestamp: entry.timestamp,
+              };
+            if (kind === "wrong-marker")
+              return {
+                ...entry,
+                message: {
+                  ...entry.message,
+                  content: [{ type: "text", text: f.input.expectedBriefing }],
+                },
+              };
+          }
+          return entry;
+        });
+        // Preserve the terminal leaf so denials exercise journal qualification.
+        const ordered =
+          kind === "message-before-custom"
+            ? [
+                ...entries.slice(0, -2),
+                { ...message, id: custom.id },
+                { ...custom, id: message.id },
+              ]
+            : kind === "duplicate-custom"
+              ? [
+                  ...changed.slice(0, -2),
+                  { ...custom, id: "duplicate-context" },
+                  ...changed.slice(-2),
+                ]
+              : kind === "extra-conversation"
+                ? [
+                    ...changed.slice(0, -1),
+                    { ...message, id: "injected-conversation" },
+                    ...changed.slice(-1),
+                  ]
+                : changed;
+        const linked = ordered.map((entry, index) => ({
+          ...entry,
+          parentId: index === 0 ? null : ordered[index - 1]!.id,
+          ...(kind === "broken-chain" && entry.id === message.id ? { parentId: null } : {}),
+          ...(kind === "duplicate-id" && entry.id === custom.id ? { id: entries[0]!.id } : {}),
+        }));
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(
+            f.file,
+            [encode(f.manager.getHeader()), ...linked.map(encode)].join("\n") + "\n",
+          ),
+        );
+        expect((yield* f.service.capture(f.input).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* f.sql`SELECT operation_id FROM project_team_review_freshness`).toEqual([]);
+      }),
+    ),
+  );
+}
+
+it.effect("keeps legacy single-message briefing receipts readable", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const entries = f.manager.getEntries().filter((entry) => entry.type !== "custom");
+      const legacy = entries.map((entry, index) => ({
+        ...entry,
+        parentId: index === 0 ? null : entries[index - 1]!.id,
+        ...(entry.type === "message"
+          ? {
+              message: {
+                ...entry.message,
+                content: [{ type: "text", text: f.input.expectedBriefing }],
+              },
+            }
+          : {}),
+      }));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          f.file,
+          [encode(f.manager.getHeader()), ...legacy.map(encode)].join("\n") + "\n",
+        ),
+      );
+      const receipt = yield* f.service.capture(f.input);
+      expect(yield* f.service.readRetained(f.input.operationId)).toEqual(receipt);
+      expect(yield* f.service.readForSession(sessionOwner(f))).toEqual(receipt);
     }),
   ),
 );
