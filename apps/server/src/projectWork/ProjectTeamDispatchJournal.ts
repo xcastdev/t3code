@@ -203,6 +203,7 @@ const RowSchema = Schema.Struct({
   repair_allowance: Safe,
   revision: Safe,
   claim_generation: Safe,
+  cleanup_claim_revision: Schema.NullOr(Safe),
   stage: Stage,
   intent_json: Schema.String.check(
     Schema.makeFilter((value) => Buffer.byteLength(value) <= 262144),
@@ -1238,6 +1239,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
               stage: "reserved",
               revision: 0,
               claim_generation: 0,
+              cleanup_claim_revision: null,
               intent_json: encodeIntent(intent),
               created_at: request.claim.committedAt,
               updated_at: request.claim.committedAt,
@@ -1648,6 +1650,54 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         Effect.gen(function* () {
           const value = yield* read(dispatchId);
           return yield* readStageHistory(value.row, value.intent);
+        }),
+      );
+    });
+    const claimCleanup = Effect.fn("ProjectTeamDispatchJournal.claimCleanup")(function* (
+      expected: ProjectTeamDispatchFence,
+    ) {
+      const client = yield* Effect.serviceOption(SqlClient.SqlClient);
+      if (
+        (Option.isSome(client) && client.value !== sql) ||
+        Option.isSome(yield* Effect.serviceOption(sql.transactionService))
+      )
+        return yield* deny("Cleanup claim requires its captured independent SQL transaction");
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const value = yield* read(expected.dispatchId);
+          yield* readStageHistory(value.row, value.intent);
+          if (
+            fingerprint(fence(value.row)) !== fingerprint(expected) ||
+            expected.stage !== "assignment-observed"
+          )
+            return yield* deny("Cleanup claim fence is stale");
+          yield* currentClaim(value.row, value.intent);
+          const snapshot = { fence: fence(value.row), intent: value.intent };
+          if (value.row.cleanup_claim_revision !== null) {
+            if (value.row.cleanup_claim_revision !== expected.revision)
+              return yield* deny("Cleanup claim belongs to another revision");
+            return { _tag: "Claimed" as const, snapshot };
+          }
+          const operations = yield* sql<{
+            operation_kind: string;
+            status: string;
+          }>`SELECT operation_kind,status
+          FROM project_team_pi_operation WHERE environment_id=${environmentId}
+          AND binding_id=${value.row.binding_id} AND generation=${value.row.generation}
+          ORDER BY operation_ordinal LIMIT 131`;
+          if (operations.length > 130 || operations.some((row) => row.status === "quarantine"))
+            return yield* deny("Cleanup operation ownership requires reconciliation");
+          const active = operations.filter((row) => row.status !== "settled");
+          if (active.some((row) => row.operation_kind !== "compact"))
+            return yield* deny("Original operation must finish before cleanup");
+          if (active.length > 0) return { _tag: "WaitingForCompact" as const };
+          const claimed =
+            yield* sql`UPDATE project_team_dispatch SET cleanup_claim_revision=${expected.revision}
+          WHERE dispatch_id=${expected.dispatchId} AND environment_id=${environmentId}
+          AND revision=${expected.revision} AND claim_generation=${expected.claimGeneration}
+          AND stage=${expected.stage} AND cleanup_claim_revision IS NULL RETURNING dispatch_id`;
+          if (claimed.length !== 1) return yield* deny("Cleanup claim was superseded");
+          return { _tag: "Claimed" as const, snapshot };
         }),
       );
     });
@@ -2172,6 +2222,7 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
       advanceStage,
       readStageReceipts,
       settleAfterJoined,
+      claimCleanup,
     };
   },
 );

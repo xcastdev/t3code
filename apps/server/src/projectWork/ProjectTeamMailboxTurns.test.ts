@@ -56,6 +56,7 @@ import { ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
 import {
   continueProjectTeamMailboxTurn,
   readProjectTeamOwnedOperationHistory,
+  waitForProjectTeamRetainedCompaction,
 } from "./ProjectTeamExecutionHost.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
@@ -1928,7 +1929,7 @@ it.effect(
           original: f.snapshot,
           turns: f.turns,
           assertCurrent: Effect.void,
-        }).pipe(Effect.provide(engine), Effect.provide(ProjectWorkEventBusLive));
+        }).pipe(Effect.provide(Layer.mergeAll(engine, ProjectWorkEventBusLive)));
         const fiber = yield* run.pipe(Effect.forkChild);
         let afterOperationId: string | undefined;
         let cursor = { ...native, leafId: "assignment-leaf" };
@@ -2419,3 +2420,194 @@ it.effect(
       }),
     ),
 );
+
+for (const order of ["cleanup-first", "compact-first"] as const) {
+  it.effect(`atomically fences ${order} after the Host's final compact read`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment();
+        const originalInput = yield* f.reserveInput();
+        yield* f.complete(f.prompt, { ...native, leafId: "atomic-original" }, "success", [
+          yield* originalInput.settle,
+        ]);
+        const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+          receiptId: "atomic-assignment-observed",
+          stage: "assignment-observed",
+          evidence: { bindingId: f.binding.recordId },
+        });
+        const snapshot = yield* f.journal.readRetained(observed.fence.dispatchId);
+        const context = yield* makeProjectTeamContext({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+        });
+        const current = yield* context.readRequired(snapshot);
+        const supplied = {
+          threadId,
+          kind: "compact" as const,
+          requestId: MessageId.make("atomic-compact"),
+          modelSelection: { instanceId: providerInstanceId, model, options: [] },
+        };
+        const boundary = yield* f.operations.readCompaction(
+          { providerInstanceId, threadId },
+          supplied,
+        );
+        const request = { ...supplied, operationId: boundary.operationId };
+        const allocation = yield* f.allocation;
+        const prepare = f.operations.prepare(
+          { providerInstanceId, threadId },
+          request,
+          hash(request),
+          {
+            allocation,
+            workerId: "atomic-compact-worker",
+            operationId: request.operationId,
+            resourceHash: "a".repeat(64),
+            compactContext: {
+              provenanceSha256: hash(current.provenance),
+              textSha256: NodeCrypto.createHash("sha256").update(current.text).digest("hex"),
+            },
+          },
+        );
+        const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        const processRows =
+          yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`;
+        const charges =
+          yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+        const operationIds =
+          yield* f.sql`SELECT operation_id FROM project_team_pi_operation ORDER BY operation_ordinal`;
+        const events = yield* PubSub.unbounded<typeof OrchestrationEvent.Type>();
+        const readFinal = yield* Deferred.make<void>();
+        const releaseClaim = yield* Deferred.make<void>();
+        const waiting = yield* Deferred.make<void>();
+        let claims = 0;
+        let cleanupStarted = false;
+        const wait = waitForProjectTeamRetainedCompaction({
+          environmentId: "environment",
+          snapshot,
+          assertCurrent: f.journal.inspect(snapshot.fence.dispatchId).pipe(
+            Effect.asVoid,
+            Effect.mapError(
+              () =>
+                new ProjectTeamDispatchJournalError({
+                  reason: "Current dispatch authority changed",
+                }),
+            ),
+          ),
+          claimCleanup: Effect.gen(function* () {
+            if (++claims === 1 && order === "compact-first") {
+              yield* Deferred.succeed(readFinal, undefined);
+              yield* Deferred.await(releaseClaim);
+            }
+            const result = yield* f.journal.claimCleanup(snapshot.fence);
+            if (result._tag === "WaitingForCompact") yield* Deferred.succeed(waiting, undefined);
+            return result;
+          }).pipe(
+            Effect.mapError(
+              () => new ProjectTeamDispatchJournalError({ reason: "Cleanup claim failed" }),
+            ),
+          ),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Layer.mock(OrchestrationEngineService)({
+                subscribeDomainEvents: PubSub.subscribe(events).pipe(
+                  Effect.map(Stream.fromSubscription),
+                ),
+              }),
+              ProjectWorkEventBusLive,
+            ),
+          ),
+        );
+        if (order === "compact-first") {
+          const host = yield* wait.pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                cleanupStarted = true;
+              }),
+            ),
+            Effect.forkChild,
+          );
+          yield* Deferred.await(readFinal);
+          const compact = yield* prepare;
+          yield* Deferred.succeed(releaseClaim, undefined);
+          yield* Deferred.await(waiting);
+          expect(cleanupStarted).toBe(false);
+          const compactInput = yield* f.reserveInput(compact);
+          const terminal = yield* f.complete(
+            compact,
+            { ...native, leafId: "atomic-compact-leaf" },
+            "success",
+            [yield* compactInput.settle],
+          );
+          yield* PubSub.publish(
+            events,
+            yield* decodeOrchestrationEvent({
+              type: "thread.session-set",
+              sequence: 1,
+              eventId: "atomic-compact-terminal",
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: at,
+              commandId: null,
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+              payload: {
+                threadId,
+                session: {
+                  threadId,
+                  status: "ready",
+                  providerName: "piAgent",
+                  providerInstanceId,
+                  runtimeMode: "approval-required",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: at,
+                },
+              },
+            }),
+          );
+          yield* Fiber.join(host);
+          expect(cleanupStarted).toBe(true);
+          expect(
+            (yield* f.operations.lookup(
+              { providerInstanceId, threadId },
+              request,
+              hash(request),
+              "a".repeat(64),
+            ))?.terminal,
+          ).toEqual(terminal);
+          expect(
+            (yield* f.operations.readCompaction({ providerInstanceId, threadId }, supplied))
+              .operationId,
+          ).toBe(request.operationId);
+        } else {
+          yield* wait;
+          // The context and stable request were obtained before cleanup claimed the boundary.
+          expect((yield* prepare.pipe(Effect.result))._tag).toBe("Failure");
+          expect(
+            yield* f.sql`SELECT operation_id FROM project_team_pi_operation ORDER BY operation_ordinal`,
+          ).toEqual(operationIds);
+          expect(yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`).toEqual(
+            processRows,
+          );
+          expect(
+            yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+          ).toEqual(charges);
+        }
+        expect(
+          (yield* f.operations
+            .readCompaction(
+              { providerInstanceId, threadId },
+              { ...supplied, requestId: MessageId.make("late-compact") },
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budget);
+        expect((yield* f.journal.readRetained(snapshot.fence.dispatchId)).intent.limits).toEqual(
+          snapshot.intent.limits,
+        );
+      }).pipe(Effect.scoped),
+    ),
+  );
+}

@@ -1474,8 +1474,7 @@ it.effect(
             resume: () =>
               Effect.gen(function* () {
                 if (active.size === 2) yield* Deferred.succeed(entered, undefined);
-                yield* Effect.never;
-                return { _tag: "Busy" as const };
+                return yield* Effect.never;
               }),
             joinCleanup: (claim) =>
               Effect.gen(function* () {
@@ -1540,13 +1539,15 @@ it.effect("retains an accepted SQL compact through its terminal event before Hos
           }),
         ),
         Effect.provide(
-          Layer.mock(OrchestrationEngineService)({
-            subscribeDomainEvents: PubSub.subscribe(events).pipe(
-              Effect.map(Stream.fromSubscription),
-            ),
-          }),
+          Layer.mergeAll(
+            Layer.mock(OrchestrationEngineService)({
+              subscribeDomainEvents: PubSub.subscribe(events).pipe(
+                Effect.map(Stream.fromSubscription),
+              ),
+            }),
+            ProjectWorkEventBusLive,
+          ),
         ),
-        Effect.provide(ProjectWorkEventBusLive),
         Effect.forkChild,
       );
       yield* Deferred.await(waiting);

@@ -2573,7 +2573,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       const authority = yield* current(identity);
       const dispatches = yield* sql<{
         dispatch_id: string;
-      }>`SELECT dispatch_id FROM project_team_dispatch
+        cleanup_claim_revision: number | null;
+      }>`SELECT dispatch_id,cleanup_claim_revision FROM project_team_dispatch
         WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
         AND generation=${authority.binding.generation} LIMIT 2`;
       if (dispatches.length !== 1 || !dispatches[0])
@@ -2594,8 +2595,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       const saved = yield* sql<{
         operation_id: string;
       }>`SELECT operation_id FROM project_team_pi_operation WHERE operation_id=${operationId}`;
-      if (saved.length === 0)
+      if (saved.length === 0) {
+        if (dispatches[0].cleanup_claim_revision !== null)
+          return yield* deny("Original dispatch has claimed cleanup", "conflict");
         yield* assertHistoryCapacity(authority.binding.recordId, authority.binding.generation);
+      }
       const rows = yield* sql<{
         operation_id: string;
       }>`SELECT operation_id FROM project_team_pi_operation
@@ -2733,6 +2737,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       const result = yield* sql.withTransaction(
         Effect.gen(function* () {
           const authority = yield* current(identity, request.kind === "initialize");
+          const cleanup = yield* sql`SELECT dispatch_id FROM project_team_dispatch
+            WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
+            AND generation=${authority.binding.generation} AND cleanup_claim_revision IS NOT NULL LIMIT 1`;
+          if (cleanup.length)
+            return yield* deny("Original dispatch has claimed cleanup", "conflict");
           if (allocation.launch.workspaceRoot !== authority.binding.worktree)
             return yield* deny("Allocated workspace differs from durable assignment");
           yield* assertReviewAllocation(authority.binding, allocation);

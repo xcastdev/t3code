@@ -204,6 +204,10 @@ export const waitForProjectTeamRetainedCompaction = Effect.fn(
   readonly environmentId: string;
   readonly snapshot: Snapshot;
   readonly assertCurrent: Effect.Effect<void, ProjectTeamDispatchJournalError>;
+  readonly claimCleanup?: Effect.Effect<
+    { readonly _tag: "WaitingForCompact" } | { readonly _tag: "Claimed" },
+    ProjectTeamDispatchJournalError
+  >;
 }) {
   const sql = yield* SqlClient.SqlClient;
   const engine = yield* OrchestrationEngineService;
@@ -226,7 +230,10 @@ export const waitForProjectTeamRetainedCompaction = Effect.fn(
     const compacts = rows.filter((row) => row.operation_kind === "compact");
     if (compacts.some((row) => row.status === "quarantine"))
       return yield* denied("Retained compact requires physical reconciliation");
-    if (compacts.every((row) => row.status === "settled")) return;
+    if (compacts.every((row) => row.status === "settled")) {
+      if (input.claimCleanup === undefined) return;
+      if ((yield* input.claimCleanup)._tag === "Claimed") return;
+    }
     yield* waitForProjectTeamAssignmentChange(
       pull,
       Math.min(
@@ -870,7 +877,7 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
           snapshot.intent.limits.deadlineAtMs,
           {
             projectId: binding.projectId,
-            assertCurrent: assertCurrent(owner, snapshot.fence).pipe(Effect.asVoid),
+            assertCurrent: boundary(assertCurrent(owner, snapshot.fence)).pipe(Effect.asVoid),
           },
         );
         if (
@@ -1031,6 +1038,9 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
             yield* owned(owner);
             const snapshot = yield* journal.readRetained(owner.snapshot.fence.dispatchId);
             owner.snapshot = snapshot;
+            const cleanupClaims = yield* sql`SELECT dispatch_id FROM project_team_dispatch
+              WHERE dispatch_id=${snapshot.fence.dispatchId} AND environment_id=${options.environmentId}
+              AND cleanup_claim_revision IS NOT NULL`;
             const current = yield* boundary(
               options.assertEnabled.pipe(
                 Effect.andThen(journal.inspect(snapshot.fence.dispatchId)),
@@ -1038,6 +1048,7 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
             ).pipe(Effect.result);
             if (
               current._tag === "Failure" ||
+              cleanupClaims.length > 0 ||
               // An existing claim cannot prove that its first Git writer completed before a crash.
               (snapshot.fence.stage === "reserved" && snapshot.fence.claimGeneration > 0) ||
               snapshot.fence.stage === "quarantine" ||
@@ -1081,10 +1092,14 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
             yield* waitForProjectTeamRetainedCompaction({
               environmentId: options.environmentId,
               snapshot: owner.snapshot,
+              claimCleanup: boundary(journal.claimCleanup(owner.snapshot.fence)),
               assertCurrent: boundary(assertCurrent(owner, owner.snapshot.fence)).pipe(
                 Effect.asVoid,
               ),
-            });
+            }).pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.provideService(OrchestrationEngineService, engine),
+            );
             // A native terminal is observation, not release. Join every original writer before settlement.
             yield* stopAndJoin(owner);
             const retained = yield* journal.readRetained(owner.snapshot.fence.dispatchId);

@@ -2638,3 +2638,106 @@ it.effect(
       ),
     ),
 );
+
+const cleanupFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+    verifyStage: () => Effect.void,
+  });
+  let snapshot = yield* journal.claimEffect((yield* journal.reserve(f.request)).fence);
+  for (const stage of [
+    "workspace-ready",
+    "setup-complete",
+    "session-bound",
+    "assignment-intent",
+    "assignment-observed",
+  ] as const) {
+    snapshot = yield* journal.advanceStage(snapshot.fence, {
+      receiptId: `cleanup-${stage}`,
+      stage,
+      evidence: {},
+    });
+  }
+  return { ...f, journal, snapshot: yield* journal.readRetained(snapshot.fence.dispatchId) };
+});
+
+it.effect(
+  "claims the current dispatch cleanup once without changing stages, receipts or budgets",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* cleanupFixture;
+        const before = yield* f.journal.readStageReceipts(f.request.dispatchId);
+        const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        const outcomes = yield* Effect.all(
+          [f.journal.claimCleanup(f.snapshot.fence), f.journal.claimCleanup(f.snapshot.fence)],
+          { concurrency: 2 },
+        );
+        expect(outcomes.map((outcome) => outcome._tag)).toEqual(["Claimed", "Claimed"]);
+        expect(yield* f.sql`SELECT cleanup_claim_revision FROM project_team_dispatch`).toEqual([
+          { cleanup_claim_revision: f.snapshot.fence.revision },
+        ]);
+        expect(yield* f.journal.readRetained(f.request.dispatchId)).toEqual(f.snapshot);
+        expect(yield* f.journal.readStageReceipts(f.request.dispatchId)).toEqual(before);
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budget);
+        expect(
+          (yield* f.journal
+            .claimCleanup({ ...f.snapshot.fence, revision: f.snapshot.fence.revision - 1 })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(f.journal.claimCleanup(f.snapshot.fence))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+);
+
+for (const failure of ["cas-race", "after-update"] as const) {
+  it.effect(`rolls back the entire cleanup claim on ${failure}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* cleanupFixture;
+        const before = yield* f.sql`SELECT * FROM project_team_dispatch`;
+        let injected = false;
+        const observingSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (statement.compile()[0].includes("SET cleanup_claim_revision=")) {
+              injected = true;
+              return failure === "cas-race"
+                ? f.sql`UPDATE project_team_dispatch SET revision=revision+1 WHERE dispatch_id=${f.request.dispatchId}`.pipe(
+                    Effect.andThen(statement),
+                  )
+                : statement.pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new ProjectTeamDispatchJournalError({
+                          reason: "Injected after cleanup UPDATE",
+                        }),
+                      ),
+                    ),
+                  );
+            }
+            return statement;
+          },
+        });
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+        }).pipe(Effect.provideService(SqlClient.SqlClient, observingSql));
+        expect(
+          (yield* journal
+            .claimCleanup(f.snapshot.fence)
+            .pipe(Effect.provideService(SqlClient.SqlClient, observingSql), Effect.result))._tag,
+        ).toBe("Failure");
+        expect(injected).toBe(true);
+        expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toEqual(before);
+        expect((yield* f.journal.claimCleanup(f.snapshot.fence))._tag).toBe("Claimed");
+      }),
+    ),
+  );
+}

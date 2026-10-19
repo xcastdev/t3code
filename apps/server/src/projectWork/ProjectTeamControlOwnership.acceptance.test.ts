@@ -37,6 +37,7 @@ import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import {
   makeProjectTeamDispatchJournal,
   type ProjectTeamDispatchRequest,
+  ProjectTeamDispatchJournalError,
 } from "./ProjectTeamDispatchJournal.ts";
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 type AwaitedState = Effect.Success<ReturnType<typeof readCurrentState>>;
@@ -300,14 +301,22 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
           Date.parse(at) + 300000,
           {
             projectId,
-            assertCurrent: f.journal.inspect(claimed.fence.dispatchId).pipe(Effect.asVoid),
+            assertCurrent: f.journal.inspect(claimed.fence.dispatchId).pipe(
+              Effect.asVoid,
+              Effect.mapError(
+                () =>
+                  new ProjectTeamDispatchJournalError({
+                    reason: "Current dispatch authority changed",
+                  }),
+              ),
+            ),
           },
         ).pipe(
           Effect.onError(() =>
             Effect.gen(function* () {
               yield* stopProjectTeamOwnedThread(pi, claimed);
               yield* journal.settleAfterJoined(claimed.fence, terminal);
-            }),
+            }).pipe(Effect.orDie),
           ),
           Effect.forkChild,
         );
