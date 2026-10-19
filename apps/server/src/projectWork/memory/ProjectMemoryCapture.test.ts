@@ -340,191 +340,213 @@ it.effect("shutdown joins a worker held at server activation without capturing",
   }).pipe(Effect.scoped, Effect.provide(captureDatabase)),
 );
 
-it.effect(
-  "suppresses superseded decisions before replacement acceptance without reviving old observations",
-  () =>
-    Effect.gen(function* () {
-      const dependencies = yield* fixture;
-      const { sql, repository } = dependencies;
-      const service = makeProjectMemoryService(dependencies);
-      const retainObservation = Effect.fn("retainObservation")(function* (
-        source: ProjectMemorySource,
-      ) {
-        yield* repository.executeAtomic(
-          Effect.gen(function* () {
-            const state = yield* readCurrentState(sql, projectId);
-            const extraction = state.foundationRecords!.find(
-              (record) =>
-                record.kind === "memory-extraction" && record.sourceId === source.recordId,
-            );
-            if (extraction?.kind !== "memory-extraction")
-              return yield* Effect.die("Missing extraction");
-            const observation = yield* decodeObservation({
-              kind: "memory-observation",
-              recordId: `observation:${source.recordId}`,
-              projectId,
-              revision: 0,
-              generation: source.generation,
-              updatedAt: at,
-              status: "current",
-              sourceId: source.recordId,
-              sourceRevision: source.sourceRevision,
-              sourceGeneration: source.generation,
-              extractionId: extraction.recordId,
-              observationKey: "strategy",
-              body: source.content,
-              provenance: source.attribution,
-            });
-            return yield* service.commit(
-              state,
-              [
-                {
-                  ...extraction,
-                  revision: extraction.revision + 1,
-                  status: "extracted",
-                  extractionHash: "fixture-hash",
-                  expectedObservationIds: [observation.recordId],
-                },
-                observation,
-              ],
-              at,
-            );
-          }),
+for (const archived of [false, true])
+  it.effect(
+    `suppresses superseded decisions ${archived ? "during archive and after restore" : "before replacement acceptance"} without reviving old observations`,
+    () =>
+      Effect.gen(function* () {
+        const dependencies = yield* fixture;
+        const { sql, repository } = dependencies;
+        const service = makeProjectMemoryService(dependencies);
+        const retainObservation = Effect.fn("retainObservation")(function* (
+          source: ProjectMemorySource,
+        ) {
+          yield* repository.executeAtomic(
+            Effect.gen(function* () {
+              const state = yield* readCurrentState(sql, projectId);
+              const extraction = state.foundationRecords!.find(
+                (record) =>
+                  record.kind === "memory-extraction" && record.sourceId === source.recordId,
+              );
+              if (extraction?.kind !== "memory-extraction")
+                return yield* Effect.die("Missing extraction");
+              const observation = yield* decodeObservation({
+                kind: "memory-observation",
+                recordId: `observation:${source.recordId}`,
+                projectId,
+                revision: 0,
+                generation: source.generation,
+                updatedAt: at,
+                status: "current",
+                sourceId: source.recordId,
+                sourceRevision: source.sourceRevision,
+                sourceGeneration: source.generation,
+                extractionId: extraction.recordId,
+                observationKey: "strategy",
+                body: source.content,
+                provenance: source.attribution,
+              });
+              return yield* service.commit(
+                state,
+                [
+                  {
+                    ...extraction,
+                    revision: extraction.revision + 1,
+                    status: "extracted",
+                    extractionHash: "fixture-hash",
+                    expectedObservationIds: [observation.recordId],
+                  },
+                  observation,
+                ],
+                at,
+              );
+            }),
+          );
+        });
+        const retrieve = () => readProjectMemoryObservations(sql, projectId, "parser");
+        yield* configure;
+        const capture = yield* makeProjectMemoryCapture({ environmentId: "capture-environment" });
+        yield* capture.ready;
+        const decision = yield* decodeDecision({
+          decisionId: "capture-decision",
+          projectId,
+          title: "Parser strategy",
+          body: "Retain a stable parser strategy.",
+          state: "proposed",
+          revision: 0,
+          createdAt: at,
+          updatedAt: at,
+          attribution,
+        });
+        yield* repository.execute({
+          type: "project-work.decision.propose",
+          projectId,
+          commandId: CommandId.make("decision-propose"),
+          decision,
+          proposedAt: at,
+          attribution,
+        });
+        yield* capture.drain(
+          (yield* sql<{
+            cursor: number;
+          }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
         );
-      });
-      const retrieve = () => readProjectMemoryObservations(sql, projectId, "parser");
-      yield* configure;
-      const capture = yield* makeProjectMemoryCapture({ environmentId: "capture-environment" });
-      yield* capture.ready;
-      const decision = yield* decodeDecision({
-        decisionId: "capture-decision",
-        projectId,
-        title: "Parser strategy",
-        body: "Retain a stable parser strategy.",
-        state: "proposed",
-        revision: 0,
-        createdAt: at,
-        updatedAt: at,
-        attribution,
-      });
-      yield* repository.execute({
-        type: "project-work.decision.propose",
-        projectId,
-        commandId: CommandId.make("decision-propose"),
-        decision,
-        proposedAt: at,
-        attribution,
-      });
-      yield* capture.drain(
-        (yield* sql<{
-          cursor: number;
-        }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
-      );
-      expect(yield* sql`SELECT * FROM project_team_memory_source`).toHaveLength(1);
-      yield* repository.execute({
-        type: "project-work.decision.accept",
-        projectId,
-        commandId: CommandId.make("decision-accept"),
-        decisionId: decision.decisionId,
-        acceptedAt: at,
-        attribution,
-      });
-      yield* capture.drain(
-        (yield* sql<{
-          cursor: number;
-        }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
-      );
-      const original = (yield* readCurrentState(sql, projectId)).foundationRecords!.find(
-        (record) => record.kind === "memory-source" && record.sourceKind === "decision",
-      );
-      expect(original?.kind).toBe("memory-source");
-      if (original?.kind !== "memory-source") return yield* Effect.die("Missing original source");
-      const unrelated = (yield* readCurrentState(sql, projectId)).foundationRecords!.find(
-        (record) => record.kind === "memory-source" && record.sourceKind === "finding",
-      );
-      if (unrelated?.kind !== "memory-source") return yield* Effect.die("Missing unrelated source");
-      yield* retainObservation(original);
-      yield* retainObservation(unrelated);
-      expect((yield* retrieve()).records.map((record) => record.sourceId).sort()).toEqual(
-        [original.recordId, unrelated.recordId].sort(),
-      );
-      const replacement = yield* decodeDecision({
-        ...decision,
-        decisionId: "capture-replacement",
-        body: "Retain the corrected parser strategy.",
-      });
-      yield* repository.execute({
-        type: "project-work.decision.supersede",
-        projectId,
-        commandId: CommandId.make("decision-supersede"),
-        decisionId: decision.decisionId,
-        replacement,
-        supersededAt: at,
-        attribution,
-      });
-      yield* capture.drain(
-        (yield* sql<{
-          cursor: number;
-        }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
-      );
-      const pending = yield* retrieve();
-      expect(pending.status).toBe("available");
-      expect(pending.records.map((record) => record.sourceId)).toEqual([unrelated.recordId]);
-      const pendingState = yield* readCurrentState(sql, projectId);
-      expect(
-        pendingState.foundationRecords!.find((record) => record.recordId === original.recordId),
-      ).toMatchObject({ status: "superseded" });
-      expect(
-        pendingState.foundationRecords!.find((record) => record.recordId === unrelated.recordId),
-      ).toEqual(unrelated);
-      expect(
-        pendingState.foundationRecords!.filter(
+        expect(yield* sql`SELECT * FROM project_team_memory_source`).toHaveLength(1);
+        yield* repository.execute({
+          type: "project-work.decision.accept",
+          projectId,
+          commandId: CommandId.make("decision-accept"),
+          decisionId: decision.decisionId,
+          acceptedAt: at,
+          attribution,
+        });
+        yield* capture.drain(
+          (yield* sql<{
+            cursor: number;
+          }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
+        );
+        const original = (yield* readCurrentState(sql, projectId)).foundationRecords!.find(
           (record) => record.kind === "memory-source" && record.sourceKind === "decision",
-        ),
-      ).toHaveLength(1);
-      expect(
-        yield* sql`SELECT effect_id FROM project_team_memory_job
+        );
+        expect(original?.kind).toBe("memory-source");
+        if (original?.kind !== "memory-source") return yield* Effect.die("Missing original source");
+        const unrelated = (yield* readCurrentState(sql, projectId)).foundationRecords!.find(
+          (record) => record.kind === "memory-source" && record.sourceKind === "finding",
+        );
+        if (unrelated?.kind !== "memory-source")
+          return yield* Effect.die("Missing unrelated source");
+        yield* retainObservation(original);
+        yield* retainObservation(unrelated);
+        expect((yield* retrieve()).records.map((record) => record.sourceId).sort()).toEqual(
+          [original.recordId, unrelated.recordId].sort(),
+        );
+        if (archived) {
+          yield* sql`INSERT INTO project_lifecycle (project_id,state,workspace_root,changed_at)
+          VALUES (${projectId},'archived','/fixture/capture',${at})`;
+          expect(
+            (yield* service
+              .captureRetained(projectId, {
+                kind: "decision",
+                retainedId: decision.decisionId,
+              })
+              .pipe(Effect.exit))._tag,
+          ).toBe("Failure");
+        }
+        const replacement = yield* decodeDecision({
+          ...decision,
+          decisionId: "capture-replacement",
+          body: "Retain the corrected parser strategy.",
+        });
+        yield* repository.execute({
+          type: "project-work.decision.supersede",
+          projectId,
+          commandId: CommandId.make("decision-supersede"),
+          decisionId: decision.decisionId,
+          replacement,
+          supersededAt: at,
+          attribution,
+        });
+        yield* capture.drain(
+          (yield* sql<{
+            cursor: number;
+          }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
+        );
+        if (archived) {
+          const suppressed = (yield* readCurrentState(sql, projectId)).foundationRecords!.find(
+            (record) => record.recordId === original.recordId,
+          );
+          expect(suppressed).toMatchObject({ status: "superseded" });
+          yield* sql`UPDATE project_lifecycle SET state='active' WHERE project_id=${projectId}`;
+          yield* capture.drain();
+        }
+        const pending = yield* retrieve();
+        expect(pending.status).toBe("available");
+        expect(pending.records.map((record) => record.sourceId)).toEqual([unrelated.recordId]);
+        const pendingState = yield* readCurrentState(sql, projectId);
+        expect(
+          pendingState.foundationRecords!.find((record) => record.recordId === original.recordId),
+        ).toMatchObject({ status: "superseded" });
+        expect(
+          pendingState.foundationRecords!.find((record) => record.recordId === unrelated.recordId),
+        ).toEqual(unrelated);
+        expect(
+          pendingState.foundationRecords!.filter(
+            (record) => record.kind === "memory-source" && record.sourceKind === "decision",
+          ),
+        ).toHaveLength(1);
+        expect(
+          yield* sql`SELECT effect_id FROM project_team_memory_job
         WHERE json_extract(input_json, '$.effect.effectKind')='memory-delete'`,
-      ).toHaveLength(1);
-      const beforeReplay = pendingState;
-      yield* capture.stop;
-      const restarted = yield* makeProjectMemoryCapture({ environmentId: "capture-environment" });
-      yield* restarted.ready;
-      expect(yield* readCurrentState(sql, projectId)).toEqual(beforeReplay);
-      yield* repository.execute({
-        type: "project-work.decision.accept",
-        projectId,
-        commandId: CommandId.make("replacement-accept"),
-        decisionId: replacement.decisionId,
-        acceptedAt: at,
-        attribution,
-      });
-      yield* restarted.drain(
-        (yield* sql<{
-          cursor: number;
-        }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
-      );
-      const sources = (yield* readCurrentState(sql, projectId)).foundationRecords!.filter(
-        (record) => record.kind === "memory-source" && record.sourceKind === "decision",
-      );
-      expect(sources).toHaveLength(2);
-      expect(sources.find((record) => record.status === "current")).toMatchObject({
-        supersedes: original.recordId,
-      });
-      const accepted = sources.find((record) => record.status === "current");
-      if (accepted?.kind !== "memory-source") return yield* Effect.die("Missing accepted source");
-      expect(accepted.generation).toBe(original.generation + 1);
-      yield* retainObservation(accepted);
-      expect((yield* retrieve()).records.map((record) => record.sourceId).sort()).toEqual(
-        [accepted.recordId, unrelated.recordId].sort(),
-      );
-      yield* restarted.drain();
-      expect(
-        (yield* retrieve()).records.some((record) => record.sourceId === original.recordId),
-      ).toBe(false);
-      yield* restarted.stop;
-    }).pipe(Effect.scoped, Effect.provide(captureDatabase)),
-);
+        ).toHaveLength(1);
+        const beforeReplay = pendingState;
+        yield* capture.stop;
+        const restarted = yield* makeProjectMemoryCapture({ environmentId: "capture-environment" });
+        yield* restarted.ready;
+        expect(yield* readCurrentState(sql, projectId)).toEqual(beforeReplay);
+        yield* repository.execute({
+          type: "project-work.decision.accept",
+          projectId,
+          commandId: CommandId.make("replacement-accept"),
+          decisionId: replacement.decisionId,
+          acceptedAt: at,
+          attribution,
+        });
+        yield* restarted.drain(
+          (yield* sql<{
+            cursor: number;
+          }>`SELECT MAX(sequence) AS cursor FROM project_work_events`)[0]!.cursor,
+        );
+        const sources = (yield* readCurrentState(sql, projectId)).foundationRecords!.filter(
+          (record) => record.kind === "memory-source" && record.sourceKind === "decision",
+        );
+        expect(sources).toHaveLength(2);
+        expect(sources.find((record) => record.status === "current")).toMatchObject({
+          supersedes: original.recordId,
+        });
+        const accepted = sources.find((record) => record.status === "current");
+        if (accepted?.kind !== "memory-source") return yield* Effect.die("Missing accepted source");
+        expect(accepted.generation).toBe(original.generation + 1);
+        yield* retainObservation(accepted);
+        expect((yield* retrieve()).records.map((record) => record.sourceId).sort()).toEqual(
+          [accepted.recordId, unrelated.recordId].sort(),
+        );
+        yield* restarted.drain();
+        expect(
+          (yield* retrieve()).records.some((record) => record.sourceId === original.recordId),
+        ).toBe(false);
+        yield* restarted.stop;
+      }).pipe(Effect.scoped, Effect.provide(captureDatabase)),
+  );
 
 it.effect("a newly known secret prevents capture without starving later safe sources", () =>
   Effect.gen(function* () {

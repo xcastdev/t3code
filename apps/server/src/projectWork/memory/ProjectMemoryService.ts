@@ -302,11 +302,13 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
   const manifests = dependencies.manifests ?? makeProjectMemoryManifestStore(sql);
   const requireProject = Effect.fn("ProjectMemoryService.requireProject")(function* (
     projectId: string,
+    allowArchived = false,
   ) {
     const rows = yield* sql`SELECT p.project_id FROM projection_projects p
       LEFT JOIN project_lifecycle l ON l.project_id=p.project_id
       WHERE p.project_id=${projectId} AND p.deleted_at IS NULL
-      AND (l.state IS NULL OR l.state='active') AND l.tombstone_json IS NULL`;
+      AND (l.state IS NULL OR l.state='active' OR (${allowArchived} AND l.state='archived'))
+      AND l.tombstone_json IS NULL`;
     if (rows.length !== 1) return yield* deny("Memory project is unavailable");
   });
   const commit = Effect.fn("ProjectMemoryService.commit")(function* (
@@ -395,7 +397,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     yield* repository.executeAtomic(
       Effect.gen(function* () {
         yield* authorizeCapture(projectId);
-        yield* requireProject(projectId);
+        yield* requireProject(projectId, true);
         const state = yield* readCurrentState(sql, projectId);
         if (
           !state.decisions?.some(
@@ -422,7 +424,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
         return yield* commit(state, changed, at);
       }),
       Effect.gen(function* () {
-        yield* requireProject(projectId);
+        yield* requireProject(projectId, true);
         yield* authorizeCapture(projectId);
       }),
     );
