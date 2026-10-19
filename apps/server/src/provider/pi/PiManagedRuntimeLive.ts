@@ -36,7 +36,7 @@ import {
   ProjectTeamAuthorization,
   type ProjectTeamAuthority,
 } from "../../projectWork/ProjectTeamAuthorization.ts";
-import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import { GitRepositoryPermits } from "../../git/GitRepositoryPermits.ts";
 import * as ManagedGit from "../../git/ManagedGitExecution.ts";
 import {
   makeProjectTeamDispatchJournal,
@@ -681,7 +681,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const reviewFreshness = yield* makeProjectTeamReviewFreshness({
     environmentId: options.environmentId,
   });
-  const workflow = yield* Effect.serviceOption(GitWorkflowService);
+  const repositoryPermits = yield* Effect.serviceOption(GitRepositoryPermits);
   const dispatchJournal = yield* makeProjectTeamDispatchJournal({
     environmentId: options.environmentId,
     maximumEnvironmentModelCalls: 128,
@@ -1646,7 +1646,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 let reviewTarget: PiManagedLaunch["reviewTarget"];
                 const checkReviewTarget = Effect.gen(function* () {
                   if (!retainedReview) return;
-                  if (authority.role.role !== "reviewer" || Option.isNone(workflow))
+                  if (authority.role.role !== "reviewer" || Option.isNone(repositoryPermits))
                     return yield* deny(
                       "Review target requires its original readonly reviewer host",
                     );
@@ -1726,7 +1726,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         }),
                     ),
                   );
-                  yield* workflow.value.withRepositoryPermit(
+                  yield* repositoryPermits.value.withRepositoryPermit(
                     "review.target",
                     job.target.repository,
                     Effect.gen(function* () {

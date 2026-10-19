@@ -1,4 +1,4 @@
-import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import { GitRepositoryPermits } from "../../git/GitRepositoryPermits.ts";
 import { canReleasePiVerificationRuntime } from "./PiVerificationRuntimeRetention.ts";
 import { HostProcessUserId } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
@@ -375,11 +375,11 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
   const setupAssets = yield* makeProjectManagedSetupAssetLifetime({
     environmentId: options.environmentId,
   });
-  const workflow = yield* GitWorkflowService;
+  const repositoryPermits = yield* GitRepositoryPermits;
   // Instance finalizers belong to its caller's scope, not the factory construction scope.
   const services = (yield* Effect.context<
     Effect.Services<ReturnType<typeof makePiManagedRuntimeLive>>
-  >()).pipe(Context.add(GitWorkflowService, workflow), Context.omit(Scope.Scope));
+  >()).pipe(Context.add(GitRepositoryPermits, repositoryPermits), Context.omit(Scope.Scope));
   const readCatalogue = catalogue.readFresh.pipe(
     Effect.map((value) => {
       if (!value) return undefined;

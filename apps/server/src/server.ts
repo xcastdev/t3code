@@ -553,7 +553,11 @@ const GitLayerLive = Layer.empty.pipe(
   Layer.provideMerge(GitVcsDriver.layer),
 );
 
-const GitWorkflowLayerLive = GitWorkflowService.layer.pipe(
+export const GitRepositoryPermitsLayerLive = GitRepositoryPermits.layer.pipe(
+  Layer.provide(VcsDriverRegistryLayerLive),
+);
+
+export const GitWorkflowLayerLive = GitWorkflowService.layer.pipe(
   Layer.provideMerge(VcsDriverRegistryLayerLive),
   Layer.provideMerge(GitLayerLive),
 );
@@ -774,7 +778,7 @@ const ProjectTeamPiRuntimeLayerLive = Layer.effect(
 
 const ProjectWorkVerificationLive = ProjectWorkVerification.layer.pipe(
   Layer.provide(ProjectTeamPiRuntimeLayerLive),
-  Layer.provide(GitRepositoryPermits.layer.pipe(Layer.provide(VcsDriverRegistryLayerLive))),
+  Layer.provide(GitRepositoryPermitsLayerLive),
   Layer.provide(ServerEnvironmentLayerLive),
   Layer.provide(ServerSettingsLayerLive),
   Layer.provide(PersistenceLayerLive),
@@ -923,7 +927,7 @@ const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
   Layer.provideMerge(ProjectLifecycleLive),
 );
 
-const PiProductionRuntimeLayerLive = Layer.effect(
+export const PiProductionRuntimeLayerLive = Layer.effect(
   PiManagedRuntime,
   Effect.gen(function* () {
     // Native cache and process ownership currently require the proven Linux host.
@@ -971,7 +975,8 @@ const PiProductionRuntimeLayerLive = Layer.effect(
     );
   }).pipe(Effect.orDie),
 ).pipe(
-  Layer.provide(GitWorkflowLayerLive),
+  // Registry hydration consumes Pi before GitManager can acquire text generation.
+  Layer.provideMerge(GitRepositoryPermitsLayerLive),
   Layer.provideMerge(ProjectTeamPiRuntimeLayerLive),
   Layer.provideMerge(PiModelCatalogueLayerLive),
   // Use the same memoized service layers as the driver and skill catalogue.

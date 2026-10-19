@@ -542,7 +542,14 @@ const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>, memoryRetraction = fals
         Layer.provideMerge(ServerSettings.layerTest({ projectWorkEnabled: true })),
         Layer.provideMerge(makeSqlitePersistenceLive(directory + "/native-runtime.sqlite")),
         Layer.provideMerge(
-          Layer.mock(GitWorkflowService, { withRepositoryPermit: (_operation, _cwd, use) => use }),
+          Layer.merge(
+            Layer.mock(GitWorkflowService, {
+              withRepositoryPermit: (_operation, _cwd, use) => use,
+            }),
+            Layer.mock(GitRepositoryPermits, {
+              withRepositoryPermit: (_operation, _cwd, use) => use,
+            }),
+          ),
         ),
       );
       return yield* Effect.scoped(effect).pipe(Effect.provide(live));
@@ -6972,9 +6979,14 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
     },
   };
   const repositoryPermit = yield* Semaphore.make(1);
-  const workflowLayer = Layer.mock(GitWorkflowService, {
-    withRepositoryPermit: (_operation, _cwd, use) => repositoryPermit.withPermits(1)(use),
-  });
+  const workflowLayer = Layer.merge(
+    Layer.mock(GitWorkflowService, {
+      withRepositoryPermit: (_operation, _cwd, use) => repositoryPermit.withPermits(1)(use),
+    }),
+    Layer.mock(GitRepositoryPermits, {
+      withRepositoryPermit: (_operation, _cwd, use) => repositoryPermit.withPermits(1)(use),
+    }),
+  );
   const runtime = yield* makePiManagedRuntimeLive(options).pipe(Effect.provide(workflowLayer));
   const instance = yield* runtime.forInstance({
     instanceId: providerInstanceId,
@@ -15453,8 +15465,45 @@ it.effect(
     ),
 );
 
+it.effect(
+  "readonly review target denies a workflow without its original repository permit host",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture();
+        const construction = makePiManagedRuntimeLive(f.options);
+        type Requirements = Effect.Services<typeof construction>;
+        const runtime = yield* construction.pipe(
+          Effect.updateContext((context: Context.Context<Requirements>) => {
+            const services = new Map(context.mapUnsafe);
+            services.delete(GitRepositoryPermits.key);
+            return Context.makeUnsafe<Requirements>(services);
+          }),
+        );
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const result = yield* instance
+          .prepareOperation(
+            {
+              threadId: f.binding.threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+            },
+            () => Effect.void,
+          )
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(f.allocations).toBe(0);
+        expect(yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).toEqual([]);
+      }),
+    ),
+);
+
 (process.env.PI_REVIEW_TARGET_NATIVE_DIST ? it.effect : it.effect.skip)(
-  "production factory captures canonical Git workflow for readonly reviewer preparation",
+  "production factory captures shared repository permits for readonly reviewer preparation",
   () =>
     scoped(
       Effect.gen(function* () {
@@ -15476,7 +15525,7 @@ it.effect(
         const captured = yield* Layer.build(canonicalWorkflow);
         const workflow = Context.get(captured, GitWorkflowService);
         const sharedPermits = Context.get(captured, GitRepositoryPermits);
-        const workflowCalls = vi.spyOn(workflow, "withRepositoryPermit");
+        const workflowCalls = vi.spyOn(sharedPermits, "withRepositoryPermit");
         yield* Effect.addFinalizer(() => Effect.sync(() => workflowCalls.mockRestore()));
         const key = yield* ManagedGit.canonicalGitMutationKey(
           f.implementationMain + "/.git",
@@ -15504,7 +15553,7 @@ it.effect(
           maxInputTokens: f.options.maxInputTokens,
           maxOutputTokens: f.options.maxOutputTokens,
         }).pipe(
-          Effect.provide(captured),
+          Effect.provideService(GitRepositoryPermits, sharedPermits),
           Effect.provideService(PiModelCatalogue, {
             readFresh: f.options.readCatalogue.pipe(Effect.orDie),
             refresh: Effect.die("Unexpected factory refresh"),
