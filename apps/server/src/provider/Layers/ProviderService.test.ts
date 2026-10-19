@@ -69,13 +69,14 @@ import {
 } from "../Errors.ts";
 import type {
   ProviderAdapterShape,
-  ProviderAdapterSessionStartInput,
   ProviderAgentTranscriptPage,
 } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "./ProviderService.ts";
+import { makePiAdapter } from "./PiAdapter.ts";
+import { PiManagedRuntimeError, type PiManagedRuntimeInstance } from "../pi/PiManagedRuntime.ts";
 import {
   sendManagedProviderAssignment,
   startManagedProviderSession,
@@ -187,7 +188,7 @@ function makeFakeCodexAdapter(
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
 
-  const startSession = vi.fn((input: ProviderAdapterSessionStartInput) =>
+  const startSession = vi.fn<ProviderAdapterShape<ProviderAdapterError>["startSession"]>((input) =>
     Effect.sync(() => {
       onStartSession?.();
       const now = "2026-01-01T00:00:00.000Z";
@@ -781,6 +782,72 @@ const assertManagedDenial = <A, E>(exit: Exit.Exit<A, E>, issue?: string) => {
 };
 
 describe("ProviderService private managed sessions", () => {
+  for (const code of ["denied", "conflict", "unavailable", "uncertain", "unknown"] as const) {
+    it.effect(`retains only safe startup classification after skill preparation: ${code}`, () => {
+      const pi = makeFakeCodexAdapter(PI_DRIVER);
+      const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+      return Effect.gen(function* () {
+        const request = yield* createManagedPiThread;
+        request.input.modelSelection.options = [];
+        const privateText = "credential account raw-protocol private-startup-detail";
+        const runtime: PiManagedRuntimeInstance = {
+          inspect: Effect.die("unused"),
+          prepareOperation: () =>
+            Effect.fail(
+              new PiManagedRuntimeError({
+                code: code === "unknown" ? "uncertain" : code,
+                detail: privateText,
+              }),
+            ),
+          readSession: () => Effect.die("unused"),
+          readThread: () => Effect.die("unused"),
+          authorizeSkills: () => Effect.die("unused"),
+          discoverNativeSkills: () => Effect.die("unused"),
+          requestStop: () => Effect.void,
+          stopAll: Effect.void,
+        };
+        const adapter = yield* makePiAdapter({ instanceId: piInstanceId, runtime });
+        pi.startSession.mockImplementationOnce((input) =>
+          code === "unknown"
+            ? Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: PI_DRIVER,
+                  method: privateText,
+                  detail: privateText,
+                  cause: new Error(privateText),
+                }),
+              )
+            : adapter.startSession(input),
+        );
+        const service = yield* ProviderService.ProviderService;
+        assert.isTrue(
+          Exit.isFailure(yield* startManagedProviderSession(service, request).pipe(Effect.exit)),
+        );
+        assert.equal(fixture.prepare.mock.calls.length, 1);
+        assert.equal(pi.startSession.mock.calls.length, 1);
+        const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+        const failure = (yield* query.getCommandReadModel()).skillApplications?.[0]?.failure;
+        assert.equal(
+          failure?.code,
+          code === "unknown" ? "provider_session_start_failed" : `provider_session_start_${code}`,
+        );
+        assert.equal(
+          failure?.message,
+          code === "unknown"
+            ? "The provider session could not start after managed skill preparation."
+            : {
+                denied: "The provider denied session startup after managed skill preparation.",
+                conflict: "The provider session startup conflicted with current state.",
+                unavailable: "The provider session runtime is unavailable.",
+                uncertain: "The provider session startup could not be confirmed.",
+              }[code],
+        );
+        assert.notInclude(encodeJson(failure), privateText);
+        assert.equal(fixture.dispose.mock.calls.length, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    });
+  }
+
   it.effect(
     "uses original primary skills, assigned cwd, and stable revision across restart initialization",
     () =>

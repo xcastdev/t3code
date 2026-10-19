@@ -99,6 +99,7 @@ import {
   makeProviderTurnPublications,
 } from "../ProviderTurnPublications.ts";
 import { makeProviderManagedSessions } from "../ProviderManagedSessions.ts";
+import { getPiAdapterFailureCode } from "./PiAdapter.ts";
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
@@ -2745,7 +2746,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 ),
               );
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
-        const failedApplicationReceipt = () => {
+        const failedApplicationReceipt = (error?: unknown) => {
+          const failureCode = getPiAdapterFailureCode(error);
           if (skillPreparation === undefined || Option.isNone(orchestrationEngine)) {
             return Effect.void;
           }
@@ -2762,8 +2764,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 status: "failed",
                 attemptedAt,
                 failure: {
-                  code: "provider_session_start_failed",
-                  message: "The provider session could not apply the managed skill catalog.",
+                  code:
+                    failureCode === undefined
+                      ? "provider_session_start_failed"
+                      : `provider_session_start_${failureCode}`,
+                  message:
+                    failureCode === undefined
+                      ? "The provider session could not start after managed skill preparation."
+                      : {
+                          denied:
+                            "The provider denied session startup after managed skill preparation.",
+                          conflict: "The provider session startup conflicted with current state.",
+                          unavailable: "The provider session runtime is unavailable.",
+                          uncertain: "The provider session startup could not be confirmed.",
+                        }[failureCode],
                 },
                 outcomes: skillPreparation.application.outcomes.map((outcome) => ({
                   ...outcome,
@@ -2802,10 +2816,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             ),
           )
           .pipe(
-            Effect.tapError(() =>
+            Effect.tapError((error) =>
               Effect.all(
                 [
-                  failedApplicationReceipt(),
+                  failedApplicationReceipt(error),
                   Option.isSome(skillCatalog) && effectiveCwd !== undefined
                     ? skillCatalog.value
                         .disposeSession({

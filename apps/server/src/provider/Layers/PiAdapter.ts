@@ -45,8 +45,14 @@ import { registerProviderTurnEventSubscription } from "../ProviderTurnPublicatio
 const provider = ProviderDriverKind.make("piAgent");
 const invalid = (operation: string, issue: string) =>
   new ProviderAdapterValidationError({ provider, operation, issue });
-const requestError = (method: string, error: PiManagedRuntimeError) =>
-  new ProviderAdapterRequestError({
+// Keep only the bounded runtime code; private diagnostics never become adapter causes.
+const isPiManagedRuntimeError = Schema.is(PiManagedRuntimeError);
+const runtimeFailureCodes = new WeakMap<object, PiManagedRuntimeError["code"]>();
+export const getPiAdapterFailureCode = (error: unknown) =>
+  typeof error === "object" && error !== null ? runtimeFailureCodes.get(error) : undefined;
+
+const requestError = (method: string, error: PiManagedRuntimeError) => {
+  const failure = new ProviderAdapterRequestError({
     provider,
     method,
     detail: {
@@ -57,6 +63,9 @@ const requestError = (method: string, error: PiManagedRuntimeError) =>
         "Pi operation could not be confirmed. Reconcile the owned session before retrying.",
     }[error.code],
   });
+  if (isPiManagedRuntimeError(error)) runtimeFailureCodes.set(failure, error.code);
+  return failure;
+};
 
 const safeStopCause = (
   method: "stopSession" | "stopAll",

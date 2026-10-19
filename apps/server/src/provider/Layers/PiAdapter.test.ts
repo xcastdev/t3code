@@ -3223,3 +3223,48 @@ it.effect(
       }).pipe(Effect.provideService(Tracer.Tracer, tracer));
     }),
 );
+
+it.effect(
+  "readonly reviewer synthetic managed initialize hands off a ready session and prompt offline",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      fake.state.autoInitialize = false;
+      fake.state.session = { ...initialSession(), runtimeMode: "approval-required" };
+      const adapter = yield* makePiAdapter({
+        instanceId,
+        runtime: fake.runtime,
+        resolveOperationId: (request) => Effect.succeed(`reviewer-${request.kind}`),
+      });
+      const events = yield* subscribe(adapter.streamEvents);
+      const plan = readyPlan();
+      const starting = yield* Effect.forkScoped(
+        adapter.startSession({
+          threadId,
+          cwd: fake.state.session.cwd,
+          modelSelection: { instanceId, model: "frozen-model" },
+          resumeCursor: fake.state.session.resumeCursor,
+          runtimeMode: "approval-required",
+          skillPlan: plan,
+        }),
+      );
+      const initialize = yield* Queue.take(fake.preparedQueue);
+      yield* Deferred.await(initialize.started);
+      yield* fake.settle(initialize, "success");
+      const session = yield* Fiber.join(starting);
+      expect(session.status).toBe("ready");
+      expect(session.runtimeMode).toBe("approval-required");
+      expect((yield* Queue.take(events)).type).toBe("session.started");
+      const sent = yield* adapter.sendTurn({
+        threadId,
+        input: "Review the implementation without edits.",
+      });
+      expect(sent.threadId).toBe(threadId);
+      expect(fake.requests.map((request) => [request.kind, request.operationId])).toEqual([
+        ["initialize", "reviewer-initialize"],
+        ["prompt", "reviewer-prompt"],
+      ]);
+      expect(fake.requests[1]?.skillPlan).toEqual(plan);
+      yield* fake.settle(fake.operations[1]!, "success");
+    }),
+);
