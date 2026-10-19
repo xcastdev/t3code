@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { CommandId, ProjectWorkCriterionId, ProjectWorkTaskId } from "@t3tools/contracts";
+import {
+  CommandId,
+  ProjectWorkCriterionId,
+  ProjectWorkKnowledgeId,
+  ProjectWorkTaskId,
+} from "@t3tools/contracts";
 
 import {
+  makeProjectWorkKnowledgePromoteCommand,
   makeProjectWorkTaskClaimCommand,
   makeProjectWorkTaskCompleteCommand,
   makeProjectWorkCriterionUpsertCommand,
@@ -16,6 +22,25 @@ const taskId = ProjectWorkTaskId.make("task-1");
 const now = "2026-09-17T15:00:00.000Z";
 
 describe("project-work mutations", () => {
+  it("promotes a replacement with a distinct identity and its retained predecessor", () => {
+    const command = makeProjectWorkKnowledgePromoteCommand({
+      projectId,
+      expectedRevision: 9,
+      commandId: CommandId.make("correction"),
+      knowledgeId: ProjectWorkKnowledgeId.make("replacement"),
+      supersedesKnowledgeId: ProjectWorkKnowledgeId.make("previous"),
+      title: "Corrected context",
+      body: "Use the corrected procedure",
+      sourceKind: "manual",
+      sourceId: "human-correction",
+      promotedAt: now,
+    });
+    expect(command.knowledge).toMatchObject({
+      knowledgeId: "replacement",
+      supersedesKnowledgeId: "previous",
+    });
+    expect(command.expectedRevision).toBe(9);
+  });
   it("retains the complete draft-create payload", () => {
     expect(
       makeProjectWorkTaskCreateCommand({

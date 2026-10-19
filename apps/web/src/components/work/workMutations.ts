@@ -514,6 +514,7 @@ export const makeProjectWorkKnowledgePromoteCommand = (input: {
   expectedRevision: number;
   commandId: CommandId;
   knowledgeId: ProjectWorkKnowledgeId;
+  supersedesKnowledgeId?: ProjectWorkKnowledgeId;
   title: string;
   body: string;
   sourceKind: "task" | "thread" | "session" | "worktree" | "attempt" | "manual";
@@ -524,6 +525,9 @@ export const makeProjectWorkKnowledgePromoteCommand = (input: {
   type: "project-work.knowledge.promote",
   knowledge: {
     knowledgeId: input.knowledgeId,
+    ...(input.supersedesKnowledgeId === undefined
+      ? {}
+      : { supersedesKnowledgeId: input.supersedesKnowledgeId }),
     projectId: input.projectId,
     title: input.title,
     body: input.body,

@@ -12,7 +12,7 @@ import {
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { BookOpenIcon, PlusIcon, SearchIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { asProjectWorkBriefing, asProjectWorkPage } from "@t3tools/client-runtime/project-work";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -31,7 +31,19 @@ import {
   makeProjectWorkKnowledgePromoteCommand,
 } from "./workMutations";
 
-export function WorkKnowledge({
+export function WorkKnowledge(props: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly connected: boolean;
+  readonly canWrite?: boolean;
+  readonly streamAvailable?: boolean;
+}) {
+  return (
+    <WorkKnowledgeContent key={JSON.stringify([props.environmentId, props.projectId])} {...props} />
+  );
+}
+
+function WorkKnowledgeContent({
   environmentId,
   projectId,
   connected,
@@ -48,6 +60,8 @@ export function WorkKnowledge({
   const [offsets, setOffsets] = useState<ReadonlyArray<number>>([0]);
   const [hasMoreByOffset, setHasMoreByOffset] = useState<Readonly<Record<number, boolean>>>({});
   const [showPromote, setShowPromote] = useState(false);
+  const [replacement, setReplacement] = useState<ProjectWorkKnowledgeRead | null>(null);
+  const [editorLocked, setEditorLocked] = useState(false);
   const trimmedSearch = search.trim();
   const previousSearch = useRef(trimmedSearch);
   const briefingResult = useAtomValue(
@@ -104,16 +118,26 @@ export function WorkKnowledge({
             placeholder="Search this project"
           />
         </label>
-        <Button size="sm" disabled={!canWrite} onClick={() => setShowPromote((value) => !value)}>
+        <Button
+          size="sm"
+          disabled={!canWrite || !connected || editorLocked}
+          onClick={() => {
+            setReplacement(null);
+            setShowPromote((value) => !value);
+          }}
+        >
           <PlusIcon /> Promote knowledge
         </Button>
       </div>
       {showPromote ? (
         <PromoteKnowledge
+          key={replacement?.knowledgeId ?? "new"}
+          replacement={replacement}
+          onLockedChange={setEditorLocked}
           environmentId={environmentId}
           projectId={projectId}
           projectRevision={projectRevision}
-          canWrite={canWrite}
+          canWrite={canWrite && connected}
           onDone={() => setShowPromote(false)}
         />
       ) : null}
@@ -125,6 +149,11 @@ export function WorkKnowledge({
             projectId={projectId}
             offset={offset}
             search={search}
+            canWrite={canWrite && connected && projectRevision !== null && !editorLocked}
+            onReplace={(entry) => {
+              setReplacement(entry);
+              setShowPromote(true);
+            }}
             connected={connected}
             streamAvailable={streamAvailable}
             onPageState={reportPage}
@@ -425,6 +454,8 @@ function KnowledgePage({
   offset,
   search,
   connected,
+  canWrite,
+  onReplace,
   streamAvailable,
   onPageState,
 }: {
@@ -433,6 +464,8 @@ function KnowledgePage({
   readonly offset: number;
   readonly search: string;
   readonly connected: boolean;
+  readonly canWrite: boolean;
+  readonly onReplace: (entry: ProjectWorkKnowledgeRead) => void;
   readonly streamAvailable: boolean;
   readonly onPageState: (offset: number, hasNext: boolean) => void;
 }) {
@@ -486,7 +519,7 @@ function KnowledgePage({
             offset,
             ...(streamAvailable ? { poll: false } : {}),
           })),
-    [environmentId, needle, offset, projectId, runPage, runSearch, streamAvailable],
+    [environmentId, needle, offset, projectId, runPage, runSearch, streamAvailable, target],
   );
   const filtered = page?.records ?? [];
 
@@ -520,7 +553,26 @@ function KnowledgePage({
                   </p>
                   <p className="mt-3 text-xs text-muted-foreground">
                     {entry.sourceKind} · updated {formatDate(entry.updatedAt)}
+                    {entry.supersedesKnowledgeId
+                      ? ` · Replaces ${entry.supersedesKnowledgeId}`
+                      : ""}
+                    {filtered.some((record) => record.supersedesKnowledgeId === entry.knowledgeId)
+                      ? " · Superseded"
+                      : ""}
                   </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="mt-3"
+                    disabled={
+                      !canWrite ||
+                      entry.projectId !== projectId ||
+                      filtered.some((record) => record.supersedesKnowledgeId === entry.knowledgeId)
+                    }
+                    onClick={() => onReplace(entry)}
+                  >
+                    Correct or replace
+                  </Button>
                 </div>
               </div>
             </WorkCard>
@@ -583,23 +635,32 @@ function asSearchPage(
 }
 
 function PromoteKnowledge({
+  replacement,
+  onLockedChange,
   environmentId,
   projectId,
   projectRevision,
   canWrite,
   onDone,
 }: {
+  replacement: ProjectWorkKnowledgeRead | null;
+  onLockedChange: (locked: boolean) => void;
   environmentId: EnvironmentId;
   projectId: ProjectId;
   projectRevision: number | null;
   canWrite: boolean;
   onDone: () => void;
 }) {
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
+  const [title, setTitle] = useState(replacement?.title ?? "");
+  const [body, setBody] = useState(replacement?.body ?? "");
   const [failure, setFailure] = useState<ProjectWorkCommandFailure | null>(null);
   const [pending, setPending] = useState(false);
   const [retryCommand, setRetryCommand] = useState<ProjectWorkCommand | null>(null);
+  const inFlight = useRef(false);
+  useLayoutEffect(() => {
+    onLockedChange(pending || retryCommand !== null);
+  }, [onLockedChange, pending, retryCommand]);
+  useLayoutEffect(() => () => onLockedChange(false), [onLockedChange]);
   const [rebasedRevision, setRebasedRevision] = useState<number | null>(null);
   const [sourceKind, setSourceKind] = useState<
     "task" | "thread" | "session" | "worktree" | "attempt" | "manual"
@@ -611,16 +672,123 @@ function PromoteKnowledge({
     reportFailure: false,
     reportDefect: false,
   });
+  const refreshPage = useAtomQueryRunner(projectWorkEnvironment.page, {
+    refresh: true,
+    reportFailure: false,
+    reportDefect: false,
+  });
+  const authority = useRef({ canWrite, projectRevision, mounted: true, generation: 0 });
+  useLayoutEffect(() => {
+    if (authority.current.canWrite !== canWrite) authority.current.generation += 1;
+    authority.current.canWrite = canWrite;
+    authority.current.projectRevision = projectRevision;
+  }, [canWrite, projectRevision]);
+  useLayoutEffect(() => {
+    authority.current.mounted = true;
+    return () => {
+      authority.current.mounted = false;
+    };
+  }, []);
+  const allowed = (generation = authority.current.generation) =>
+    authority.current.mounted &&
+    authority.current.canWrite &&
+    authority.current.generation === generation;
+  const [validationError, setValidationError] = useState<string | null>(null);
+  // A visible page cannot establish terminal status: successors may be on later pages.
+  const validateReplacement = async (revision: number) => {
+    if (!replacement) return true;
+    const records: ProjectWorkKnowledgeRead[] = [];
+    for (let offset = 0; offset < 256; offset += projectWorkEnvironment.pageSize) {
+      const response = await refreshPage({
+        environmentId,
+        projectId,
+        collection: "knowledge",
+        offset,
+      });
+      if (!allowed()) return false;
+      if (response._tag !== "Success") break;
+      const page = asProjectWorkPage<ProjectWorkKnowledgeRead>(response.value, offset);
+      if (page.revision !== revision || page.records.some((entry) => entry.projectId !== projectId))
+        break;
+      records.push(...page.records);
+      if (records.length > 256) break;
+      if (page.hasNext) continue;
+      const byId = new Map(records.map((entry) => [entry.knowledgeId, entry]));
+      const replaced = new Set<ProjectWorkKnowledgeId>();
+      if (byId.size !== records.length) break;
+      let valid = true;
+      for (const entry of records) {
+        if (!entry.supersedesKnowledgeId) continue;
+        if (!byId.has(entry.supersedesKnowledgeId) || replaced.has(entry.supersedesKnowledgeId)) {
+          valid = false;
+          break;
+        }
+        replaced.add(entry.supersedesKnowledgeId);
+        const seen = new Set<ProjectWorkKnowledgeId>([entry.knowledgeId]);
+        let previous: ProjectWorkKnowledgeRead | undefined = byId.get(entry.supersedesKnowledgeId);
+        while (previous) {
+          if (seen.has(previous.knowledgeId)) {
+            valid = false;
+            break;
+          }
+          seen.add(previous.knowledgeId);
+          previous = previous.supersedesKnowledgeId
+            ? byId.get(previous.supersedesKnowledgeId)
+            : undefined;
+        }
+      }
+      const selected = byId.get(replacement.knowledgeId);
+      if (!valid || !selected) break;
+      if (replaced.has(selected.knowledgeId)) {
+        setValidationError(
+          "This retained knowledge is superseded. Select its current replacement.",
+        );
+        return false;
+      }
+      if (
+        selected.revision !== replacement.revision ||
+        selected.title !== replacement.title ||
+        selected.body !== replacement.body
+      )
+        break;
+      return true;
+    }
+    setValidationError(
+      "Cannot confirm current knowledge at this revision. Refresh and select the record again.",
+    );
+    return false;
+  };
   const submit = async () => {
     if (
       !canWrite ||
-      pending ||
-      (rebasedRevision ?? projectRevision) === null ||
+      inFlight.current ||
+      failure?.staleRevision ||
+      (!retryCommand && (rebasedRevision ?? projectRevision) === null) ||
       !title.trim() ||
       !body.trim() ||
       !sourceId.trim()
     )
       return;
+    inFlight.current = true;
+    setPending(true);
+    setValidationError(null);
+    const generation = authority.current.generation;
+    const observedRevision = authority.current.projectRevision;
+    const revision = rebasedRevision ?? projectRevision!;
+    if ((!retryCommand || failure === null) && !(await validateReplacement(revision))) {
+      inFlight.current = false;
+      setPending(false);
+      return;
+    }
+    if (
+      !allowed(generation) ||
+      ((!retryCommand || failure === null) &&
+        authority.current.projectRevision !== observedRevision)
+    ) {
+      inFlight.current = false;
+      setPending(false);
+      return;
+    }
     const recordedAt = new Date().toISOString();
     const command =
       retryCommand ??
@@ -629,6 +797,7 @@ function PromoteKnowledge({
         expectedRevision: rebasedRevision ?? projectRevision!,
         commandId: CommandId.make(randomUUID()),
         knowledgeId: ProjectWorkKnowledgeId.make(randomUUID()),
+        ...(replacement ? { supersedesKnowledgeId: replacement.knowledgeId } : {}),
         title: title.trim(),
         body: body.trim(),
         sourceKind,
@@ -636,11 +805,11 @@ function PromoteKnowledge({
         promotedAt: recordedAt,
       });
     setRetryCommand(command);
-    setPending(true);
     const result = await write({
       environmentId,
       input: command,
     });
+    inFlight.current = false;
     setPending(false);
     if (result._tag === "Failure")
       setFailure(projectWorkCommandFailure(squashAtomCommandFailure(result)));
@@ -652,15 +821,30 @@ function PromoteKnowledge({
   };
   return (
     <WorkCard>
-      <h3 className="font-medium">Promote manual knowledge</h3>
+      <h3 className="font-medium">
+        {replacement ? "Correct or replace knowledge" : "Promote manual knowledge"}
+      </h3>
+      {replacement ? (
+        <p className="mt-2 text-sm text-muted-foreground">
+          Replacing “{replacement.title}” ({replacement.knowledgeId}). The predecessor remains in
+          history. Current status is checked before saving.
+        </p>
+      ) : null}
+      {validationError ? (
+        <p role="alert" className="mt-2 text-sm">
+          {validationError}
+        </p>
+      ) : null}
       <div className="mt-3 grid gap-3">
         <Input
+          disabled={!canWrite || pending || retryCommand !== null}
           value={title}
           onChange={(event) => setTitle(event.target.value)}
           placeholder="Title"
         />
         <textarea
           className="min-h-24 rounded-md border border-input bg-background p-2 text-sm"
+          disabled={!canWrite || pending || retryCommand !== null}
           value={body}
           onChange={(event) => setBody(event.target.value)}
           placeholder="Durable project context"
@@ -672,7 +856,7 @@ function PromoteKnowledge({
               className="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
               value={sourceKind}
               onChange={(event) => setSourceKind(event.target.value as typeof sourceKind)}
-              disabled={!canWrite || pending}
+              disabled={!canWrite || pending || retryCommand !== null}
             >
               {(["task", "thread", "session", "worktree", "attempt", "manual"] as const).map(
                 (kind) => (
@@ -688,7 +872,7 @@ function PromoteKnowledge({
               value={sourceId}
               onChange={(event) => setSourceId(event.target.value)}
               placeholder="Source record ID"
-              disabled={!canWrite || pending}
+              disabled={!canWrite || pending || retryCommand !== null}
             />
           </label>
         </div>
@@ -698,38 +882,57 @@ function PromoteKnowledge({
           disabled={
             !canWrite ||
             pending ||
+            failure !== null ||
             (rebasedRevision ?? projectRevision) === null ||
             !sourceId.trim()
           }
         >
-          Promote
+          {replacement ? "Save replacement" : "Promote"}
         </Button>
         {failure ? (
-          <WorkCommandFailureNotice
-            failure={failure}
-            onRetry={() => void submit()}
-            onDiscard={() => {
-              setRetryCommand(null);
-              setRebasedRevision(null);
-              setFailure(null);
-            }}
-            onRebase={() => {
-              void refreshBriefing({ environmentId, projectId }).then((fresh) => {
-                if (fresh._tag !== "Success") return;
-                const briefing = asProjectWorkBriefing(fresh.value);
-                if (!briefing) return;
-                if (retryCommand) {
-                  setRetryCommand({
-                    ...retryCommand,
-                    commandId: CommandId.make(randomUUID()),
-                    expectedRevision: briefing.sourceRevision,
-                  });
-                }
-                setRebasedRevision(briefing.sourceRevision);
+          <fieldset disabled={!canWrite || pending}>
+            <WorkCommandFailureNotice
+              failure={failure}
+              onRetry={() => void submit()}
+              onDiscard={() => {
+                setRetryCommand(null);
+                setRebasedRevision(null);
                 setFailure(null);
-              });
-            }}
-          />
+              }}
+              onRebase={() => {
+                if (!allowed() || inFlight.current || !failure?.staleRevision) return;
+                inFlight.current = true;
+                setPending(true);
+                const generation = authority.current.generation;
+                const observedRevision = authority.current.projectRevision;
+                void (async () => {
+                  const fresh = await refreshBriefing({ environmentId, projectId });
+                  if (!allowed(generation) || fresh._tag !== "Success") return;
+                  const briefing = asProjectWorkBriefing(fresh.value);
+                  if (
+                    !briefing ||
+                    !(await validateReplacement(briefing.sourceRevision)) ||
+                    !allowed(generation) ||
+                    (authority.current.projectRevision !== observedRevision &&
+                      authority.current.projectRevision !== briefing.sourceRevision)
+                  )
+                    return;
+                  if (retryCommand) {
+                    setRetryCommand({
+                      ...retryCommand,
+                      commandId: CommandId.make(randomUUID()),
+                      expectedRevision: briefing.sourceRevision,
+                    });
+                  }
+                  setRebasedRevision(briefing.sourceRevision);
+                  setFailure(null);
+                })().finally(() => {
+                  inFlight.current = false;
+                  setPending(false);
+                });
+              }}
+            />
+          </fieldset>
         ) : null}
       </div>
     </WorkCard>
