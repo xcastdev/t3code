@@ -63,6 +63,7 @@ import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
+import * as Queue from "effect/Queue";
 import * as Semaphore from "effect/Semaphore";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import { GitRepositoryPermits } from "../../git/GitRepositoryPermits.ts";
@@ -15670,6 +15671,45 @@ it.effect(
     ),
 );
 
+for (const remainingMs of [300000, 80000, 20000])
+  it.effect(`reviewer broker deadline preserves its original ${remainingMs}ms task remainder`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture(true);
+        const originalDeadline = f.snapshot.intent.limits.rootDeadlineAtMs;
+        yield* TestClock.setTime(originalDeadline - remainingMs);
+        let captured: SessionRuntime.PiSessionRuntimeOptions | undefined;
+        const original = SessionRuntime.makePiSessionRuntime;
+        const spy = vi.spyOn(SessionRuntime, "makePiSessionRuntime").mockImplementation((input) => {
+          captured = input;
+          return original(input);
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        yield* f.instance.prepareOperation(
+          {
+            threadId: f.binding.threadId,
+            kind: "initialize",
+            operationId: f.request.initializeOperationId,
+          },
+          () => Effect.void,
+        );
+        if (!captured) return yield* Effect.die("Missing actual reviewer broker deadline");
+        expect(captured.broker.deadlineMs).toBe(Math.min(120000, Math.floor(remainingMs / 2)));
+        expect(captured.deadlineMs).toBeLessThanOrEqual(remainingMs);
+        expect(f.snapshot.intent.limits.rootDeadlineAtMs).toBe(originalDeadline);
+        const claim = f.snapshot.intent.compiledClaim.transition;
+        if (claim?.kind !== "claim") return yield* Effect.die("Missing original reviewer claim");
+        expect(claim.binding.configuration.maxDurationMs).toBe(300000);
+        const rootClaim = f.root.snapshot.intent.compiledClaim.transition;
+        if (rootClaim?.kind !== "claim") return yield* Effect.die("Missing original root claim");
+        expect(rootClaim.binding.configuration.maxTokens).toBe(64000);
+        expect(rootClaim.binding.configuration.maxDurationMs).toBe(300000);
+        expect(f.transports).toBe(0);
+        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+      }),
+    ),
+  );
+
 (process.env.PI_REVIEW_TARGET_NATIVE_DIST ? it.effect : it.effect.skip)(
   "production factory captures shared repository permits for readonly reviewer preparation",
   () =>
@@ -15765,6 +15805,8 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
   () => {
     for (const mode of [
       "mounted",
+      "long-authorized-stream",
+      "long-revoked-stream",
       "ack-authority-held",
       "assessed",
       "missing-descriptor",
@@ -15774,13 +15816,15 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
       "unicode-alias",
     ] as const)
       it.effect(
-        mode === "ack-authority-held"
-          ? "consumes native ACK receipts while the managed authority host is held"
-          : mode === "mounted"
-            ? "reads committed target bytes from an independent readonly reviewer and retains its report"
-            : mode === "assessed"
-              ? "assesses exact parent criteria after native reads and retains qualified joined progress"
-              : `rejects actual native review reads with ${mode}`,
+        mode === "long-authorized-stream" || mode === "long-revoked-stream"
+          ? `handles native reviewer ${mode} beyond the former request deadline`
+          : mode === "ack-authority-held"
+            ? "consumes native ACK receipts while the managed authority host is held"
+            : mode === "mounted"
+              ? "reads committed target bytes from an independent readonly reviewer and retains its report"
+              : mode === "assessed"
+                ? "assesses exact parent criteria after native reads and retains qualified joined progress"
+                : `rejects actual native review reads with ${mode}`,
         () =>
           scoped(
             Effect.gen(function* () {
@@ -15841,6 +15885,55 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                 "export const greeting = 'hello';\n",
                 "import { greeting } from './greeting.js';\nif (greeting !== 'hello') throw Error('wrong greeting');\n",
               ];
+              const delayed = mode === "long-authorized-stream" || mode === "long-revoked-stream";
+              const testClock = yield* TestClock.testClockWith(Effect.succeed);
+              const advances = yield* Queue.unbounded<{
+                revoke: boolean;
+                resolve: () => void;
+                reject: (cause: unknown) => void;
+              }>();
+              yield* Effect.gen(function* () {
+                const advance = yield* Queue.take(advances);
+                yield* Effect.gen(function* () {
+                  yield* testClock.adjust(1000);
+                  if (advance.revoke) {
+                    const current = (yield* readCurrentState(
+                      f.sql,
+                      projectId,
+                    )).foundationRecords?.find(
+                      (entry) =>
+                        entry.kind === "run-binding" && entry.recordId === f.binding.recordId,
+                    );
+                    if (current?.kind !== "run-binding")
+                      return yield* Effect.die("Missing native reviewer binding");
+                    yield* restoreHistoricalBinding({
+                      ...current,
+                      revision: current.revision + 1,
+                      status: "revoked",
+                    });
+                  }
+                  advance.resolve();
+                }).pipe(Effect.catchCause((cause) => Effect.sync(() => advance.reject(cause))));
+              }).pipe(Effect.forever, Effect.forkScoped);
+              let virtualMillis = 0;
+              let modelDeadlineMs = 0;
+              let delayedRequest = false;
+              let delayedForwards = 0;
+              let delayedAcks = 0;
+              let parentSignal: AbortSignal | undefined;
+              let deadlineOnlyAbort = false;
+              const deadlines: Array<{ at: number; controller: AbortController }> = [];
+              if (delayed) {
+                // Virtualize only the captured broker timer; native owner and parent timers stay real.
+                const timeout = AbortSignal.timeout;
+                const timerSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation((millis) => {
+                  if (millis !== modelDeadlineMs) return timeout(millis);
+                  const controller = new AbortController();
+                  deadlines.push({ at: virtualMillis + millis, controller });
+                  return controller.signal;
+                });
+                yield* Effect.addFinalizer(() => Effect.sync(() => timerSpy.mockRestore()));
+              }
               let calls = 0;
               let reportIntent = "";
               let reportCommandId = "";
@@ -15890,9 +15983,43 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                 .spyOn(SessionRuntime, "makePiSessionRuntime")
                 .mockImplementation((input) => {
                   const target = input.bootstrap.resources?.reviewTarget;
+                  if (delayed) modelDeadlineMs = input.broker.deadlineMs;
                   return originalSession({
                     ...input,
-                    ...(mode === "ack-authority-held"
+                    ...(delayed
+                      ? {
+                          broker: {
+                            ...input.broker,
+                            authorizeCurrent: async (
+                              phase: Parameters<typeof input.broker.authorizeCurrent>[0],
+                              signal: AbortSignal,
+                            ) => {
+                              if (
+                                phase === "beforeForward" &&
+                                delayedRequest &&
+                                delayedForwards < 40
+                              ) {
+                                delayedForwards++;
+                                await new Promise<void>((resolve, reject) => {
+                                  Queue.offerUnsafe(advances, {
+                                    revoke:
+                                      mode === "long-revoked-stream" && delayedForwards === 10,
+                                    resolve,
+                                    reject,
+                                  });
+                                });
+                                virtualMillis += 1000;
+                                for (const deadline of deadlines)
+                                  if (deadline.at <= virtualMillis) deadline.controller.abort();
+                                if (signal.aborted && parentSignal && !parentSignal.aborted)
+                                  deadlineOnlyAbort = true;
+                              }
+                              await input.broker.authorizeCurrent(phase, signal);
+                            },
+                          },
+                        }
+                      : {}),
+                    ...(mode === "ack-authority-held" || delayed
                       ? {
                           persistTerminal: async (
                             terminal: SessionRuntime.PiSessionTerminal,
@@ -15922,6 +16049,9 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                           }
                         : {}),
                     onWorkerFrame: async (frame, signal) => {
+                      parentSignal = signal;
+                      if (delayed && frame.message.type === "ack" && frame.message.requestId === 2)
+                        delayedAcks++;
                       if (frame.message.type === "worker-failure")
                         workerFailures.push(frame.message.code);
                       if (mode === "ack-authority-held" && frame.message.type === "ack") {
@@ -16005,6 +16135,7 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                     observations.push(content);
                   }
                   const index = calls++;
+                  delayedRequest = delayed && index === 1;
                   const tool =
                     index < reads.length
                       ? {
@@ -16034,13 +16165,32 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                         ],
                       }
                     : { role: "assistant", content: "Review recorded." };
-                  return new Response(
+                  const deltas =
+                    delayedRequest && tool
+                      ? [
+                          {
+                            role: "assistant",
+                            tool_calls: [
+                              {
+                                index: 0,
+                                id: `review-call-${index}`,
+                                type: "function",
+                                function: { name: tool.name, arguments: "" },
+                              },
+                            ],
+                          },
+                          ...Array.from(" ".repeat(48) + json(tool.args), (part) => ({
+                            tool_calls: [{ index: 0, function: { arguments: part } }],
+                          })),
+                        ]
+                      : [delta];
+                  const streamText =
                     [
-                      {
+                      ...deltas.map((part) => ({
                         id: "offline-review",
                         model,
-                        choices: [{ index: 0, delta, finish_reason: null }],
-                      },
+                        choices: [{ index: 0, delta: part, finish_reason: null }],
+                      })),
                       {
                         id: "offline-review",
                         model,
@@ -16055,7 +16205,23 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                       },
                     ]
                       .map((event) => `data: ${json(event)}\n\n`)
-                      .join("") + "data: [DONE]\n\n",
+                      .join("") + "data: [DONE]\n\n";
+                  let offset = 0;
+                  return new Response(
+                    delayedRequest
+                      ? new ReadableStream<Uint8Array>({
+                          pull(controller) {
+                            if (offset === streamText.length) {
+                              controller.close();
+                              return;
+                            }
+                            controller.enqueue(
+                              new TextEncoder().encode(streamText.slice(offset, offset + 8)),
+                            );
+                            offset = Math.min(streamText.length, offset + 8);
+                          },
+                        })
+                      : streamText,
                     { headers: { "content-type": "text/event-stream" } },
                   );
                 },
@@ -16245,6 +16411,36 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                   expected[1],
                 );
                 return;
+              }
+              if (delayed) {
+                const remaining =
+                  f.snapshot.intent.limits.rootDeadlineAtMs - testClock.currentTimeMillisUnsafe();
+                expect(remaining).toBeGreaterThan(200000);
+                expect(calls).toBeGreaterThanOrEqual(2);
+                expect(delayedAcks).toBeGreaterThanOrEqual(Math.min(delayedForwards - 1, 40));
+                if (mode === "long-revoked-stream") {
+                  expect(assignment._tag).toBe("Failure");
+                  expect(deadlineOnlyAbort).toBe(false);
+                  expect(ackTerminal).toMatchObject({
+                    outcome: "failed",
+                    failureCode: "AUTHORIZATION_REJECTED",
+                    drain: { kernel: "removed" },
+                  });
+                  expect(virtualMillis).toBe(10000);
+                  expect(observations).toEqual([expected[0]]);
+                  return;
+                }
+                expect({
+                  deadlineOnlyAbort,
+                  failureCode: ackTerminal?.failureCode,
+                  virtualMillis,
+                  delayedAcks,
+                }).toMatchObject({
+                  deadlineOnlyAbort: false,
+                  failureCode: undefined,
+                  virtualMillis: 40000,
+                });
+                expect(delayedAcks).toBeGreaterThanOrEqual(40);
               }
               if (mode === "ack-authority-held") {
                 expect(nativeAckReceipts).toBeGreaterThan(0);

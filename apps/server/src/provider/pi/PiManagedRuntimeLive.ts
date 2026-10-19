@@ -2484,7 +2484,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     deadlineMs: Math.max(
                       1,
                       Math.min(
-                        30000,
+                        120000,
                         Math.floor((durable.deadlineAtMs - (yield* Clock.currentTimeMillis)) / 2),
                       ),
                     ),
