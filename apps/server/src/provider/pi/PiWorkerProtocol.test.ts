@@ -1,4 +1,9 @@
 import * as Schema from "effect/Schema";
+import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
+import { credential, sdkModel } from "./PiSubscriptionTestKit.ts";
+import { toolStream } from "./fixtures/subscription-sse/streams.ts";
 import * as Protocol from "./PiWorkerProtocol.ts";
 import { projectTeamDerivedRecordId } from "../../projectWork/ProjectTeamPolicy.ts";
 import { describe, expect, it } from "vite-plus/test";
@@ -627,7 +632,10 @@ describe("bounded synchronous frame intake", () => {
 });
 
 describe("frozen tool manifest and bounded payloads", () => {
-  function toolPeer(execution: "local" | "bridge" = "local", toolName: "read" | "write" = "read") {
+  function toolPeer(
+    execution: "local" | "bridge" = "local",
+    toolName: "read" | "write" | "lookup" = "read",
+  ) {
     const peer = runtimePeers();
     peer.bootstrap({
       allowedTools: [{ name: toolName, execution, description: "workspace tool" }],
@@ -663,8 +671,19 @@ describe("frozen tool manifest and bounded payloads", () => {
     peer.worker({ type: "transfer-end", transferId: `input-${callId}` });
     return call;
   }
-  it.each(["call_fixture|fc_fixture", `${"a".repeat(63)}|${"b".repeat(64)}`])(
-    "accepts the SDK composite native ID through the encoded bridge approval/result lifecycle (%#)",
+  it.each([
+    "call_fixture|fc_fixture",
+    "call.a:b/c+1=2-3_4|fc_1",
+    "call_one/fc_one",
+    "call_one|../fc_one",
+    "call_one|fc_one|extra",
+    "call_one|",
+    "|fc_one",
+    `${"a".repeat(63)}|${"b".repeat(64)}`,
+    "é".repeat(64),
+    "🛰".repeat(32),
+  ])(
+    "accepts opaque SDK native IDs through the encoded bridge approval/result lifecycle (%#)",
     (nativeCallId) => {
       const peer = toolPeer("bridge");
       const call = input(peer, '{"arguments":{"path":"README.md"}}', 1, nativeCallId);
@@ -706,34 +725,86 @@ describe("frozen tool manifest and bounded payloads", () => {
       expect(peer.protocol.canStartRequest).toBe(true);
     },
   );
-  it("rejects malformed SDK native-call composites while generic frame tokens remain restricted", () => {
+  it("preserves the pinned SDK's opaque tool ID through worker calls and replay requests", async () => {
+    const sdk = streamCodexResponses(
+      sdkModel,
+      normalizeContext({ messages: [{ role: "user", content: "Read", timestamp: 1 }] }),
+      {
+        apiKey: credential,
+        transport: "sse",
+        maxRetries: 0,
+        fetch: async () =>
+          new Response(toolStream("punctuation"), {
+            headers: { "content-type": "text/event-stream" },
+          }),
+      },
+    );
+    const result = await sdk.result();
+    expect(result.stopReason).toBe("toolUse");
+    const tool = result.content.find((part) => part.type === "toolCall");
+    if (!tool) throw Error("Missing SDK tool call");
+    expect(tool.id).toBe("call.a:b/c+1=2-3_4|fc_1");
+    expect(tool.name).toBe("lookup");
+    const peer = toolPeer("bridge", "lookup");
+    const call = input(peer, JSON.stringify({ arguments: tool.arguments }), 1, tool.id);
+    expect(call.message).toMatchObject({ nativeCallId: tool.id });
+
+    const replay = convertResponsesMessages(
+      sdkModel,
+      normalizeContext({
+        messages: [
+          result,
+          {
+            role: "toolResult",
+            toolCallId: tool.id,
+            toolName: tool.name,
+            content: [{ type: "text", text: "# T3" }],
+            isError: false,
+            timestamp: 2,
+          },
+        ],
+      }),
+      new Set([sdkModel.provider]),
+    );
+    const request = workerFrame({
+      type: "request",
+      requestId: 1,
+      lifecycleId: 1,
+      body: JSON.stringify({ input: replay }),
+    });
+    const decoded = decodePiWorkerFrame(encodePiWorkerFrame(request).toString().trimEnd());
+    expect(decoded).toEqual(request);
+    if (decoded.message.type !== "request") throw Error("Missing replay request");
+    expect(JSON.parse(decoded.message.body).input).toEqual([
+      expect.objectContaining({ type: "function_call", call_id: "call.a:b/c+1=2-3_4", id: "fc_1" }),
+      expect.objectContaining({ type: "function_call_output", call_id: "call.a:b/c+1=2-3_4" }),
+    ]);
+  });
+  it("rejects empty, oversized and unsafe native IDs while generic frame tokens remain restricted", () => {
     const peer = toolPeer("bridge");
     const badNativeCallIds = [
-      "call_one|fc_one|extra",
-      "call_one/fc_one",
-      "call_one|../fc_one",
-      "call_one|fc_one\r\n",
-      "call_one|fc_one\n",
-      "call_one|",
-      "|fc_one",
-      `call_${"a".repeat(60)}|fc_${"b".repeat(60)}`,
+      "",
+      "a".repeat(129),
+      "é".repeat(65),
+      "🛰".repeat(33),
+      "call_\ud800",
+      "call_\udc00",
+      ...["\r", "\n", "\t", " ", "\u0000", "\u007f", "\u0085", "\u200b", "\u202e", "\u00a0"].map(
+        (control) => `call_one${control}|fc_one`,
+      ),
     ];
     for (const nativeCallId of badNativeCallIds) {
-      expect(() =>
-        decodePiWorkerFrame(
-          json(
-            workerFrame({
-              type: "tool-call",
-              callId: 1,
-              nativeCallId,
-              lifecycleId: 1,
-              toolName: "read",
-              execution: "bridge",
-              input: { transferId: "input", totalBytes: 0 },
-            }),
-          ),
-        ),
-      ).toThrow();
+      const frame = workerFrame({
+        type: "tool-call",
+        callId: 1,
+        nativeCallId,
+        lifecycleId: 1,
+        toolName: "read",
+        execution: "bridge",
+        input: { transferId: "input", totalBytes: 0 },
+      });
+      expect(() => decodePiWorkerFrame(json(frame))).toThrow("INVALID_WORKER_FRAME");
+      expect(() => encodePiWorkerFrame(frame)).toThrow();
     }
     expect(() =>
       decodePiWorkerFrame(
@@ -1003,7 +1074,7 @@ describe("frozen tool manifest and bounded payloads", () => {
         type: "tool-call",
         lifecycleId: 1,
         callId: 1,
-        nativeCallId: "native-1",
+        nativeCallId: "call.a:b/c+1=2-3_4|fc_1",
         toolName: "shell",
         execution: "local",
         input: { transferId: "input", totalBytes: 0 },
@@ -1012,7 +1083,7 @@ describe("frozen tool manifest and bounded payloads", () => {
   });
   it("prevents execution before the completed input and parent authorization", () => {
     const peer = toolPeer();
-    input(peer);
+    input(peer, undefined, 1, "call.a:b/c+1=2-3_4|fc_1");
     expect(() =>
       peer.worker({
         type: "sdk-event",

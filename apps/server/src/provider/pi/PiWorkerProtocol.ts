@@ -22,11 +22,6 @@ const SafeInteger = Schema.Int.check(
 );
 const RequestId = SafeInteger.check(Schema.isGreaterThan(0));
 const Token = Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9_-]{1,128}$/));
-// The Codex SDK pairs call and item IDs; only native tool IDs use this shape.
-const NativeCallId = Schema.String.check(
-  Schema.isMaxLength(128),
-  Schema.isPattern(/^[a-zA-Z0-9_-]+(?:\|[a-zA-Z0-9_-]+)?(?![\s\S])/),
-);
 const OperationId = Schema.String.check(
   Schema.isPattern(/^(?:[a-zA-Z0-9_-]{1,128}|guided:[a-f0-9]{64})(?![\s\S])/),
 );
@@ -54,6 +49,13 @@ const boundedText = (bytes: number) =>
         !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value),
     ),
   );
+// Native SDK tool IDs are opaque, including Codex's call|item composite.
+// Match subscription call-ID punctuation without relaxing authority tokens.
+const NativeCallId = boundedText(128).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(128),
+  Schema.makeFilter((value) => !/[\s\p{Cc}\p{Cf}]/u.test(value)),
+);
 const Cwd = boundedText(4096).check(
   Schema.isPattern(/^\/(?:[^/\0]+(?:\/[^/\0]+)*)?$/),
   Schema.makeFilter((value) => !value.split("/").some((part) => part === "." || part === "..")),
