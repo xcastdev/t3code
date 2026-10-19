@@ -789,7 +789,9 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
       const consume = async (bytes: Uint8Array) => {
         const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/\r?\n$/, "");
         if (text === "") return;
-        if (done || ++frameCount > 16_384) fail("SSE_FRAME_INVALID");
+        if (++frameCount > 16_384) fail("SSE_FRAME_INVALID");
+        if (subscription && text.startsWith(":")) return;
+        if (done) fail("SSE_FRAME_INVALID");
         if (subscription && text.startsWith("event:")) {
           if (subscriptionEvent) fail("SSE_FRAME_INVALID");
           subscriptionEvent = text.slice(6).replace(/^ /, "");

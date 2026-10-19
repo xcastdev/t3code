@@ -3,7 +3,7 @@ import { Type, type AssistantMessage, type Model, type Usage } from "@earendil-w
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { piManagedModelRoute } from "./PiManagedModels.ts";
-import { PI_WORKER_MAX_CHUNK_BYTES } from "./PiWorkerProtocol.ts";
+import { PI_WORKER_MAX_CHUNK_BYTES, PI_WORKER_MAX_RESPONSE_BYTES } from "./PiWorkerProtocol.ts";
 import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import {
   makePiModelBroker,
@@ -213,6 +213,190 @@ describe("Pi OpenAI subscription broker", () => {
       if (boundary === "large-frame") expect(f.chunks).toHaveLength(0);
     },
   );
+  it("ignores subscription SSE comments across CRLF, split UTF-8, event fields, and terminal frames", async () => {
+    const stream =
+      ": keepalive 🛰 comment-sentinel-before\r\n" +
+      success()
+        .replaceAll("\n", "\r\n")
+        .replace(
+          "event: response.created\r\n",
+          "event: response.created\r\n: comment-sentinel-between-fields 🟢\r\n",
+        )
+        .replace(
+          "event: response.output_text.delta\r\n",
+          "event: response.output_text.delta\r\n: comment-sentinel-between-events\r\n",
+        ) +
+      ": comment-sentinel-after-terminal\r\n";
+    const bytes = new TextEncoder().encode(stream);
+    const colon = bytes.indexOf(new TextEncoder().encode(": keepalive")[0]!);
+    const emoji = bytes.indexOf(new TextEncoder().encode("🛰")[0]!);
+    const carriageReturn = bytes.indexOf(13);
+    const boundaries = [colon + 1, emoji + 1, carriageReturn + 1].sort((a, b) => a - b);
+    const pieces: Uint8Array[] = [];
+    let offset = 0;
+    for (const boundary of boundaries) {
+      if (boundary > offset) pieces.push(bytes.slice(offset, boundary));
+      offset = boundary;
+    }
+    pieces.push(bytes.slice(offset));
+    let calls = 0;
+    const f = fixture({
+      transport: async () => {
+        calls++;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const piece of pieces) controller.enqueue(piece);
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+
+    const receipt = await f.invoke();
+    const forwarded = Buffer.concat(f.chunks).toString();
+    expect(receipt.usage).toMatchObject({
+      prompt_tokens: 50,
+      completion_tokens: 10,
+      total_tokens: 60,
+    });
+    expect(forwarded).toBe(success());
+    expect(forwarded).not.toContain("comment-sentinel");
+    expect(calls).toBe(1);
+    expect(f.reservations).toHaveLength(1);
+    expect(f.settlements).toMatchObject([
+      {
+        outcome: "reported",
+        transportDrained: true,
+        chargedInputTokens: 50,
+        chargedOutputTokens: 10,
+      },
+    ]);
+  });
+
+  it("does not treat subscription comments without terminal usage as a successful response", async () => {
+    let calls = 0;
+    const f = fixture({
+      transport: async () => {
+        calls++;
+        return new Response(": keepalive only\n", {
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+
+    await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_ACCOUNTING_REQUIRED" });
+    expect(f.chunks).toHaveLength(0);
+    expect(calls).toBe(1);
+    expect(f.reservations).toHaveLength(1);
+    expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+  });
+
+  it("keeps counting subscription comment lines against the existing SSE frame limit", async () => {
+    const f = fixture({
+      transport: async () =>
+        new Response(": keepalive\n".repeat(16_385), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+
+    await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_FRAME_INVALID" });
+    expect(f.chunks).toHaveLength(0);
+    expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+  });
+
+  it.each(["credential", "account", "invalid UTF-8"] as const)(
+    "rejects raw %s inside a subscription comment split across transport reads",
+    async (kind) => {
+      const value = kind === "credential" ? credential : kind === "account" ? accountId : "";
+      const prefix = new TextEncoder().encode(kind === "invalid UTF-8" ? ": " : `: ${value}`);
+      const suffix = new TextEncoder().encode("\n");
+      const comment =
+        kind === "invalid UTF-8"
+          ? new Uint8Array([...prefix, 0xff, ...suffix])
+          : new Uint8Array([...prefix, ...suffix]);
+      const split =
+        kind === "invalid UTF-8" ? prefix.length + 1 : prefix.length - Math.floor(value.length / 2);
+      const f = fixture({
+        transport: async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(comment.slice(0, split));
+                controller.enqueue(comment.slice(split));
+                controller.close();
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+      });
+      const code = kind === "invalid UTF-8" ? "REQUEST_FAILED" : "CREDENTIAL_ECHO_REJECTED";
+
+      await expect(f.invoke()).rejects.toMatchObject({ code });
+      if (value) expect(Buffer.concat(f.chunks).toString()).not.toContain(value);
+      expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+    },
+  );
+
+  it.each([
+    ["unsupported field", "retry: 1000\n"],
+    [
+      "semantic frame after terminal usage",
+      `${success()}: keepalive after terminal\ndata: {"type":"response.output_text.delta","delta":"late"}\n\n`,
+    ],
+  ] as const)("continues rejecting subscription %s around comments", async (_name, stream) => {
+    const f = fixture({
+      transport: async () =>
+        new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+    });
+
+    await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_FRAME_INVALID" });
+    expect(Buffer.concat(f.chunks).toString()).not.toContain("late");
+    expect(f.settlements).toMatchObject([
+      { outcome: _name === "semantic frame after terminal usage" ? "failed" : "unknown" },
+    ]);
+  });
+
+  it("retains the existing subscription response byte limit for an oversized comment line", async () => {
+    const f = fixture({
+      transport: async () =>
+        new Response(`:${"x".repeat(PI_WORKER_MAX_RESPONSE_BYTES)}\n`, {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+
+    await expect(f.invoke()).rejects.toMatchObject({ code: "RESPONSE_BYTE_LIMIT" });
+    expect(f.chunks).toHaveLength(0);
+    expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+  });
+
+  it("keeps CommandCode SSE comments invalid", async () => {
+    const hardModel = "inclusionai/ling-3.1-flash:free";
+    const f = fixture({
+      ...piManagedModelRoute(hardModel),
+      model: hardModel,
+      transport: async () =>
+        new Response(": command-code comment\n", {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    const request = JSON.stringify({
+      model: hardModel,
+      stream: true,
+      stream_options: { include_usage: true },
+      max_tokens: 512,
+      messages: [
+        { role: "system", content: "Trusted assignment" },
+        { role: "user", content: "Investigate" },
+      ],
+    });
+
+    await expect(f.invoke(request)).rejects.toMatchObject({ code: "SSE_FRAME_INVALID" });
+    expect(f.chunks).toHaveLength(0);
+    expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
+  });
   it.each([
     "valid",
     "sdk-metadata",
