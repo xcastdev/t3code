@@ -2441,12 +2441,16 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     perform(
                       guard(
                         Effect.gen(function* () {
-                          yield* check(signal);
+                          // ACK only advances the validated transport/translator cursor; capability
+                          // checks remain on forwarding, tools, persistence and terminal receipts.
+                          const ack = frame.message.type === "ack";
+                          if (!ack) yield* check(signal);
                           if (!translator) return;
                           const translated = translator.accept(
                             frame,
                             IsoDateTime.make(DateTime.formatIso(yield* DateTime.now)),
                           );
+                          if (ack) return;
                           for (const event of translated.events) {
                             yield* check(signal);
                             yield* observe(event);

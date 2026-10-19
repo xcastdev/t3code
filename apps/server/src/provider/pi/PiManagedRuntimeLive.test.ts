@@ -1,3 +1,5 @@
+import * as PiOperations from "../../projectWork/ProjectTeamPiOperations.ts";
+import type { PiWorkerFrame } from "./PiWorkerProtocol.ts";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
 import * as GitManager from "../../git/GitManager.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -3883,6 +3885,172 @@ const settledNativeForRead = Effect.fn("PiManagedRuntimeLive.settledNativeForRea
   yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${operation.operation.operationId}`;
   return native;
 });
+for (const host of [
+  "blocked",
+  "revoked",
+  "foreign-worker",
+  "foreign-generation",
+  "foreign-operation",
+  "sequence-gap",
+  "malformed-ack",
+] as const)
+  it.effect(`managed ACK observer retains ${host} authority and protocol fences`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredTransferFixture();
+        yield* initializeRequiredContext(f);
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let armed = false;
+        let authorityCalls = 0;
+        const makeOperations = PiOperations.makeProjectTeamPiOperations;
+        const authoritySpy = vi
+          .spyOn(PiOperations, "makeProjectTeamPiOperations")
+          .mockImplementation((options) =>
+            makeOperations(options).pipe(
+              Effect.map((operations) => ({
+                ...operations,
+                authorize: (operation) =>
+                  Effect.gen(function* () {
+                    if (armed) {
+                      authorityCalls++;
+                      yield* Deferred.succeed(entered, undefined);
+                      if (host === "blocked") yield* Deferred.await(release);
+                    }
+                    return yield* operations.authorize(operation);
+                  }),
+              })),
+            ),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => authoritySpy.mockRestore()));
+        const runtime = yield* makePiManagedRuntimeLive(f.options);
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        let captured: SessionRuntime.PiSessionRuntimeOptions | undefined;
+        const makeSession = SessionRuntime.makePiSessionRuntime;
+        const sessionSpy = vi
+          .spyOn(SessionRuntime, "makePiSessionRuntime")
+          .mockImplementation((input) => {
+            captured = input;
+            return makeSession(input);
+          });
+        yield* Effect.addFinalizer(() => Effect.sync(() => sessionSpy.mockRestore()));
+        const observed: unknown[] = [];
+        yield* instance.prepareOperation(
+          {
+            threadId: f.binding.threadId,
+            kind: "prompt",
+            operationId: f.request.assignmentOperationId,
+            prompt: f.request.assignment,
+          },
+          (event) =>
+            Effect.sync(() => {
+              observed.push(event);
+            }),
+        );
+        if (!captured?.onWorkerFrame) return yield* Effect.die("Missing actual managed observer");
+        const session = captured;
+        const signal = new AbortController().signal;
+        const frame = (sequence: number, message: PiWorkerFrame["message"]): PiWorkerFrame => ({
+          version: 1,
+          ...session.identity,
+          ...session.operation,
+          sequence,
+          message,
+        });
+        const invoke = (value: PiWorkerFrame) =>
+          Effect.tryPromise({
+            try: () => session.onWorkerFrame!(value, signal),
+            catch: controlledCallbackError,
+          });
+        if (host === "revoked")
+          yield* restoreHistoricalBinding({
+            ...f.binding,
+            revision: f.binding.revision + 1,
+            status: "revoked",
+          });
+        armed = true;
+        if (host !== "blocked" && host !== "revoked") {
+          const invalid: PiWorkerFrame = {
+            ...frame(host === "sequence-gap" ? 1 : 0, {
+              type: "ack",
+              requestId: 1,
+              chunkSequence: host === "malformed-ack" ? -1 : 3,
+            }),
+            ...(host === "foreign-worker"
+              ? { workerId: session.identity.workerId + "-foreign" }
+              : {}),
+            ...(host === "foreign-generation"
+              ? { generation: session.identity.generation + 1 }
+              : {}),
+            ...(host === "foreign-operation"
+              ? { operationId: session.operation.operationId + "-foreign" }
+              : {}),
+          };
+          expect((yield* invoke(invalid).pipe(Effect.result))._tag).toBe("Failure");
+          expect(authorityCalls).toBe(0);
+          expect(observed).toEqual([]);
+          return;
+        }
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        const ack = yield* invoke(frame(0, { type: "ack", requestId: 1, chunkSequence: 3 })).pipe(
+          Effect.result,
+          Effect.forkChild,
+        );
+        const receipt = yield* Effect.raceFirst(
+          Fiber.join(ack).pipe(
+            Effect.map((result) => (result._tag === "Success" ? "ack-consumed" : "ack-rejected")),
+          ),
+          Deferred.await(entered).pipe(Effect.as("authority-entered")),
+        );
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(ack);
+        expect(receipt).toBe("ack-consumed");
+        expect(authorityCalls).toBe(0);
+        expect(observed).toEqual([]);
+        // The next non-ACK frame proves ACK consumed the translator's sequence cursor.
+        armed = false;
+        const next = yield* invoke(frame(1, { type: "agent_start", lifecycleId: 1 })).pipe(
+          Effect.result,
+        );
+        expect(next._tag).toBe(host === "blocked" ? "Success" : "Failure");
+        armed = true;
+        if (host === "blocked") {
+          // Keep this fence's authorizer denied after the ACK receipt completed.
+          yield* restoreHistoricalBinding({
+            ...f.binding,
+            revision: f.binding.revision + 1,
+            status: "revoked",
+          });
+        }
+        for (const phase of ["beforeForward", "beforeReturn"] as const) {
+          expect(
+            (yield* Effect.tryPromise({
+              try: () => session.broker.authorizeCurrent!(phase, signal),
+              catch: controlledCallbackError,
+            }).pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        for (const phase of ["beforeToolInvoke", "beforeToolReturn", "beforeStart"] as const)
+          expect(
+            (yield* Effect.tryPromise({
+              try: () =>
+                session.authorizeCurrent(
+                  { phase, identity: session.identity, operation: session.operation },
+                  signal,
+                ),
+              catch: controlledCallbackError,
+            }).pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        expect(authorityCalls).toBeGreaterThan(0);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+
 const reportInputFeedbackFixture = Effect.fn("reportInputFeedbackFixture")(function* (
   write?: ProjectWorkGatewayShape["write"],
 ) {
@@ -15597,6 +15765,7 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
   () => {
     for (const mode of [
       "mounted",
+      "ack-authority-held",
       "assessed",
       "missing-descriptor",
       "mismatched-descriptor",
@@ -15605,11 +15774,13 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
       "unicode-alias",
     ] as const)
       it.effect(
-        mode === "mounted"
-          ? "reads committed target bytes from an independent readonly reviewer and retains its report"
-          : mode === "assessed"
-            ? "assesses exact parent criteria after native reads and retains qualified joined progress"
-            : `rejects actual native review reads with ${mode}`,
+        mode === "ack-authority-held"
+          ? "consumes native ACK receipts while the managed authority host is held"
+          : mode === "mounted"
+            ? "reads committed target bytes from an independent readonly reviewer and retains its report"
+            : mode === "assessed"
+              ? "assesses exact parent criteria after native reads and retains qualified joined progress"
+              : `rejects actual native review reads with ${mode}`,
         () =>
           scoped(
             Effect.gen(function* () {
@@ -15679,6 +15850,41 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
               );
               let criterionAssessments: ProjectTeamReviewCriterionAssessment[] | undefined;
               const workerFailures: string[] = [];
+              let ackAuthoritySignal: AbortSignal | undefined;
+              let nativeAckReceipts = 0;
+              let ackTerminal: SessionRuntime.PiSessionTerminal | undefined;
+              let redundantAckAuthorityCalls = 0;
+              if (mode === "ack-authority-held") {
+                const originalOperations = PiOperations.makeProjectTeamPiOperations;
+                const authoritySpy = vi
+                  .spyOn(PiOperations, "makeProjectTeamPiOperations")
+                  .mockImplementation((options) =>
+                    originalOperations(options).pipe(
+                      Effect.map((operations) => ({
+                        ...operations,
+                        authorize: (operation) =>
+                          Effect.gen(function* () {
+                            const signal = ackAuthoritySignal;
+                            if (signal) {
+                              redundantAckAuthorityCalls++;
+                              yield* Effect.promise(
+                                () =>
+                                  new Promise<void>((resolve) => {
+                                    if (signal.aborted) resolve();
+                                    else
+                                      signal.addEventListener("abort", () => resolve(), {
+                                        once: true,
+                                      });
+                                  }),
+                              );
+                            }
+                            return yield* operations.authorize(operation);
+                          }),
+                      })),
+                    ),
+                  );
+                yield* Effect.addFinalizer(() => Effect.sync(() => authoritySpy.mockRestore()));
+              }
               const originalSession = SessionRuntime.makePiSessionRuntime;
               const sessionSpy = vi
                 .spyOn(SessionRuntime, "makePiSessionRuntime")
@@ -15686,6 +15892,17 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                   const target = input.bootstrap.resources?.reviewTarget;
                   return originalSession({
                     ...input,
+                    ...(mode === "ack-authority-held"
+                      ? {
+                          persistTerminal: async (
+                            terminal: SessionRuntime.PiSessionTerminal,
+                            signal: AbortSignal,
+                          ) => {
+                            ackTerminal = terminal;
+                            await input.persistTerminal(terminal, signal);
+                          },
+                        }
+                      : {}),
                     ...(mode === "missing-descriptor"
                       ? {
                           bootstrap: {
@@ -15707,7 +15924,15 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                     onWorkerFrame: async (frame, signal) => {
                       if (frame.message.type === "worker-failure")
                         workerFailures.push(frame.message.code);
-                      await input.onWorkerFrame?.(frame, signal);
+                      if (mode === "ack-authority-held" && frame.message.type === "ack") {
+                        nativeAckReceipts++;
+                        ackAuthoritySignal = signal;
+                        try {
+                          await input.onWorkerFrame?.(frame, signal);
+                        } finally {
+                          ackAuthoritySignal = undefined;
+                        }
+                      } else await input.onWorkerFrame?.(frame, signal);
                     },
                   });
                 });
@@ -16020,6 +16245,14 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                   expected[1],
                 );
                 return;
+              }
+              if (mode === "ack-authority-held") {
+                expect(nativeAckReceipts).toBeGreaterThan(0);
+                expect(ackTerminal).toMatchObject({
+                  outcome: "success",
+                  drain: { kernel: "removed", childExitCode: 0 },
+                });
+                expect(redundantAckAuthorityCalls).toBe(0);
               }
               if (assignment._tag === "Failure") return yield* Effect.fail(assignment.failure);
               const result = assignment.success;
