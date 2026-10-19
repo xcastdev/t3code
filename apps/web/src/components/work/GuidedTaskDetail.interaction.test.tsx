@@ -609,6 +609,268 @@ describe("GuidedTaskDetail human interactions", () => {
     expect(host.textContent).not.toContain("opaque-failure-fingerprint");
   });
 
+  async function selectImplementationCriterion(description = "Retain the conversation") {
+    const label = [...host.querySelectorAll("label")].find(
+      (entry) => entry.textContent === description,
+    );
+    const checkbox = label?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    if (!checkbox) throw Error(`Missing implementation criterion ${description}`);
+    await act(async () => checkbox.click());
+  }
+
+  it("starts an implementation subtask using only selected approved parent criteria and exact approvals", async () => {
+    foundation = records(current, "approved");
+    await render();
+    expect(button("Start implementation subtask").disabled).toBe(true);
+    await selectImplementationCriterion();
+    await fill("Implementation objective", "Implement retained reconnect history");
+    await fill("Expected implementation outputs (one per line)", "Reconnect fix\nFocused tests");
+    await click("Start implementation subtask");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.assignment.start",
+      assignmentKind: "implementation",
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      specRevision: 2,
+      specificationGateId: "spec-gate",
+      expectedSpecificationGateRevision: 1,
+      parentPlan: {
+        recordId: "plan",
+        expectedRecordRevision: 1,
+        planRevision: 3,
+        gateId: "plan-gate",
+        expectedGateRevision: 1,
+      },
+      parentCriterionIds: ["criterion-1"],
+      objective: "Implement retained reconnect history",
+      outputDescriptions: ["Reconnect fix", "Focused tests"],
+    });
+    expect(emitted[0]).not.toHaveProperty("assignmentAuthorization");
+    expect(emitted[0]).not.toHaveProperty("specification");
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("keeps implementation selection and review drafts separate and uses valid defaults", async () => {
+    foundation = records(current, "approved");
+    await render();
+    await fill("Review objective", "Review the completed change independently");
+    await selectImplementationCriterion();
+    await click("Start implementation subtask");
+    expect(emitted[0]).toMatchObject({
+      assignmentKind: "implementation",
+      objective: "Implement the selected approved acceptance criteria.",
+      outputDescriptions: ["Implementation and focused validation results"],
+    });
+    expect(
+      host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Review objective"]')?.value,
+    ).toBe("Review the completed change independently");
+  });
+
+  it.each(["spec-gate", "plan-gate"])(
+    "refuses implementation when %s approval is revoked and fences retained callbacks",
+    async (gateId) => {
+      foundation = records(current, "approved");
+      await render();
+      await selectImplementationCriterion();
+      const retained = callbacks.get("Start implementation subtask");
+      foundation = foundation.map((record) =>
+        record.recordId === gateId ? decodeRecord({ ...record, status: "pending" }) : record,
+      );
+      await render();
+      await act(async () => retained?.());
+      await act(async () => callbacks.get("Start implementation subtask")?.());
+      expect(button("Start implementation subtask").disabled).toBe(true);
+      expect(emitted).toEqual([]);
+    },
+  );
+
+  it.each([
+    "nonhuman-spec",
+    "nonhuman-plan",
+    "foreign-spec",
+    "foreign-plan",
+    "old-plan-spec",
+    "incomplete-foundation",
+  ])("refuses implementation for %s parent approval state", async (change) => {
+    foundation = records(current, "approved");
+    await render();
+    await selectImplementationCriterion();
+    const retained = callbacks.get("Start implementation subtask");
+    foundation = foundation.map((record) => {
+      if (
+        (change === "nonhuman-spec" && record.recordId === "spec-gate") ||
+        (change === "nonhuman-plan" && record.recordId === "plan-gate")
+      )
+        return decodeRecord({
+          ...record,
+          attribution: { ...attribution, actor: { kind: "system" } },
+        });
+      if (
+        (change === "foreign-spec" && record.recordId === "spec-gate") ||
+        (change === "foreign-plan" && record.recordId === "plan-gate")
+      )
+        return decodeRecord({ ...record, contentHash: "another-approved-target" });
+      if (change === "old-plan-spec" && record.kind === "plan-revision")
+        return decodeRecord({ ...record, specRevision: 1 });
+      return record;
+    });
+    await render(change === "incomplete-foundation" ? { foundationRevision: 9 } : {});
+    await act(async () => retained?.());
+    await act(async () => callbacks.get("Start implementation subtask")?.());
+    expect(button("Start implementation subtask").disabled).toBe(true);
+    expect(emitted).toEqual([]);
+  });
+
+  it.each(["plan", "plan-gate", "spec-gate"])(
+    "retains implementation selection until the changed %s target is explicitly reviewed",
+    async (recordId) => {
+      foundation = records(current, "approved");
+      await render();
+      await selectImplementationCriterion();
+      const retained = callbacks.get("Start implementation subtask");
+      foundation = foundation.map((record) =>
+        record.recordId === recordId ? decodeRecord({ ...record, revision: 2 }) : record,
+      );
+      await render();
+      await act(async () => retained?.());
+      await act(async () => callbacks.get("Start implementation subtask")?.());
+      expect(emitted).toEqual([]);
+      expect(button("Start implementation subtask").disabled).toBe(true);
+      await click("Keep edits against reviewed revisions");
+      await click("Start implementation subtask");
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]).toMatchObject({ parentCriterionIds: ["criterion-1"] });
+    },
+  );
+
+  it("refuses removed selected criteria without silently replacing the selection and supports explicit discard", async () => {
+    foundation = records(current, "approved");
+    await render();
+    await selectImplementationCriterion();
+    current = decodeContext({
+      ...current,
+      revision: 11,
+      task: {
+        ...current.task,
+        specRevision: 3,
+        specification: {
+          ...current.task.specification,
+          revision: 3,
+          criterionIds: ["criterion-2"],
+        },
+      },
+      criteria: [
+        { ...current.criteria[0], criterionId: "criterion-2", description: "Reconnect once" },
+      ],
+    });
+    foundation = records(current, "approved");
+    await render();
+    expect(button("Start implementation subtask").disabled).toBe(true);
+    expect(button("Keep edits against reviewed revisions").disabled).toBe(true);
+    expect(host.textContent).toContain("Selected parent criteria changed");
+    await act(async () => callbacks.get("Start implementation subtask")?.());
+    expect(emitted).toEqual([]);
+    await click("Discard local draft");
+    await selectImplementationCriterion("Reconnect once");
+    await click("Start implementation subtask");
+    expect(emitted[0]).toMatchObject({ specRevision: 3, parentCriterionIds: ["criterion-2"] });
+  });
+
+  it("bounds mounted selection to 64 unique approved criteria and explicitly reviews selection edits", async () => {
+    const criteria = Array.from({ length: 65 }, (_, i) => ({
+      ...current.criteria[0],
+      criterionId: `criterion-${String(i).padStart(3, "0")}`,
+      description: `Approved criterion ${i}`,
+    }));
+    current = decodeContext({
+      ...current,
+      criteria,
+      task: {
+        ...current.task,
+        specification: {
+          ...current.task.specification,
+          criterionIds: criteria.map((criterion) => criterion.criterionId),
+        },
+      },
+    });
+    foundation = records(current, "approved");
+    await render();
+    for (let i = 0; i < 64; i++) await selectImplementationCriterion(`Approved criterion ${i}`);
+    const last = [...host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].at(-1);
+    expect(last?.disabled).toBe(true);
+    expect(button("Start implementation subtask").disabled).toBe(true);
+    await click("Keep edits against reviewed revisions");
+    await click("Start implementation subtask");
+    expect(emitted).toHaveLength(1);
+    const intent = emitted[0];
+    if (intent?.type !== "project-team.assignment.start") throw Error("Expected assignment");
+    expect(intent.parentCriterionIds).toHaveLength(64);
+    expect(new Set(intent.parentCriterionIds).size).toBe(64);
+    expect(intent.parentCriterionIds).not.toContain("criterion-064");
+  });
+
+  it("retains the in-flight selection when approval snapshots refresh before the response", async () => {
+    const pending = deferred();
+    foundation = records(current, "approved");
+    write.mockImplementationOnce(async (intent) => {
+      emitted.push(decodeWrite(intent));
+      await pending.promise;
+    });
+    await render();
+    await selectImplementationCriterion();
+    await click("Start implementation subtask");
+    const original = emitted[0];
+    current = context(11);
+    foundation = records(current, "pending");
+    await render();
+    expect(button("Discard local draft").disabled).toBe(true);
+    expect(host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
+    await act(async () => pending.resolve());
+    expect(emitted).toEqual([original]);
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("only offers criteria in the current approved specification", async () => {
+    current = decodeContext({
+      ...current,
+      criteria: [
+        ...current.criteria,
+        {
+          ...current.criteria[0],
+          criterionId: "unapproved",
+          description: "Unapproved extra criterion",
+        },
+      ],
+    });
+    foundation = records(current, "approved");
+    await render();
+    expect([...host.querySelectorAll('input[type="checkbox"]')]).toHaveLength(1);
+    await selectImplementationCriterion();
+    await click("Start implementation subtask");
+    expect(emitted[0]).toMatchObject({ parentCriterionIds: ["criterion-1"] });
+  });
+
+  it("retries the exact uncertain implementation request after a parent update", async () => {
+    foundation = records(current, "approved");
+    write.mockImplementationOnce(async (intent) => {
+      emitted.push(decodeWrite(intent));
+      throw Error("Lost response");
+    });
+    await render();
+    await selectImplementationCriterion();
+    await click("Start implementation subtask");
+    const original = emitted[0];
+    current = context(11);
+    foundation = records(current, "approved").map((record) =>
+      record.recordId === "plan" ? decodeRecord({ ...record, revision: 2 }) : record,
+    );
+    await render();
+    expect(button("Discard local draft").disabled).toBe(true);
+    await click("Retry exact request");
+    expect(emitted).toEqual([original, original]);
+  });
+
   it("starts a linked independent review against the exact approved specification and plan", async () => {
     foundation = records(current, "approved");
     await render();

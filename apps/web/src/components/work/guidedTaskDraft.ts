@@ -20,6 +20,7 @@ export interface GuidedTaskDraftKey {
   readonly projectId: ProjectId;
   readonly taskId: ProjectWorkTaskId;
   readonly kind: DraftIntent["type"];
+  readonly assignmentKind?: "implementation";
 }
 export type GuidedTaskDraftOutcome = "success" | "uncertain" | "stale" | "denied" | "unavailable";
 export interface GuidedTaskDraftSubmission {
@@ -77,7 +78,8 @@ const sameKey = (a: GuidedTaskDraftKey, b: GuidedTaskDraftKey) =>
   a.environmentId === b.environmentId &&
   a.projectId === b.projectId &&
   a.taskId === b.taskId &&
-  a.kind === b.kind;
+  a.kind === b.kind &&
+  a.assignmentKind === b.assignmentKind;
 const refuse = (state: GuidedTaskDraftState, reason: Refusal) => ({
   ok: false as const,
   state,
@@ -162,6 +164,9 @@ function snapshot(state: GuidedTaskDraftState, key: GuidedTaskDraftKey, input: u
         intent.type === "project-team.verification.propose"
       ) ||
       intent.type !== key.kind ||
+      (key.assignmentKind === "implementation") !==
+        (intent.type === "project-team.assignment.start" &&
+          intent.assignmentKind === "implementation") ||
       intent.projectId !== key.projectId ||
       intent.taskId !== key.taskId
     )
@@ -206,6 +211,8 @@ function targets(intent: ProjectWorkWriteIntent): string {
     "specificationGateId",
     "expectedSpecificationGateRevision",
     "parentPlan",
+    "assignmentKind",
+    "parentCriterionIds",
     "episodeId",
     "expectedEpisodeRevision",
     "failureFingerprint",
@@ -318,6 +325,7 @@ export function editGuidedTaskDraft(
             projectId: key.projectId,
             taskId: key.taskId,
             kind: key.kind,
+            ...(key.assignmentKind === undefined ? {} : { assignmentKind: key.assignmentKind }),
           }),
           fields,
           originalIntentJson: source.json,

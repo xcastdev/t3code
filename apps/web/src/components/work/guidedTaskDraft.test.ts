@@ -779,6 +779,134 @@ describe("guided task drafts and exact submissions", () => {
     expect(beginGuidedTaskSubmission(draft, draftKey, removed).ok).toBe(true);
   });
 
+  const implementation = () => ({
+    type: "project-team.assignment.start" as const,
+    assignmentKind: "implementation" as const,
+    commandId: CommandId.make("implementation-reference"),
+    projectId,
+    taskId,
+    expectedRevision: 10,
+    expectedTaskRevision: 7,
+    specRevision: 2,
+    objective: "Implement selected approved criteria",
+    outputDescriptions: ["Fix", "Focused tests"],
+    specificationGateId: "spec-gate",
+    expectedSpecificationGateRevision: 1,
+    parentPlan: {
+      recordId: "plan",
+      expectedRecordRevision: 2,
+      planRevision: 3,
+      gateId: "plan-gate",
+      expectedGateRevision: 1,
+    },
+    parentCriterionIds: [ProjectWorkCriterionId.make("criterion-1")],
+  });
+  const implementationKey = () =>
+    key({ kind: "project-team.assignment.start", assignmentKind: "implementation" });
+
+  it.each(["criteria", "specification", "plan"])(
+    "requires explicit review when implementation %s targets change",
+    (target) => {
+      const input = implementation();
+      const draft = edited(createGuidedTaskDraftState(), implementationKey(), input);
+      const next = {
+        ...input,
+        commandId: CommandId.make("implementation-command"),
+        ...(target === "criteria"
+          ? { parentCriterionIds: [ProjectWorkCriterionId.make("criterion-2")] }
+          : {}),
+        ...(target === "specification" ? { expectedSpecificationGateRevision: 2 } : {}),
+        ...(target === "plan"
+          ? { parentPlan: { ...input.parentPlan, expectedRecordRevision: 3 } }
+          : {}),
+      };
+      expect(compareGuidedTaskDraft(draft, implementationKey(), next)?.targetsChanged).toBe(true);
+      expectRefusal(
+        beginGuidedTaskSubmission(draft, implementationKey(), next),
+        draft,
+        "target-changed",
+      );
+      const reviewed = changed(rebaseGuidedTaskDraft(draft, implementationKey(), next));
+      expect(beginGuidedTaskSubmission(reviewed, implementationKey(), next).ok).toBe(true);
+    },
+  );
+
+  it("retains implementation command bytes and selection for uncertain retry without rebasing", () => {
+    const input = implementation();
+    const draft = edited(createGuidedTaskDraftState(), implementationKey(), input);
+    const sent = submit(draft, implementationKey(), {
+      ...input,
+      commandId: CommandId.make("implementation-command"),
+      objective: "Exact retained objective\nwith newline",
+    });
+    const uncertain = changed(
+      recordGuidedTaskDraftOutcome(sent.state, sent.submission, "uncertain"),
+    );
+    const next = {
+      ...input,
+      expectedRevision: 11,
+      parentCriterionIds: [ProjectWorkCriterionId.make("criterion-2")],
+    };
+    expectRefusal(
+      rebaseGuidedTaskDraft(uncertain, implementationKey(), next),
+      uncertain,
+      "pending-submission",
+    );
+    expectRefusal(
+      editGuidedTaskDraft(uncertain, implementationKey(), next, {
+        parentCriterionIds: '["criterion-2"]',
+      }),
+      uncertain,
+      "pending-submission",
+    );
+    const retry = retryGuidedTaskSubmission(uncertain, implementationKey());
+    expect(retry.ok).toBe(true);
+    if (!retry.ok || !("submission" in retry)) throw Error("Expected exact retry");
+    expect(retry.submission.intentJson).toBe(sent.submission.intentJson);
+    expect(retry.submission.commandId).toBe(sent.submission.commandId);
+    expect(JSON.parse(retry.submission.intentJson)).toMatchObject({
+      expectedRevision: 10,
+      parentCriterionIds: ["criterion-1"],
+    });
+  });
+
+  it("keeps review and implementation drafts independent under the same wire intent", () => {
+    const input = implementation();
+    const reviewKey = key({ kind: "project-team.assignment.start" });
+    const { parentCriterionIds: _selection, ...base } = input;
+    const review = { ...base, assignmentKind: "review", objective: "Independent review" };
+    const draft = edited(createGuidedTaskDraftState(), implementationKey(), input);
+    const both = edited(draft, reviewKey, review);
+    expect(both.entries).toHaveLength(2);
+    expect(changed(discardGuidedTaskDraft(both, implementationKey())).entries).toMatchObject([
+      { key: reviewKey },
+    ]);
+    expectRefusal(
+      editGuidedTaskDraft(draft, implementationKey(), review, fields),
+      draft,
+      "invalid-input",
+    );
+    expectRefusal(editGuidedTaskDraft(both, reviewKey, input, fields), both, "invalid-input");
+  });
+
+  it.each([
+    [],
+    ["criterion-1", "criterion-1"],
+    Array.from({ length: 65 }, (_, i) => `criterion-${i}`),
+  ])("refuses invalid implementation criterion selection %j", (ids) => {
+    const state = createGuidedTaskDraftState();
+    expectRefusal(
+      editGuidedTaskDraft(
+        state,
+        implementationKey(),
+        { ...implementation(), parentCriterionIds: ids },
+        fields,
+      ),
+      state,
+      "invalid-input",
+    );
+  });
+
   it.each([
     {
       type: "project-team.investigation.start",

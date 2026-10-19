@@ -64,7 +64,11 @@ interface GuidedTaskDetailProps {
 type Intent =
   | ProjectTeamGuidedIntent
   | Extract<ProjectTeamWriteIntent, { type: "project-team.gate.respond" }>;
-type Kind = Intent["type"];
+type Kind = Intent["type"] | "implementation-subtask";
+const implementationKind = "implementation-subtask";
+const criterionIdsJson = Schema.fromJsonString(Schema.Array(ProjectWorkCriterionId));
+const decodeCriterionIds = Schema.decodeUnknownSync(criterionIdsJson);
+const encodeCriterionIds = Schema.encodeSync(criterionIdsJson);
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
 type Plan = Extract<ProjectTeamRecord, { kind: "plan-revision" }>;
 type RepairEpisode = Extract<ProjectTeamRecord, { kind: "repair-episode" }>;
@@ -323,12 +327,32 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     state.current = next;
     setDrafts(next);
   };
-  const draftFor = (kind: Kind) => drafts.entries.find((draft) => draft.key.kind === kind);
+  const matchesKind = (draft: GuidedTaskDraft, kind: Kind) =>
+    kind === implementationKind
+      ? draft.key.kind === "project-team.assignment.start" &&
+        draft.key.assignmentKind === "implementation"
+      : draft.key.kind === kind && draft.key.assignmentKind === undefined;
+  const draftFor = (kind: Kind) => drafts.entries.find((draft) => matchesKind(draft, kind));
+  const implementationDraft = draftFor(implementationKind);
+  const selectedImplementationCriteria = decodeCriterionIds(
+    implementationDraft?.fields.parentCriterionIds ?? "[]",
+  );
+  const approvedCriteria = criteria.filter((criterion) =>
+    task?.specification?.criterionIds.includes(criterion.criterionId),
+  );
   const draftDescriptions = criterionFields(
     draftFor("project-team.specification.propose")?.fields ?? {},
   );
   const keyFor = (kind: Kind): GuidedTaskDraftKey | null =>
-    task ? { environmentId, projectId, taskId: task.taskId, kind } : null;
+    task
+      ? {
+          environmentId,
+          projectId,
+          taskId: task.taskId,
+          kind: kind === implementationKind ? "project-team.assignment.start" : kind,
+          ...(kind === implementationKind ? { assignmentKind: "implementation" as const } : {}),
+        }
+      : null;
   const base = task &&
     context && {
       commandId: CommandId.make(randomUUID()),
@@ -390,7 +414,23 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             ? { issueRecordId: issue.recordId, expectedIssueRevision: issue.revision }
             : {}),
         };
-      case "project-team.assignment.start":
+      case implementationKind:
+      case "project-team.assignment.start": {
+        const implementation = kind === implementationKind;
+        const selected = decodeCriterionIds(
+          fields.parentCriterionIds ?? encodeCriterionIds(selectedImplementationCriteria),
+        );
+        if (
+          implementation &&
+          (!task.specification ||
+            selected.length < 1 ||
+            selected.length > 64 ||
+            new Set(selected).size !== selected.length ||
+            selected.some(
+              (id) => !approvedCriteria.some((criterion) => criterion.criterionId === id),
+            ))
+        )
+          return null;
         return plan &&
           plan.specRevision === task.specRevision &&
           specGate?.status === "approved" &&
@@ -402,12 +442,20 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
           !repair
           ? {
               ...base,
-              type: kind,
-              assignmentKind: "review",
+              type: "project-team.assignment.start",
+              assignmentKind: implementation ? "implementation" : "review",
+              ...(implementation ? { parentCriterionIds: selected } : {}),
               objective:
                 fields.objective ??
-                "Independently review the approved work and its verification evidence.",
-              outputDescriptions: (fields.outputs ?? "Independent review findings")
+                (implementation
+                  ? "Implement the selected approved acceptance criteria."
+                  : "Independently review the approved work and its verification evidence."),
+              outputDescriptions: (
+                fields.outputs ??
+                (implementation
+                  ? "Implementation and focused validation results"
+                  : "Independent review findings")
+              )
                 .split("\n")
                 .map((line) => line.trim())
                 .filter(Boolean),
@@ -423,6 +471,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               },
             }
           : null;
+      }
       case "project-team.specification.propose": {
         const retained =
           source?.type === kind
@@ -642,6 +691,8 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
         content: plan?.content ?? "",
         integrationSourceRefs: JSON.stringify(retainedSources()),
       };
+    if (kind === implementationKind)
+      return { parentCriterionIds: encodeCriterionIds(selectedImplementationCriteria) };
     if (kind === "project-team.task.control") return { reason: "" };
     if (kind === "project-team.criterion.waiver") return { reason: "", evidenceIds: "[]" };
     if (kind === "project-team.repair.resolve") return { decision: "diagnose", reason: "" };
@@ -650,8 +701,9 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
 
   function edit(kind: Kind, patch: Readonly<Record<string, string>>) {
     const key = keyFor(kind);
-    const current = build(kind);
-    if (!key || !current || draftFor(kind)?.pending) return;
+    const current =
+      kind === implementationKind ? (original(draftFor(kind)) ?? build(kind, patch)) : build(kind);
+    if (!currentCallback() || !key || !current || draftFor(kind)?.pending) return;
     const defaults = defaultFields(kind);
     const descriptions = Object.fromEntries(
       Object.entries(patch).filter(
@@ -724,7 +776,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     )
       return;
     const key = keyFor(kind);
-    const existing = state.current.entries.find((draft) => draft.key.kind === kind);
+    const existing = state.current.entries.find((draft) => matchesKind(draft, kind));
     const fields = { ...defaultFields(kind), ...existing?.fields, ...patch };
     if (
       kind === "project-team.specification.propose" &&
@@ -878,7 +930,9 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             ? draftDescriptions[name]
             : draftFor(kind)?.fields[name]) ?? fallback
         }
-        disabled={Boolean(draftFor(kind)?.pending)}
+        disabled={
+          Boolean(draftFor(kind)?.pending) || (kind === implementationKind && !implementationDraft)
+        }
         onChange={(event) => edit(kind, { [name]: event.target.value })}
       />
     </label>
@@ -1155,6 +1209,86 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               Start investigation
             </Button>
             {status("project-team.investigation.start")}
+          </div>
+        </details>
+        <details className="mt-3">
+          <summary className="cursor-pointer text-sm font-medium">Implementation subtask</summary>
+          <div className="mt-3 space-y-3">
+            <fieldset
+              disabled={
+                !canWrite ||
+                Boolean(implementationDraft?.pending) ||
+                !plan ||
+                plan.specRevision !== task.specRevision ||
+                specGate?.status !== "approved" ||
+                planGate?.status !== "approved" ||
+                specGate.attribution.actor.kind !== "human" ||
+                planGate.attribution.actor.kind !== "human"
+              }
+            >
+              <legend className="text-sm">Approved parent criteria (select 1–64)</legend>
+              {approvedCriteria.map((criterion) => (
+                <label key={criterion.criterionId} className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={selectedImplementationCriteria.includes(criterion.criterionId)}
+                    disabled={
+                      !selectedImplementationCriteria.includes(criterion.criterionId) &&
+                      selectedImplementationCriteria.length >= 64
+                    }
+                    onChange={(event) => {
+                      if (!currentCallback() || implementationDraft?.pending) return;
+                      const selected = event.target.checked
+                        ? [...selectedImplementationCriteria, criterion.criterionId]
+                        : selectedImplementationCriteria.filter(
+                            (id) => id !== criterion.criterionId,
+                          );
+                      edit(implementationKind, {
+                        parentCriterionIds: encodeCriterionIds(selected),
+                      });
+                    }}
+                  />
+                  {criterion.description}
+                </label>
+              ))}
+            </fieldset>
+            {selectedImplementationCriteria.some(
+              (id) => !approvedCriteria.some((criterion) => criterion.criterionId === id),
+            ) ? (
+              <p role="status" className="text-sm text-warning-foreground">
+                Selected parent criteria changed. Review the selection or discard the local draft.
+              </p>
+            ) : null}
+            {field(
+              implementationKind,
+              "objective",
+              "Implementation objective",
+              "Implement the selected approved acceptance criteria.",
+              32000,
+            )}
+            {field(
+              implementationKind,
+              "outputs",
+              "Expected implementation outputs (one per line)",
+              "Implementation and focused validation results",
+              64000,
+            )}
+            <p className="text-xs text-muted-foreground">
+              Creates a linked implementation task from the selected approved criteria and current
+              approved plan. Uses the task's remaining budget and original deadline.
+            </p>
+            <Button
+              size="sm"
+              disabled={
+                !canWrite ||
+                !build(implementationKind, implementationDraft?.fields) ||
+                blockedDraft(implementationKind)
+              }
+              onClick={() => submit(implementationKind)}
+            >
+              Start implementation subtask
+            </Button>
+            {status(implementationKind)}
           </div>
         </details>
         <details className="mt-3">
