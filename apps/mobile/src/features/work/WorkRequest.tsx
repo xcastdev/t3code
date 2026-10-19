@@ -6,17 +6,15 @@ import {
   type ProjectId,
 } from "@t3tools/contracts";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import * as Schema from "effect/Schema";
 import { useLayoutEffect, useRef, useState } from "react";
 import { AppTextInput as TextInput } from "../../components/AppText";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { uuidv4 } from "../../lib/uuid";
 import { mobileWorkEnvironment } from "./workEnvironment";
-import { publicWorkRejection } from "./workActions";
+import { createMobileWorkRequest, publicWorkRejection } from "./workActions";
 import { Notice, WorkButton, WorkCard } from "./WorkScreens";
 
 type Request = Extract<ProjectWorkWriteIntent, { type: "project-work.task.create" }>;
-const decode = Schema.decodeUnknownSync(ProjectWorkWriteIntent);
 
 /** Create a draft only; specification and execution still require their own approvals. */
 export function WorkRequest(props: {
@@ -59,8 +57,7 @@ export function WorkRequest(props: {
     if (revision === null || !live.current.available || (!pending && !title.trim())) return;
     const input =
       pending ??
-      decode({
-        type: "project-work.task.create",
+      createMobileWorkRequest({
         commandId: CommandId.make(uuidv4()),
         taskId: ProjectWorkTaskId.make(uuidv4()),
         projectId: props.target.projectId,

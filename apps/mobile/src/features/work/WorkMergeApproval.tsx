@@ -15,7 +15,12 @@ import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { mobileWorkEnvironment } from "./workEnvironment";
-import { reviewMobileWork, type MobileWorkCurrent, type MobileWorkScope } from "./workActions";
+import {
+  reviewMobileWork,
+  reviewMobileTaskControl,
+  type MobileWorkCurrent,
+  type MobileWorkScope,
+} from "./workActions";
 import { Notice, WorkButton, WorkCard } from "./WorkScreens";
 
 type Publication = NonNullable<ReturnType<typeof readProjectWorkPublicationHistory>>;
@@ -103,7 +108,7 @@ function mergeDetail(detail: PullRequestDetail) {
     mergeCapabilities: { ...detail.mergeCapabilities },
   };
 }
-function matches(
+function samePullRequest(
   detail: ReturnType<typeof mergeDetail>,
   owner: MobileWorkScope,
   publication: Publication,
@@ -114,15 +119,59 @@ function matches(
     detail.repository === publication.repository.nameWithOwner &&
     detail.number === pr.number &&
     detail.url === pr.url &&
-    detail.state === "open" &&
-    !detail.isDraft &&
     detail.headRevision === pr.headSha &&
     detail.baseRevision === pr.baseSha &&
     detail.baseBranch === pr.baseRef &&
-    detail.headBranch === pr.headRef &&
+    detail.headBranch === pr.headRef
+  );
+}
+function matches(
+  detail: ReturnType<typeof mergeDetail>,
+  owner: MobileWorkScope,
+  publication: Publication,
+) {
+  return (
+    samePullRequest(detail, owner, publication) &&
+    detail.state === "open" &&
+    !detail.isDraft &&
     detail.capabilities.actions.includes("merge") &&
     detail.viewerPermissions.actions.includes("merge")
   );
+}
+
+/** Replay retains the approved publication, while its own gate/evidence may advance revisions. */
+function replayCurrent(current: MobileWorkCurrent, request: MobileMergeRequest) {
+  if (!own(current, request.owner) || reviewMobileTaskControl(current).reason !== null)
+    return false;
+  const original = request.review.publication;
+  const candidates = current.foundation.records.filter(knownRecord).flatMap((record) => {
+    if (record.kind !== "effect") return [];
+    const publication = readProjectWorkPublicationHistory(record);
+    return publication &&
+      publication.repository.host === original.repository.host &&
+      publication.repository.nameWithOwner === original.repository.nameWithOwner &&
+      publication.pullRequest.number === original.pullRequest.number
+      ? [{ record, publication }]
+      : [];
+  });
+  const retained = candidates[0];
+  if (
+    candidates.length !== 1 ||
+    !retained ||
+    retained.record.taskId !== request.owner.taskId ||
+    canonicalProjectWorkPayload(retained.publication) !== canonicalProjectWorkPayload(original) ||
+    !retained.record.payload.summary
+  )
+    return false;
+  try {
+    const target = decodePublicationRequest(retained.record.payload.summary).target;
+    return (
+      current.context?.task.specRevision === target.specRevision &&
+      reviewMobileTaskControl(current).plan?.planRevision === target.planRevision
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function WorkMergeApprovalSource(
@@ -141,7 +190,10 @@ export function WorkMergeApprovalSource(
     <WorkMergeApproval
       {...props}
       readPullRequest={async (input) => {
-        const result = await read({ environmentId: props.current.environmentId, input });
+        const result = await read({
+          environmentId: props.current.environmentId,
+          input: { ...input, allowStale: false },
+        });
         if (result._tag === "Failure") throw squashAtomCommandFailure(result);
         return result.value;
       }}
@@ -169,6 +221,7 @@ export function WorkMergeApproval(props: {
   };
   const request = props.store.snapshot.find((entry) => own(entry.owner, owner));
   const [review, setReview] = useState<Review | null>(null);
+  const reviewed = useRef<Review | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [page, setPage] = useState(0);
@@ -201,6 +254,7 @@ export function WorkMergeApproval(props: {
     if (!before) return;
     lock.current = true;
     setLoading(true);
+    reviewed.current = null;
     setReview(null);
     try {
       const {
@@ -217,7 +271,9 @@ export function WorkMergeApproval(props: {
         fingerprint(live.current.readCurrent(), owner, publication) !== before
       )
         throw Error("The publication or pull request changed. Refresh and review it again.");
-      setReview({ publication, detail, fingerprint: before });
+      const next = { publication, detail, fingerprint: before };
+      reviewed.current = next;
+      setReview(next);
       setNotice(null);
     } catch (error) {
       if (mounted.current)
@@ -230,20 +286,23 @@ export function WorkMergeApproval(props: {
     }
   }
   async function submit(method: Method, prior?: MobileMergeRequest) {
-    const selected = prior?.review ?? review;
+    const selected = prior?.review ?? reviewed.current;
     if (
       !mounted.current ||
       lock.current ||
       !selected ||
-      (!prior && live.current.store.read().some((entry) => own(entry.owner, owner)))
+      (!prior && live.current.store.read().some((entry) => own(entry.owner, owner))) ||
+      (prior && (prior.status !== "uncertain" || !live.current.store.read().includes(prior)))
     )
       return;
     if (
-      fingerprint(live.current.readCurrent(), owner, selected.publication) !==
-        selected.fingerprint ||
-      !matches(selected.detail, owner, selected.publication) ||
-      !selected.detail.mergeCapabilities[method] ||
-      !selected.detail.capabilities.mergeMethods.includes(method)
+      prior
+        ? !replayCurrent(live.current.readCurrent(), prior)
+        : fingerprint(live.current.readCurrent(), owner, selected.publication) !==
+            selected.fingerprint ||
+          !matches(selected.detail, owner, selected.publication) ||
+          !selected.detail.mergeCapabilities[method] ||
+          !selected.detail.capabilities.mergeMethods.includes(method)
     ) {
       setNotice("Work changed. Refresh and review before approving a merge.");
       return;
@@ -266,6 +325,18 @@ export function WorkMergeApproval(props: {
     lock.current = true;
     save("sending");
     try {
+      if (prior) {
+        const { action: _action, mergeMethod: _method, ...reference } = captured.input;
+        const raw = await live.current.readPullRequest(reference);
+        if (
+          !mounted.current ||
+          !knownDetail(raw) ||
+          !samePullRequest(mergeDetail(raw), owner, selected.publication) ||
+          (raw.state !== "open" && raw.state !== "merged") ||
+          !replayCurrent(live.current.readCurrent(), captured)
+        )
+          throw Error("The recorded merge target changed. Inspect its result before retrying.");
+      }
       await live.current.send(captured.input);
       save("accepted");
       if (mounted.current) {
@@ -354,7 +425,7 @@ export function WorkMergeApproval(props: {
             {props.current.context?.task.specRevision} · project revision{" "}
             {props.current.context?.revision}
           </Notice>
-          {!usable ? (
+          {!usable && !request ? (
             <Notice>The reviewed work changed. Refresh and review the target again.</Notice>
           ) : null}
           {(["merge", "squash", "rebase"] as const).map((method) => (
@@ -372,7 +443,14 @@ export function WorkMergeApproval(props: {
             </WorkButton>
           ))}
           {!request ? (
-            <WorkButton onPress={() => setReview(null)}>Cancel merge review</WorkButton>
+            <WorkButton
+              onPress={() => {
+                reviewed.current = null;
+                setReview(null);
+              }}
+            >
+              Cancel merge review
+            </WorkButton>
           ) : null}
         </View>
       ) : null}
@@ -384,7 +462,7 @@ export function WorkMergeApproval(props: {
       ) : null}
       {request?.status === "uncertain" ? (
         <WorkButton
-          disabled={!usable}
+          disabled={!replayCurrent(props.current, request)}
           onPress={() => void submit(request.input.mergeMethod ?? "merge", request)}
         >
           Retry exact merge request
@@ -393,9 +471,16 @@ export function WorkMergeApproval(props: {
       {request && request.status !== "sending" ? (
         <WorkButton
           onPress={() => {
+            if (
+              !mounted.current ||
+              !live.current.store.read().includes(request) ||
+              request.status === "sending"
+            )
+              return;
             live.current.store.write(
               live.current.store.read().filter((entry) => !own(entry.owner, owner)),
             );
+            reviewed.current = null;
             setReview(null);
             setNotice(
               "Local request discarded. Refresh and inspect the recorded result before approving again.",

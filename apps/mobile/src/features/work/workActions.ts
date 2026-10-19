@@ -17,6 +17,18 @@ import {
 import type { ProjectWorkFoundationSnapshot } from "@t3tools/client-runtime/project-work";
 import * as Schema from "effect/Schema";
 
+/** A captured draft request keeps one command identity across transport retries. */
+export function createMobileWorkRequest(input: {
+  readonly commandId: CommandId;
+  readonly taskId: ProjectWorkTaskId;
+  readonly projectId: ProjectId;
+  readonly expectedRevision: number;
+  readonly title: string;
+  readonly createdAt: string;
+}) {
+  return decodeWrite({ type: "project-work.task.create", ...input, deliverableKind: "code" });
+}
+
 export interface MobileWorkScope {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;

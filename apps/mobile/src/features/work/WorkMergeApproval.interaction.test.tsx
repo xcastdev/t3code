@@ -338,6 +338,24 @@ function Harness() {
     />
   );
 }
+function Source() {
+  const [, changed] = React.useState(0);
+  return (
+    <WorkMergeApprovalSource
+      current={value}
+      readCurrent={() => value}
+      store={{
+        snapshot: requests,
+        read: () => requests,
+        write: (entries) => {
+          requests = entries;
+          changed((n) => n + 1);
+        },
+      }}
+      onRefresh={() => {}}
+    />
+  );
+}
 async function render() {
   await act(async () => root.render(<Harness />));
 }
@@ -405,7 +423,11 @@ it("blocks a retained approval callback after revision, disconnect or environmen
   for (const changed of [
     { ...original, connected: false },
     { ...original, environmentId: EnvironmentId.make("foreign") },
-    { ...original, context: { ...context, revision: 11 } },
+    {
+      ...original,
+      context: { ...context, revision: 11 },
+      foundation: { ...original.foundation, revision: 11 },
+    },
   ]) {
     value = changed;
     await act(async () => held?.());
@@ -446,29 +468,18 @@ it("blocks review completed after the owning work changed", async () => {
 it("routes human approval through the selected environment's existing pull request RPC", async () => {
   transport.read.mockResolvedValue({ _tag: "Success", value: detail });
   transport.send.mockResolvedValue({ _tag: "Success" });
-  function Source() {
-    const [, changed] = React.useState(0);
-    return (
-      <WorkMergeApprovalSource
-        current={value}
-        readCurrent={() => value}
-        store={{
-          snapshot: requests,
-          read: () => requests,
-          write: (entries) => {
-            requests = entries;
-            changed((n) => n + 1);
-          },
-        }}
-        onRefresh={() => {}}
-      />
-    );
-  }
+
   await act(async () => root.render(<Source />));
   await click(inspectLabel);
   expect(transport.read).toHaveBeenCalledWith({
     environmentId,
-    input: { projectId, host: "github.com", repository: "owner/repo", number: 42 },
+    input: {
+      projectId,
+      host: "github.com",
+      repository: "owner/repo",
+      number: 42,
+      allowStale: false,
+    },
   });
   await click("Approve merge now");
   expect(transport.send).toHaveBeenCalledExactlyOnceWith({
@@ -519,3 +530,159 @@ it("excludes a publication from an earlier specification and unsupported guided 
   expect(host.textContent).toContain("No current confirmed publication");
   expect(send).not.toHaveBeenCalled();
 });
+
+it("does not qualify held host detail after a strict refresh fails", async () => {
+  transport.read.mockResolvedValueOnce({ _tag: "Success", value: detail });
+  transport.send.mockClear();
+  await act(async () => root.render(<Source />));
+  await click(inspectLabel);
+  const heldApproval = callbacks.get("Approve merge now");
+  transport.read.mockImplementation(async ({ input }: { input: { allowStale?: boolean } }) => {
+    if (input.allowStale === false) throw Error("host refresh failed");
+    return { _tag: "Success", value: detail };
+  });
+  await click(inspectLabel);
+  await act(async () => heldApproval?.());
+  expect(transport.send).not.toHaveBeenCalled();
+  expect(host.textContent).toContain("host refresh failed");
+});
+
+function acceptedMergeRevision() {
+  const gate = decodeRecord({
+    ...records[1],
+    recordId: "accepted-merge",
+    gate: "merge",
+    status: "approved",
+    revision: 11,
+    repository: "github.com/owner/repo",
+    pullRequestNumber: 42,
+    headSha: detail.headRevision,
+    targetBranch: "main",
+    mergeMethod: "squash",
+  });
+  const contextAfter = decodeContext({
+    ...context,
+    revision: 12,
+    task: { ...context.task, revision: 5 },
+    evidence: [
+      {
+        evidenceId: "merge-permission",
+        taskId,
+        kind: "observation",
+        summary: "Human approved the exact reviewed pull request merge",
+        detail: canonicalProjectWorkPayload({
+          kind: "project-work.human-merge",
+          input: requests[0]?.input,
+        }),
+        recordedAt: at,
+        revision: 12,
+      },
+    ],
+  });
+  value = {
+    ...value,
+    context: contextAfter,
+    foundation: { ...value.foundation, revision: 12, records: [...value.foundation.records, gate] },
+  };
+}
+
+it("replays only the exact uncertain request after its own approval and evidence advance revisions", async () => {
+  send.mockImplementationOnce(async () => {
+    acceptedMergeRevision();
+    throw Error("accepted, response lost");
+  });
+  await render();
+  await click(inspectLabel);
+  await click("Approve squash merge now");
+  expect(requests[0]?.status).toBe("uncertain");
+  expect(value.context?.revision).toBe(12);
+  expect(value.context?.evidence[0]?.summary).toContain("Human approved");
+  expect(JSON.parse(value.context?.evidence[0]?.detail ?? "null").input).toEqual(
+    send.mock.calls[0]?.[0],
+  );
+  await render();
+  const captured = requests[0]?.input;
+  await click("Approve merge now");
+  expect(send).toHaveBeenCalledTimes(1);
+  await click("Retry exact merge request");
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(send.mock.calls[1]?.[0]).toEqual(captured);
+  expect(read).toHaveBeenCalledTimes(2);
+  expect(requests[0]?.status).toBe("accepted");
+});
+
+it.each(["head", "repository", "number", "environment", "project"])(
+  "does not replay an uncertain merge against a changed %s",
+  async (change) => {
+    send.mockImplementationOnce(async () => {
+      acceptedMergeRevision();
+      throw Error("accepted, response lost");
+    });
+    await render();
+    await click(inspectLabel);
+    await click("Approve squash merge now");
+    read.mockResolvedValue({
+      ...detail,
+      ...(change === "head"
+        ? { headRevision: "c".repeat(40) }
+        : change === "repository"
+          ? { repository: "foreign/repo" }
+          : change === "number"
+            ? { number: 43 }
+            : {}),
+    });
+    if (change === "environment")
+      value = { ...value, environmentId: EnvironmentId.make("foreign") };
+    if (change === "project") value = { ...value, projectId: ProjectId.make("foreign") };
+    await render();
+    await act(async () => callbacks.get("Retry exact merge request")?.());
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(requests[0]?.status).toBe("uncertain");
+  },
+);
+
+it("reconciles the captured request for an already merged target without reusing fresh merge permission", async () => {
+  send.mockImplementationOnce(async () => {
+    acceptedMergeRevision();
+    throw Error("accepted, response lost");
+  });
+  await render();
+  await click(inspectLabel);
+  await click("Approve squash merge now");
+  const captured = requests[0]?.input;
+  read.mockResolvedValue({
+    ...detail,
+    state: "merged",
+    viewerPermissions: { ...detail.viewerPermissions, actions: [] },
+    mergeCapabilities: { merge: false, squash: false, rebase: false },
+  });
+  await render();
+  await click("Retry exact merge request");
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(send.mock.calls[1]?.[0]).toEqual(captured);
+  expect(requests[0]?.status).toBe("accepted");
+});
+
+it.each(["failed read", "disconnect during read"])(
+  "retains the exact uncertain request after %s",
+  async (failure) => {
+    send.mockImplementationOnce(async () => {
+      acceptedMergeRevision();
+      throw Error("accepted, response lost");
+    });
+    await render();
+    await click(inspectLabel);
+    await click("Approve squash merge now");
+    const captured = requests[0]?.input;
+    read.mockImplementation(async () => {
+      if (failure === "failed read") throw Error("host unavailable");
+      value = { ...value, connected: false };
+      return detail;
+    });
+    await render();
+    await click("Retry exact merge request");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(requests[0]?.status).toBe("uncertain");
+    expect(requests[0]?.input).toEqual(captured);
+  },
+);

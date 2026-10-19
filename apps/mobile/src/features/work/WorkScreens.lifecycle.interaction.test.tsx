@@ -1001,6 +1001,7 @@ it("creates a project-scoped draft and retains an exact uncertain request across
     projectId,
     expectedRevision: 10,
     title: "Review remote supervision",
+    deliverableKind: "code",
   });
   expect(emitted[0]).not.toHaveProperty("attribution");
   await click("Show evidence");
