@@ -1,4 +1,4 @@
-import { expect, it } from "@effect/vitest";
+import { expect, it, vi } from "@effect/vitest";
 import {
   CommandId,
   canonicalProjectWorkPayload,
@@ -7,8 +7,17 @@ import {
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as ManagedGit from "../git/ManagedGitExecution.ts";
+import { GitWorkflowService } from "../git/GitWorkflowService.ts";
+import * as PiProcess from "../provider/pi/PiManagedProcess.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import { scoped, at } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import { ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
+import * as VerificationExecutable from "./ProjectWorkVerificationExecutable.ts";
+import { makeProjectWorkVerificationExecutionHost } from "./ProjectWorkVerificationExecutionHost.ts";
 import { makeVerificationFixture } from "./ProjectWorkVerification.testFixtures.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { makeProjectWorkVerificationGate } from "./ProjectWorkVerificationGate.ts";
@@ -174,7 +183,7 @@ const makeFixture = Effect.fn("makeExecutionFixture")(function* (
   };
   // Controlled execution tests retain an already-established original task budget.
   // Production standalone budget bootstrap is deliberately still unavailable.
-  yield* f.sql`INSERT INTO project_task_resource_budget VALUES('environment',${f.selection.projectId},${f.selection.taskId},${intent.deadlineAtMs + 300000},2147483648)`;
+  yield* f.sql`INSERT INTO project_task_resource_budget VALUES('environment',${f.selection.projectId},${f.snapshot.intent.limits.rootTaskId},${f.snapshot.intent.limits.rootDeadlineAtMs},2147483648)`;
   const journal = yield* makeProjectWorkVerificationExecutionJournal(options);
   const owner = {
     type: "owner" as const,
@@ -212,6 +221,269 @@ const makeFixture = Effect.fn("makeExecutionFixture")(function* (
     },
   };
 });
+
+const startupFailureThroughHost = Effect.fn("startupFailureThroughHost")(function* (
+  error: unknown,
+) {
+  const f = yield* makeFixture();
+  const job = f.prepared.manifest;
+  const claim = f.snapshot.intent.compiledClaim.transition;
+  if (claim?.kind !== "claim") return yield* Effect.die("Missing original assignment claim");
+  const pi = yield* makeProjectTeamPiRuntime();
+  yield* pi.publishAssets(
+    claim.binding.providerInstanceId,
+    {
+      runtimeFiles: f.intent.allocation.launch.runtimeFiles,
+      revalidate: Effect.void,
+      borrow: (effect) => effect,
+    },
+    {
+      inspect: Effect.die("Unexpected runtime inspection"),
+      prepareOperation: () => Effect.die("Unexpected native preparation"),
+      readSession: () => Effect.die("Unexpected native session read"),
+      readThread: () => Effect.die("Unexpected native thread read"),
+      requestStop: () => Effect.die("Unexpected native stop"),
+      stopAll: Effect.die("Unexpected native stop"),
+      authorizeSkills: () => Effect.die("Unexpected native skill authorization"),
+      discoverNativeSkills: () => Effect.die("Unexpected native skill discovery"),
+    },
+  );
+  // Both Git entry points are intercepted; the token grants no filesystem authority.
+  const make = vi
+    .spyOn(ManagedGit, "make")
+    .mockImplementation(() => Effect.succeed({} as ManagedGit.ManagedGitExecution));
+  const withTarget: typeof ManagedGit.withManagedVerificationTarget = (_context, use) =>
+    use({
+      receipt: f.receipt,
+      cwd: job.target.worktree,
+      baseSha: job.target.baseSha,
+      headSha: job.target.headSha,
+      testedCommit: job.target.testedCommit,
+      testedTree: job.target.testedTree,
+    });
+  const target = vi
+    .spyOn(ManagedGit, "withManagedVerificationTarget")
+    .mockImplementation(withTarget);
+  const withExecutable: typeof VerificationExecutable.withProjectWorkVerificationExecutable = (
+    _assets,
+    _target,
+    use,
+  ) =>
+    Effect.scoped(
+      use({
+        executableTarget: job.executable.target,
+        sha256: job.executable.sha256,
+        runtimeClosureSha256: job.executable.runtimeClosureSha256,
+      }),
+    );
+  const executable = vi
+    .spyOn(VerificationExecutable, "withProjectWorkVerificationExecutable")
+    .mockImplementation(withExecutable);
+  const allocate = vi.spyOn(PiProcess, "preallocatePiManagedProcess").mockImplementation(() =>
+    Effect.succeed({
+      ...f.intent.allocation,
+      launch: {
+        ...f.intent.allocation.launch,
+        workspaceAccess: "readonly",
+        nativeState: f.intent.allocation.launch.nativeState,
+        protectedRoots: [...f.intent.allocation.launch.protectedRoots],
+        protectedWorkspaceEntries: f.intent.allocation.launch.protectedWorkspaceEntries.map(
+          (entry) => ({ ...entry }),
+        ),
+        runtimeFiles: f.intent.allocation.launch.runtimeFiles.map((file) => ({ ...file })),
+      },
+    }),
+  );
+  let activations = 0;
+  const acquire = vi
+    .spyOn(PiProcess, "acquirePiManagedProcess")
+    .mockImplementation((_launch, persistence) =>
+      Effect.gen(function* () {
+        if (!persistence) return yield* Effect.die("Missing verification persistence");
+        yield* persistence.claimActivation(f.intent.allocation);
+        activations++;
+        // Deliberately inject untrusted failures at the provider error boundary.
+        return yield* Effect.fail(error as PiManagedProcessError);
+      }),
+    );
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      acquire.mockRestore();
+      allocate.mockRestore();
+      executable.mockRestore();
+      target.mockRestore();
+      make.mockRestore();
+    }),
+  );
+  const commands: ChildProcess.Command[] = [];
+  const host = yield* makeProjectWorkVerificationExecutionHost({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 4,
+    protectedRoots: ["/protected"],
+    nativeAdmission: Effect.void,
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        ServerSettings.layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true }),
+        ProjectWorkEventBusLive,
+        Layer.succeed(ProjectTeamPiRuntime, pi),
+        Layer.mock(GitWorkflowService, {
+          withRepositoryPermit: (_operation, _cwd, effect) => effect,
+        }),
+        Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make((command) => {
+            commands.push(command);
+            return Effect.die("Unexpected native launch");
+          }),
+        ),
+      ),
+    ),
+  );
+  const hostErrors: string[] = [];
+  const execution = yield* makeProjectWorkVerificationExecution({
+    ...host,
+    environmentId: "environment",
+    acquire: (claim, persistence) =>
+      host.acquire(claim, persistence).pipe(
+        Effect.tapError((failure) =>
+          Effect.sync(() => {
+            hostErrors.push(failure.reason);
+          }),
+        ),
+      ),
+  });
+  return { ...f, host, execution, hostErrors, commands, acquire, activations: () => activations };
+});
+
+for (const test of [
+  {
+    name: "deadline refusal before native launch",
+    error: new PiManagedProcessError({
+      phase: "startup",
+      message: "Original operation deadline cannot accommodate activation.",
+    }),
+    reason: "Original verification deadline could not accommodate activation before native launch",
+  },
+  {
+    name: "launcher failure before owner capture",
+    error: new PiManagedProcessError({
+      phase: "startup",
+      message: "Managed owned service could not launch.",
+    }),
+    reason: "Original verification launcher failed before owner capture",
+  },
+  {
+    name: "untrusted startup message",
+    error: new PiManagedProcessError({
+      phase: "startup",
+      message: "/private/credential.json token=secret-shaped-test-value",
+    }),
+  },
+  {
+    name: "deadline message with untrusted suffix",
+    error: new PiManagedProcessError({
+      phase: "startup",
+      message:
+        "Original operation deadline cannot accommodate activation. /private/credential.json token=secret-shaped-test-value",
+    }),
+  },
+  {
+    name: "launcher message with untrusted suffix",
+    error: new PiManagedProcessError({
+      phase: "startup",
+      message:
+        "Managed owned service could not launch. /private/credential.json token=secret-shaped-test-value",
+    }),
+  },
+  {
+    name: "deadline message outside startup",
+    error: new PiManagedProcessError({
+      phase: "transport",
+      message: "Original operation deadline cannot accommodate activation.",
+    }),
+  },
+  {
+    name: "launcher message outside startup",
+    error: new PiManagedProcessError({
+      phase: "quarantine",
+      message: "Managed owned service could not launch.",
+    }),
+  },
+  {
+    name: "untyped deadline message",
+    error: new Error("Original operation deadline cannot accommodate activation."),
+  },
+  {
+    name: "untyped launcher message",
+    error: new Error("Managed owned service could not launch."),
+  },
+  {
+    name: "untrusted error reason and stack",
+    error: Object.assign(new Error("/private/credential.json token=secret-shaped-test-value"), {
+      reason: "untrusted reason token=secret-shaped-test-value",
+      stack: "untrusted stack /private/credential.json",
+    }),
+  },
+] as const)
+  it.effect(`verification startup uncertainty through Host: ${test.name}`, () =>
+    scoped(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* startupFailureThroughHost(test.error);
+          const deadlineAtMs = f.intent.deadlineAtMs;
+          const budgetBefore = yield* f.sql`SELECT * FROM project_task_resource_budget`;
+          yield* f.execution.ready;
+          const outcome = yield* f.execution.sweep.pipe(Effect.result);
+          expect(outcome._tag).toBe("Failure");
+          expect(f.activations()).toBe(1);
+          expect(f.acquire).toHaveBeenCalledTimes(1);
+          expect(f.commands).toEqual([]);
+          expect(yield* f.host.journal.readResult(f.selection.jobId)).toBeUndefined();
+          const retained = yield* f.host.journal.readRecoveryPage({ limit: 1 });
+          expect(retained.items).toHaveLength(1);
+          const snapshot = retained.items[0]!;
+          expect(snapshot).toMatchObject({
+            phase: "quarantine",
+            owner: null,
+            result: null,
+            intent: { deadlineAtMs },
+          });
+          const rows = yield* f.sql`SELECT * FROM project_work_verification_execution`;
+          expect(rows).toHaveLength(1);
+          expect(rows[0]).toMatchObject({
+            phase: "quarantine",
+            revision: 2,
+            deadline_at_ms: deadlineAtMs,
+            owner_json: null,
+            result_json: null,
+            result_hash: null,
+          });
+          const state = yield* readCurrentState(f.sql, f.selection.projectId);
+          expect(
+            state.foundationRecords?.find((row) => row.recordId === f.intent.gate.recordId),
+          ).toMatchObject({ status: "consumed", revision: 1, consumedByRunId: snapshot.attemptId });
+          // Repeated wakes must preserve the original quarantined row and its reason.
+          yield* f.execution.sweep;
+          yield* f.execution.sweep;
+          expect(f.acquire).toHaveBeenCalledTimes(1);
+          expect(f.commands).toEqual([]);
+          expect(yield* f.sql`SELECT * FROM project_work_verification_execution`).toEqual(rows);
+          expect(yield* f.sql`SELECT * FROM project_task_resource_budget`).toEqual(budgetBefore);
+          expect(yield* readCurrentState(f.sql, f.selection.projectId)).toEqual(state);
+          const reason =
+            "reason" in test
+              ? test.reason
+              : "Original verification did not produce a committed terminal result";
+          expect(f.hostErrors).toEqual([
+            "reason" in test ? test.reason : "Verification host evidence unavailable",
+          ]);
+          expect(snapshot.reason).toBe(reason);
+          expect(rows[0]?.reason).toBe(reason);
+        }),
+      ),
+    ),
+  );
 
 const controlled = (
   config: {

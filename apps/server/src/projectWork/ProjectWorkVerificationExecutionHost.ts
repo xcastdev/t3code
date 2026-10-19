@@ -13,6 +13,7 @@ import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import * as ManagedGit from "../git/ManagedGitExecution.ts";
 import {
   acquirePiManagedProcess,
+  PiManagedProcessError,
   preallocatePiManagedProcess,
   reconcilePiManagedProcess,
   type PiManagedProcessAllocation,
@@ -49,6 +50,7 @@ const same = (a: unknown, b: unknown) =>
   canonicalProjectWorkPayload(a) === canonicalProjectWorkPayload(b);
 const denied = (reason: string) => new ProjectWorkVerificationExecutionError({ reason });
 const isError = Schema.is(ProjectWorkVerificationExecutionError);
+const isManagedProcessError = Schema.is(PiManagedProcessError);
 const boundary = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
     Effect.mapError((error) =>
@@ -369,6 +371,18 @@ export const makeProjectWorkVerificationExecutionHost = Effect.fn("VerificationE
               runtimeSeconds: launch.runtimeSeconds,
             },
             persistence,
+          ).pipe(
+            Effect.mapError((error) => {
+              if (isManagedProcessError(error) && error.phase === "startup") {
+                if (error.message === "Original operation deadline cannot accommodate activation.")
+                  return denied(
+                    "Original verification deadline could not accommodate activation before native launch",
+                  );
+                if (error.message === "Managed owned service could not launch.")
+                  return denied("Original verification launcher failed before owner capture");
+              }
+              return denied("Verification host evidence unavailable");
+            }),
           );
           const observe = (drain: Effect.Success<typeof process.awaitExit>) =>
             Effect.sync(() => {

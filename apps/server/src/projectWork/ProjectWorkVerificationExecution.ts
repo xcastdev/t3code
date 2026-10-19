@@ -361,7 +361,13 @@ export const makeProjectWorkVerificationExecution = Effect.fn(
                         provide(
                           journal.recordUncertain(
                             outcome.claim,
-                            "Original verification did not produce a committed terminal result",
+                            isError(error) &&
+                              (error.reason ===
+                                "Original verification deadline could not accommodate activation before native launch" ||
+                                error.reason ===
+                                  "Original verification launcher failed before owner capture")
+                              ? error.reason
+                              : "Original verification did not produce a committed terminal result",
                           ),
                         ).pipe(Effect.andThen(Effect.fail(error))),
                       ),
