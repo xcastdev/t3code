@@ -1,37 +1,23 @@
 import { describe, expect, it } from "vite-plus/test";
-import { Type, type AssistantMessage, type Model, type Usage } from "@earendil-works/pi-ai";
+import { Type, type AssistantMessage, type Usage } from "@earendil-works/pi-ai";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { piManagedModelRoute } from "./PiManagedModels.ts";
 import { PI_WORKER_MAX_CHUNK_BYTES, PI_WORKER_MAX_RESPONSE_BYTES } from "./PiWorkerProtocol.ts";
 import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import type { PiModelBrokerConfig } from "./PiModelBroker.ts";
 import {
-  makePiModelBroker,
-  type PiModelBrokerConfig,
-  type PiModelRequestReservation,
-  type PiModelRequestSettlement,
-} from "./PiModelBroker.ts";
+  part,
+  model,
+  accountId,
+  credential,
+  body,
+  event,
+  success,
+  sdkModel,
+  fixture,
+} from "./PiSubscriptionTestKit.ts";
 
-const model = "gpt-6-luna";
-const endpoint = "https://chatgpt.com/backend-api/codex/responses";
-const accountId = "synthetic-parent-account";
-const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
-const credential = `${part({ alg: "none" })}.${part({ exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_account_id: accountId } })}.synthetic-signature`;
-const body = (extra: object = {}) =>
-  JSON.stringify({
-    model,
-    store: false,
-    stream: true,
-    instructions: "Trusted assignment",
-    input: [{ role: "user", content: [{ type: "input_text", text: "Investigate" }] }],
-    text: { verbosity: "medium" },
-    include: ["reasoning.encrypted_content"],
-    tool_choice: "auto",
-    parallel_tool_calls: true,
-    reasoning: { effort: "high", summary: "auto" },
-    service_tier: "default",
-    ...extra,
-  });
 const reasoningInput = (
   summary: readonly string[],
   content: readonly string[] = [],
@@ -44,36 +30,6 @@ const reasoningInput = (
   content: content.map((text) => ({ type: "reasoning_text", text })),
   encrypted_content: encryptedContent,
 });
-const event = <T extends { type: string }>(value: T) =>
-  `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`;
-const success = (outputTokens = 10) =>
-  event({
-    type: "response.created",
-    response: { id: "response-1", model, status: "in_progress" },
-  }) +
-  event({
-    type: "response.output_text.delta",
-    item_id: "message-1",
-    output_index: 0,
-    content_index: 0,
-    delta: "bounded result",
-  }) +
-  event({
-    type: "response.completed",
-    response: {
-      id: "response-1",
-      model,
-      status: "completed",
-      output: [],
-      usage: {
-        input_tokens: 50,
-        output_tokens: outputTokens,
-        total_tokens: 50 + outputTokens,
-        input_tokens_details: { cached_tokens: 5 },
-        output_tokens_details: { reasoning_tokens: 7 },
-      },
-    },
-  });
 const paddedSuccess = (obfuscation: unknown) =>
   success().replace(
     '"delta":"bounded result"',
@@ -85,18 +41,6 @@ const responseMetadata = {
   response_id: "response-1",
   metadata: { openai_verification_recommendation: ["gpt-6-luna"] },
 };
-const sdkModel = {
-  id: model,
-  name: "GPT-6 Luna",
-  api: "openai-codex-responses",
-  provider: "openai-codex",
-  baseUrl: endpoint,
-  input: ["text"],
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  reasoning: true,
-  contextWindow: 128_000,
-  maxTokens: 2_048,
-} satisfies Model<"openai-codex-responses">;
 const zeroUsage: Usage = {
   input: 0,
   output: 0,
@@ -104,67 +48,6 @@ const zeroUsage: Usage = {
   cacheWrite: 0,
   totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
-
-const fixture = (
-  overrides: Partial<PiModelBrokerConfig> = {},
-  omitSubscriptionAuthorization = false,
-) => {
-  const reservations: PiModelRequestReservation[] = [];
-  const settlements: PiModelRequestSettlement[] = [];
-  const chunks: Uint8Array[] = [];
-  let transportCalls = 0;
-  const cfg: PiModelBrokerConfig = {
-    workerId: "worker",
-    generation: 7,
-    operationId: "operation",
-    routeId: "openai-subscription-luna",
-    provider: "openai-codex",
-    model,
-    endpoint,
-    tools: [],
-    acceptedReportedModels: [model],
-    maxInputTokens: 16_384,
-    maxOutputTokens: 2_048,
-    deadlineMs: 10_000,
-    requiredSystemText: "Trusted assignment",
-    bindRequestInput: async () => {},
-    authorizeCurrent: async () => {},
-    ...(omitSubscriptionAuthorization ? {} : { authorizeSubscriptionTest: async () => {} }),
-    getCredential: async () => credential,
-    reserveRequest: async (reservation) => {
-      reservations.push(reservation);
-      return { reservationId: "reservation-1" };
-    },
-    settleRequest: async (settlement) => {
-      settlements.push(settlement);
-      return { accountingReceiptId: "accounted-1" };
-    },
-    transport: async (url, init) => {
-      transportCalls++;
-      expect(url).toBe(endpoint);
-      expect(init.headers.Authorization).toBe(`Bearer ${credential}`);
-      expect(init.headers["chatgpt-account-id"]).toBe(accountId);
-      expect(init.headers.originator).toBe("pi");
-      expect(init.headers["OpenAI-Beta"]).toBe("responses=experimental");
-      expect(init.headers.accept).toBe("text/event-stream");
-      expect(JSON.parse(init.body)).toEqual(JSON.parse(body()));
-      return new Response(success(), { headers: { "content-type": "text/event-stream" } });
-    },
-    ...overrides,
-  };
-  const broker = makePiModelBroker(cfg);
-  const invoke = (request = body(), forward?: (chunk: Uint8Array) => void) =>
-    broker.request({
-      requestId: 1,
-      body: request,
-      signal: new AbortController().signal,
-      onChunk: async (chunk) => {
-        chunks.push(chunk);
-        forward?.(chunk);
-      },
-    });
-  return { invoke, reservations, settlements, chunks, transportCalls: () => transportCalls };
 };
 
 describe("Pi OpenAI subscription broker", () => {
