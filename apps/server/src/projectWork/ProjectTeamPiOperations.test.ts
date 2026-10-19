@@ -3310,3 +3310,38 @@ it.effect(
       }),
     ),
 );
+
+it.effect(
+  "rejects an allocation that invents a review mount without a retained review assignment",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const allocation = {
+          ...f.allocation,
+          launch: {
+            ...f.allocation.launch,
+            reviewTarget: {
+              source: "/unrelated-review-source",
+              target: "/review-target" as const,
+              targetHash: "a".repeat(64),
+              manifestHash: "b".repeat(64),
+              testedCommit: "c".repeat(40),
+              testedTree: "d".repeat(40),
+              dev: 1,
+              ino: 2,
+            },
+          },
+        };
+        const result = yield* f.operations
+          .prepare(f.identity, { threadId, kind: "initialize" }, "invented-review", {
+            allocation,
+            workerId: "worker",
+            operationId: "invented-review",
+          })
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(0);
+      }),
+    ),
+);

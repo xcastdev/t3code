@@ -3,7 +3,11 @@ import * as Schema from "effect/Schema";
 import { makePiBashToolIsolation } from "./PiBashToolIsolation.ts";
 import { makePiSelectedSkillRead } from "./PiSelectedSkillRead.ts";
 import type { PiWorkerBootstrap } from "./PiWorkerProtocol.ts";
-import { PI_WORKER_MAX_TOOL_BYTES, PiWorkerToolOutput } from "./PiWorkerProtocol.ts";
+import {
+  PI_WORKER_MAX_TOOL_BYTES,
+  PiWorkerToolOutput,
+  PiWorkerReviewTarget,
+} from "./PiWorkerProtocol.ts";
 
 const MAX_PATH = 4096;
 const MAX_TEXT = 60_000;
@@ -41,6 +45,9 @@ const Cwd = path.check(
 const decodeCwd = Schema.decodeSync(Cwd);
 const parseObject = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.JsonObject));
 const parseOutput = Schema.decodeUnknownSync(Schema.fromJsonString(PiWorkerToolOutput));
+const decodeReviewTarget = Schema.decodeUnknownSync(PiWorkerReviewTarget, {
+  onExcessProperty: "error",
+});
 
 class MissingReadLeafError extends Error {}
 
@@ -150,17 +157,26 @@ function adapt<S extends Schema.ConstraintDecoder<unknown, never>>(
 }
 
 /** The Linux worker admits one workspace mount, never ambient filesystem authority. */
-async function workspaceFiles(cwd: string) {
+async function workspaceFiles(
+  cwd: string,
+  expected?: { readonly dev: number; readonly ino: number },
+) {
   if (process.getBuiltinModule("os").platform() !== "linux") throw Error("UNAVAILABLE");
   const fs = process.getBuiltinModule("fs");
   const paths = process.getBuiltinModule("path");
   const files = fs.promises;
   const admitRoot = async () => {
     const root = await files.lstat(cwd, { bigint: true });
-    if (!root.isDirectory() || (await files.realpath(cwd)) !== cwd) throw Error("TOOL_FAILURE");
+    if (
+      !root.isDirectory() ||
+      (await files.realpath(cwd)) !== cwd ||
+      (expected && (root.dev !== BigInt(expected.dev) || root.ino !== BigInt(expected.ino)))
+    )
+      throw Error("TOOL_FAILURE");
     return root;
   };
   let admission: ReturnType<typeof admitRoot> | undefined;
+  if (expected) await (admission = admitRoot());
   const same = (a: { dev: bigint; ino: bigint }, b: { dev: bigint; ino: bigint }) =>
     a.dev === b.dev && a.ino === b.ino;
   const fdPath = (fd: number) => `/proc/self/fd/${fd}`;
@@ -175,6 +191,7 @@ async function workspaceFiles(cwd: string) {
     if (normalized.startsWith("file://"))
       normalized = process.getBuiltinModule("url").fileURLToPath(normalized);
     const absolute = paths.resolve(cwd, normalized);
+    if (expected && (normalized !== input || absolute !== input)) throw Error("TOOL_FAILURE");
     const relative = paths.relative(cwd, absolute);
     if (
       !relative ||
@@ -394,6 +411,10 @@ async function makeLocalTools(
   operations: BashOperations,
   selectedRead?: Awaited<ReturnType<typeof makePiSelectedSkillRead>>["read"],
   assertOpen: () => void = () => {},
+  reviewRead?: (
+    args: typeof ReadInput.Type,
+    signal: AbortSignal,
+  ) => Promise<AgentToolResult<unknown>>,
 ) {
   const executeFile = await workspaceFiles(cwd);
   const bash = sdk.createBashTool(cwd, { operations, exposeSessionEnvironment: false });
@@ -412,6 +433,13 @@ async function makeLocalTools(
             !args.path.split("/").some((part) => part === "." || part === "..")
           )
             return selectedRead(args, signal);
+          if (
+            args.path.startsWith("/review-target/") &&
+            reviewRead &&
+            /^\/(?:[^/\\\0\r\n]+\/)*[^/\\\0\r\n]+$/.test(args.path) &&
+            !args.path.split("/").some((part) => part === "." || part === "..")
+          )
+            return reviewRead(args, signal);
           return executeFile(args.path, "read", signal, (operations, readPath) =>
             sdk
               .createReadTool(cwd, {
@@ -467,7 +495,7 @@ export async function makePiLocalTools(cwd: string) {
 }
 
 /** Read the fixed outer mount's mode; the owned helper independently admits its authority. */
-async function workspaceAccess() {
+async function workspaceAccess(mountPath = "/workspace") {
   const fs = process.getBuiltinModule("fs");
   const handle = await fs.promises.open(
     "/proc/self/mountinfo",
@@ -501,7 +529,12 @@ async function workspaceAccess() {
       return { id: fields[0]!, path: fields[4]!, options: fields[5]!.split(",") };
     });
     if (new Set(mounts.map((mount) => mount.id)).size !== mounts.length) throw Error("UNAVAILABLE");
-    const assigned = mounts.filter((mount) => mount.path === "/workspace");
+    if (
+      mountPath === "/review-target" &&
+      mounts.some((mount) => mount.path.startsWith(mountPath + "/"))
+    )
+      throw Error("UNAVAILABLE");
+    const assigned = mounts.filter((mount) => mount.path === mountPath);
     if (assigned.length !== 1) throw Error("UNAVAILABLE");
     const options = assigned[0]!.options;
     if (
@@ -531,6 +564,7 @@ export async function makePiIsolatedLocalTools() {
   let closed = false;
   let activated = false;
   let selected: Awaited<ReturnType<typeof makePiSelectedSkillRead>> | undefined;
+  let reviewFiles: Awaited<ReturnType<typeof workspaceFiles>> | undefined;
   let initialization: Promise<void> | undefined;
   let closing: Promise<void> | undefined;
   const assertOpen = () => {
@@ -543,6 +577,11 @@ export async function makePiIsolatedLocalTools() {
     activated = true;
     initialization = (async () => {
       selected = await makePiSelectedSkillRead(resources.skills);
+      if (resources.reviewTarget) {
+        const descriptor = decodeReviewTarget(resources.reviewTarget);
+        if ((await workspaceAccess("/review-target")) !== "readonly") throw Error("UNAVAILABLE");
+        reviewFiles = await workspaceFiles("/review-target", descriptor);
+      }
     })();
     return initialization.then(assertOpen);
   };
@@ -575,6 +614,21 @@ export async function makePiIsolatedLocalTools() {
           return selected.read(args, signal);
         },
         assertOpen,
+        (args, signal) => {
+          if (!reviewFiles) return Promise.reject(Error("TOOL_FAILURE"));
+          return reviewFiles(args.path, "read", signal, (operations, readPath) =>
+            sdk
+              .createReadTool("/review-target", {
+                autoResizeImages: false,
+                operations: {
+                  ...operations,
+                  detectImageMimeType: (path) =>
+                    operations.detectImageMimeType(path, sdk.detectSupportedImageMimeTypeFromFile),
+                },
+              })
+              .execute("t3-review-read", { ...args, path: readPath! }, signal),
+          );
+        },
       )),
       initializeLocalResources,
       close,

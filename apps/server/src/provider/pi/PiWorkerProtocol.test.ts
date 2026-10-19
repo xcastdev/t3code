@@ -1837,3 +1837,32 @@ describe("identity, ordering and lifecycle failures", () => {
     }
   });
 });
+
+describe("authenticated fixed review target descriptor", () => {
+  const descriptor = {
+    target: "/review-target",
+    targetHash: "a".repeat(64),
+    manifestHash: "b".repeat(64),
+    testedCommit: "c".repeat(40),
+    testedTree: "d".repeat(40),
+    dev: 1,
+    ino: 2,
+  };
+  const decode = Schema.decodeUnknownSync(Protocol.PiWorkerReviewTarget, {
+    onExcessProperty: "error",
+  });
+  it("retains only the fixed mount and its immutable verification identity", () => {
+    expect(decode(descriptor)).toEqual(descriptor);
+    for (const change of [
+      { target: "/review-target-extra" },
+      { target: "/workspace" },
+      { source: "/host/source" },
+      { writable: true },
+      { mode: "readwrite" },
+      { ino: 0 },
+      { manifestHash: "stale" },
+      { testedTree: "stale" },
+    ])
+      expect(() => decode({ ...descriptor, ...change })).toThrow();
+  });
+});

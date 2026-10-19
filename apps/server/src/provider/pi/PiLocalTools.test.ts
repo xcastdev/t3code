@@ -66,6 +66,12 @@ describe("Pi child-local native SDK tools", () => {
         yield* Effect.promise(() => nodeFS.link(secret, cwd + "/hard-alias"));
         yield* fs.writeFileString(cwd + "/.git", "protected-metadata");
         const paths = [
+          "/review-target/README.md",
+          "/review-target-extra/README.md",
+          "@/review-target/README.md",
+          "file:///review-target/README.md",
+          "/review-target/../README.md",
+          "/review-target/.git/config",
           secret,
           "@" + secret,
           process.getBuiltinModule("url").pathToFileURL(secret).href,

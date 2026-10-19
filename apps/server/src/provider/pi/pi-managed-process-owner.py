@@ -54,6 +54,13 @@ def launch(spec):
             fds.append(fd)
             command += ["--ro-bind-fd", str(fd), entry["target"]]
         command += ["--ro-bind-fd" if spec.get("workspaceAccess") == "readonly" else "--bind-fd", str(workspace_fd), "/workspace"]
+        if spec.get("reviewTarget") is not None:
+            target = spec["reviewTarget"]
+            if target["target"] != "/review-target":
+                raise RuntimeError("invalid fixed review target")
+            fd = pinned(target["source"], target["dev"], target["ino"], True)
+            fds.append(fd)
+            command += ["--ro-bind-fd", str(fd), "/review-target"]
         if spec.get("nativeState") is not None:
             state = spec["nativeState"]
             fd = pinned(state["path"], state["dev"], state["ino"], True)

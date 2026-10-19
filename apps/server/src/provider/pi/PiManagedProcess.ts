@@ -23,7 +23,20 @@ export const MAX_PI_RUNTIME_FILE_BYTES = 256 * 1024 * 1024;
 export const piRuntimeClosureByteLimit = (electron: boolean) =>
   electron ? 2 * MAX_PI_RUNTIME_FILE_BYTES : MAX_PI_RUNTIME_FILE_BYTES;
 
+const Digest = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+const GitObject = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40,64}$/));
+const ReviewTargetSource = Schema.Struct({
+  source: Schema.String,
+  target: Schema.Literal("/review-target"),
+  targetHash: Digest,
+  manifestHash: Digest,
+  testedCommit: GitObject,
+  testedTree: GitObject,
+  dev: Schema.Int,
+  ino: Schema.Int,
+});
 const LaunchSchema = Schema.Struct({
+  reviewTarget: Schema.optional(ReviewTargetSource),
   workspaceRoot: Schema.String,
   workspaceAccess: Schema.optional(Schema.Literals(["readonly", "readwrite"])),
   nativeStateRoot: Schema.optional(Schema.String),
@@ -106,6 +119,28 @@ export const validatePiManagedLaunch = Effect.fn("validatePiManagedLaunch")(
     const rootStat = yield* fs.stat(root);
     if (rootStat.type !== "Directory" || Option.isNone(rootStat.ino))
       return yield* fail("validation", "Assigned cwd requires a directory inode.");
+    if (value.reviewTarget) {
+      const target = value.reviewTarget;
+      if (
+        !path.isAbsolute(target.source) ||
+        path.resolve(target.source) !== target.source ||
+        (yield* fs.realPath(target.source)) !== target.source ||
+        overlaps(target.source, root) ||
+        protectedRoots.some((entry) => overlaps(entry, target.source))
+      )
+        return yield* fail(
+          "validation",
+          "Review target must be an independent canonical worktree.",
+        );
+      const stat = yield* fs.stat(target.source);
+      if (
+        stat.type !== "Directory" ||
+        Option.isNone(stat.ino) ||
+        stat.dev !== target.dev ||
+        stat.ino.value !== target.ino
+      )
+        return yield* fail("validation", "Review target directory identity changed.");
+    }
     const nativeState =
       value.nativeStateRoot === undefined
         ? undefined
@@ -127,6 +162,8 @@ export const validatePiManagedLaunch = Effect.fn("validatePiManagedLaunch")(
               return yield* fail("validation", "Native state requires a directory inode.");
             return { path: statePath, dev: stat.dev, ino: stat.ino.value };
           });
+    if (value.reviewTarget && nativeState && overlaps(value.reviewTarget.source, nativeState.path))
+      return yield* fail("validation", "Review target overlaps native state.");
     const protectedWorkspaceEntries: Array<{
       source: string;
       target: string;
@@ -182,6 +219,7 @@ export const validatePiManagedLaunch = Effect.fn("validatePiManagedLaunch")(
       if (
         protectedRoots.some((entry) => overlaps(source, entry)) ||
         overlaps(source, root) ||
+        (value.reviewTarget !== undefined && overlaps(source, value.reviewTarget.source)) ||
         (nativeState && overlaps(source, nativeState.path))
       )
         return yield* fail("validation", "Runtime closure overlaps protected or writable data.");

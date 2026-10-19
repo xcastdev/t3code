@@ -3,6 +3,7 @@ import { ProjectMemoryOperation } from "../../projectWork/memory/ProjectMemoryMo
 import { ProjectMemoryServiceError } from "../../projectWork/memory/ProjectMemoryService.ts";
 import * as NodeCrypto from "node:crypto";
 import {
+  GitCommandError,
   CommandId,
   IsoDateTime,
   canonicalProjectWorkPayload,
@@ -35,6 +36,12 @@ import {
   ProjectTeamAuthorization,
   type ProjectTeamAuthority,
 } from "../../projectWork/ProjectTeamAuthorization.ts";
+import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import * as ManagedGit from "../../git/ManagedGitExecution.ts";
+import {
+  makeProjectTeamDispatchJournal,
+  ProjectTeamWorkspaceReceipt,
+} from "../../projectWork/ProjectTeamDispatchJournal.ts";
 import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
 import {
   make as makeAccounting,
@@ -98,6 +105,10 @@ import {
 
 import { PiManagedModel, piBrokerModelRoute, piManagedModels } from "./PiManagedModels.ts";
 
+const decodeReviewWorkspace = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectTeamWorkspaceReceipt),
+  { onExcessProperty: "error" },
+);
 const provider = ProviderDriverKind.make("piAgent");
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeBinding = Schema.decodeUnknownSync(ProjectTeamRunBinding);
@@ -669,6 +680,11 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   });
   const reviewFreshness = yield* makeProjectTeamReviewFreshness({
     environmentId: options.environmentId,
+  });
+  const workflow = yield* Effect.serviceOption(GitWorkflowService);
+  const dispatchJournal = yield* makeProjectTeamDispatchJournal({
+    environmentId: options.environmentId,
+    maximumEnvironmentModelCalls: 128,
   });
   const requiredContext = yield* makeProjectTeamContext({
     environmentId: options.environmentId,
@@ -1626,7 +1642,163 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     "Required context differs from current assignment",
                     "conflict",
                   );
-                const requiredText = required.text;
+                const retainedReview = required.required.reviewTarget;
+                let reviewTarget: PiManagedLaunch["reviewTarget"];
+                const checkReviewTarget = Effect.gen(function* () {
+                  if (!retainedReview) return;
+                  if (authority.role.role !== "reviewer" || Option.isNone(workflow))
+                    return yield* deny(
+                      "Review target requires its original readonly reviewer host",
+                    );
+                  const fresh = yield* readOperationContext;
+                  if (
+                    canonicalProjectWorkPayload(fresh.required.reviewTarget) !==
+                    canonicalProjectWorkPayload(retainedReview)
+                  )
+                    return yield* deny("Retained review target changed", "conflict");
+                  const job = retainedReview.prepared.manifest;
+                  const implementation = yield* dispatchJournal.readRetained(job.dispatchId);
+                  yield* dispatchJournal.readStageReceipts(job.dispatchId);
+                  const claim = implementation.intent.compiledClaim.transition;
+                  if (
+                    implementation.fence.stage !== "settled" ||
+                    claim?.kind !== "claim" ||
+                    claim.binding.environmentId !== options.environmentId ||
+                    claim.binding.projectId !== job.projectId ||
+                    claim.binding.taskId !== job.taskId ||
+                    claim.binding.recordId !== job.bindingId ||
+                    claim.binding.generation !== job.generation ||
+                    retainedReview.reviewer.bindingId !== binding.recordId ||
+                    retainedReview.reviewer.generation !== binding.generation ||
+                    digest(canonicalProjectWorkPayload(job)) !== retainedReview.prepared.sha256
+                  )
+                    return yield* deny(
+                      "Original review implementation identity changed",
+                      "conflict",
+                    );
+                  const rows = yield* sql<{
+                    receipt_json: string | null;
+                    assignment_json: string | null;
+                  }>`SELECT
+                    CASE WHEN length(CAST(receipt_json AS BLOB))<=262144 THEN receipt_json END AS receipt_json,
+                    CASE WHEN length(CAST(assignment_json AS BLOB))<=262144 THEN assignment_json END AS assignment_json
+                    FROM project_team_workspace_receipt WHERE dispatch_id=${job.dispatchId} AND environment_id=${options.environmentId}
+                    AND binding_id=${job.bindingId} AND generation=${job.generation} AND claim_generation=${implementation.fence.claimGeneration} LIMIT 2`;
+                  if (
+                    rows.length !== 1 ||
+                    typeof rows[0]?.receipt_json !== "string" ||
+                    rows[0].assignment_json !==
+                      canonicalProjectWorkPayload(implementation.intent.request.git)
+                  )
+                    return yield* deny("Original review workspace is unavailable");
+                  const receipt = yield* decodeReviewWorkspace(rows[0].receipt_json);
+                  if (
+                    canonicalProjectWorkPayload(receipt) !== rows[0].receipt_json ||
+                    digest(canonicalProjectWorkPayload(receipt)) !== job.workspaceReceiptHash ||
+                    canonicalProjectWorkPayload(receipt.assignment) !==
+                      canonicalProjectWorkPayload(implementation.intent.request.git)
+                  )
+                    return yield* deny("Original review workspace hash changed");
+                  const revalidate = Effect.gen(function* () {
+                    const current = yield* operations.current(
+                      identity(request.threadId),
+                      request.kind === "initialize",
+                    );
+                    if (contextFor(current) !== authorityContext)
+                      return yield* deny("Review target authority changed", "conflict");
+                    const fresh = yield* readOperationContext;
+                    if (
+                      canonicalProjectWorkPayload(fresh.required.reviewTarget) !==
+                      canonicalProjectWorkPayload(retainedReview)
+                    )
+                      return yield* deny(
+                        "Review target changed during physical validation",
+                        "conflict",
+                      );
+                  }).pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new GitCommandError({
+                          operation: "review.target",
+                          command: "/usr/bin/git",
+                          cwd: job.target.worktree,
+                          detail: "Review target authority changed",
+                          cause,
+                        }),
+                    ),
+                  );
+                  yield* workflow.value.withRepositoryPermit(
+                    "review.target",
+                    job.target.repository,
+                    Effect.gen(function* () {
+                      const managed = yield* ManagedGit.make({
+                        assignment: implementation.intent.request.git,
+                        priorReceipt: receipt,
+                        revalidate,
+                        persistWorkspace: () =>
+                          Effect.fail(
+                            new GitCommandError({
+                              operation: "review.target",
+                              command: "/usr/bin/git",
+                              cwd: job.target.worktree,
+                              detail: "Review target cannot create a workspace",
+                            }),
+                          ),
+                      });
+                      yield* ManagedGit.withManagedVerificationTarget(managed, (target) =>
+                        Effect.gen(function* () {
+                          if (
+                            target.cwd !== job.target.worktree ||
+                            target.baseSha !== job.target.baseSha ||
+                            target.headSha !== job.target.headSha ||
+                            target.testedCommit !== job.target.testedCommit ||
+                            target.testedTree !== job.target.testedTree ||
+                            canonicalProjectWorkPayload(target.receipt) !==
+                              canonicalProjectWorkPayload(receipt)
+                          )
+                            return yield* deny("Committed review target changed", "conflict");
+                          if ((yield* fs.realPath(target.cwd)) !== target.cwd)
+                            return yield* deny("Review target is not canonical");
+                          const stat = yield* fs.stat(target.cwd);
+                          if (stat.type !== "Directory" || Option.isNone(stat.ino))
+                            return yield* deny("Review target inode is unavailable");
+                          const descriptor = {
+                            source: target.cwd,
+                            target: "/review-target" as const,
+                            targetHash: digest(canonicalProjectWorkPayload(retainedReview)),
+                            manifestHash: retainedReview.prepared.sha256,
+                            testedCommit: target.testedCommit,
+                            testedTree: target.testedTree,
+                            dev: stat.dev,
+                            ino: stat.ino.value,
+                          };
+                          if (
+                            reviewTarget &&
+                            canonicalProjectWorkPayload(reviewTarget) !==
+                              canonicalProjectWorkPayload(descriptor)
+                          )
+                            return yield* deny(
+                              "Review target physical identity changed",
+                              "conflict",
+                            );
+                          reviewTarget = descriptor;
+                        }),
+                      );
+                      yield* revalidate;
+                    }),
+                  );
+                }).pipe(
+                  Effect.provide(services),
+                  Effect.mapError(() =>
+                    deny("Current verified review target is unavailable or changed", "conflict"),
+                  ),
+                );
+                yield* checkReviewTarget;
+                const requiredText =
+                  required.text +
+                  (reviewTarget
+                    ? `\nVerified review files: /review-target/<relative-file> maps to the retained verification worktree. Readonly; tested commit ${reviewTarget.testedCommit}; tested tree ${reviewTarget.testedTree}. Relative reads still use /workspace.\n`
+                    : "");
                 const promptBytes =
                   request.kind === "prompt" ? Buffer.byteLength(request.prompt) : 0;
                 if (
@@ -1803,6 +1975,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 if ((yield* fs.realPath(nativeStateDirectory)) !== nativeStateDirectory)
                   return yield* deny("Pi native state directory is not canonical");
                 const launch: PiManagedLaunch = {
+                  reviewTarget,
                   workspaceRoot: binding.worktree,
                   workspaceAccess: localTools.some((tool) => tool.name !== "read")
                     ? "readwrite"
@@ -1844,6 +2017,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 yield* finalWorkspaceFence(paths, workspace.fence);
                 yield* preparationCurrent;
                 yield* verifySource(sourceFence);
+                yield* checkReviewTarget;
                 const allocation = yield* preallocatePiManagedProcess(launch).pipe(
                   Effect.provide(services),
                 );
@@ -1989,6 +2163,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           "Pi current selected content identity changed",
                           "conflict",
                         );
+                      if (verify) yield* checkReviewTarget;
                       if (verify) yield* resources.revalidate;
                       if (verify) yield* verifyWorkspace(current, agentDirectory, workspace);
                       if (revalidate) {
@@ -2023,7 +2198,22 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     executionMode: "managed",
                     expectedCwd: "/workspace",
                     native: previous?.native ?? null,
-                    resources: resources.resources,
+                    resources: {
+                      ...resources.resources,
+                      ...(reviewTarget
+                        ? {
+                            reviewTarget: {
+                              target: reviewTarget.target,
+                              targetHash: reviewTarget.targetHash,
+                              manifestHash: reviewTarget.manifestHash,
+                              testedCommit: reviewTarget.testedCommit,
+                              testedTree: reviewTarget.testedTree,
+                              dev: reviewTarget.dev,
+                              ino: reviewTarget.ino,
+                            },
+                          }
+                        : {}),
+                    },
                     context: descriptor("context"),
                     prompt: request.kind === "prompt" ? descriptor("prompt") : null,
                     model:
@@ -2424,6 +2614,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           "Pi publication selected content or authority changed",
                           "conflict",
                         );
+                      yield* checkReviewTarget;
                       yield* verifyWorkspace(beforePublication, agentDirectory, workspace);
                       if (
                         request.kind === "initialize" &&
@@ -2442,6 +2633,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                               "Reviewer initialization authority changed",
                               "conflict",
                             );
+                          yield* checkReviewTarget;
                           yield* verifyWorkspace(current, agentDirectory, workspace);
                           yield* verifySource(sourceFence);
                           yield* finalWorkspaceFence(paths, workspace.fence);

@@ -1850,3 +1850,62 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
     );
   },
 );
+
+describe("fixed readonly verification target", () => {
+  check(
+    "pins the independent source and refuses replacement, aliases, writable flags and alternate destinations",
+    () =>
+      Effect.gen(function* () {
+        const source = NodePath.join(scratch, "review-source");
+        yield* Effect.promise(() => NodeFSP.mkdir(source));
+        const stat = yield* Effect.promise(() => NodeFSP.stat(source));
+        const reviewTarget = {
+          source,
+          target: "/review-target" as const,
+          targetHash: "a".repeat(64),
+          manifestHash: "b".repeat(64),
+          testedCommit: "c".repeat(40),
+          testedTree: "d".repeat(40),
+          dev: stat.dev,
+          ino: stat.ino,
+        };
+        const pinned = yield* validate({ ...input, reviewTarget });
+        expect(pinned.reviewTarget).toEqual(reviewTarget);
+        const variants = [
+          { ...reviewTarget, source: input.workspaceRoot },
+          { ...reviewTarget, source: input.protectedRoots[0]! },
+          { ...reviewTarget, source: source + "/../review-source" },
+          { ...reviewTarget, ino: stat.ino + 1 },
+        ];
+        for (const target of variants)
+          expect(
+            (yield* validate({ ...input, reviewTarget: target }).pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        for (const extra of [
+          { target: "/other-target" },
+          { access: "readwrite" },
+          { writable: true },
+        ])
+          expect(
+            (yield* validate({
+              ...input,
+              reviewTarget: { ...reviewTarget, ...extra },
+            } as PiManagedLaunch).pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        const alias = NodePath.join(scratch, "review-alias");
+        yield* Effect.promise(() => NodeFSP.symlink(source, alias));
+        expect(
+          (yield* validate({ ...input, reviewTarget: { ...reviewTarget, source: alias } }).pipe(
+            Effect.result,
+          ))._tag,
+        ).toBe("Failure");
+        yield* Effect.promise(async () => {
+          await NodeFSP.rename(source, source + "-old");
+          await NodeFSP.mkdir(source);
+        });
+        expect((yield* validate({ ...input, reviewTarget }).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+      }),
+  );
+});

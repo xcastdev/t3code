@@ -57,6 +57,7 @@ import {
   type ProjectTeamAuthority,
   type ProjectTeamPrincipal,
 } from "./ProjectTeamAuthorization.ts";
+import { ProjectTeamReviewTarget } from "./ProjectTeamReviewTargets.ts";
 import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import {
   makeProjectTeamDispatchJournal,
@@ -64,6 +65,10 @@ import {
 } from "./ProjectTeamDispatchJournal.ts";
 
 const encode = canonicalProjectWorkPayload;
+const decodeAllocationReviewTarget = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectTeamReviewTarget),
+  { onExcessProperty: "error" },
+);
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
 const isWorkerIdentity = Schema.is(PiWorkerIdentity);
 const isWorkerOperation = Schema.is(PiWorkerOperation);
@@ -362,6 +367,18 @@ const physicalIdentity = (value: { readonly dev: number; readonly ino: number })
 const validRetainedAllocation = (allocation: PiManagedProcessAllocation) => {
   const launch = allocation.launch;
   const native = launch.nativeState;
+  const target = launch.reviewTarget;
+  if (
+    target &&
+    (!canonicalPath(target.source) ||
+      !physicalIdentity(target) ||
+      target.target !== "/review-target" ||
+      overlaps(target.source, launch.workspaceRoot) ||
+      (native && overlaps(target.source, native.path)) ||
+      launch.protectedRoots.some((root) => overlaps(root, target.source)) ||
+      launch.runtimeFiles.some((file) => overlaps(file.source, target.source)))
+  )
+    return false;
   if (
     !native ||
     !canonicalPath(launch.workspaceRoot) ||
@@ -546,6 +563,43 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       environmentId: options.environmentId,
       maximumEnvironmentModelCalls: 128,
     });
+    const assertReviewAllocation = Effect.fn("ProjectTeamPiOperations.assertReviewAllocation")(
+      function* (binding: ProjectTeamAuthority["binding"], allocation: PiManagedProcessAllocation) {
+        const rows = yield* sql<{ manifest_json: string | null; sha256: string }>`SELECT
+        CASE WHEN length(CAST(manifest_json AS BLOB))<=65536 THEN manifest_json END AS manifest_json,sha256
+        FROM project_team_review_target WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId}
+        AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 2`;
+        const mounted = allocation.launch.reviewTarget;
+        if (!rows.length && !mounted) return;
+        if (
+          rows.length !== 1 ||
+          typeof rows[0]?.manifest_json !== "string" ||
+          !mounted ||
+          !validRetainedAllocation(allocation)
+        )
+          return yield* deny("Retained review allocation target is unavailable");
+        const target = yield* decodeAllocationReviewTarget(rows[0].manifest_json).pipe(
+          Effect.mapError(() => deny("Retained review allocation target is invalid")),
+        );
+        const hash = (value: unknown) =>
+          NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
+        const job = target.prepared.manifest;
+        if (
+          canonicalProjectWorkPayload(target) !== rows[0].manifest_json ||
+          hash(target) !== rows[0].sha256 ||
+          mounted.targetHash !== rows[0].sha256 ||
+          mounted.manifestHash !== target.prepared.sha256 ||
+          hash(job) !== mounted.manifestHash ||
+          mounted.source !== job.target.worktree ||
+          mounted.testedCommit !== job.target.testedCommit ||
+          mounted.testedTree !== job.target.testedTree ||
+          target.reviewer.bindingId !== binding.recordId ||
+          target.reviewer.generation !== binding.generation ||
+          target.reviewer.taskId !== binding.taskId
+        )
+          return yield* deny("Retained review allocation target identity changed");
+      },
+    );
     const ownTransaction = Effect.fn("ProjectTeamPiOperations.ownTransaction")(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(supplied) && supplied.value !== sql)
@@ -1784,6 +1838,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         root.deadlineAtMs < row.deadline_at_ms
       )
         return yield* deny("Pi operation owner changed");
+      yield* assertReviewAllocation(binding, captured.allocation);
       yield* operationBudget(authority, root, row);
       yield* clockCheck(row.deadline_at_ms);
       return authority;
@@ -1895,6 +1950,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         Effect.mapError(() => deny("Stable Pi drain unavailable", "uncertain")),
       );
       const allocation = intent.allocation;
+      yield* assertReviewAllocation(binding, allocation);
       const nativeState = allocation.launch.nativeState;
       if (
         !nativeState ||
@@ -2487,6 +2543,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           const authority = yield* current(identity, request.kind === "initialize");
           if (allocation.launch.workspaceRoot !== authority.binding.worktree)
             return yield* deny("Allocated workspace differs from durable assignment");
+          yield* assertReviewAllocation(authority.binding, allocation);
           const root = yield* roots(authority);
           yield* clockCheck(root.deadlineAtMs);
           let compaction: typeof CompactAssociation.Type | undefined;

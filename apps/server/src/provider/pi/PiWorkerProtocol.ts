@@ -83,6 +83,15 @@ export const PiWorkerTransferDescriptor = Schema.Struct({
 const ToolTransfer = PiWorkerTransferDescriptor.check(
   Schema.makeFilter((value) => value.totalBytes <= PI_WORKER_MAX_TOOL_BYTES),
 );
+export const PiWorkerReviewTarget = Schema.Struct({
+  target: Schema.Literal("/review-target"),
+  targetHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  manifestHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  testedCommit: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40,64}$/)),
+  testedTree: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40,64}$/)),
+  dev: SafeInteger,
+  ino: RequestId,
+});
 export const PiWorkerBootstrap = Schema.Struct({
   type: Schema.Literal("bootstrap"),
   executionMode: Schema.Literals(["managed", "ordinary"]),
@@ -123,6 +132,7 @@ export const PiWorkerBootstrap = Schema.Struct({
   ).check(Schema.isMaxLength(32)),
   resources: Schema.optional(
     Schema.Struct({
+      reviewTarget: Schema.optional(PiWorkerReviewTarget),
       skills: Schema.Array(
         Schema.Struct({
           key: Token,

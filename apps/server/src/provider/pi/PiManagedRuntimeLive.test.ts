@@ -1,4 +1,6 @@
 import { vi } from "vite-plus/test";
+import { makeProjectTeamReviewCompletionProposals } from "../../projectWork/ProjectTeamReviewCompletionProposals.ts";
+import { makeProjectTeamReviewCompletion } from "../../projectWork/ProjectTeamReviewCompletion.ts";
 import * as SessionRuntime from "./PiSessionRuntime.ts";
 import * as ManagedProcess from "./PiManagedProcess.ts";
 import * as RuntimeLive from "./PiManagedRuntimeLive.ts";
@@ -103,7 +105,8 @@ import {
   ProjectWorkRepositoryLive,
 } from "../../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkPolicyError } from "../../projectWork/ProjectWorkPolicy.ts";
-import { verificationFixture } from "../../projectWork/ProjectWorkVerification.testFixtures.ts";
+import * as VerificationPreparation from "../../projectWork/ProjectWorkVerificationPreparation.ts";
+import { makeProjectWorkVerificationJobs } from "../../projectWork/ProjectWorkVerificationJobs.ts";
 import {
   makeProjectWorkVerificationGate,
   ProjectWorkVerificationApproval,
@@ -232,6 +235,52 @@ const parseTransportBody = Schema.decodeSync(
       ),
     }),
   ),
+);
+const decodeNativeReadOutput = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      content: Schema.Array(Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })),
+    }),
+  ),
+);
+const decodeNativeReportParameters = Schema.decodeUnknownSync(
+  Schema.Struct({
+    properties: Schema.Struct({ intentJSON: Schema.Struct({ description: Schema.String }) }),
+  }),
+);
+const decodeNativeReportTemplate = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.JsonObject),
+);
+const decodeReviewNativeRequest = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      messages: Schema.Array(Schema.Struct({ role: Schema.String, content: Schema.Unknown })),
+      tools: Schema.Array(
+        Schema.Struct({
+          function: Schema.Struct({ name: Schema.String, parameters: Schema.JsonObject }),
+        }),
+      ),
+    }),
+  ),
+);
+const decodeNativeAllocation = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ManagedProcess.PiManagedProcessAllocationSchema),
+);
+const decodeNativeOwner = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("owner"),
+      unit: Schema.String,
+      nonce: Schema.String,
+      invocation: Schema.String,
+      cgroup: Schema.String,
+      pid: Schema.Int,
+      memoryBytes: Schema.Int,
+      swapBytes: Schema.Int,
+      oomGroup: Schema.Int,
+    }),
+  ),
+  { onExcessProperty: "error" },
 );
 const decodeLocalTerminal = Schema.decodeEffect(
   Schema.fromJsonString(
@@ -467,6 +516,9 @@ const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>, memoryRetraction = fals
         Layer.provide(Layer.mock(EnvironmentAuth)({})),
         Layer.provideMerge(ServerSettings.layerTest({ projectWorkEnabled: true })),
         Layer.provideMerge(makeSqlitePersistenceLive(directory + "/native-runtime.sqlite")),
+        Layer.provideMerge(
+          Layer.mock(GitWorkflowService, { withRepositoryPermit: (_operation, _cwd, use) => use }),
+        ),
       );
       return yield* Effect.scoped(effect).pipe(Effect.provide(live));
     }),
@@ -6142,9 +6194,82 @@ const decodeQueryCompanionInput = Schema.decodeUnknownEffect(
   { onExcessProperty: "error" },
 );
 
-// Required-context cases intercept only session execution; no managed worker or model is run.
-const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")(function* () {
+// Default required-context cases control session execution; the opt-in native case uses the real owner and worker.
+const reviewFixtureEpoch = at;
+const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")(function* (
+  native = false,
+) {
+  const at = native ? DateTime.formatIso(DateTime.nowUnsafe()) : reviewFixtureEpoch;
+  const shiftSeedDates = <A>(input: A): A => {
+    const cloned = structuredClone(input);
+    const visit = (value: unknown) => {
+      if (value === null || typeof value !== "object") return;
+      for (const key of Object.keys(value)) {
+        const entry: unknown = Reflect.get(value, key);
+        if (typeof entry === "string" && /^2026-01-01T[0-9:.]+Z$/.test(entry))
+          Reflect.set(
+            value,
+            key,
+            DateTime.formatIso(
+              DateTime.makeUnsafe(
+                Date.parse(entry) + Date.parse(at) - Date.parse(reviewFixtureEpoch),
+              ),
+            ),
+          );
+        else visit(entry);
+      }
+    };
+    if (native) visit(cloned);
+    return cloned;
+  };
+  // This container maps the installed Git binary's root owner to nobody. Keep
+  // physical Git execution and all workspace checks; normalize only that host UID.
+  const hostFs = process.getBuiltinModule("fs");
+  const originalLstat = hostFs.lstatSync;
+  const gitOwnership = vi.spyOn(hostFs, "lstatSync").mockImplementation((...args) => {
+    const stat = originalLstat(...args);
+    if (args[0] === "/usr/bin/git" && stat?.uid === 65534n)
+      Object.defineProperty(stat, "uid", { value: 0n });
+    return stat;
+  });
+  yield* Effect.addFinalizer(() => Effect.sync(() => gitOwnership.mockRestore()));
   const capturedSql = yield* SqlClient.SqlClient;
+  const physicalServices = yield* Effect.context<
+    FileSystem.FileSystem | import("effect/Path").Path | ChildProcessSpawner.ChildProcessSpawner
+  >();
+  const physicalFs = yield* FileSystem.FileSystem;
+  const nativeScratch = native ? process.env.PI_REVIEW_TARGET_NATIVE_SCRATCH : undefined;
+  if (nativeScratch) yield* physicalFs.makeDirectory(nativeScratch, { recursive: true });
+  const physicalRoot = yield* physicalFs.makeTempDirectoryScoped(
+    nativeScratch ? { directory: nativeScratch } : undefined,
+  );
+  const implementationMain = physicalRoot + "/implementation-main";
+  const implementationWorktree = physicalRoot + "/implementation-worktree";
+  const physicalGit = (cwd: string, args: ReadonlyArray<string>) =>
+    Effect.sync(() =>
+      process
+        .getBuiltinModule("child_process")
+        .execFileSync("/usr/bin/git", ["-C", cwd, ...args], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        })
+        .trim(),
+    );
+  yield* physicalFs.makeDirectory(implementationMain);
+  yield* physicalGit(implementationMain, ["init", "-qb", "main"]);
+  yield* physicalFs.writeFileString(implementationMain + "/README.md", "base README\n");
+  yield* physicalGit(implementationMain, ["add", "."]);
+  yield* physicalGit(implementationMain, [
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "-qm",
+    "base",
+  ]);
+  const implementationBase = yield* physicalGit(implementationMain, ["rev-parse", "HEAD"]);
+  let implementationReceipt: typeof DispatchJournal.ProjectTeamWorkspaceReceipt.Type | undefined;
   const originalJournal = DispatchJournal.makeProjectTeamDispatchJournal;
   // Correct the historical fixture producer before its first durable claim, then sequence
   // controlled setup receipts before settlement. No native setup worker is launched.
@@ -6175,6 +6300,60 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
               );
               if (role?.kind !== "role-revision")
                 return yield* Effect.die("Missing original root role");
+              const physicalAssignment = {
+                ...request.git,
+                primaryRoot: implementationMain,
+                commonGitDirectory: implementationMain + "/.git",
+                worktreePath: implementationWorktree,
+                baseOid: implementationBase,
+              };
+              Object.assign(request.git, physicalAssignment);
+              Object.assign(transition.binding, {
+                worktree: implementationWorktree,
+                branch: physicalAssignment.branchRef,
+              });
+              if (!implementationReceipt) {
+                const managed = yield* ManagedGit.make({
+                  assignment: physicalAssignment,
+                  revalidate: Effect.void,
+                  persistWorkspace: (receipt) =>
+                    Effect.sync(() => {
+                      implementationReceipt = receipt;
+                    }),
+                });
+                yield* ManagedGit.createManagedWorktree(managed, {
+                  cwd: implementationMain,
+                  path: implementationWorktree,
+                  refName: physicalAssignment.baseRef,
+                  newRefName: physicalAssignment.branchRef.slice(11),
+                });
+                yield* physicalFs.writeFileString(
+                  implementationWorktree + "/README.md",
+                  "implemented README\n",
+                );
+                yield* physicalFs.writeFileString(
+                  implementationWorktree + "/space name.txt",
+                  "verified spaced name\n",
+                );
+                yield* physicalFs.writeFileString(
+                  implementationWorktree + "/greeting.js",
+                  "export const greeting = 'hello';\n",
+                );
+                yield* physicalFs.writeFileString(
+                  implementationWorktree + "/greeting.test.js",
+                  "import { greeting } from './greeting.js';\nif (greeting !== 'hello') throw Error('wrong greeting');\n",
+                );
+                yield* physicalGit(implementationWorktree, ["add", "."]);
+                yield* physicalGit(implementationWorktree, [
+                  "-c",
+                  "user.name=Fixture",
+                  "-c",
+                  "user.email=fixture@example.test",
+                  "commit",
+                  "-qm",
+                  "implementation",
+                ]);
+              }
               return yield* journal.reserve({
                 ...request,
                 claim: {
@@ -6185,6 +6364,7 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
                       ...transition.binding,
                       configuration: {
                         ...transition.binding.configuration,
+                        ...(native ? { maxTokens: 64000, maxDurationMs: 300000 } : {}),
                         instructionsHash: NodeCrypto.createHash("sha256")
                           .update(role.instructions)
                           .digest("hex"),
@@ -6193,7 +6373,15 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
                   },
                 },
               });
-            }),
+            }).pipe(
+              Effect.provide(physicalServices),
+              Effect.mapError(
+                () =>
+                  new ProjectTeamDispatchJournalError({
+                    reason: "Physical fixture reservation failed",
+                  }),
+              ),
+            ),
           settleAfterJoined: (expected, receipt) =>
             Effect.gen(function* () {
               let snapshot = yield* journal.readRetained(expected.dispatchId);
@@ -6238,7 +6426,191 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
         })),
       );
     });
-  const f = yield* verificationFixture.pipe(
+  const physicalVerificationFixture = Effect.gen(function* () {
+    const repository = yield* ProjectWorkRepository;
+    const sql = capturedSql;
+    const key = (id: string) => id;
+    let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+    yield* seed("implementer", "reserved", {
+      roleTools: ["pi.read", "pi.write"],
+      toolIds: ["pi.read", "pi.write"],
+      issueCredential: false,
+    }).pipe(
+      Effect.provideService(ProjectWorkRepository, {
+        ...repository,
+        execute: (rawCommand) => {
+          const command = shiftSeedDates(rawCommand);
+          if (
+            command.type === "project-work.foundation.commit" &&
+            command.transition?.kind === "claim"
+          ) {
+            pending = command;
+            return Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Retain physical claim"),
+            );
+          }
+          return repository.execute(command);
+        },
+      }),
+      Effect.result,
+    );
+    if (!pending || pending.transition?.kind !== "claim")
+      return yield* Effect.die("Missing physical claim");
+    yield* repository.execute(
+      yield* decodeRequiredFoundation({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "configure-limits",
+        expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+        attribution,
+        committedAt: at,
+        records: [
+          {
+            kind: "limits",
+            projectId,
+            recordId: "limits",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "configured",
+            environmentModelCalls: 4,
+            projectWritableWorkers: 1,
+            modelCalls: native ? 12 : 2,
+            delegationDepth: 2,
+            repairAllowance: 2,
+            model: "test",
+            tokenLimit: native ? 128000 : 2000,
+            durationLimitMs: native ? 300000 : 2000,
+          },
+        ],
+      }),
+    );
+    yield* TestClock.setTime(Date.parse(at) + 1);
+    const claim = {
+      ...pending,
+      expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+      transition: {
+        ...pending.transition,
+        binding: {
+          ...pending.transition.binding,
+          branch: key("refs/heads/assigned"),
+          worktree: key("/workspace-assigned"),
+        },
+      },
+    };
+    const request: DispatchJournal.ProjectTeamDispatchRequest = {
+      dispatchId: key("dispatch-intent"),
+      claim,
+      git: {
+        effectId: key("dispatch-intent"),
+        runId: key("binding"),
+        generation: 0,
+        primaryRoot: "/workspace",
+        commonGitDirectory: "/workspace/.git",
+        worktreePath: key("/workspace-assigned"),
+        branchRef: key("refs/heads/assigned"),
+        baseRef: "refs/heads/main",
+        baseOid: "a".repeat(40),
+        ownershipToken: "owner",
+        policyHash: "b".repeat(64),
+      },
+      setupId: key("setup"),
+      initializeOperationId: key("initialize"),
+      assignmentOperationId: key("assignment"),
+      assignment: "Implement the approved task",
+    };
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    const f = { sql, repository, request, journal };
+    const claimed = yield* journal.claimEffect((yield* journal.reserve(request)).fence);
+    const settling = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+      verifyStage: () => Effect.void,
+      verifySettlement: () => Effect.void,
+    });
+    const snapshot = yield* settling.settleAfterJoined(claimed.fence, {
+      receiptId: "prepared-joined",
+      stage: "settled",
+      evidence: { worker: "joined", setup: "joined", transport: "drained" },
+    });
+    if (!implementationReceipt) return yield* Effect.die("Missing physical workspace receipt");
+    const receipt = implementationReceipt;
+    yield* sql`INSERT INTO project_team_workspace_receipt VALUES (${request.dispatchId},'environment','binding',0,${snapshot.fence.claimGeneration},${canonicalProjectWorkPayload(receipt.assignment)},${canonicalProjectWorkPayload(receipt)})`;
+    const state = yield* readCurrentState(f.sql, projectId);
+    const binding = state.foundationRecords?.find(
+      (r) => r.kind === "run-binding" && r.recordId === key("binding"),
+    );
+    if (binding?.kind !== "run-binding") return yield* Effect.die("Missing settled binding");
+    const selectedTask = state.tasks.find((t) => t.taskId === binding.taskId);
+    if (!selectedTask) return yield* Effect.die("Missing current task");
+    const selection = yield* decodeNativeVerificationSelection({
+      jobId: key("verification-1"),
+      projectId,
+      taskId: selectedTask.taskId,
+      expectedRevision: state.revision,
+      expectedTaskRevision: selectedTask.revision,
+      specRevision: selectedTask.specRevision,
+      planRevision: binding.planRevision,
+      bindingId: binding.recordId,
+      expectedBindingRevision: binding.revision,
+      generation: binding.generation,
+      criterionIds: state.criteria
+        .filter((c) => c.taskId === selectedTask.taskId)
+        .map((c) => c.criterionId),
+      command: {
+        executable: "/bin/bash",
+        argv: ["-n", "test.sh"],
+        environment: "clean",
+        limits: { maxDurationMs: 1000, maxOutputBytes: 4096 },
+      },
+    });
+    const jobs = yield* makeProjectWorkVerificationJobs({ environmentId: "environment" });
+    const preparation = yield* VerificationPreparation.makeProjectWorkVerificationPreparation({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+      assertHumanCurrent: () => Effect.void,
+      captureWorkspace: (original, use) =>
+        Effect.gen(function* () {
+          const managed = yield* ManagedGit.make({
+            assignment: original.receipt.assignment,
+            priorReceipt: original.receipt,
+            revalidate: Effect.void,
+            persistWorkspace: () => Effect.die("Cannot recreate verification workspace"),
+          });
+          return yield* ManagedGit.withManagedVerificationTarget(managed, use);
+        }).pipe(
+          Effect.provide(physicalServices),
+          Effect.mapError(
+            () =>
+              new ProjectWorkVerificationPreparationError({
+                reason: "Physical verification target changed",
+              }),
+          ),
+        ),
+      captureExecutable: (_binding, command, use) =>
+        use({
+          executableTarget: command.executable,
+          sha256: "e".repeat(64),
+          runtimeClosureSha256: "f".repeat(64),
+        }),
+      retainPrepared: (manifest) =>
+        jobs.retainPrepared(manifest).pipe(
+          Effect.mapError(
+            () =>
+              new ProjectWorkVerificationPreparationError({
+                reason: "Physical fixture retention failed",
+              }),
+          ),
+        ),
+    });
+    const principal = { actor: { kind: "human" as const, id: "maintainer" } };
+    const prepared = yield* preparation.prepare(selection, principal);
+    return { ...f, state, snapshot, receipt, selection, jobs, preparation, principal, prepared };
+  });
+  const f = yield* physicalVerificationFixture.pipe(
     Effect.ensuring(Effect.sync(() => fixtureSpy.mockRestore())),
   );
   const rootClaim = f.snapshot.intent.compiledClaim.transition;
@@ -6405,12 +6777,23 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
         instructions: `Required context for ${role}`,
         skills: [],
         tools:
-          role === "implementer" || role === "integrator" ? ["pi.read", "pi.write"] : ["pi.read"],
+          role === "implementer" || role === "integrator"
+            ? ["pi.read", "pi.write"]
+            : native && role === "reviewer"
+              ? ["pi.read", "project-work.report"]
+              : ["pi.read"],
         model,
         memoryAccess: "none",
         delegationDepth: 2,
       })),
-      modelPolicies: [{ model, tokenLimit: 2000, durationLimitMs: 2000, modelCalls: 2 }],
+      modelPolicies: [
+        {
+          model,
+          tokenLimit: native ? 128000 : 2000,
+          durationLimitMs: native ? 300000 : 2000,
+          modelCalls: 2,
+        },
+      ],
       environmentModelCalls: 4,
       projectWritableWorkers: 2,
       delegationDepth: 2,
@@ -6421,7 +6804,9 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
     f.principal,
   );
   const fs = yield* FileSystem.FileSystem;
-  const scratch = yield* fs.makeTempDirectoryScoped();
+  const scratch = yield* fs.makeTempDirectoryScoped(
+    nativeScratch ? { directory: nativeScratch } : undefined,
+  );
   const main = scratch + "/main";
   const assigned = scratch + "/assigned";
   const agentDirectory = scratch + "/agent";
@@ -6454,6 +6839,19 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
     "-qm",
     "initial",
   ]);
+  yield* fs.writeFileString(main + "/README.md", "base README\n");
+  yield* git(["-C", main, "add", "."]);
+  yield* git([
+    "-C",
+    main,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.test",
+    "commit",
+    "-qm",
+    "reviewer base",
+  ]);
   const baseOid = yield* git(["-C", main, "rev-parse", "HEAD"]);
   yield* git(["-C", main, "worktree", "add", "-qb", "required-review", assigned]);
   const catalogue = {
@@ -6462,7 +6860,7 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
     selectedEntry: {
       id: "inclusionai/ling-3.1-flash:free" as const,
       owned_by: "command-code" as const,
-      context_length: 20000,
+      context_length: native ? 128000 : 20000,
       supported_endpoints: ["/chat/completions"],
     },
   };
@@ -6477,11 +6875,13 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
         driverKind: "piAgent",
         enabled: true,
         runtimeVersion: "0.99.1",
-        maxInputTokens: 100,
-        maxOutputTokens: 100,
+        maxInputTokens: native ? 32000 : 100,
+        maxOutputTokens: native ? 512 : 100,
         catalogue,
       },
-      supportedToolIds: ["pi.read", "pi.write"],
+      supportedToolIds: native
+        ? ["pi.read", "pi.write", "project-work.report"]
+        : ["pi.read", "pi.write"],
       ownedSkillIds: [],
       git: {
         primaryRoot: main,
@@ -6528,15 +6928,19 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
     },
     memoryBytes: 33554432,
     cleanupDeadlineMs: 1000,
-    maxInputTokens: 100,
-    maxOutputTokens: 100,
+    maxInputTokens: native ? 32000 : 100,
+    maxOutputTokens: native ? 512 : 100,
     readCatalogue: Effect.succeed(catalogue),
     transport: async () => {
       transports++;
       throw Error("Required review transport forbidden");
     },
   };
-  const runtime = yield* makePiManagedRuntimeLive(options);
+  const repositoryPermit = yield* Semaphore.make(1);
+  const workflowLayer = Layer.mock(GitWorkflowService, {
+    withRepositoryPermit: (_operation, _cwd, use) => repositoryPermit.withPermits(1)(use),
+  });
+  const runtime = yield* makePiManagedRuntimeLive(options).pipe(Effect.provide(workflowLayer));
   const instance = yield* runtime.forInstance({
     instanceId: providerInstanceId,
     enabled: true,
@@ -6565,6 +6969,10 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
     request,
     snapshot,
     binding,
+    implementationMain,
+    implementationWorktree,
+    implementationReceipt,
+    workflowLayer,
     root: { snapshot: f.snapshot, bindingId: f.selection.bindingId, taskId: f.selection.taskId },
     get allocations() {
       return allocations;
@@ -14806,7 +15214,10 @@ for (const readonlyKind of [undefined, "review"] as const)
           const prepared = yield* f.instance.prepareOperation(request, () => Effect.void);
           const initialized = yield* prepared.run;
           expect(initialized.terminal.outcome).toBe("success");
-          expect(briefing).toBe(required.text);
+          expect(briefing.startsWith(required.text)).toBe(true);
+          expect(briefing.includes("Verified review files: /review-target/<relative-file>")).toBe(
+            true,
+          );
           const freshness = yield* f.sql<{
             manifest_json: string;
             native_jsonl: string;
@@ -15003,6 +15414,689 @@ it.effect(
         expect((yield* instance.inspect).models.map((entry) => entry.slug)).toEqual([alternate]);
         expect(f.launches).toBe(0);
         expect(f.transports).toBe(0);
+      }),
+    ),
+);
+
+// Opt in with a Root-built distribution. This runs the actual owner, worker entry,
+// SDK and report bridge; the transport below only replays deterministic SSE.
+describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
+  "verified review target native regression",
+  () => {
+    for (const mode of [
+      "mounted",
+      "missing-descriptor",
+      "mismatched-descriptor",
+      "absent-mount",
+      "path-alias",
+      "unicode-alias",
+    ] as const)
+      it.effect(
+        mode === "mounted"
+          ? "reads committed target bytes from an independent readonly reviewer and retains its report"
+          : `rejects actual native review reads with ${mode}`,
+        () =>
+          scoped(
+            Effect.gen(function* () {
+              const f = yield* requiredReviewTransferFixture(true);
+              const stageDirectory = yield* f.fs.makeTempDirectoryScoped(
+                process.env.PI_REVIEW_TARGET_NATIVE_SCRATCH
+                  ? { directory: process.env.PI_REVIEW_TARGET_NATIVE_SCRATCH }
+                  : undefined,
+              );
+              const assets = yield* preparePiRuntimeAssets({
+                distributionDirectory: process.env.PI_REVIEW_TARGET_NATIVE_DIST!,
+                stagingDirectory: stageDirectory,
+                protectedRoots: [f.options.agentDirectory],
+              });
+              yield* Effect.addFinalizer(() =>
+                f.fs.chmod(stageDirectory, 0o700).pipe(Effect.orDie),
+              );
+              yield* f.fs.writeFileString(
+                f.options.agentDirectory + "/auth.json",
+                json({ "command-code": { type: "api_key", key: "synthetic-offline-review-key" } }),
+              );
+              const reads = [
+                "README.md",
+                "/review-target/README.md",
+                "/review-target/greeting.js",
+                "/review-target/greeting.test.js",
+              ];
+              const expected = [
+                "base README\n",
+                "implemented README\n",
+                "export const greeting = 'hello';\n",
+                "import { greeting } from './greeting.js';\nif (greeting !== 'hello') throw Error('wrong greeting');\n",
+              ];
+              let calls = 0;
+              let reportIntent = "";
+              let reportCommandId = "";
+              const observations: string[] = [];
+              const reviewCriteria = (yield* readCurrentState(f.sql, projectId)).criteria.filter(
+                (criterion) => criterion.taskId === f.binding.taskId && criterion.required,
+              );
+              const workerFailures: string[] = [];
+              const originalSession = SessionRuntime.makePiSessionRuntime;
+              const sessionSpy = vi
+                .spyOn(SessionRuntime, "makePiSessionRuntime")
+                .mockImplementation((input) => {
+                  const target = input.bootstrap.resources?.reviewTarget;
+                  return originalSession({
+                    ...input,
+                    ...(mode === "missing-descriptor"
+                      ? {
+                          bootstrap: {
+                            ...input.bootstrap,
+                            resources: { skills: input.bootstrap.resources?.skills ?? [] },
+                          },
+                        }
+                      : mode === "mismatched-descriptor" && target
+                        ? {
+                            bootstrap: {
+                              ...input.bootstrap,
+                              resources: {
+                                ...input.bootstrap.resources!,
+                                reviewTarget: { ...target, ino: target.ino + 1 },
+                              },
+                            },
+                          }
+                        : {}),
+                    onWorkerFrame: async (frame, signal) => {
+                      if (frame.message.type === "worker-failure")
+                        workerFailures.push(frame.message.code);
+                      await input.onWorkerFrame?.(frame, signal);
+                    },
+                  });
+                });
+              yield* Effect.addFinalizer(() => Effect.sync(() => sessionSpy.mockRestore()));
+              const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+              const missingMountSpawner = ChildProcessSpawner.make((command) => {
+                if (
+                  mode !== "absent-mount" ||
+                  command._tag !== "StandardCommand" ||
+                  command.command !== "/usr/bin/systemd-run"
+                )
+                  return spawner.spawn(command);
+                const args = [...command.args];
+                const last = args.length - 1;
+                const spec = decodeNativeJsonEvidence(
+                  Buffer.from(args[last]!, "base64").toString("utf8"),
+                );
+                const { reviewTarget: _omitted, ...withoutTarget } = spec;
+                args[last] = Buffer.from(json(withoutTarget)).toString("base64");
+                return spawner.spawn({ ...command, args });
+              });
+              const runtime = yield* makePiManagedRuntimeLive({
+                ...f.options,
+                runtimeFiles: assets.runtimeFiles,
+                workerArgv: (identity, operation) =>
+                  assets.workerArgv(identity, operation, "/state/sessions"),
+                memoryBytes: 536870912,
+                cleanupDeadlineMs: 5000,
+                maxInputTokens: 32000,
+                maxOutputTokens: 512,
+                revalidateRuntime: assets.revalidate.pipe(Effect.mapError(controlledCallbackError)),
+                transport: async (_url, init) => {
+                  const body = decodeReviewNativeRequest(init.body);
+                  const reportSchema = body.tools.find(
+                    (tool) => tool.function.name === "project_work_report",
+                  );
+                  if (!reportSchema) throw Error("Missing advertised native report schema");
+                  const template = decodeNativeReportTemplate(
+                    decodeNativeReportParameters(reportSchema.function.parameters).properties
+                      .intentJSON.description,
+                  );
+                  if (typeof template.commandId !== "string")
+                    throw Error("Missing advertised native report command");
+                  reportCommandId = template.commandId;
+                  reportIntent = json({
+                    ...template,
+                    outcome: "complete",
+                    outputs: reviewCriteria.map((criterion) => ({
+                      criterionId: criterion.criterionId,
+                      kind: "observation",
+                      detail:
+                        "Independently read the committed README, greeting implementation and its test at the exact retained verification target.",
+                    })),
+                    summary:
+                      "Read the exact committed README, greeting and test from the verified readonly target.",
+                  });
+                  const previous = body.messages.filter(
+                    (message: { role: string }) => message.role === "tool",
+                  );
+                  for (
+                    let index = observations.length;
+                    index < Math.min(previous.length, reads.length);
+                    index++
+                  ) {
+                    const content = decodeNativeReadOutput(String(previous[index]!.content))
+                      .content.map((part) => part.text)
+                      .join("");
+                    expect(content).toBe(expected[index]!);
+                    observations.push(content);
+                  }
+                  const index = calls++;
+                  const tool =
+                    index < reads.length
+                      ? {
+                          name: "read",
+                          args: {
+                            path:
+                              index === 1 && mode === "path-alias"
+                                ? "@/review-target/README.md"
+                                : index === 1 && mode === "unicode-alias"
+                                  ? "/review-target/space\u00A0name.txt"
+                                  : reads[index],
+                          },
+                        }
+                      : index === reads.length
+                        ? { name: "project_work_report", args: { intentJSON: reportIntent } }
+                        : undefined;
+                  const delta = tool
+                    ? {
+                        role: "assistant",
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: `review-call-${index}`,
+                            type: "function",
+                            function: { name: tool.name, arguments: json(tool.args) },
+                          },
+                        ],
+                      }
+                    : { role: "assistant", content: "Review recorded." };
+                  return new Response(
+                    [
+                      {
+                        id: "offline-review",
+                        model,
+                        choices: [{ index: 0, delta, finish_reason: null }],
+                      },
+                      {
+                        id: "offline-review",
+                        model,
+                        choices: [
+                          { index: 0, delta: {}, finish_reason: tool ? "tool_calls" : "stop" },
+                        ],
+                      },
+                      {
+                        model,
+                        choices: [],
+                        usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+                      },
+                    ]
+                      .map((event) => `data: ${json(event)}\n\n`)
+                      .join("") + "data: [DONE]\n\n",
+                    { headers: { "content-type": "text/event-stream" } },
+                  );
+                },
+              }).pipe(
+                Effect.provide(f.workflowLayer),
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, missingMountSpawner),
+              );
+              const instance = yield* runtime.forInstance({
+                instanceId: providerInstanceId,
+                enabled: true,
+                configuration: {},
+              });
+              const journal = yield* makeProjectTeamDispatchJournal({
+                environmentId: "environment",
+                maximumEnvironmentModelCalls: 4,
+                verifyStage: (receipt) =>
+                  receipt.evidence.bindingId === f.binding.recordId
+                    ? Effect.void
+                    : Effect.die("Foreign native review stage"),
+              });
+              let snapshot = f.snapshot;
+              const advance = (
+                stage: "workspace-ready" | "setup-complete" | "session-bound" | "assignment-intent",
+              ) =>
+                Effect.gen(function* () {
+                  snapshot = yield* journal.readRetained(
+                    (yield* journal.advanceStage(snapshot.fence, {
+                      receiptId: `native-review-${stage}`,
+                      stage,
+                      evidence: { bindingId: f.binding.recordId },
+                    })).fence.dispatchId,
+                  );
+                });
+              yield* advance("workspace-ready");
+              yield* advance("setup-complete");
+              const initialized = yield* instance.prepareOperation(
+                {
+                  threadId: f.binding.threadId,
+                  kind: "initialize",
+                  operationId: f.request.initializeOperationId,
+                },
+                () => Effect.void,
+              );
+              const initialization = yield* initialized.run.pipe(Effect.result);
+              if (mode === "mismatched-descriptor" || mode === "absent-mount") {
+                expect(initialization._tag).toBe("Failure");
+                expect(workerFailures.length > 0).toBe(true);
+                expect(calls).toBe(0);
+                return;
+              }
+              if (initialization._tag === "Failure")
+                return yield* Effect.fail(initialization.failure);
+              const initResult = initialization.success;
+              expect(initResult.terminal.outcome).toBe("success");
+              expect(initResult.terminal.drain?.kernel).toBe("removed");
+              expect(calls).toBe(0);
+              yield* advance("session-bound");
+              yield* advance("assignment-intent");
+              const assigned = yield* instance.prepareOperation(
+                {
+                  threadId: f.binding.threadId,
+                  kind: "prompt",
+                  operationId: f.request.assignmentOperationId,
+                  prompt: f.request.assignment,
+                  resumeCursor: initResult.session.resumeCursor,
+                },
+                () => Effect.void,
+              );
+              const assignment = yield* assigned.run.pipe(Effect.result);
+              if (
+                mode === "missing-descriptor" ||
+                mode === "path-alias" ||
+                mode === "unicode-alias"
+              ) {
+                expect(assignment._tag).toBe("Failure");
+                expect(workerFailures.includes("TOOL_FAILURE")).toBe(true);
+                expect(observations.length).toBe(1);
+                expect(calls).toBe(2);
+                expect(
+                  (yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE command_id=${reportCommandId}`)
+                    .length,
+                ).toBe(0);
+                const drains = yield* f.sql<{
+                  kernel: string;
+                }>`SELECT json_extract(drain_json,'$.kernel') AS kernel FROM project_team_pi_process WHERE operation_id=${f.request.assignmentOperationId}`;
+                expect(drains[0]?.kernel).toBe("removed");
+                expect(yield* f.fs.readFileString(f.implementationWorktree + "/README.md")).toBe(
+                  expected[1],
+                );
+                return;
+              }
+              if (assignment._tag === "Failure") return yield* Effect.fail(assignment.failure);
+              const result = assignment.success;
+              expect(result.terminal.outcome).toBe("success");
+              expect(result.terminal.drain?.kernel).toBe("removed");
+              expect(observations.length).toBe(reads.length);
+              expect(calls).toBe(6);
+              const processes = yield* f.sql<{
+                operation_id: string;
+                allocation_json: string;
+                owner_json: string;
+                drain_json: string;
+                status: string;
+              }>`SELECT operation_id,allocation_json,owner_json,drain_json,status FROM project_team_pi_process ORDER BY operation_id`;
+              expect(processes.length).toBe(2);
+              for (const row of processes) {
+                const allocation = yield* decodeNativeAllocation(row.allocation_json);
+                expect(allocation.launch.workspaceRoot).toBe(f.binding.worktree);
+                expect(allocation.launch.workspaceAccess).toBe("readonly");
+                expect(allocation.launch.reviewTarget?.source).toBe(f.implementationWorktree);
+                expect(allocation.launch.reviewTarget?.target).toBe("/review-target");
+              }
+              const reports =
+                yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE command_id=${reportCommandId}`;
+              expect(reports.length).toBe(1);
+              const proposals = yield* makeProjectTeamReviewCompletionProposals(() =>
+                Effect.succeed(undefined),
+              );
+              const proposal = yield* f.sql.withTransaction(
+                proposals.readRetained({
+                  environmentId: "environment",
+                  projectId,
+                  commandId: reportCommandId,
+                }),
+              );
+              if (!proposal)
+                return yield* Effect.die("Missing actual retained reviewer report provenance");
+              expect(proposal.manifest.provenance.dispatchId).toBe(f.request.dispatchId);
+              expect(proposal.manifest.operation.operationId).toBe(f.request.assignmentOperationId);
+              expect(proposal.manifest.target.headSha).toBe(
+                f.implementationReceipt
+                  ? process
+                      .getBuiltinModule("child_process")
+                      .execFileSync(
+                        "/usr/bin/git",
+                        ["-C", f.implementationWorktree, "rev-parse", "HEAD"],
+                        { encoding: "utf8" },
+                      )
+                      .trim()
+                  : "missing",
+              );
+              expect(proposal.manifest.prepared.sha256.length).toBe(64);
+              const reconciliationServices = yield* Effect.context<
+                FileSystem.FileSystem | ChildProcessSpawner.ChildProcessSpawner
+              >();
+              const collectJoined = () =>
+                Effect.forEach(processes, (row) =>
+                  Effect.gen(function* () {
+                    const allocation = yield* decodeNativeAllocation(row.allocation_json);
+                    const owner = decodeNativeOwner(row.owner_json);
+                    const reconciliation = yield* ManagedProcess.reconcilePiManagedProcess(
+                      {
+                        allocation,
+                        activation: "owned",
+                        owner,
+                      },
+                      { stop: true },
+                    );
+                    expect(reconciliation.state).toBe("drained");
+                    expect(reconciliation.kernel).toBe("removed");
+                    return decodeNativeJsonEvidence(
+                      json({ operationId: row.operation_id, allocation, owner, reconciliation }),
+                    );
+                  }),
+                );
+              const completion = yield* makeProjectTeamReviewCompletion({
+                environmentId: "environment",
+                maximumEnvironmentModelCalls: 4,
+              });
+              const settling = yield* makeProjectTeamDispatchJournal({
+                environmentId: "environment",
+                maximumEnvironmentModelCalls: 4,
+                verifyStage: (receipt) =>
+                  receipt.evidence.bindingId === f.binding.recordId
+                    ? Effect.void
+                    : Effect.die("Foreign native joined review"),
+                prepareReviewCompletion: completion.prepare,
+                verifySettlement: (receipt, original) =>
+                  Effect.gen(function* () {
+                    expect(original.fence.dispatchId).toBe(f.request.dispatchId);
+                    expect(receipt.evidence.operations).toEqual(yield* collectJoined());
+                  }).pipe(
+                    Effect.provide(reconciliationServices),
+                    Effect.mapError(
+                      () =>
+                        new ProjectTeamDispatchJournalError({
+                          reason: "Actual native owner reconciliation changed",
+                        }),
+                    ),
+                  ),
+              });
+              snapshot = yield* settling.readRetained(
+                (yield* settling.advanceStage(snapshot.fence, {
+                  receiptId: "native-review-observed",
+                  stage: "assignment-observed",
+                  evidence: { bindingId: f.binding.recordId },
+                })).fence.dispatchId,
+              );
+              const settled = yield* settling.settleAfterJoined(snapshot.fence, {
+                receiptId: "native-review-joined",
+                stage: "settled",
+                evidence: {
+                  version: 1,
+                  dispatchId: f.request.dispatchId,
+                  bindingId: f.binding.recordId,
+                  generation: f.binding.generation,
+                  claimGeneration: snapshot.fence.claimGeneration,
+                  operations: yield* collectJoined(),
+                },
+              });
+              expect(settled.fence.stage).toBe("settled");
+              const completed = yield* readCurrentState(f.sql, projectId);
+              expect(completed.tasks.find((task) => task.taskId === f.binding.taskId)?.state).toBe(
+                "completed",
+              );
+              expect(completed.tasks.find((task) => task.taskId === f.root.taskId)?.state).toBe(
+                "ready",
+              );
+
+              const freshness = yield* f.sql<{
+                native_jsonl: string;
+                manifest_json: string;
+              }>`SELECT native_jsonl,manifest_json FROM project_team_review_freshness`;
+              expect(freshness.length).toBe(1);
+              expect(
+                freshness[0]!.native_jsonl.includes(
+                  "Verified review files: /review-target/<relative-file>",
+                ),
+              ).toBe(true);
+              expect(freshness[0]!.native_jsonl.includes('"cwd":"/workspace"')).toBe(true);
+              const initialContext = freshness[0]!.native_jsonl
+                .trim()
+                .split("\n")
+                .map((line) => decodeNativeJsonEvidence(line))
+                .find((entry) => entry.customType === "t3-approved-initial-context");
+              const data = initialContext?.data;
+              if (
+                !data ||
+                typeof data !== "object" ||
+                Array.isArray(data) ||
+                !("text" in data) ||
+                typeof data.text !== "string"
+              )
+                return yield* Effect.die("Missing actual native approved briefing");
+              const target = (yield* decodeNativeAllocation(processes[0]!.allocation_json)).launch
+                .reviewTarget;
+              if (!target) return yield* Effect.die("Missing retained mounted target");
+              expect(
+                data.text.includes(
+                  `tested commit ${target.testedCommit}; tested tree ${target.testedTree}`,
+                ),
+              ).toBe(true);
+              expect(NodeCrypto.createHash("sha256").update(data.text).digest("hex")).toBe(
+                proposal.manifest.freshness.briefingSHA256,
+              );
+              expect(decodeNativeJsonEvidence(freshness[0]!.manifest_json).briefingSHA256).toBe(
+                proposal.manifest.freshness.briefingSHA256,
+              );
+              expect(yield* f.fs.readFileString(f.binding.worktree + "/README.md")).toBe(
+                expected[0],
+              );
+              for (let index = 1; index < reads.length; index++)
+                expect(
+                  yield* f.fs.readFileString(
+                    f.implementationWorktree + reads[index]!.slice("/review-target".length),
+                  ),
+                ).toBe(expected[index]);
+            }),
+          ),
+        120_000,
+      );
+  },
+);
+
+for (const mutation of ["dirty", "untracked", "ignored", "new-commit", "root-replaced"] as const)
+  it.effect(`rejects a ${mutation} verified review target before allocation`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture();
+        const root = f.implementationWorktree;
+        if (mutation === "dirty")
+          yield* f.fs.writeFileString(root + "/README.md", "unverified change\n");
+        if (mutation === "untracked")
+          yield* f.fs.writeFileString(root + "/untracked.txt", "unverified\n");
+        if (mutation === "ignored") {
+          yield* f.fs.writeFileString(root + "/.ignored", "unverified\n");
+          yield* f.fs.writeFileString(f.implementationMain + "/.git/info/exclude", ".ignored\n");
+        }
+        if (mutation === "new-commit")
+          yield* Effect.sync(() =>
+            process
+              .getBuiltinModule("child_process")
+              .execFileSync(
+                "/usr/bin/git",
+                [
+                  "-C",
+                  root,
+                  "-c",
+                  "user.name=Fixture",
+                  "-c",
+                  "user.email=fixture@example.test",
+                  "commit",
+                  "--allow-empty",
+                  "-qm",
+                  "unverified head",
+                ],
+                { stdio: "ignore" },
+              ),
+          );
+        if (mutation === "root-replaced")
+          yield* Effect.promise(async () => {
+            const fs = process.getBuiltinModule("fs").promises;
+            await fs.rename(root, root + "-original");
+            await fs.cp(root + "-original", root, { recursive: true });
+          });
+        const result = yield* f.instance
+          .prepareOperation(
+            {
+              threadId: f.binding.threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+            },
+            () => Effect.void,
+          )
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(f.allocations).toBe(0);
+        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(0);
+      }),
+    ),
+  );
+
+for (const phase of [
+  "beforeAcquire",
+  "beforeStart",
+  "beforeToolInvoke",
+  "beforeToolReturn",
+] as const)
+  it.effect(`rechecks physical review target at ${phase}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture();
+        yield* initializeRequiredContext(f);
+        let captured: SessionRuntime.PiSessionRuntimeOptions | undefined;
+        const original = SessionRuntime.makePiSessionRuntime;
+        const spy = vi.spyOn(SessionRuntime, "makePiSessionRuntime").mockImplementation((input) => {
+          captured = input;
+          return original(input);
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        yield* f.instance.prepareOperation(
+          {
+            threadId: f.binding.threadId,
+            kind: "prompt",
+            operationId: f.request.assignmentOperationId,
+            prompt: f.request.assignment,
+          },
+          () => Effect.void,
+        );
+        if (!captured) return yield* Effect.die("Missing real prepared session boundary");
+        const input = captured;
+        const authorize = () =>
+          input.authorizeCurrent(
+            {
+              phase,
+              identity: input.identity,
+              operation: input.operation,
+              ...(["beforeToolInvoke", "beforeToolReturn"].includes(phase)
+                ? { tool: { name: "read", capability: "pi.read", execution: "local" as const } }
+                : {}),
+            },
+            new AbortController().signal,
+          );
+        yield* Effect.promise(authorize);
+        yield* f.fs.writeFileString(
+          f.implementationWorktree + "/README.md",
+          "changed after preparation\n",
+        );
+        const denied = yield* Effect.promise(() =>
+          authorize().then(
+            () => false,
+            () => true,
+          ),
+        );
+        expect(denied).toBe(true);
+        yield* f.instance.requestStop(f.binding.threadId);
+      }),
+    ),
+  );
+
+for (const mutation of ["absent", "hash", "manifest", "tree", "commit", "foreign-source"] as const)
+  it.effect(`retained allocation rejects ${mutation} review identity`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture();
+        const original = ManagedProcess.preallocatePiManagedProcess;
+        const spy = vi
+          .spyOn(ManagedProcess, "preallocatePiManagedProcess")
+          .mockImplementation((launch) => {
+            const target = launch.reviewTarget;
+            if (!target) return Effect.die("Missing physical review launch descriptor");
+            return original({
+              ...launch,
+              reviewTarget:
+                mutation === "absent"
+                  ? undefined
+                  : {
+                      ...target,
+                      ...(mutation === "hash" ? { targetHash: "0".repeat(64) } : {}),
+                      ...(mutation === "manifest" ? { manifestHash: "0".repeat(64) } : {}),
+                      ...(mutation === "tree" ? { testedTree: "0".repeat(40) } : {}),
+                      ...(mutation === "commit" ? { testedCommit: "0".repeat(40) } : {}),
+                      ...(mutation === "foreign-source"
+                        ? { source: f.options.agentDirectory }
+                        : {}),
+                    },
+            });
+          });
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        expect(
+          (yield* f.instance
+            .prepareOperation(
+              {
+                threadId: f.binding.threadId,
+                kind: "initialize",
+                operationId: f.request.initializeOperationId,
+              },
+              () => Effect.void,
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* f.sql`SELECT operation_id FROM project_team_pi_operation`).length).toBe(0);
+      }),
+    ),
+  );
+
+it.effect(
+  "keeps the production trusted Git ownership guard before native review target access",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const fs = process.getBuiltinModule("fs");
+        const original = fs.lstatSync;
+        const spy = vi.spyOn(fs, "lstatSync").mockImplementation((...args) => {
+          const stat = original(...args);
+          if (args[0] === "/usr/bin/git" && stat)
+            Object.defineProperty(stat, "uid", { value: 65534n });
+          return stat;
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+        const result = yield* ManagedGit.make({
+          assignment: {
+            effectId: "guard",
+            runId: "guard",
+            generation: 1,
+            primaryRoot: "/guard-primary",
+            commonGitDirectory: "/guard-primary/.git",
+            worktreePath: "/guard-worktree",
+            branchRef: "refs/heads/guard",
+            baseRef: "refs/heads/main",
+            baseOid: "a".repeat(40),
+            ownershipToken: "guard",
+            policyHash: "a".repeat(64),
+          },
+          revalidate: Effect.void,
+          persistWorkspace: () => Effect.die("Untrusted binary cannot persist a workspace"),
+        }).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure")
+          expect(result.failure.detail).toBe("Trusted Git executable is unavailable.");
       }),
     ),
 );
