@@ -960,98 +960,129 @@ const withRetainedGateway = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 
 it.effect(
   "commits authoritative work during cache and observation storage outages without replaying effects",
-  () =>
-    withRetainedGateway(
-      Effect.gen(function* () {
-        const f = yield* makeFixture("implementer", 1, undefined, false, "project");
-        const gateway = yield* ProjectWorkGateway;
-        const w = yield* retainedWriter();
-        const { content } = yield* addContextObservation(f);
-        const before = yield* f.reader.readRequired(f.snapshot);
-        expect(before.observations.status).toBe("available");
-        expect(before.text).toContain(content);
+  () => {
+    let failedCacheReads = 0;
+    const unavailable = () =>
+      Effect.fail(new ProjectMemoryServiceError({ reason: "Controlled memory port outage" }));
+    const ports = ProjectMemoryPorts.of({
+      assertConfigured: unavailable,
+      readConfiguration: unavailable,
+      availability: unavailable(),
+      consume: unavailable,
+      consumeQuery: unavailable,
+      readQueryCache: () =>
+        unavailable().pipe(
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              failedCacheReads++;
+            }),
+          ),
+        ),
+    });
+    return Effect.gen(function* () {
+      const f = yield* makeFixture("implementer", 1, undefined, false, "project");
+      const gateway = yield* ProjectWorkGateway;
+      const w = yield* retainedWriter();
+      const { content } = yield* addContextObservation(f);
+      const before = yield* f.reader.readRequired(f.snapshot);
+      expect(before.observations.status).toBe("available");
+      expect(before.text).toContain(content);
+      expect(failedCacheReads).toBe(1);
+      const observationSchema =
+        yield* f.sql`SELECT sql FROM sqlite_master WHERE type='table' AND name='project_team_memory_observation'`;
+      expect(observationSchema).toHaveLength(1);
 
-        // Only optional dependencies fail; writes still traverse the real gateway,
-        // authorization, repository and SQL projection paths.
-        yield* f.sql`DROP TABLE project_team_memory_observation`;
-        expect(
-          yield* f.sql`SELECT name FROM sqlite_master WHERE type='table' AND name='project_team_memory_observation'`,
-        ).toEqual([]);
-        const unavailable = () =>
-          Effect.fail(new ProjectMemoryServiceError({ reason: "Controlled companion outage" }));
-        const reader = yield* makeProjectTeamContext({
-          environmentId: "environment",
-          maximumEnvironmentModelCalls: 4,
-        }).pipe(
-          Effect.provideService(ProjectMemoryPorts, {
-            assertConfigured: unavailable,
-            readQueryCache: unavailable,
-          }),
-        );
-        const create = yield* decodeRetainedIntent({
-          type: "project-work.task.create",
-          projectId,
-          commandId: "outage-task-create",
-          taskId: "outage-task",
-          title: "Work remains pending during memory outage",
-          createdAt: at,
+      // Only optional dependencies fail; writes still traverse the real gateway,
+      // authorization, repository and SQL projection paths.
+      yield* f.sql`DROP TABLE project_team_memory_observation`;
+      expect(
+        yield* f.sql`SELECT name FROM sqlite_master WHERE type='table' AND name='project_team_memory_observation'`,
+      ).toEqual([]);
+      const readDegraded = Effect.gen(function* () {
+        const failuresBefore = failedCacheReads;
+        const context = yield* f.reader.readRequired(f.snapshot);
+        expect(failedCacheReads).toBe(failuresBefore + 1);
+        expect(context.observations).toMatchObject({ status: "degraded", records: [] });
+        expect(context.observations.omitted.join("\n")).toContain("unavailable");
+        expect(context.observations.provenance.queryId).toBeUndefined();
+        expect(context.text).toContain("Optional memory observations status: degraded");
+        expect(context.text).not.toContain(content);
+        return context;
+      });
+      const create = yield* decodeRetainedIntent({
+        type: "project-work.task.create",
+        projectId,
+        commandId: "outage-task-create",
+        taskId: "outage-task",
+        title: "Work remains pending during memory outage",
+        createdAt: at,
+      });
+      const writeTask = gateway.write(
+        create,
+        { kind: "human", id: "retained-human" },
+        { kind: "web", id: "retained-browser" },
+      );
+      yield* writeTask;
+      // Repository.execute ensures projection tables before applying a write.
+      // Recreating the same schema restores neither lost facts nor query access.
+      expect(
+        yield* f.sql`SELECT sql FROM sqlite_master WHERE type='table' AND name='project_team_memory_observation'`,
+      ).toEqual(observationSchema);
+      expect(yield* f.sql`SELECT * FROM project_team_memory_observation`).toEqual([]);
+      yield* readDegraded;
+      yield* w.propose("outage-decision", "Memory outages grant no completion or approval.");
+      yield* readDegraded;
+      yield* w.accept("outage-decision");
+      expect(yield* f.sql`SELECT * FROM project_team_memory_observation`).toEqual([]);
+      const committed = yield* readCurrentState(f.sql, projectId);
+      const events =
+        yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`;
+      const receipts =
+        yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} ORDER BY command_id`;
+
+      // Retrying the same writes and rebuilding context must not duplicate
+      // authoritative effects or turn missing optional facts into completion.
+      yield* writeTask;
+      yield* w.propose("outage-decision", "Memory outages grant no completion or approval.");
+      yield* w.accept("outage-decision");
+      for (let pass = 0; pass < 2; pass++) {
+        const context = yield* readDegraded;
+        expect(context.required).toEqual({
+          ...before.required,
+          sourceRevision: committed.revision,
+          decisions: committed.decisions?.filter((decision) => decision.state === "accepted"),
         });
-        const writeTask = gateway.write(
-          create,
-          { kind: "human", id: "retained-human" },
-          { kind: "web", id: "retained-browser" },
-        );
-        yield* writeTask;
-        yield* w.propose("outage-decision", "Memory outages grant no completion or approval.");
-        yield* w.accept("outage-decision");
-        // Projection writes recreate the optional table, but cannot recover its
-        // lost observations from the current incremental projection checkpoint.
-        expect(yield* f.sql`SELECT * FROM project_team_memory_observation`).toEqual([]);
-        const committed = yield* readCurrentState(f.sql, projectId);
-        const events =
-          yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`;
-        const receipts =
-          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} ORDER BY command_id`;
-
-        // Retrying the same writes and rebuilding context must not duplicate
-        // authoritative effects or turn missing optional facts into completion.
-        yield* writeTask;
-        yield* w.propose("outage-decision", "Memory outages grant no completion or approval.");
-        yield* w.accept("outage-decision");
-        for (let pass = 0; pass < 2; pass++) {
-          const context = yield* reader.readRequired(f.snapshot);
-          expect(context.required).toEqual({
-            ...before.required,
-            sourceRevision: committed.revision,
-            decisions: committed.decisions?.filter((decision) => decision.state === "accepted"),
-          });
-          expect(context.required.tasks[0]?.task.specification).toMatchObject({
-            scopeIn: "Task",
-            scopeOut: "Other tasks",
-          });
-          expect(context.required.tasks[0]?.criteria[0]?.status).toBe("unsatisfied");
-          expect(context.observations).toMatchObject({ status: "degraded", records: [] });
-          expect(context.observations.omitted.join("\n")).toContain("unavailable");
-          expect(context.observations.provenance.queryId).toBeUndefined();
-          expect(context.text).toContain("Optional memory observations status: degraded");
-          expect(context.text).not.toContain(content);
-          const briefing = yield* gateway
-            .read({ projectId, operation: "briefing", kind: "standard" })
-            .pipe(Effect.flatMap(Schema.decodeUnknownEffect(BriefingRecord)));
-          expect(briefing.includedTaskIds).toContain("outage-task");
-          expect(briefing.text).toContain("[draft] Work remains pending during memory outage");
-          expect(briefing.text).toContain("Memory outages grant no completion or approval.");
-          expect(briefing.text).toContain("1 required criterion pending");
-          expect(yield* readCurrentState(f.sql, projectId)).toEqual(committed);
-          expect(
-            yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`,
-          ).toEqual(events);
-          expect(
-            yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} ORDER BY command_id`,
-          ).toEqual(receipts);
-        }
-      }),
-    ),
+        expect(context.required.tasks[0]?.task.specification).toMatchObject({
+          scopeIn: "Task",
+          scopeOut: "Other tasks",
+        });
+        expect(context.required.tasks[0]?.criteria[0]?.status).toBe("unsatisfied");
+        const briefing = yield* gateway
+          .read({ projectId, operation: "briefing", kind: "standard" })
+          .pipe(Effect.flatMap(Schema.decodeUnknownEffect(BriefingRecord)));
+        expect(briefing.includedTaskIds).toContain("outage-task");
+        expect(briefing.text).toContain("[draft] Work remains pending during memory outage");
+        expect(briefing.text).toContain("Memory outages grant no completion or approval.");
+        expect(briefing.text).toContain("1 required criterion pending");
+        yield* readDegraded;
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(committed);
+        expect(
+          yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectId} ORDER BY sequence`,
+        ).toEqual(events);
+        expect(
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id=${projectId} ORDER BY command_id`,
+        ).toEqual(receipts);
+      }
+    }).pipe(
+      // Supply the same outage to both service construction and every write,
+      // retry, briefing and context read, including optional service lookups.
+      Effect.provide(
+        Layer.fresh(
+          gatewayRuntime.pipe(Layer.provideMerge(Layer.succeed(ProjectMemoryPorts, ports))),
+        ),
+      ),
+    );
+  },
 );
 
 it.effect(
