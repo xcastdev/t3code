@@ -745,6 +745,37 @@ export type ProjectTeamReviewFindingIntent = typeof ProjectTeamReviewFindingInte
 
 const MemoryId = Text.check(Schema.isMaxLength(256));
 const MemoryRevision = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+export const ProjectTeamMemorySourceSelector = Schema.Struct({
+  sourceRecordId: Schema.String.check(
+    Schema.isTrimmed(),
+    Schema.isMinLength(1),
+    Schema.isMaxLength(256),
+  ),
+  expectedSourceRecordRevision: MemoryRevision,
+  sourceRevision: MemoryRevision,
+  sourceGeneration: MemoryRevision,
+  contentHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamMemorySourceSelector = typeof ProjectTeamMemorySourceSelector.Type;
+/** A human replaces the complete grant set; an empty set revokes all sharing. */
+export const ProjectTeamMemorySharesReplaceIntent = Schema.Struct({
+  ...ProjectTeamMemorySourceSelector.fields,
+  type: Schema.Literal("project-team.memory.shares.replace"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  expectedRevision: MemoryRevision,
+  sharedWithProjectIds: Schema.Array(
+    Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256)).pipe(
+      Schema.brand("ProjectId"),
+    ),
+  ).check(
+    Schema.isMaxLength(32),
+    Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+  ),
+})
+  .check(Schema.makeFilter((input) => !input.sharedWithProjectIds.includes(input.projectId)))
+  .annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamMemorySharesReplaceIntent = typeof ProjectTeamMemorySharesReplaceIntent.Type;
 /** Human suppression is independent of a processing task or its model budget. */
 export const ProjectTeamMemoryRetractIntent = Schema.Struct({
   type: Schema.Literal("project-team.memory.retract"),
@@ -785,6 +816,7 @@ export type ProjectTeamMemoryProcessIntent = typeof ProjectTeamMemoryProcessInte
 export const ProjectTeamMemoryQueryIntent = Schema.Struct({
   ...IntentFields,
   type: Schema.Literal("project-team.memory.query"),
+  sharedSource: Schema.optionalKey(ProjectTeamMemorySourceSelector),
   query: Schema.String.check(
     Schema.isMinLength(1),
     Schema.isTrimmed(),
@@ -808,6 +840,20 @@ export const ProjectTeamMemorySourcesRead = Schema.Struct({
   nextCursor: Schema.optionalKey(MemoryId),
 });
 export type ProjectTeamMemorySourcesRead = typeof ProjectTeamMemorySourcesRead.Type;
+export const ProjectTeamMemorySharedSourcesRead = Schema.Struct({
+  projectId: ProjectId,
+  taskId: ProjectWorkTaskId,
+  revision: MemoryRevision,
+  status: Schema.Literals(["available", "disabled", "degraded"]),
+  items: Schema.Array(
+    Schema.Struct({
+      ownerProjectId: ProjectId,
+      selection: ProjectTeamMemorySourceSelector,
+    }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  ).check(Schema.isMaxLength(32)),
+  nextCursor: Schema.optionalKey(MemoryId),
+});
+export type ProjectTeamMemorySharedSourcesRead = typeof ProjectTeamMemorySharedSourcesRead.Type;
 
 export const ProjectTeamWriteIntent = Schema.Union([
   ProjectTeamMemoryQueryIntent,

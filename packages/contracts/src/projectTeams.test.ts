@@ -15,6 +15,7 @@ import {
   ProjectWorkWriteIntent,
   ProjectWorkTeamTransition,
   ProjectWorkEvidence,
+  ProjectWorkReadIntent,
 } from "./projectWork.ts";
 
 const decodeCredential = Schema.decodeUnknownSync(ProjectTeamCredential);
@@ -39,6 +40,89 @@ const member = {
   roleRevisionId: "role",
 };
 describe("team contracts", () => {
+  it("accepts exact human sharing grants and revocation without caller authority", () => {
+    const request = {
+      type: "project-team.memory.shares.replace",
+      commandId: "replace-shares",
+      projectId: "owner-project",
+      expectedRevision: 3,
+      sourceRecordId: "source",
+      expectedSourceRecordRevision: 2,
+      sourceRevision: 1,
+      sourceGeneration: 4,
+      contentHash: "a".repeat(64),
+      sharedWithProjectIds: ["recipient-project"],
+    };
+    expect(decodePublicWrite(request)).toEqual(request);
+    expect(decodePublicWrite({ ...request, sharedWithProjectIds: [] })).toEqual({
+      ...request,
+      sharedWithProjectIds: [],
+    });
+    for (const change of [
+      { sharedWithProjectIds: ["owner-project"] },
+      { sharedWithProjectIds: ["recipient", "recipient"] },
+      { sharedWithProjectIds: Array.from({ length: 33 }, (_, i) => `recipient-${i}`) },
+      { sharedWithProjectIds: [" recipient "] },
+      { expectedSourceRecordRevision: -1 },
+      { sourceRecordId: " source " },
+      { contentHash: "wrong" },
+      { owner: { operationId: "caller" } },
+      { maximumTokens: 1000 },
+      { taskId: "task" },
+    ])
+      expect(() => decodePublicWrite({ ...request, ...change }), JSON.stringify(change)).toThrow();
+  });
+  it("admits one exact shared source per task query and bounds discovery", () => {
+    const sharedSource = {
+      sourceRecordId: "shared-source",
+      expectedSourceRecordRevision: 2,
+      sourceRevision: 1,
+      sourceGeneration: 4,
+      contentHash: "a".repeat(64),
+    };
+    const request = {
+      type: "project-team.memory.query",
+      commandId: "shared-query",
+      projectId: "recipient-project",
+      taskId: "task",
+      expectedRevision: 3,
+      expectedTaskRevision: 1,
+      specRevision: 1,
+      planRevision: 1,
+      query: "Which explicitly shared facts apply?",
+      sharedSource,
+    };
+    expect(decodePublicWrite(request)).toEqual(request);
+    for (const change of [
+      { sourceGeneration: -1 },
+      { contentHash: undefined },
+      { sourceRecordId: " shared-source " },
+      { ownerProjectId: "caller-owner" },
+      { environmentId: "caller-environment" },
+      { vector: [1] },
+    ])
+      expect(
+        () => decodePublicWrite({ ...request, sharedSource: { ...sharedSource, ...change } }),
+        JSON.stringify(change),
+      ).toThrow();
+    const decodeRead = Schema.decodeUnknownSync(ProjectWorkReadIntent);
+    const discovery = {
+      operation: "memory-shared-sources",
+      projectId: "recipient-project",
+      taskId: "task",
+      limit: 32,
+    };
+    expect(decodeRead(discovery)).toEqual(discovery);
+    for (const change of [
+      { taskId: undefined },
+      { query: "caller-query" },
+      { state: "caller-state" },
+      { offset: 1 },
+      { limit: 0 },
+      { limit: 33 },
+    ])
+      expect(() => decodeRead({ ...discovery, ...change })).toThrow();
+  });
   it("accepts exact human memory retraction without a task, owner or renewed limits", () => {
     const request = {
       type: "project-team.memory.retract",

@@ -4,6 +4,7 @@ import {
   ProjectTeamRecordRead,
   ProjectTeamWriteIntent,
   ProjectTeamMemoryRetractIntent,
+  ProjectTeamMemorySharesReplaceIntent,
   ProjectTeamRunBinding,
   ProjectTeamDeliverableKind,
   ProjectTeamEffect,
@@ -1874,6 +1875,7 @@ export type ProjectWorkCommand = typeof ProjectWorkCommand.Type;
 export const ProjectWorkWriteIntent = Schema.Union([
   ProjectWorkCommand,
   ProjectTeamMemoryRetractIntent,
+  ProjectTeamMemorySharesReplaceIntent,
   ProjectTeamWriteIntent,
   ProjectTeamGuidedIntent,
 ]);
@@ -1913,6 +1915,7 @@ export const ProjectWorkReadOperation = Schema.Literals([
   "verification-job",
   "integration-sources",
   "memory-sources",
+  "memory-shared-sources",
   "tasks",
   "attempts",
   "criteria",
@@ -1987,7 +1990,7 @@ export const ProjectWorkReadIntent = Schema.Struct({
   ),
   Schema.makeFilter(
     (input) =>
-      input.operation !== "memory-sources" ||
+      (input.operation !== "memory-sources" && input.operation !== "memory-shared-sources") ||
       (input.taskId !== undefined &&
         input.query === undefined &&
         input.state === undefined &&
