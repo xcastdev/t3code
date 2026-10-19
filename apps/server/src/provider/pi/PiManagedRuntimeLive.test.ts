@@ -1,5 +1,6 @@
 import * as PiOperations from "../../projectWork/ProjectTeamPiOperations.ts";
 import type { PiWorkerFrame } from "./PiWorkerProtocol.ts";
+import { decodePiParentFrame } from "./PiWorkerProtocol.ts";
 import * as GitWorkflow from "../../git/GitWorkflowService.ts";
 import * as GitManager from "../../git/GitManager.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -9205,6 +9206,563 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_ACTIVATION_SMOKE === "1")(
       90000,
     );
   },
+);
+
+it.effect(
+  "joined managed context survives session replacement, compaction and replay within original authority",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        // The broker uses wall time; keep it aligned with the Effect test clock.
+        let wallClock = Date.parse(at) + 1;
+        const wallClockSpy = vi.spyOn(Date, "now").mockImplementation(() => wallClock);
+        yield* Effect.addFinalizer(() => Effect.sync(() => wallClockSpy.mockRestore()));
+        const f = yield* dispatchedRuntimeFixture();
+        const gateway = yield* ProjectWorkGateway;
+        const human = { kind: "human" as const, id: "joined-human" };
+        const source = { kind: "web" as const, id: "joined-browser" };
+        const decision = yield* decodeMemorySourceDecision({
+          decisionId: "joined-decision",
+          projectId,
+          title: "Preserve assignment provenance",
+          body: "Keep the approved scope and original budget through compaction.",
+          state: "proposed",
+          revision: 0,
+          createdAt: at,
+          updatedAt: at,
+        });
+        yield* gateway.write(
+          {
+            type: "project-work.decision.propose",
+            commandId: CommandId.make("joined-propose"),
+            projectId,
+            decision,
+            proposedAt: at,
+          },
+          human,
+          source,
+          { actor: human },
+        );
+        yield* gateway.write(
+          {
+            type: "project-work.decision.accept",
+            commandId: CommandId.make("joined-accept"),
+            projectId,
+            decisionId: decision.decisionId,
+            acceptedAt: at,
+          },
+          human,
+          source,
+          { actor: human },
+        );
+        const state = yield* readCurrentState(f.sql, projectId);
+        const gate = state.foundationRecords?.find(
+          (r) => r.kind === "gate" && r.taskId === f.binding.taskId && r.gate === "plan",
+        );
+        if (gate?.kind !== "gate") return yield* Effect.die("Missing approved joined plan");
+        yield* f.repository.execute(
+          yield* decodeRequiredFoundation({
+            type: "project-work.foundation.commit",
+            projectId,
+            commandId: "joined-question",
+            expectedRevision: state.revision,
+            attribution,
+            committedAt: at,
+            records: [
+              {
+                kind: "question",
+                projectId,
+                recordId: "joined-question",
+                revision: 0,
+                generation: 0,
+                updatedAt: at,
+                status: "pending",
+                taskId: f.binding.taskId,
+                senderId: f.binding.memberId,
+                targetGateId: gate.recordId,
+                targetRevision: gate.revision,
+                body: "Should a later task expand the scope? Await a human answer.",
+                choices: [],
+              },
+            ],
+          }),
+        );
+        const before = yield* f.reader.readRequired(f.snapshot);
+        expect(before.required.tasks[0]?.task.specification).toMatchObject({
+          scopeIn: "Task",
+          scopeOut: "Other tasks",
+        });
+        expect(before.required.tasks[0]?.plan).toMatchObject({
+          content: "Implement the bounded scope and verify the requirement",
+        });
+        expect(before.required.approvals).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ gate: "plan", status: "approved" }),
+            expect.objectContaining({ gate: "specification", status: "approved" }),
+          ]),
+        );
+        expect(before.required.decisions).toEqual([
+          expect.objectContaining({ decisionId: decision.decisionId, state: "accepted" }),
+        ]);
+        expect(before.required.questions).toEqual([
+          expect.objectContaining({ recordId: "joined-question", status: "pending" }),
+        ]);
+        const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
+        yield* f.fs.writeFileString(
+          f.options.agentDirectory + "/auth.json",
+          json({ "command-code": { type: "api_key", key: "synthetic-joined-key" } }),
+        );
+        let executions = 0;
+        let calls = 0;
+        const transfers: Array<{
+          kind: string;
+          context: string;
+          prompt: string;
+          resume: string | null;
+        }> = [];
+        // Only the worker byte transport and its synthetic owner/drain are controlled.
+        // Session protocol, authorization, broker, accounting and terminal persistence run unchanged.
+        const processSpy = vi
+          .spyOn(ManagedProcess, "acquirePiManagedProcess")
+          .mockImplementation((launch, persistence) =>
+            Effect.gen(function* () {
+              executions++;
+              if (!persistence) return yield* Effect.die("Missing durable process callbacks");
+              const allocation = persistence.allocation;
+              const owner = {
+                type: "owner" as const,
+                unit: allocation.unit,
+                nonce: allocation.nonce,
+                invocation: "a".repeat(32),
+                cgroup: `/sys/fs/cgroup/${allocation.unit}`,
+                pid: 99999999,
+                memoryBytes: allocation.policy.memoryBytes,
+                swapBytes: 0,
+                oomGroup: 1,
+              };
+              yield* persistence.claimActivation(allocation);
+              yield* persistence.beforeStart(owner);
+              const output = yield* Queue.unbounded<Uint8Array | null>();
+              const exited = yield* Deferred.make<ManagedProcess.PiManagedDrain>();
+              const drain = {
+                unit: owner.unit,
+                invocation: owner.invocation,
+                cgroup: owner.cgroup,
+                ownerPid: owner.pid,
+                memoryBytes: owner.memoryBytes,
+                swapBytes: 0,
+                oomGroup: 1,
+                launcherPid: 99999998,
+                childPid: 99999997,
+                childExitCode: 0,
+                kernel: "removed",
+              };
+              let pending = "";
+              let sequence = 0;
+              let envelope:
+                | Pick<PiWorkerFrame, "workerId" | "generation" | "operationId" | "operationKind">
+                | undefined;
+              let bootstrap:
+                | Extract<ReturnType<typeof decodePiParentFrame>["message"], { type: "bootstrap" }>
+                | undefined;
+              const parts = new Map<string, Buffer[]>();
+              const ended = new Set<string>();
+              const emit = (message: PiWorkerFrame["message"]) =>
+                Queue.offer(
+                  output,
+                  Buffer.from(
+                    json({ version: 1, ...envelope, sequence: sequence++, message }) + "\n",
+                  ),
+                );
+              const native = {
+                sessionId: "joined-session",
+                sessionReference: "sessions/joined.jsonl",
+                leafId: "joined-initialize",
+                persisted: true,
+              };
+              const persistLeaf = Effect.fn("joinedTransport.persistLeaf")(function* (
+                leafId: string,
+                text: string,
+              ) {
+                const path = launch.nativeStateRoot + "/" + native.sessionReference;
+                yield* f.fs.makeDirectory(launch.nativeStateRoot + "/sessions", {
+                  recursive: true,
+                });
+                const prior = (yield* f.fs.exists(path))
+                  ? yield* f.fs.readFileString(path)
+                  : json({
+                      type: "session",
+                      version: 3,
+                      id: native.sessionId,
+                      timestamp: at,
+                      cwd: "/workspace",
+                    }) + "\n";
+                yield* f.fs.writeFileString(
+                  path,
+                  prior +
+                    json({
+                      type: "message",
+                      id: leafId,
+                      parentId: bootstrap?.native?.leafId ?? null,
+                      timestamp: at,
+                      message: {
+                        role: "user",
+                        content: [{ type: "text", text }],
+                        timestamp: Date.parse(at),
+                      },
+                    }) +
+                    "\n",
+                );
+                return { ...native, leafId };
+              });
+              const send = Effect.fn("joinedTransport.send")(function* (bytes: Uint8Array) {
+                pending += Buffer.from(bytes).toString("utf8");
+                for (;;) {
+                  const newline = pending.indexOf("\n");
+                  if (newline < 0) break;
+                  const frame = decodePiParentFrame(pending.slice(0, newline));
+                  pending = pending.slice(newline + 1);
+                  envelope = {
+                    workerId: frame.workerId,
+                    generation: frame.generation,
+                    operationId: frame.operationId,
+                    operationKind: frame.operationKind,
+                  };
+                  const message = frame.message;
+                  if (message.type === "bootstrap") bootstrap = message;
+                  if (message.type === "transfer-chunk") {
+                    const chunks = parts.get(message.transferId) ?? [];
+                    chunks.push(Buffer.from(message.data, "base64"));
+                    parts.set(message.transferId, chunks);
+                  }
+                  if (message.type === "transfer-end") {
+                    ended.add(message.transferId);
+                    if (
+                      !bootstrap ||
+                      !ended.has(bootstrap.context.transferId) ||
+                      (bootstrap.prompt && !ended.has(bootstrap.prompt.transferId))
+                    )
+                      continue;
+                    const text = (id: string) =>
+                      Buffer.concat(parts.get(id) ?? []).toString("utf8");
+                    const context = text(bootstrap.context.transferId);
+                    const prompt = bootstrap.prompt ? text(bootstrap.prompt.transferId) : "";
+                    transfers.push({
+                      kind: frame.operationKind!,
+                      context,
+                      prompt,
+                      resume: bootstrap.native?.leafId ?? null,
+                    });
+                    yield* emit({
+                      type: "ready",
+                      actualCwd: "/workspace",
+                      native: bootstrap.native ?? native,
+                    });
+                    if (frame.operationKind === "initialize") {
+                      yield* emit({
+                        type: "initialized",
+                        native: yield* persistLeaf(native.leafId, context),
+                      });
+                    } else {
+                      yield* emit({
+                        type:
+                          frame.operationKind === "compact" ? "compaction_start" : "agent_start",
+                        lifecycleId: 1,
+                      });
+                      yield* emit({
+                        type: "request",
+                        requestId: 1,
+                        lifecycleId: 1,
+                        body: json({
+                          model,
+                          messages: [
+                            { role: "system", content: context },
+                            { role: "user", content: prompt || "Compact within approved scope" },
+                          ],
+                          max_tokens: 512,
+                          stream: true,
+                          stream_options: { include_usage: true },
+                        }),
+                      });
+                    }
+                  }
+                  if (message.type === "chunk")
+                    yield* emit({
+                      type: "ack",
+                      requestId: message.requestId,
+                      chunkSequence: frame.sequence,
+                    });
+                  if (message.type === "end") {
+                    const context = Buffer.concat(parts.get("context") ?? []).toString("utf8");
+                    const leaf = yield* persistLeaf(
+                      frame.operationKind === "compact" ? "joined-compact" : "joined-assignment",
+                      context,
+                    );
+                    if (frame.operationKind === "compact") {
+                      yield* emit({ type: "compaction_end", lifecycleId: 1 });
+                      yield* emit({ type: "compacted", lifecycleId: 1, native: leaf });
+                    } else {
+                      yield* emit({
+                        type: "sdk-event",
+                        lifecycleId: 1,
+                        event: { type: "message_start", entryId: "message-1", role: "assistant" },
+                      });
+                      yield* emit({
+                        type: "sdk-event",
+                        lifecycleId: 1,
+                        event: { type: "message_end", entryId: "message-1", role: "assistant" },
+                      });
+                      yield* emit({
+                        type: "sdk-event",
+                        lifecycleId: 1,
+                        event: { type: "assistant_result", stopReason: "stop" },
+                      });
+                      yield* emit({ type: "native", lifecycleId: 1, native: leaf });
+                      yield* emit({ type: "agent_end", lifecycleId: 1 });
+                      yield* emit({ type: "agent_settled", lifecycleId: 1 });
+                    }
+                    yield* emit({ type: "operation_settled", lifecycleId: 1, outcome: "success" });
+                    yield* emit({ type: "done" });
+                  }
+                }
+              });
+              const finish = Effect.gen(function* () {
+                yield* Queue.offer(output, null);
+                if (persistence.afterDrain) yield* persistence.afterDrain(drain);
+                yield* Deferred.succeed(exited, drain);
+              });
+              return {
+                owner,
+                start: Effect.succeed(99999997),
+                send: (bytes: Uint8Array) => send(bytes).pipe(Effect.orDie),
+                stdout: Stream.fromQueue(output).pipe(Stream.takeWhile((chunk) => chunk !== null)),
+                stderr: Stream.empty,
+                endInput: finish,
+                awaitExit: Deferred.await(exited),
+                stop: finish.pipe(Effect.as(drain)),
+              } satisfies ManagedProcess.PiManagedProcess;
+            }),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => processSpy.mockRestore()));
+        const options = {
+          ...f.options,
+          transport: async () => {
+            calls++;
+            expect(calls).toBeLessThanOrEqual(2);
+            return new Response(
+              [
+                {
+                  model,
+                  choices: [
+                    { index: 0, delta: { content: "Within approved scope" }, finish_reason: null },
+                  ],
+                },
+                { model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+                {
+                  model,
+                  choices: [],
+                  usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+                },
+              ]
+                .map((entry) => `data: ${json(entry)}\n\n`)
+                .join("") + "data: [DONE]\n\n",
+              { headers: { "content-type": "text/event-stream" } },
+            );
+          },
+        };
+        const create = Effect.fn("joined.createRuntime")(function* () {
+          return yield* (yield* makePiManagedRuntimeLive(options)).forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+        });
+        const instance = yield* create();
+        const initialized = yield* instance.prepareOperation(
+          { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
+          () => Effect.void,
+        );
+        expect((yield* initialized.run).terminal.outcome).toBe("success");
+        const sessionReceipts = yield* makeProjectTeamSessionReceipts({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+        });
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+          verifyStage: (receipt, original) =>
+            Effect.gen(function* () {
+              expect(receipt.evidence.bindingId).toBe(original.intent.request.git.runId);
+              expect(yield* sessionReceipts.readInitialization(original)).toBeDefined();
+              if (receipt.stage === "assignment-observed")
+                expect(yield* sessionReceipts.readAssignment(original)).toBeDefined();
+            }).pipe(
+              Effect.mapError(
+                () =>
+                  new ProjectTeamDispatchJournalError({ reason: "Joined session receipt missing" }),
+              ),
+            ),
+        });
+        const authority = yield* readCurrentState(f.sql, projectId);
+        let snapshot = f.snapshot;
+        for (const stage of ["session-bound", "assignment-intent"] as const)
+          snapshot = yield* journal.readRetained(
+            (yield* journal.advanceStage(snapshot.fence, {
+              receiptId: "joined-" + stage,
+              stage,
+              evidence: { bindingId: f.binding.recordId },
+            })).fence.dispatchId,
+          );
+        const assigned = yield* instance.prepareOperation(
+          {
+            threadId,
+            kind: "prompt",
+            operationId: f.request.assignmentOperationId,
+            prompt: f.request.assignment,
+          },
+          () => Effect.void,
+        );
+        const assignmentRun = yield* assigned.run.pipe(Effect.result);
+        expect(
+          assignmentRun,
+          json({
+            operations: yield* f.sql`SELECT terminal_json FROM project_team_pi_operation`,
+            charges: yield* f.sql`SELECT * FROM project_team_model_request`,
+          }),
+        ).toMatchObject({ _tag: "Success" });
+
+        snapshot = yield* journal.readRetained(
+          (yield* journal.advanceStage(snapshot.fence, {
+            receiptId: "joined-observed",
+            stage: "assignment-observed",
+            evidence: { bindingId: f.binding.recordId },
+          })).fence.dispatchId,
+        );
+        wallClock += 100;
+        yield* TestClock.adjust(100);
+        const charged = yield* f.reader.readRequired(snapshot);
+        expect(charged.required.remaining).toMatchObject({
+          rootUsedTokens: 12,
+          attemptUsedTokens: 12,
+          rootRemainingTokens: before.required.frozenLimits.maximumTokens - 12,
+          outstandingRequests: 0,
+        });
+        const replacement = yield* create();
+        const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+        const supplied = {
+          threadId,
+          kind: "compact" as const,
+          requestId: MessageId.make("joined-compact"),
+        };
+        const boundary = yield* operations.readCompaction(
+          { providerInstanceId, threadId },
+          supplied,
+        );
+        const request = { ...supplied, operationId: boundary.operationId };
+        const compact = yield* replacement.prepareOperation(request, () => Effect.void);
+        const terminal = (yield* compact.run).terminal;
+        expect(terminal.outcome).toBe("success");
+        expect(transfers.map((t) => [t.kind, t.resume])).toEqual([
+          ["initialize", null],
+          ["prompt", "joined-initialize"],
+          ["compact", "joined-assignment"],
+        ]);
+        expect(transfers[1]?.prompt).toContain(f.request.assignment);
+        expect(transfers[2]?.context).toContain(charged.text);
+        const intent = yield* f.sql<{
+          intent_json: string;
+        }>`SELECT intent_json FROM project_team_pi_operation WHERE operation_id=${boundary.operationId}`;
+        expect(decodeRequiredJson(intent[0]!.intent_json)).toMatchObject({
+          compaction: {
+            predecessorOperationId: f.request.assignmentOperationId,
+            contextProvenanceSha256: NodeCrypto.createHash("sha256")
+              .update(json(charged.provenance))
+              .digest("hex"),
+            contextTextSha256: NodeCrypto.createHash("sha256")
+              .update(transfers[2]!.context)
+              .digest("hex"),
+          },
+        });
+        const after = yield* f.reader.readRequired(snapshot);
+        for (const current of [charged, after]) {
+          expect(current.required).toMatchObject({
+            projectId,
+            taskId: f.binding.taskId,
+            runId: f.binding.recordId,
+            attemptId: f.binding.attemptId,
+            generation: f.binding.generation,
+          });
+          expect(current.required.originalAssignment).toBe(f.request.assignment);
+          expect(current.required.role).toEqual(before.required.role);
+          expect(current.required.member).toEqual(before.required.member);
+          expect(current.required.tasks).toEqual(before.required.tasks);
+          expect(current.required.approvals).toEqual(before.required.approvals);
+          expect(current.required.decisions).toEqual(before.required.decisions);
+          expect(current.required.questions).toEqual(before.required.questions);
+          expect(current.required.questions[0]?.answer).toBeUndefined();
+          expect(current.required.frozenLimits).toEqual(before.required.frozenLimits);
+          expect(current.required.originalRootCaps).toEqual(before.required.originalRootCaps);
+          expect(current.provenance.recordIds).toEqual(before.provenance.recordIds);
+          expect(current.provenance.decisions).toEqual(before.provenance.decisions);
+        }
+        expect(after.required.remaining).toMatchObject({
+          rootUsedTokens: 24,
+          attemptUsedTokens: 24,
+          rootRemainingTokens: before.required.frozenLimits.maximumTokens - 24,
+          outstandingRequests: 0,
+        });
+        expect(after.required.remaining.rootRemainingDurationMs).toBe(
+          charged.required.remaining.rootRemainingDurationMs,
+        );
+        expect(after.required.remaining.rootRemainingDurationMs).toBe(
+          before.required.remaining.rootRemainingDurationMs - 100,
+        );
+        expect(after.required.remaining.attemptRemainingDurationMs).toBe(
+          before.required.remaining.attemptRemainingDurationMs - 100,
+        );
+        expect(after.required.remaining.attemptRemainingDurationMs).toBe(
+          charged.required.remaining.attemptRemainingDurationMs,
+        );
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budget);
+        const operationLimits =
+          yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_pi_operation ORDER BY operation_ordinal`;
+        expect(operationLimits).toHaveLength(3);
+        expect(operationLimits[0]?.maximum_tokens).toBe(before.required.frozenLimits.maximumTokens);
+        expect(operationLimits[0]?.deadline_at_ms).toBeLessThanOrEqual(
+          before.required.frozenLimits.deadlineAtMs,
+        );
+        expect(operationLimits.slice(1)).toEqual(
+          Array.from({ length: 2 }, () => ({
+            maximum_tokens: before.required.frozenLimits.maximumTokens,
+            deadline_at_ms: before.required.frozenLimits.deadlineAtMs,
+          })),
+        );
+        const rows =
+          yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_ordinal`;
+        const charges =
+          yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+        const allocations = f.allocations;
+        const replay = yield* (yield* create()).prepareOperation(request, () =>
+          Effect.die("Replay emitted execution"),
+        );
+        expect((yield* replay.run).terminal).toEqual(terminal);
+        expect(replay.replayHeadOperationId).toBe(terminal.operation.operationId);
+        expect(yield* f.reader.readRequired(snapshot)).toEqual(after);
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(authority);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_ordinal`,
+        ).toEqual(rows);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+        ).toEqual(charges);
+        expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(budget);
+        expect({ executions, calls, allocations: f.allocations }).toEqual({
+          executions: 3,
+          calls: 2,
+          allocations,
+        });
+      }),
+    ),
 );
 
 for (const compactProof of [
