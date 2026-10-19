@@ -155,6 +155,31 @@ function usableQuestion(question: Summary["questions"]["items"][number]) {
   );
 }
 
+// Summaries carry blockers and question targets, but no task approval gates. Open the
+// owning task or project to inspect its current policy before taking an action.
+function nextActions(data: Summary) {
+  return [
+    ...data.blockers.items.map((blocker) => ({
+      category: "blockers" as const,
+      recordId: blocker.recordId,
+      taskId: blocker.taskId,
+      label: `Review blocker for ${blocker.taskId}: ${blocker.reason} · Resolver ${blocker.resolver}`,
+    })),
+    ...data.questions.items.flatMap((question) =>
+      usableQuestion(question) && "taskId" in question && question.status === "pending"
+        ? [
+            {
+              category: "questions" as const,
+              recordId: question.recordId,
+              taskId: question.taskId,
+              label: `Answer question for ${question.taskId} · Gate ${question.targetGateId}`,
+            },
+          ]
+        : [],
+    ),
+  ];
+}
+
 /** Render bounded recorded metadata supplied by the owning environment; this view performs no reads. */
 export function Portfolio(props: PortfolioProps) {
   const entries = props.entries.slice(0, PAGE_SIZE);
@@ -235,6 +260,7 @@ function PortfolioEntry({
 }) {
   const view = entryView(entry, props.now, props.loading);
   const data = view.data?.availability === "available" ? view.data : undefined;
+  const actions = data ? nextActions(data) : [];
   const mounted = useRef(true);
   useLayoutEffect(() => {
     mounted.current = true;
@@ -267,6 +293,20 @@ function PortfolioEntry({
       props.onOpenTask({ environmentId: entry.environmentId, projectId: entry.projectId, taskId });
     },
   );
+  const nextAction = useEffectEvent((action: ReturnType<typeof nextActions>[number]) => {
+    if (!mounted.current || !view.current || !data) return;
+    if (
+      !nextActions(data).some(
+        (current) =>
+          current.category === action.category &&
+          current.recordId === action.recordId &&
+          current.taskId === action.taskId &&
+          current.label === action.label,
+      )
+    )
+      return;
+    task(action.category, action.recordId, action.taskId);
+  });
   const worker = useEffectEvent((recordId: string, threadId: ThreadId) => {
     if (!mounted.current || !view.current || !data) return;
     const matches = data.bindings.items.filter((binding) => binding.recordId === recordId);
@@ -318,6 +358,29 @@ function PortfolioEntry({
       <Button className="mt-2" size="sm" variant="outline" onClick={() => project()}>
         Inspect project {entry.title}
       </Button>
+      <div className="mt-3 space-y-2 text-sm">
+        <h4 className="font-medium">Next action</h4>
+        {!view.current ? (
+          <p>Refresh the portfolio for current next actions.</p>
+        ) : actions.length > 0 ? (
+          actions.map((action, index) => (
+            <Button
+              key={JSON.stringify([action.category, action.recordId, index])}
+              size="sm"
+              variant="outline"
+              onClick={() => nextAction(action)}
+            >
+              {action.label}
+            </Button>
+          ))
+        ) : (
+          <Button size="sm" variant="outline" onClick={() => project()}>
+            {data && data.taskCounts.total > 0
+              ? "Inspect task workflow and approvals"
+              : "Inspect project to plan work"}
+          </Button>
+        )}
+      </div>
       {data ? (
         <div className="mt-3 flex flex-col gap-3 text-sm">
           <div>

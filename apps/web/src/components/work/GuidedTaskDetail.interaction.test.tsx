@@ -362,9 +362,7 @@ describe("GuidedTaskDetail human interactions", () => {
   }
 
   async function repairDecision(value: string) {
-    const select = host.querySelector<HTMLSelectElement>(
-      'select[aria-label="Repair decision"]',
-    );
+    const select = host.querySelector<HTMLSelectElement>('select[aria-label="Repair decision"]');
     if (!select) throw Error("Missing repair decision");
     select.value = value;
     await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
@@ -376,7 +374,9 @@ describe("GuidedTaskDetail human interactions", () => {
     await render();
 
     expect(host.textContent).toContain("The last repair left the reconnect check failing");
-    expect(host.textContent).toContain("Review the failed reconnect check and choose the next step");
+    expect(host.textContent).toContain(
+      "Review the failed reconnect check and choose the next step",
+    );
     expect(host.textContent).toMatch(/2\s*(of|\/)\s*2/);
 
     await repairDecision("approve-one-repair");
@@ -400,6 +400,37 @@ describe("GuidedTaskDetail human interactions", () => {
       reason: "Approve one repair attempt after reviewing the failing check",
     });
     expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it.each(["diagnose", "revise-scope", "abandon"])(
+    "submits the explicit %s repair decision",
+    async (decision) => {
+      current = decodeContext({ ...current, blockers: [linkedRepairBlocker()] });
+      foundation = [...records(current), repairEpisode()];
+      await render();
+      await repairDecision(decision);
+      await fill("Repair reason", "Human reviewed the exhausted repair");
+      await click("Resolve repair decision");
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0]).toMatchObject({
+        type: "project-team.repair.resolve",
+        decision,
+        episodeId: "repair-episode",
+        expectedEpisodeRevision: 6,
+      });
+    },
+  );
+
+  it("withholds repair decisions when linked blockers are ambiguous", async () => {
+    const blocker = linkedRepairBlocker();
+    current = decodeContext({
+      ...current,
+      blockers: [blocker, { ...blocker, blockerId: "another-blocker" }],
+    });
+    foundation = [...records(current), repairEpisode()];
+    await render();
+    expect(host.querySelector('select[aria-label="Repair decision"]')).toBeNull();
+    expect(emitted).toEqual([]);
   });
 
   it("asks for refreshed blocker details instead of inferring a reason from an exhausted episode", async () => {
@@ -432,6 +463,8 @@ describe("GuidedTaskDetail human interactions", () => {
     ];
     await render();
     await act(async () => retained?.());
+    expect(button("Resolve repair decision").disabled).toBe(true);
+    await act(async () => callbacks.get("Resolve repair decision")?.());
 
     expect(emitted).toEqual([]);
     expect(host.textContent).toContain("The last repair left the reconnect check failing");

@@ -206,6 +206,52 @@ describe("Portfolio mounted read-only presentation", () => {
     { ...entry, ...patch },
   ];
 
+  it("links next actions to recorded blockers and pending question targets", async () => {
+    await render();
+    await click("Review blocker for task-blocked: Waiting for a decision · Resolver human");
+    await click("Answer question for task-question · Gate gate-1");
+    expect(props.onOpenTask).toHaveBeenNthCalledWith(1, {
+      environmentId,
+      projectId,
+      taskId: "task-blocked",
+    });
+    expect(props.onOpenTask).toHaveBeenNthCalledWith(2, {
+      environmentId,
+      projectId,
+      taskId: "task-question",
+    });
+  });
+
+  it("removes answered questions from next actions and links workflow inspection to the project", async () => {
+    const question = available.questions.items[0];
+    if (!question) throw new Error("Question fixture required");
+    await render({
+      entries: changeEntry({
+        snapshot: {
+          ...entry.snapshot,
+          data: {
+            ...available,
+            blockers: { items: [], hasMore: false },
+            questions: { items: [{ ...question, status: "answered" }], hasMore: false },
+          },
+        },
+      }),
+    });
+    expect(host.textContent).not.toContain("Answer question for");
+    await click("Inspect task workflow and approvals");
+    expect(props.onOpenProject).toHaveBeenCalledWith({ environmentId, projectId });
+  });
+
+  it("withdraws next actions when summaries become stale", async () => {
+    await render();
+    const held = button("Answer question for task-question · Gate gate-1");
+    await render({ entries: changeEntry({ current: false }) });
+    await act(async () => held.click());
+    expect(props.onOpenTask).not.toHaveBeenCalled();
+    expect(host.textContent).toContain("Refresh the portfolio for current next actions");
+    expect(host.textContent).not.toContain("Answer question for");
+  });
+
   it("shows recorded counts, deterministic missions, coordinator and separate frozen/profile models", async () => {
     await render();
     expect(host.textContent).toContain("Current recorded summary");
@@ -215,10 +261,10 @@ describe("Portfolio mounted read-only presentation", () => {
     expect(host.textContent).toContain("Coordinator · coordinator-model");
     expect(host.textContent).toContain("Binding model: frozen-model");
     expect(host.textContent).toContain(
-      "Shared root: 200 charged (40 unknown), 50 held; 750/1000 tokens remaining.",
+      "Shared root: 200 charged (40 conservatively charged for unknown usage), 50 held; 750/1,000 tokens remaining.",
     );
     expect(host.textContent).toContain(
-      "This attempt: 150 charged (40 unknown), 10 held; 240/400 tokens remaining.",
+      "This attempt: 150 charged (40 conservatively charged for unknown usage), 10 held; 240/400 tokens remaining.",
     );
     expect(host.textContent).toContain("Profile: Implementer · profile-model");
     expect(host.textContent).toContain("Waiting for a decision · Resolver human");

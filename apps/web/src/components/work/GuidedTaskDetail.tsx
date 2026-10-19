@@ -283,12 +283,13 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
       record.kind === "repair-episode" && record.status === "exhausted",
   );
   const exhaustedEpisode = one(exhaustedEpisodes);
-  const linkedRepairBlockers = context?.blockers.filter(
-    (blocker) =>
-      blocker.taskId === task?.taskId &&
-      exhaustedEpisode !== undefined &&
-      blocker.referenceIds.includes(exhaustedEpisode.recordId),
-  ) ?? [];
+  const linkedRepairBlockers =
+    context?.blockers.filter(
+      (blocker) =>
+        blocker.taskId === task?.taskId &&
+        exhaustedEpisode !== undefined &&
+        blocker.referenceIds.includes(exhaustedEpisode.recordId),
+    ) ?? [];
   const linkedRepairBlocker = one(linkedRepairBlockers);
   const repairDecisionEpisode =
     exhaustedEpisodes.length === 1 && linkedRepairBlockers.length === 1
@@ -948,7 +949,8 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               <p className="text-sm">{linkedRepairBlocker.reason}</p>
               <p className="mt-2 text-sm text-muted-foreground">{linkedRepairBlocker.resolver}</p>
               <p className="mt-2 text-sm text-muted-foreground">
-                Repairs used: {repairDecisionEpisode.semanticRepairs} of {repairDecisionEpisode.allowance}
+                Repairs used: {repairDecisionEpisode.semanticRepairs} of{" "}
+                {repairDecisionEpisode.allowance}
               </p>
               <div className="mt-3 space-y-3">
                 <label className="block space-y-1 text-sm">
@@ -985,7 +987,8 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             </>
           ) : (
             <p role="status" className="text-sm text-warning-foreground">
-              Repair blocker details are missing or changed. Refresh the task before choosing a repair decision.
+              Repair blocker details are missing or changed. Refresh the task before choosing a
+              repair decision.
             </p>
           )}
         </WorkCard>
