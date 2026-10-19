@@ -5,7 +5,12 @@ import * as SessionRuntime from "./PiSessionRuntime.ts";
 import * as ManagedProcess from "./PiManagedProcess.ts";
 import * as RuntimeLive from "./PiManagedRuntimeLive.ts";
 import * as ProjectWorkTools from "./PiProjectWorkTools.ts";
-import { makePiProductionRuntime } from "./PiProductionRuntime.ts";
+import { makePiProductionRuntime, type PiProductionRuntimeAssets } from "./PiProductionRuntime.ts";
+import { withProjectWorkVerificationExecutable } from "../../projectWork/ProjectWorkVerificationExecutable.ts";
+import {
+  makeProjectTeamReviewCurrentTarget,
+  ProjectTeamReviewCurrentTarget,
+} from "../../projectWork/ProjectTeamReviewCurrentTarget.ts";
 import { PiModelCatalogue } from "./PiModelCatalogue.ts";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -33,6 +38,7 @@ import {
   ManagedSkillKey,
   SkillCatalogRevision,
   ProjectTeamGuidedIntent,
+  type ProjectTeamReviewCriterionAssessment,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamWriteIntent,
   ProjectWorkTaskId,
@@ -316,6 +322,16 @@ const controlledCallbackError = (cause: unknown) =>
   isManagedRuntimeError(cause)
     ? cause
     : new PiManagedRuntimeError({ code: "uncertain", detail: "Controlled callback failed" });
+const ownedReviewNativeAssets = (
+  assets: Effect.Success<ReturnType<typeof preparePiRuntimeAssets>>,
+): PiProductionRuntimeAssets => {
+  const revalidate = assets.revalidate.pipe(Effect.mapError(controlledCallbackError));
+  return {
+    runtimeFiles: assets.runtimeFiles,
+    revalidate,
+    borrow: <A, E, R>(use: Effect.Effect<A, E, R>) => revalidate.pipe(Effect.andThen(use)),
+  };
+};
 const isControlledProcessError = Schema.is(ManagedProcess.PiManagedProcessError);
 const isControlledBackendError = Schema.is(MemoryBackendError);
 
@@ -6201,6 +6217,7 @@ const decodeQueryCompanionInput = Schema.decodeUnknownEffect(
 const reviewFixtureEpoch = at;
 const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")(function* (
   native = false,
+  verificationAssets?: PiProductionRuntimeAssets,
 ) {
   const at = native ? DateTime.formatIso(DateTime.nowUnsafe()) : reviewFixtureEpoch;
   const shiftSeedDates = <A>(input: A): A => {
@@ -6564,10 +6581,10 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
         .filter((c) => c.taskId === selectedTask.taskId)
         .map((c) => c.criterionId),
       command: {
-        executable: "/bin/bash",
-        argv: ["-n", "test.sh"],
+        executable: verificationAssets ? "/runtime/node" : "/bin/bash",
+        argv: verificationAssets ? ["greeting.test.js"] : ["-n", "test.sh"],
         environment: "clean",
-        limits: { maxDurationMs: 1000, maxOutputBytes: 4096 },
+        limits: { maxDurationMs: verificationAssets ? 20000 : 1000, maxOutputBytes: 4096 },
       },
     });
     const jobs = yield* makeProjectWorkVerificationJobs({ environmentId: "environment" });
@@ -6594,11 +6611,20 @@ const requiredReviewTransferFixture = Effect.fn("requiredReviewTransferFixture")
           ),
         ),
       captureExecutable: (_binding, command, use) =>
-        use({
-          executableTarget: command.executable,
-          sha256: "e".repeat(64),
-          runtimeClosureSha256: "f".repeat(64),
-        }),
+        verificationAssets
+          ? withProjectWorkVerificationExecutable(verificationAssets, command.executable, use).pipe(
+              Effect.mapError(
+                () =>
+                  new ProjectWorkVerificationPreparationError({
+                    reason: "Actual native verification closure changed",
+                  }),
+              ),
+            )
+          : use({
+              executableTarget: command.executable,
+              sha256: "e".repeat(64),
+              runtimeClosureSha256: "f".repeat(64),
+            }),
       retainPrepared: (manifest) =>
         jobs.retainPrepared(manifest).pipe(
           Effect.mapError(
@@ -15428,6 +15454,7 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
   () => {
     for (const mode of [
       "mounted",
+      "assessed",
       "missing-descriptor",
       "mismatched-descriptor",
       "absent-mount",
@@ -15437,21 +15464,50 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
       it.effect(
         mode === "mounted"
           ? "reads committed target bytes from an independent readonly reviewer and retains its report"
-          : `rejects actual native review reads with ${mode}`,
+          : mode === "assessed"
+            ? "assesses exact parent criteria after native reads and retains qualified joined progress"
+            : `rejects actual native review reads with ${mode}`,
         () =>
           scoped(
             Effect.gen(function* () {
-              const f = yield* requiredReviewTransferFixture(true);
+              const nativeFs = yield* FileSystem.FileSystem;
+              const assessmentStage =
+                mode === "assessed"
+                  ? yield* nativeFs.makeTempDirectoryScoped({
+                      directory: process.env.PI_REVIEW_TARGET_NATIVE_SCRATCH,
+                    })
+                  : undefined;
+              const assessmentAssets = assessmentStage
+                ? yield* preparePiRuntimeAssets({
+                    distributionDirectory: process.env.PI_REVIEW_TARGET_NATIVE_DIST!,
+                    stagingDirectory: assessmentStage,
+                    protectedRoots: [
+                      yield* nativeFs.makeTempDirectoryScoped({
+                        directory: process.env.PI_REVIEW_TARGET_NATIVE_SCRATCH,
+                      }),
+                    ],
+                  })
+                : undefined;
+              if (assessmentStage)
+                yield* Effect.addFinalizer(() =>
+                  nativeFs.chmod(assessmentStage, 0o700).pipe(Effect.orDie),
+                );
+              const f = yield* requiredReviewTransferFixture(
+                true,
+                assessmentAssets ? ownedReviewNativeAssets(assessmentAssets) : undefined,
+              );
               const stageDirectory = yield* f.fs.makeTempDirectoryScoped(
                 process.env.PI_REVIEW_TARGET_NATIVE_SCRATCH
                   ? { directory: process.env.PI_REVIEW_TARGET_NATIVE_SCRATCH }
                   : undefined,
               );
-              const assets = yield* preparePiRuntimeAssets({
-                distributionDirectory: process.env.PI_REVIEW_TARGET_NATIVE_DIST!,
-                stagingDirectory: stageDirectory,
-                protectedRoots: [f.options.agentDirectory],
-              });
+              const assets =
+                assessmentAssets ??
+                (yield* preparePiRuntimeAssets({
+                  distributionDirectory: process.env.PI_REVIEW_TARGET_NATIVE_DIST!,
+                  stagingDirectory: stageDirectory,
+                  protectedRoots: [f.options.agentDirectory],
+                }));
               yield* Effect.addFinalizer(() =>
                 f.fs.chmod(stageDirectory, 0o700).pipe(Effect.orDie),
               );
@@ -15478,6 +15534,7 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
               const reviewCriteria = (yield* readCurrentState(f.sql, projectId)).criteria.filter(
                 (criterion) => criterion.taskId === f.binding.taskId && criterion.required,
               );
+              let criterionAssessments: ProjectTeamReviewCriterionAssessment[] | undefined;
               const workerFailures: string[] = [];
               const originalSession = SessionRuntime.makePiSessionRuntime;
               const sessionSpy = vi
@@ -15555,6 +15612,7 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                   reportIntent = json({
                     ...template,
                     outcome: "complete",
+                    ...(criterionAssessments ? { criterionAssessments } : {}),
                     outputs: reviewCriteria.map((criterion) => ({
                       criterionId: criterion.criterionId,
                       kind: "observation",
@@ -15642,6 +15700,13 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                 enabled: true,
                 configuration: {},
               });
+              const pi = yield* makeProjectTeamPiRuntime();
+              const ownedAssets = ownedReviewNativeAssets(assets);
+              yield* pi.publishAssets(providerInstanceId, ownedAssets, instance);
+              let parentEvidenceId: string | undefined;
+              let verificationJobId: string | undefined;
+              const before =
+                mode === "assessed" ? yield* f.reader.readRequired(f.snapshot) : undefined;
               const journal = yield* makeProjectTeamDispatchJournal({
                 environmentId: "environment",
                 maximumEnvironmentModelCalls: 4,
@@ -15686,6 +15751,98 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
               expect(initResult.terminal.outcome).toBe("success");
               expect(initResult.terminal.drain?.kernel).toBe("removed");
               expect(calls).toBe(0);
+              if (mode === "assessed") {
+                const settings = yield* ServerSettings.ServerSettingsService;
+                yield* settings.updateSettings({ projectTeamExecutionEnabled: true });
+                if (!before) return yield* Effect.die("Missing assessed original context");
+                verificationJobId = before.required.reviewTarget?.prepared.manifest.jobId;
+                if (!verificationJobId)
+                  return yield* Effect.die("Missing original assessed verification job");
+                const host = yield* makeProjectWorkVerificationExecutionHost({
+                  environmentId: "environment",
+                  maximumEnvironmentModelCalls: 4,
+                  protectedRoots: [f.options.agentDirectory, f.options.nativeStateRoot],
+                  nativeAdmission: Effect.void,
+                }).pipe(
+                  Effect.provide(Layer.merge(f.workflowLayer, ProjectWorkEventBusLive)),
+                  Effect.provideService(ProjectTeamPiRuntime, pi),
+                );
+                const verification = yield* makeProjectWorkVerificationExecution({
+                  ...host,
+                  environmentId: "environment",
+                });
+                yield* verification.sweep;
+                const verified = yield* host.journal.readResult(verificationJobId);
+                expect(verified).toMatchObject({
+                  outcome: "success",
+                  exitCode: 0,
+                  outputComplete: true,
+                  drain: { kernel: "removed", childExitCode: 0 },
+                });
+                if (!verified) return yield* Effect.die("Missing retained actual verifier result");
+                const artifacts = yield* makeProjectWorkArtifacts({
+                  environmentId: "environment",
+                  maximumArtifactBytes: 4096,
+                });
+                for (const output of [verified.stdout, verified.stderr]) {
+                  const retained = yield* artifacts.readRetained(output.artifactId);
+                  if (!retained)
+                    return yield* Effect.die("Missing retained actual verifier output");
+                  const { bytes, ...receipt } = retained;
+                  expect(receipt).toEqual(output);
+                  expect(bytes.byteLength).toBe(0);
+                }
+                const parentState = yield* readCurrentState(f.sql, projectId);
+                const evidence = parentState.evidence.find(
+                  (entry) =>
+                    entry.taskId === f.root.taskId &&
+                    entry.kind === "test" &&
+                    entry.detail &&
+                    decodeNativeJsonEvidence(entry.detail).jobId === verificationJobId,
+                );
+                if (!evidence)
+                  return yield* Effect.die(
+                    "Missing actual retained successful verification evidence",
+                  );
+                const applicability = parentState.foundationRecords?.find(
+                  (record) =>
+                    record.kind === "evidence-applicability" &&
+                    record.evidenceId === evidence.evidenceId,
+                );
+                const verifiedTarget = before.required.reviewTarget!.prepared.manifest.target;
+                expect(applicability).toMatchObject({
+                  kind: "evidence-applicability",
+                  status: "current",
+                  taskId: f.root.taskId,
+                  evidenceId: evidence.evidenceId,
+                  exitCode: 0,
+                  repository: verifiedTarget.repository,
+                  worktree: verifiedTarget.worktree,
+                  testedCommit: verifiedTarget.testedCommit,
+                  testedTree: verifiedTarget.testedTree,
+                  artifactId: verified.stdout.artifactId,
+                });
+                parentEvidenceId = evidence.evidenceId;
+                const selected = before.required.reviewTarget!.prepared.manifest.criteria;
+                criterionAssessments = selected.map((criterion) => ({
+                  criterionId: criterion.criterionId,
+                  expectedRevision: criterion.revision,
+                  verdict: "met",
+                  detail:
+                    "Independently read the exact committed files and retained successful greeting test result.",
+                  evidenceIds: [evidence.evidenceId],
+                }));
+                expect(criterionAssessments.length).toBeGreaterThan(0);
+                expect(
+                  parentState.criteria
+                    .filter(
+                      (entry) =>
+                        entry.taskId === f.root.taskId &&
+                        selected.some((criterion) => criterion.criterionId === entry.criterionId),
+                    )
+                    .every((entry) => entry.status !== "satisfied"),
+                ).toBe(true);
+              }
               yield* advance("session-bound");
               yield* advance("assignment-intent");
               const assigned = yield* instance.prepareOperation(
@@ -15795,10 +15952,43 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                     );
                   }),
                 );
-              const completion = yield* makeProjectTeamReviewCompletion({
-                environmentId: "environment",
-                maximumEnvironmentModelCalls: 4,
-              });
+              const currentTarget = yield* Effect.gen(function* () {
+                return yield* makeProjectTeamReviewCurrentTarget({ environmentId: "environment" });
+              }).pipe(
+                Effect.provide(f.workflowLayer),
+                Effect.provideService(ProjectTeamPiRuntime, pi),
+              );
+              let preparedTargetChecks = 0;
+              let finalTargetChecks = 0;
+              const observedCurrentTarget = {
+                ...currentTarget,
+                assertInTransaction: (
+                  ...input: Parameters<typeof currentTarget.assertInTransaction>
+                ) =>
+                  currentTarget.assertInTransaction(...input).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        preparedTargetChecks++;
+                      }),
+                    ),
+                  ),
+                assertOriginalInTransaction: (
+                  ...input: Parameters<typeof currentTarget.assertOriginalInTransaction>
+                ) =>
+                  currentTarget.assertOriginalInTransaction(...input).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        finalTargetChecks++;
+                      }),
+                    ),
+                  ),
+              };
+              const completion = yield* Effect.gen(function* () {
+                return yield* makeProjectTeamReviewCompletion({
+                  environmentId: "environment",
+                  maximumEnvironmentModelCalls: 4,
+                });
+              }).pipe(Effect.provideService(ProjectTeamReviewCurrentTarget, observedCurrentTarget));
               const settling = yield* makeProjectTeamDispatchJournal({
                 environmentId: "environment",
                 maximumEnvironmentModelCalls: 4,
@@ -15807,6 +15997,9 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                     ? Effect.void
                     : Effect.die("Foreign native joined review"),
                 prepareReviewCompletion: completion.prepare,
+                ...(mode === "assessed"
+                  ? { verifyReviewTarget: observedCurrentTarget.assertOriginalInTransaction }
+                  : {}),
                 verifySettlement: (receipt, original) =>
                   Effect.gen(function* () {
                     expect(original.fence.dispatchId).toBe(f.request.dispatchId);
@@ -15828,7 +16021,7 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                   evidence: { bindingId: f.binding.recordId },
                 })).fence.dispatchId,
               );
-              const settled = yield* settling.settleAfterJoined(snapshot.fence, {
+              const joined: DispatchJournal.ProjectTeamDispatchStageReceipt = {
                 receiptId: "native-review-joined",
                 stage: "settled",
                 evidence: {
@@ -15839,7 +16032,14 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                   claimGeneration: snapshot.fence.claimGeneration,
                   operations: yield* collectJoined(),
                 },
-              });
+              };
+              const settled = yield* mode === "assessed"
+                ? currentTarget.withOriginalTarget(
+                    snapshot,
+                    joined,
+                    settling.settleAfterJoined(snapshot.fence, joined),
+                  )
+                : settling.settleAfterJoined(snapshot.fence, joined);
               expect(settled.fence.stage).toBe("settled");
               const completed = yield* readCurrentState(f.sql, projectId);
               expect(completed.tasks.find((task) => task.taskId === f.binding.taskId)?.state).toBe(
@@ -15849,6 +16049,57 @@ describe.runIf(Boolean(process.env.PI_REVIEW_TARGET_NATIVE_DIST))(
                 "ready",
               );
 
+              if (mode === "assessed") {
+                expect(preparedTargetChecks).toBeGreaterThan(0);
+                expect(finalTargetChecks).toBeGreaterThan(0);
+                if (proposal.manifest.report.type !== "project-team.assignment.report")
+                  return yield* Effect.die("Unexpected native report type");
+                expect(proposal.manifest.report.criterionAssessments).toEqual(criterionAssessments);
+                expect(proposal.manifest.criterionAssessments?.length).toBe(
+                  criterionAssessments!.length,
+                );
+                for (const assessment of criterionAssessments!) {
+                  const criterion = completed.criteria.find(
+                    (entry) => entry.criterionId === assessment.criterionId,
+                  );
+                  expect(criterion).toMatchObject({
+                    taskId: f.root.taskId,
+                    status: "satisfied",
+                    revision: assessment.expectedRevision + 1,
+                  });
+                  const progress = completed.evidence.find(
+                    (entry) =>
+                      entry.taskId === f.root.taskId &&
+                      entry.criterionId === assessment.criterionId &&
+                      entry.evidenceId.startsWith("review-criterion-progress:"),
+                  );
+                  if (!progress?.detail)
+                    return yield* Effect.die(
+                      "Missing retained parent criterion assessment evidence",
+                    );
+                  expect(criterion?.satisfiedByEvidenceIds).toContain(progress.evidenceId);
+                  const provenance = decodeNativeJsonEvidence(progress.detail);
+                  expect(provenance).toMatchObject({
+                    kind: "project-team.review-criterion-progress",
+                    proposalCommandId: reportCommandId,
+                    assignmentOperationId: f.request.assignmentOperationId,
+                    joinedReceiptId: joined.receiptId,
+                    target: proposal.manifest.target,
+                    verification: {
+                      jobId: verificationJobId,
+                      outcome: "success",
+                      exitCode: 0,
+                      evidenceId: parentEvidenceId,
+                    },
+                    assessment: {
+                      verdict: "met",
+                      originalRevision: assessment.expectedRevision,
+                      evidence: [expect.objectContaining({ id: parentEvidenceId })],
+                    },
+                    criterionChange: { revision: criterion!.revision },
+                  });
+                }
+              }
               const freshness = yield* f.sql<{
                 native_jsonl: string;
                 manifest_json: string;
