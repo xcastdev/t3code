@@ -3,6 +3,7 @@ import { canonicalProjectWorkPayload } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
+import * as TestClock from "effect/testing/TestClock";
 import * as Deferred from "effect/Deferred";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
@@ -19,7 +20,7 @@ import {
 } from "./PiManagedProcess.ts";
 
 /** Every command is intercepted. This proves consuming control flow, not Linux behavior. */
-const fixture = Effect.gen(function* () {
+const fixture = Effect.fn("fixture")(function* (runtimeSeconds = 30) {
   const fs = yield* FileSystem.FileSystem;
   const workspaceRoot = yield* fs.makeTempDirectoryScoped();
   const protectedRoot = yield* fs.makeTempDirectoryScoped();
@@ -30,7 +31,7 @@ const fixture = Effect.gen(function* () {
     runtimeFiles: [{ source, target: "/bin/true" }],
     argv: ["/bin/true"],
     memoryBytes: 33554432,
-    runtimeSeconds: 30,
+    runtimeSeconds,
   };
   const allocation = yield* preallocatePiManagedProcess(launch);
   const frames = yield* Queue.unbounded<Uint8Array, Cause.Done>();
@@ -150,7 +151,7 @@ it.effect(
   () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
+        const f = yield* fixture();
         const deadline = (yield* Clock.currentTimeMillis) + 5500;
         let claimed = false;
         let drain: PiManagedDrain | undefined;
@@ -202,12 +203,79 @@ it.effect(
     ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+for (const test of [
+  { remainingMs: 5500, activationMs: 4501, runtimeSeconds: 30, kernelSeconds: 0 },
+  { remainingMs: 5500, activationMs: 4500, runtimeSeconds: 30, kernelSeconds: 1 },
+  { remainingMs: 120000, activationMs: 5500, runtimeSeconds: 120, kernelSeconds: 114 },
+])
+  it.effect(
+    `task resources retain the original ${test.remainingMs}ms deadline after ${test.activationMs}ms activation overhead`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* fixture(test.runtimeSeconds);
+          const startedAtMs = yield* Clock.currentTimeMillis;
+          const deadlineAtMs = startedAtMs + test.remainingMs;
+          let claims = 0;
+          let drain: PiManagedDrain | undefined;
+          const result = yield* acquirePiManagedProcess(f.launch, {
+            allocation: f.allocation,
+            deadlineAtMs,
+            claimActivation: (allocation) =>
+              Effect.gen(function* () {
+                expect(allocation).toEqual(f.allocation);
+                claims++;
+                yield* TestClock.adjust(test.activationMs);
+              }),
+            beforeStart: () => f.capture(),
+            afterDrain: (receipt) =>
+              Effect.sync(() => {
+                drain = receipt;
+              }),
+          }).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, f.spawner),
+            Effect.provideService(FileSystem.FileSystem, f.controlledFs),
+            Effect.result,
+          );
+          expect(claims).toBe(1);
+          expect(yield* Clock.currentTimeMillis).toBe(startedAtMs + test.activationMs);
+          expect(drain).toBeUndefined();
+          if (test.kernelSeconds === 0) {
+            expect(result).toMatchObject({
+              _tag: "Failure",
+              failure: {
+                phase: "startup",
+                message: "Original operation deadline cannot accommodate activation.",
+              },
+            });
+            expect(deadlineAtMs - (yield* Clock.currentTimeMillis)).toBe(999);
+            expect(f.readArgs()).toEqual([]);
+            expect(f.captures()).toBe(0);
+          } else {
+            expect(result._tag).toBe("Success");
+            expect(f.readArgs()).toContain(`RuntimeMaxSec=${test.kernelSeconds}s`);
+            expect(f.captures()).toBe(1);
+            expect(test.activationMs + test.kernelSeconds * 1000).toBeLessThanOrEqual(
+              test.remainingMs,
+            );
+            expect(test.activationMs + (test.kernelSeconds + 1) * 1000).toBeGreaterThan(
+              test.remainingMs,
+            );
+            if (result._tag !== "Success") return;
+            const stopped = yield* result.success.stop;
+            expect(drain).toEqual(stopped);
+            expect(stopped).toMatchObject({ ownerPid: f.owner.pid, kernel: "removed" });
+          }
+        }),
+      ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
 it.effect(
   "task resources deny an expired original deadline before any controlled native launch",
   () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
+        const f = yield* fixture();
         const result = yield* acquirePiManagedProcess(f.launch, {
           allocation: f.allocation,
           deadlineAtMs: yield* Clock.currentTimeMillis,
@@ -229,7 +297,7 @@ it.effect(
   () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
+        const f = yield* fixture();
         let attempted: PiManagedDrain | undefined;
         const result = yield* Effect.scoped(
           Effect.gen(function* () {

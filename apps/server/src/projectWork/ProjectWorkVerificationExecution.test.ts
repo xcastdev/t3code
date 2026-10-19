@@ -224,6 +224,7 @@ const makeFixture = Effect.fn("makeExecutionFixture")(function* (
 
 const startupFailureThroughHost = Effect.fn("startupFailureThroughHost")(function* (
   error: unknown,
+  activationOverhead = false,
 ) {
   const f = yield* makeFixture();
   const job = f.prepared.manifest;
@@ -295,6 +296,8 @@ const startupFailureThroughHost = Effect.fn("startupFailureThroughHost")(functio
     }),
   );
   let activations = 0;
+  let activationDeadlineAtMs: number | undefined;
+  let remainingAfterActivationMs: number | undefined;
   const acquire = vi
     .spyOn(PiProcess, "acquirePiManagedProcess")
     .mockImplementation((_launch, persistence) =>
@@ -302,6 +305,13 @@ const startupFailureThroughHost = Effect.fn("startupFailureThroughHost")(functio
         if (!persistence) return yield* Effect.die("Missing verification persistence");
         yield* persistence.claimActivation(f.intent.allocation);
         activations++;
+        if (activationOverhead) {
+          activationDeadlineAtMs = persistence.deadlineAtMs;
+          if (activationDeadlineAtMs === undefined)
+            return yield* Effect.die("Missing original verification deadline");
+          yield* TestClock.adjust(activationDeadlineAtMs - (yield* Clock.currentTimeMillis) - 999);
+          remainingAfterActivationMs = activationDeadlineAtMs - (yield* Clock.currentTimeMillis);
+        }
         // Deliberately inject untrusted failures at the provider error boundary.
         return yield* Effect.fail(error as PiManagedProcessError);
       }),
@@ -353,12 +363,22 @@ const startupFailureThroughHost = Effect.fn("startupFailureThroughHost")(functio
         ),
       ),
   });
-  return { ...f, host, execution, hostErrors, commands, acquire, activations: () => activations };
+  return {
+    ...f,
+    host,
+    execution,
+    hostErrors,
+    commands,
+    acquire,
+    activations: () => activations,
+    activationTiming: () => ({ activationDeadlineAtMs, remainingAfterActivationMs }),
+  };
 });
 
 for (const test of [
   {
-    name: "deadline refusal before native launch",
+    name: "deadline refusal after claimed activation overhead before native launch",
+    activationOverhead: true,
     error: new PiManagedProcessError({
       phase: "startup",
       message: "Original operation deadline cannot accommodate activation.",
@@ -430,13 +450,21 @@ for (const test of [
     scoped(
       Effect.scoped(
         Effect.gen(function* () {
-          const f = yield* startupFailureThroughHost(test.error);
+          const f = yield* startupFailureThroughHost(
+            test.error,
+            "activationOverhead" in test && test.activationOverhead,
+          );
           const deadlineAtMs = f.intent.deadlineAtMs;
           const budgetBefore = yield* f.sql`SELECT * FROM project_task_resource_budget`;
           yield* f.execution.ready;
           const outcome = yield* f.execution.sweep.pipe(Effect.result);
           expect(outcome._tag).toBe("Failure");
           expect(f.activations()).toBe(1);
+          if ("activationOverhead" in test)
+            expect(f.activationTiming()).toEqual({
+              activationDeadlineAtMs: deadlineAtMs,
+              remainingAfterActivationMs: 999,
+            });
           expect(f.acquire).toHaveBeenCalledTimes(1);
           expect(f.commands).toEqual([]);
           expect(yield* f.host.journal.readResult(f.selection.jobId)).toBeUndefined();
