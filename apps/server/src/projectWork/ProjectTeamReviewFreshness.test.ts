@@ -348,6 +348,11 @@ it.effect(
           .withTransaction(
             Effect.gen(function* () {
               const value = yield* f.service.readForSessionInTransaction(sessionOwner(f));
+              for (const read of [
+                f.service.readForSession(sessionOwner(f)),
+                f.service.readRetained(f.input.operationId),
+              ])
+                expect((yield* read.pipe(Effect.result))._tag).toBe("Failure");
               yield* f.sql`INSERT INTO controlled_child(parent_id) VALUES(1)`;
               return value;
             }),
@@ -364,17 +369,12 @@ it.effect(
         if (owning._tag === "Failure")
           expect(Cause.pretty(owning.cause)).toContain("FOREIGN KEY constraint failed");
         expect(committedReceipts).toBe(0);
-        expect(yield* f.sql`SELECT parent_id FROM controlled_child`).toEqual([{ parent_id: 1 }]);
-        for (const read of [
-          f.service.readForSession(sessionOwner(f)),
-          f.service.readRetained(f.input.operationId),
-          f.service.readForSessionInTransaction(sessionOwner(f)),
-        ])
-          expect((yield* read.pipe(Effect.result))._tag).toBe("Failure");
-        // Cleanup only this disposable connection's failed physical transaction.
-        yield* f.sql`ROLLBACK`;
         expect(yield* f.sql`SELECT parent_id FROM controlled_child`).toEqual([]);
+        expect(
+          (yield* f.service.readForSessionInTransaction(sessionOwner(f)).pipe(Effect.result))._tag,
+        ).toBe("Failure");
         expect(yield* f.service.readForSession(sessionOwner(f))).toEqual(receipt);
+        expect(yield* f.service.readRetained(f.input.operationId)).toEqual(receipt);
         expect(
           yield* f.sql.withTransaction(f.service.readForSessionInTransaction(sessionOwner(f))),
         ).toEqual(receipt);
