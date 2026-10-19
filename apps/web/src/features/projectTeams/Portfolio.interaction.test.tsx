@@ -282,6 +282,216 @@ describe("Portfolio mounted read-only presentation", () => {
     expect(props.onOpenProject).toHaveBeenCalledWith({ environmentId, projectId });
   });
 
+  it("keeps Alpha and Beta stages, assignments, usage and next actions with their exact owners", async () => {
+    const betaSummary = decodeSummary({
+      ...available,
+      projectId: otherProjectId,
+      taskCounts: {
+        draft: 0,
+        specified: 0,
+        ready: 0,
+        "in-progress": 1,
+        blocked: 2,
+        "in-review": 0,
+        completed: 3,
+        failed: 0,
+        canceled: 0,
+        unknown: 0,
+        total: 6,
+      },
+      coordinator: {
+        ...available.coordinator,
+        ...metadata,
+        recordId: "coordinator-beta",
+        name: "Coordinator Beta",
+        status: "active",
+        roleRevisionId: "coordinator-profile-beta",
+        profile: {
+          ...profile,
+          recordId: "coordinator-profile-beta",
+          role: "Planner",
+          model: "beta-coordinator-model",
+        },
+      },
+      bindings: {
+        items: [
+          {
+            ...binding,
+            recordId: "binding-beta",
+            status: "stopping",
+            taskId: "task-beta",
+            attemptId: "attempt-beta",
+            memberId: "member-beta",
+            roleRevisionId: "profile-beta",
+            model: "beta-frozen-model",
+            workerThreadId: "worker-beta",
+            profile: {
+              ...profile,
+              recordId: "profile-beta",
+              role: "Reviewer",
+              model: "beta-profile-model",
+            },
+            accounting: {
+              ...accounting,
+              projectId: otherProjectId,
+              environmentId: otherEnvironmentId,
+              bindingId: "binding-beta",
+              taskId: "task-beta",
+              attemptId: "attempt-beta",
+              root: { ...accounting.root, chargedTokens: 300, remainingTokens: 650 },
+            },
+          },
+        ],
+        hasMore: false,
+      },
+      missions: { items: [], hasMore: false },
+      blockers: {
+        items: [
+          {
+            recordId: "blocker-beta",
+            taskId: "blocked-beta",
+            revision: 1,
+            reason: "Beta needs credentials",
+            resolver: "coordinator",
+          },
+        ],
+        hasMore: false,
+      },
+      questions: {
+        items: [
+          {
+            ...metadata,
+            recordId: "question-beta",
+            status: "pending",
+            taskId: "question-task-beta",
+            senderId: "member-beta",
+            targetGateId: "gate-beta",
+            targetRevision: 7,
+          },
+        ],
+        hasMore: false,
+      },
+    });
+    await render({
+      entries: [
+        entry,
+        {
+          ...entry,
+          environmentId: otherEnvironmentId,
+          projectId: otherProjectId,
+          title: "Project Beta",
+          snapshot: { environmentId: otherEnvironmentId, data: betaSummary, receivedAt: now },
+        },
+      ],
+    });
+    const cards = [...host.querySelectorAll("section")];
+    expect(cards).toHaveLength(2);
+    const alpha = cards.find((card) => card.querySelector("h3")?.textContent === "Project Alpha");
+    const beta = cards.find((card) => card.querySelector("h3")?.textContent === "Project Beta");
+    if (!alpha || !beta) throw new Error("Both project cards required");
+    for (const [card, captions, foreign] of [
+      [
+        alpha,
+        [
+          "Environment environment-1 · Project project-1",
+          "in-progress 4 · blocked 5 · in-review 6",
+          "total 55",
+          "Coordinator Alpha",
+          "Coordinator · coordinator-model",
+          "binding-1 · Recorded running",
+          "Task task-1 · Attempt attempt-1 · Member member-1",
+          "Binding model: frozen-model",
+          "Profile: Implementer · profile-model",
+          "Shared root: 200 charged",
+          "Waiting for a decision · Resolver human",
+          "question-1 · Recorded pending",
+          "Gate gate-1 · Target revision 4",
+        ],
+        ["Coordinator Beta", "beta-frozen-model", "Beta needs credentials", "gate-beta"],
+      ],
+      [
+        beta,
+        [
+          "Environment environment-2 · Project project-2",
+          "in-progress 1 · blocked 2 · in-review 0",
+          "total 6",
+          "Coordinator Beta",
+          "Planner · beta-coordinator-model",
+          "binding-beta · Recorded stopping",
+          "Task task-beta · Attempt attempt-beta · Member member-beta",
+          "Binding model: beta-frozen-model",
+          "Profile: Reviewer · beta-profile-model",
+          "Shared root: 300 charged",
+          "Beta needs credentials · Resolver coordinator",
+          "question-beta · Recorded pending",
+          "Gate gate-beta · Target revision 7",
+        ],
+        [
+          "Coordinator Alpha",
+          "Binding model: frozen-model",
+          "Waiting for a decision",
+          "Gate gate-1",
+        ],
+      ],
+    ] as const) {
+      for (const caption of captions) expect(card.textContent).toContain(caption);
+      for (const caption of foreign) expect(card.textContent).not.toContain(caption);
+    }
+    for (const [card, owner, taskId, worker, blocker, questionTask, gate, reason, resolver] of [
+      [
+        alpha,
+        { environmentId, projectId },
+        "task-1",
+        threadId,
+        "task-blocked",
+        "task-question",
+        "gate-1",
+        "Waiting for a decision",
+        "human",
+      ],
+      [
+        beta,
+        { environmentId: otherEnvironmentId, projectId: otherProjectId },
+        "task-beta",
+        ThreadId.make("worker-beta"),
+        "blocked-beta",
+        "question-task-beta",
+        "gate-beta",
+        "Beta needs credentials",
+        "coordinator",
+      ],
+    ] as const) {
+      for (const label of [
+        `Inspect project ${card.querySelector("h3")?.textContent}`,
+        `Inspect task ${taskId}`,
+        `Inspect worker ${worker}`,
+        `Review blocker for ${blocker}: ${reason} · Resolver ${resolver}`,
+        `Inspect task with pending question for ${questionTask} · Gate ${gate}`,
+      ]) {
+        const control = [...card.querySelectorAll("button")].find(
+          (item) => item.textContent === label,
+        );
+        if (!control) throw new Error(`Missing project control: ${label}`);
+        await act(async () => control.click());
+      }
+      expect(props.onOpenProject).toHaveBeenLastCalledWith(owner);
+      expect(props.onOpenWorker).toHaveBeenLastCalledWith({ ...owner, threadId: worker });
+      expect(props.onOpenTask).toHaveBeenNthCalledWith(owner.projectId === projectId ? 1 : 4, {
+        ...owner,
+        taskId,
+      });
+      expect(props.onOpenTask).toHaveBeenNthCalledWith(owner.projectId === projectId ? 2 : 5, {
+        ...owner,
+        taskId: blocker,
+      });
+      expect(props.onOpenTask).toHaveBeenLastCalledWith({ ...owner, taskId: questionTask });
+    }
+    expect(props.onOpenProject).toHaveBeenCalledTimes(2);
+    expect(props.onOpenWorker).toHaveBeenCalledTimes(2);
+    expect(props.onOpenTask).toHaveBeenCalledTimes(6);
+    expect(props.onRefresh).not.toHaveBeenCalled();
+  });
+
   it("updates accounting without a project revision and withholds foreign observations", async () => {
     await render();
     const changed = {

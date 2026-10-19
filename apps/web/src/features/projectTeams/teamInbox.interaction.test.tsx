@@ -17,6 +17,8 @@ import {
   EnvironmentId,
   ProjectId,
   WS_METHODS,
+  ORCHESTRATION_WS_METHODS,
+  type ProjectTeamBindingAccounting,
   type ProjectWorkReadIntent,
   ProjectWorkWriteIntent,
   ProjectWorkTaskId,
@@ -187,6 +189,8 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
   let registry: AtomRegistry.AtomRegistry;
   let atoms: ReturnType<typeof createProjectWorkEnvironmentAtoms>;
   let records: unknown[];
+  let accounting: ProjectTeamBindingAccounting[];
+  const subscribeThread = vi.fn(() => Stream.empty);
   let revision: number;
   let taskRevision: number;
   let nextCursor: string | undefined;
@@ -217,6 +221,8 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
   const setup = Effect.gen(function* () {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     records = [member, role, binding, membership, gate, question];
+    accounting = [];
+    subscribeThread.mockClear();
     revision = 10;
     taskRevision = 10;
     nextCursor = undefined;
@@ -250,6 +256,7 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
     const children = { criteria: [], evidence: [], relationships: [], blockers: [], comments: [] };
     // This fixture implements only the exercised Project Work protocol methods.
     const client = {
+      [ORCHESTRATION_WS_METHODS.subscribeThread]: subscribeThread,
       [WS_METHODS.projectWorkRead]: (input: ProjectWorkReadIntent) =>
         Effect.gen(function* () {
           if (input.operation === "attention" && attentionFailure)
@@ -269,6 +276,7 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
                 projectId: input.projectId,
                 revision,
                 items: input.cursor ? [] : records,
+                accounting,
                 ...(input.cursor || nextCursor === undefined ? {} : { nextCursor }),
               };
             if (input.operation === "attention")
@@ -1014,6 +1022,59 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
   interaction(
     "shows recorded run activity and links the actual task without opening transcripts",
     async () => {
+      records = records.map((record) =>
+        record === binding ? { ...binding, parentRunId: "coordinator-run" } : record,
+      );
+      records.push(
+        {
+          ...member,
+          recordId: "coordinator-member",
+          name: "Coordinator Alpha",
+          coordinator: true,
+          roleRevisionId: "coordinator-role",
+        },
+        {
+          ...role,
+          recordId: "coordinator-role",
+          roleId: "coordinator",
+          role: "coordinator",
+          model: "coordinator-model",
+        },
+      );
+      accounting = [
+        {
+          availability: "available",
+          projectId,
+          environmentId,
+          bindingId: binding.recordId,
+          generation: binding.generation,
+          taskId: binding.taskId,
+          attemptId: binding.attemptId,
+          observedAt: at,
+          root: {
+            taskId: "root-task",
+            maximumTokens: 1000,
+            deadlineAtMs: 2000,
+            chargedTokens: 200,
+            reservedTokens: 50,
+            unknownChargedTokens: 40,
+            remainingTokens: 750,
+            heldCalls: 1,
+            quarantinedCalls: 1,
+          },
+          attempt: {
+            maximumTokens: 400,
+            deadlineAtMs: 1500,
+            chargedTokens: 150,
+            reservedTokens: 10,
+            unknownChargedTokens: 40,
+            remainingTokens: 240,
+            heldCalls: 1,
+            quarantinedCalls: 1,
+          },
+        },
+      ];
+      checkRecords();
       await act(async () => {
         root.render(
           <RegistryContext.Provider value={registry}>
@@ -1023,10 +1084,29 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
       });
       await click("Team");
       await act(async () => settle(atoms.foundationPage({ environmentId, projectId })));
-      expect(host.textContent).toContain("actual-model");
-      expect(host.textContent).toContain("Waiting for human answer");
+      const cards = [...host.querySelectorAll("section")];
+      const worker = cards.find((card) => card.querySelector("h3")?.textContent === "Investigator");
+      const coordinator = cards.find((card) =>
+        card.querySelector("h3")?.textContent?.includes("Coordinator Alpha"),
+      );
+      expect(coordinator?.textContent).toContain("Coordinator Alpha · Coordinator");
+      expect(coordinator?.textContent).toContain("coordinator · coordinator-model");
+      expect(coordinator?.textContent).toContain("No assignment recorded.");
+      for (const caption of [
+        "investigator · actual-model",
+        "Waiting for human answer",
+        "Assignment task-1 · Run run-1 · Recorded state running",
+        "Parent run coordinator-run",
+        "/sandbox/work · investigate",
+        "Shared root: 200 charged (40 conservatively charged for unknown usage), 50 held; 750/1,000 tokens remaining.",
+        "This attempt: 150 charged (40 conservatively charged for unknown usage), 10 held; 240/400 tokens remaining.",
+      ])
+        expect(worker?.textContent).toContain(caption);
+      expect(worker?.textContent).not.toContain("configured-model");
+      expect(worker?.querySelector("button")?.textContent).toBe("Open task task-1");
+      expect(subscribeThread).not.toHaveBeenCalled();
       expect(
-        host.querySelector<HTMLAnchorElement>('a[href="/environment-1/worker-thread"]'),
+        worker?.querySelector<HTMLAnchorElement>('a[href="/environment-1/worker-thread"]'),
       ).not.toBeNull();
       taskPages.set(0, { projectId, revision: 10, items: [], hasMore: false });
       await click("Open task task-1");
@@ -1035,6 +1115,8 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
         await settle(atoms.taskContext({ environmentId, projectId, taskId: task.taskId }));
       });
       expect(host.textContent).toContain(task.title);
+      expect(reads).toContainEqual({ operation: "task-context", projectId, taskId: task.taskId });
+      expect(subscribeThread).not.toHaveBeenCalled();
       await act(async () => {
         const control =
           host.querySelector<HTMLSelectElement>('select[aria-label="Task action"]') ??
@@ -1061,6 +1143,7 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
         taskId: task.taskId,
         control: { action: "pause" },
       });
+      expect(subscribeThread).not.toHaveBeenCalled();
     },
   );
   interaction(
