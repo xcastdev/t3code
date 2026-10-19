@@ -67,6 +67,7 @@ type Intent =
 type Kind = Intent["type"];
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
 type Plan = Extract<ProjectTeamRecord, { kind: "plan-revision" }>;
+type RepairEpisode = Extract<ProjectTeamRecord, { kind: "repair-episode" }>;
 const decodeIntegrationSourceRefs = Schema.decodeUnknownSync(
   Schema.fromJsonString(ProjectTeamIntegrationSourceRefs),
 );
@@ -277,6 +278,22 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
       (record.status === "exhausted" ||
         (record.status === "active" && record.pendingSemanticRepair !== false)),
   );
+  const exhaustedEpisodes = taskRecords.filter(
+    (record): record is RepairEpisode =>
+      record.kind === "repair-episode" && record.status === "exhausted",
+  );
+  const exhaustedEpisode = one(exhaustedEpisodes);
+  const linkedRepairBlockers = context?.blockers.filter(
+    (blocker) =>
+      blocker.taskId === task?.taskId &&
+      exhaustedEpisode !== undefined &&
+      blocker.referenceIds.includes(exhaustedEpisode.recordId),
+  ) ?? [];
+  const linkedRepairBlocker = one(linkedRepairBlockers);
+  const repairDecisionEpisode =
+    exhaustedEpisodes.length === 1 && linkedRepairBlockers.length === 1
+      ? exhaustedEpisode
+      : undefined;
 
   const update = (next: typeof drafts) => {
     state.current = next;
@@ -532,6 +549,27 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             reason: fields.reason ?? "Describe why this work should change state",
           },
         };
+      case "project-team.repair.resolve": {
+        const decision = fields.decision ?? "diagnose";
+        if (
+          !repairDecisionEpisode ||
+          (decision !== "diagnose" &&
+            decision !== "approve-one-repair" &&
+            decision !== "revise-scope" &&
+            decision !== "abandon")
+        )
+          return null;
+        return {
+          ...base,
+          type: kind,
+          episodeId: repairDecisionEpisode.recordId,
+          expectedEpisodeRevision: repairDecisionEpisode.revision,
+          failureFingerprint: repairDecisionEpisode.failureFingerprint,
+          relevantRevision: repairDecisionEpisode.relevantRevision,
+          decision,
+          reason: fields.reason?.trim() || "Explain the human repair decision",
+        };
+      }
       default:
         return null;
     }
@@ -581,6 +619,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
       };
     if (kind === "project-team.task.control") return { reason: "" };
     if (kind === "project-team.criterion.waiver") return { reason: "", evidenceIds: "[]" };
+    if (kind === "project-team.repair.resolve") return { decision: "diagnose", reason: "" };
     return {};
   }
 
@@ -676,6 +715,10 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     }
     if (kind === "project-team.plan.propose" && !fields.content?.trim()) {
       setNotice("Describe the implementation and validation plan.");
+      return;
+    }
+    if (kind === "project-team.repair.resolve" && !fields.reason?.trim()) {
+      setNotice("Explain the repair decision before submitting it.");
       return;
     }
     if (
@@ -896,6 +939,56 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
         <p role="alert" className="text-sm text-destructive-foreground">
           {notice}
         </p>
+      ) : null}
+      {exhaustedEpisodes.length > 0 ? (
+        <WorkCard>
+          <h3 className="mb-3 font-medium">Exhausted repair episode</h3>
+          {repairDecisionEpisode && linkedRepairBlocker ? (
+            <>
+              <p className="text-sm">{linkedRepairBlocker.reason}</p>
+              <p className="mt-2 text-sm text-muted-foreground">{linkedRepairBlocker.resolver}</p>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Repairs used: {repairDecisionEpisode.semanticRepairs} of {repairDecisionEpisode.allowance}
+              </p>
+              <div className="mt-3 space-y-3">
+                <label className="block space-y-1 text-sm">
+                  <span>Repair decision</span>
+                  <select
+                    aria-label="Repair decision"
+                    value={draftFor("project-team.repair.resolve")?.fields.decision ?? "diagnose"}
+                    disabled={Boolean(draftFor("project-team.repair.resolve")?.pending)}
+                    onChange={(event) =>
+                      edit("project-team.repair.resolve", { decision: event.target.value })
+                    }
+                  >
+                    <option value="diagnose">Diagnose</option>
+                    <option value="approve-one-repair">Approve one repair</option>
+                    <option value="revise-scope">Revise scope</option>
+                    <option value="abandon">Abandon task</option>
+                  </select>
+                </label>
+                {field("project-team.repair.resolve", "reason", "Repair reason", "")}
+                <Button
+                  size="sm"
+                  disabled={
+                    !canWrite ||
+                    !repairDecisionEpisode ||
+                    !draftFor("project-team.repair.resolve")?.fields.reason?.trim() ||
+                    blockedDraft("project-team.repair.resolve")
+                  }
+                  onClick={() => submit("project-team.repair.resolve")}
+                >
+                  Resolve repair decision
+                </Button>
+                {status("project-team.repair.resolve")}
+              </div>
+            </>
+          ) : (
+            <p role="status" className="text-sm text-warning-foreground">
+              Repair blocker details are missing or changed. Refresh the task before choosing a repair decision.
+            </p>
+          )}
+        </WorkCard>
       ) : null}
       <WorkCard>
         <h3 className="mb-3 font-medium">Recorded workers</h3>

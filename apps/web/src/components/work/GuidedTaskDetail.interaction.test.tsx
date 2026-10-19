@@ -238,6 +238,39 @@ function workerRecords(overrides: Record<string, unknown> = {}) {
   ];
 }
 
+function repairEpisode(overrides: Record<string, unknown> = {}) {
+  return decodeRecord({
+    projectId,
+    revision: 6,
+    generation: 0,
+    updatedAt: at,
+    recordId: "repair-episode",
+    kind: "repair-episode",
+    status: "exhausted",
+    taskId: "task-1",
+    failureFingerprint: "opaque-failure-fingerprint",
+    relevantRevision: "relevant-revision-6",
+    allowance: 2,
+    semanticRepairs: 2,
+    transportRetries: 1,
+    timeoutCount: 0,
+    attemptIds: [],
+    ...overrides,
+  });
+}
+
+function linkedRepairBlocker() {
+  return {
+    blockerId: "repair-blocker",
+    taskId: "task-1",
+    reason: "The last repair left the reconnect check failing",
+    resolver: "Review the failed reconnect check and choose the next step",
+    referenceIds: ["repair-episode"],
+    attention: true,
+    revision: 3,
+  };
+}
+
 function deferred() {
   let resolve: () => void = () => {};
   let reject: (error: unknown) => void = () => {};
@@ -327,6 +360,83 @@ describe("GuidedTaskDetail human interactions", () => {
     select.value = value;
     await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
   }
+
+  async function repairDecision(value: string) {
+    const select = host.querySelector<HTMLSelectElement>(
+      'select[aria-label="Repair decision"]',
+    );
+    if (!select) throw Error("Missing repair decision");
+    select.value = value;
+    await act(async () => select.dispatchEvent(new Event("change", { bubbles: true })));
+  }
+
+  it("shows the linked exhausted repair and submits an explicit decision for its exact episode", async () => {
+    current = decodeContext({ ...current, blockers: [linkedRepairBlocker()] });
+    foundation = [...records(current), repairEpisode()];
+    await render();
+
+    expect(host.textContent).toContain("The last repair left the reconnect check failing");
+    expect(host.textContent).toContain("Review the failed reconnect check and choose the next step");
+    expect(host.textContent).toMatch(/2\s*(of|\/)\s*2/);
+
+    await repairDecision("approve-one-repair");
+    expect(button("Resolve repair decision").disabled).toBe(true);
+    expect(emitted).toEqual([]);
+    await fill("Repair reason", "Approve one repair attempt after reviewing the failing check");
+    await click("Resolve repair decision");
+
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.repair.resolve",
+      projectId,
+      taskId: "task-1",
+      expectedRevision: 10,
+      expectedTaskRevision: 4,
+      episodeId: "repair-episode",
+      expectedEpisodeRevision: 6,
+      failureFingerprint: "opaque-failure-fingerprint",
+      relevantRevision: "relevant-revision-6",
+      decision: "approve-one-repair",
+      reason: "Approve one repair attempt after reviewing the failing check",
+    });
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it("asks for refreshed blocker details instead of inferring a reason from an exhausted episode", async () => {
+    foundation = [...records(current), repairEpisode()];
+    await render();
+
+    expect(host.textContent?.toLowerCase()).toContain("blocker");
+    expect(host.textContent?.toLowerCase()).toContain("refresh");
+    expect(host.textContent).not.toContain("opaque-failure-fingerprint");
+    expect(host.querySelector('select[aria-label="Repair decision"]')).toBeNull();
+    expect(emitted).toEqual([]);
+  });
+
+  it("fences a retained repair decision when its captured episode changes and keeps the blocker visible", async () => {
+    current = decodeContext({ ...current, blockers: [linkedRepairBlocker()] });
+    foundation = [...records(current), repairEpisode()];
+    await render();
+    await repairDecision("diagnose");
+    await fill("Repair reason", "Diagnose the retained reconnect failure");
+    const retained = callbacks.get("Resolve repair decision");
+    expect(retained).toBeDefined();
+
+    foundation = [
+      ...records(current),
+      repairEpisode({
+        revision: 7,
+        failureFingerprint: "new-failure-fingerprint",
+        relevantRevision: "relevant-revision-7",
+      }),
+    ];
+    await render();
+    await act(async () => retained?.());
+
+    expect(emitted).toEqual([]);
+    expect(host.textContent).toContain("The last repair left the reconnect check failing");
+    expect(host.textContent).not.toContain("opaque-failure-fingerprint");
+  });
 
   it("starts a linked independent review against the exact approved specification and plan", async () => {
     foundation = records(current, "approved");
