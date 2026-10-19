@@ -80,6 +80,7 @@ import {
   executePiProjectWorkBridgeTool,
   preparePiProjectWorkTools,
   piProjectWorkToolCapabilities,
+  PiProjectWorkToolValidationError,
   type PiProjectWorkReportContext,
 } from "./PiProjectWorkTools.ts";
 import type { PiModelBrokerConfig, PiModelTool } from "./PiModelBroker.ts";
@@ -101,6 +102,7 @@ const provider = ProviderDriverKind.make("piAgent");
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeBinding = Schema.decodeUnknownSync(ProjectTeamRunBinding);
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
+const isProjectWorkToolValidationError = Schema.is(PiProjectWorkToolValidationError);
 const skillAbsolute = Schema.String.check(
   Schema.isMaxLength(4096),
   Schema.isPattern(/^\/[^\0\r\n]*$/),
@@ -2184,9 +2186,19 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                                         ),
                                   })
                                 : effect,
+                            Effect.map((value) => encode(value)),
+                            Effect.catch((error) =>
+                              call.toolName === "project_work_report" &&
+                              isProjectWorkToolValidationError(error) &&
+                              error.reason === "invalid-intent"
+                                ? Effect.succeed(
+                                    'Report rejected; no report was recorded. Resubmit intentJSON using the complete advertised intent JSON, including type "project-team.assignment.report" and all required revision fields.',
+                                  )
+                                : Effect.fail(error),
+                            ),
                           );
                           yield* check(signal);
-                          return { kind: "text" as const, text: encode(result) };
+                          return { kind: "text" as const, text: result };
                         }),
                       ),
                       { signal },

@@ -2,6 +2,7 @@ import { vi } from "vite-plus/test";
 import * as SessionRuntime from "./PiSessionRuntime.ts";
 import * as ManagedProcess from "./PiManagedProcess.ts";
 import * as RuntimeLive from "./PiManagedRuntimeLive.ts";
+import * as ProjectWorkTools from "./PiProjectWorkTools.ts";
 import { makePiProductionRuntime } from "./PiProductionRuntime.ts";
 import { PiModelCatalogue } from "./PiModelCatalogue.ts";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
@@ -171,6 +172,8 @@ import { ProjectWorkBriefingLive } from "../../projectWork/ProjectWorkBriefing.t
 import {
   ProjectWorkGateway,
   ProjectWorkGatewayLive,
+  ProjectWorkAuthorizationError,
+  type ProjectWorkGatewayShape,
 } from "../../projectWork/ProjectWorkGateway.ts";
 import {
   ProjectWorkProjection,
@@ -3796,6 +3799,399 @@ const settledNativeForRead = Effect.fn("PiManagedRuntimeLive.settledNativeForRea
   yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${operation.operation.operationId}`;
   return native;
 });
+const reportInputFeedbackFixture = Effect.fn("reportInputFeedbackFixture")(function* (
+  write?: ProjectWorkGatewayShape["write"],
+) {
+  const f = yield* requiredTransferFixture(
+    false,
+    false,
+    undefined,
+    false,
+    "project",
+    "Retain the assignment report",
+    {
+      ...basicRuntimeProfile,
+      roleTools: ["project-work.report"],
+      toolIds: ["project-work.report"],
+      deliverableKind: "non-code",
+    },
+  );
+  const actualGateway = yield* ProjectWorkGateway;
+  let reads = 0;
+  const writes: Array<Parameters<ProjectWorkGatewayShape["write"]>> = [];
+  const gateway = ProjectWorkGateway.of({
+    ...actualGateway,
+    read: (...args) =>
+      Effect.sync(() => {
+        reads++;
+      }).pipe(Effect.andThen(actualGateway.read(...args))),
+    write: (...args) =>
+      Effect.sync(() => {
+        writes.push(args);
+      }).pipe(Effect.andThen((write ?? actualGateway.write)(...args))),
+  });
+  const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(
+    Effect.provideService(ProjectWorkGateway, gateway),
+  );
+  const instance = yield* runtime.forInstance({
+    instanceId: providerInstanceId,
+    enabled: true,
+    configuration: {},
+  });
+  yield* initializeRequiredContext(f, false, instance);
+  let captured: SessionRuntime.PiSessionRuntimeOptions | undefined;
+  const original = SessionRuntime.makePiSessionRuntime;
+  const capture = vi.spyOn(SessionRuntime, "makePiSessionRuntime").mockImplementation((input) => {
+    captured = input;
+    return original(input);
+  });
+  yield* Effect.addFinalizer(() => Effect.sync(() => capture.mockRestore()));
+  yield* instance.prepareOperation(
+    {
+      threadId: f.binding.threadId,
+      kind: "prompt",
+      operationId: f.request.assignmentOperationId,
+      prompt: f.request.assignment,
+    },
+    () => Effect.void,
+  );
+  if (!captured) return yield* Effect.die("No report session callback captured");
+  const session = captured;
+  const schemaText = session.transferTexts.find(
+    (entry) => entry.transferId === "project_work_report",
+  )?.text;
+  if (schemaText === undefined) return yield* Effect.die("Missing advertised report schema");
+  const description = reportTemplateDescription(decodeNativeJsonEvidence(schemaText));
+  const template = description === undefined ? undefined : decodeReportTemplate(description);
+  if (template?.type !== "project-team.assignment.report")
+    return yield* Effect.die("Missing advertised assignment report intent");
+  const intent = {
+    ...template,
+    summary: "Retained findings without a claim of completed verification",
+  };
+  let callId = 0;
+  const invoke = Effect.fn("reportInputFeedbackFixture.invoke")(function* (
+    toolName: string,
+    arguments_: Parameters<
+      SessionRuntime.PiSessionRuntimeOptions["executeBridgeTool"]
+    >[1]["arguments"],
+    signal = new AbortController().signal,
+  ) {
+    const input = { arguments: arguments_ };
+    const id = ++callId;
+    return yield* Effect.tryPromise({
+      try: () =>
+        session.executeBridgeTool(
+          {
+            type: "tool-call",
+            callId: id,
+            nativeCallId: "report-feedback-" + id,
+            lifecycleId: 1,
+            toolName,
+            execution: "bridge",
+            input: {
+              transferId: "report-feedback-input-" + id,
+              totalBytes: Buffer.byteLength(json(input)),
+            },
+          },
+          input,
+          signal,
+        ),
+      catch: controlledCallbackError,
+    });
+  });
+  const durable = Effect.gen(function* () {
+    return {
+      budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+      operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+      dispatches: yield* f.sql`SELECT * FROM project_team_dispatch ORDER BY dispatch_id`,
+      models: yield* f.sql`SELECT * FROM project_team_model_request`,
+      processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+      allocations: f.allocations,
+      transports: f.transports,
+    };
+  });
+  reads = 0;
+  writes.length = 0;
+  return {
+    f,
+    session,
+    intent,
+    invoke,
+    durable,
+    writes,
+    get reads() {
+      return reads;
+    },
+  };
+});
+
+describe("assignment report input feedback", () => {
+  it.effect("allows caller correction after rejection within the original operation budget", () =>
+    scoped(
+      Effect.gen(function* () {
+        const fixture = yield* reportInputFeedbackFixture();
+        const { f, session, invoke, durable, writes } = fixture;
+        const hostile = "PRIVATE_REPORT_INPUT_do_not_echo_" + "x".repeat(128);
+        const intent = { ...fixture.intent, summary: hostile };
+        const before = yield* readCurrentState(f.sql, f.binding.projectId);
+        const originalDurable = yield* durable;
+        expect(originalDurable.budgets).toHaveLength(1);
+        expect(originalDurable.budgets[0]?.deadline_at_ms).toBe(
+          f.snapshot.intent.limits.rootDeadlineAtMs,
+        );
+        expect(originalDurable.models).toEqual([]);
+        expect(session.operation.operationId).toBe(f.request.assignmentOperationId);
+        const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts`;
+        const { type, ...missingType } = intent;
+        expect(type).toBe("project-team.assignment.report");
+        const { expectedRevision, ...missingRevision } = intent;
+        expect(expectedRevision).toBe(before.revision);
+        let feedback: string | undefined;
+        for (const intentJSON of [
+          json(missingType),
+          json(missingRevision),
+          "{malformed-json-" + hostile.repeat(32),
+        ]) {
+          const returned = yield* invoke("project_work_report", { intentJSON });
+          expect(Object.keys(returned).sort()).toEqual(["kind", "text"]);
+          expect(returned.kind).toBe("text");
+          if (returned.kind !== "text") return yield* Effect.die("Report rejection was not text");
+          expect(returned.text).toMatch(/report (?:was )?rejected/i);
+          expect(returned.text).toMatch(/no report (?:was )?recorded/i);
+          expect(returned.text).toContain("intentJSON");
+          expect(returned.text).toContain("project-team.assignment.report");
+          expect(returned.text).toMatch(/advertised/i);
+          expect(returned.text).toMatch(/type/);
+          expect(returned.text).toMatch(/revision/i);
+          expect(Buffer.byteLength(returned.text)).toBeLessThanOrEqual(1024);
+          for (const privateText of [hostile, f.binding.recordId, f.binding.worktree])
+            expect(returned.text).not.toContain(privateText);
+          expect(returned.text).not.toContain("PRIVATE_REPORT_INPUT");
+          expect(returned.text).not.toContain("PiProjectWorkToolValidationError");
+          expect(returned.text).not.toMatch(/"status"\s*:\s*"accepted"/);
+          if (feedback !== undefined) expect(returned.text).toBe(feedback);
+          feedback = returned.text;
+          expect(fixture.reads).toBe(0);
+          expect(writes).toEqual([]);
+          expect(yield* readCurrentState(f.sql, f.binding.projectId)).toEqual(before);
+          expect(yield* f.sql`SELECT * FROM project_work_command_receipts`).toEqual(receipts);
+          expect(yield* durable).toEqual(originalDurable);
+          yield* Effect.tryPromise({
+            try: () =>
+              session.authorizeCurrent(
+                {
+                  identity: session.identity,
+                  operation: session.operation,
+                  phase: "beforeToolReturn",
+                },
+                new AbortController().signal,
+              ),
+            catch: controlledCallbackError,
+          });
+        }
+        // The caller supplies the complete original intent; the runtime fills in no fields.
+        const returned = yield* invoke("project_work_report", { intentJSON: json(intent) });
+        expect(writes).toHaveLength(1);
+        expect(writes[0]?.[0]).toEqual(intent);
+        expect(writes[0]?.[3]?.managed).toMatchObject({
+          bindingId: f.binding.recordId,
+          generation: f.binding.generation,
+          providerInstanceId,
+          threadId: f.binding.threadId,
+        });
+        const accepted = yield* f.sql<{ result_json: string }>`SELECT result_json
+          FROM project_work_command_receipts WHERE project_id=${intent.projectId}
+          AND command_id=${intent.commandId}`;
+        expect(accepted).toHaveLength(1);
+        expect((yield* decodeReportReceipt(accepted[0]!.result_json)).receipt).toMatchObject({
+          commandId: intent.commandId,
+          status: "accepted",
+        });
+        expect(returned).toEqual({ kind: "text", text: accepted[0]!.result_json });
+        expect(
+          (yield* readCurrentState(f.sql, f.binding.projectId)).evidence.some(
+            (entry) => entry.detail === intent.summary,
+          ),
+        ).toBe(true);
+        expect(yield* durable).toEqual(originalDurable);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+
+  for (const mode of [
+    "write-invalid-intent",
+    "plan-invalid-intent",
+    "report-invalid-arguments",
+    "report-intent-kind",
+    "unknown-tool",
+  ] as const)
+    it.effect(`keeps ${mode} fatal`, () =>
+      scoped(
+        Effect.gen(function* () {
+          const fixture = yield* reportInputFeedbackFixture();
+          const before = yield* readCurrentState(fixture.f.sql, fixture.f.binding.projectId);
+          const originalDurable = yield* fixture.durable;
+          const { type, ...missingType } = fixture.intent;
+          expect(type).toBe("project-team.assignment.report");
+          const result = yield* fixture
+            .invoke(
+              mode === "write-invalid-intent"
+                ? "project_work_write"
+                : mode === "plan-invalid-intent"
+                  ? "project_work_plan"
+                  : mode === "unknown-tool"
+                    ? "unknown_project_work_tool"
+                    : "project_work_report",
+              mode === "report-invalid-arguments"
+                ? { intentJSON: 12 }
+                : mode === "report-intent-kind"
+                  ? {
+                      intentJSON: json({
+                        type: "project-work.task.create",
+                        projectId: fixture.intent.projectId,
+                        taskId: "unrelated-report-task",
+                        commandId: "unrelated-report-command",
+                        title: "Not an assignment report",
+                        createdAt: at,
+                      }),
+                    }
+                  : { intentJSON: json(missingType) },
+            )
+            .pipe(Effect.result);
+          expect(result).toMatchObject({
+            _tag: "Failure",
+            failure: { _tag: "PiManagedRuntimeError", code: "unavailable" },
+          });
+          expect(fixture.reads).toBe(0);
+          expect(fixture.writes).toEqual([]);
+          expect(yield* readCurrentState(fixture.f.sql, fixture.f.binding.projectId)).toEqual(
+            before,
+          );
+          expect(yield* fixture.durable).toEqual(originalDurable);
+        }),
+      ),
+    );
+
+  for (const mode of ["authorization", "gateway", "revision-conflict", "unknown-error"] as const)
+    it.effect(`keeps ${mode} after valid report decoding fatal`, () =>
+      scoped(
+        Effect.gen(function* () {
+          // Failure stubs exercise propagation only; the correction test uses actual gateway authority.
+          const fixture = yield* reportInputFeedbackFixture(
+            mode === "authorization"
+              ? () =>
+                  Effect.fail(
+                    new ProjectWorkAuthorizationError({ reason: "agent-approval-required" }),
+                  )
+              : mode === "gateway"
+                ? () =>
+                    Effect.fail(
+                      new Authorization.ProjectTeamAuthorizationError({ reason: "invalid-intent" }),
+                    )
+                : mode === "unknown-error"
+                  ? () => Effect.die(Error("Private gateway failure"))
+                  : undefined,
+          );
+          const before = yield* readCurrentState(fixture.f.sql, fixture.f.binding.projectId);
+          const originalDurable = yield* fixture.durable;
+          const intent =
+            mode === "revision-conflict"
+              ? { ...fixture.intent, expectedRevision: fixture.intent.expectedRevision + 1 }
+              : fixture.intent;
+          const result = yield* fixture
+            .invoke("project_work_report", {
+              intentJSON: json(intent),
+            })
+            .pipe(Effect.result);
+          expect(result).toMatchObject({
+            _tag: "Failure",
+            failure: {
+              _tag: "PiManagedRuntimeError",
+              code: mode === "unknown-error" ? "uncertain" : "unavailable",
+            },
+          });
+          expect(fixture.writes).toHaveLength(1);
+          expect(fixture.writes[0]?.[0]).toEqual(intent);
+          expect(yield* readCurrentState(fixture.f.sql, fixture.f.binding.projectId)).toEqual(
+            before,
+          );
+          expect(
+            yield* fixture.f.sql`SELECT * FROM project_work_command_receipts
+            WHERE command_id=${intent.commandId}`,
+          ).toEqual([]);
+          expect(yield* fixture.durable).toEqual(originalDurable);
+        }),
+      ),
+    );
+
+  for (const mode of ["cancellation", "revoked-authority"] as const)
+    it.effect(`keeps ${mode} after invalid report decoding fatal`, () =>
+      scoped(
+        Effect.gen(function* () {
+          const fixture = yield* reportInputFeedbackFixture();
+          const { f } = fixture;
+          const before = yield* readCurrentState(f.sql, f.binding.projectId);
+          const originalDurable = yield* fixture.durable;
+          const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts`;
+          const decoded = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const original = ProjectWorkTools.executePiProjectWorkBridgeTool;
+          const decode = vi
+            .spyOn(ProjectWorkTools, "executePiProjectWorkBridgeTool")
+            .mockImplementation((input) =>
+              original(input).pipe(
+                Effect.tapError((error) =>
+                  Effect.gen(function* () {
+                    expect(error).toMatchObject({
+                      _tag: "PiProjectWorkToolValidationError",
+                      reason: "invalid-intent",
+                    });
+                    yield* Deferred.succeed(decoded, undefined);
+                    yield* Deferred.await(release);
+                  }),
+                ),
+              ),
+            );
+          yield* Effect.addFinalizer(() => Effect.sync(() => decode.mockRestore()));
+          yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+          const controller = new AbortController();
+          const { type, ...missingType } = fixture.intent;
+          expect(type).toBe("project-team.assignment.report");
+          const pending = yield* fixture
+            .invoke("project_work_report", { intentJSON: json(missingType) }, controller.signal)
+            .pipe(Effect.result, Effect.forkChild);
+          yield* Deferred.await(decoded);
+          if (mode === "cancellation") controller.abort();
+          else
+            yield* restoreHistoricalBinding({
+              ...f.binding,
+              revision: f.binding.revision + 1,
+              status: "revoked",
+            });
+          const current = yield* readCurrentState(f.sql, f.binding.projectId);
+          yield* Deferred.succeed(release, undefined);
+          const result = yield* Fiber.join(pending);
+          expect(result).toMatchObject({
+            _tag: "Failure",
+            failure: { _tag: "PiManagedRuntimeError" },
+          });
+          if (result._tag === "Failure")
+            expect(mode === "cancellation" ? ["uncertain"] : ["unavailable", "denied"]).toContain(
+              result.failure.code,
+            );
+          expect(fixture.reads).toBe(0);
+          expect(fixture.writes).toEqual([]);
+          expect(yield* readCurrentState(f.sql, f.binding.projectId)).toEqual(current);
+          if (mode === "cancellation") expect(current).toEqual(before);
+          expect(yield* f.sql`SELECT * FROM project_work_command_receipts`).toEqual(receipts);
+          expect(yield* fixture.durable).toEqual(originalDurable);
+        }),
+      ),
+    );
+});
+
 for (const outcome of ["findings", "complete"] as const)
   it.effect(`retains committed ${outcome} reports across the return fence`, () =>
     scoped(
