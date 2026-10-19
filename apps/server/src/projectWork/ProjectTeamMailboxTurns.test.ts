@@ -14,6 +14,7 @@ import {
   type OrchestrationCommand,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import type * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -67,6 +68,19 @@ const now = Date.parse(at) + 100;
 const canonical = canonicalProjectWorkPayload;
 const hash = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(canonical(value)).digest("hex");
+const expectCommitFailure = (exit: Exit.Exit<unknown, unknown>) => {
+  expect(exit._tag).toBe("Failure");
+  if (exit._tag !== "Failure") return;
+  expect(exit.cause.reasons).toMatchObject([
+    {
+      _tag: "Die",
+      defect: {
+        _tag: "SqlError",
+        reason: { operation: "execute", cause: { message: "FOREIGN KEY constraint failed" } },
+      },
+    },
+  ]);
+};
 const decodeCommit = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand);
 const decodeMessage = Schema.decodeUnknownEffect(ProjectTeamMessage);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
@@ -1181,35 +1195,34 @@ it.effect(
         yield* f.sql`CREATE TABLE turn_commit_child(id TEXT REFERENCES turn_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER fail_turn_commit AFTER UPDATE ON project_team_mailbox_batch WHEN NEW.status='delivered' BEGIN INSERT INTO turn_commit_child VALUES('missing'); END`;
         let escaped = false;
-        expect(
-          (yield* f.turns.reflect({ operationId: f.decision.request.operationId }).pipe(
+        expectCommitFailure(
+          yield* f.turns.reflect({ operationId: f.decision.request.operationId }).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
                 escaped = true;
               }),
             ),
             Effect.exit,
-          ))._tag,
-        ).toBe("Failure");
+          ),
+        );
         expect(escaped).toBe(false);
         expect(
           (yield* f.turns
             .reflect({ operationId: f.decision.request.operationId })
             .pipe(Effect.exit))._tag,
         ).toBe("Failure");
-        expect((yield* f.turns.claim(f.snapshot).pipe(Effect.exit))._tag).toBe("Failure");
-        // Disposable test connection only: release the physically failed COMMIT loan.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
-        expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+        expect((yield* f.turns.claim(f.snapshot)).decision).toEqual(f.decision);
+        expect(yield* f.sql.withTransaction(readCurrentState(f.sql, projectId))).toEqual(before);
+        expect(yield* f.sql`SELECT * FROM turn_commit_child`).toEqual([]);
         yield* f.sql`DROP TRIGGER fail_turn_commit`;
         expect((yield* f.turns.reflect({ operationId: f.decision.request.operationId }))._tag).toBe(
           "Delivered",
         );
+        const delivered = yield* readCurrentState(f.sql, projectId);
+        expect((yield* f.turns.reflect({ operationId: f.decision.request.operationId }))._tag).toBe(
+          "Retained",
+        );
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(delivered);
       }),
     ),
 );
@@ -2036,21 +2049,22 @@ it.effect(
       Effect.gen(function* () {
         const f = yield* laterFixture;
         yield* f.addMessage("first", "Freeze this one");
+        const before = yield* readCurrentState(f.sql, projectId);
         yield* f.sql`PRAGMA foreign_keys=ON`;
         yield* f.sql`CREATE TABLE turn_boundary_parent(id TEXT PRIMARY KEY)`;
         yield* f.sql`CREATE TABLE turn_boundary_child(id TEXT REFERENCES turn_boundary_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER fail_turn_boundary AFTER INSERT ON project_team_mailbox_turn BEGIN INSERT INTO turn_boundary_child VALUES('missing'); END`;
         let escaped = false;
-        expect(
-          (yield* f.turns.claim(f.snapshot).pipe(
+        expectCommitFailure(
+          yield* f.turns.claim(f.snapshot).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
                 escaped = true;
               }),
             ),
             Effect.exit,
-          ))._tag,
-        ).toBe("Failure");
+          ),
+        );
         expect(escaped).toBe(false);
         const reader = yield* makeProjectTeamMailboxTurnDecisionReader({
           environmentId: "environment",
@@ -2061,12 +2075,14 @@ it.effect(
             .pipe(Effect.exit))._tag,
         ).toBe("Failure");
         expect((yield* f.turns.claim(f.snapshot).pipe(Effect.exit))._tag).toBe("Failure");
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
+        expect(
+          yield* f.sql.withTransaction(
+            reader.readInTransaction({ dispatchId: f.snapshot.fence.dispatchId }),
+          ),
+        ).toBeUndefined();
+        expect(yield* f.sql`SELECT operation_id FROM project_team_mailbox_turn`).toEqual([]);
+        expect(yield* f.sql`SELECT * FROM turn_boundary_child`).toEqual([]);
+        expect(yield* f.sql.withTransaction(readCurrentState(f.sql, projectId))).toEqual(before);
         yield* f.sql`DROP TRIGGER fail_turn_boundary`;
         const selected = yield* f.turns.claim(f.snapshot);
         if (selected._tag !== "Selected") return yield* Effect.die("Expected selected message");
@@ -2339,41 +2355,37 @@ it.effect(
           "Delivered",
         );
         yield* f.addMessage("second", "Retain this exact successor");
+        const before = yield* readCurrentState(f.sql, projectId);
+        const turnsBefore = yield* f.sql`SELECT * FROM project_team_mailbox_turn`;
         yield* f.sql`PRAGMA foreign_keys=ON`;
         yield* f.sql`CREATE TABLE successor_parent(id TEXT PRIMARY KEY)`;
         yield* f.sql`CREATE TABLE successor_child(id TEXT REFERENCES successor_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
         yield* f.sql`CREATE TRIGGER fail_successor_commit AFTER INSERT ON project_team_mailbox_successor BEGIN INSERT INTO successor_child VALUES('missing'); END`;
         const supplied = { afterOperationId: f.decision.request.operationId };
         let escaped = false;
-        expect(
-          (yield* f.turns.claim(f.snapshot, supplied).pipe(
+        expectCommitFailure(
+          yield* f.turns.claim(f.snapshot, supplied).pipe(
             Effect.tap(() =>
               Effect.sync(() => {
                 escaped = true;
               }),
             ),
             Effect.exit,
-          ))._tag,
-        ).toBe("Failure");
+          ),
+        );
         expect(escaped).toBe(false);
         const reader = yield* makeProjectTeamMailboxTurnDecisionReader({
           environmentId: "environment",
         });
         expect(
-          (yield* f.sql
-            .withTransaction(
-              reader.readInTransaction({ dispatchId: f.snapshot.fence.dispatchId, ...supplied }),
-            )
-            .pipe(Effect.exit))._tag,
-        ).toBe("Failure");
-        // Dispose only this fixture's physically failed COMMIT loan.
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const connection = yield* f.sql.reserve;
-            yield* connection.executeUnprepared("ROLLBACK", [], undefined);
-          }),
-        );
+          yield* f.sql.withTransaction(
+            reader.readInTransaction({ dispatchId: f.snapshot.fence.dispatchId, ...supplied }),
+          ),
+        ).toBeUndefined();
+        expect(yield* f.sql`SELECT * FROM successor_child`).toEqual([]);
         expect(yield* f.sql`SELECT operation_id FROM project_team_mailbox_successor`).toEqual([]);
+        expect(yield* f.sql.withTransaction(readCurrentState(f.sql, projectId))).toEqual(before);
+        expect(yield* f.sql`SELECT * FROM project_team_mailbox_turn`).toEqual(turnsBefore);
         yield* f.sql`DROP TRIGGER fail_successor_commit`;
         const capture = f.turns.claim(f.snapshot, supplied);
         supplied.afterOperationId = "foreign-operation";
@@ -2391,6 +2403,9 @@ it.effect(
         expect(retries.map((retry) => retry.decision)).toEqual([
           selected.decision,
           selected.decision,
+        ]);
+        expect(yield* f.sql`SELECT operation_id FROM project_team_mailbox_successor`).toEqual([
+          { operation_id: selected.decision.request.operationId },
         ]);
         expect(
           yield* f.sql.withTransaction(
