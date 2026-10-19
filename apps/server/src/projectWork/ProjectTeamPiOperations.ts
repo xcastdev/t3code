@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
+  GitCommandError,
   ProjectTeamRunBinding,
   ProjectTeamRoleRevision,
   CommandId,
@@ -12,6 +13,12 @@ import {
   SkillApplicationMode,
   ManagedSkillKey,
 } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { GitWorkflowService } from "../git/GitWorkflowService.ts";
+import * as ManagedGit from "../git/ManagedGitExecution.ts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -57,16 +64,24 @@ import {
   type ProjectTeamAuthority,
   type ProjectTeamPrincipal,
 } from "./ProjectTeamAuthorization.ts";
-import { ProjectTeamReviewTarget } from "./ProjectTeamReviewTargets.ts";
+import {
+  ProjectTeamReviewTarget,
+  makeProjectTeamReviewTargets,
+} from "./ProjectTeamReviewTargets.ts";
 import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 import {
   makeProjectTeamDispatchJournal,
+  ProjectTeamWorkspaceReceipt,
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
 
 const encode = canonicalProjectWorkPayload;
 const decodeAllocationReviewTarget = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectTeamReviewTarget),
+  { onExcessProperty: "error" },
+);
+const decodeReviewWorkspace = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectTeamWorkspaceReceipt),
   { onExcessProperty: "error" },
 );
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
@@ -552,6 +567,15 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     const clock = yield* Clock.Clock;
     const authorization = yield* ProjectTeamAuthorization;
     const repository = yield* ProjectWorkRepository;
+    const reviewTargets = yield* makeProjectTeamReviewTargets({
+      environmentId: options.environmentId,
+      maximumEnvironmentModelCalls: 128,
+    });
+    const workflow = yield* Effect.serviceOption(GitWorkflowService);
+    const filesystem = yield* Effect.serviceOption(FileSystem.FileSystem);
+    const path = yield* Effect.serviceOption(Path.Path);
+    const spawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
+    const platform = yield* HostProcessPlatform;
     // These retained reads validate intent, claim receipts and stage history only.
     // The schema maximum is unused by them and grants no model-call capacity.
     const {
@@ -598,6 +622,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           target.reviewer.taskId !== binding.taskId
         )
           return yield* deny("Retained review allocation target identity changed");
+        return target;
       },
     );
     const ownTransaction = Effect.fn("ProjectTeamPiOperations.ownTransaction")(function* () {
@@ -1843,6 +1868,131 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       yield* clockCheck(row.deadline_at_ms);
       return authority;
     });
+    // Successful receipts are observations of the original target, not permission
+    // to replay after its retained ownership or physical Git identity changes.
+    const assertReviewReplay = Effect.fn("ProjectTeamPiOperations.assertReviewReplay")(function* (
+      authority: ProjectTeamAuthority,
+      allocation: PiManagedProcessAllocation,
+      retained: ProjectTeamReviewTarget,
+    ) {
+      if (
+        authority.role.role !== "reviewer" ||
+        Option.isNone(filesystem) ||
+        Option.isNone(path) ||
+        Option.isNone(spawner)
+      )
+        return yield* deny("Stable review target host is unavailable");
+      const fs = filesystem.value;
+      const binding = authority.binding;
+      const mounted = allocation.launch.reviewTarget;
+      if (!mounted) return yield* deny("Stable review target allocation is missing");
+      const reviewer = yield* readRetained(retained.dispatchId);
+      const revalidate = Effect.gen(function* () {
+        const fresh = yield* current({
+          providerInstanceId: binding.providerInstanceId,
+          threadId: binding.threadId,
+        });
+        if (
+          immutableBinding(fresh.binding) !== immutableBinding(binding) ||
+          fresh.binding.sessionId !== binding.sessionId ||
+          encode(fresh.role) !== encode(authority.role) ||
+          encode(yield* reviewTargets.readForDispatch(reviewer)) !== encode(retained)
+        )
+          return yield* deny("Stable review target authority changed", "conflict");
+      }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.mapError(
+          (cause) =>
+            new GitCommandError({
+              operation: "review.replay",
+              command: "/usr/bin/git",
+              cwd: mounted.source,
+              detail: "Original review target authority changed",
+              cause,
+            }),
+        ),
+      );
+      const job = retained.prepared.manifest;
+      const implementation = yield* readRetained(job.dispatchId);
+      yield* readStageReceipts(job.dispatchId);
+      const claim = implementation.intent.compiledClaim.transition;
+      if (
+        implementation.fence.stage !== "settled" ||
+        claim?.kind !== "claim" ||
+        claim.binding.environmentId !== options.environmentId ||
+        claim.binding.projectId !== job.projectId ||
+        claim.binding.taskId !== job.taskId ||
+        claim.binding.recordId !== job.bindingId ||
+        claim.binding.generation !== job.generation
+      )
+        return yield* deny("Stable review implementation authority changed", "conflict");
+      const rows = yield* sql<{
+        receipt_json: string | null;
+        assignment_json: string | null;
+      }>`SELECT
+        CASE WHEN length(CAST(receipt_json AS BLOB))<=262144 THEN receipt_json END AS receipt_json,
+        CASE WHEN length(CAST(assignment_json AS BLOB))<=262144 THEN assignment_json END AS assignment_json
+        FROM project_team_workspace_receipt WHERE environment_id=${options.environmentId} AND dispatch_id=${job.dispatchId}
+        AND binding_id=${job.bindingId} AND generation=${job.generation} AND claim_generation=${implementation.fence.claimGeneration} LIMIT 2`;
+      if (
+        rows.length !== 1 ||
+        typeof rows[0]?.receipt_json !== "string" ||
+        rows[0].assignment_json !== encode(implementation.intent.request.git)
+      )
+        return yield* deny("Stable review implementation workspace is unavailable", "conflict");
+      const receipt = yield* decodeReviewWorkspace(rows[0].receipt_json);
+      if (
+        encode(receipt) !== rows[0].receipt_json ||
+        digest(receipt) !== job.workspaceReceiptHash ||
+        encode(receipt.assignment) !== encode(implementation.intent.request.git)
+      )
+        return yield* deny("Stable review implementation workspace changed", "conflict");
+      yield* Effect.gen(function* () {
+        const managed = yield* ManagedGit.make({
+          assignment: implementation.intent.request.git,
+          priorReceipt: receipt,
+          revalidate,
+          persistWorkspace: () =>
+            Effect.fail(
+              new GitCommandError({
+                operation: "review.replay",
+                command: "/usr/bin/git",
+                cwd: mounted.source,
+                detail: "Review replay cannot create a workspace",
+              }),
+            ),
+        });
+        yield* ManagedGit.withManagedVerificationTarget(managed, (target) =>
+          Effect.gen(function* () {
+            if (
+              target.cwd !== mounted.source ||
+              target.cwd !== job.target.worktree ||
+              target.baseSha !== job.target.baseSha ||
+              target.headSha !== job.target.headSha ||
+              target.testedCommit !== mounted.testedCommit ||
+              target.testedTree !== mounted.testedTree ||
+              encode(target.receipt) !== encode(receipt) ||
+              (yield* fs.realPath(target.cwd)) !== target.cwd
+            )
+              return yield* deny("Stable committed review target changed", "conflict");
+            const stat = yield* fs.stat(target.cwd);
+            if (
+              stat.type !== "Directory" ||
+              Option.isNone(stat.ino) ||
+              stat.dev !== mounted.dev ||
+              stat.ino.value !== mounted.ino
+            )
+              return yield* deny("Stable review target physical identity changed", "conflict");
+          }),
+        );
+        yield* revalidate;
+      }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.provideService(Path.Path, path.value),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner.value),
+        Effect.provideService(HostProcessPlatform, platform),
+      );
+    });
     // A stable dispatch ID is a receipt locator, never permission to execute again.
     const lookupInside = Effect.fn("ProjectTeamPiOperations.lookupInside")(function* (
       identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
@@ -1950,7 +2100,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         Effect.mapError(() => deny("Stable Pi drain unavailable", "uncertain")),
       );
       const allocation = intent.allocation;
-      yield* assertReviewAllocation(binding, allocation);
+      const retainedReview = yield* assertReviewAllocation(binding, allocation);
       const nativeState = allocation.launch.nativeState;
       if (
         !nativeState ||
@@ -2207,6 +2357,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       )
         return yield* deny("Stable Pi native receipt has a successor", "conflict");
       yield* current(identity);
+      if (retainedReview) yield* assertReviewReplay(authority, allocation, retainedReview);
       yield* clockCheck(row.deadline_at_ms);
       return {
         operation,
@@ -2489,7 +2640,36 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     ) {
       yield* ownTransaction();
       if (request.operationId === undefined) return undefined;
-      return yield* sql.withTransaction(lookupInside(identity, request, requestHash, resourceHash));
+      // Acquire the repository permit before the SQL loan: workspace writers
+      // persist their receipts in the opposite direction, under that permit.
+      const targets = yield* sql<{ manifest_json: string | null; sha256: string }>`SELECT
+        CASE WHEN length(CAST(t.manifest_json AS BLOB))<=65536 THEN t.manifest_json END AS manifest_json,t.sha256
+        FROM project_team_pi_operation p JOIN project_team_review_target t ON t.environment_id=p.environment_id
+        AND t.project_id=p.project_id AND t.binding_id=p.binding_id AND t.generation=p.generation
+        WHERE p.operation_id=${request.operationId} AND p.environment_id=${options.environmentId}
+        AND p.provider_instance_id=${identity.providerInstanceId} AND p.thread_id=${identity.threadId} LIMIT 2`;
+      const lookupReceipt = sql.withTransaction(
+        lookupInside(identity, request, requestHash, resourceHash),
+      );
+      if (targets.length === 0) return yield* lookupReceipt;
+      if (
+        targets.length !== 1 ||
+        typeof targets[0]?.manifest_json !== "string" ||
+        Option.isNone(workflow)
+      )
+        return yield* deny("Stable review target repository is unavailable");
+      const target = yield* decodeAllocationReviewTarget(targets[0].manifest_json);
+      if (
+        encode(target) !== targets[0].manifest_json ||
+        digest(target) !== targets[0].sha256 ||
+        target.environmentId !== options.environmentId
+      )
+        return yield* deny("Stable review target repository changed", "conflict");
+      return yield* workflow.value.withRepositoryPermit(
+        "review.replay",
+        target.prepared.manifest.target.repository,
+        lookupReceipt,
+      );
     });
     const lookupTransaction = Effect.gen(function* () {
       const supplied = yield* Effect.serviceOption(SqlClient.SqlClient);
@@ -2500,6 +2680,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       )
         return yield* deny("Pi receipt lookup requires its captured SQL transaction");
     });
+    // Inherited transaction readers cannot acquire a repository permit. Their
+    // ManagedGit capture still checks the clean target both before and after use.
     const lookupInTransaction = (...args: Parameters<typeof lookup>) => {
       const captured = structuredClone(args);
       return guard(lookupTransaction.pipe(Effect.andThen(lookupInside(...captured))));

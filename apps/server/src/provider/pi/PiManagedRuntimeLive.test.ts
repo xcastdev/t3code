@@ -16100,3 +16100,141 @@ it.effect(
       }),
     ),
 );
+
+for (const boundary of ["prepare", "run"] as const)
+  for (const mutation of ["dirty", "root-replaced", "receipt-removed", "commit-changed"] as const)
+    it.effect(`reviewer initialize replay rejects ${mutation} target at ${boundary}`, () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* requiredReviewTransferFixture();
+          yield* initializeRequiredContext(f);
+          const request = {
+            threadId: f.binding.threadId,
+            kind: "initialize" as const,
+            operationId: f.request.initializeOperationId,
+          };
+          const noEmission = () => Effect.die("Unexpected reviewer replay emission");
+          const stable = yield* f.instance.prepareOperation(request, noEmission);
+          expect((yield* stable.run).terminal.outcome).toBe("success");
+          const allocations = f.allocations;
+          const rows =
+            yield* f.sql`SELECT operation_id,status,terminal_json FROM project_team_pi_operation`;
+          const root = f.implementationWorktree;
+          if (mutation === "dirty")
+            yield* f.fs.writeFileString(root + "/README.md", "unverified replay mutation\n");
+          if (mutation === "root-replaced")
+            yield* Effect.promise(async () => {
+              const fs = process.getBuiltinModule("fs").promises;
+              await fs.rename(root, root + "-original");
+              await fs.cp(root + "-original", root, { recursive: true });
+            });
+          if (mutation === "commit-changed")
+            yield* Effect.sync(() =>
+              process
+                .getBuiltinModule("child_process")
+                .execFileSync(
+                  "/usr/bin/git",
+                  [
+                    "-C",
+                    root,
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.test",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "unreviewed replay head",
+                  ],
+                  { stdio: "ignore" },
+                ),
+            );
+          if (mutation === "receipt-removed")
+            yield* f.sql`DELETE FROM project_team_workspace_receipt WHERE binding_id=${f.root.bindingId}`;
+          const result = yield* (
+            boundary === "run"
+              ? stable.run
+              : f.instance
+                  .prepareOperation(request, noEmission)
+                  .pipe(Effect.flatMap((replay) => replay.run))
+          ).pipe(Effect.result);
+          expect(result._tag).toBe("Failure");
+          expect(f.allocations).toBe(allocations);
+          expect(f.transports).toBe(0);
+          expect(
+            yield* f.sql`SELECT operation_id,status,terminal_json FROM project_team_pi_operation`,
+          ).toEqual(rows);
+        }),
+      ),
+    );
+
+it.effect(
+  "reviewer replay acquires its repository permit before SQL and fences inherited reads",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture();
+        yield* initializeRequiredContext(f);
+        let permits = 0;
+        const workflow = Layer.mock(GitWorkflowService, {
+          withRepositoryPermit: (operation, _cwd, use) =>
+            Effect.gen(function* () {
+              if (operation === "review.replay") {
+                expect(Option.isNone(yield* Effect.serviceOption(f.sql.transactionService))).toBe(
+                  true,
+                );
+                permits++;
+              }
+              return yield* use;
+            }),
+        });
+        const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(Effect.provide(workflow));
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const request = {
+          threadId: f.binding.threadId,
+          kind: "initialize" as const,
+          operationId: f.request.initializeOperationId,
+        };
+        const replay = yield* instance.prepareOperation(request, () =>
+          Effect.die("Unexpected replay emission"),
+        );
+        expect((yield* replay.run).terminal.outcome).toBe("success");
+        expect(permits).toBeGreaterThan(0);
+        const operations = yield* makeProjectTeamPiOperations({
+          environmentId: "environment",
+        }).pipe(Effect.provide(workflow));
+        const rows = yield* f.sql<{
+          request_hash: string;
+          intent_json: string;
+        }>`SELECT request_hash,intent_json FROM project_team_pi_operation WHERE operation_id=${request.operationId}`;
+        const row = rows[0];
+        if (!row) return yield* Effect.die("Missing original reviewer replay operation");
+        const resourceHash = decodeNativeJsonEvidence(row.intent_json).resourceHash;
+        if (typeof resourceHash !== "string")
+          return yield* Effect.die("Missing original reviewer replay resource identity");
+        const before = permits;
+        const inherited = () =>
+          f.sql.withTransaction(
+            operations.lookupInTransaction(
+              { providerInstanceId, threadId: f.binding.threadId },
+              request,
+              row.request_hash,
+              resourceHash,
+            ),
+          );
+        expect((yield* inherited())?.terminal.outcome).toBe("success");
+        expect(permits).toBe(before);
+        yield* f.fs.writeFileString(
+          f.implementationWorktree + "/README.md",
+          "unverified inherited replay\n",
+        );
+        expect((yield* inherited().pipe(Effect.result))._tag).toBe("Failure");
+        expect(permits).toBe(before);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+);
