@@ -136,6 +136,10 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [acceptedRevision, setAcceptedRevision] = useState<number | null>(null);
   const [controlAction, setControlAction] = useState<(typeof controls)[number]>("defer");
+  const liveControlAction = useRef(controlAction);
+  useLayoutEffect(() => {
+    liveControlAction.current = controlAction;
+  }, [controlAction]);
   const [recipient, setRecipient] = useState<{
     readonly id: string;
     readonly revision: number;
@@ -712,6 +716,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   function submit(kind: Kind, patch: Readonly<Record<string, string>> = {}) {
     if (
       !currentCallback() ||
+      (kind === "project-team.task.control" && liveControlAction.current !== controlAction) ||
       !canWrite ||
       state.current.entries.some(
         (draft) => draft.pending?.status === "sending" || draft.pending?.status === "uncertain",

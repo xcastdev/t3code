@@ -440,6 +440,42 @@ describe("GuidedTaskDetail human interactions", () => {
     });
   });
 
+  it("rejects a retained failure resolution callback after selecting cancel", async () => {
+    current = decodeContext({
+      ...current,
+      task: { ...current.task, state: "blocked" },
+      blockers: [linkedRepairBlocker()],
+    });
+    const episode = repairEpisode({ exceptionGrantId: "repair-grant" });
+    const grant = decodeRecord({
+      ...records(current, "approved")[2],
+      recordId: "repair-grant",
+      gate: "repair",
+      status: "approved",
+    });
+    foundation = [...records(current, "approved"), episode, grant];
+    await render();
+    await action("resolve-failure");
+    await fill("Control reason", "Continue with the approved single repair");
+    expect(button("Apply resolve-failure").disabled).toBe(false);
+    const retained = callbacks.get("Apply resolve-failure");
+    expect(retained).toBeDefined();
+
+    await action("cancel");
+    await act(async () => retained?.());
+    expect(emitted).toEqual([]);
+    await fill("Control reason", "Cancel this task instead of continuing repair");
+    await click("Keep edits against reviewed revisions");
+    expect(button("Apply cancel").disabled).toBe(false);
+
+    await click("Apply cancel");
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      type: "project-team.task.control",
+      control: { action: "cancel", reason: "Cancel this task instead of continuing repair" },
+    });
+  });
+
   it("requires an exact approved repair exception and drained owners before explicit failure resolution", async () => {
     current = decodeContext({
       ...current,
