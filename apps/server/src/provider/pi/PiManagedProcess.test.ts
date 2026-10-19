@@ -275,7 +275,9 @@ describe("managed bubblewrap compatibility", () => {
   for (const [label, response, code, accepted] of [
     ["0.12.0", "bubblewrap 0.12.0\n", 0, true],
     ["0.13.0", "bubblewrap 0.13.0\n", 0, true],
+    ["0.13.1", "bubblewrap 0.13.1\n", 0, true],
     ["older version", "bubblewrap 0.11.0\n", 0, false],
+    ["unproven patch version", "bubblewrap 0.13.2\n", 0, false],
     ["unproven newer version", "bubblewrap 0.14.0\n", 0, false],
     ["modified version", "bubblewrap 0.13.0-custom\n", 0, false],
     ["additional output", "bubblewrap 0.13.0\nforeign", 0, false],

@@ -705,8 +705,16 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
   const { control, managerEnv } = yield* makeManagedControl();
   const version = yield* control("/usr/bin/bwrap", ["--version"]);
   const release = version.stdout.trim();
-  if (version.code !== 0 || (release !== "bubblewrap 0.12.0" && release !== "bubblewrap 0.13.0"))
-    return yield* fail("unavailable", "Managed execution requires bubblewrap 0.12.0 or 0.13.0.");
+  if (
+    version.code !== 0 ||
+    (release !== "bubblewrap 0.12.0" &&
+      release !== "bubblewrap 0.13.0" &&
+      release !== "bubblewrap 0.13.1")
+  )
+    return yield* fail(
+      "unavailable",
+      "Managed execution requires bubblewrap 0.12.0, 0.13.0 or 0.13.1.",
+    );
   const helper = yield* path
     .fromFileUrl(new URL("./pi-managed-process-owner.py", import.meta.url))
     .pipe(
