@@ -958,6 +958,9 @@ export const layer = Layer.effect(
                   ...fields,
                   type: "project-team.assignment.start",
                   assignmentKind: inherited.assignmentKind,
+                  ...(inherited.parentCriterionIds === undefined
+                    ? {}
+                    : { parentCriterionIds: inherited.parentCriterionIds }),
                   specRevision: parent.specRevision,
                   specificationGateId: specificationGate.recordId,
                   expectedSpecificationGateRevision: specificationGate.revision,

@@ -9,6 +9,7 @@ import { HttpServer } from "effect/unstable/http";
 import {
   ProjectId,
   ProjectWorkTaskId,
+  ProjectWorkCriterionId,
   EnvironmentId,
   ThreadId,
   CommandId,
@@ -692,6 +693,8 @@ const investigationRecipient = Effect.fn("messageTest.investigationRecipient")(f
     readonly repository?: boolean;
     readonly issueRecordId?: string;
     readonly planning?: boolean;
+    readonly implementation?: boolean;
+    readonly replay?: boolean;
   } = {},
 ) {
   const gateway = yield* ProjectWorkGateway;
@@ -708,7 +711,7 @@ const investigationRecipient = Effect.fn("messageTest.investigationRecipient")(f
     outputDescriptions: ["Retained findings"],
   };
   let intent: ProjectTeamGuidedIntent;
-  if (options.planning) {
+  if (options.planning || options.implementation) {
     const specificationGate = before.foundationRecords?.find(
       (r) => r.kind === "gate" && r.recordId === f.binding.specificationGateId,
     );
@@ -727,7 +730,10 @@ const investigationRecipient = Effect.fn("messageTest.investigationRecipient")(f
     intent = yield* decodeMessageFixtureGuided({
       ...fields,
       type: "project-team.assignment.start",
-      assignmentKind: "planning",
+      assignmentKind: options.implementation ? "implementation" : "planning",
+      ...(options.implementation
+        ? { parentCriterionIds: parent.specification!.criterionIds.slice(0, 1) }
+        : {}),
       specRevision: parent.specRevision,
       specificationGateId: specificationGate.recordId,
       expectedSpecificationGateRevision: specificationGate.revision,
@@ -771,13 +777,20 @@ const investigationRecipient = Effect.fn("messageTest.investigationRecipient")(f
         guided: { intent },
       }),
     );
-  else yield* gateway.write(intent, human.actor, human.source);
+  else {
+    const receipt = yield* gateway.write(intent, human.actor, human.source);
+    if (options.replay)
+      expect(yield* gateway.write(intent, human.actor, human.source)).toEqual(receipt);
+  }
   const issued = yield* readCurrentState(f.sql, projectId);
   const grant = issued.foundationRecords?.find(
     (r) =>
       r.kind === "gate" &&
       r.recordId ===
-        projectTeamDerivedRecordId(commandId, options.planning ? "assignment" : "investigation"),
+        projectTeamDerivedRecordId(
+          commandId,
+          options.planning || options.implementation ? "assignment" : "investigation",
+        ),
   );
   const role = issued.foundationRecords?.find(
     (r) =>
@@ -1030,6 +1043,209 @@ for (const mode of [
         ),
       ).toMatchObject({ status: "queued", taskId: child.taskId });
       expect(child.configuration.toolIds).toEqual(["read"]);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+  );
+
+const seedAssignmentSelection = Effect.gen(function* () {
+  const repository = yield* ProjectWorkRepository;
+  // Issue a real approved parent with a second, unselected criterion so reconstruction cannot fill in all criteria.
+  return yield* seed("implementer").pipe(
+    Effect.provideService(ProjectWorkRepository, {
+      ...repository,
+      execute: (command) => {
+        if (
+          command.type !== "project-work.foundation.commit" ||
+          command.guided?.intent.type !== "project-team.specification.propose"
+        )
+          return repository.execute(command);
+        const intent = command.guided.intent;
+        const source = intent.criterionSnapshots[0];
+        if (source === undefined) return repository.execute(command);
+        const criterionId = ProjectWorkCriterionId.make("unselected-parent-criterion");
+        return repository.execute({
+          ...command,
+          guided: {
+            ...command.guided,
+            intent: {
+              ...intent,
+              specification: {
+                ...intent.specification,
+                criterionIds: [...intent.specification.criterionIds, criterionId],
+              },
+              criterionSnapshots: [
+                ...intent.criterionSnapshots,
+                { ...source, criterionId, description: "Separate unselected behavior" },
+              ],
+            },
+          },
+        });
+      },
+    }),
+  );
+});
+
+for (const operation of ["discovery", "message"] as const)
+  for (const assignmentKind of ["planning", "implementation"] as const)
+    it.effect(
+      `discovers and messages an exact approved ${assignmentKind} child with duplicate command replay (${operation})`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* seedAssignmentSelection;
+          const id = `retained-${assignmentKind}-recipient`;
+          const child = yield* investigationRecipient(f, taskId, id, {
+            planning: assignmentKind === "planning",
+            implementation: assignmentKind === "implementation",
+            replay: true,
+          });
+          const state = yield* readCurrentState(f.sql, projectId);
+          const membership = state.foundationRecords?.find(
+            (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+          );
+          if (membership?.kind !== "task-membership")
+            return yield* Effect.die("Missing issued assignment membership");
+          if (operation === "discovery")
+            expect(
+              yield* f.sql.withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal)),
+            ).toEqual({
+              recipients: [
+                {
+                  memberId: child.memberId,
+                  taskId: child.taskId,
+                  taskTitle: assignmentKind === "planning" ? "Plan: Task" : "Implement: Task",
+                  expectedRecipientMembershipRevision: membership.revision,
+                  relation: "approved-tree",
+                },
+              ],
+              omitted: 0,
+              degraded: false,
+            });
+          const parent = state.tasks.find((t) => t.taskId === taskId)!;
+          const grant = state.foundationRecords!.find(
+            (r) => r.kind === "gate" && r.recordId === child.authorizationGateId,
+          );
+          if (grant?.kind !== "gate") return yield* Effect.die("Missing issued assignment gate");
+          expect(parent.specification!.criterionIds).toHaveLength(2);
+          if (assignmentKind === "implementation")
+            expect(state.criteria.filter((c) => c.taskId === child.taskId)).toHaveLength(1);
+          expect(grant.assignmentAuthorization?.parentCriterionIds).toEqual(
+            assignmentKind === "implementation"
+              ? parent.specification!.criterionIds.slice(0, 1)
+              : undefined,
+          );
+          const request = {
+            type: "project-team.message.send" as const,
+            commandId: CommandId.make(`${id}:message`),
+            projectId,
+            taskId,
+            expectedRevision: state.revision,
+            expectedTaskRevision: parent.revision,
+            specRevision: parent.specRevision,
+            planRevision: f.binding.planRevision,
+            messageId: `${id}:message`,
+            recipientId: child.memberId,
+            recipientTaskId: child.taskId,
+            expectedRecipientMembershipRevision: membership.revision,
+            body: "Coordinate within the exact approved implementation scope",
+            evidenceIds: [],
+          };
+          const gateway = yield* ProjectWorkGateway;
+          const source = { kind: "mcp" as const, id: "retained-assignment-tool" };
+          const receipt = yield* gateway.write(request, f.principal.actor, source, f.principal);
+          expect(yield* gateway.write(request, f.principal.actor, source, f.principal)).toEqual(
+            receipt,
+          );
+          const after = yield* readCurrentState(f.sql, projectId);
+          expect(
+            after.foundationRecords!.filter(
+              (r) => r.kind === "message" && r.recordId === request.messageId,
+            ),
+          ).toMatchObject([
+            { status: "queued", taskId: child.taskId, recipientId: child.memberId },
+          ]);
+          expect(
+            yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${request.commandId}`,
+          ).toHaveLength(1);
+          expect(
+            yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${id}`,
+          ).toHaveLength(1);
+        }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+    );
+
+for (const change of ["source criterion", "child criterion", "retained selection"] as const)
+  it.effect(`denies implementation recipient and message after changed ${change}`, () =>
+    Effect.gen(function* () {
+      const f = yield* seed("implementer");
+      const child = yield* investigationRecipient(f, taskId, `changed-${change}`, {
+        implementation: true,
+      });
+      expect(
+        (yield* f.sql.withTransaction(
+          f.auth.readMessageRecipientsInTransaction(f.principal),
+        )).recipients.map((r) => r.taskId),
+      ).toEqual([child.taskId]);
+      const state = yield* readCurrentState(f.sql, projectId);
+      const membership = state.foundationRecords?.find(
+        (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+      );
+      if (membership?.kind !== "task-membership")
+        return yield* Effect.die("Missing approved implementation membership");
+      // Corrupt only disposable projections/checkpoints; original accepted events and receipts remain unchanged.
+      if (change === "retained selection") {
+        const index = state.foundationRecords!.findIndex(
+          (r) => r.kind === "gate" && r.recordId === child.authorizationGateId,
+        );
+        const selection = encodeMemoryDiscoveryJson(["not-the-approved-criterion"]);
+        yield* f.sql`UPDATE project_team_gate SET payload_json=json_set(payload_json,'$.assignmentAuthorization.parentCriterionIds',json(${selection})) WHERE project_id=${projectId} AND record_id=${child.authorizationGateId}`;
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${`$.foundationRecords[${index}].assignmentAuthorization.parentCriterionIds`},json(${selection})) WHERE project_id=${projectId}`;
+      } else {
+        const selectedTaskId = change === "source criterion" ? taskId : child.taskId;
+        const index = state.criteria.findIndex((c) => c.taskId === selectedTaskId);
+        const criterion = state.criteria[index]!;
+        yield* f.sql`UPDATE project_work_criteria SET description='Changed approved criterion' WHERE project_id=${projectId} AND criterion_id=${criterion.criterionId}`;
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${`$.criteria[${index}].description`},'Changed approved criterion') WHERE project_id=${projectId}`;
+      }
+      const changed = yield* readCurrentState(f.sql, projectId);
+      const discovery = yield* f.sql
+        .withTransaction(f.auth.readMessageRecipientsInTransaction(f.principal))
+        .pipe(Effect.result);
+      if (change === "source criterion") expect(discovery._tag).toBe("Failure");
+      else
+        expect(discovery).toMatchObject({
+          _tag: "Success",
+          success: { recipients: [], omitted: 1, degraded: true },
+        });
+      const parent = changed.tasks.find((t) => t.taskId === taskId)!;
+      const gateway = yield* ProjectWorkGateway;
+      const request = {
+        type: "project-team.message.send" as const,
+        commandId: CommandId.make(`denied-${change}`),
+        projectId,
+        taskId,
+        expectedRevision: changed.revision,
+        expectedTaskRevision: parent.revision,
+        specRevision: parent.specRevision,
+        planRevision: f.binding.planRevision,
+        messageId: `denied-${change}`,
+        recipientId: child.memberId,
+        recipientTaskId: child.taskId,
+        expectedRecipientMembershipRevision: membership.revision,
+        body: "Changed criteria cannot retain an approved audience",
+        evidenceIds: [],
+      };
+      expect(
+        (yield* gateway
+          .write(
+            request,
+            f.principal.actor,
+            { kind: "mcp", id: "changed-criteria-tool" },
+            f.principal,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* readCurrentState(f.sql, projectId)).toEqual(changed);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${projectId} AND command_id=${request.commandId}`,
+      ).toHaveLength(0);
     }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
   );
 
@@ -1370,7 +1586,11 @@ for (const status of ["delivered", "uncertain", "canceled"] as const)
           rebuilt.intent(
             f.principal,
             f.request,
-            { actor: f.principal.actor, source: f.source, recordedAt: "2026-01-03T00:00:00.000Z" },
+            {
+              actor: f.principal.actor,
+              source: f.source,
+              recordedAt: "2026-01-03T00:00:00.000Z",
+            },
             true,
           ),
         ),
