@@ -901,8 +901,14 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             "startSession",
             "Pi requires an explicit skill plan for this instance and a new session.",
           );
-        // A cursor requests restoration; only the runtime's current authority read admits it.
-        if (existing || hints.resumeCursor !== undefined) {
+        const discovered =
+          !existing && hints.resumeCursor === undefined && runtime.readSessionForStart
+            ? yield* runtime
+                .readSessionForStart(hints.threadId, hints.skillPlan)
+                .pipe(Effect.mapError((error) => requestError("readSessionForStart", error)))
+            : undefined;
+        // A cursor or trusted discovery requests restoration; only the runtime admits it.
+        if (existing || hints.resumeCursor !== undefined || discovered?.kind === "existing") {
           const context: SessionContext = existing
             ? yield* owned(hints.threadId)
             : { threadId: hints.threadId, closing: false };
@@ -915,7 +921,11 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           const previousOperationId = context.lastOperationId;
           const previousSkillPlan = context.skillPlan;
           const skillPlan = hints.skillPlan ?? previousSkillPlan;
-          const session = yield* runtime.readSession(hints.threadId, skillPlan).pipe(
+          const session = yield* (
+            discovered?.kind === "existing"
+              ? Effect.succeed(discovered.session)
+              : runtime.readSession(hints.threadId, skillPlan)
+          ).pipe(
             Effect.mapError((error) => requestError("readSession", error)),
             Effect.flatMap((session) => validateSession(session, hints.threadId)),
           );
@@ -963,7 +973,18 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           closing: false,
           ...(skillPlan === undefined ? {} : { skillPlan }),
         };
-        sessions.set(hints.threadId, context);
+        yield* Effect.suspend((): Effect.Effect<void, ProviderAdapterError> => {
+          if (shuttingDown)
+            return Effect.fail(
+              new ProviderAdapterSessionClosedError({ provider, threadId: hints.threadId }),
+            );
+          if (sessions.has(hints.threadId))
+            return Effect.fail(
+              invalid("startSession", "Pi session changed while startup was being authorized."),
+            );
+          sessions.set(hints.threadId, context);
+          return Effect.void;
+        });
         const request = {
           threadId: hints.threadId,
           kind: "initialize" as const,

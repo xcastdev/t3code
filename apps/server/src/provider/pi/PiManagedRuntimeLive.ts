@@ -2942,6 +2942,21 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             readCommitted(threadId, skillPlan, (committed) =>
               Effect.succeed(sessionFor(committed.authority, committed.native)),
             ),
+          readSessionForStart: Effect.fn("PiManagedRuntime.readSessionForStart")(function* (
+            threadId: ThreadId,
+            skillPlan?: ProviderSkillPlan,
+          ) {
+            const plan = yield* Effect.try({
+              try: () => (skillPlan === undefined ? undefined : structuredClone(skillPlan)),
+              catch: () => deny("Pi skill plan cannot be copied"),
+            });
+            const state = yield* operations.sessionForStart(identity(threadId));
+            if (state.kind === "fresh") return state;
+            const session = yield* readCommitted(threadId, plan, (committed) =>
+              Effect.succeed(sessionFor(committed.authority, committed.native)),
+            );
+            return { kind: "existing" as const, session };
+          }, guard),
           readThread: (threadId: ThreadId) =>
             readCommitted(threadId, undefined, (committed) =>
               Effect.tryPromise({

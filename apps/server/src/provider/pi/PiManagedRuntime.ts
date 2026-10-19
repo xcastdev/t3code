@@ -101,6 +101,14 @@ export interface PiManagedRuntimeInstance {
     threadId: ThreadId,
     skillPlan?: ProviderSkillPlan,
   ) => Effect.Effect<ProviderSession, PiManagedRuntimeError>;
+  /** Trusted startup discovery distinguishes an unused assignment from a current native session. */
+  readonly readSessionForStart?: (
+    threadId: ThreadId,
+    skillPlan?: ProviderSkillPlan,
+  ) => Effect.Effect<
+    { readonly kind: "fresh" } | { readonly kind: "existing"; readonly session: ProviderSession },
+    PiManagedRuntimeError
+  >;
   /** Bounded, authorized native reads cannot rewrite or migrate session files. */
   readonly readThread: (
     threadId: ThreadId,

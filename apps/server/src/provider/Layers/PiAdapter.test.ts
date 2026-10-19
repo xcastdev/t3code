@@ -194,6 +194,133 @@ for (const code of ["denied", "conflict", "unavailable", "uncertain"] as const)
     }),
   );
 
+it.effect("replacement adapter discovers its retained session without caller cursor hints", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const scope = yield* Scope.make();
+    const original = yield* makePiAdapter({ instanceId, runtime: fake.runtime }).pipe(
+      Scope.provide(scope),
+    );
+    const committed = yield* original.startSession(startInput);
+    yield* Scope.close(scope, Exit.void);
+    const adapter = yield* makePiAdapter({
+      instanceId,
+      runtime: {
+        ...fake.runtime,
+        readSessionForStart: (thread, plan) =>
+          fake.runtime
+            .readSession(thread, plan)
+            .pipe(Effect.map((session) => ({ kind: "existing" as const, session }))),
+      },
+      resolveOperationId: () => Effect.fail(denied),
+    });
+    const events = yield* subscribe(adapter.streamEvents);
+    expect(yield* adapter.startSession(startInput)).toEqual(committed);
+    expect(yield* adapter.listSessions()).toEqual([committed]);
+    expect(fake.requests).toHaveLength(1);
+    expect(yield* Queue.size(events)).toBe(0);
+  }),
+);
+
+it.effect(
+  "trusted fresh discovery initializes once and cannot replace an explicit cursor read",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      let discoveries = 0;
+      const adapter = yield* makePiAdapter({
+        instanceId,
+        runtime: {
+          ...fake.runtime,
+          readSessionForStart: () =>
+            Effect.sync(() => {
+              discoveries++;
+              return { kind: "fresh" as const };
+            }),
+        },
+      });
+      // An explicit cursor never permits fresh setup, even if discovery could report fresh.
+      fake.state.readError = denied;
+      expect(
+        Exit.isFailure(
+          yield* Effect.exit(
+            adapter.startSession({
+              ...startInput,
+              resumeCursor: initialSession().resumeCursor,
+            }),
+          ),
+        ),
+      ).toBe(true);
+      expect(discoveries).toBe(0);
+      expect(fake.requests).toHaveLength(0);
+      fake.state.readError = undefined;
+      expect(yield* adapter.startSession(startInput)).toEqual(initialSession());
+      expect(discoveries).toBe(1);
+      expect(fake.requests.map((request) => request.kind)).toEqual(["initialize"]);
+    }),
+);
+
+for (const code of ["denied", "conflict", "unavailable", "uncertain"] as const)
+  it.effect(`startup discovery propagates ${code} without initialization`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const adapter = yield* makePiAdapter({
+        instanceId,
+        runtime: {
+          ...fake.runtime,
+          readSessionForStart: () =>
+            Effect.fail(
+              new PiManagedRuntimeError({
+                code,
+                detail: "private-discovery-failure",
+              }),
+            ),
+        },
+      });
+      expect(json(yield* Effect.exit(adapter.startSession(startInput)))).toContain(
+        "ProviderAdapterRequestError",
+      );
+      expect(yield* adapter.listSessions()).toEqual([]);
+      expect(fake.requests).toHaveLength(0);
+    }),
+  );
+
+for (const kind of ["fresh", "existing"] as const)
+  for (const change of ["replacement", "shutdown"] as const)
+    it.effect(`held ${kind} startup discovery cannot publish after ${change}`, () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFake();
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const adapter = yield* makePiAdapter({
+          instanceId,
+          runtime: {
+            ...fake.runtime,
+            readSessionForStart: () =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+                return kind === "fresh" ? { kind } : { kind, session: initialSession() };
+              }),
+          },
+        });
+        const starting = yield* Effect.forkScoped(Effect.exit(adapter.startSession(startInput)));
+        yield* Deferred.await(entered);
+        if (change === "shutdown") yield* adapter.stopAll();
+        else
+          yield* adapter.startSession({
+            ...startInput,
+            resumeCursor: initialSession().resumeCursor,
+          });
+        yield* Deferred.succeed(release, undefined);
+        expect(Exit.isFailure(yield* Fiber.join(starting))).toBe(true);
+        expect(yield* adapter.listSessions()).toEqual(
+          change === "shutdown" ? [] : [initialSession()],
+        );
+        expect(fake.requests).toHaveLength(0);
+      }),
+    );
+
 it.effect(
   "replacement restoration rejects stale hints, foreign identities and native aliases",
   () =>

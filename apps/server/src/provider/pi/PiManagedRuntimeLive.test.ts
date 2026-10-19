@@ -55,6 +55,7 @@ import {
   ProjectWorkFoundationCommitCommand,
   ProjectTeamWriteIntent,
   ProjectWorkTaskId,
+  ProviderDriverKind,
   ProjectId,
   ThreadId,
   ProjectWorkCommand,
@@ -71,7 +72,23 @@ import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
 import * as Queue from "effect/Queue";
+import * as PubSub from "effect/PubSub";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
+import { makePiAdapter } from "../Layers/PiAdapter.ts";
+import { makeProviderServiceLive } from "../Layers/ProviderService.ts";
+import { ProviderService } from "../Services/ProviderService.ts";
+import { ProviderAdapterRegistry } from "../Services/ProviderAdapterRegistry.ts";
+import { ProviderSessionDirectoryLive } from "../Layers/ProviderSessionDirectory.ts";
+import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
+import { ProviderEventLoggers, NoOpProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
+import { startManagedProviderSession } from "../ProviderManagedSessions.ts";
+import { ProviderValidationError } from "../Errors.ts";
+import { SkillCatalogService } from "../../skills/SkillCatalogService.ts";
+import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
+import { createEmptyReadModel } from "../../orchestration/projector.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import { GitRepositoryPermits } from "../../git/GitRepositoryPermits.ts";
 import * as ManagedGit from "../../git/ManagedGitExecution.ts";
@@ -4718,6 +4735,226 @@ for (const outcome of ["findings", "complete"] as const)
       }),
     ),
   );
+it.effect("startup discovery admits only the original fresh setup without allocating", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* dispatchedRuntimeFixture();
+      const read = f.instance.readSessionForStart;
+      if (!read) return yield* Effect.die("Production runtime has no startup discovery");
+      expect(yield* read(threadId)).toEqual({ kind: "fresh" });
+      const adapter = yield* makePiAdapter({ instanceId: providerInstanceId, runtime: f.instance });
+      yield* rejected(
+        adapter.startSession({
+          threadId,
+          runtimeMode: "approval-required",
+          resumeCursor: { sessionId: "unretained-native" },
+        }),
+      );
+      expect(f.allocations).toBe(0);
+      expect(f.transports).toBe(0);
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual([]);
+      expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+    }),
+  ),
+);
+
+it.effect("startup discovery denies an unqualified reserved binding without allocating", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const read = f.instance.readSessionForStart;
+      if (!read) return yield* Effect.die("Production runtime has no startup discovery");
+      yield* rejected(read(threadId));
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual([]);
+      expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+    }),
+  ),
+);
+
+it.effect("startup discovery rechecks changed authority before restoring an existing session", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* settledNativeForRead(f);
+      const before = yield* f.sql`SELECT * FROM project_team_pi_operation`;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const makeOperations = PiOperations.makeProjectTeamPiOperations;
+      const spy = vi
+        .spyOn(PiOperations, "makeProjectTeamPiOperations")
+        .mockImplementation((options) =>
+          makeOperations(options).pipe(
+            Effect.map((operations) => ({
+              ...operations,
+              sessionForStart: (identity) =>
+                Effect.gen(function* () {
+                  const state = yield* operations.sessionForStart(identity);
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                  return state;
+                }),
+            })),
+          ),
+        );
+      yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+      const runtime = yield* makePiManagedRuntimeLive(f.options);
+      const instance = yield* runtime.forInstance({
+        instanceId: providerInstanceId,
+        enabled: true,
+        configuration: {},
+      });
+      const adapter = yield* makePiAdapter({ instanceId: providerInstanceId, runtime: instance });
+      const starting = yield* adapter
+        .startSession({ threadId, runtimeMode: "approval-required" })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(starting).pipe(
+          Effect.andThen(Effect.die("Startup ended before current authority could be changed")),
+        ),
+      );
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        status: "revoked",
+      });
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(starting))._tag).toBe("Failure");
+      expect(yield* adapter.listSessions()).toEqual([]);
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual(before);
+      expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+    }),
+  ),
+);
+
+it.effect("managed ProviderService restores a replacement adapter without a caller cursor", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const native = yield* settledNativeForRead(f);
+      const before = yield* f.sql`SELECT * FROM project_team_pi_operation`;
+      const provider = ProviderDriverKind.make("piAgent");
+      const oldScope = yield* Scope.make();
+      let adapter = yield* makePiAdapter({
+        instanceId: providerInstanceId,
+        runtime: f.instance,
+        resolveOperationId: () =>
+          Effect.fail(
+            new PiManagedRuntimeError({
+              code: "denied",
+              detail: "No new initialization is authorized",
+            }),
+          ),
+      }).pipe(Scope.provide(oldScope));
+      yield* adapter.startSession({
+        threadId,
+        runtimeMode: "approval-required",
+        resumeCursor: native,
+      });
+      const changes = yield* PubSub.unbounded<void>();
+      const application = {
+        threadId,
+        providerInstanceId,
+        desiredRevision: SkillCatalogRevision.make(1),
+        appliedRevision: SkillCatalogRevision.make(0),
+        status: "pending_new_session" as const,
+        outcomes: [],
+      };
+      const services = yield* Layer.build(
+        makeProviderServiceLive().pipe(
+          // Empty authored skill state; runtime/session/SQL admission below are real.
+          Layer.provide(
+            Layer.mock(SkillCatalogService)({
+              describeSession: () => Effect.succeed(application),
+              prepareSession: () => Effect.succeed({ application }),
+              disposeSession: () => Effect.void,
+            }),
+          ),
+          Layer.provide(
+            Layer.mock(ProjectionSnapshotQuery)({
+              getCommandReadModel: () => Effect.succeed(createEmptyReadModel(at)),
+              getThreadShellById: () => Effect.succeed(Option.none()),
+            }),
+          ),
+          Layer.provide(
+            Layer.mock(OrchestrationEngineService)({
+              dispatch: () => Effect.succeed({ sequence: 0 }),
+            }),
+          ),
+          Layer.provide(
+            Layer.succeed(ProviderAdapterRegistry, {
+              getByInstance: () => Effect.suspend(() => Effect.succeed(adapter)),
+              getInstanceInfo: () =>
+                Effect.succeed({
+                  instanceId: providerInstanceId,
+                  driverKind: provider,
+                  displayName: undefined,
+                  enabled: true,
+                  continuationIdentity: {
+                    driverKind: provider,
+                    continuationKey: "startup-fixture",
+                  },
+                }),
+              listInstances: () => Effect.succeed([providerInstanceId]),
+              subscribeChanges: PubSub.subscribe(changes),
+            }),
+          ),
+          Layer.provide(
+            ProviderSessionDirectoryLive.pipe(Layer.provide(ProviderSessionRuntime.layer)),
+          ),
+          Layer.provide(AnalyticsService.layerTest),
+          Layer.provide(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
+          Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "pi-startup-service-" })),
+        ),
+      );
+      const service = Context.get(services, ProviderService);
+      const request = {
+        input: {
+          threadId,
+          providerInstanceId,
+          runtimeMode: "approval-required" as const,
+          cwd: f.worktree,
+          modelSelection: { instanceId: providerInstanceId, model },
+        },
+        primaryProjectRoot: f.main,
+        assertCurrent: f.instance.readSession(threadId).pipe(
+          Effect.mapError(
+            (error) =>
+              new ProviderValidationError({
+                operation: "startupFixture.current",
+                issue: error.code,
+              }),
+          ),
+          Effect.asVoid,
+        ),
+      };
+      const original = yield* startManagedProviderSession(service, request);
+      yield* Scope.close(oldScope, Exit.void);
+      adapter = yield* makePiAdapter({
+        instanceId: providerInstanceId,
+        runtime: f.instance,
+        resolveOperationId: () =>
+          Effect.fail(
+            new PiManagedRuntimeError({
+              code: "denied",
+              detail: "Replacement cannot reinitialize",
+            }),
+          ),
+      });
+      expect(yield* startManagedProviderSession(service, request)).toEqual(original);
+      expect((yield* adapter.listSessions())[0]?.resumeCursor).toEqual(native);
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual(before);
+      expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+    }),
+  ),
+);
+
 it.effect(
   "admits the exact committed native view and rejects a changed durable resource hash without launch",
   () =>
@@ -4726,8 +4963,15 @@ it.effect(
         const f = yield* fixture;
         const native = yield* settledNativeForRead(f);
         expect((yield* f.instance.readSession(threadId)).resumeCursor).toEqual(native);
+        const readStart = f.instance.readSessionForStart;
+        if (!readStart) return yield* Effect.die("Production runtime has no startup discovery");
+        expect(yield* readStart(threadId)).toMatchObject({
+          kind: "existing",
+          session: { resumeCursor: native },
+        });
         yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json, '$.resourceHash', ${"a".repeat(64)})`;
         yield* rejected(f.instance.readSession(threadId));
+        yield* rejected(readStart(threadId));
         expect(f.launches).toBe(0);
         expect(f.transports).toBe(0);
       }),
@@ -4749,12 +4993,20 @@ it.effect(
         ]);
         const native = yield* settledNativeForRead(f, resourceHash);
         expect((yield* f.instance.readSession(threadId, f.plan)).resumeCursor).toEqual(native);
+        const readStart = f.instance.readSessionForStart;
+        if (!readStart) return yield* Effect.die("Production runtime has no startup discovery");
+        expect(yield* readStart(threadId, f.plan)).toMatchObject({
+          kind: "existing",
+          session: { resumeCursor: native },
+        });
         expect(yield* f.fs.readDirectory(f.cache)).toEqual([]);
         const badPlan = structuredClone(f.plan);
         Object.assign(badPlan, { desiredRevision: -1 });
         yield* rejected(f.instance.readSession(threadId, badPlan));
+        yield* rejected(readStart(threadId, badPlan));
         yield* f.fs.writeFileString(f.skill.packagePath + "/SKILL.md", "Changed selected source");
         yield* rejected(f.instance.readSession(threadId, f.plan));
+        yield* rejected(readStart(threadId, f.plan));
         yield* rejected(f.instance.readThread(threadId));
         expect(yield* f.fs.readDirectory(f.cache)).toEqual([]);
         expect(f.launches).toBe(0);
