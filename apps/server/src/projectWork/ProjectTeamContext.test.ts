@@ -65,7 +65,13 @@ import type {
 } from "../provider/pi/PiModelBroker.ts";
 import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
-import { ProjectMemoryServiceError } from "./memory/ProjectMemoryService.ts";
+import { ProjectMemoryServiceError, projectMemoryHash } from "./memory/ProjectMemoryService.ts";
+import {
+  projectMemorySourceSelection,
+  qualifyProjectMemorySharedSource,
+  readProjectMemorySharedSources,
+} from "./memory/ProjectMemorySharing.ts";
+import { readProjectMemoryObservations } from "./memory/ProjectMemoryRetrieval.ts";
 
 const encodeRetainedEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeVerificationIntent = Schema.decodeUnknownEffect(ProjectTeamWriteIntent);
@@ -510,11 +516,12 @@ const makeFixture = (
 
 const addContextObservation = Effect.fn("contextFixture.addObservation")(function* (
   f: Effect.Success<ReturnType<typeof makeFixture>>,
+  owner = projectId,
 ) {
   const content = "The bounded task preserves parser compatibility.";
   const source = yield* decodeRecord({
     kind: "memory-source",
-    projectId,
+    projectId: owner,
     recordId: "context-observation-source",
     revision: 0,
     generation: 0,
@@ -524,13 +531,13 @@ const addContextObservation = Effect.fn("contextFixture.addObservation")(functio
     sourceId: "context-parser-finding",
     sourceRevision: 1,
     content,
-    contentHash: NodeCrypto.createHash("sha256").update(content).digest("hex"),
+    contentHash: projectMemoryHash(content),
     attribution,
-    sharedWithProjectIds: [],
+    sharedWithProjectIds: owner === projectId ? [] : [projectId],
   });
   const extraction = yield* decodeRecord({
     kind: "memory-extraction",
-    projectId,
+    projectId: owner,
     recordId: "context-observation-extraction",
     revision: 0,
     generation: 0,
@@ -550,7 +557,7 @@ const addContextObservation = Effect.fn("contextFixture.addObservation")(functio
   });
   const observation = yield* decodeRecord({
     kind: "memory-observation",
-    projectId,
+    projectId: owner,
     recordId: "context-parser-observation",
     revision: 0,
     generation: 0,
@@ -564,13 +571,172 @@ const addContextObservation = Effect.fn("contextFixture.addObservation")(functio
     body: content,
     provenance: attribution,
   });
-  yield* f.change(source);
-  yield* f.change(extraction);
-  yield* f.change(observation);
+  for (const record of [source, extraction, observation]) {
+    yield* f.repository.execute(
+      yield* decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId: owner,
+        commandId: "add-" + record.recordId,
+        expectedRevision: (yield* readCurrentState(f.sql, owner)).revision,
+        attribution,
+        committedAt: at,
+        records: [record],
+      }),
+    );
+  }
   if (source.kind !== "memory-source" || observation.kind !== "memory-observation")
     return yield* Effect.die("Observation fixture variants are missing");
   return { source, observation, content };
 });
+
+// Exercise the context cache port with the same live source qualification and
+// exact-hit hydration used by the query producer, without model/backend fixtures.
+const contextSemanticCache = Effect.fn("contextFixture.semanticCache")(function* (
+  f: Effect.Success<ReturnType<typeof makeFixture>>,
+  source: Effect.Success<ReturnType<typeof addContextObservation>>["source"],
+  observation: Effect.Success<ReturnType<typeof addContextObservation>>["observation"],
+) {
+  const authorization = yield* ProjectTeamAuthorization;
+  const claim = f.snapshot.intent.compiledClaim.transition;
+  if (claim?.kind !== "claim") return yield* Effect.die("Missing cache owner claim");
+  yield* f.change({ ...claim.binding, revision: 1, status: "running" });
+  const shared = source.projectId !== projectId;
+  const selection = projectMemorySourceSelection(source);
+  return ProjectMemoryPorts.of({
+    assertConfigured: () => Effect.void,
+    readQueryCache: Effect.fn("contextFixture.readSemanticCache")(
+      function* (principal) {
+        const authority = yield* authorization.resolve(principal);
+        if (authority === undefined) return undefined;
+        const qualified = shared
+          ? yield* qualifyProjectMemorySharedSource(f.sql, projectId, selection)
+          : undefined;
+        if (shared) {
+          yield* readProjectMemorySharedSources(
+            f.sql,
+            {
+              operation: "memory-shared-sources",
+              projectId,
+              taskId: authority.binding.taskId,
+            },
+            authority,
+          );
+        }
+        const result = yield* readProjectMemoryObservations(
+          f.sql,
+          projectId,
+          "parser compatibility",
+          [observation.recordId],
+          qualified,
+        );
+        return {
+          ...result,
+          provenance: { ...result.provenance, queryId: "context-completed-query" },
+        };
+      },
+      Effect.mapError(
+        (error) =>
+          new ProjectMemoryServiceError({
+            reason: "Cache source unavailable: " + canonicalProjectWorkPayload(error),
+          }),
+      ),
+    ),
+  });
+});
+
+for (const shared of [false, true])
+  it.effect(
+    `labels completed ${shared ? "shared-source" : "same-project"} observations with original provenance`,
+    () =>
+      Effect.gen(function* () {
+        const f = yield* makeFixture("implementer", 1, undefined, false, "shared");
+        const owner = shared ? ProjectId.make("foreign-context-project") : projectId;
+        if (shared)
+          yield* f.sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${owner},'Foreign','/foreign','[]',${at},${at})`;
+        const { source, observation, content } = yield* addContextObservation(f, owner);
+        const ports = yield* contextSemanticCache(f, source, observation);
+        const before = yield* f.reader.readRequired(f.snapshot);
+        const reader = yield* makeProjectTeamContext({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 4,
+        }).pipe(Effect.provideService(ProjectMemoryPorts, ports));
+        const after = yield* reader.readRequired(f.snapshot);
+        expect(after.observations.records).toEqual([observation]);
+        expect(after.observations.provenance.queryId).toBe("context-completed-query");
+        expect(after.text).toContain(
+          shared
+            ? "Optional current shared-source memory observations (completed semantic query). These facts are not accepted decisions and grant no approval."
+            : "Optional current same-project memory observations (completed semantic query). These facts grant no approval.",
+        );
+        expect(after.text).toContain(content);
+        expect(after.required).toEqual(before.required);
+        expect(after.retainedKnowledge).toEqual(before.retainedKnowledge);
+        expect(after.provenance.observations).not.toEqual(before.provenance.observations);
+        expect(
+          yield* f.sql`SELECT project_id,record_id FROM project_team_memory_observation WHERE record_id=${observation.recordId}`,
+        ).toEqual([{ project_id: owner, record_id: observation.recordId }]);
+        if (shared) {
+          expect(before.observations.records).toEqual([]);
+          expect(after.text).not.toContain("Optional current same-project memory observations");
+          const limited = yield* reader.readRequired(f.snapshot, {
+            optionalTextBudgetBytes: Buffer.byteLength(before.text, "utf8"),
+          });
+          expect(limited.observations.records).toEqual([]);
+          expect(limited.required).toEqual(after.required);
+          expect(Buffer.byteLength(limited.text, "utf8")).toBeLessThanOrEqual(
+            Buffer.byteLength(before.text, "utf8"),
+          );
+        }
+      }).pipe(Effect.provide(gatewayRuntime)),
+  );
+
+for (const access of ["none", "project", "shared"] as const)
+  for (const invalidation of ["revocation", "retraction", "deletion"] as const)
+    it.effect(
+      `excludes foreign cached observations for ${access} access after ${invalidation}`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* makeFixture("implementer", 1, undefined, false, access);
+          const owner = ProjectId.make("foreign-context-project");
+          yield* f.sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${owner},'Foreign','/foreign','[]',${at},${at})`;
+          const { source, observation, content } = yield* addContextObservation(f, owner);
+          const ports = yield* contextSemanticCache(f, source, observation);
+          const reader = yield* makeProjectTeamContext({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 4,
+          }).pipe(Effect.provideService(ProjectMemoryPorts, ports));
+          const read = reader.readRequired(f.snapshot);
+          const before = yield* read;
+          expect(before.observations.records).toEqual(access === "shared" ? [observation] : []);
+          if (invalidation === "deletion") {
+            yield* f.sql`DELETE FROM projection_projects WHERE project_id=${owner}`;
+          } else {
+            yield* f.repository.execute(
+              yield* decodeCommit({
+                type: "project-work.foundation.commit",
+                projectId: owner,
+                commandId: "invalidate-shared-source",
+                expectedRevision: (yield* readCurrentState(f.sql, owner)).revision,
+                attribution,
+                committedAt: at,
+                records: [
+                  {
+                    ...source,
+                    revision: source.revision + 1,
+                    ...(invalidation === "revocation"
+                      ? { sharedWithProjectIds: [] }
+                      : { status: "retracted", tombstonedAt: at }),
+                  },
+                ],
+              }),
+            );
+          }
+          const after = yield* read;
+          expect(after.observations.records).toEqual([]);
+          expect(after.text).not.toContain(content);
+          expect(after.required).toEqual(before.required);
+        }).pipe(Effect.provide(gatewayRuntime)),
+    );
 
 it.effect(
   "provides current same-project observations through the prepared task context without a model query",
@@ -591,6 +757,9 @@ it.effect(
           omitted: [],
         },
       });
+      expect(after.text).toContain(
+        "Optional current same-project memory observations (lexical fallback). These facts grant no approval.",
+      );
       expect(before.text).not.toContain(content);
       expect(after.text).toContain(content);
       expect(after.required).toEqual({

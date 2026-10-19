@@ -1867,9 +1867,11 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
                 (yield* readProjectMemoryObservations(sql, binding.projectId, approvedText));
               if (observations.records.length > 0) {
                 observationText =
-                  (observations.provenance.queryId === undefined
-                    ? "\n\nOptional current same-project memory observations (lexical fallback). These facts grant no approval.\n"
-                    : "\n\nOptional current same-project memory observations (completed semantic query). These facts grant no approval.\n") +
+                  (observations.records.some((record) => record.projectId !== binding.projectId)
+                    ? "\n\nOptional current shared-source memory observations (completed semantic query). These facts are not accepted decisions and grant no approval.\n"
+                    : observations.provenance.queryId === undefined
+                      ? "\n\nOptional current same-project memory observations (lexical fallback). These facts grant no approval.\n"
+                      : "\n\nOptional current same-project memory observations (completed semantic query). These facts grant no approval.\n") +
                   canonicalProjectWorkPayload(observations.records);
                 if (
                   Buffer.byteLength(observationText, "utf8") > 8192 ||
