@@ -5,6 +5,8 @@ import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as TestClock from "effect/testing/TestClock";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Scope from "effect/Scope";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
 import type * as Cause from "effect/Cause";
@@ -20,7 +22,10 @@ import {
 } from "./PiManagedProcess.ts";
 
 /** Every command is intercepted. This proves consuming control flow, not Linux behavior. */
-const fixture = Effect.fn("fixture")(function* (runtimeSeconds = 30) {
+const fixture = Effect.fn("fixture")(function* (
+  runtimeSeconds = 30,
+  probe: "success" | "nonzero" | "timeout" | "cancel" = "success",
+) {
   const fs = yield* FileSystem.FileSystem;
   const workspaceRoot = yield* fs.makeTempDirectoryScoped();
   const protectedRoot = yield* fs.makeTempDirectoryScoped();
@@ -47,6 +52,10 @@ const fixture = Effect.fn("fixture")(function* (runtimeSeconds = 30) {
     swapBytes: 0,
     oomGroup: 1,
   };
+  const fixtureScope = yield* Effect.scope;
+  const probeEntered = yield* Deferred.make<void>();
+  let probeScratch: string | undefined;
+  let scratchAtActivation = false;
   let stopped = false;
   let args: readonly string[] = [];
   let captures = 0;
@@ -73,8 +82,28 @@ const fixture = Effect.fn("fixture")(function* (runtimeSeconds = 30) {
     Effect.gen(function* () {
       if (command._tag !== "StandardCommand")
         return yield* Effect.die("Unexpected controlled command");
-      if (command.command === "/usr/bin/python3" && command.args[0] === "-c") return text("");
+      if (command.command === "/usr/bin/python3" && command.args[0] === "-c") {
+        // Simulate Python's old child-owned directory without launching any native command.
+        probeScratch =
+          command.args[2] ?? (yield* fs.makeTempDirectory({ prefix: "t3-bwrap-probe-" }));
+        const scratch = probeScratch;
+        yield* Scope.addFinalizer(
+          fixtureScope,
+          fs.remove(scratch, { recursive: true, force: true }).pipe(Effect.orDie),
+        );
+        yield* fs.writeFileString(`${scratch}/probe-marker`, "controlled probe");
+        if (command.args[2] === undefined && (probe === "success" || probe === "nonzero"))
+          yield* fs.remove(scratch, { recursive: true });
+        yield* Deferred.succeed(probeEntered, undefined);
+        return handle(
+          Stream.empty,
+          probe === "timeout" || probe === "cancel"
+            ? Effect.never
+            : Effect.succeed(ChildProcessSpawner.ExitCode(probe === "nonzero" ? 1 : 0)),
+        );
+      }
       if (command.command === "/usr/bin/systemd-run") {
+        scratchAtActivation = probeScratch !== undefined && (yield* fs.exists(probeScratch));
         args = command.args;
         yield* Queue.offer(frames, Buffer.from(canonicalProjectWorkPayload(owner) + "\n"));
         return handle(Stream.fromQueue(frames), Deferred.await(exited));
@@ -135,6 +164,9 @@ const fixture = Effect.fn("fixture")(function* (runtimeSeconds = 30) {
     controlledFs,
     owner,
     readArgs: () => args,
+    probeEntered,
+    probeScratch: () => probeScratch,
+    scratchAtActivation: () => scratchAtActivation,
     recoveryRuntime: (value: string) => {
       recoveryRuntime = value;
     },
@@ -332,3 +364,43 @@ it.effect(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );
+
+for (const mode of ["success", "nonzero", "timeout", "cancel"] as const)
+  it.effect(`parent removes capability scratch on ${mode} before activation or return`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture(30, mode);
+        let claims = 0;
+        const acquisition = acquirePiManagedProcess(f.launch, {
+          allocation: f.allocation,
+          claimActivation: () =>
+            Effect.sync(() => {
+              claims++;
+            }),
+          beforeStart: () => f.capture(),
+        }).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, f.spawner),
+          Effect.provideService(FileSystem.FileSystem, f.controlledFs),
+        );
+        const pending = yield* acquisition.pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(f.probeEntered);
+        const scratch = f.probeScratch();
+        expect(scratch).toBeDefined();
+        if (!scratch) return;
+        if (mode === "timeout") yield* TestClock.adjust("3 seconds");
+        if (mode === "cancel") yield* Fiber.interrupt(pending);
+        else {
+          const result = yield* Fiber.join(pending);
+          if (mode === "success") {
+            expect(result._tag).toBe("Success");
+            if (result._tag === "Success") yield* result.success.stop;
+          } else
+            expect(result).toMatchObject({ _tag: "Failure", failure: { phase: "unavailable" } });
+        }
+        expect(yield* f.controlledFs.exists(scratch)).toBe(false);
+        expect(f.scratchAtActivation()).toBe(false);
+        expect(claims).toBe(mode === "success" ? 1 : 0);
+        expect(f.captures()).toBe(mode === "success" ? 1 : 0);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );

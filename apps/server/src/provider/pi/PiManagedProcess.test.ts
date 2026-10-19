@@ -288,11 +288,13 @@ describe("managed bubblewrap compatibility", () => {
           let probeCalls = 0;
           let unitLaunches = 0;
           let probeClosed = false;
+          let probeScratch: string | undefined;
           const spawner = ChildProcessSpawner.make((command) => {
             if (command._tag === "StandardCommand" && command.command === "/usr/bin/python3") {
               probeCalls++;
-              expect(command.args).toHaveLength(2);
+              expect(command.args).toHaveLength(3);
               expect(command.args[0]).toBe("-c");
+              probeScratch = command.args[2];
               for (const option of [
                 "--unshare-all",
                 "--die-with-parent",
@@ -357,6 +359,8 @@ describe("managed bubblewrap compatibility", () => {
           expect(unitLaunches).toBe(0);
           expect(probeCalls).toBe(1);
           expect(probeClosed).toBe(true);
+          expect(probeScratch).toBeDefined();
+          if (probeScratch) yield* absent(probeScratch);
         }),
       ),
     );

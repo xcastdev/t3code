@@ -858,7 +858,14 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         let native: typeof Native.Type;
         try {
           if (subscription) {
-            const responsePayload: unknown = JSON.parse(data);
+            let responsePayload: unknown;
+            try {
+              responsePayload = JSON.parse(data);
+            } catch (error) {
+              // Completion seals semantics; parse trailers only when possible to scan decoded secrets.
+              if (done) return;
+              throw error;
+            }
             const scanValue = (value: unknown): void => {
               if (typeof value === "string") {
                 if (
@@ -1021,7 +1028,8 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
               }),
             );
             if (adapted.terminal) {
-              if (!subscriptionStarted || !subscriptionResponseId) fail("SSE_ACCOUNTING_REQUIRED");
+              if ((!subscriptionStarted && !terminalFailure) || !subscriptionResponseId)
+                fail("SSE_ACCOUNTING_REQUIRED");
               contentSeen = true;
               finishSeen = true;
             }

@@ -190,6 +190,12 @@ const compatibilityCases = [
   },
   { name: "DONE before completion", wire: done + textStream },
   { name: "DONE after completion", wire: textStream + done },
+  ...["{", "not-json", '{"type":'].flatMap((payload) =>
+    ["\n\n", ""].map((suffix) => ({
+      name: `malformed postterminal JSON ${JSON.stringify(payload + suffix)}`,
+      wire: textStream + `data: ${payload}` + suffix,
+    })),
+  ),
   {
     name: "postterminal event",
     wire: textStream + event({ type: "response.future_annotation" }),
@@ -252,17 +258,22 @@ describe("synthetic subscription SSE replay through pinned SDK", () => {
     },
   );
 
-  it.each([
-    { reportedUsage: usage, input: 16384, output: 2048 },
-    {
-      reportedUsage: { ...usage, input_tokens: 20000, output_tokens: 3000, total_tokens: 23000 },
-      input: 20000,
-      output: 3000,
-    },
-  ])(
+  it.each(
+    [
+      { reportedUsage: usage, input: 16384, output: 2048 },
+      {
+        reportedUsage: { ...usage, input_tokens: 20000, output_tokens: 3000, total_tokens: 23000 },
+        input: 20000,
+        output: 3000,
+      },
+    ].flatMap((test) => [true, false].map((started) => ({ ...test, started }))),
+  )(
     "retains validated upstream failure usage and existing maximum charges (%#)",
-    async ({ reportedUsage, input, output }) => {
-      const r = await replay(upstreamError("response.failed", reportedUsage), true);
+    async ({ reportedUsage, input, output, started }) => {
+      const r = await replay(
+        upstreamError("response.failed", reportedUsage).slice(started ? 0 : created.length),
+        true,
+      );
       expect(r.brokerFailure).toMatchObject({ code: "SSE_UPSTREAM_ERROR" });
       expect(r.result.stopReason).toBe("error");
       expect(r.settlements).toMatchObject([

@@ -705,19 +705,25 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
   const { control, managerEnv } = yield* makeManagedControl();
   // Fixed no-op exercises the actual launch options, independent of release labels.
   // Private scratch is the only writable host bind; the inherited root is read-only.
-  const capability = yield* control("/usr/bin/python3", [
-    "-c",
-    `import os, subprocess, sys, tempfile
-with tempfile.TemporaryDirectory(prefix="t3-bwrap-probe-") as scratch:
-    root = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-    writable = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        sys.exit(subprocess.call(["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv", "--ro-bind-fd", str(root), "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind-fd", str(writable), "/tmp/probe", "--ro-bind-fd", str(writable), "/tmp/probe-readonly", "--setenv", "HOME", "/tmp/probe", "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "LANG", "C.UTF-8", "--remount-ro", "/", "--chdir", "/tmp/probe", "--", "/usr/bin/true"], pass_fds=(root, writable), env={}))
-    finally:
-        os.close(writable)
-        os.close(root)
+  const capability = yield* Effect.scoped(
+    Effect.gen(function* () {
+      // The parent removes scratch even if the control child is interrupted or times out.
+      const scratch = yield* fs.makeTempDirectoryScoped({ prefix: "t3-bwrap-probe-" });
+      return yield* control("/usr/bin/python3", [
+        "-c",
+        `import os, subprocess, sys
+root = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+writable = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    sys.exit(subprocess.call(["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv", "--ro-bind-fd", str(root), "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind-fd", str(writable), "/tmp/probe", "--ro-bind-fd", str(writable), "/tmp/probe-readonly", "--setenv", "HOME", "/tmp/probe", "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "LANG", "C.UTF-8", "--remount-ro", "/", "--chdir", "/tmp/probe", "--", "/usr/bin/true"], pass_fds=(root, writable), env={}))
+finally:
+    os.close(writable)
+    os.close(root)
 `,
-  ]).pipe(
+        scratch,
+      ]);
+    }),
+  ).pipe(
     Effect.mapError(
       () =>
         new PiManagedProcessError({

@@ -2496,3 +2496,54 @@ it("cancels and awaits a pending missing-MIME prefix read at its original deadli
     chargedOutputTokens: 64_000,
   });
 });
+
+// A standalone failed terminal can account usage, but cannot relax identity or usage checks.
+it.each([
+  { name: "missing identity", response: { id: "" }, code: "SSE_ACCOUNTING_REQUIRED" },
+  { name: "wrong model", response: { model: "foreign-model" }, code: "SSE_MODEL_REJECTED" },
+  {
+    name: "inconsistent usage",
+    response: { usage: { input_tokens: 50, output_tokens: 10, total_tokens: 59 } },
+    code: "SSE_USAGE_INVALID",
+  },
+  {
+    name: "malformed usage",
+    response: { usage: { input_tokens: -1, output_tokens: 10, total_tokens: 9 } },
+    code: "SSE_USAGE_INVALID",
+  },
+  {
+    name: "mismatched identity",
+    response: { id: "foreign-response" },
+    code: "SSE_MODEL_REJECTED",
+    started: true,
+  },
+])("retains standalone failure guard: $name", async ({ response, code, started }) => {
+  const stream =
+    (started
+      ? event({
+          type: "response.created",
+          response: { id: "response-1", model, status: "in_progress" },
+        })
+      : "") +
+    event({
+      type: "response.failed",
+      response: {
+        id: "response-1",
+        model,
+        status: "failed",
+        usage: { input_tokens: 50, output_tokens: 10, total_tokens: 60 },
+        ...response,
+      },
+    });
+  const f = fixture({ transport: async () => new Response(stream) });
+  await expect(f.invoke()).rejects.toMatchObject({ code });
+  expect(f.settlements).toMatchObject([
+    {
+      outcome: "unknown",
+      chargedInputTokens: 16384,
+      chargedOutputTokens: 64000,
+      failureCode: code,
+      transportDrained: true,
+    },
+  ]);
+});
