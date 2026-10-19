@@ -79,6 +79,12 @@ const paddedSuccess = (obfuscation: unknown) =>
     '"delta":"bounded result"',
     `"delta":"bounded result","obfuscation":${JSON.stringify(obfuscation)}`,
   );
+const responseMetadata = {
+  type: "response.metadata",
+  sequence_number: 1,
+  response_id: "response-1",
+  metadata: { openai_verification_recommendation: ["gpt-6-luna"] },
+};
 const sdkModel = {
   id: model,
   name: "GPT-6 Luna",
@@ -211,6 +217,7 @@ describe("Pi OpenAI subscription broker", () => {
     "valid",
     "sdk-metadata",
     "sdk-null-caller",
+    "response-metadata",
     "arguments",
     "identity",
     "item-id",
@@ -313,6 +320,7 @@ describe("Pi OpenAI subscription broker", () => {
             item: { ...call, id: "fc_extra", call_id: "extra-call" },
           })
         : "") +
+      (mutation === "response-metadata" ? event(responseMetadata) : "") +
       event({
         type: "response.completed",
         response: {
@@ -385,11 +393,18 @@ describe("Pi OpenAI subscription broker", () => {
     expect(joined).toBeDefined();
     await joined;
     const calls = result.content.filter((part) => part.type === "toolCall");
-    if (mutation === "valid" || mutation === "sdk-metadata" || mutation === "sdk-null-caller") {
+    if (
+      mutation === "valid" ||
+      mutation === "sdk-metadata" ||
+      mutation === "sdk-null-caller" ||
+      mutation === "response-metadata"
+    ) {
       expect(brokerFailure).toBeUndefined();
       expect(result.stopReason).toBe("toolUse");
       expect(calls).toMatchObject([{ id: "call-1|fc_1", name: "lookup", arguments: { key: "A" } }]);
       expect(f.settlements).toMatchObject([{ outcome: "reported", transportDrained: true }]);
+      if (mutation === "response-metadata")
+        expect(Buffer.concat(f.chunks).toString()).toContain(event(responseMetadata));
     } else {
       expect(brokerFailure).toMatchObject({
         code:
@@ -401,6 +416,73 @@ describe("Pi OpenAI subscription broker", () => {
       expect(calls.some((call) => call.arguments.key === "B")).toBe(false);
       expect(f.settlements).toMatchObject([{ outcome: "unknown" }]);
     }
+  });
+
+  it("requires terminal accounting after response metadata with usage-shaped annotations", async () => {
+    const stream =
+      event({
+        type: "response.created",
+        response: { id: "response-1", model, status: "in_progress" },
+      }) +
+      event({
+        ...responseMetadata,
+        metadata: {
+          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+          status: "completed",
+        },
+      });
+    const f = fixture({
+      transport: async () =>
+        new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_ACCOUNTING_REQUIRED" });
+    expect(f.settlements).toMatchObject([{ outcome: "unknown", transportDrained: true }]);
+  });
+
+  it("requires a real response start before response metadata can precede completion", async () => {
+    const stream =
+      event(responseMetadata) +
+      event({
+        type: "response.completed",
+        response: {
+          id: "response-1",
+          model,
+          status: "completed",
+          output: [],
+          usage: { input_tokens: 50, output_tokens: 10, total_tokens: 60 },
+        },
+      });
+    const f = fixture({
+      transport: async () =>
+        new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code: "SSE_ACCOUNTING_REQUIRED" });
+    expect(f.settlements).toMatchObject([{ outcome: "unknown", transportDrained: true }]);
+  });
+
+  it.each([
+    ["missing response identity", { response_id: undefined }, "SSE_FRAME_INVALID"],
+    ["empty response identity", { response_id: "" }, "SSE_FRAME_INVALID"],
+    ["foreign response identity", { response_id: "foreign-response" }, "SSE_MODEL_REJECTED"],
+    ["missing metadata", { metadata: undefined }, "SSE_FRAME_INVALID"],
+    ["null metadata", { metadata: null }, "SSE_FRAME_INVALID"],
+    ["array metadata", { metadata: [] }, "SSE_FRAME_INVALID"],
+    ["text metadata", { metadata: "annotation" }, "SSE_FRAME_INVALID"],
+    ["negative sequence", { sequence_number: -1 }, "SSE_FRAME_INVALID"],
+    ["extra field", { unexpected: true }, "SSE_FRAME_INVALID"],
+    ["credential echo", { metadata: { annotation: credential } }, "CREDENTIAL_ECHO_REJECTED"],
+    ["account echo", { metadata: { annotation: accountId } }, "CREDENTIAL_ECHO_REJECTED"],
+  ] as const)("rejects response metadata with %s", async (_label, fields, code) => {
+    const stream = success().replace(
+      "event: response.completed",
+      event({ ...responseMetadata, ...fields }) + "event: response.completed",
+    );
+    const f = fixture({
+      transport: async () =>
+        new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+    });
+    await expect(f.invoke()).rejects.toMatchObject({ code });
+    expect(f.settlements).toMatchObject([{ outcome: "unknown", transportDrained: true }]);
   });
 
   it.each([

@@ -5,6 +5,7 @@ import { PI_WORKER_MAX_RESPONSE_BYTES, PI_WORKER_MAX_TEXT_PART_BYTES } from "./P
 const Json = Schema.decodeUnknownSync(Schema.Json);
 const UnknownRecord = Schema.Record(Schema.String, Schema.Unknown);
 const isRecord = Schema.is(UnknownRecord);
+const isJsonObject = Schema.is(Schema.JsonObject);
 const canonical = (value: Schema.Json): string => {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -375,23 +376,28 @@ export function decodePiSubscriptionEvent(
 ): PiSubscriptionEvent {
   if (
     !isRecord(payload) ||
-    !only(payload, [
-      "type",
-      "sequence_number",
-      "response",
-      "item_id",
-      "output_index",
-      "content_index",
-      "summary_index",
-      "delta",
-      "item",
-      "arguments",
-      "text",
-      "content_part",
-      "part",
-      "logprobs",
-      "obfuscation",
-    ]) ||
+    !only(
+      payload,
+      eventType === "response.metadata"
+        ? ["type", "sequence_number", "response_id", "metadata"]
+        : [
+            "type",
+            "sequence_number",
+            "response",
+            "item_id",
+            "output_index",
+            "content_index",
+            "summary_index",
+            "delta",
+            "item",
+            "arguments",
+            "text",
+            "content_part",
+            "part",
+            "logprobs",
+            "obfuscation",
+          ],
+    ) ||
     payload.type !== eventType ||
     (payload.obfuscation !== undefined &&
       (!eventType.endsWith(".delta") || !text(payload.obfuscation))) ||
@@ -399,6 +405,20 @@ export function decodePiSubscriptionEvent(
       (!Number.isSafeInteger(payload.sequence_number) || Number(payload.sequence_number) < 0))
   )
     throw new Error("SSE_FRAME_INVALID");
+  if (eventType === "response.metadata") {
+    if (
+      !text(payload.response_id) ||
+      payload.response_id.length === 0 ||
+      !isJsonObject(payload.metadata)
+    )
+      throw new Error("SSE_FRAME_INVALID");
+    // Annotations retain response identity; completion frames still own all usage accounting.
+    return {
+      responseId: payload.response_id,
+      chunk: { model: expectedModel, choices: [{ index: 0, delta: {}, finish_reason: null }] },
+      semanticText: "",
+    };
+  }
   if (eventType.endsWith(".delta")) {
     if (
       !text(payload.delta) ||
