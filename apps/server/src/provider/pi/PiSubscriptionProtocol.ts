@@ -16,6 +16,10 @@ const canonical = (value: Schema.Json): string => {
 };
 const only = (value: Record<string, unknown>, keys: readonly string[]) =>
   Object.keys(value).every((key) => keys.includes(key));
+// Approved system context has its own bound; ordinary identifiers and fields stay smaller.
+export const PI_SUBSCRIPTION_MAX_INSTRUCTIONS_BYTES = 49_152;
+const instructionsText = (value: unknown): value is string =>
+  typeof value === "string" && Buffer.byteLength(value) <= PI_SUBSCRIPTION_MAX_INSTRUCTIONS_BYTES;
 const text = (value: unknown): value is string =>
   typeof value === "string" && Buffer.byteLength(value) <= 12_288;
 export const isPiSubscriptionCallId = (value: unknown): value is string =>
@@ -189,7 +193,7 @@ export function decodePiSubscriptionRequest(body: string, model: string): PiSubs
     value.model !== model ||
     value.store !== false ||
     value.stream !== true ||
-    !text(value.instructions) ||
+    !instructionsText(value.instructions) ||
     !Array.isArray(value.input) ||
     value.input.length > 128 ||
     !isRecord(value.text) ||

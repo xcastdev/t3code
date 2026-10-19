@@ -1,10 +1,20 @@
 import * as NodeZlib from "node:zlib";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, type Message } from "@earendil-works/pi-ai";
 import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { describe, expect, it } from "vite-plus/test";
-import { accountId, credential, event, fixture, sdkModel } from "./PiSubscriptionTestKit.ts";
-import { PI_WORKER_MAX_RESPONSE_BYTES } from "./PiWorkerProtocol.ts";
+import {
+  accountId,
+  credential,
+  endpoint,
+  event,
+  fixture,
+  model,
+  sdkModel,
+} from "./PiSubscriptionTestKit.ts";
+import { makePiModelBroker } from "./PiModelBroker.ts";
+import { decodePiSubscriptionRequest } from "./PiSubscriptionProtocol.ts";
+import { PI_WORKER_MAX_REQUEST_BYTES, PI_WORKER_MAX_RESPONSE_BYTES } from "./PiWorkerProtocol.ts";
 import {
   completed,
   created,
@@ -163,6 +173,174 @@ const unknownRejection = (r: Awaited<ReturnType<typeof replay>>, code: string) =
   expect(r.settlements[0]?.reportedUsage).toBeUndefined();
 };
 
+// Exercise both complete request builders, including the SDK-produced assistant history.
+// Lengths match fixture29; all content here is synthetic.
+const successiveRequests = async (
+  instructionsBytes: number,
+  firstWire: string,
+  toolError = false,
+) => {
+  const workerModel = {
+    ...sdkModel,
+    compat: { supportsDeveloperRole: false, maxTokensField: "max_tokens" },
+  };
+  const instructions = "x\n".repeat(1708) + "x".repeat(instructionsBytes - 3416);
+  const cwdSection = "Synthetic current directory";
+  const tools = [
+    {
+      name: "lookup",
+      description: declaredTool.function.description,
+      parameters: Type.Unsafe<{ key: string }>(parameters),
+    },
+  ];
+  const shapes: {
+    fields: string[];
+    inputTypes: string[];
+    inputCount: number;
+    bodyBytes: number;
+    normalizedBytes: number;
+  }[] = [];
+  const settlements: string[] = [];
+  let transports = 0;
+  let fetches = 0;
+  const broker = makePiModelBroker({
+    workerId: "worker",
+    generation: 7,
+    operationId: "operation",
+    routeId: "openai-subscription-luna",
+    provider: "openai-codex",
+    model,
+    endpoint,
+    tools: [declaredTool],
+    acceptedReportedModels: [model],
+    maxInputTokens: 32768,
+    maxOutputTokens: 2048,
+    deadlineMs: 10000,
+    requiredSystemText: instructions + "\n\n" + cwdSection,
+    bindRequestInput: async () => {},
+    authorizeCurrent: async () => {},
+    authorizeSubscriptionTest: async () => {},
+    getCredential: async () => credential,
+    reserveRequest: async () => ({ reservationId: `reservation-${fetches}` }),
+    settleRequest: async (settlement) => {
+      settlements.push(settlement.outcome);
+      return { accountingReceiptId: `accounted-${fetches}` };
+    },
+    transport: async (url) => {
+      expect(url).toBe(endpoint);
+      return response(transports++ === 0 ? firstWire : textStream);
+    },
+  });
+  const messages: Message[] = [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "Session initialized. Approved context is supplied separately." },
+      ],
+      timestamp: 1,
+    },
+    {
+      role: "system",
+      content: "",
+      sections: { preamble: instructions, cwd: cwdSection },
+      toolsAdded: tools,
+      timestamp: 2,
+    },
+    { role: "user", content: "Review the assignment. " + "p".repeat(4507), timestamp: 3 },
+  ];
+  const run = async () => {
+    let joined: Promise<void> | undefined;
+    const sdk = streamCodexResponses(workerModel, normalizeContext({ messages }), {
+      apiKey: credential,
+      reasoningEffort: "high",
+      serviceTier: "default",
+      transport: "sse",
+      maxRetries: 0,
+      sessionId: "synthetic-reviewer-session",
+      fetch: async (_url, init) => {
+        const id = ++fetches;
+        const encoded = init?.body;
+        const request =
+          typeof encoded === "string"
+            ? encoded
+            : encoded instanceof Uint8Array &&
+                new Headers(init?.headers).get("content-encoding") === "zstd"
+              ? NodeZlib.zstdDecompressSync(encoded, {
+                  maxOutputLength: PI_WORKER_MAX_REQUEST_BYTES,
+                }).toString("utf8")
+              : undefined;
+        if (request === undefined) throw Error("SDK request body absent");
+        const adapted = decodePiSubscriptionRequest(request, model);
+        const value = JSON.parse(request);
+        shapes.push({
+          fields: Object.keys(value).sort(),
+          inputTypes: value.input.map((item: { type?: string }) => item.type ?? "message"),
+          inputCount: value.input.length,
+          bodyBytes: Buffer.byteLength(request),
+          normalizedBytes: Buffer.byteLength(adapted.normalizedBody),
+        });
+        expect(value).toMatchObject({
+          model,
+          stream: true,
+          store: false,
+          reasoning: { effort: "high", summary: "auto" },
+          service_tier: "default",
+          tool_choice: "auto",
+          parallel_tool_calls: true,
+        });
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              joined = broker
+                .request({
+                  requestId: id,
+                  body: request,
+                  signal: new AbortController().signal,
+                  onChunk: async (chunk) => {
+                    controller.enqueue(chunk);
+                  },
+                })
+                .then(
+                  () => controller.close(),
+                  (error: unknown) => controller.error(error),
+                );
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const result = await sdk.result();
+    await joined;
+    return result;
+  };
+  const first = await run();
+  messages.push(first);
+  for (const call of first.content)
+    if (first.stopReason === "toolUse" && call.type === "toolCall")
+      messages.push({
+        role: "toolResult",
+        toolCallId: call.id,
+        toolName: call.name,
+        content: [{ type: "text", text: toolError ? "Lookup failed" : "value=42" }],
+        isError: toolError,
+        timestamp: 3,
+      });
+  if (first.stopReason === "error")
+    messages.push({ role: "user", content: "Retry the review.", timestamp: 4 });
+  const second = await run();
+  expect(second.stopReason).toBe("stop");
+  expect(fetches).toBe(2);
+  expect(transports).toBe(2);
+  expect(shapes).toHaveLength(2);
+  for (const shape of shapes) {
+    expect(shape.bodyBytes).toBeLessThanOrEqual(PI_WORKER_MAX_REQUEST_BYTES);
+    expect(shape.normalizedBytes).toBeLessThanOrEqual(32768);
+  }
+  expect(shapes[1]?.fields).toEqual(shapes[0]?.fields);
+  return { first, shapes, settlements };
+};
+
 const compatibilityCases = [
   {
     name: "unknown non-tool event",
@@ -207,6 +385,45 @@ const compatibilityCases = [
 ];
 
 describe("synthetic subscription SSE replay through pinned SDK", () => {
+  it.each([10658, 24071])(
+    "actual SDK initial context and tool-result followup with %s instruction bytes",
+    async (size) => {
+      const r = await successiveRequests(size, toolStream("valid"));
+      expect(r.first.stopReason).toBe("toolUse");
+      expect(r.shapes.map((shape) => shape.inputTypes)).toEqual([
+        ["message", "message"],
+        ["message", "message", "function_call", "function_call_output"],
+      ]);
+      expect(r.settlements).toEqual(["reported", "reported"]);
+    },
+  );
+  it("actual SDK retries after a tool error with the complete tool history", async () => {
+    const r = await successiveRequests(24071, toolStream("punctuation"), true);
+    expect(r.first.stopReason).toBe("toolUse");
+    expect(r.shapes[1]?.inputTypes).toContain("function_call_output");
+    expect(r.settlements).toEqual(["reported", "reported"]);
+  });
+  it.each(["error", "response.failed"] as const)(
+    "actual SDK retry after first %s does not retain failed assistant history",
+    async (kind) => {
+      const r = await successiveRequests(24071, upstreamError(kind));
+      expect(r.first.stopReason).toBe("error");
+      expect(r.shapes[1]?.inputTypes).toEqual(["message", "message", "message"]);
+      expect(r.settlements).toEqual(["unknown", "reported"]);
+    },
+  );
+
+  it("actual SDK retry drops a tool call from a failed partial assistant", async () => {
+    const wire =
+      toolStream("valid").split("event: response.completed")[0] +
+      upstreamError("error").slice(created.length);
+    const r = await successiveRequests(24071, wire);
+    expect(r.first.stopReason).toBe("error");
+    expect(r.first.content).toEqual([]);
+    expect(r.shapes[1]?.inputTypes).toEqual(["message", "message", "message"]);
+    expect(r.settlements).toEqual(["unknown", "reported"]);
+  });
+
   it.each([false, true])("baseline through broker=%s", async (throughBroker) => {
     const r = await replay(textStream, throughBroker);
     expect(r.result.stopReason).toBe("stop");

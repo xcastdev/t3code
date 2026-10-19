@@ -10,6 +10,7 @@ import {
   piSubscriptionModelRoute,
 } from "./PiManagedModels.ts";
 import {
+  PI_SUBSCRIPTION_MAX_INSTRUCTIONS_BYTES,
   decodePiSubscriptionEvent,
   decodePiSubscriptionRequest,
   isPiSubscriptionCallId,
@@ -141,7 +142,18 @@ const Native = Schema.Struct({
 // Subscription call identities are opaque; CommandCode retains its identifier grammar.
 const SubscriptionCallId = Schema.String.check(Schema.makeFilter(isPiSubscriptionCallId));
 const SubscriptionMessage = Schema.Union([
-  Message.members[0],
+  Schema.Struct({ role: Schema.Literal("user"), content: Content }),
+  Schema.Struct({
+    role: Schema.Literal("system"),
+    content: Schema.Union([
+      Schema.String.check(
+        Schema.makeFilter(
+          (value) => Buffer.byteLength(value) <= PI_SUBSCRIPTION_MAX_INSTRUCTIONS_BYTES,
+        ),
+      ),
+      Content.members[1],
+    ]),
+  }),
   Schema.Struct({
     ...Message.members[1].fields,
     tool_calls: Schema.optional(

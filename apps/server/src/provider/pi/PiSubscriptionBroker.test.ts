@@ -5,6 +5,10 @@ import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { piManagedModelRoute } from "./PiManagedModels.ts";
 import { PI_WORKER_MAX_CHUNK_BYTES, PI_WORKER_MAX_RESPONSE_BYTES } from "./PiWorkerProtocol.ts";
 import { stream as streamCodexResponses } from "@earendil-works/pi-ai/api/openai-codex-responses";
+import {
+  PI_SUBSCRIPTION_MAX_INSTRUCTIONS_BYTES,
+  decodePiSubscriptionRequest,
+} from "./PiSubscriptionProtocol.ts";
 import type { PiModelBrokerConfig } from "./PiModelBroker.ts";
 import {
   part,
@@ -51,6 +55,66 @@ const zeroUsage: Usage = {
 };
 
 describe("Pi OpenAI subscription broker", () => {
+  it.each([
+    {
+      name: "instruction field",
+      extra: { instructions: "x".repeat(PI_SUBSCRIPTION_MAX_INSTRUCTIONS_BYTES + 1) },
+      code: "REQUEST_MODEL_OR_OUTPUT_INVALID",
+    },
+    {
+      name: "normalized input budget",
+      extra: { instructions: "x".repeat(32768) },
+      code: "REQUEST_INPUT_LIMIT",
+    },
+    {
+      name: "whole request budget",
+      extra: { instructions: "x".repeat(65536) },
+      code: "REQUEST_BYTE_LIMIT",
+    },
+    {
+      name: "input item count",
+      extra: { input: Array.from({ length: 129 }, () => ({ role: "user", content: "x" })) },
+      code: "REQUEST_MODEL_OR_OUTPUT_INVALID",
+    },
+    {
+      name: "ordinary tool description",
+      extra: {
+        tools: [
+          { type: "function", name: "lookup", description: "x".repeat(12289), parameters: {} },
+        ],
+      },
+      code: "REQUEST_INVALID",
+    },
+    {
+      name: "ordinary input text part",
+      extra: {
+        input: [{ role: "user", content: [{ type: "input_text", text: "x".repeat(16385) }] }],
+      },
+      code: "REQUEST_INVALID",
+    },
+  ])("retains $name limit with a separate instructions bound", async ({ extra, code }) => {
+    const instructions = "instructions" in extra ? extra.instructions : "Trusted assignment";
+    const f = fixture({ maxInputTokens: 32768, requiredSystemText: instructions });
+    await expect(f.invoke(body(extra))).rejects.toMatchObject({ code });
+    expect(f.reservations).toHaveLength(0);
+    expect(f.transportCalls()).toBe(0);
+  });
+
+  it("bounds instructions in UTF-8 bytes and retains exact system authority", async () => {
+    expect(() =>
+      decodePiSubscriptionRequest(body({ instructions: "é".repeat(24576) }), model),
+    ).not.toThrow();
+    expect(() =>
+      decodePiSubscriptionRequest(body({ instructions: "é".repeat(24577) }), model),
+    ).toThrow("REQUEST_MODEL_OR_OUTPUT_INVALID");
+    const f = fixture({ maxInputTokens: 32768, requiredSystemText: "x".repeat(24071) });
+    await expect(f.invoke(body({ instructions: "y".repeat(24071) }))).rejects.toMatchObject({
+      code: "REQUEST_SYSTEM_INPUT_INVALID",
+    });
+    expect(f.reservations).toHaveLength(0);
+    expect(f.transportCalls()).toBe(0);
+  });
+
   it.each(["reported-input", "large-frame"] as const)(
     "review R4/R6 preserves CommandCode hard limits: %s",
     async (boundary) => {
