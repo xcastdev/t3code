@@ -10,6 +10,8 @@ import {
   type ProjectTeamGuidedIntent,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -132,64 +134,80 @@ const git = Effect.fn("workspaceTest.git")(function* (cwd: string, args: readonl
   );
 });
 
-// This OS fixture replaces the provider port, not the SQL ownership policy or managed Git.
-// A cooperative parent reaps its descendant; cancellation deliberately leaves the latter
-// alive until the test releases it. IPC acknowledgments replace timing assumptions.
+// The disposable Linux subreaper owns cleanup after the Node parent exits. It
+// joins both real Node processes; parent exit alone cannot produce a drain.
 const processMessage = Schema.decodeUnknownSync(
-  Schema.Struct({
-    kind: Schema.String,
-    pid: Schema.Int,
-    cwd: Schema.String,
-  }),
+  Schema.Struct({ kind: Schema.String, pid: Schema.Int, cwd: Schema.String }),
 );
-const childSource = `
+const supervisorSource = `
+import ctypes, json, os, subprocess, sys
+if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER failed')
+parent = subprocess.Popen(sys.argv[1:], stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
+while True:
+    try:
+        pid, status = os.waitpid(-1, 0)
+    except ChildProcessError:
+        break
+    print(json.dumps(dict(kind='parent-exited' if pid == parent.pid else 'descendant-exited', pid=pid, cwd=os.getcwd())), flush=True)
+    if status != 0:
+        sys.exit(1)
+`;
+const childSource = String.raw`
 const { fork } = require('node:child_process');
 const fs = require('node:fs');
+const emit = kind => process.stdout.write(JSON.stringify({kind,pid:process.pid,cwd:process.cwd()})+'\n');
 if (process.env.OWNERSHIP_DESCENDANT === '1') {
-  process.on('message', message => {
-    if (message === 'hold') process.send({kind:'holding',pid:process.pid,cwd:process.cwd()});
-    if (message === 'release') process.exit(0);
-  });
-  process.send({kind:'descendant',pid:process.pid,cwd:process.cwd()});
-} else {
-  const descendant = fork(__filename, [], {
-    cwd: process.cwd(), env: {...process.env, OWNERSHIP_DESCENDANT:'1'},
-    stdio: ['ignore','ignore','ignore','ipc']
-  });
-  descendant.on('message', message => process.send(message));
-  descendant.on('exit', (code, signal) => process.exit(code === 0 && !signal ? 0 : 1));
-  process.on('message', message => {
-    if (message === 'stop') descendant.send('hold');
-    if (message === 'release') descendant.send('release');
-    if (message === 'write') {
-      fs.appendFileSync('ownership.txt', 'owned write\\n');
-      process.send({kind:'written',pid:process.pid,cwd:process.cwd()});
+  require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+    const message = JSON.parse(line);
+    if (message.kind === 'stop') emit('holding');
+    if (message.kind === 'exit-parent') process.send('exit-parent');
+    if (message.kind === 'release') process.exit(0);
+    if (message.kind === 'write') {
+      if (message.assignment !== process.argv[2]) return emit('rejected');
+      fs.appendFileSync('ownership.txt', message.assignment+'\n');
+      emit('written');
     }
   });
-  process.send({kind:'parent',pid:process.pid,cwd:process.cwd()});
+  emit('descendant');
+} else {
+  const descendant = fork(__filename, [process.argv[2]], {
+    cwd: process.cwd(), env: {...process.env, OWNERSHIP_DESCENDANT:'1'},
+    stdio: ['inherit','inherit','inherit','ipc']
+  });
+  descendant.on('message', message => { if (message === 'exit-parent') process.exit(0); });
+  descendant.on('exit', (code, signal) => process.exit(code === 0 && !signal ? 0 : 1));
+  emit('parent');
 }
 `;
 const startWriter = Effect.fn("concurrentOwnership.startWriter")(function* (
   source: string,
   cwd: string,
+  approvedAssignment: string,
 ) {
   const cp = process.getBuiltinModule("child_process");
-  const child = cp.fork(source, [], {
-    cwd,
-    env: {},
-    execArgv: [],
-    stdio: ["ignore", "ignore", "ignore", "ipc"],
-  });
-  if (!child.pid) return yield* Effect.die("Child has no captured PID");
+  const child = cp.spawn(
+    "/usr/bin/python3",
+    ["-u", "-c", supervisorSource, process.execPath, source, approvedAssignment],
+    {
+      cwd,
+      env: {},
+      stdio: ["pipe", "pipe", "inherit"],
+    },
+  );
+  if (!child.pid) return yield* Effect.die("Supervisor has no captured PID");
   capturedPids.push(child.pid);
   const messages: ReturnType<typeof processMessage>[] = [];
   const waiters = new Map<string, (message: ReturnType<typeof processMessage>) => void>();
-  child.on("message", (raw) => {
-    const message = processMessage(raw);
-    if (message.kind === "descendant") capturedPids.push(message.pid);
-    const waiter = waiters.get(message.kind);
+  const lines = process.getBuiltinModule("readline").createInterface({ input: child.stdout });
+  const channel = (kind: string) =>
+    kind === "written" || kind === "rejected" ? "write-result" : kind;
+  lines.on("line", (raw) => {
+    const message = processMessage(JSON.parse(raw));
+    if (message.kind === "parent" || message.kind === "descendant") capturedPids.push(message.pid);
+    const waiter = waiters.get(channel(message.kind));
     if (waiter) {
-      waiters.delete(message.kind);
+      waiters.delete(channel(message.kind));
       waiter(message);
     } else messages.push(message);
   });
@@ -197,21 +215,21 @@ const startWriter = Effect.fn("concurrentOwnership.startWriter")(function* (
     child.once("error", reject);
     child.once("close", (code, signal) => {
       if (code === 0 && signal === null) resolve();
-      else reject(new Error(`Owned child failed: ${code}/${signal}`));
+      else reject(new Error(`Owned supervisor failed: ${code}/${signal}`));
     });
   });
-  // Install cleanup before awaiting startup. Only this captured child and its own
-  // IPC-controlled descendant are stopped; the parent waits for descendant exit.
+  const send = (message: { kind: string; assignment?: string }) =>
+    child.stdin.write(JSON.stringify(message) + "\n");
   yield* Effect.addFinalizer(() =>
     Effect.promise(async () => {
-      if (child.exitCode === null && child.signalCode === null && child.connected)
-        child.send("release");
+      if (child.exitCode === null && child.signalCode === null) send({ kind: "release" });
       await closed;
+      lines.close();
     }),
   );
   const awaitMessage = (kind: string) =>
     Effect.promise(() => {
-      const index = messages.findIndex((message) => message.kind === kind);
+      const index = messages.findIndex((message) => channel(message.kind) === kind);
       const retained = index < 0 ? undefined : messages.splice(index, 1)[0];
       return retained
         ? Promise.resolve(retained)
@@ -219,15 +237,24 @@ const startWriter = Effect.fn("concurrentOwnership.startWriter")(function* (
     });
   const parent = yield* awaitMessage("parent");
   const descendant = yield* awaitMessage("descendant");
-  expect(parent.cwd).toBe(cwd);
-  expect(descendant.cwd).toBe(cwd);
-  expect(parent.pid).toBe(child.pid);
-  expect(nativeFs.readlinkSync(`/proc/${parent.pid}/cwd`)).toBe(cwd);
-  expect(nativeFs.readlinkSync(`/proc/${descendant.pid}/cwd`)).toBe(cwd);
-  const command = (message: "stop" | "write", response: string) =>
-    Effect.sync(() => child.send(message)).pipe(Effect.andThen(awaitMessage(response)));
-  const join = Effect.promise(() => closed);
-  return { parent, descendant, command, join, release: Effect.sync(() => child.send("release")) };
+  for (const owner of [parent, descendant]) {
+    expect(owner.cwd).toBe(cwd);
+    expect(nativeFs.readlinkSync(`/proc/${owner.pid}/cwd`)).toBe(cwd);
+  }
+  const command = (kind: "stop" | "exit-parent", response: string) =>
+    Effect.sync(() => send({ kind })).pipe(Effect.andThen(awaitMessage(response)));
+  const write = (assignment: string) =>
+    Effect.sync(() => send({ kind: "write", assignment })).pipe(
+      Effect.andThen(awaitMessage("write-result")),
+    );
+  return {
+    parent,
+    descendant,
+    command,
+    write,
+    join: Effect.promise(() => closed),
+    release: Effect.sync(() => send({ kind: "release" })),
+  };
 });
 
 const fixture = Effect.fn("concurrentOwnership.fixture")(function* () {
@@ -368,7 +395,7 @@ const fixture = Effect.fn("concurrentOwnership.fixture")(function* () {
       setupId: `${label}-setup`,
       initializeOperationId: `${label}-initialize`,
       assignmentOperationId: `${label}-assignment`,
-      assignment: "Approved isolated task",
+      assignment: `Write the approved ${label} task result`,
     };
     return result;
   });
@@ -621,15 +648,28 @@ for (const action of ["cancel", "reassign"] as const) {
                   reopened.setup(snapshot, workspace).pipe(Effect.mapError(error)),
                 initialize: (_owner, _snapshot, workspace) =>
                   Effect.gen(function* () {
-                    writer = yield* startWriter(f.source, workspace.worktree.path);
+                    const approved =
+                      workspace.assignment.branchRef === f.first.git.branchRef
+                        ? f.first.assignment
+                        : f.second.assignment;
+                    writer = yield* startWriter(f.source, workspace.worktree.path, approved);
                     return writer.parent;
                   }),
-                sendAssignment: () =>
+                sendAssignment: (_owner, snapshot) =>
                   Effect.gen(function* () {
                     if (!writer) return yield* error();
-                    const written = yield* writer.command("write", "written");
+                    const foreign =
+                      snapshot.intent.request.git.branchRef === f.first.git.branchRef
+                        ? f.second.assignment
+                        : f.first.assignment;
+                    expect((yield* writer.write(foreign)).kind).toBe("rejected");
+                    expect(
+                      yield* f.fs.exists(f.path.join(writer.parent.cwd, "ownership.txt")),
+                    ).toBe(false);
+                    const written = yield* writer.write(snapshot.intent.request.assignment);
+                    if (written.kind !== "written") return yield* error();
                     return { _tag: "Observed" as const, receipt: written };
-                  }),
+                  }).pipe(Effect.mapError(error)),
                 readAssignmentObservation: () =>
                   Effect.succeed(
                     receipt.stage === "assignment-observed" ? receipt.assignment : undefined,
@@ -663,6 +703,18 @@ for (const action of ["cancel", "reassign"] as const) {
             for (const writer of [first, second]) {
               expect(nativeFs.existsSync(`/proc/${writer.parent.pid}`)).toBe(true);
               expect(nativeFs.existsSync(`/proc/${writer.descendant.pid}`)).toBe(true);
+            }
+            expect(f.first.assignment).not.toBe(f.second.assignment);
+            for (const [writer, own, foreign] of [
+              [first, f.first, f.second],
+              [second, f.second, f.first],
+            ] as const) {
+              const file = f.path.join(own.git.worktreePath, "ownership.txt");
+              expect(yield* f.fs.readFileString(file)).toBe(own.assignment + "\n");
+              // Swapping either task's instructions, including reusing the first
+              // assignment for the second writer, must produce no task bytes.
+              expect((yield* writer.write(foreign.assignment)).kind).toBe("rejected");
+              expect(yield* f.fs.readFileString(file)).toBe(own.assignment + "\n");
             }
             const setup = yield* reopened.setup(firstSnapshot, firstWorkspace.workspace);
             expect(setup.outcome).toBe("skipped");
@@ -711,7 +763,7 @@ for (const action of ["cancel", "reassign"] as const) {
             expect((yield* setupJournal.read(input))?.uncertain).toBe(true);
             expect(
               yield* f.fs.readFileString(f.path.join(f.first.git.worktreePath, "ownership.txt")),
-            ).toBe("owned write\n");
+            ).toBe(f.first.assignment + "\n");
             const control = Effect.fn("concurrentOwnership.control")(function* (
               id: string,
               value: Extract<
@@ -796,18 +848,7 @@ for (const action of ["cancel", "reassign"] as const) {
             const before = yield* f.fs.readFileString(
               f.path.join(f.second.git.worktreePath, "ownership.txt"),
             );
-            yield* second.command("write", "written");
-            yield* first.release;
-            yield* first.join;
-            expect(nativeFs.existsSync(`/proc/${first.parent.pid}`)).toBe(false);
-            expect(nativeFs.existsSync(`/proc/${first.descendant.pid}`)).toBe(false);
-            expect(
-              yield* control("joined-but-unsettled", {
-                action: resumeAction,
-                reason: "Physical exit alone is not durable settlement",
-              }).pipe(Effect.result),
-            ).toMatchObject({ _tag: "Failure" });
-            expect((yield* f.journal.reserve(premature).pipe(Effect.result))._tag).toBe("Failure");
+            yield* second.write(f.second.assignment);
             const terminal = {
               receiptId: `physical-join-${action}`,
               stage: "settled" as const,
@@ -817,6 +858,20 @@ for (const action of ["cancel", "reassign"] as const) {
                 claimGeneration: firstSnapshot.fence.claimGeneration,
               },
             };
+            const observePending = Effect.gen(function* () {
+              return {
+                state: yield* readCurrentState(f.sql, projectId),
+                held: yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+                terminals:
+                  yield* f.sql`SELECT * FROM project_team_dispatch_receipt WHERE stage='settled'`,
+              };
+            });
+            type Observation = Effect.Success<typeof observePending>;
+            const entered = yield* Deferred.make<Observation>();
+            const parentExited = yield* Deferred.make<void>();
+            const afterParentExit = yield* Deferred.make<Observation>();
+            const joining = yield* Deferred.make<void>();
+            let physicallyJoined = false;
             const settling = yield* makeProjectTeamDispatchJournal({
               ...f.options,
               verifyStage: (receipt, snapshot) =>
@@ -827,15 +882,85 @@ for (const action of ["cancel", "reassign"] as const) {
                 }),
               verifySettlement: (receipt, snapshot) =>
                 Effect.gen(function* () {
+                  if (!physicallyJoined) {
+                    // Read through the settlement transaction: outside SQL callers wait
+                    // for its lock while the actual verifier is awaiting physical exit.
+                    yield* Deferred.succeed(entered, yield* observePending);
+                    yield* Deferred.await(parentExited);
+                    yield* Deferred.succeed(afterParentExit, yield* observePending);
+                    yield* Deferred.succeed(joining, undefined);
+                  }
                   yield* first.join;
                   expect(nativeFs.existsSync(`/proc/${first.parent.pid}`)).toBe(false);
                   expect(nativeFs.existsSync(`/proc/${first.descendant.pid}`)).toBe(false);
+                  physicallyJoined = true;
                   expect(receipt.evidence).toEqual(terminal.evidence);
                   expect(snapshot.fence.dispatchId).toBe(f.first.dispatchId);
                   expect(snapshot.fence.claimGeneration).toBe(firstSnapshot.fence.claimGeneration);
-                }),
+                }).pipe(
+                  Effect.mapError(
+                    () =>
+                      new ProjectTeamDispatchJournalError({
+                        reason: "Pending settlement observation failed",
+                      }),
+                  ),
+                ),
             });
-            yield* settling.settleAfterJoined(firstSnapshot.fence, terminal);
+            // This is the actual settlement call, entered with both Node owners alive.
+            // The proposed evidence is not a physical receipt until verification joins.
+            const settlement = yield* settling
+              .settleAfterJoined(firstSnapshot.fence, terminal)
+              .pipe(Effect.forkChild);
+            const assertPending = (observation: Observation) => {
+              expect(observation.state).toEqual(stopped);
+              expect(observation.held).toEqual(held);
+              expect(observation.terminals).toEqual([]);
+              expect(settlement.pollUnsafe()).toBeUndefined();
+              expect(physicallyJoined).toBe(false);
+              expect(nativeFs.existsSync(`/proc/${first.descendant.pid}`)).toBe(true);
+            };
+            assertPending(yield* Deferred.await(entered));
+            const claimEntered = yield* Deferred.make<void>();
+            const resumeEntered = yield* Deferred.make<void>();
+            const successorAttempt = yield* Deferred.succeed(claimEntered, undefined).pipe(
+              Effect.andThen(f.journal.reserve(premature)),
+              Effect.forkChild,
+            );
+            const resumeAttempt = yield* Deferred.succeed(resumeEntered, undefined).pipe(
+              Effect.andThen(
+                control("during-settlement", {
+                  action: resumeAction,
+                  reason: "No authority before physical drain",
+                }),
+              ),
+              Effect.forkChild,
+            );
+            yield* Deferred.await(claimEntered);
+            yield* Deferred.await(resumeEntered);
+            expect(successorAttempt.pollUnsafe()).toBeUndefined();
+            expect(resumeAttempt.pollUnsafe()).toBeUndefined();
+            // The subreaper receipt is emitted after waitpid, so the Node parent
+            // is absent while its original descendant is still physically held.
+            const exited = yield* first.command("exit-parent", "parent-exited");
+            expect(exited.pid).toBe(first.parent.pid);
+            expect(nativeFs.existsSync(`/proc/${first.parent.pid}`)).toBe(false);
+            yield* Deferred.succeed(parentExited, undefined);
+            assertPending(yield* Deferred.await(afterParentExit));
+            yield* Deferred.await(joining);
+            expect(successorAttempt.pollUnsafe()).toBeUndefined();
+            expect(resumeAttempt.pollUnsafe()).toBeUndefined();
+            expect(yield* f.fs.exists(premature.git.worktreePath)).toBe(false);
+            yield* second.write(f.second.assignment);
+            // Cancel queued probes before releasing the transaction; they must
+            // never acquire successor authority as a side effect of the proof.
+            const claimCanceled = yield* Fiber.interrupt(successorAttempt).pipe(Effect.forkChild);
+            const resumeCanceled = yield* Fiber.interrupt(resumeAttempt).pipe(Effect.forkChild);
+            yield* first.release;
+            const settled = yield* Fiber.join(settlement);
+            yield* Fiber.join(claimCanceled);
+            yield* Fiber.join(resumeCanceled);
+            expect(settled.fence.stage).toBe("settled");
+            expect(physicallyJoined).toBe(true);
             const drained = yield* readCurrentState(f.sql, projectId);
             const oldBinding = drained.foundationRecords!.find((r) => r.recordId === "binding");
             expect(oldBinding).toMatchObject({
@@ -852,7 +977,7 @@ for (const action of ["cancel", "reassign"] as const) {
             expect(yield* f.journal.readRetained(f.second.dispatchId)).toEqual(otherDispatch);
             expect(
               yield* f.fs.readFileString(f.path.join(f.second.git.worktreePath, "ownership.txt")),
-            ).toBe(before + "owned write\n");
+            ).toBe(before + (f.second.assignment + "\n").repeat(2));
             expect(
               yield* f.sql`SELECT status FROM project_team_reservation WHERE status='held'`,
             ).toHaveLength(1);
@@ -878,16 +1003,20 @@ for (const action of ["cancel", "reassign"] as const) {
             expect(successorWorkspace.workspace.worktree.path).toBe(
               successorRequest.git.worktreePath,
             );
-            const successor = yield* startWriter(f.source, successorRequest.git.worktreePath);
-            yield* successor.command("write", "written");
+            const successor = yield* startWriter(
+              f.source,
+              successorRequest.git.worktreePath,
+              successorRequest.assignment,
+            );
+            yield* successor.write(successorRequest.assignment);
             expect(
               yield* f.fs.readFileString(
                 f.path.join(successorRequest.git.worktreePath, "ownership.txt"),
               ),
-            ).toBe("owned write\n");
+            ).toBe(successorRequest.assignment + "\n");
             expect(
               yield* f.fs.readFileString(f.path.join(f.first.git.worktreePath, "ownership.txt")),
-            ).toBe("owned write\n");
+            ).toBe(f.first.assignment + "\n");
             const current = yield* readCurrentState(f.sql, projectId);
             expect((yield* f.journal.readRetained(f.first.dispatchId)).intent).toEqual(
               firstSnapshot.intent,
