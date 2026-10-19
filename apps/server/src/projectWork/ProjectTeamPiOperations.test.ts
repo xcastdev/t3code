@@ -3345,3 +3345,155 @@ it.effect(
       }),
     ),
 );
+
+const freshStartFixture = Effect.gen(function* () {
+  const f = yield* journalFixture();
+  // Exercise committed stage sequencing with a controlled stage verifier. This is not native setup proof.
+  const journal = yield* makeProjectTeamDispatchJournal({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 2,
+    verifyStage: () => Effect.void,
+  });
+  let snapshot = yield* journal.claimEffect(f.admitted.fence);
+  for (const stage of ["workspace-ready", "setup-complete"] as const) {
+    snapshot = yield* journal.advanceStage(snapshot.fence, {
+      receiptId: `fresh-start-${stage}`,
+      stage,
+      evidence: { fixture: "controlled-stage-verifier" },
+    });
+  }
+  return { ...f, journal, snapshot };
+});
+
+it.effect(
+  "session start classifies only untouched setup-complete reserved bindings as fresh without mutation",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* freshStartFixture;
+        const before = yield* readCurrentState(f.sql, projectId);
+        const sessions = yield* f.sql`SELECT * FROM auth_sessions`;
+        const receipts = yield* f.sql`SELECT * FROM project_team_dispatch_receipt`;
+        expect(yield* f.operations.sessionForStart(f.identity)).toEqual({ kind: "fresh" });
+        expect(yield* f.operations.sessionForStart(f.identity)).toEqual({ kind: "fresh" });
+        expect(yield* readCurrentState(f.sql, projectId)).toEqual(before);
+        expect(yield* f.sql`SELECT * FROM auth_sessions`).toEqual(sessions);
+        expect(yield* f.sql`SELECT * FROM project_team_dispatch_receipt`).toEqual(receipts);
+        expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual([]);
+      }),
+    ),
+);
+
+for (const stage of ["reserved", "claimed"] as const) {
+  it.effect(`session start denies ${stage} dispatches before setup`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* journalFixture();
+        if (stage === "claimed") yield* f.journal.claimEffect(f.admitted.fence);
+        yield* rejected(f.operations.sessionForStart(f.identity));
+      }),
+    ),
+  );
+}
+
+for (const status of ["prepared", "starting", "running", "settled", "quarantine"] as const) {
+  it.effect(`session start never calls reserved initialization history ${status} fresh`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* freshStartFixture;
+        yield* f.operations.prepare(f.identity, { threadId, kind: "initialize" }, "start-history", {
+          allocation: f.allocation,
+          workerId: "start-worker",
+          operationId: f.request.initializeOperationId,
+        });
+        yield* f.sql`UPDATE project_team_pi_operation SET status=${status}`;
+        yield* rejected(f.operations.sessionForStart(f.identity));
+        expect(
+          (yield* readCurrentState(f.sql, projectId)).foundationRecords!.find(
+            (r) => r.kind === "run-binding",
+          ),
+        ).toMatchObject({ status: "reserved" });
+      }),
+    ),
+  );
+}
+
+for (const mode of [
+  "receipt",
+  "claim",
+  "gate",
+  "lease",
+  "deadline",
+  "budget",
+  "session",
+  "owner",
+  "process",
+] as const) {
+  it.effect(`session start refuses changed fresh authority or ownership: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* freshStartFixture;
+        if (mode === "receipt")
+          yield* f.sql`INSERT INTO project_team_dispatch_receipt(receipt_id,dispatch_id,revision,claim_generation,stage,evidence_json,recorded_at)
+            VALUES ('unexpected-receipt',${f.snapshot.fence.dispatchId},99,1,'setup-complete','{}',${at})`;
+        if (mode === "claim")
+          yield* restoreHistoricalBinding({
+            ...f.binding,
+            worktree: "/foreign",
+            revision: f.binding.revision + 1,
+          });
+        if (mode === "budget")
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=maximum_tokens+1`;
+        if (mode === "gate") {
+          const state = yield* readCurrentState(f.sql, projectId);
+          const grant = state.foundationRecords!.find(
+            (r) => r.kind === "gate" && r.recordId === f.binding.authorizationGateId,
+          );
+          if (grant?.kind !== "gate") return yield* Effect.die("Missing original gate");
+          yield* restoreHistoricalBinding({
+            ...grant,
+            status: "invalidated",
+            revision: grant.revision + 1,
+          });
+        }
+        if (mode === "lease") yield* TestClock.setTime(time + 10001);
+        if (mode === "deadline") yield* TestClock.setTime(time + 300001);
+        if (mode === "session")
+          yield* restoreHistoricalBinding({
+            ...f.binding,
+            sessionId: "already-owned",
+            revision: f.binding.revision + 1,
+          });
+        if (mode === "owner" || mode === "process") {
+          yield* f.operations.prepare(f.identity, { threadId, kind: "initialize" }, "prior-owner", {
+            allocation: f.allocation,
+            workerId: "prior-worker",
+            operationId: f.request.initializeOperationId,
+          });
+          // Negative control: a different old binding still owns this provider/thread's operation/process.
+          yield* f.sql`UPDATE project_team_pi_operation SET binding_id='prior-binding',generation=generation+1,status=${mode === "owner" ? "quarantine" : "settled"}`;
+        }
+        yield* rejected(f.operations.sessionForStart(f.identity));
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "session start preserves existing durable native success and missing/corrupt/active failures",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixtureFor(true);
+        yield* f.activate;
+        yield* f.operations.persistTerminal(f.op, f.terminal("success", true));
+        expect(yield* f.operations.sessionForStart(f.identity)).toEqual({ kind: "existing" });
+        yield* f.sql`UPDATE project_team_pi_operation SET native_json='{}'`;
+        yield* rejected(f.operations.sessionForStart(f.identity));
+        yield* f.sql`UPDATE project_team_pi_operation SET native_json=NULL`;
+        yield* rejected(f.operations.sessionForStart(f.identity));
+        yield* f.sql`UPDATE project_team_pi_operation SET status='quarantine'`;
+        yield* rejected(f.operations.sessionForStart(f.identity));
+      }),
+    ),
+);

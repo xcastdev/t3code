@@ -61,6 +61,7 @@ import {
 } from "./memory/ProjectMemoryModelAccounting.ts";
 import {
   ProjectTeamAuthorization,
+  inspectProjectTeamSessionAuthority,
   managedActorId,
   type ProjectTeamAuthority,
   type ProjectTeamPrincipal,
@@ -3325,6 +3326,103 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       yield* current(identity);
       return result;
     });
+    /** Fresh initialization is a read-only classification of untouched original dispatch ownership. */
+    const sessionForStart = Effect.fn("ProjectTeamPiOperations.sessionForStart")(
+      function* (identity: {
+        readonly providerInstanceId: ProviderInstanceId;
+        readonly threadId: ThreadId;
+      }) {
+        yield* ownTransaction();
+        const initial = yield* inspectProjectTeamSessionAuthority(authorization, identity);
+        if (
+          !initial ||
+          initial.binding.environmentId !== options.environmentId ||
+          !isPiBrokerManagedModel(initial.binding.model)
+        )
+          return yield* deny("Current managed Pi binding required");
+        if (initial.binding.status === "running") {
+          yield* nativeFor(identity);
+          return { kind: "existing" as const };
+        }
+        const sameAuthority = Effect.gen(function* () {
+          const authority = yield* inspectProjectTeamSessionAuthority(authorization, identity);
+          if (
+            !authority ||
+            encode(authority.binding) !== encode(initial.binding) ||
+            encode(authority.role) !== encode(initial.role) ||
+            authority.binding.status !== "reserved" ||
+            authority.binding.sessionId !== undefined
+          )
+            return yield* deny("Fresh Pi start authority changed");
+          return authority;
+        });
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const authority = yield* sameAuthority;
+            const binding = authority.binding;
+            const history = yield* sql`SELECT operation_id FROM project_team_pi_operation
+          WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 1`;
+            if (history.length)
+              return yield* deny(
+                "Reserved Pi initialization history belongs to original recovery",
+                "conflict",
+              );
+            const owners = yield* sql`SELECT operation_id FROM project_team_pi_operation
+          WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}
+          AND status <> 'settled' LIMIT 1`;
+            const processes =
+              yield* sql`SELECT p.unit FROM project_team_pi_process p JOIN project_team_pi_operation o ON o.operation_id=p.operation_id
+          WHERE o.environment_id=${options.environmentId} AND o.provider_instance_id=${identity.providerInstanceId} AND o.thread_id=${identity.threadId}
+          AND p.status <> 'drained' LIMIT 1`;
+            if (owners.length || processes.length)
+              return yield* deny("Fresh Pi start has an active or uncertain owner", "uncertain");
+            const dispatches = yield* sql<{
+              dispatch_id: string;
+            }>`SELECT dispatch_id FROM project_team_dispatch
+          WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation} LIMIT 2`;
+            if (dispatches.length !== 1 || !dispatches[0])
+              return yield* deny("Fresh Pi start requires one original dispatch");
+            const snapshot = yield* inspectDispatch(dispatches[0].dispatch_id, {
+              requireClaim: true,
+            });
+            yield* readStageReceipts(snapshot.fence.dispatchId);
+            const claim = snapshot.intent.compiledClaim.transition;
+            if (
+              snapshot.fence.stage !== "setup-complete" ||
+              snapshot.fence.claimGeneration < 1 ||
+              claim?.kind !== "claim" ||
+              immutableBinding(claim.binding) !== immutableBinding(binding) ||
+              claim.binding.status !== "reserved" ||
+              claim.binding.sessionId !== undefined
+            )
+              return yield* deny("Fresh Pi start requires its exact setup-complete original claim");
+            const root = yield* roots(authority);
+            const budgets = yield* sql<{
+              maximum_tokens: number;
+              deadline_at_ms: number;
+            }>`SELECT maximum_tokens,deadline_at_ms
+          FROM project_team_model_budget WHERE environment_id=${options.environmentId} AND project_id=${binding.projectId} AND root_task_id=${root.rootTaskId} LIMIT 2`;
+            if (
+              snapshot.intent.limits.rootTaskId !== root.rootTaskId ||
+              budgets.length !== 1 ||
+              budgets[0]?.maximum_tokens !== snapshot.intent.limits.maximumTokens ||
+              budgets[0]?.deadline_at_ms !== snapshot.intent.limits.rootDeadlineAtMs
+            )
+              return yield* deny("Fresh Pi start original root budget changed");
+            yield* clockCheck(
+              Math.min(
+                root.deadlineAtMs,
+                snapshot.intent.limits.deadlineAtMs,
+                snapshot.intent.limits.rootDeadlineAtMs,
+              ),
+            );
+            yield* sameAuthority;
+          }),
+        );
+        yield* sameAuthority;
+        return { kind: "fresh" as const };
+      },
+    );
     const readMemoryOperationOwnerInTransaction = Effect.fn(
       "ProjectTeamPiOperations.readMemoryOperationOwnerInTransaction",
     )(function* (
@@ -3566,6 +3664,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       persistTerminal: (...args: Parameters<typeof persistTerminal>) =>
         guard(persistTerminal(...args)),
       nativeFor: (...args: Parameters<typeof nativeFor>) => guard(nativeFor(...args)),
+      sessionForStart: (...args: Parameters<typeof sessionForStart>) =>
+        guard(sessionForStart(...args)),
       resolveOperation,
       readUsageHistoryInTransaction: (bindingId: string, generation: number) =>
         guard(readUsageHistoryInTransaction(bindingId, generation)),
