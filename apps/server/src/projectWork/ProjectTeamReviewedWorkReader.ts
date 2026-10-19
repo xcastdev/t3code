@@ -338,8 +338,7 @@ export const makeProjectTeamReviewedWorkReader = (input: typeof Options.Encoded)
       const ownership = yield* decodeWorkspace(workspace.receipt_json);
       if (
         hash(ownership) !== job.workspaceReceiptHash ||
-        canonical(ownership.assignment) !== canonical(original.snapshot.intent.request.git) ||
-        canonical(ownership) !== workspace.receipt_json
+        canonical(ownership.assignment) !== canonical(original.snapshot.intent.request.git)
       )
         return yield* deny("Original source physical ownership changed");
       // Historical storage rehashes both raw outputs; no current filesystem permission is supplied here.
