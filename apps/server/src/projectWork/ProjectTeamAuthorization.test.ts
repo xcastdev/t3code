@@ -15,6 +15,7 @@ import {
   ProjectWorkEvidenceId,
   ProjectWorkComment,
   ProjectTeamMemorySourcesRead,
+  ProjectTeamMemorySharedSourcesRead,
   ProjectWorkFoundationCommitCommand,
   ProjectTeamGuidedIntent,
   ProviderInstanceId,
@@ -54,6 +55,7 @@ import {
   gatewayRuntime,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
 
+const decodeSharedDiscovery = Schema.decodeUnknownEffect(ProjectTeamMemorySharedSourcesRead);
 const decodeMemoryDiscovery = Schema.decodeUnknownEffect(ProjectTeamMemorySourcesRead);
 const decodeMemoryComment = Schema.decodeUnknownEffect(ProjectWorkComment);
 const encodeMemoryDiscoveryJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -3128,3 +3130,180 @@ it.effect(
       }
     }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
 );
+
+for (const memoryAccess of ["none", "project", "shared"] as const)
+  it.effect(
+    `shared memory discovery requires exact assigned task and shared access (${memoryAccess})`,
+    () =>
+      Effect.gen(function* () {
+        const f = yield* seed("implementer");
+        const role = decodeRecord({
+          ...f.role,
+          recordId: "shared-discovery-role",
+          roleId: "shared-discovery-role",
+          memoryAccess,
+          tools: ["project-work.write", "project-work.read-task"],
+        });
+        if (role.kind !== "role-revision") return yield* Effect.die("Missing role");
+        yield* f.change(role);
+        yield* f.change(
+          decodeRecord({
+            ...f.member,
+            recordId: "shared-discovery-member",
+            roleRevisionId: role.recordId,
+          }),
+        );
+        const assignedTask = ProjectWorkTaskId.make("shared-discovery-task");
+        const binding = yield* createManagedAssignment({
+          taskId: assignedTask,
+          recordId: "shared-discovery-binding",
+          attemptId: "shared-discovery-attempt",
+          commandId: "shared-discovery-claim",
+          providerInstanceId,
+          threadId: ThreadId.make("shared-discovery-thread"),
+          role,
+          status: "running",
+          configuration: { ...f.binding.configuration, toolIds: [...role.tools] },
+          memberId: "shared-discovery-member",
+          sessionId: "shared-discovery-session",
+        });
+        const issued = yield* f.auth.issueCredential({
+          providerInstanceId: binding.providerInstanceId,
+          threadId: binding.threadId,
+        });
+        if (issued === undefined) return yield* Effect.die("Missing credential");
+        const principal = {
+          actor: { kind: "agent" as const, id: Authorization.managedActorId(issued.credential) },
+          managed: issued.credential,
+        };
+        const gateway = yield* ProjectWorkGateway;
+        if (memoryAccess === "shared") {
+          const ownerId = ProjectId.make("shared-source-owner");
+          yield* f.sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+            VALUES (${ownerId},'Owner','/fixture/shared-owner','[]',${binding.updatedAt},${binding.updatedAt})`;
+          const ownerTask = ProjectWorkTaskId.make("owner-task");
+          yield* f.repo.execute({
+            type: "project-work.task.create",
+            commandId: CommandId.make("owner-task-create"),
+            projectId: ownerId,
+            taskId: ownerTask,
+            title: "Owner facts",
+            createdAt: binding.updatedAt,
+          });
+          const memory = makeProjectMemoryService({
+            sql: f.sql,
+            repository: f.repo,
+            authorization: f.auth,
+            contentGuard: yield* ContentGuard.ProjectWorkContentGuard,
+            environmentId: binding.environmentId,
+          });
+          for (const suffix of ["a", "b"]) {
+            const comment = yield* decodeMemoryComment({
+              commentId: `owner-comment-${suffix}`,
+              projectId: ownerId,
+              taskId: ownerTask,
+              body: `Retained parser source ${suffix}.`,
+              revision: 0,
+              createdAt: binding.updatedAt,
+              attribution: {
+                actor: { kind: "human", id: "owner" },
+                source: { kind: "web", id: "owner" },
+                recordedAt: binding.updatedAt,
+              },
+            });
+            yield* f.repo.execute({
+              type: "project-work.comment.add",
+              commandId: CommandId.make(`owner-comment-add-${suffix}`),
+              projectId: ownerId,
+              comment,
+              addedAt: binding.updatedAt,
+              attribution: comment.attribution!,
+            });
+            const source = yield* memory.captureRetained(ownerId, {
+              kind: "comment",
+              retainedId: comment.commentId,
+            });
+            yield* memory.replaceShares(ownerId, source.recordId, [projectId]);
+          }
+          yield* f.sql`INSERT INTO project_lifecycle(project_id,state,workspace_root,changed_at) VALUES (${ownerId},'archived','/fixture/shared-owner',${binding.updatedAt})`;
+          const first = yield* gateway
+            .read(
+              { projectId, taskId: assignedTask, operation: "memory-shared-sources", limit: 1 },
+              principal,
+            )
+            .pipe(Effect.flatMap(decodeSharedDiscovery));
+          expect(first.items).toHaveLength(1);
+          expect(first.items[0]?.ownerProjectId).toBe(ownerId);
+          expect(first.nextCursor).toBeDefined();
+          const second = yield* gateway
+            .read(
+              {
+                projectId,
+                taskId: assignedTask,
+                operation: "memory-shared-sources",
+                limit: 1,
+                cursor: first.nextCursor!,
+              },
+              principal,
+            )
+            .pipe(Effect.flatMap(decodeSharedDiscovery));
+          expect(second.items).toHaveLength(1);
+          expect(second.items[0]?.selection.sourceRecordId).not.toBe(
+            first.items[0]?.selection.sourceRecordId,
+          );
+          expect(second.nextCursor).toBeUndefined();
+          // A foreign physical row cannot borrow another owner's valid source payload.
+          yield* f.sql`INSERT INTO project_team_memory_source
+            (record_id,project_id,status,revision,generation,updated_at,payload_json)
+            SELECT '000-laundered-shared-source','foreign-physical-owner',status,revision,generation,updated_at,payload_json
+            FROM project_team_memory_source WHERE record_id=${first.items[0]!.selection.sourceRecordId}`;
+          expect(
+            (yield* gateway
+              .read(
+                { projectId, taskId: assignedTask, operation: "memory-shared-sources", limit: 1 },
+                principal,
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          yield* f.sql`DELETE FROM project_team_memory_source WHERE record_id='000-laundered-shared-source'`;
+          yield* f.sql`UPDATE projection_projects SET deleted_at=${binding.updatedAt} WHERE project_id=${ownerId}`;
+          expect(
+            (yield* gateway
+              .read(
+                { projectId, taskId: assignedTask, operation: "memory-shared-sources", limit: 1 },
+                principal,
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          yield* f.sql`DELETE FROM project_team_memory_source WHERE project_id=${ownerId}`;
+        }
+        const input = {
+          projectId,
+          taskId: assignedTask,
+          operation: "memory-shared-sources" as const,
+          limit: 1,
+        };
+        const result = yield* gateway.read(input, principal).pipe(Effect.result);
+        if (memoryAccess === "shared")
+          expect(result).toMatchObject({
+            _tag: "Success",
+            success: { status: "available", items: [], taskId: assignedTask },
+          });
+        else expect(result._tag).toBe("Failure");
+        expect(
+          (yield* gateway.read({ ...input, taskId }, principal).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* gateway.read(input).pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* gateway
+            .read({ ...input, projectId: ProjectId.make("foreign-project") }, principal)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* gateway.read({ ...input, limit: 33 }, principal).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* gateway.read({ ...input, offset: 0 }, principal).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }).pipe(Effect.provide([ContentGuard.layer, gatewayRuntime])),
+  );

@@ -144,7 +144,11 @@ export const makeMem0Backend = (transport: MemoryBackendTransport): MemoryBacken
         result.candidates.some(
           (candidate) =>
             candidate.environmentId !== input.environmentId ||
-            candidate.projectId !== input.projectId,
+            candidate.projectId !== input.projectId ||
+            (input.source !== undefined &&
+              (candidate.sourceRecordId !== input.source.sourceRecordId ||
+                candidate.sourceRevision !== input.source.sourceRevision ||
+                candidate.sourceGeneration !== input.source.sourceGeneration)),
         )
       ) {
         return yield* new MemoryBackendError({

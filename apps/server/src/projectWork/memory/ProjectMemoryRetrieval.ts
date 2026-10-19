@@ -3,12 +3,14 @@ import {
   canonicalProjectWorkPayload,
   ProjectId,
   ProjectMemorySource,
+  type ProjectTeamMemorySourceSelector,
   type ProjectMemoryObservation,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
+import { qualifyProjectMemorySharedSource } from "./ProjectMemorySharing.ts";
 import { hydrateProjectMemoryHits } from "./ProjectMemoryHitHydration.ts";
 
 const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
@@ -50,7 +52,24 @@ export const readProjectMemoryObservations = Effect.fn("ProjectMemoryRetrieval.r
     projectId: ProjectId,
     query: string,
     exactHitIds?: readonly string[],
+    sharedSource?: {
+      readonly ownerProjectId: ProjectId;
+      readonly selection: ProjectTeamMemorySourceSelector;
+      readonly sourceSha256: string;
+    },
   ) {
+    if (sharedSource !== undefined) {
+      if (exactHitIds === undefined)
+        return degraded("Shared retrieval requires exact semantic hits", query);
+      const current = yield* qualifyProjectMemorySharedSource(
+        sql,
+        projectId,
+        sharedSource.selection,
+      );
+      if (canonicalProjectWorkPayload(current) !== canonicalProjectWorkPayload(sharedSource))
+        return degraded("Shared source grant changed", query);
+    }
+    const sourceProjectId = sharedSource?.ownerProjectId ?? projectId;
     if (Buffer.byteLength(query, "utf8") > 65_536)
       return degraded("Observation query exceeds the lexical bound", query);
     if (exactHitIds !== undefined && exactHitIds.length > 12)
@@ -72,20 +91,32 @@ export const readProjectMemoryObservations = Effect.fn("ProjectMemoryRetrieval.r
       const owners = yield* sql`SELECT CASE WHEN length(CAST(project_id AS BLOB))<=1024
         THEN project_id END AS project_id FROM project_team_memory_observation
         WHERE record_id IN ${sql.in(hitIds)} LIMIT 129`;
-      if (owners.length !== hitIds.length || owners.some((row) => row.project_id !== projectId))
+      if (
+        owners.length !== hitIds.length ||
+        owners.some((row) => row.project_id !== sourceProjectId)
+      )
         return degraded("Observation candidate ownership is ambiguous", query);
     }
     const hydrated = yield* hydrateProjectMemoryHits(sql, { projectId, hitIds });
     if (hydrated.status === "denied")
       return degraded("Observation authority is unavailable: " + hydrated.reason, query);
-    if (hydrated.selected.some((record) => record.projectId !== projectId))
+    if (
+      hydrated.selected.some(
+        (record) =>
+          record.projectId !== sourceProjectId ||
+          (sharedSource !== undefined &&
+            (record.sourceId !== sharedSource.selection.sourceRecordId ||
+              record.sourceRevision !== sharedSource.selection.sourceRevision ||
+              record.sourceGeneration !== sharedSource.selection.sourceGeneration)),
+      )
+    )
       return degraded("Observation authority is foreign", query);
     const sourceIds = [...new Set(hydrated.selected.map((record) => record.sourceId))].sort();
     const sources: ProjectMemorySource[] = [];
     if (sourceIds.length > 0) {
       const metadataRows = yield* sql`SELECT CASE WHEN length(CAST(record_id AS BLOB))<=1024
         THEN record_id END AS recordId, length(CAST(payload_json AS BLOB)) AS bytes
-        FROM project_team_memory_source WHERE project_id=${projectId}
+        FROM project_team_memory_source WHERE project_id=${sourceProjectId}
         AND record_id IN ${sql.in(sourceIds)} ORDER BY record_id LIMIT 129`;
       const metadata = decodeSourceMetadata(metadataRows);
       if (
@@ -100,7 +131,7 @@ export const readProjectMemoryObservations = Effect.fn("ProjectMemoryRetrieval.r
         payload: string | null;
       }>`SELECT record_id AS recordId,
         CASE WHEN length(CAST(payload_json AS BLOB))<=1048576 THEN payload_json END AS payload
-        FROM project_team_memory_source WHERE project_id=${projectId}
+        FROM project_team_memory_source WHERE project_id=${sourceProjectId}
         AND record_id IN ${sql.in(sourceIds)} ORDER BY record_id LIMIT 129`;
       if (payloads.length !== metadata.value.length)
         return degraded("Observation source provenance is incomplete", query);
@@ -108,7 +139,7 @@ export const readProjectMemoryObservations = Effect.fn("ProjectMemoryRetrieval.r
         const source = decodeSource(row.payload);
         if (
           Option.isNone(source) ||
-          source.value.projectId !== projectId ||
+          source.value.projectId !== sourceProjectId ||
           source.value.recordId !== row.recordId ||
           row.recordId !== sourceIds[index] ||
           Buffer.byteLength(row.payload ?? "", "utf8") !== metadata.value[index]?.bytes

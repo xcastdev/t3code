@@ -6,6 +6,7 @@ import {
   ProjectTeamMemorySelection,
   ProjectTeamMemoryProcessIntent,
   ProjectTeamMemoryQueryIntent,
+  ProjectTeamMemorySourceSelector,
   ProjectTeamEffect,
   canonicalProjectWorkPayload,
   EventId,
@@ -97,6 +98,13 @@ export const ProjectMemoryQueryOwner = Schema.Struct({
   kind: Schema.Literal("query"),
   operation: ProjectMemoryTaskOwner,
   request: ProjectTeamMemoryQueryIntent,
+  sharedSource: Schema.optionalKey(
+    Schema.Struct({
+      ownerProjectId: ProjectId,
+      selection: ProjectTeamMemorySourceSelector,
+      sourceSha256: Hash,
+    }),
+  ),
   configurationSha256: Hash,
   taskScopeSha256: Hash,
   intentFingerprint: Schema.String.check(Schema.isMaxLength(256)),

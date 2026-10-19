@@ -15,6 +15,7 @@ import {
   ProjectWorkEvidence,
   ProjectWorkDecision,
   ProjectTeamMemoryRetractIntent,
+  ProjectTeamMemorySharesReplaceIntent,
   ProjectTeamEffect,
   type ServerSettingsError,
 } from "@t3tools/contracts";
@@ -642,85 +643,114 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     return sourceTombstone(source, at, content);
   });
   /** The human Gateway owns authorization, the original receipt and this transaction. */
+  const currentSourceInTransaction = Effect.fn("ProjectMemoryService.currentSourceInTransaction")(
+    function* (request: ProjectTeamMemoryRetractIntent | ProjectTeamMemorySharesReplaceIntent) {
+      if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* deny("Memory mutation requires the owning SQL transaction");
+      yield* requireProject(request.projectId);
+      const state = yield* readCurrentState(sql, request.projectId);
+      const selected = sourceFor(state, request.sourceRecordId);
+      if (state.revision !== request.expectedRevision || selected === undefined)
+        return yield* deny("Selected memory source revision changed");
+      const source = yield* validate(ProjectMemorySource, selected);
+      if (
+        source.status !== "current" ||
+        source.tombstonedAt !== undefined ||
+        source.projectId !== request.projectId ||
+        source.revision !== request.expectedSourceRecordRevision ||
+        source.sourceRevision !== request.sourceRevision ||
+        source.generation !== request.sourceGeneration ||
+        source.contentHash !== request.contentHash ||
+        projectMemoryHash(source.content) !== source.contentHash
+      )
+        return yield* deny("Selected memory source is no longer current");
+      const versions = records(state).filter(
+        (entry): entry is Source =>
+          entry.kind === "memory-source" && entry.sourceId === source.sourceId,
+      );
+      if (
+        versions.length > 256 ||
+        versions.some(
+          (entry) =>
+            entry.status === "conflicted" ||
+            entry.status === "retracted" ||
+            entry.tombstonedAt !== undefined ||
+            (entry.recordId !== source.recordId &&
+              (entry.status === "current" ||
+                entry.generation > source.generation ||
+                entry.sourceRevision > source.sourceRevision)) ||
+            entry.supersedes === source.recordId,
+        )
+      )
+        return yield* deny("Selected memory source is not the effective current version");
+      const visited = new Set<string>();
+      let cursor: Source | undefined = source;
+      while (cursor !== undefined) {
+        if (visited.has(cursor.recordId))
+          return yield* deny("Memory source correction chain is invalid");
+        visited.add(cursor.recordId);
+        if (cursor.supersedes === undefined) break;
+        const parent = versions.find((entry) => entry.recordId === cursor?.supersedes);
+        if (
+          parent === undefined ||
+          parent.projectId !== source.projectId ||
+          parent.status !== "superseded" ||
+          versions.filter((entry) => entry.supersedes === parent.recordId).length !== 1
+        )
+          return yield* deny("Memory source correction chain is incomplete or ambiguous");
+        cursor = parent;
+      }
+      const metadata = yield* sql<{
+        bytes: number;
+      }>`SELECT length(CAST(payload_json AS BLOB)) AS bytes
+      FROM project_team_memory_source WHERE project_id=${request.projectId} AND record_id=${source.recordId} LIMIT 2`;
+      if (
+        metadata.length !== 1 ||
+        !Number.isSafeInteger(metadata[0]?.bytes) ||
+        (metadata[0]?.bytes ?? 262145) > 262144
+      )
+        return yield* deny("Selected physical memory source is unavailable");
+      const rows = yield* sql<{ payload: string }>`SELECT payload_json AS payload
+      FROM project_team_memory_source WHERE project_id=${request.projectId} AND record_id=${source.recordId}
+      AND length(CAST(payload_json AS BLOB))<=262144 LIMIT 2`;
+      if (
+        rows.length !== 1 ||
+        canonicalProjectWorkPayload(
+          yield* validate(Schema.fromJsonString(ProjectMemorySource), rows[0]?.payload),
+        ) !== canonicalProjectWorkPayload(source)
+      )
+        return yield* deny("Selected physical memory source changed");
+      return source;
+    },
+  );
+  const prepareSharesInTransaction = Effect.fn("ProjectMemoryService.prepareSharesInTransaction")(
+    function* (input: ProjectTeamMemorySharesReplaceIntent, at: string) {
+      const request = yield* validate(ProjectTeamMemorySharesReplaceIntent, input);
+      const source = yield* currentSourceInTransaction(request);
+      const shares = request.sharedWithProjectIds;
+      if (shares.includes(source.projectId))
+        return yield* deny("Memory cannot be shared with its owner");
+      for (const projectId of shares) yield* requireProject(projectId);
+      yield* contentGuard
+        .assertSafe(source)
+        .pipe(Effect.mapError(() => deny("Selected memory source is no longer safe to share")));
+      // A grant changes authority, not indexed content. Keep the source tuple so
+      // existing observations remain usable; query owners freeze the full source hash.
+      return [
+        yield* validate(ProjectMemorySource, {
+          ...source,
+          revision: source.revision + 1,
+          updatedAt: at,
+          sharedWithProjectIds: shares,
+        }),
+      ] satisfies ReadonlyArray<ProjectTeamRecord>;
+    },
+  );
   const prepareRetractionInTransaction = Effect.fn(
     "ProjectMemoryService.prepareRetractionInTransaction",
   )(function* (input: ProjectTeamMemoryRetractIntent, at: string) {
-    if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
-      return yield* deny("Memory retraction requires the owning SQL transaction");
     const request = yield* validate(ProjectTeamMemoryRetractIntent, input);
-    yield* requireProject(request.projectId);
-    const state = yield* readCurrentState(sql, request.projectId);
-    const selected = sourceFor(state, request.sourceRecordId);
-    if (state.revision !== request.expectedRevision || selected === undefined)
-      return yield* deny("Selected memory source revision changed");
-    const source = yield* validate(ProjectMemorySource, selected);
-    if (
-      source.status !== "current" ||
-      source.tombstonedAt !== undefined ||
-      source.projectId !== request.projectId ||
-      source.revision !== request.expectedSourceRecordRevision ||
-      source.sourceRevision !== request.sourceRevision ||
-      source.generation !== request.sourceGeneration ||
-      source.contentHash !== request.contentHash ||
-      projectMemoryHash(source.content) !== source.contentHash
-    )
-      return yield* deny("Selected memory source is no longer current");
-    const versions = records(state).filter(
-      (entry): entry is Source =>
-        entry.kind === "memory-source" && entry.sourceId === source.sourceId,
-    );
-    if (
-      versions.length > 256 ||
-      versions.some(
-        (entry) =>
-          entry.status === "conflicted" ||
-          entry.status === "retracted" ||
-          entry.tombstonedAt !== undefined ||
-          (entry.recordId !== source.recordId &&
-            (entry.status === "current" ||
-              entry.generation > source.generation ||
-              entry.sourceRevision > source.sourceRevision)) ||
-          entry.supersedes === source.recordId,
-      )
-    )
-      return yield* deny("Selected memory source is not the effective current version");
-    const visited = new Set<string>();
-    let cursor: Source | undefined = source;
-    while (cursor !== undefined) {
-      if (visited.has(cursor.recordId))
-        return yield* deny("Memory source correction chain is invalid");
-      visited.add(cursor.recordId);
-      if (cursor.supersedes === undefined) break;
-      const parent = versions.find((entry) => entry.recordId === cursor?.supersedes);
-      if (
-        parent === undefined ||
-        parent.projectId !== source.projectId ||
-        parent.status !== "superseded" ||
-        versions.filter((entry) => entry.supersedes === parent.recordId).length !== 1
-      )
-        return yield* deny("Memory source correction chain is incomplete or ambiguous");
-      cursor = parent;
-    }
-    const metadata = yield* sql<{
-      bytes: number;
-    }>`SELECT length(CAST(payload_json AS BLOB)) AS bytes
-      FROM project_team_memory_source WHERE project_id=${request.projectId} AND record_id=${source.recordId} LIMIT 2`;
-    if (
-      metadata.length !== 1 ||
-      !Number.isSafeInteger(metadata[0]?.bytes) ||
-      (metadata[0]?.bytes ?? 262145) > 262144
-    )
-      return yield* deny("Selected physical memory source is unavailable");
-    const rows = yield* sql<{ payload: string }>`SELECT payload_json AS payload
-      FROM project_team_memory_source WHERE project_id=${request.projectId} AND record_id=${source.recordId}
-      AND length(CAST(payload_json AS BLOB))<=262144 LIMIT 2`;
-    if (
-      rows.length !== 1 ||
-      canonicalProjectWorkPayload(
-        yield* validate(Schema.fromJsonString(ProjectMemorySource), rows[0]?.payload),
-      ) !== canonicalProjectWorkPayload(source)
-    )
-      return yield* deny("Selected physical memory source changed");
+    const source = yield* currentSourceInTransaction(request);
     const tombstone = yield* validate(ProjectMemorySource, yield* prepareTombstone(source, at));
     const effect = yield* validate(ProjectTeamEffect, intent(tombstone, "memory-delete", at));
     yield* retainProjectMemoryJob(sql, {
@@ -1144,6 +1174,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
     supersedeDecision,
     retract,
     prepareRetractionInTransaction,
+    prepareSharesInTransaction,
     replaceShares,
     readWork,
     currentIndex,

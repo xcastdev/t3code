@@ -3531,3 +3531,147 @@ it.effect("rejects persisted malformed metadata without effects and restores hea
     expect(yield* ledgers).toEqual(before);
   }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
 );
+
+it.effect(
+  "replaces exact memory grants through one human gateway transaction with replay and rollback",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const repository = yield* ProjectWorkRepository.ProjectWorkRepository;
+      const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+      const human = { kind: "human", id: "share-human" } as const;
+      const web = { kind: "web", id: "share-panel" } as const;
+      yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+      VALUES (${projectId},'Owner','/fixture/owner','[]',${at},${at}),('sharing-recipient','Recipient','/fixture/recipient','[]',${at},${at})`;
+      yield* repository.execute({
+        type: "project-work.task.create",
+        commandId: CommandId.make("share-task"),
+        projectId,
+        taskId,
+        title: "Shared finding",
+        createdAt: at,
+      });
+      yield* gateway.write(
+        yield* decodePublicWrite({
+          type: "project-work.comment.add",
+          commandId: "share-comment-add",
+          projectId,
+          addedAt: at,
+          comment: {
+            commentId: "share-comment",
+            projectId,
+            taskId,
+            body: "Retain exact parser provenance.",
+            revision: 0,
+            createdAt: at,
+          },
+        }),
+        human,
+        web,
+      );
+      const service = makeProjectMemoryService({
+        sql,
+        repository,
+        authorization: yield* TeamAuthorization.ProjectTeamAuthorization,
+        contentGuard: yield* ContentGuard.ProjectWorkContentGuard,
+        environmentId: "gateway-environment",
+      });
+      const source = yield* service.captureRetained(projectId, {
+        kind: "comment",
+        retainedId: "share-comment",
+      });
+      const before = yield* ProjectWorkRepository.readCurrentState(sql, projectId);
+      const jobs = yield* sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
+      const request = yield* decodePublicWrite({
+        type: "project-team.memory.shares.replace",
+        commandId: "human-share",
+        projectId,
+        expectedRevision: before.revision,
+        sourceRecordId: source.recordId,
+        expectedSourceRecordRevision: source.revision,
+        sourceRevision: source.sourceRevision,
+        sourceGeneration: source.generation,
+        contentHash: source.contentHash,
+        sharedWithProjectIds: ["sharing-recipient"],
+      });
+      expect((yield* gateway.write(request, human, web).pipe(Effect.result))._tag).toBe("Failure");
+      let calls = 0;
+      let denyFinal = false;
+      const permission = ProjectWorkVerificationRequest.of({
+        assertCurrent: (principal, target, purpose) =>
+          Effect.gen(function* () {
+            expect(principal).toEqual({ actor: human });
+            expect(target).toBe(projectId);
+            expect(purpose).toBe("write");
+            calls++;
+            if (denyFinal && calls > 1)
+              return yield* new ProjectWorkVerificationRequestError({
+                reason: "Revoked before commit",
+              });
+          }),
+      });
+      const write = (input: ProjectWorkWriteIntent) =>
+        gateway
+          .write(input, human, web)
+          .pipe(Effect.provideService(ProjectWorkVerificationRequest, permission));
+      expect(
+        (yield* gateway
+          .write(request, { kind: "agent", id: "forged" }, web)
+          .pipe(Effect.provideService(ProjectWorkVerificationRequest, permission), Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      if (request.type !== "project-team.memory.shares.replace")
+        return yield* Effect.die("Missing sharing intent");
+      for (const changed of [
+        { ...request, expectedSourceRecordRevision: source.revision + 1 },
+        { ...request, sharedWithProjectIds: [projectId] },
+      ]) {
+        expect((yield* write(changed).pipe(Effect.result))._tag).toBe("Failure");
+      }
+      calls = 0;
+      denyFinal = true;
+      expect((yield* write(request).pipe(Effect.result))._tag).toBe("Failure");
+      expect(calls).toBeGreaterThan(1);
+      expect(yield* ProjectWorkRepository.readCurrentState(sql, projectId)).toEqual(before);
+      expect(
+        yield* sql`SELECT * FROM project_work_command_receipts WHERE command_id=${request.commandId}`,
+      ).toEqual([]);
+      calls = 0;
+      denyFinal = false;
+      const accepted = yield* write(request);
+      expect(accepted.receipt).toMatchObject({ status: "accepted", eventCount: 1 });
+      expect(yield* write(request)).toEqual(accepted);
+      const after = yield* ProjectWorkRepository.readCurrentState(sql, projectId);
+      expect(after.foundationRecords?.find((r) => r.recordId === source.recordId)).toEqual({
+        ...source,
+        revision: source.revision + 1,
+        sharedWithProjectIds: ["sharing-recipient"],
+        updatedAt: after.foundationRecords?.find((r) => r.recordId === source.recordId)?.updatedAt,
+      });
+      expect(yield* sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`).toEqual(jobs);
+      expect(
+        yield* sql`SELECT * FROM project_team_memory_source WHERE project_id='sharing-recipient'`,
+      ).toEqual([]);
+      const current = after.foundationRecords?.find((r) => r.recordId === source.recordId);
+      if (current?.kind !== "memory-source") return yield* Effect.die("Missing shared source");
+      yield* write({
+        ...request,
+        commandId: CommandId.make("human-unshare"),
+        expectedRevision: after.revision,
+        expectedSourceRecordRevision: current.revision,
+        sharedWithProjectIds: [],
+      });
+      expect(
+        (yield* ProjectWorkRepository.readCurrentState(sql, projectId)).foundationRecords?.find(
+          (r) => r.recordId === source.recordId,
+        ),
+      ).toMatchObject({ sharedWithProjectIds: [] });
+    }).pipe(
+      Effect.provide(
+        Layer.fresh(gatewayLayer.pipe(Layer.provideMerge(ContentGuard.layer))).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
+);

@@ -92,13 +92,13 @@ export const managedActorId = (
   credential: Pick<ProjectTeamCredential, "providerInstanceId" | "threadId">,
 ) => `agent:mcp:${credential.providerInstanceId}:${credential.threadId}`;
 const deny = (reason: string) => new ProjectTeamAuthorizationError({ reason });
-export const assertHumanMemoryRetractionInTransaction = Effect.fn(
-  "ProjectTeamAuthorization.assertHumanMemoryRetractionInTransaction",
+export const assertHumanMemoryMutationInTransaction = Effect.fn(
+  "ProjectTeamAuthorization.assertHumanMemoryMutationInTransaction",
 )(function* (sql: SqlClient.SqlClient, principal: ProjectTeamPrincipal, projectId: ProjectId) {
   if (principal.actor.kind !== "human" || principal.managed !== undefined)
-    return yield* deny("Memory retraction requires authenticated human authority");
+    return yield* deny("Memory mutation requires authenticated human authority");
   if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
-    return yield* deny("Memory retraction requires the owning SQL transaction");
+    return yield* deny("Memory mutation requires the owning SQL transaction");
   const request = yield* Effect.serviceOption(ProjectWorkVerificationRequest);
   if (Option.isNone(request)) return yield* deny("Current human project permission is unavailable");
   yield* request.value
@@ -1343,10 +1343,12 @@ export const layer = Layer.effect(
       if (!authority) return;
       if (input.projectId !== authority.binding.projectId)
         return yield* deny("Managed project mismatch");
-      if (input.operation === "memory-sources") {
+      if (input.operation === "memory-sources" || input.operation === "memory-shared-sources") {
         if (
           input.taskId !== authority.binding.taskId ||
           authority.role.memoryAccess === "none" ||
+          (input.operation === "memory-shared-sources" &&
+            authority.role.memoryAccess !== "shared") ||
           !["project-work.read-task", "project-work.read-project"].some(
             (tool) =>
               authority.role.tools.includes(tool) &&

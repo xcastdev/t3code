@@ -81,7 +81,14 @@ class ManifestInput(TupleInput):
         return entries
 
 
+class SourceSelector(StrictModel):
+    sourceRecordId: TextId
+    sourceRevision: Counter
+    sourceGeneration: Counter
+
+
 class SearchInput(Scope):
+    source: SourceSelector | None = None
     vector: list[float]
     limit: Annotated[StrictInt, Field(ge=1, le=100)]
     _vector = field_validator("vector", mode="before")(validate_vector)
@@ -313,7 +320,10 @@ def execute(directory, fence_path, fence, store, operation, input, checkpoint):
         raise BackendFailure("fenced")
     if operation == "search":
         candidates = []
-        for point in store.search(query="", vectors=input.vector, top_k=input.limit, filters=scoped(input)):
+        filters = scoped(input)
+        if input.source is not None:
+            filters.update(input.source.model_dump())
+        for point in store.search(query="", vectors=input.vector, top_k=input.limit, filters=filters):
             payload = point.payload or {}
             try:
                 candidate = Candidate.model_validate({key: payload[key] for key in Candidate.model_fields if key != "score"}
@@ -323,7 +333,9 @@ def execute(directory, fence_path, fence, store, operation, input, checkpoint):
             source = fence.sources.get(candidate.sourceRecordId)
             if (source and not source.deleted and candidate.sourceGeneration == source.generation
                     and candidate.sourceRevision == source.sourceRevision
-                    and scoped(candidate) == scoped(input)):
+                    and scoped(candidate) == scoped(input)
+                    and (input.source is None or all(getattr(candidate, key) == value
+                         for key, value in input.source.model_dump().items()))):
                 candidates.append(candidate.model_dump())
         return {"candidates": candidates}
     require_current(fence, input)

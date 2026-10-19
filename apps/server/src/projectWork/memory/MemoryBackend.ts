@@ -43,6 +43,13 @@ export const MemoryIndexManifest = Schema.Struct({
 });
 export const MemoryBackendSearch = Schema.Struct({
   ...MemoryBackendScope.fields,
+  source: Schema.optionalKey(
+    Schema.Struct({
+      sourceRecordId: Id,
+      sourceRevision: Counter,
+      sourceGeneration: Counter,
+    }),
+  ),
   vector: MemoryVector,
   limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 })),
 });

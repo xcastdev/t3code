@@ -4,6 +4,7 @@ import {
   type ProjectWorkWriteIntent,
   ProjectTeamWriteIntent,
   type ProjectTeamMemoryRetractIntent,
+  type ProjectTeamMemorySharesReplaceIntent,
   ProjectWorkVerificationJobRead,
   ProjectTeamGuidedIntent,
   ProjectTeamIntegrationSourcePage,
@@ -42,6 +43,7 @@ import {
   makeProjectMemoryService,
   ProjectMemoryServiceError,
 } from "./memory/ProjectMemoryService.ts";
+import { readProjectMemorySharedSources } from "./memory/ProjectMemorySharing.ts";
 import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
 import {
   makeProjectMemoryQuery,
@@ -520,6 +522,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     const result: Effect.Effect<unknown, ProjectionRepositoryError> = (() => {
       switch (boundedInput.operation) {
         case "memory-sources":
+        case "memory-shared-sources":
         case "integration-sources":
         case "verification-job":
           return Effect.fail(
@@ -1097,7 +1100,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     });
 
   const read: ProjectWorkGatewayShape["read"] = (input, principal) => {
-    if (input.operation === "memory-sources")
+    if (input.operation === "memory-sources" || input.operation === "memory-shared-sources")
       return sql
         .withTransaction(
           Effect.gen(function* () {
@@ -1116,8 +1119,13 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             yield* teamAuthorization.value.read(principal, input);
             const authority = yield* teamAuthorization.value.resolve(principal);
             if (authority === undefined) return yield* deny();
-            const processing = yield* makeProjectMemoryProcessing;
-            const page = yield* processing.readSourcesInTransaction(input, authority);
+            const page =
+              input.operation === "memory-shared-sources"
+                ? yield* readProjectMemorySharedSources(sql, input, authority)
+                : yield* Effect.gen(function* () {
+                    const processing = yield* makeProjectMemoryProcessing;
+                    return yield* processing.readSourcesInTransaction(input, authority);
+                  });
             yield* teamAuthorization.value.read(principal, input);
             if (!(yield* serverSettings.getSettings).projectWorkEnabled) return yield* deny();
             return page;
@@ -1332,8 +1340,8 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         ),
       );
   };
-  const writeMemoryRetraction = Effect.fn("ProjectWorkGateway.writeMemoryRetraction")(function* (
-    input: ProjectTeamMemoryRetractIntent,
+  const writeMemoryMutation = Effect.fn("ProjectWorkGateway.writeMemoryMutation")(function* (
+    input: ProjectTeamMemoryRetractIntent | ProjectTeamMemorySharesReplaceIntent,
     actor: ProjectWorkActor,
     source: ProjectWorkAttribution["source"],
     principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
@@ -1342,9 +1350,9 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     const denied = (reason: string) =>
       new ProjectTeamAuthorization.ProjectTeamAuthorizationError({ reason });
     if (caller.actor.kind !== actor.kind || caller.actor.id !== actor.id)
-      return yield* denied("Memory retraction actor does not match the authenticated request");
+      return yield* denied("Memory mutation actor does not match the authenticated request");
     if (Option.isNone(teamAuthorization) || Option.isNone(contentGuard))
-      return yield* denied("Memory retraction safety and authorization services are unavailable");
+      return yield* denied("Memory mutation safety and authorization services are unavailable");
     const authorization = teamAuthorization.value;
     const guard = contentGuard.value;
     const at = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
@@ -1362,7 +1370,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         )
         .digest("hex");
     const authorize = Effect.gen(function* () {
-      yield* ProjectTeamAuthorization.assertHumanMemoryRetractionInTransaction(
+      yield* ProjectTeamAuthorization.assertHumanMemoryMutationInTransaction(
         sql,
         caller,
         input.projectId,
@@ -1403,17 +1411,19 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             authorization,
             environmentId,
           });
-          const records = yield* service
-            .prepareRetractionInTransaction(input, at)
-            .pipe(
-              Effect.mapError((error) =>
-                denied(
-                  isMemoryServiceError(error)
-                    ? error.reason
-                    : "Selected memory source is unavailable",
-                ),
+          const records = yield* (
+            input.type === "project-team.memory.shares.replace"
+              ? service.prepareSharesInTransaction(input, at)
+              : service.prepareRetractionInTransaction(input, at)
+          ).pipe(
+            Effect.mapError((error) =>
+              denied(
+                isMemoryServiceError(error)
+                  ? error.reason
+                  : "Selected memory source is unavailable",
               ),
-            );
+            ),
+          );
           yield* authorize;
           for (const record of records) {
             if (record.kind !== "memory-source") continue;
@@ -1437,8 +1447,11 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     return result.writeResult;
   });
   const write: ProjectWorkGatewayShape["write"] = (input, actor, source, principal) => {
-    if (input.type === "project-team.memory.retract")
-      return writeMemoryRetraction(input, actor, source, principal);
+    if (
+      input.type === "project-team.memory.retract" ||
+      input.type === "project-team.memory.shares.replace"
+    )
+      return writeMemoryMutation(input, actor, source, principal);
     if (!isTeamIntent(input) && !isGuidedIntent(input))
       return writeCommand(input, actor, source, principal);
     return Effect.gen(function* () {

@@ -100,7 +100,12 @@ export const makeProjectMemoryCompanion = Effect.fn("makeProjectMemoryCompanion"
       );
       if (roots.some((protectedRoot) => overlaps(root, protectedRoot)))
         return yield* deny("Companion store overlaps protected data");
-      const key = projectMemoryHash([owner.operation.environmentId, owner.operation.projectId]);
+      const key = projectMemoryHash([
+        owner.operation.environmentId,
+        owner.version === 2
+          ? (owner.sharedSource?.ownerProjectId ?? owner.operation.projectId)
+          : owner.operation.projectId,
+      ]);
       const workspaceRoot = path.join(root, "cwd", key);
       const nativeStateRoot = path.join(root, "projects", key);
       for (const directory of [

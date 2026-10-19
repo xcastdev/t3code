@@ -50,6 +50,7 @@ import {
   readProjectMemoryObservations,
   type ProjectMemoryRetrieval,
 } from "./ProjectMemoryRetrieval.ts";
+import { qualifyProjectMemorySharedSource } from "./ProjectMemorySharing.ts";
 import { ProjectTeamAuthorization } from "../ProjectTeamAuthorization.ts";
 import { ProjectMemoryServiceError, projectMemoryHash } from "./ProjectMemoryService.ts";
 
@@ -355,6 +356,7 @@ type Qualification = {
   readonly configurationSha256: string;
   readonly taskScopeSha256: string;
   readonly intentFingerprint: string;
+  readonly sharedSource?: NonNullable<ProjectMemoryQueryOwner["sharedSource"]>;
 };
 export class ProjectMemoryQueryQualification extends Context.Service<
   ProjectMemoryQueryQualification,
@@ -415,6 +417,7 @@ const originalFingerprint = (owner: ProjectMemoryQueryOwner) =>
       operation: owner.operation,
       configurationSha256: owner.configurationSha256,
       taskScopeSha256: owner.taskScopeSha256,
+      ...(owner.sharedSource === undefined ? {} : { sharedSource: owner.sharedSource }),
     },
   );
 const admittedEffect = (
@@ -695,7 +698,12 @@ export const auditProjectMemoryQueryStages = Effect.fn("ProjectMemoryQuery.audit
           (candidate) =>
             candidate.observationId === hit &&
             candidate.environmentId === owner.operation.environmentId &&
-            candidate.projectId === owner.operation.projectId,
+            candidate.projectId ===
+              (owner.sharedSource?.ownerProjectId ?? owner.operation.projectId) &&
+            (owner.sharedSource === undefined ||
+              (candidate.sourceRecordId === owner.sharedSource.selection.sourceRecordId &&
+                candidate.sourceRevision === owner.sharedSource.selection.sourceRevision &&
+                candidate.sourceGeneration === owner.sharedSource.selection.sourceGeneration)),
         ),
       )
     )
@@ -731,6 +739,10 @@ export const auditProjectMemoryQueryStages = Effect.fn("ProjectMemoryQuery.audit
 export const auditProjectMemoryQueryAdmission = Effect.fn("ProjectMemoryQuery.auditAdmission")(
   function* (sql: SqlClient.SqlClient, owner: ProjectMemoryQueryOwner) {
     if (
+      (owner.request.sharedSource === undefined) !== (owner.sharedSource === undefined) ||
+      (owner.sharedSource !== undefined &&
+        (owner.sharedSource.ownerProjectId === owner.request.projectId ||
+          !same(owner.sharedSource.selection, owner.request.sharedSource))) ||
       owner.intentFingerprint !== originalFingerprint(owner) ||
       !same(
         owner.admittedEffect,
@@ -741,6 +753,7 @@ export const auditProjectMemoryQueryAdmission = Effect.fn("ProjectMemoryQuery.au
             configurationSha256: owner.configurationSha256,
             taskScopeSha256: owner.taskScopeSha256,
             intentFingerprint: owner.intentFingerprint,
+            ...(owner.sharedSource === undefined ? {} : { sharedSource: owner.sharedSource }),
           },
           owner.admittedAt,
         ),
@@ -899,6 +912,16 @@ export const makeProjectMemoryQuery = Effect.fn("makeProjectMemoryQuery")(
           task.state !== "in-progress"
         )
           return yield* deny("Query task, specification or plan changed");
+        const sharedSource =
+          request.sharedSource === undefined
+            ? undefined
+            : authority.role.memoryAccess !== "shared"
+              ? yield* deny("Cross-project query requires shared memory access")
+              : yield* qualifyProjectMemorySharedSource(
+                  sql,
+                  request.projectId,
+                  request.sharedSource,
+                );
         yield* ports.value.assertConfigured();
         const configuration = yield* ports.value.readConfiguration();
         if (configuration === undefined)
@@ -917,10 +940,19 @@ export const makeProjectMemoryQuery = Effect.fn("makeProjectMemoryQuery")(
         )
           return yield* deny("Query configuration or approved task changed after qualification");
         yield* guard.value.assertSafe(request.query);
+        if (
+          sharedSource !== undefined &&
+          !same(
+            sharedSource,
+            yield* qualifyProjectMemorySharedSource(sql, request.projectId, sharedSource.selection),
+          )
+        )
+          return yield* deny("Shared source changed during query qualification");
         const qualified = {
           operation: owner,
           configurationSha256: projectMemoryHash(configuration),
           taskScopeSha256: projectMemoryQueryTaskScope(authority),
+          ...(sharedSource === undefined ? {} : { sharedSource }),
         };
         return {
           ...qualified,
@@ -969,6 +1001,7 @@ export const makeProjectMemoryQuery = Effect.fn("makeProjectMemoryQuery")(
           configurationSha256: retained.configurationSha256,
           taskScopeSha256: retained.taskScopeSha256,
           intentFingerprint: retained.intentFingerprint,
+          ...(retained.sharedSource === undefined ? {} : { sharedSource: retained.sharedSource }),
         };
       },
       Effect.mapError((error) =>
@@ -1210,6 +1243,22 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
             !same(yield* executing.value.readCurrentInTransaction(principal), owner.operation)
           )
             return yield* deny("Original query owner, scope or grants changed");
+          if (owner.request.sharedSource !== undefined) {
+            if (
+              authority.role.memoryAccess !== "shared" ||
+              owner.sharedSource === undefined ||
+              !same(
+                owner.sharedSource,
+                yield* qualifyProjectMemorySharedSource(
+                  sql,
+                  owner.request.projectId,
+                  owner.request.sharedSource,
+                ),
+              )
+            )
+              return yield* deny("Original shared source grant changed");
+          } else if (owner.sharedSource !== undefined)
+            return yield* deny("Local query cannot have a shared source");
           yield* guard.assertSafe(owner.request.query);
         }).pipe(
           Effect.provideService(SqlClient.SqlClient, sql),
@@ -1372,7 +1421,16 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
         const found = yield* backend
           .search(search.requestId, {
             environmentId: owner.operation.environmentId,
-            projectId: owner.operation.projectId,
+            projectId: owner.sharedSource?.ownerProjectId ?? owner.operation.projectId,
+            ...(owner.sharedSource === undefined
+              ? {}
+              : {
+                  source: {
+                    sourceRecordId: owner.sharedSource.selection.sourceRecordId,
+                    sourceRevision: owner.sharedSource.selection.sourceRevision,
+                    sourceGeneration: owner.sharedSource.selection.sourceGeneration,
+                  },
+                }),
             vector,
             limit: 12,
           })
@@ -1395,7 +1453,7 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
         const hits = found.success.candidates.filter(
           (hit) =>
             hit.environmentId === owner.operation.environmentId &&
-            hit.projectId === owner.operation.projectId,
+            hit.projectId === (owner.sharedSource?.ownerProjectId ?? owner.operation.projectId),
         );
         const hitIds = [...new Set(hits.map((hit) => hit.observationId))];
         yield* publishFinal(
@@ -1407,6 +1465,7 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
               owner.request.projectId,
               owner.request.query,
               hitIds,
+              owner.sharedSource,
             );
             if (hydrated.status !== "available")
               return yield* deny("Current query hit authority unavailable");
@@ -1539,6 +1598,20 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
             owner.configurationSha256 !== projectMemoryHash(configuration)
           )
             continue;
+          if (
+            owner.request.sharedSource !== undefined &&
+            (authority.role.memoryAccess !== "shared" ||
+              owner.sharedSource === undefined ||
+              !same(
+                owner.sharedSource,
+                yield* qualifyProjectMemorySharedSource(
+                  sql,
+                  owner.request.projectId,
+                  owner.request.sharedSource,
+                ),
+              ))
+          )
+            continue;
           yield* auditProjectMemoryQueryAdmission(sql, owner);
           yield* guard.assertSafe(owner.request.query);
           const { auditProjectMemoryOperationLedger } = yield* Effect.promise(
@@ -1553,12 +1626,15 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
             owner.request.projectId,
             owner.request.query,
             result.hitIds,
+            owner.sharedSource,
           );
           if (
             hydrated.status !== "available" ||
             hydrated.provenance.snapshotSha256 !== result.snapshotSha256
           )
             continue;
+          yield* guard.assertSafe(owner.request.query);
+          yield* guard.assertSafe(hydrated.records);
           const finalAuthority = yield* authorization.resolve(principal);
           const finalConfiguration = yield* options.readConfiguration;
           if (
@@ -1568,8 +1644,19 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
             projectMemoryHash(finalConfiguration) !== owner.configurationSha256
           )
             continue;
-          yield* guard.assertSafe(owner.request.query);
-          yield* guard.assertSafe(hydrated.records);
+          if (
+            owner.sharedSource !== undefined &&
+            (finalAuthority.role.memoryAccess !== "shared" ||
+              !same(
+                owner.sharedSource,
+                yield* qualifyProjectMemorySharedSource(
+                  sql,
+                  owner.request.projectId,
+                  owner.sharedSource.selection,
+                ),
+              ))
+          )
+            continue;
           return {
             ...hydrated,
             provenance: {

@@ -1,3 +1,4 @@
+import { projectMemorySourceSelection } from "../../projectWork/memory/ProjectMemorySharing.ts";
 import * as PiOperations from "../../projectWork/ProjectTeamPiOperations.ts";
 import type { PiWorkerFrame } from "./PiWorkerProtocol.ts";
 import { decodePiParentFrame } from "./PiWorkerProtocol.ts";
@@ -43,6 +44,10 @@ import {
   ProjectTeamMemorySourcesRead,
   ProjectTeamMemoryProcessIntent,
   ProjectTeamMemoryQueryIntent,
+  type ProjectTeamMemorySourceSelector,
+  type ProjectMemoryObservation,
+  ProjectTeamMemorySharedSourcesRead,
+  ProjectTeamMemorySharesReplaceIntent,
   ManagedSkillKey,
   SkillCatalogRevision,
   ProjectTeamGuidedIntent,
@@ -50,6 +55,7 @@ import {
   ProjectWorkFoundationCommitCommand,
   ProjectTeamWriteIntent,
   ProjectWorkTaskId,
+  ProjectId,
   ThreadId,
   ProjectWorkCommand,
 } from "@t3tools/contracts";
@@ -6384,6 +6390,8 @@ const decodeMemoryCompanionInput = Schema.decodeUnknownEffect(
   ),
   { onExcessProperty: "error" },
 );
+const decodeSharedQuerySources = Schema.decodeUnknownEffect(ProjectTeamMemorySharedSourcesRead);
+const decodeSharedQueryShares = Schema.decodeUnknownEffect(ProjectTeamMemorySharesReplaceIntent);
 const decodeQueryCompanionInput = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
     Schema.Struct({
@@ -7224,7 +7232,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   child = !reviewer,
   readonlyKind?: "planning" | "review" | "investigation",
   memory = false,
-  memoryPolicy: "project" | "none" | "read-only" = "project",
+  memoryPolicy: "project" | "shared" | "none" | "read-only" = "project",
   assignment = "Implement the approved retained context",
   profile?: RuntimeFixtureProfile,
 ) {
@@ -7303,7 +7311,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
                     : {}),
                   ...(memory
                     ? {
-                        memoryAccess: memoryPolicy === "none" ? "none" : "project",
+                        memoryAccess: memoryPolicy === "read-only" ? "project" : memoryPolicy,
                         tools:
                           memoryPolicy === "read-only"
                             ? ["project-work.read-task"]
@@ -9790,6 +9798,16 @@ for (const compactProof of [
   "memoryHumanRetraction",
   "memoryQuery",
   "memoryQueryPipeline",
+  "memoryQueryShared",
+  "memoryCompanionSharedQuery",
+  "memoryQuerySharedProject",
+  "memoryQuerySharedNone",
+  "memoryQuerySharedRevokeCache",
+  "memoryQuerySharedRevokeDelivery",
+  "memoryQuerySharedRevokeBeforeSearch",
+  "memoryQuerySharedDeleteCache",
+  "memoryQuerySharedTombstoneCache",
+  "memoryQuerySharedSupersedeCache",
   "memoryQueryModelUnknown",
   "memoryQuerySearchUnknown",
   "memoryQueryGuards",
@@ -9800,51 +9818,54 @@ for (const compactProof of [
   "memoryQueryMixed",
 ] as const)
   it.effect(
-    compactProof === undefined
-      ? "managed compact transfers current required context after durable association and replays without another execution"
-      : compactProof === "memoryAdmission"
-        ? "retains exact memory selection against the executing operation before processing and replays after terminal"
-        : compactProof === "memoryAccounting"
-          ? "accounts memory and ordinary stages against the same executing operation and shared capacity"
-          : compactProof === "memorySharedRoot"
-            ? "reads shared root usage outside the charged child binding page without assigning parent charges"
-            : compactProof === "memoryPipeline"
-              ? "processes an exact admitted source through shared model accounting and the configured index consumer"
-              : compactProof === "memoryFailure"
-                ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
-                : compactProof === "memorySecret"
-                  ? "rejects a newly learned escaped source secret before memory extraction reservation"
-                  : compactProof === "memoryEmbeddingSecret"
-                    ? "rejects newly learned escaped embedding text before its memory reservation"
-                    : compactProof === "memoryCleanup"
-                      ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
-                      : compactProof === "memoryHumanRetraction"
-                        ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
-                        : compactProof === "memoryCleanupGuards"
-                          ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
-                          : compactProof === "memoryQuery"
-                            ? "admits an explicit semantic query through the executing task bridge before forward stages"
-                            : compactProof === "memoryQueryPipeline"
-                              ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
-                              : compactProof === "memoryQueryMixed"
-                                ? "retains current semantic context when completed search also returns a genuinely superseded observation"
-                                : compactProof === "memoryQueryGuards"
-                                  ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
-                                  : compactProof === "memoryQueryNoGrant"
-                                    ? "denies semantic query admission without the original frozen write intersection"
-                                    : compactProof === "memoryQueryNoAccess"
-                                      ? "denies semantic query admission for an original no-memory role"
-                                      : compactProof === "memoryQueryBudget"
-                                        ? "retains authenticated query failure when the original operation budget cannot fund embedding"
-                                        : compactProof === "memoryQuerySecret"
-                                          ? "rejects a newly learned escaped query credential before embedding reservation"
-                                          : compactProof === "memoryQueryModelUnknown"
-                                            ? "retains an unknown query embedding charge until authenticated drain without resend"
-                                            : compactProof === "memoryQuerySearchUnknown"
-                                              ? "settles an uncertain query search only after its exact authenticated late drain"
-                                              : compactProof === "successorReplay"
-                                                ? "retained compact replay preserves the latest successful native head without another execution"
-                                                : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+    (compactProof?.includes("Shared") && compactProof.includes("Query")) ||
+      compactProof?.startsWith("memoryQueryShared")
+      ? `shared semantic query preserves recipient accounting and exact owner authority: ${compactProof}`
+      : compactProof === undefined
+        ? "managed compact transfers current required context after durable association and replays without another execution"
+        : compactProof === "memoryAdmission"
+          ? "retains exact memory selection against the executing operation before processing and replays after terminal"
+          : compactProof === "memoryAccounting"
+            ? "accounts memory and ordinary stages against the same executing operation and shared capacity"
+            : compactProof === "memorySharedRoot"
+              ? "reads shared root usage outside the charged child binding page without assigning parent charges"
+              : compactProof === "memoryPipeline"
+                ? "processes an exact admitted source through shared model accounting and the configured index consumer"
+                : compactProof === "memoryFailure"
+                  ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
+                  : compactProof === "memorySecret"
+                    ? "rejects a newly learned escaped source secret before memory extraction reservation"
+                    : compactProof === "memoryEmbeddingSecret"
+                      ? "rejects newly learned escaped embedding text before its memory reservation"
+                      : compactProof === "memoryCleanup"
+                        ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
+                        : compactProof === "memoryHumanRetraction"
+                          ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
+                          : compactProof === "memoryCleanupGuards"
+                            ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
+                            : compactProof === "memoryQuery"
+                              ? "admits an explicit semantic query through the executing task bridge before forward stages"
+                              : compactProof === "memoryQueryPipeline"
+                                ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
+                                : compactProof === "memoryQueryMixed"
+                                  ? "retains current semantic context when completed search also returns a genuinely superseded observation"
+                                  : compactProof === "memoryQueryGuards"
+                                    ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
+                                    : compactProof === "memoryQueryNoGrant"
+                                      ? "denies semantic query admission without the original frozen write intersection"
+                                      : compactProof === "memoryQueryNoAccess"
+                                        ? "denies semantic query admission for an original no-memory role"
+                                        : compactProof === "memoryQueryBudget"
+                                          ? "retains authenticated query failure when the original operation budget cannot fund embedding"
+                                          : compactProof === "memoryQuerySecret"
+                                            ? "rejects a newly learned escaped query credential before embedding reservation"
+                                            : compactProof === "memoryQueryModelUnknown"
+                                              ? "retains an unknown query embedding charge until authenticated drain without resend"
+                                              : compactProof === "memoryQuerySearchUnknown"
+                                                ? "settles an uncertain query search only after its exact authenticated late drain"
+                                                : compactProof === "successorReplay"
+                                                  ? "retained compact replay preserves the latest successful native head without another execution"
+                                                  : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
@@ -9893,21 +9914,37 @@ for (const compactProof of [
           const queryRecovery = compactProof === "memoryQueryModelUnknown" || searchUnknown;
           const queryBudget = compactProof === "memoryQueryBudget";
           const querySecret = compactProof === "memoryQuerySecret";
+          const sharedBeforeSearchDenied = compactProof === "memoryQuerySharedRevokeBeforeSearch";
+          const sharedDeliveryDenied =
+            compactProof === "memoryQuerySharedRevokeDelivery" || sharedBeforeSearchDenied;
           const queryNoForward = queryBudget || querySecret;
           const queryText = querySecret
             ? 'controlled-query-"secret\\tail'
             : "Which retained facts explain parser provenance?";
+          const sharedQuery =
+            compactProof?.startsWith("memoryQueryShared") === true ||
+            compactProof === "memoryCompanionSharedQuery";
+          const sharedDenied =
+            compactProof === "memoryQuerySharedProject" || compactProof === "memoryQuerySharedNone";
+          const sharedOwnerId = ProjectId.make("shared-query-owner");
+          let sharedSelection: ProjectTeamMemorySourceSelector | undefined;
+          let sharedObservation: ProjectMemoryObservation | undefined;
+          let sharedMemory: ReturnType<typeof makeProjectMemoryService> | undefined;
           const queryDenied =
-            compactProof === "memoryQueryNoGrant" || compactProof === "memoryQueryNoAccess";
+            compactProof === "memoryQueryNoGrant" ||
+            compactProof === "memoryQueryNoAccess" ||
+            sharedDenied;
           const queryAdmissionOnly =
             compactProof === "memoryQuery" || compactProof === "memoryQueryGuards" || queryDenied;
           const queryMixed =
             compactProof === "memoryQueryMixed" || compactProof === "memoryCompanionQuery";
           const queryCache =
+            (sharedQuery && !sharedDenied && !sharedDeliveryDenied) ||
             compactProof === "memoryQueryPipeline" ||
             compactProof === "memoryCompanionQuery" ||
             queryMixed;
-          const queryForward = queryCache || queryRecovery || queryNoForward;
+          const queryForward =
+            queryCache || queryRecovery || queryNoForward || sharedDeliveryDenied;
           let activeQuery = false;
           let failedUsageOperationId: string | undefined;
           const queryDrains = new Set<string>();
@@ -9951,9 +9988,11 @@ for (const compactProof of [
             memoryProof,
             compactProof === "memoryQueryNoGrant"
               ? "read-only"
-              : compactProof === "memoryQueryNoAccess"
+              : compactProof === "memoryQueryNoAccess" || compactProof === "memoryQuerySharedNone"
                 ? "none"
-                : "project",
+                : sharedQuery && !sharedDenied
+                  ? "shared"
+                  : "project",
           ).pipe(
             Effect.provideService(ProjectMemoryPorts, {
               assertConfigured: () =>
@@ -10315,6 +10354,127 @@ for (const compactProof of [
                           managed: credential.credential,
                         };
                         const issueQuery = Effect.fn("controlledQuery.issue")(function* () {
+                          if (sharedQuery && sharedSelection === undefined) {
+                            yield* f.sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at)
+                              VALUES (${sharedOwnerId},'Shared owner','/fixture/shared-query-owner','[]',${at},${at})`;
+                            const ownerTaskId = ProjectWorkTaskId.make("shared-query-owner-task");
+                            yield* f.repository.execute({
+                              type: "project-work.task.create",
+                              projectId: sharedOwnerId,
+                              taskId: ownerTaskId,
+                              commandId: CommandId.make("shared-owner-task-create"),
+                              title: "Owner source",
+                              createdAt: at,
+                            });
+                            const ownerAttribution = {
+                              actor: { kind: "human" as const, id: "shared-owner-human" },
+                              source: { kind: "web" as const, id: "shared-owner-web" },
+                              recordedAt: at,
+                            };
+                            const ownerComment = yield* decodeMemorySourceComment({
+                              commentId: "shared-owner-comment",
+                              projectId: sharedOwnerId,
+                              taskId: ownerTaskId,
+                              body: "The approved parser retains exact provenance.",
+                              revision: 0,
+                              createdAt: at,
+                              attribution: ownerAttribution,
+                            });
+                            yield* f.repository.execute({
+                              type: "project-work.comment.add",
+                              commandId: CommandId.make("shared-owner-comment-add"),
+                              projectId: sharedOwnerId,
+                              comment: ownerComment,
+                              addedAt: at,
+                              attribution: ownerAttribution,
+                            });
+                            // Retained owner facts use controlled extraction only. Query embedding,
+                            // accounting and companion execution below use their production services.
+                            sharedMemory = makeProjectMemoryService({
+                              sql: f.sql,
+                              repository: f.repository,
+                              authorization,
+                              contentGuard: queryGuard,
+                              environmentId: f.binding.environmentId,
+                              models: {
+                                extract: () =>
+                                  Effect.succeed([
+                                    {
+                                      key: "shared-parser",
+                                      body: ownerComment.body,
+                                      quote: "exact provenance",
+                                    },
+                                  ]),
+                                embed: () =>
+                                  Effect.die("Shared fixture must not run an embedding model"),
+                              },
+                            });
+                            const source = yield* sharedMemory.captureRetained(sharedOwnerId, {
+                              kind: "comment",
+                              retainedId: ownerComment.commentId,
+                            });
+                            const ownerState = yield* readCurrentState(f.sql, sharedOwnerId);
+                            const work = ownerState.foundationRecords?.find(
+                              (r) => r.kind === "effect" && r.targetId === source.recordId,
+                            );
+                            if (work?.kind !== "effect")
+                              return yield* Effect.die("Shared owner work missing");
+                            const claim = yield* sharedMemory.claim(sharedOwnerId, work.effectId);
+                            if (claim === undefined)
+                              return yield* Effect.die("Shared owner claim missing");
+                            yield* sharedMemory.extract(sharedOwnerId, work.effectId, claim);
+                            sharedObservation = (yield* sharedMemory.readWork(
+                              sharedOwnerId,
+                              work.effectId,
+                            )).observations[0];
+                            const beforeShares = yield* readCurrentState(f.sql, sharedOwnerId);
+                            yield* gateway
+                              .write(
+                                yield* decodeSharedQueryShares({
+                                  type: "project-team.memory.shares.replace",
+                                  projectId: sharedOwnerId,
+                                  commandId: "human-share-query-source",
+                                  expectedRevision: beforeShares.revision,
+                                  ...projectMemorySourceSelection(source),
+                                  sharedWithProjectIds: [projectId],
+                                }),
+                                ownerAttribution.actor,
+                                ownerAttribution.source,
+                              )
+                              .pipe(
+                                Effect.provideService(ProjectWorkVerificationRequest, {
+                                  assertCurrent: () => Effect.void,
+                                }),
+                              );
+                            const sharedSource = (yield* readCurrentState(
+                              f.sql,
+                              sharedOwnerId,
+                            )).foundationRecords?.find((r) => r.recordId === source.recordId);
+                            if (
+                              sharedSource?.kind !== "memory-source" ||
+                              sharedObservation === undefined
+                            )
+                              return yield* Effect.die("Shared source missing");
+                            sharedSelection = projectMemorySourceSelection(sharedSource);
+                            yield* f.sql`INSERT INTO project_lifecycle(project_id,state,workspace_root,changed_at)
+                              VALUES (${sharedOwnerId},'archived','/fixture/shared-query-owner',${at})`;
+                            if (!sharedDenied) {
+                              const discovered = yield* gateway
+                                .read(
+                                  {
+                                    operation: "memory-shared-sources",
+                                    projectId,
+                                    taskId: f.binding.taskId,
+                                    limit: 32,
+                                  },
+                                  principal,
+                                )
+                                .pipe(Effect.flatMap(decodeSharedQuerySources));
+                              expect(discovered.items).toEqual([
+                                { ownerProjectId: sharedOwnerId, selection: sharedSelection },
+                              ]);
+                            }
+                          }
                           const current = yield* readCurrentState(f.sql, projectId);
                           const task = current.tasks.find(
                             (entry) => entry.taskId === f.binding.taskId,
@@ -10331,6 +10491,9 @@ for (const compactProof of [
                             specRevision: task.specRevision,
                             planRevision: f.binding.planRevision,
                             query: queryText,
+                            ...(sharedSelection === undefined
+                              ? {}
+                              : { sharedSource: sharedSelection }),
                           });
                           if (compactProof === "memoryQueryGuards") {
                             const prior = yield* readCurrentState(f.sql, projectId);
@@ -10459,9 +10622,13 @@ for (const compactProof of [
                               processingCause: memoryPipelineFailure,
                             }).toEqual({
                               processingFailure:
-                                queryRecovery || queryNoForward ? memoryPipelineError : undefined,
+                                queryRecovery || queryNoForward || sharedDeliveryDenied
+                                  ? memoryPipelineError
+                                  : undefined,
                               processingCause:
-                                queryRecovery || queryNoForward ? memoryPipelineFailure : "",
+                                queryRecovery || queryNoForward || sharedDeliveryDenied
+                                  ? memoryPipelineFailure
+                                  : "",
                             });
                           }
                           if (queryDenied) {
@@ -10506,10 +10673,11 @@ for (const compactProof of [
                             queryNoForward
                               ? 3
                               : queryForward &&
+                                  !sharedBeforeSearchDenied &&
                                   compactProof !== "memoryQueryModelUnknown" &&
                                   !startFailure
                                 ? 4
-                                : queryRecovery
+                                : queryRecovery || sharedBeforeSearchDenied
                                   ? 3
                                   : 0,
                           );
@@ -11060,6 +11228,38 @@ for (const compactProof of [
                                       return yield* new ProjectMemoryServiceError({
                                         reason: "Controlled query exchange is unknown",
                                       });
+                                    if (sharedBeforeSearchDenied) {
+                                      yield* f.sql`UPDATE project_lifecycle SET state='active' WHERE project_id=${sharedOwnerId}`;
+                                      const ownerState = yield* readCurrentState(
+                                        f.sql,
+                                        sharedOwnerId,
+                                      );
+                                      const source = ownerState.foundationRecords?.find(
+                                        (r) =>
+                                          r.kind === "memory-source" &&
+                                          r.recordId === sharedSelection?.sourceRecordId,
+                                      );
+                                      if (source?.kind !== "memory-source")
+                                        return yield* Effect.die("Missing delayed source");
+                                      yield* gateway
+                                        .write(
+                                          yield* decodeSharedQueryShares({
+                                            type: "project-team.memory.shares.replace",
+                                            projectId: sharedOwnerId,
+                                            commandId: "revoke-inflight-query",
+                                            expectedRevision: ownerState.revision,
+                                            ...projectMemorySourceSelection(source),
+                                            sharedWithProjectIds: [],
+                                          }),
+                                          { kind: "human", id: "shared-owner-human" },
+                                          { kind: "web", id: "shared-owner-web" },
+                                        )
+                                        .pipe(
+                                          Effect.provideService(ProjectWorkVerificationRequest, {
+                                            assertCurrent: () => Effect.void,
+                                          }),
+                                        );
+                                    }
                                     drained.add(id);
                                     return {
                                       reportedModel: exchange.model,
@@ -11215,6 +11415,21 @@ for (const compactProof of [
                                     new TextDecoder().decode(bytes),
                                   );
                                   expect(envelope.input.limit).toBe(12);
+                                  if (sharedQuery) {
+                                    expect(envelope.input.projectId).toBe(sharedOwnerId);
+                                    expect(owner.operation.projectId).toBe(projectId);
+                                    expect(owner.operation.taskId).toBe(f.binding.taskId);
+                                    expect(envelope.input.source).toEqual({
+                                      sourceRecordId: sharedSelection?.sourceRecordId,
+                                      sourceRevision: sharedSelection?.sourceRevision,
+                                      sourceGeneration: sharedSelection?.sourceGeneration,
+                                    });
+                                    expect(owner.sharedSource).toMatchObject({
+                                      ownerProjectId: sharedOwnerId,
+                                      selection: sharedSelection,
+                                      sourceSha256: expect.any(String),
+                                    });
+                                  }
                                   expect(envelope.input.vector).toEqual(
                                     Array.from({ length: 2048 }, () => 0.375),
                                   );
@@ -11224,13 +11439,18 @@ for (const compactProof of [
                                   expect(
                                     yield* f.sql`SELECT status FROM project_team_memory_query`,
                                   ).toEqual([{ status: "searching" }]);
-                                  const state = yield* readCurrentState(f.sql, projectId);
-                                  const observation = state.foundationRecords?.find(
-                                    (record) =>
-                                      record.kind === "memory-observation" &&
-                                      record.sourceId === selection.sourceRecordId &&
-                                      (!queryMixed || record.status === "current"),
+                                  const state = yield* readCurrentState(
+                                    f.sql,
+                                    sharedQuery ? sharedOwnerId : projectId,
                                   );
+                                  const observation = sharedQuery
+                                    ? sharedObservation
+                                    : state.foundationRecords?.find(
+                                        (record) =>
+                                          record.kind === "memory-observation" &&
+                                          record.sourceId === selection.sourceRecordId &&
+                                          (!queryMixed || record.status === "current"),
+                                      );
                                   if (observation?.kind !== "memory-observation")
                                     return yield* Effect.die(
                                       "Query fixture has no indexed observation",
@@ -11253,6 +11473,38 @@ for (const compactProof of [
                                       code: "unavailable",
                                       message: "Controlled query search is unknown",
                                     });
+                                  if (sharedDeliveryDenied && !sharedBeforeSearchDenied) {
+                                    yield* f.sql`UPDATE project_lifecycle SET state='active' WHERE project_id=${sharedOwnerId}`;
+                                    const ownerState = yield* readCurrentState(
+                                      f.sql,
+                                      sharedOwnerId,
+                                    );
+                                    const source = ownerState.foundationRecords?.find(
+                                      (r) =>
+                                        r.kind === "memory-source" &&
+                                        r.recordId === sharedSelection?.sourceRecordId,
+                                    );
+                                    if (source?.kind !== "memory-source")
+                                      return yield* Effect.die("Missing delayed source");
+                                    yield* gateway
+                                      .write(
+                                        yield* decodeSharedQueryShares({
+                                          type: "project-team.memory.shares.replace",
+                                          projectId: sharedOwnerId,
+                                          commandId: "revoke-inflight-query",
+                                          expectedRevision: ownerState.revision,
+                                          ...projectMemorySourceSelection(source),
+                                          sharedWithProjectIds: [],
+                                        }),
+                                        { kind: "human", id: "shared-owner-human" },
+                                        { kind: "web", id: "shared-owner-web" },
+                                      )
+                                      .pipe(
+                                        Effect.provideService(ProjectWorkVerificationRequest, {
+                                          assertCurrent: () => Effect.void,
+                                        }),
+                                      );
+                                  }
                                   queryDrains.add(envelope.requestId);
                                   return new TextEncoder().encode(
                                     json({
@@ -11263,7 +11515,7 @@ for (const compactProof of [
                                         candidates: [
                                           {
                                             environmentId: owner.operation.environmentId,
-                                            projectId,
+                                            projectId: observation.projectId,
                                             sourceRecordId: observation.sourceId,
                                             sourceRevision: observation.sourceRevision,
                                             sourceGeneration: observation.sourceGeneration,
@@ -11752,6 +12004,15 @@ for (const compactProof of [
                                   );
                                   if (!latest?.owner)
                                     return yield* Effect.die("Controlled host lost original owner");
+                                  if (sharedQuery && owner.version === 2) {
+                                    const namespace = projectMemoryHash([
+                                      owner.operation.environmentId,
+                                      sharedOwnerId,
+                                    ]);
+                                    expect(
+                                      latest.intent.allocation.launch.nativeState?.path,
+                                    ).toContain(namespace);
+                                  }
                                   const observedReceipt = observed.get(
                                     latest.intent.allocation.unit,
                                   );
@@ -12085,6 +12346,38 @@ for (const compactProof of [
                                   .queryId,
                               ).toBeUndefined();
                             }
+                            if (sharedDeliveryDenied) {
+                              activeQuery = true;
+                              yield* issueQuery();
+                              activeQuery = false;
+                              expect(memoryPipelineError).toMatchObject({
+                                reason: "Shared source grant or exact current tuple changed",
+                              });
+                              const queries = yield* f.sql<{
+                                id: string;
+                                status: string;
+                              }>`SELECT query_id AS id,status FROM project_team_memory_query`;
+                              expect(queries).toMatchObject([
+                                { status: sharedBeforeSearchDenied ? "searching" : "uncertain" },
+                              ]);
+                              if (!queries[0] || reconcileMemory === undefined)
+                                return yield* Effect.die("Missing delayed query cleanup");
+                              yield* reconcileMemory(queries[0].id);
+                              expect(
+                                yield* f.sql`SELECT status FROM project_team_memory_query`,
+                              ).toEqual([{ status: "failed" }]);
+                              expect(
+                                (yield* f.reader.readRequired(snapshot)).observations.provenance
+                                  .queryId,
+                              ).toBeUndefined();
+                              expect(
+                                (yield* f.reader.readRequired(snapshot)).observations.records.every(
+                                  (r) => r.projectId !== sharedOwnerId,
+                                ),
+                              ).toBe(true);
+                              expect(memoryExchanges).toBe(3);
+                              expect(memoryBackendCalls).toBe(sharedBeforeSearchDenied ? 3 : 4);
+                            }
                             if (queryCache) {
                               const beforeCommit = yield* readCurrentState(f.sql, projectId);
                               const task = beforeCommit.tasks.find(
@@ -12208,6 +12501,12 @@ for (const compactProof of [
                                   expect(fallback.required).toEqual(context.required);
                                   expect(fallback.observations.provenance.queryId).toBeUndefined();
                                   expect(fallback.text).not.toContain("completed semantic query");
+                                  if (sharedQuery)
+                                    expect(
+                                      fallback.observations.records.every(
+                                        (r) => r.projectId !== sharedOwnerId,
+                                      ),
+                                    ).toBe(true);
                                   expect({
                                     exchanges: memoryExchanges,
                                     backend: memoryBackendCalls,
@@ -12268,6 +12567,72 @@ for (const compactProof of [
                               };
                               yield* expectFallback();
                               queryConfiguration = originalConfiguration;
+                              if (sharedQuery) {
+                                expect(
+                                  (yield* f.reader.readRequired(snapshot)).observations.records,
+                                ).toEqual([sharedObservation]);
+                                expect(context.observations.records[0]?.projectId).toBe(
+                                  sharedOwnerId,
+                                );
+                                expect(
+                                  yield* f.sql`SELECT project_id FROM project_team_memory_query`,
+                                ).toEqual([{ project_id: projectId }]);
+                                expect(
+                                  yield* f.sql`SELECT project_id FROM project_team_memory_observation WHERE record_id=${sharedObservation?.recordId ?? "missing"}`,
+                                ).toEqual([{ project_id: sharedOwnerId }]);
+                                const currentOwner = yield* readCurrentState(f.sql, sharedOwnerId);
+                                const currentSource = currentOwner.foundationRecords?.find(
+                                  (r) =>
+                                    r.kind === "memory-source" &&
+                                    r.recordId === sharedSelection?.sourceRecordId,
+                                );
+                                if (currentSource?.kind !== "memory-source")
+                                  return yield* Effect.die("Shared cache source missing");
+                                if (compactProof === "memoryQuerySharedRevokeCache") {
+                                  yield* f.sql`UPDATE project_lifecycle SET state='active' WHERE project_id=${sharedOwnerId}`;
+                                  yield* gateway
+                                    .write(
+                                      yield* decodeSharedQueryShares({
+                                        type: "project-team.memory.shares.replace",
+                                        projectId: sharedOwnerId,
+                                        commandId: "human-revoke-query-source",
+                                        expectedRevision: currentOwner.revision,
+                                        ...projectMemorySourceSelection(currentSource),
+                                        sharedWithProjectIds: [],
+                                      }),
+                                      { kind: "human", id: "shared-owner-human" },
+                                      { kind: "web", id: "shared-owner-web" },
+                                    )
+                                    .pipe(
+                                      Effect.provideService(ProjectWorkVerificationRequest, {
+                                        assertCurrent: () => Effect.void,
+                                      }),
+                                    );
+                                } else if (compactProof === "memoryQuerySharedDeleteCache") {
+                                  yield* f.sql`UPDATE projection_projects SET deleted_at=${at} WHERE project_id=${sharedOwnerId}`;
+                                } else if (compactProof === "memoryQuerySharedTombstoneCache") {
+                                  yield* f.sql`UPDATE project_lifecycle SET state='tombstoned' WHERE project_id=${sharedOwnerId}`;
+                                } else if (compactProof === "memoryQuerySharedSupersedeCache") {
+                                  yield* f.repository.execute(
+                                    yield* decodeRequiredFoundation({
+                                      type: "project-work.foundation.commit",
+                                      projectId: sharedOwnerId,
+                                      commandId: "shared-query-superseded",
+                                      expectedRevision: currentOwner.revision,
+                                      attribution,
+                                      committedAt: at,
+                                      records: [
+                                        {
+                                          ...currentSource,
+                                          revision: currentSource.revision + 1,
+                                          status: "superseded",
+                                        },
+                                      ],
+                                    }),
+                                  );
+                                }
+                                if (compactProof?.endsWith("Cache")) yield* expectFallback();
+                              }
                               yield* queryGuard.registerKnownSecrets([queryRequest.query]);
                               yield* expectFallback();
                             }
@@ -13478,7 +13843,7 @@ for (const compactProof of [
               expect(cached.text).not.toContain("completed semantic query");
               expect(memoryExchanges).toBe(3);
               expect(memoryBackendCalls).toBe(4);
-            } else if (queryRecovery || queryNoForward) {
+            } else if (queryRecovery || queryNoForward || sharedDeliveryDenied) {
               if (
                 queryRequest === undefined ||
                 queryReceipt === undefined ||
@@ -13495,7 +13860,10 @@ for (const compactProof of [
               ).toEqual(queryReceipt);
               expect(memoryExchanges).toBe(queryNoForward ? 2 : 3);
               expect(memoryBackendCalls).toBe(
-                queryNoForward || compactProof === "memoryQueryModelUnknown" || startFailure
+                queryNoForward ||
+                  sharedBeforeSearchDenied ||
+                  compactProof === "memoryQueryModelUnknown" ||
+                  startFailure
                   ? 3
                   : 4,
               );
@@ -14085,7 +14453,10 @@ for (const compactProof of [
             yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`,
           ).toEqual(rows);
         }),
-        compactProof === "memoryHumanRetraction" || compactProof === "memoryCompanionDelete",
+        compactProof === "memoryHumanRetraction" ||
+          compactProof === "memoryCompanionDelete" ||
+          compactProof?.startsWith("memoryQueryShared") === true ||
+          compactProof === "memoryCompanionSharedQuery",
       ),
   );
 

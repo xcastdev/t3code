@@ -19,6 +19,7 @@ import {
   auditProjectMemoryAdmission,
   auditProjectMemoryTaskOwner,
 } from "./ProjectMemoryModelAccounting.ts";
+import { qualifyProjectMemorySharedSource } from "./ProjectMemorySharing.ts";
 import { ProjectMemoryProcessingConfiguration } from "./ProjectMemoryPorts.ts";
 import {
   MEMORY_BACKEND_MAX_BYTES,
@@ -321,6 +322,19 @@ export const makeProjectMemoryCompanionJournal = Effect.fn("makeProjectMemoryCom
           )
             return yield* deny("Query companion configuration or operation changed");
           const input = yield* decodeSearch(request.input);
+          const shared = owner.sharedSource;
+          if (
+            shared !== undefined &&
+            !same(
+              shared,
+              yield* qualifyProjectMemorySharedSource(
+                sql,
+                owner.request.projectId,
+                shared.selection,
+              ),
+            )
+          )
+            return yield* deny("Query companion shared grant changed");
           const rows = yield* sql<{
             status: string;
             search: string | null;
@@ -344,7 +358,17 @@ export const makeProjectMemoryCompanionJournal = Effect.fn("makeProjectMemoryCom
                 owner.operation.leaseDeadlineAtMs,
               ) ||
             input.environmentId !== environmentId ||
-            input.projectId !== owner.operation.projectId
+            input.projectId !== (shared?.ownerProjectId ?? owner.operation.projectId) ||
+            !same(
+              input.source,
+              shared === undefined
+                ? undefined
+                : {
+                    sourceRecordId: shared.selection.sourceRecordId,
+                    sourceRevision: shared.selection.sourceRevision,
+                    sourceGeneration: shared.selection.sourceGeneration,
+                  },
+            )
           )
             return yield* deny("Query companion changed its frozen search");
         } else {
