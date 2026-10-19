@@ -219,7 +219,6 @@ export const makeProjectTeamReviewCurrentTarget = (rawOptions: typeof Options.Ty
         return yield* fail("changed", "Original implementation workspace changed");
       const receipt = yield* decodeWorkspace(workspace.receipt_json);
       if (
-        canonical(receipt) !== workspace.receipt_json ||
         !same(receipt.assignment, implementation.intent.request.git) ||
         hash(receipt) !== job.workspaceReceiptHash ||
         receipt.assignment.primaryRoot !== job.target.repository ||
