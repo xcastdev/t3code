@@ -307,3 +307,150 @@ it.effect(
       }),
     ),
 );
+
+it.effect(
+  "authenticated implementation admission retains exact human parent approvals and selected scope",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const { sql, gateway } = yield* setup;
+        const envelope = Effect.gen(function* () {
+          const state = yield* readCurrentState(sql, projectId);
+          return {
+            projectId,
+            taskId,
+            expectedRevision: state.revision,
+            expectedTaskRevision: state.tasks.find((t) => t.taskId === taskId)!.revision,
+          };
+        });
+        const criterionId = ProjectWorkCriterionId.make("implementation-source");
+        yield* gateway.write(
+          {
+            ...(yield* envelope),
+            type: "project-team.specification.propose",
+            commandId: CommandId.make("implementation-spec"),
+            expectedSpecRevision: 0,
+            specification: {
+              objective: "Approved behavior",
+              scopeIn: "One file",
+              scopeOut: "Other files",
+              criterionIds: [criterionId],
+              revision: 1,
+              protected: false,
+            },
+            criterionSnapshots: [
+              {
+                criterionId,
+                taskId,
+                description: "Behavior passes",
+                required: true,
+                status: "unsatisfied",
+                satisfiedByEvidenceIds: [],
+                revision: 0,
+                updatedAt: at,
+              },
+            ],
+          },
+          human,
+          source,
+          { actor: human },
+        );
+        const approve = Effect.fn("implementationGatewayTest.approve")(function* (
+          kind: "specification" | "plan",
+        ) {
+          const state = yield* readCurrentState(sql, projectId);
+          const gate = state.foundationRecords!.find(
+            (r) => r.kind === "gate" && r.gate === kind && r.status === "pending",
+          );
+          if (gate?.kind !== "gate") return yield* Effect.die("Missing pending approval");
+          yield* gateway.write(
+            {
+              ...(yield* envelope),
+              type: "project-team.gate.respond",
+              commandId: CommandId.make(`implementation-approve-${kind}`),
+              gateId: gate.recordId,
+              expectedGateRevision: gate.revision,
+              specRevision: gate.specRevision,
+              planRevision: gate.planRevision,
+              response: "approved",
+            },
+            human,
+            source,
+            { actor: human },
+          );
+        });
+        yield* approve("specification");
+        yield* gateway.write(
+          {
+            ...(yield* envelope),
+            type: "project-team.plan.propose",
+            commandId: CommandId.make("implementation-plan"),
+            specRevision: 1,
+            content: "Implement and test the file",
+            dependencyTaskIds: [],
+          },
+          human,
+          source,
+          { actor: human },
+        );
+        yield* approve("plan");
+        const state = yield* readCurrentState(sql, projectId);
+        const spec = state.foundationRecords!.find(
+          (r) => r.kind === "gate" && r.gate === "specification",
+        );
+        const planGate = state.foundationRecords!.find(
+          (r) => r.kind === "gate" && r.gate === "plan",
+        );
+        const plan = state.foundationRecords!.find((r) => r.kind === "plan-revision");
+        if (spec?.kind !== "gate" || planGate?.kind !== "gate" || plan?.kind !== "plan-revision")
+          return yield* Effect.die("Missing exact approvals");
+        const intent: ProjectTeamGuidedIntent = {
+          ...(yield* envelope),
+          type: "project-team.assignment.start",
+          assignmentKind: "implementation",
+          commandId: CommandId.make("implementation-child"),
+          objective: "Implement approved behavior",
+          outputDescriptions: ["Tested change"],
+          parentCriterionIds: [criterionId],
+          specRevision: 1,
+          specificationGateId: spec.recordId,
+          expectedSpecificationGateRevision: spec.revision,
+          parentPlan: {
+            recordId: plan.recordId,
+            expectedRecordRevision: plan.revision,
+            planRevision: plan.planRevision,
+            gateId: planGate.recordId,
+            expectedGateRevision: planGate.revision,
+          },
+        };
+        const bad = {
+          ...intent,
+          commandId: CommandId.make("implementation-foreign-criterion"),
+          parentCriterionIds: [ProjectWorkCriterionId.make("foreign")],
+        };
+        expect(
+          (yield* gateway.write(bad, human, source, { actor: human }).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* readCurrentState(sql, projectId)).revision).toBe(state.revision);
+        const receipt = yield* gateway.write(yield* decodePublicWrite(intent), human, source, {
+          actor: human,
+        });
+        expect(yield* gateway.write(intent, human, source, { actor: human })).toEqual(receipt);
+        const after = yield* readCurrentState(sql, projectId);
+        const child = after.tasks.find((t) => t.taskId !== taskId)!;
+        expect(child.specification).toMatchObject({ scopeIn: "One file", scopeOut: "Other files" });
+        expect(
+          after.foundationRecords!.find((r) => r.kind === "gate" && r.taskId === child.taskId),
+        ).toMatchObject({
+          attribution: { actor: human, source },
+          assignmentAuthorization: {
+            assignmentKind: "implementation",
+            parentTaskId: taskId,
+            parentCriterionIds: [criterionId],
+            parentPlan: { recordId: plan.recordId, gateId: planGate.recordId },
+          },
+        });
+        expect(after.attempts).toHaveLength(0);
+      }),
+    ),
+);

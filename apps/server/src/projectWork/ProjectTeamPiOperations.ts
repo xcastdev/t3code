@@ -1,3 +1,4 @@
+import { projectTeamAssignmentProfile } from "./ProjectTeamPolicy.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
@@ -682,8 +683,17 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         grant.consumedByRunId !== binding.recordId ||
         grant.attribution?.actor.kind !== "human" ||
         grant.assignmentAuthorization?.parentTaskId !== membership.parentTaskId ||
-        (grant.assignmentAuthorization.assignmentKind !== "planning" &&
-          grant.assignmentAuthorization.assignmentKind !== "review")
+        membership.deliverableKind !==
+          projectTeamAssignmentProfile(grant.assignmentAuthorization.assignmentKind)
+            .deliverableKind ||
+        authority.role.role !==
+          projectTeamAssignmentProfile(grant.assignmentAuthorization.assignmentKind).role ||
+        binding.configuration.toolIds.some(
+          (tool) =>
+            !projectTeamAssignmentProfile(
+              grant.assignmentAuthorization!.assignmentKind,
+            ).tools.includes(tool),
+        )
       )
         return yield* deny("Pi root run is orphaned");
       // This retained root is budget evidence. Current forward authority belongs to the human-approved child.

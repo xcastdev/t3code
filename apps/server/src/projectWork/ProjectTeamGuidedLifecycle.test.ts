@@ -27,6 +27,7 @@ import {
   emptyProjectWorkReducerState,
   type ProjectWorkReducerState,
 } from "./ProjectWorkDecider.ts";
+import { resolveProjectTeamLimits } from "./ProjectTeamLimits.ts";
 import { staleIntegrationTaskIds } from "./ProjectTeamIntegrationSourceState.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import { prepareReviewCriterionProgress } from "./ProjectTeamReviewCriterionProgress.ts";
@@ -1564,7 +1565,7 @@ describe("review regressions for successor authorization and retained reports", 
 
 const inheritedStart = (
   state: ProjectWorkReducerState,
-  kind: "planning" | "review",
+  kind: "planning" | "review" | "implementation",
   label: string,
 ): Extract<ProjectTeamGuidedIntent, { type: "project-team.assignment.start" }> => {
   const spec = state.foundationRecords!.find(
@@ -1583,6 +1584,12 @@ const inheritedStart = (
     ...envelope(state, label),
     type: "project-team.assignment.start",
     assignmentKind: kind,
+    ...(kind === "implementation"
+      ? {
+          parentCriterionIds: state.tasks.find((t) => t.taskId === taskId)!.specification!
+            .criterionIds,
+        }
+      : {}),
     objective: kind === "planning" ? "Propose a bounded plan" : "Review the bounded approved scope",
     outputDescriptions: [
       kind === "planning" ? "Retained proposed plan" : "Sourced review findings",
@@ -1732,6 +1739,209 @@ const reviewerReport = () => {
 };
 
 describe("bounded inherited planning and review assignments", () => {
+  it("derives a writable implementation child from exact parent scope and selected criteria", () => {
+    const approved = planned();
+    const intent = inheritedStart(approved, "implementation", "start-implementation");
+    const state = run(approved, intent);
+    const child = state.tasks.find((t) => t.taskId !== taskId)!;
+    const parent = approved.tasks.find((t) => t.taskId === taskId)!;
+    expect(child.specification).toMatchObject({
+      scopeIn: parent.specification!.scopeIn,
+      scopeOut: parent.specification!.scopeOut,
+    });
+    expect(
+      state.foundationRecords!.find(
+        (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+      ),
+    ).toMatchObject({
+      parentTaskId: taskId,
+      executionKind: "managed",
+      deliverableKind: "code",
+    });
+    expect(state.criteria.find((c) => c.taskId === child.taskId)).toMatchObject({
+      description: approved.criteria[0]!.description,
+      required: approved.criteria[0]!.required,
+      status: "unsatisfied",
+      satisfiedByEvidenceIds: [],
+    });
+    expect(
+      state.foundationRecords!.find((r) => r.kind === "gate" && r.taskId === child.taskId),
+    ).toMatchObject({
+      attribution,
+      assignmentAuthorization: {
+        assignmentKind: "implementation",
+        parentTaskId: taskId,
+        parentCriterionIds: parent.specification!.criterionIds,
+        parentSpecificationHash: projectTeamSpecificationHash(approved, taskId),
+        parentScopeHash: projectTeamScopeHash(
+          approved,
+          taskId,
+          approved.foundationRecords!.find((r) => r.kind === "plan-revision"),
+        ),
+      },
+    });
+    const fixture = childRun(state, child.taskId);
+    expect(fixture.role.role).toBe("implementer");
+    expect(fixture.binding.configuration.toolIds).toContain("pi.write");
+    expect(fixture.binding.parentRunId).toBeUndefined();
+    const delegatedRole = {
+      ...fixture.role,
+      tools: [...fixture.role.tools, "project-work.delegate"],
+    };
+    const delegatedBinding = {
+      ...fixture.binding,
+      configuration: {
+        ...fixture.binding.configuration,
+        toolIds: [...fixture.binding.configuration.toolIds, "project-work.delegate"],
+      },
+    };
+    expect(() =>
+      assertProjectTeamRunAuthority(fixture.state, delegatedBinding, delegatedRole, false),
+    ).toThrow();
+    expect(() =>
+      assertProjectTeamRunAuthority(
+        fixture.state,
+        fixture.binding,
+        { ...fixture.role, role: "reviewer" },
+        false,
+      ),
+    ).toThrow();
+    for (const controlState of ["paused", "canceled"] as const) {
+      const heldParent = {
+        ...fixture.state,
+        foundationRecords: fixture.state.foundationRecords!.map((r) =>
+          r.kind === "task-membership" && r.taskId === taskId ? { ...r, controlState } : r,
+        ),
+      };
+      expect(() =>
+        assertProjectTeamRunAuthority(heldParent, fixture.binding, fixture.role, false),
+      ).toThrow();
+    }
+
+    expect(() =>
+      assertProjectTeamRunAuthority(fixture.state, fixture.binding, fixture.role, false),
+    ).not.toThrow();
+    expect(state.tasks.find((t) => t.taskId === taskId)!.activeAttemptId).toBeUndefined();
+    expect(state.foundationRecords!.filter((r) => r.kind === "limits")).toEqual(
+      approved.foundationRecords!.filter((r) => r.kind === "limits"),
+    );
+    const alteredScope = {
+      ...fixture.state,
+      tasks: fixture.state.tasks.map((t) =>
+        t.taskId === child.taskId
+          ? { ...t, specification: { ...t.specification!, scopeIn: "Unapproved scope" } }
+          : t,
+      ),
+    };
+    expect(() =>
+      assertProjectTeamRunAuthority(alteredScope, fixture.binding, fixture.role, false),
+    ).toThrow();
+  });
+
+  it("keeps a derived writable child within the existing root deadline and token budget", () => {
+    const parent = planned();
+    const derived = run(parent, inheritedStart(parent, "implementation", "bounded-implementation"));
+    const child = derived.tasks.find((task) => task.taskId !== taskId)!;
+    const fixture = childRun(derived, child.taskId);
+    const role = { ...fixture.role, delegationDepth: 1 };
+    const limits: Extract<ProjectTeamRecord, { kind: "limits" }> = {
+      kind: "limits",
+      recordId: "implementation-limits",
+      projectId,
+      revision: 0,
+      generation: 0,
+      updatedAt: at,
+      status: "configured",
+      model: role.model,
+      tokenLimit: 64000,
+      durationLimitMs: 300000,
+      environmentModelCalls: 2,
+      modelCalls: 2,
+      projectWritableWorkers: 1,
+      delegationDepth: 1,
+      repairAllowance: 2,
+    };
+    const state = {
+      ...fixture.state,
+      foundationRecords: [
+        ...fixture.state.foundationRecords!.filter((r) => r.recordId !== role.recordId),
+        role,
+        limits,
+      ],
+    };
+    const input = {
+      state,
+      taskId: child.taskId,
+      roleRevisionId: role.recordId,
+      nowMs: 100000,
+      environmentModelCalls: 2,
+      writable: true,
+      attemptConfiguration: {
+        maxTokens: 64000,
+        maxDurationMs: 300000,
+        paidFallback: false as const,
+      },
+    };
+    expect(resolveProjectTeamLimits(input)).toEqual({
+      _tag: "Blocked",
+      reason: "root-budget-required",
+    });
+    const rootBudget = { rootTaskId: taskId, maximumTokens: 64000, deadlineAtMs: 300000 };
+    expect(resolveProjectTeamLimits({ ...input, rootBudget })).toMatchObject({
+      _tag: "Eligible",
+      frozen: {
+        rootTaskId: taskId,
+        maximumTokens: 64000,
+        rootDeadlineAtMs: 300000,
+        deadlineAtMs: 300000,
+        writable: true,
+        projectWritableWorkers: 1,
+        delegationDepth: 1,
+      },
+    });
+    expect(resolveProjectTeamLimits({ ...input, nowMs: 300000, rootBudget })).toEqual({
+      _tag: "Blocked",
+      reason: "deadline-expired",
+    });
+    expect(
+      resolveProjectTeamLimits({
+        ...input,
+        rootBudget: { ...rootBudget, rootTaskId: child.taskId },
+      }),
+    ).toEqual({ _tag: "Blocked", reason: "root-budget-mismatch" });
+  });
+
+  it("rejects implementation without exact current approvals, selected source criteria or active parent", () => {
+    const approved = planned();
+    const intent = inheritedStart(approved, "implementation", "invalid-implementation");
+    const { parentPlan: _parentPlan, ...withoutPlan } = intent;
+    expect(() => run(approved, withoutPlan)).toThrow();
+    expect(() =>
+      run(approved, {
+        ...intent,
+        expectedSpecificationGateRevision: intent.expectedSpecificationGateRevision + 1,
+      }),
+    ).toThrow();
+    expect(() =>
+      run(approved, { ...intent, parentCriterionIds: [ProjectWorkCriterionId.make("foreign")] }),
+    ).toThrow();
+    for (const action of ["pause", "cancel"] as const) {
+      const stopped = run(approved, {
+        ...envelope(approved, `parent-${action}`),
+        type: "project-team.task.control",
+        control: { action, reason: "Hold parent" },
+      });
+      expect(() =>
+        run(stopped, { ...intent, ...envelope(stopped, `child-after-${action}`) }),
+      ).toThrow();
+    }
+    const stale = {
+      ...approved,
+      criteria: approved.criteria.map((c) => ({ ...c, description: "Changed source criterion" })),
+    };
+    expect(() => run(stale, intent)).toThrow();
+  });
+
   it("denies managed reviewer completion from inline criterion outputs", () => {
     const fixture = reviewerReport();
     const before = canonicalProjectWorkPayload(fixture.state);

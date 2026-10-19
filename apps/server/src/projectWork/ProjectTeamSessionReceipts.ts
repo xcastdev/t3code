@@ -1,3 +1,4 @@
+import { projectTeamAssignmentProfile } from "./ProjectTeamPolicy.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   canonicalProjectWorkPayload,
@@ -413,8 +414,10 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         childGate.consumedByRunId !== binding.recordId ||
         childGate.attribution?.actor.kind !== "human" ||
         childGate.assignmentAuthorization?.parentTaskId !== childMembership.parentTaskId ||
-        (childGate.assignmentAuthorization?.assignmentKind !== "planning" &&
-          childGate.assignmentAuthorization?.assignmentKind !== "review")
+        childGate.assignmentAuthorization === undefined ||
+        childMembership.deliverableKind !==
+          projectTeamAssignmentProfile(childGate.assignmentAuthorization.assignmentKind)
+            .deliverableKind
       )
         return yield* deny("Original human child assignment provenance changed", "denied");
 
@@ -648,6 +651,19 @@ export const makeProjectTeamSessionReceipts = Effect.fn("makeProjectTeamSessionR
         immutableRole(role) !== immutableRole(intent.role)
       )
         return yield* deny("Original Pi role provenance is missing or changed");
+      if (inheritedRoot !== undefined) {
+        const grant = state.foundationRecords?.find(
+          (record) => record.kind === "gate" && record.recordId === binding.authorizationGateId,
+        );
+        if (grant?.kind !== "gate" || grant.assignmentAuthorization === undefined)
+          return yield* deny("Original Pi assignment provenance is missing or changed");
+        const profile = projectTeamAssignmentProfile(grant.assignmentAuthorization.assignmentKind);
+        if (
+          role.role !== profile.role ||
+          binding.configuration.toolIds.some((tool) => !profile.tools.includes(tool))
+        )
+          return yield* deny("Original Pi assignment capabilities changed");
+      }
       let ancestor = binding;
       const seen = new Set<string>();
       while (ancestor.parentRunId !== undefined) {

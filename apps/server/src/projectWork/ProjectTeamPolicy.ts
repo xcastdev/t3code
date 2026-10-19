@@ -117,7 +117,28 @@ export const projectTeamScopeHash = (state: ProjectWorkState, taskId: string, pl
           },
   });
 
-/** A child grant retains its parent's exact approvals without approving the child's implementation. */
+/** The inherited grant fixes both the deliverable and its maximum capabilities. */
+export const projectTeamAssignmentProfile = (
+  kind: NonNullable<Gate["assignmentAuthorization"]>["assignmentKind"],
+) => ({
+  deliverableKind: kind === "implementation" ? "code" : kind === "planning" ? "plan" : "review",
+  role: kind === "implementation" ? "implementer" : kind === "planning" ? "planner" : "reviewer",
+  tools: [
+    "read",
+    "search",
+    "pi.read",
+    "project-work",
+    "project-work.read-project",
+    "project-work.read-task",
+    "project-work.report",
+    ...(kind === "planning" ? ["project-work.plan"] : []),
+    ...(kind === "implementation"
+      ? ["write", "edit", "bash", "pi.write", "pi.edit", "pi.bash", "project-work.write"]
+      : []),
+  ],
+});
+
+/** A child grant retains the exact parent approvals and its derived assignment scope. */
 export const assertProjectTeamAssignmentAuthorization = (state: ProjectWorkState, grant: Gate) => {
   function deny(message: string): never {
     throw new ProjectWorkPolicyError("authority-required", message);
@@ -228,6 +249,42 @@ export const assertProjectTeamAssignmentAuthorization = (state: ProjectWorkState
     });
     if (!approval.available) deny("Inherited assignment plan approval is stale");
   }
+  if (proof.assignmentKind === "implementation") {
+    const selected = proof.parentCriterionIds ?? [];
+    const child = state.tasks.find(
+      (task) => task.taskId === grant.taskId && task.projectId === grant.projectId,
+    );
+    const childCriteria = state.criteria.filter((criterion) => criterion.taskId === grant.taskId);
+    if (
+      selected.length === 0 ||
+      new Set(selected).size !== selected.length ||
+      child?.specification === undefined ||
+      childCriteria.length !== selected.length ||
+      child.specification.criterionIds.length !== selected.length ||
+      new Set(child.specification.criterionIds).size !== selected.length ||
+      child.specification.scopeIn !== parent.specification!.scopeIn ||
+      child.specification.scopeOut !== parent.specification!.scopeOut ||
+      selected.some((criterionId, index) => {
+        const source = state.criteria.find(
+          (criterion) =>
+            criterion.taskId === parent.taskId && criterion.criterionId === criterionId,
+        );
+        const target = childCriteria.find(
+          (criterion) => criterion.criterionId === child.specification!.criterionIds[index],
+        );
+        return (
+          !parent.specification!.criterionIds.includes(criterionId) ||
+          source === undefined ||
+          target === undefined ||
+          source.description !== target.description ||
+          source.required !== target.required
+        );
+      })
+    )
+      deny("Inherited implementation criterion or scope provenance changed");
+  } else if (proof.parentCriterionIds !== undefined) {
+    deny("Readonly assignments cannot retain implementation criteria");
+  }
   return proof;
 };
 
@@ -320,25 +377,14 @@ export const assertProjectTeamRunAuthority = (
     (grant.gate === "repair" && grant.assignmentAuthorization !== undefined)
   ) {
     const inherited = assertProjectTeamAssignmentAuthorization(state, grant);
+    const profile = projectTeamAssignmentProfile(inherited.assignmentKind);
     if (
       m?.parentTaskId !== inherited.parentTaskId ||
-      m.deliverableKind !== (inherited.assignmentKind === "planning" ? "plan" : "review") ||
-      role.role !== (inherited.assignmentKind === "planning" ? "planner" : "reviewer") ||
+      m.deliverableKind !== profile.deliverableKind ||
+      role.role !== profile.role ||
       plan !== undefined ||
       grant.contentHash !== binding.scopeHash ||
-      binding.configuration.toolIds.some(
-        (tool) =>
-          ![
-            "read",
-            "search",
-            "pi.read",
-            "project-work",
-            "project-work.read-project",
-            "project-work.read-task",
-            "project-work.report",
-            ...(inherited.assignmentKind === "planning" ? ["project-work.plan"] : []),
-          ].includes(tool),
-      )
+      binding.configuration.toolIds.some((tool) => !profile.tools.includes(tool))
     )
       deny("Inherited assignment cannot grant writable implementation authority");
   } else if (

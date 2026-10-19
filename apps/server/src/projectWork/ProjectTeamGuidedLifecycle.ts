@@ -394,8 +394,27 @@ export const decideProjectTeamGuidedLifecycle = (
         if (issue?.kind !== "issue" || issue.revision !== intent.expectedIssueRevision)
           reject("Investigation issue revision changed");
       }
-      ensureMembership(task);
+      const parentMembership = ensureMembership(task);
+      if (parentMembership.controlState !== undefined && parentMembership.controlState !== "active")
+        reject("Parent assignment control is not active");
       const inherited = intent.type === "project-team.assignment.start";
+      const implementation = inherited && intent.assignmentKind === "implementation";
+      const sourceCriteria = implementation
+        ? (intent.parentCriterionIds ?? []).map((criterionId) => {
+            const criterion = state.criteria.find(
+              (c) => c.taskId === task.taskId && c.criterionId === criterionId,
+            );
+            if (criterion === undefined || !task.specification?.criterionIds.includes(criterionId))
+              return reject("Implementation requires current parent specification criteria");
+            return criterion;
+          })
+        : [];
+      if (
+        implementation &&
+        (sourceCriteria.length === 0 ||
+          new Set(intent.parentCriterionIds).size !== sourceCriteria.length)
+      )
+        reject("Implementation requires unique selected parent criteria");
       let assignmentAuthorization: Gate["assignmentAuthorization"];
       if (inherited) {
         if (intent.assignmentKind === "planning" && intent.outputDescriptions.length !== 1)
@@ -421,7 +440,7 @@ export const decideProjectTeamGuidedLifecycle = (
           reject("Parent specification approval changed");
         const plan = currentPlan(task.taskId);
         if (intent.parentPlan === undefined) {
-          if (intent.assignmentKind === "review" || plan !== undefined)
+          if (intent.assignmentKind !== "planning" || plan !== undefined)
             reject("Assignment requires exact current approved parent plan");
           dependencies(task);
         } else {
@@ -453,6 +472,7 @@ export const decideProjectTeamGuidedLifecycle = (
         assignmentAuthorization = {
           assignmentKind: intent.assignmentKind,
           parentTaskId: task.taskId,
+          ...(implementation ? { parentCriterionIds: intent.parentCriterionIds } : {}),
           parentSpecRevision: task.specRevision,
           parentSpecificationGateId: spec!.recordId,
           parentSpecificationHash: hash,
@@ -470,7 +490,10 @@ export const decideProjectTeamGuidedLifecycle = (
         };
       }
       const childId = ProjectWorkTaskId.make(id(inherited ? intent.assignmentKind : "research"));
-      const criterionIds = intent.outputDescriptions.map((_, index) =>
+      const descriptions = implementation
+        ? sourceCriteria.map((c) => c.description)
+        : intent.outputDescriptions;
+      const criterionIds = descriptions.map((_, index) =>
         ProjectWorkCriterionId.make(id(`output:${index}`)),
       );
       emit({
@@ -479,7 +502,7 @@ export const decideProjectTeamGuidedLifecycle = (
         task: {
           taskId: childId,
           projectId: command.projectId,
-          title: `${inherited ? (intent.assignmentKind === "planning" ? "Plan" : "Review") : "Investigate"}: ${task.title}`,
+          title: `${inherited ? (intent.assignmentKind === "planning" ? "Plan" : implementation ? "Implement" : "Review") : "Investigate"}: ${task.title}`,
           summary: intent.objective,
           state: "draft",
           watchers: [],
@@ -490,7 +513,7 @@ export const decideProjectTeamGuidedLifecycle = (
           attribution: command.attribution,
         },
       });
-      for (const [index, description] of intent.outputDescriptions.entries())
+      for (const [index, description] of descriptions.entries())
         emit({
           type: "project-work.criterion.upserted",
           taskId: childId,
@@ -500,7 +523,7 @@ export const decideProjectTeamGuidedLifecycle = (
             criterionId: criterionIds[index]!,
             taskId: childId,
             description,
-            required: true,
+            required: implementation ? sourceCriteria[index]!.required : true,
             status: "unsatisfied",
             satisfiedByEvidenceIds: [],
             revision: 0,
@@ -514,9 +537,12 @@ export const decideProjectTeamGuidedLifecycle = (
         updatedAt: at,
         specification: {
           objective: intent.objective,
-          scopeIn: intent.outputDescriptions.join("\n"),
-          scopeOut:
-            "Read-only investigation. No implementation, publishing, merging, or delegation.",
+          scopeIn: implementation
+            ? task.specification!.scopeIn
+            : intent.outputDescriptions.join("\n"),
+          scopeOut: implementation
+            ? task.specification!.scopeOut
+            : "Read-only investigation. No implementation, publishing, merging, or delegation.",
           criterionIds,
           revision: 1,
           protected: false,
@@ -536,6 +562,7 @@ export const decideProjectTeamGuidedLifecycle = (
         attribution: command.attribution,
         ...(assignmentAuthorization === undefined ? {} : { assignmentAuthorization }),
       };
+      if (inherited) assertProjectTeamAssignmentAuthorization(state, authorization);
       record(authorization);
       record({
         ...fields("research-membership"),
@@ -545,9 +572,11 @@ export const decideProjectTeamGuidedLifecycle = (
         parentTaskId: task.taskId,
         executionKind: "managed",
         deliverableKind: inherited
-          ? intent.assignmentKind === "review"
-            ? "review"
-            : "plan"
+          ? implementation
+            ? "code"
+            : intent.assignmentKind === "review"
+              ? "review"
+              : "plan"
           : "research",
         controlState: "active",
         assignment: {
@@ -562,9 +591,11 @@ export const decideProjectTeamGuidedLifecycle = (
         roleId: id("investigator"),
         roleRevision: 0,
         role: inherited
-          ? intent.assignmentKind === "planning"
-            ? "planner"
-            : "reviewer"
+          ? implementation
+            ? "implementer"
+            : intent.assignmentKind === "planning"
+              ? "planner"
+              : "reviewer"
           : "investigator",
         instructions: intent.objective,
         skills: [],
@@ -574,6 +605,9 @@ export const decideProjectTeamGuidedLifecycle = (
           "project-work",
           "project-work.report",
           ...(inherited && intent.assignmentKind === "planning" ? ["project-work.plan"] : []),
+          ...(implementation
+            ? ["pi.read", "pi.write", "pi.edit", "pi.bash", "project-work.write"]
+            : []),
         ],
         model: "unconfigured",
         memoryAccess: "project",
