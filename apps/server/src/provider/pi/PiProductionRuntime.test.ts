@@ -12,6 +12,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
+import * as Cause from "effect/Cause";
+import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
@@ -90,6 +93,7 @@ const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       );
       const live = ProjectWorkGatewayLive.pipe(
         Layer.provideMerge(services),
+        Layer.provideMerge(Layer.mock(GitWorkflowService)({})),
         Layer.provide(Layer.mock(EnvironmentAuth)({})),
         Layer.provideMerge(ServerSettings.layerTest({ projectWorkEnabled: true })),
         Layer.provideMerge(makeSqlitePersistenceLive(scratch + "/factory.sqlite")),
@@ -211,6 +215,30 @@ const failure = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   );
 
 describe("private Pi production factory", () => {
+  it.effect("production factory acquisition requires its original Git workflow", () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const construction = construct(f);
+        type Requirements = Effect.Services<typeof construction>;
+        const result = yield* construction.pipe(
+          Effect.updateContext((context: Context.Context<Requirements>) => {
+            // Deliberately malformed host context reproduces an omitted production layer.
+            const services = new Map(context.mapUnsafe);
+            services.delete(GitWorkflowService.key);
+            return Context.makeUnsafe<Requirements>(services);
+          }),
+          Effect.exit,
+        );
+        expect(Exit.isFailure(result)).toBe(true);
+        if (Exit.isFailure(result))
+          expect(Cause.pretty(result.cause)).toContain(GitWorkflowService.key);
+        expect(yield* f.fs.exists(f.options.stagingRoot)).toBe(false);
+        expect(f.captured).toHaveLength(0);
+        expect(f.fetch).not.toHaveBeenCalled();
+      }),
+    ),
+  );
   it.effect("the constructor-only subscription context has no default selection", () =>
     scoped(
       Effect.gen(function* () {

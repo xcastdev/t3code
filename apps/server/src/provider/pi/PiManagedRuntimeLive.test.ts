@@ -1,3 +1,8 @@
+import * as GitWorkflow from "../../git/GitWorkflowService.ts";
+import * as GitManager from "../../git/GitManager.ts";
+import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
+import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
+import * as VcsProcess from "../../vcs/VcsProcess.ts";
 import { vi } from "vite-plus/test";
 import { makeProjectTeamReviewCompletionProposals } from "../../projectWork/ProjectTeamReviewCompletionProposals.ts";
 import { makeProjectTeamReviewCompletion } from "../../projectWork/ProjectTeamReviewCompletion.ts";
@@ -50,6 +55,7 @@ import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
@@ -15443,6 +15449,94 @@ it.effect(
         expect((yield* instance.inspect).models.map((entry) => entry.slug)).toEqual([alternate]);
         expect(f.launches).toBe(0);
         expect(f.transports).toBe(0);
+      }),
+    ),
+);
+
+(process.env.PI_REVIEW_TARGET_NATIVE_DIST ? it.effect : it.effect.skip)(
+  "production factory captures canonical Git workflow for readonly reviewer preparation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* requiredReviewTransferFixture(true);
+        const git = GitVcsDriver.layer.pipe(
+          Layer.provide(VcsProcess.layer),
+          Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "pi-review-factory-" })),
+        );
+        const registry = VcsDriverRegistry.layer.pipe(
+          Layer.provide(VcsProcess.layer),
+          Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "pi-review-registry-" })),
+        );
+        const canonicalWorkflow = GitWorkflow.layer.pipe(
+          Layer.provide(git),
+          Layer.provide(registry),
+          // Reviewer preparation never uses the mutation/status manager methods.
+          Layer.provide(Layer.mock(GitManager.GitManager)({})),
+        );
+        const captured = yield* Layer.build(canonicalWorkflow);
+        const workflow = Context.get(captured, GitWorkflowService);
+        const sharedPermits = Context.get(captured, GitRepositoryPermits);
+        const workflowCalls = vi.spyOn(workflow, "withRepositoryPermit");
+        yield* Effect.addFinalizer(() => Effect.sync(() => workflowCalls.mockRestore()));
+        const key = yield* ManagedGit.canonicalGitMutationKey(
+          f.implementationMain + "/.git",
+          f.implementationWorktree,
+        );
+        const semaphore = yield* sharedPermits.getMutationSemaphore(key);
+        yield* workflow.withRepositoryPermit(
+          "review-factory.shared",
+          f.implementationWorktree,
+          Effect.gen(function* () {
+            expect(Option.isNone(yield* semaphore.withPermitsIfAvailable(1)(Effect.void))).toBe(
+              true,
+            );
+          }),
+        );
+        const factory = yield* makePiProductionRuntime({
+          environmentId: "environment",
+          distributionDirectory: process.env.PI_REVIEW_TARGET_NATIVE_DIST!,
+          agentDirectory: f.options.agentDirectory,
+          nativeStateRoot: f.options.nativeStateRoot,
+          stagingRoot: f.options.agentDirectory + "-factory-stage",
+          protectedRoots: [...f.options.protectedRoots],
+          memoryBytes: f.options.memoryBytes,
+          cleanupDeadlineMs: f.options.cleanupDeadlineMs,
+          maxInputTokens: f.options.maxInputTokens,
+          maxOutputTokens: f.options.maxOutputTokens,
+        }).pipe(
+          Effect.provide(captured),
+          Effect.provideService(PiModelCatalogue, {
+            readFresh: f.options.readCatalogue.pipe(Effect.orDie),
+            refresh: Effect.die("Unexpected factory refresh"),
+          }),
+          Effect.provideService(FetchHttpClient.Fetch, async () => {
+            throw Error("Unexpected factory transport");
+          }),
+        );
+        // Instance acquisition/preparation happen outside the supplying layer's context.
+        const instance = yield* factory.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const operation = yield* instance.prepareOperation(
+          {
+            threadId: f.binding.threadId,
+            kind: "initialize",
+            operationId: f.request.initializeOperationId,
+          },
+          () => Effect.void,
+        );
+        expect(operation.operation.operationKind).toBe("initialize");
+        expect(
+          workflowCalls.mock.calls.some(
+            ([operation, cwd]) => operation === "review.target" && cwd === f.implementationMain,
+          ),
+        ).toBe(true);
+        expect(f.transports).toBe(0);
+        const rows =
+          yield* f.sql`SELECT status FROM project_team_pi_operation WHERE operation_id=${f.request.initializeOperationId}`;
+        expect(rows).toEqual([expect.objectContaining({ status: "prepared" })]);
       }),
     ),
 );

@@ -971,6 +971,7 @@ const PiProductionRuntimeLayerLive = Layer.effect(
     );
   }).pipe(Effect.orDie),
 ).pipe(
+  Layer.provide(GitWorkflowLayerLive),
   Layer.provideMerge(ProjectTeamPiRuntimeLayerLive),
   Layer.provideMerge(PiModelCatalogueLayerLive),
   // Use the same memoized service layers as the driver and skill catalogue.
