@@ -300,6 +300,7 @@ export function reviewMobileTaskControl(current: MobileWorkCurrent) {
 export type MobileWorkAction =
   | { readonly kind: "investigate" }
   | { readonly kind: "review" }
+  | { readonly kind: "implement" }
   | { readonly kind: "waiver"; readonly action: "waive" | "revoke" }
   | {
       readonly kind: "control";
@@ -323,6 +324,10 @@ export interface MobileWorkActionState {
   readonly reason: string;
   readonly recipient: { readonly id: string; readonly revision: number } | null;
   readonly objective: string;
+  readonly implementationObjective: string;
+  readonly implementationOutputs: string;
+  readonly implementationTarget: string | null;
+  readonly implementationCriterionIds: ReadonlyArray<ProjectWorkCriterionId>;
   readonly reviewObjective: string;
   readonly reviewOutputs: string;
   readonly reviewTarget: string | null;
@@ -427,6 +432,10 @@ export function createWorkActionSession(
     reason: "",
     recipient: null,
     objective: "",
+    implementationObjective: "Implement the selected approved criteria.",
+    implementationOutputs: "Implementation and focused validation",
+    implementationTarget: null,
+    implementationCriterionIds: [],
     reviewObjective: "Independently review the approved work and its verification evidence.",
     reviewOutputs: "Independent review findings",
     reviewTarget: null,
@@ -498,6 +507,36 @@ export function createWorkActionSession(
         reviewObjective: objective,
         reviewOutputs: outputs,
         reviewTarget: state.reviewTarget ?? reviewRequestTarget(value),
+      });
+    },
+    editImplementation(objective: string, outputs: string) {
+      const value = available();
+      if (state.status !== "idle" || value === null) return;
+      update({
+        implementationObjective: objective,
+        implementationOutputs: outputs,
+        implementationTarget: state.implementationTarget ?? reviewRequestTarget(value),
+      });
+    },
+    toggleImplementationCriterion(criterionId: ProjectWorkCriterionId) {
+      const value = available();
+      if (state.status !== "idle" || value === null || !reviewMobileWork(value).canReview) return;
+      if (!value.context?.task.specification?.criterionIds.includes(criterionId)) return;
+      const target = reviewRequestTarget(value);
+      if (state.implementationTarget !== null && state.implementationTarget !== target) {
+        update({
+          status: "stale",
+          notice: "The implementation targets changed. Refresh and review them again.",
+        });
+        return;
+      }
+      const selected = state.implementationCriterionIds.includes(criterionId);
+      if (!selected && state.implementationCriterionIds.length >= 64) return;
+      update({
+        implementationTarget: target,
+        implementationCriterionIds: selected
+          ? state.implementationCriterionIds.filter((id) => id !== criterionId)
+          : [...state.implementationCriterionIds, criterionId],
       });
     },
     editControl(reason: string) {
@@ -742,25 +781,40 @@ export function createWorkActionSession(
                   }
                 : { action: action.action, reason: state.reason },
           });
-        } else if (action.kind === "review") {
+        } else if (action.kind === "review" || action.kind === "implement") {
+          const implementation = action.kind === "implement";
+          const criterionIds = [...state.implementationCriterionIds];
+          const capturedTarget = implementation ? state.implementationTarget : state.reviewTarget;
           const target = reviewRequestTarget(value);
           if (
             !review.canReview ||
             !review.plan ||
             !review.approvedSpecification ||
             !review.approvedPlan ||
-            (state.reviewTarget !== null && state.reviewTarget !== target)
+            (capturedTarget !== null && capturedTarget !== target) ||
+            (implementation &&
+              (criterionIds.length < 1 ||
+                criterionIds.length > 64 ||
+                new Set(criterionIds).size !== criterionIds.length ||
+                criterionIds.some(
+                  (id) => !value.context?.task.specification?.criterionIds.includes(id),
+                )))
           ) {
             update({
               status: "stale",
-              notice:
-                "Review the current human-approved specification and plan before requesting review.",
+              notice: implementation
+                ? "Review the current human-approved specification and plan and select one to 64 criteria before requesting implementation."
+                : "Review the current human-approved specification and plan before requesting review.",
             });
             return;
           }
-          const objective = state.reviewObjective;
-          const outputs = state.reviewOutputs;
-          update({ status: "preparing", reviewTarget: target, notice: null });
+          const objective = implementation ? state.implementationObjective : state.reviewObjective;
+          const outputs = implementation ? state.implementationOutputs : state.reviewOutputs;
+          update({
+            status: "preparing",
+            ...(implementation ? { implementationTarget: target } : { reviewTarget: target }),
+            notice: null,
+          });
           const { CryptoDigestAlgorithm, digestStringAsync } = await import("expo-crypto");
           const specificationHash = await digestStringAsync(
             CryptoDigestAlgorithm.SHA256,
@@ -781,20 +835,27 @@ export function createWorkActionSession(
             !after ||
             reviewRequestTarget(after) !== target ||
             !reviewMobileWork(after).canReview ||
+            (implementation &&
+              (canonicalProjectWorkPayload(state.implementationCriterionIds) !==
+                canonicalProjectWorkPayload(criterionIds) ||
+                criterionIds.some(
+                  (id) => !after.context?.task.specification?.criterionIds.includes(id),
+                ))) ||
             specificationHash !== review.approvedSpecification.contentHash ||
             planHash !== review.plan.contentHash
           ) {
             if (alive)
               update({
                 status: "stale",
-                notice: "The approved review targets changed. Refresh and review them again.",
+                notice: "The approved assignment targets changed. Refresh and review them again.",
               });
             return;
           }
           intent = decodeWrite({
             ...base,
             type: "project-team.assignment.start",
-            assignmentKind: "review",
+            assignmentKind: implementation ? "implementation" : "review",
+            ...(implementation ? { parentCriterionIds: criterionIds } : {}),
             objective,
             outputDescriptions: outputs
               .split("\n")
@@ -847,7 +908,7 @@ export function createWorkActionSession(
         }
       } catch {
         update({
-          ...(action.kind === "waiver" || action.kind === "review"
+          ...(action.kind === "waiver" || action.kind === "review" || action.kind === "implement"
             ? { status: "denied" as const }
             : {}),
           notice:
@@ -887,6 +948,8 @@ export function createWorkActionSession(
           notice: null,
           waiver: null,
           reviewTarget: null,
+          implementationTarget: null,
+          implementationCriterionIds: [],
           waiverReason: "",
           waiverEvidenceIds: [],
         });

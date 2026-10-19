@@ -988,6 +988,54 @@ function WorkTaskSession({
             ))}
             {review.gates.length === 0 ? <Notice>No recorded approvals.</Notice> : null}
           </WorkCard>
+          <WorkCard title="Implementation">
+            <Notice>
+              Select one to 64 criteria from the current human-approved specification and plan. The
+              child task derives its criteria and scope from this selection.
+            </Notice>
+            {ownContext.criteria
+              .filter((criterion) =>
+                ownContext.task.specification?.criterionIds.includes(criterion.criterionId),
+              )
+              .map((criterion) => (
+                <WorkButton
+                  key={criterion.criterionId}
+                  disabled={locked || !review.canReview}
+                  onPress={() => session.toggleImplementationCriterion(criterion.criterionId)}
+                >
+                  {`${state.implementationCriterionIds.includes(criterion.criterionId) ? "Deselect" : "Select"} implementation criterion: ${criterion.description}`}
+                </WorkButton>
+              ))}
+            <Notice>
+              {state.implementationCriterionIds.length} implementation criteria selected
+            </Notice>
+            <TextInput
+              accessibilityLabel="Implementation objective"
+              multiline
+              maxLength={32000}
+              editable={state.status === "idle"}
+              value={state.implementationObjective}
+              onChangeText={(text) => session.editImplementation(text, state.implementationOutputs)}
+            />
+            <TextInput
+              accessibilityLabel="Implementation outputs, one per line"
+              multiline
+              maxLength={64000}
+              editable={state.status === "idle"}
+              value={state.implementationOutputs}
+              onChangeText={(text) =>
+                session.editImplementation(state.implementationObjective, text)
+              }
+            />
+            <WorkButton
+              disabled={
+                locked || !review.canReview || state.implementationCriterionIds.length === 0
+              }
+              onPress={() => void session.submit({ kind: "implement" })}
+            >
+              Start implementation
+            </WorkButton>
+          </WorkCard>
           <WorkCard title="Task controls">
             <Notice>
               Recorded control state: {control.membership?.controlState ?? "not reported"}

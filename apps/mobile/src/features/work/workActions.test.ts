@@ -6,6 +6,7 @@ import {
   ProjectId,
   ProjectTeamRecordRead,
   ProjectWorkAction,
+  ProjectWorkCriterionId,
   ProjectWorkTaskContext,
   ProjectWorkWriteIntent,
   canonicalProjectWorkPayload,
@@ -839,13 +840,13 @@ describe("mobile human work", () => {
   });
 });
 
-function approvedReviewCurrent() {
+function approvedReviewCurrent(taskContext = context) {
   const value = current();
   const hash = (value: unknown) =>
     NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
   const specificationHash = hash({
-    specification: context.task.specification,
-    criteria: context.criteria
+    specification: taskContext.task.specification,
+    criteria: taskContext.criteria
       .map(({ criterionId, description, required, waiver }) => ({
         criterionId,
         description,
@@ -869,6 +870,7 @@ function approvedReviewCurrent() {
   );
   return {
     ...value,
+    context: taskContext,
     foundation: combineProjectWorkFoundationPages({
       projectId,
       pages: [{ value: { projectId, revision: 10, items: approved } }],
@@ -1013,3 +1015,220 @@ it.each(["completed", "canceled"] as const)(
     });
   },
 );
+
+it("implementation selects approved criteria, keeps a separate draft, and retries its exact uncertain intent", async () => {
+  const value = approvedReviewCurrent();
+  const sent: ProjectWorkWriteIntent[] = [];
+  const session = createWorkActionSession(
+    value,
+    () => value,
+    async (intent) => {
+      sent.push(decodeWrite(intent));
+      if (sent.length === 1) throw Error("lost response");
+    },
+    () => CommandId.make("implementation-command"),
+  );
+  session.toggleImplementationCriterion(context.criteria[0]!.criterionId);
+  session.editImplementation("Implement reconnect", "Code\nFocused validation");
+  expect(session.state.reviewObjective).toContain("Independently review");
+  await session.submit({ kind: "implement" });
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({
+    type: "project-team.assignment.start",
+    assignmentKind: "implementation",
+    objective: "Implement reconnect",
+    outputDescriptions: ["Code", "Focused validation"],
+    parentCriterionIds: ["criterion"],
+    specificationGateId: "spec",
+    specRevision: 2,
+    expectedSpecificationGateRevision: 1,
+    parentPlan: {
+      recordId: "plan",
+      expectedRecordRevision: 1,
+      planRevision: 3,
+      gateId: "plan-gate",
+      expectedGateRevision: 1,
+    },
+  });
+  expect(sent[0]).not.toHaveProperty("scopeIn");
+  expect(sent[0]).not.toHaveProperty("criteria");
+  session.toggleImplementationCriterion(context.criteria[0]!.criterionId);
+  session.editImplementation("Changed", "Changed");
+  expect(session.state.implementationCriterionIds).toEqual(["criterion"]);
+  session.setCurrent(() => ({
+    ...value,
+    context: {
+      ...context,
+      criteria: context.criteria.map((criterion) => ({
+        ...criterion,
+        description: "Changed after uncertain send",
+      })),
+    },
+  }));
+  await session.retry();
+  expect(sent[1]).toEqual(sent[0]);
+});
+
+it("implementation blocks an empty selection and excludes criteria outside the approved specification", async () => {
+  const value = approvedReviewCurrent();
+  const send = vi.fn(async (_intent: ProjectWorkWriteIntent) => {});
+  const session = createWorkActionSession(
+    value,
+    () => value,
+    send,
+    () => CommandId.make("empty"),
+  );
+  session.toggleImplementationCriterion(ProjectWorkCriterionId.make("foreign"));
+  await session.submit({ kind: "implement" });
+  expect(send).not.toHaveBeenCalled();
+  expect(session.state.implementationCriterionIds).toEqual([]);
+});
+
+it.each(["plan", "approval", "criterion", "disconnect"])(
+  "implementation rechecks %s after async preparation and keeps its selected IDs",
+  async (change) => {
+    const value = approvedReviewCurrent();
+    let reads = 0;
+    const send = vi.fn(async (_intent: ProjectWorkWriteIntent) => {});
+    const session = createWorkActionSession(
+      value,
+      () => {
+        reads++;
+        if (reads <= 2) return value;
+        if (change === "disconnect") return { ...value, connected: false };
+        if (change === "criterion")
+          return {
+            ...value,
+            context: {
+              ...context,
+              criteria: context.criteria.map((criterion) => ({
+                ...criterion,
+                description: "Changed criterion",
+              })),
+            },
+          };
+        return {
+          ...value,
+          foundation: {
+            ...value.foundation,
+            records: value.foundation.records.map((record) =>
+              change === "plan" && record.kind === "plan-revision"
+                ? decodeRecord({ ...record, revision: 2 })
+                : change === "approval" && record.kind === "gate"
+                  ? decodeRecord({ ...record, status: "pending" })
+                  : record,
+            ),
+          },
+        };
+      },
+      send,
+      () => CommandId.make("changed"),
+    );
+    session.toggleImplementationCriterion(context.criteria[0]!.criterionId);
+    await session.submit({ kind: "implement" });
+    expect(send).not.toHaveBeenCalled();
+    expect(session.state.status).toBe("stale");
+    expect(session.state.implementationCriterionIds).toEqual(["criterion"]);
+  },
+);
+
+it.each(["pending", "agent", "plan"])(
+  "implementation requires current human approval (%s)",
+  async (change) => {
+    const value = approvedReviewCurrent();
+    const changed = {
+      ...value,
+      foundation: {
+        ...value.foundation,
+        records: value.foundation.records.map((record) =>
+          record.kind === "gate" && "attribution" in record && "gate" in record
+            ? decodeRecord({
+                ...record,
+                ...(change === "pending" ? { status: "pending" } : {}),
+                ...(change === "agent"
+                  ? {
+                      attribution: {
+                        ...record.attribution,
+                        actor: { kind: "agent", threadId: "agent-thread" },
+                      },
+                    }
+                  : {}),
+                ...(change === "plan" && record.gate === "plan" ? { planRevision: 9 } : {}),
+              })
+            : record,
+        ),
+      },
+    };
+    const send = vi.fn(async (_intent: ProjectWorkWriteIntent) => {});
+    const session = createWorkActionSession(
+      changed,
+      () => changed,
+      send,
+      () => CommandId.make("approval"),
+    );
+    session.toggleImplementationCriterion(context.criteria[0]!.criterionId);
+    await session.submit({ kind: "implement" });
+    expect(send).not.toHaveBeenCalled();
+  },
+);
+
+it("implementation selects at most 64 unique current criteria and supports deselection", async () => {
+  const criteria = Array.from({ length: 65 }, (_, index) => ({
+    ...context.criteria[0]!,
+    criterionId: ProjectWorkCriterionId.make(`criterion-${index}`),
+  }));
+  const expanded = decodeContext({
+    ...context,
+    criteria,
+    task: {
+      ...context.task,
+      specification: {
+        ...context.task.specification,
+        criterionIds: criteria.map((criterion) => criterion.criterionId),
+      },
+    },
+  });
+  const value = approvedReviewCurrent(expanded);
+  const sent: ProjectWorkWriteIntent[] = [];
+  const session = createWorkActionSession(
+    value,
+    () => value,
+    async (intent) => {
+      sent.push(decodeWrite(intent));
+    },
+    () => CommandId.make("boundary"),
+  );
+  for (const criterion of criteria) session.toggleImplementationCriterion(criterion.criterionId);
+  expect(session.state.implementationCriterionIds).toHaveLength(64);
+  expect(new Set(session.state.implementationCriterionIds).size).toBe(64);
+  session.toggleImplementationCriterion(criteria[0]!.criterionId);
+  session.toggleImplementationCriterion(criteria[64]!.criterionId);
+  await session.submit({ kind: "implement" });
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({
+    assignmentKind: "implementation",
+    parentCriterionIds: criteria.slice(1).map((criterion) => criterion.criterionId),
+  });
+});
+
+it.each([
+  ["", "Code"],
+  ["Implement selected work", ""],
+  ["Implement selected work", Array.from({ length: 17 }, () => "Output").join("\n")],
+])("implementation validates the objective and output draft (%s)", async (objective, outputs) => {
+  const value = approvedReviewCurrent();
+  const send = vi.fn(async (_intent: ProjectWorkWriteIntent) => {});
+  const session = createWorkActionSession(
+    value,
+    () => value,
+    send,
+    () => CommandId.make("invalid-draft"),
+  );
+  session.toggleImplementationCriterion(context.criteria[0]!.criterionId);
+  session.editImplementation(objective, outputs);
+  await session.submit({ kind: "implement" });
+  expect(send).not.toHaveBeenCalled();
+  expect(session.state.status).toBe("denied");
+  expect(session.state.implementationObjective).toBe(objective);
+  expect(session.state.implementationOutputs).toBe(outputs);
+});
