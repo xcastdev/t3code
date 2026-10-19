@@ -25,6 +25,8 @@ import {
   ProjectWorkWriteIntent,
   ProjectWorkWriteResult,
   type ProjectTeamMemoryRetractIntent,
+  type ProjectTeamMemorySharesReplaceIntent,
+  OrchestrationProjectShell,
   WS_METHODS,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -41,12 +43,18 @@ import { createRoot, type Root } from "react-dom/client";
 import { vi } from "vite-plus/test";
 
 const bridge = vi.hoisted(() => {
-  const state: { atoms: unknown } = { atoms: undefined };
+  const state: { atoms: unknown; projects: unknown } = { atoms: undefined, projects: undefined };
   return state;
 });
 vi.mock("~/state/projectWork", () => ({
   get projectWorkEnvironment() {
     return bridge.atoms;
+  },
+}));
+
+vi.mock("~/state/projects", () => ({
+  get environmentProjects() {
+    return { projectsAtom: bridge.projects };
   },
 }));
 
@@ -59,6 +67,7 @@ const at = "2026-10-04T10:00:00.000Z";
 const decodeRead = Schema.decodeUnknownEffect(ProjectWorkReadIntent);
 const decodeWrite = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
 const encodeResult = Schema.encodeEffect(ProjectWorkWriteResult);
+const decodeProject = Schema.decodeUnknownSync(OrchestrationProjectShell);
 const decodeEffect = Schema.decodeUnknownSync(ProjectTeamEffect);
 const isSource = Schema.is(ProjectMemorySource);
 function receipt() {
@@ -153,7 +162,22 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
       }
     | undefined;
   let fail: boolean;
-  let writes: Array<{ environmentId: EnvironmentId; input: ProjectTeamMemoryRetractIntent }>;
+  type MemoryWrite = ProjectTeamMemoryRetractIntent | ProjectTeamMemorySharesReplaceIntent;
+  let writes: Array<{ environmentId: EnvironmentId; input: MemoryWrite }>;
+  const catalogueProject = (id: string, environment = environmentId) => ({
+    ...decodeProject({
+      id,
+      title: id,
+      workspaceRoot: `/tmp/${id}`,
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: at,
+      updatedAt: at,
+    }),
+    environmentId: environment,
+  });
+  let projects: ReturnType<typeof Atom.make<ReadonlyArray<ReturnType<typeof catalogueProject>>>>;
+
   let writeMode: "accepted" | "denied" | "mixed" | "lost" | "wrong-project";
   let accepted: Map<string, ProjectWorkWriteResult>;
   let writeCompleted: ReturnType<typeof receipt>;
@@ -183,7 +207,10 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
               if (request._tag !== "Request") return;
               if (request.tag === WS_METHODS.projectWorkWrite) {
                 const input = yield* decodeWrite(request.payload).pipe(Effect.orDie);
-                if (input.type !== "project-team.memory.retract")
+                if (
+                  input.type !== "project-team.memory.retract" &&
+                  input.type !== "project-team.memory.shares.replace"
+                )
                   return yield* Effect.die("Unexpected memory action");
                 writes.push({ environmentId: id, input });
                 if (writeMode === "denied" || writeMode === "mixed") {
@@ -224,33 +251,45 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
                     sourceGeneration: current.generation,
                     contentHash: current.contentHash,
                   });
-                  const tombstone = {
-                    ...current,
-                    status: "retracted" as const,
-                    revision: current.revision + 1,
-                    generation: current.generation + 1,
-                    tombstonedAt: at,
-                    sharedWithProjectIds: [],
-                  };
-                  records = records.map((record) => (record === current ? tombstone : record));
-                  records.push(
-                    decodeEffect({
-                      ...base,
-                      recordId: "delete-1",
-                      effectId: "delete-1",
-                      kind: "effect",
-                      effectKind: "memory-delete",
-                      status: "pending",
-                      targetId: current.recordId,
-                      generation: tombstone.generation,
-                      claimGeneration: 0,
-                      availableAt: at,
-                      payload: {
-                        recordIds: [current.recordId],
-                        expectedRevision: current.sourceRevision,
-                      },
-                    }),
-                  );
+                  if (input.type === "project-team.memory.shares.replace") {
+                    records = records.map((record) =>
+                      record === current
+                        ? {
+                            ...current,
+                            revision: current.revision + 1,
+                            sharedWithProjectIds: input.sharedWithProjectIds,
+                          }
+                        : record,
+                    );
+                  } else {
+                    const tombstone = {
+                      ...current,
+                      status: "retracted" as const,
+                      revision: current.revision + 1,
+                      generation: current.generation + 1,
+                      tombstonedAt: at,
+                      sharedWithProjectIds: [],
+                    };
+                    records = records.map((record) => (record === current ? tombstone : record));
+                    records.push(
+                      decodeEffect({
+                        ...base,
+                        recordId: "delete-1",
+                        effectId: "delete-1",
+                        kind: "effect",
+                        effectKind: "memory-delete",
+                        status: "pending",
+                        targetId: current.recordId,
+                        generation: tombstone.generation,
+                        claimGeneration: 0,
+                        availableAt: at,
+                        payload: {
+                          recordIds: [current.recordId],
+                          expectedRevision: current.sourceRevision,
+                        },
+                      }),
+                    );
+                  }
                   revision += 2;
                   result = {
                     projectId,
@@ -383,6 +422,13 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
       followStream: (id, stream) =>
         Stream.provideService(stream, EnvironmentSupervisor, supervisorFor(id)),
     });
+    projects = Atom.make<ReadonlyArray<ReturnType<typeof catalogueProject>>>([
+      catalogueProject(projectId),
+      catalogueProject("shared-project"),
+      catalogueProject("new-project"),
+      catalogueProject("foreign-project", otherEnvironmentId),
+    ]);
+    bridge.projects = projects;
     registry = AtomRegistry.make();
     atoms = createProjectWorkEnvironmentAtoms(
       Atom.runtime(Layer.succeed(EnvironmentRegistry, environments)),
@@ -488,6 +534,209 @@ describe("Memory through mounted foundation and encoded RPC transport", () => {
     await click(label);
     await act(async () => writeCompleted.promise);
   }
+
+  async function reviewSharing() {
+    prepareRetraction();
+    await render({ writesSupported: true });
+    await inspect(source.recordId);
+    await click("Review sharing");
+  }
+  async function toggleGrant(id: string) {
+    const checkbox = host.querySelector<HTMLElement>(
+      `[role="checkbox"][aria-label="Share with ${id}"]`,
+    );
+    expect(checkbox).not.toBeNull();
+    // Base UI forwards a PointerEvent to its native input; happy-dom does not
+    // perform the native checkbox default action for dispatchEvent(PointerEvent).
+    const input = checkbox
+      ?.closest("label")
+      ?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    expect(input).not.toBeNull();
+    await act(async () => input?.click());
+  }
+  interaction("replaces the complete reviewed grant set and explicitly revokes it", async () => {
+    await reviewSharing();
+    expect(host.querySelector('[aria-label="Share with project-1"]')).toBeNull();
+    expect(host.querySelector('[aria-label="Share with foreign-project"]')).toBeNull();
+    await toggleGrant("shared-project");
+    await toggleGrant("new-project");
+    await submit("Apply sharing changes");
+    await act(async () => settle());
+    expect(writes[0]).toMatchObject({
+      environmentId,
+      input: {
+        type: "project-team.memory.shares.replace",
+        projectId,
+        expectedRevision: 10,
+        sourceRecordId: source.recordId,
+        expectedSourceRecordRevision: 1,
+        sourceRevision: 3,
+        sourceGeneration: 2,
+        contentHash: writableSource.contentHash,
+        sharedWithProjectIds: ["new-project"],
+      },
+    });
+    expect(host.textContent).toContain("Sharing update recorded");
+    await click("Review sharing");
+    await click("Clear all grants");
+    await submit("Apply sharing changes");
+    await act(async () => settle());
+    expect(writes[1]?.input).toMatchObject({ sharedWithProjectIds: [], expectedRevision: 12 });
+    expect(records.find(isSource)).toMatchObject({
+      projectId,
+      recordId: source.recordId,
+      sharedWithProjectIds: [],
+    });
+    expect(records.filter(isSource)).toHaveLength(1);
+  });
+  interaction("requires fresh review when only grants or project revision changed", async () => {
+    await reviewSharing();
+    records = [{ ...writableSource, sharedWithProjectIds: ["new-project"] }];
+    revision++;
+    await refresh();
+    expect(button("Apply sharing changes")?.disabled).toBe(true);
+    await click("Apply sharing changes");
+    expect(writes).toEqual([]);
+    await click("Review sharing");
+    await click("Clear all grants");
+    await submit("Apply sharing changes");
+    expect(writes[0]?.input).toMatchObject({ expectedRevision: 11, sharedWithProjectIds: [] });
+  });
+  interaction("rechecks removed catalogue projects before applying reviewed grants", async () => {
+    await reviewSharing();
+    await toggleGrant("new-project");
+    await act(async () => registry.set(projects, [catalogueProject(projectId)]));
+    await click("Apply sharing changes");
+    expect(writes).toEqual([]);
+    expect(host.textContent).toContain("Review the current source and project grants again");
+  });
+  for (const state of ["disconnected", "disabled", "unsupported"] as const) {
+    interaction(`blocks reviewed sharing while ${state}`, async () => {
+      await reviewSharing();
+      const stale = button("Apply sharing changes");
+      await render({
+        connected: state !== "disconnected",
+        enabled: state !== "disabled",
+        writesSupported: state !== "unsupported",
+      });
+      await act(async () => stale?.click());
+      expect(writes).toEqual([]);
+    });
+  }
+  for (const target of ["project", "environment"] as const) {
+    interaction(`blocks a retained sharing action after switching ${target}`, async () => {
+      await reviewSharing();
+      const stale = button("Apply sharing changes");
+      await render({
+        writesSupported: true,
+        ...(target === "project"
+          ? { project: ProjectId.make("project-2") }
+          : { environment: otherEnvironmentId }),
+      });
+      await act(async () => stale?.click());
+      expect(writes).toEqual([]);
+      expect(button("Apply sharing changes")).toBeUndefined();
+    });
+  }
+  for (const state of ["superseded", "retracted", "broken-chain"] as const) {
+    interaction(`blocks reviewed sharing after source becomes ${state}`, async () => {
+      await reviewSharing();
+      records =
+        state === "broken-chain"
+          ? [{ ...writableSource, supersedes: "missing" }]
+          : [{ ...writableSource, status: state }];
+      revision++;
+      await refresh();
+      expect(button("Apply sharing changes")?.disabled).toBe(true);
+      expect(button("Review sharing")?.disabled).toBe(true);
+      await click("Apply sharing changes");
+      expect(writes).toEqual([]);
+    });
+  }
+  for (const mode of ["lost", "wrong-project", "mixed"] as const) {
+    interaction(
+      `retains exact sharing after ${mode} across refresh and reconciles its receipt`,
+      async () => {
+        await reviewSharing();
+        await click("Clear all grants");
+        writeMode = mode;
+        await submit("Apply sharing changes");
+        const original = writes[0];
+        expect(button("Retract memory")?.disabled).toBe(true);
+        await refresh();
+        expect(button("Retry exact sharing update")).toBeDefined();
+        expect(button("Apply sharing changes")?.disabled).toBe(true);
+        writeMode = "accepted";
+        await submit("Retry exact sharing update");
+        await act(async () => settle());
+        expect(writes).toEqual([original, original]);
+        expect(accepted.size).toBe(1);
+        expect(button("Retry exact sharing update")).toBeUndefined();
+        expect(host.textContent).toContain("Sharing update recorded");
+      },
+    );
+  }
+  interaction(
+    "admits one sharing command when apply and retraction are clicked before rerender",
+    async () => {
+      await reviewSharing();
+      await click("Clear all grants");
+      const apply = button("Apply sharing changes");
+      const retract = button("Retract memory");
+      writeCompleted = receipt();
+      await act(async () => {
+        apply?.click();
+        apply?.click();
+        retract?.click();
+        await writeCompleted.promise;
+      });
+      await act(async () => settle());
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.input.type).toBe("project-team.memory.shares.replace");
+    },
+  );
+
+  for (const laterState of ["superseded", "retracted"] as const) {
+    interaction(
+      `reconciles an uncertain accepted share after later ${laterState} without retargeting`,
+      async () => {
+        await reviewSharing();
+        await click("Clear all grants");
+        writeMode = "lost";
+        await submit("Apply sharing changes");
+        const original = writes[0];
+        records = [
+          {
+            ...writableSource,
+            revision: 3,
+            generation: 3,
+            status: laterState,
+            ...(laterState === "retracted" ? { tombstonedAt: at } : {}),
+          },
+        ];
+        revision++;
+        await refresh();
+        expect(button("Review sharing")?.disabled).toBe(true);
+        writeMode = "accepted";
+        await submit("Retry exact sharing update");
+        await act(async () => settle());
+        expect(writes).toEqual([original, original]);
+        expect(accepted.size).toBe(1);
+        expect(button("Retry exact sharing update")).toBeUndefined();
+        expect(host.textContent).toContain("Sharing update recorded");
+      },
+    );
+  }
+
+  interaction("clears rejected sharing and requires another explicit review", async () => {
+    await reviewSharing();
+    writeMode = "denied";
+    await submit("Apply sharing changes");
+    expect(button("Retry exact sharing update")).toBeUndefined();
+    expect(button("Apply sharing changes")).toBeUndefined();
+    expect(host.textContent).toContain("Sharing update rejected");
+    expect(button("Retract memory")?.disabled).toBe(false);
+  });
 
   interaction(
     "retracts the inspected exact source and hides its cached observation family during held refresh",
