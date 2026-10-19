@@ -7,6 +7,14 @@ import {
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import {
+  stopProjectTeamOwnedThread,
+  waitForProjectTeamAssignmentChange,
+} from "./ProjectTeamExecutionHost.ts";
+import { ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
+import { makeProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import { PiManagedRuntimeError } from "../provider/pi/PiManagedRuntime.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -219,26 +227,6 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
             { kind: "web", id: "control-device" },
           );
         });
-        yield* sendControl(
-          `control-${action}`,
-          action === "reassign"
-            ? {
-                action,
-                reason: "Transfer exact owner",
-                recipientMemberId: "successor",
-                expectedMemberRevision: 0,
-              }
-            : { action, reason: "Stop exact owner" },
-        );
-        const stopped = yield* readCurrentState(f.sql, projectId);
-        expect(stopped.foundationRecords?.find((r) => r.recordId === "binding")).toMatchObject({
-          status: "stopping",
-        });
-        expect(
-          stopped.foundationRecords?.find((r) => r.kind === "effect" && r.effectKind === "stop"),
-        ).toMatchObject({ status: "pending", runId: "binding", claimGeneration: 0 });
-        const held = yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`;
-        expect(held).toHaveLength(1);
         const ownerJoined = yield* Deferred.make<{
           dispatchId: string;
           bindingId: string;
@@ -269,15 +257,83 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
               expect(joined.claimGeneration).toBe(snapshot.fence.claimGeneration);
             }),
         });
-        // Controlled owner port: the exact owner's join precedes the durable journal transaction.
-        const settlement = yield* Effect.forkChild(
-          Effect.gen(function* () {
-            yield* Deferred.succeed(stopping, undefined);
-            yield* Deferred.await(ownerJoined);
-            return yield* journal.settleAfterJoined(claimed.fence, terminal);
+        const pi = yield* makeProjectTeamPiRuntime();
+        const transition = claimed.intent.compiledClaim.transition;
+        if (transition?.kind !== "claim") return yield* Effect.die("Missing retained binding");
+        const binding = transition.binding;
+        const requests: string[] = [];
+        const unused = Effect.fail(
+          new PiManagedRuntimeError({
+            code: "denied",
+            detail: "Unused controlled runtime operation",
           }),
         );
+        yield* pi.publishAssets(
+          binding.providerInstanceId,
+          {
+            instanceConfiguration: { enabled: true, configuration: {} },
+            runtimeFacts: { runtimeVersion: "0.99.1", maxInputTokens: 100, maxOutputTokens: 100 },
+            runtimeFiles: [],
+            revalidate: Effect.void,
+            borrow: (body) => body,
+          },
+          {
+            inspect: unused,
+            prepareOperation: () => unused,
+            readSession: () => unused,
+            readThread: () => unused,
+            stopAll: unused,
+            authorizeSkills: () => unused,
+            discoverNativeSkills: () => unused,
+            requestStop: (threadId) =>
+              Effect.gen(function* () {
+                requests.push(threadId);
+                yield* Deferred.succeed(stopping, undefined);
+                yield* Deferred.await(ownerJoined);
+              }),
+          },
+        );
+        const entered = yield* Deferred.make<void>();
+        // The production Host wait observes committed controls even if the provider remains silent.
+        const settlement = yield* waitForProjectTeamAssignmentChange(
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          Date.parse(at) + 300000,
+          {
+            projectId,
+            assertCurrent: f.journal.inspect(claimed.fence.dispatchId).pipe(Effect.asVoid),
+          },
+        ).pipe(
+          Effect.onError(() =>
+            Effect.gen(function* () {
+              yield* stopProjectTeamOwnedThread(pi, claimed);
+              yield* journal.settleAfterJoined(claimed.fence, terminal);
+            }),
+          ),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(entered);
+        yield* sendControl(
+          `control-${action}`,
+          action === "reassign"
+            ? {
+                action,
+                reason: "Transfer exact owner",
+                recipientMemberId: "successor",
+                expectedMemberRevision: 0,
+              }
+            : { action, reason: "Stop exact owner" },
+        );
+        const stopped = yield* readCurrentState(f.sql, projectId);
+        expect(stopped.foundationRecords?.find((r) => r.recordId === "binding")).toMatchObject({
+          status: "stopping",
+        });
+        expect(
+          stopped.foundationRecords?.find((r) => r.kind === "effect" && r.effectKind === "stop"),
+        ).toMatchObject({ status: "pending", runId: "binding", claimGeneration: 0 });
+        const held = yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`;
+        expect(held).toHaveLength(1);
         yield* Deferred.await(stopping);
+        expect(requests).toEqual([binding.threadId]);
         const resumeAction = action === "cancel" ? "reopen" : "resume";
         expect(
           yield* sendControl("too-early", {
@@ -295,9 +351,10 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
         expect(
           yield* f.sql`SELECT * FROM project_team_dispatch_receipt WHERE stage='settled'`,
         ).toEqual([]);
+        expect(settlement.pollUnsafe()).toBeUndefined();
         yield* Deferred.succeed(ownerJoined, terminal.evidence);
-        const settled = yield* Fiber.join(settlement);
-        expect(settled.fence.stage).toBe("settled");
+        expect(Exit.isFailure(yield* Fiber.await(settlement))).toBe(true);
+        expect((yield* journal.readRetained(claimed.fence.dispatchId)).fence.stage).toBe("settled");
         const drained = yield* readCurrentState(f.sql, projectId);
         expect(drained.foundationRecords?.find((r) => r.recordId === "binding")).toMatchObject({
           status: "settled",
@@ -376,6 +433,12 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
         );
         expect((yield* journal.settleAfterJoined(claimed.fence, terminal)).duplicate).toBe(true);
         expect(yield* readCurrentState(f.sql, projectId)).toEqual(current);
-      }).pipe(Effect.provide(ProjectWorkProjectionLive.pipe(Layer.provideMerge(gatewayRuntime)))),
+      }).pipe(
+        Effect.provide(
+          ProjectWorkProjectionLive.pipe(
+            Layer.provideMerge(gatewayRuntime.pipe(Layer.provideMerge(ProjectWorkEventBusLive))),
+          ),
+        ),
+      ),
   );
 }

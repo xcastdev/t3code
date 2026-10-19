@@ -52,6 +52,7 @@ import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts"
 import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 import type { PiNativeReference } from "../provider/pi/PiWorkerProtocol.ts";
 
+import { ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
 import {
   continueProjectTeamMailboxTurn,
   readProjectTeamOwnedOperationHistory,
@@ -1927,7 +1928,7 @@ it.effect(
           original: f.snapshot,
           turns: f.turns,
           assertCurrent: Effect.void,
-        }).pipe(Effect.provide(engine));
+        }).pipe(Effect.provide(engine), Effect.provide(ProjectWorkEventBusLive));
         const fiber = yield* run.pipe(Effect.forkChild);
         let afterOperationId: string | undefined;
         let cursor = { ...native, leafId: "assignment-leaf" };

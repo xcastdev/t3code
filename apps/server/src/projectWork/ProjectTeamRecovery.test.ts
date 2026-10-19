@@ -1,6 +1,11 @@
 import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProjectWorkFoundationCommitCommand } from "@t3tools/contracts";
+import { ProjectWorkFoundationCommitCommand, OrchestrationEvent } from "@t3tools/contracts";
+import * as PubSub from "effect/PubSub";
+import * as Stream from "effect/Stream";
+import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import { waitForProjectTeamRetainedCompaction } from "./ProjectTeamExecutionHost.ts";
+import { ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
@@ -44,6 +49,7 @@ import {
   type ProjectTeamRecoveryPorts,
 } from "./ProjectTeamRecovery.ts";
 
+const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 
@@ -1408,3 +1414,176 @@ for (const positioned of [false, true]) {
     );
   }
 }
+
+it.effect(
+  "starts a bounded page of held owners together and joins all cleanup before another sweep",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const retained = yield* f.journal.reserve(f.request);
+        const entered = yield* Deferred.make<void>();
+        const joining = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const active = new Set<string>();
+        const settled: string[] = [];
+        let reads = 0;
+        let admissions = 0;
+        let maximumAdmissions = 0;
+        const h = harness(retained);
+        const recovery = makeProjectTeamRecovery(
+          {
+            ...h.ports,
+            readPage: () => {
+              reads++;
+              return Effect.succeed(
+                ["a", "b"].map((dispatchId) => ({
+                  dispatchId,
+                  snapshot: Exit.succeed({ ...retained, fence: { ...retained.fence, dispatchId } }),
+                })),
+              );
+            },
+            withClaim: (snapshot, run) =>
+              Effect.acquireUseRelease(
+                Effect.sync(() => {
+                  expect(active.has(snapshot.fence.dispatchId)).toBe(false);
+                  active.add(snapshot.fence.dispatchId);
+                  return { original: snapshot };
+                }),
+                run,
+                () =>
+                  Effect.sync(() => {
+                    active.delete(snapshot.fence.dispatchId);
+                  }),
+              ),
+            assess: (claim) =>
+              Effect.gen(function* () {
+                admissions++;
+                maximumAdmissions = Math.max(maximumAdmissions, admissions);
+                yield* Effect.yieldNow;
+                admissions--;
+                return {
+                  _tag: "Resume" as const,
+                  claim,
+                  snapshot: {
+                    ...claim.original,
+                    fence: { ...claim.original.fence, claimGeneration: 1 },
+                  },
+                };
+              }),
+            resume: () =>
+              Effect.gen(function* () {
+                if (active.size === 2) yield* Deferred.succeed(entered, undefined);
+                yield* Effect.never;
+                return { _tag: "Busy" as const };
+              }),
+            joinCleanup: (claim) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(joining, undefined);
+                yield* Deferred.await(release);
+                return { _tag: "Joined" as const, receipt: { claim } };
+              }),
+            settle: (claim) =>
+              Effect.sync(() => {
+                settled.push(claim.original.fence.dispatchId);
+              }),
+          },
+          { pageSize: 2 },
+        );
+        const first = yield* recovery.sweep().pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        expect(active.size).toBe(2);
+        expect(maximumAdmissions).toBe(1);
+        const second = yield* recovery.sweep().pipe(Effect.forkChild);
+        first.interruptUnsafe();
+        yield* Deferred.await(joining);
+        expect(reads).toBe(1);
+        expect(active.size).toBe(2);
+        yield* Fiber.interrupt(second);
+        yield* Deferred.succeed(release, undefined);
+        expect(Exit.isFailure(yield* Fiber.await(first))).toBe(true);
+        expect(active.size).toBe(0);
+        expect(settled.sort()).toEqual(["a", "b"]);
+      }),
+    ),
+);
+
+it.effect("retains an accepted SQL compact through its terminal event before Host cleanup", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const snapshot = yield* f.journal.reserve(f.request);
+      const transition = snapshot.intent.compiledClaim.transition;
+      if (transition?.kind !== "claim") return yield* Effect.die("Missing binding");
+      const binding = transition.binding;
+      yield* f.sql`INSERT INTO project_team_pi_operation (
+        operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,
+        worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,
+        maximum_tokens,deadline_at_ms,status,intent_json
+      ) VALUES ('compact','environment',${projectId},${binding.recordId},${binding.generation},
+        ${binding.providerInstanceId},${binding.threadId},'compact-worker',0,'compact','hash',
+        ${binding.recordId},${binding.taskId},1,${snapshot.intent.limits.deadlineAtMs},'running','{}')`;
+      const events = yield* PubSub.unbounded<typeof OrchestrationEvent.Type>();
+      const waiting = yield* Deferred.make<void>();
+      let checks = 0;
+      let cleanupStarted = false;
+      const fiber = yield* waitForProjectTeamRetainedCompaction({
+        environmentId: "environment",
+        snapshot,
+        assertCurrent: Effect.gen(function* () {
+          if (++checks === 2) yield* Deferred.succeed(waiting, undefined);
+        }),
+      }).pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            cleanupStarted = true;
+          }),
+        ),
+        Effect.provide(
+          Layer.mock(OrchestrationEngineService)({
+            subscribeDomainEvents: PubSub.subscribe(events).pipe(
+              Effect.map(Stream.fromSubscription),
+            ),
+          }),
+        ),
+        Effect.provide(ProjectWorkEventBusLive),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(waiting);
+      expect(cleanupStarted).toBe(false);
+      expect(fiber.pollUnsafe()).toBeUndefined();
+      yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id='compact'`;
+      yield* PubSub.publish(
+        events,
+        yield* decodeOrchestrationEvent({
+          type: "thread.session-set",
+          sequence: 1,
+          eventId: "compact-terminal",
+          aggregateKind: "thread",
+          aggregateId: binding.threadId,
+          occurredAt: at,
+          commandId: null,
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          payload: {
+            threadId: binding.threadId,
+            session: {
+              threadId: binding.threadId,
+              status: "ready",
+              providerName: "piAgent",
+              providerInstanceId: binding.providerInstanceId,
+              runtimeMode: "approval-required",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: at,
+            },
+          },
+        }),
+      );
+      yield* Fiber.join(fiber);
+      expect(cleanupStarted).toBe(true);
+      expect(checks).toBe(3);
+    }),
+  ),
+);

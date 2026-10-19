@@ -108,6 +108,7 @@ export function makeProjectTeamRecovery<
 ) {
   const pageSize = options.pageSize ?? 128;
   const serial = Semaphore.makeUnsafe(1);
+  const admission = Semaphore.makeUnsafe(1);
   type Cursor = {
     readonly dispatchId: string | null;
     readonly position?: ProjectTeamDispatchRecoveryPosition;
@@ -147,9 +148,9 @@ export function makeProjectTeamRecovery<
     return yield* ports.withClaim(discovered, (claim) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          const assessed = yield* restore(Effect.suspend(() => ports.assess(claim))).pipe(
-            Effect.exit,
-          );
+          const assessed = yield* restore(
+            admission.withPermit(Effect.suspend(() => ports.assess(claim))),
+          ).pipe(Effect.exit);
           if (Exit.isFailure(assessed)) return yield* cleanup(claim, assessed.cause);
           if (assessed.value._tag === "Cleanup") return yield* cleanup(claim, assessed.value.cause);
           const continuation = assessed.value;
@@ -256,35 +257,39 @@ export function makeProjectTeamRecovery<
         validated.push(item);
       }
     }
-    const items: {
-      readonly dispatchId: string | null;
-      readonly result: Exit.Exit<Outcome, Error | ProjectTeamRecoveryError>;
-    }[] = [];
-    for (const item of validated) {
-      const result = yield* Effect.scoped(
-        Effect.suspend(() => {
-          if (Exit.isFailure(item.snapshot)) return discoveryFailure(item, item.snapshot.cause);
-          if (!isDispatchId(item.dispatchId))
-            return discoveryFailure(
-              item,
-              Cause.fail(reject("Root discovery dispatch identity is invalid")),
-            );
-          if (item.snapshot.value.fence.dispatchId !== item.dispatchId)
-            return discoveryFailure(
-              item,
-              Cause.fail(reject("Root discovery identity does not match its snapshot")),
-            );
-          return recover(item.snapshot.value);
+    const items = yield* Effect.forEach(
+      validated,
+      (item) =>
+        Effect.gen(function* () {
+          const result = yield* Effect.scoped(
+            Effect.suspend(() => {
+              if (Exit.isFailure(item.snapshot)) return discoveryFailure(item, item.snapshot.cause);
+              if (!isDispatchId(item.dispatchId))
+                return discoveryFailure(
+                  item,
+                  Cause.fail(reject("Root discovery dispatch identity is invalid")),
+                );
+              if (item.snapshot.value.fence.dispatchId !== item.dispatchId)
+                return discoveryFailure(
+                  item,
+                  Cause.fail(reject("Root discovery identity does not match its snapshot")),
+                );
+              return recover(item.snapshot.value);
+            }),
+          ).pipe(Effect.exit);
+          if (Exit.isFailure(result) && Cause.hasInterrupts(result.cause))
+            return yield* Effect.failCause(result.cause);
+          return { dispatchId: item.dispatchId, result };
         }),
-      ).pipe(Effect.exit);
-      if (Exit.isFailure(result) && Cause.hasInterrupts(result.cause))
-        return yield* Effect.failCause(result.cause);
-      items.push({ dispatchId: item.dispatchId, result });
+      { concurrency: pageSize },
+    );
+    // Advance only after every bounded owner has joined. Retrying earlier completed items is safe.
+    const last = validated.at(-1);
+    if (last !== undefined)
       cursor = {
-        dispatchId: item.dispatchId,
-        ...(item.position === undefined ? {} : { position: item.position }),
+        dispatchId: last.dispatchId,
+        ...(last.position === undefined ? {} : { position: last.position }),
       };
-    }
     const wrapped = page.length < pageSize;
     if (wrapped) cursor = undefined;
     return {

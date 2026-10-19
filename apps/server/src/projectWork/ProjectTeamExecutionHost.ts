@@ -4,6 +4,7 @@ import {
   CommandId,
   MessageId,
   ProjectTeamRecord,
+  type ProjectId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -59,6 +60,7 @@ import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository
 import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import { ProjectWorkEventBus } from "./ProjectWorkEventBus.ts";
 
 type Snapshot = ProjectTeamDispatchSnapshot;
 type ReviewCompletion = Effect.Success<ReturnType<typeof makeProjectTeamReviewCompletion>>;
@@ -127,12 +129,23 @@ export const readProjectTeamOwnedOperationHistory = Effect.fn(
   const rows = yield* sql<{
     operation_id: string;
     status: string;
-  }>`SELECT operation_id,status FROM project_team_pi_operation
+    operation_kind: string;
+  }>`SELECT operation_id,status,operation_kind FROM project_team_pi_operation
     WHERE environment_id=${environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation}
     ORDER BY operation_ordinal LIMIT 131`;
   // Initialization and assignment precede at most 128 later mailbox prompts.
   if (rows.length > 130) return yield* denied("Owned operation history exceeds its cleanup bound");
   return rows;
+});
+/** Cleanup uses only the instance and thread retained by this registered dispatch. */
+export const stopProjectTeamOwnedThread = Effect.fn("stopProjectTeamOwnedThread")(function* (
+  pi: ProjectTeamPiRuntime["Service"],
+  snapshot: Snapshot,
+) {
+  const binding = bindingFor(snapshot);
+  yield* pi.withInstance(binding.providerInstanceId, ({ runtime }) =>
+    runtime.requestStop(binding.threadId),
+  );
 });
 const setupInput = (snapshot: Snapshot) => {
   const binding = bindingFor(snapshot);
@@ -148,17 +161,82 @@ const setupInput = (snapshot: Snapshot) => {
 };
 
 export const waitForProjectTeamAssignmentChange = Effect.fn("waitForProjectTeamAssignmentChange")(
-  function* <A, E, R>(wait: Effect.Effect<A, E, R>, deadlineAtMs: number) {
+  function* <A, E, R>(
+    wait: Effect.Effect<A, E, R>,
+    deadlineAtMs: number,
+    controls?: {
+      readonly projectId: ProjectId;
+      readonly assertCurrent: Effect.Effect<void, ProjectTeamDispatchJournalError>;
+    },
+  ) {
+    let pending: Effect.Effect<A, E | ProjectTeamDispatchJournalError, R | Scope.Scope> = wait;
+    if (controls !== undefined) {
+      const bus = yield* Effect.serviceOption(ProjectWorkEventBus);
+      if (Option.isNone(bus))
+        return yield* denied("Committed task control subscription is unavailable");
+      const changes = yield* bus.value.subscribe;
+      // Subscribe before the current-authority check so a control cannot fall between them.
+      yield* controls.assertCurrent;
+      pending = Effect.raceFirst(
+        wait,
+        Stream.runForEach(
+          changes.pipe(Stream.filter((change) => change.event.projectId === controls.projectId)),
+          () => controls.assertCurrent,
+        ).pipe(Effect.andThen(Effect.never)),
+      );
+    }
     const remaining = deadlineAtMs - (yield* Clock.currentTimeMillis);
     if (remaining <= 0) return yield* denied("Original assignment deadline elapsed");
-    return yield* wait.pipe(
+    return yield* pending.pipe(
       Effect.timeoutOrElse({
         duration: remaining,
         orElse: () => Effect.fail(denied("Original assignment deadline elapsed")),
       }),
     );
   },
+  Effect.scoped,
 );
+
+/** A retained compact owns its remaining lifetime before normal dispatch cleanup can stop writers. */
+export const waitForProjectTeamRetainedCompaction = Effect.fn(
+  "waitForProjectTeamRetainedCompaction",
+)(function* (input: {
+  readonly environmentId: string;
+  readonly snapshot: Snapshot;
+  readonly assertCurrent: Effect.Effect<void, ProjectTeamDispatchJournalError>;
+}) {
+  const sql = yield* SqlClient.SqlClient;
+  const engine = yield* OrchestrationEngineService;
+  const binding = bindingFor(input.snapshot);
+  const changes = yield* engine.subscribeDomainEvents;
+  const pull = yield* Stream.toPull(
+    changes.pipe(
+      Stream.filter(
+        (event) => "threadId" in event.payload && event.payload.threadId === binding.threadId,
+      ),
+    ),
+  );
+  for (;;) {
+    yield* input.assertCurrent;
+    const rows = yield* readProjectTeamOwnedOperationHistory(
+      sql,
+      input.environmentId,
+      input.snapshot,
+    );
+    const compacts = rows.filter((row) => row.operation_kind === "compact");
+    if (compacts.some((row) => row.status === "quarantine"))
+      return yield* denied("Retained compact requires physical reconciliation");
+    if (compacts.every((row) => row.status === "settled")) return;
+    yield* waitForProjectTeamAssignmentChange(
+      pull,
+      Math.min(
+        input.snapshot.intent.limits.deadlineAtMs,
+        input.snapshot.intent.limits.rootDeadlineAtMs,
+      ),
+      { projectId: binding.projectId, assertCurrent: input.assertCurrent },
+    );
+  }
+}, Effect.scoped);
 
 /** Delivers a bounded chain of queued messages while the original executor owns each safe boundary. */
 export const continueProjectTeamMailboxTurn = Effect.fn("continueProjectTeamMailboxTurn")(
@@ -236,6 +314,7 @@ export const continueProjectTeamMailboxTurn = Effect.fn("continueProjectTeamMail
             input.original.intent.limits.deadlineAtMs,
             input.original.intent.limits.rootDeadlineAtMs,
           ),
+          { projectId: binding.projectId, assertCurrent: input.assertCurrent },
         );
         if (
           events.some(
@@ -623,15 +702,10 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       yield* owned(owner);
       const snapshot = yield* journal.readRetained(owner.snapshot.fence.dispatchId);
       owner.snapshot = snapshot;
-      const binding = bindingFor(snapshot);
       const operations = yield* operationRows(snapshot);
       // Stop only this exact registered thread; retained physical reconciliation still decides release.
       if (operations.some((row) => row.status !== "settled"))
-        yield* pi
-          .withInstance(binding.providerInstanceId, ({ runtime }) =>
-            runtime.requestStop(binding.threadId),
-          )
-          .pipe(Effect.result);
+        yield* stopProjectTeamOwnedThread(pi, snapshot).pipe(Effect.result);
       const evidence = yield* boundary(collectDrain(snapshot)).pipe(Effect.result);
       if (evidence._tag === "Failure")
         return { _tag: "Uncertain" as const, cause: Cause.fail(evidence.failure) };
@@ -794,6 +868,10 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
         const events = yield* waitForProjectTeamAssignmentChange(
           pull,
           snapshot.intent.limits.deadlineAtMs,
+          {
+            projectId: binding.projectId,
+            assertCurrent: assertCurrent(owner, snapshot.fence).pipe(Effect.asVoid),
+          },
         );
         if (
           events.some(
@@ -1000,6 +1078,13 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
                 Effect.asVoid,
               ),
             }).pipe(Effect.provideService(OrchestrationEngineService, engine));
+            yield* waitForProjectTeamRetainedCompaction({
+              environmentId: options.environmentId,
+              snapshot: owner.snapshot,
+              assertCurrent: boundary(assertCurrent(owner, owner.snapshot.fence)).pipe(
+                Effect.asVoid,
+              ),
+            });
             // A native terminal is observation, not release. Join every original writer before settlement.
             yield* stopAndJoin(owner);
             const retained = yield* journal.readRetained(owner.snapshot.fence.dispatchId);
