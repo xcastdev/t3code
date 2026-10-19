@@ -56,6 +56,122 @@ class Mem0BackendTest(unittest.TestCase):
         self.assertEqual([hit["observationId"] for hit in result["candidates"]], ["observation-a"])
         self.assertNotIn("Retained source observation", json.dumps(result))
 
+    def source_filter_fixture(self):
+        selected = self.index_input(sourceRevision=3, sourceGeneration=4,
+                                    observations=[self.entry("selected-first", vector=[0.999, 0.001] + [0.0] * 2046),
+                                                  self.entry("selected-second", vector=[0.998, 0.002] + [0.0] * 2046)])
+        other = self.index_input(sourceRecordId="memory-source-b", sourceRevision=7,
+                                 sourceGeneration=8, extractionId="extraction-b",
+                                 observations=[self.entry("other-first"), self.entry("other-second")])
+        neighbor = self.index_input(sourceRecordId="neighbor-source", extractionId="neighbor-extraction",
+                                    observations=[self.entry("selected-first"), self.entry("selected-second")])
+        for data in (selected, other):
+            self.call("index", **data)
+            self.assertTrue(self.call("reconcile", **data)["complete"])
+        for scope in ({"projectId": "project-b"}, {"environmentId": "environment-b"}):
+            self.call("index", **neighbor, **scope)
+        selector = {key: selected[key] for key in ("sourceRecordId", "sourceRevision", "sourceGeneration")}
+        return selected, other, neighbor, selector
+
+    def test_native_source_filter_precedes_ranking_and_preserves_local_queries(self):
+        selected, other, neighbor, selector = self.source_filter_fixture()
+        query = {"vector": self.entry()["vector"], "limit": 10}
+        candidates = self.call("search", source=selector, **query)["candidates"]
+        selected_ids = {entry["observationId"] for entry in selected["observations"]}
+        self.assertEqual({hit["observationId"] for hit in candidates}, selected_ids)
+        for hit in candidates:
+            self.assertEqual({key: hit[key] for key in selector}, selector)
+            self.assertEqual(hit["environmentId"], "environment-a")
+            self.assertEqual(hit["projectId"], "project-a")
+            self.assertEqual(hit["extractionId"], selected["extractionId"])
+            self.assertNotIn("data", hit)
+            self.assertNotIn("body", hit)
+        # The other source has closer vectors. Filtering after top-k would lose
+        # every selected hit when the limit is one.
+        nearest = self.call("search", source=selector, **{**query, "limit": 1})["candidates"]
+        self.assertEqual(len(nearest), 1)
+        self.assertIn(nearest[0]["observationId"], selected_ids)
+        local = self.call("search", **query)["candidates"]
+        self.assertEqual({hit["observationId"] for hit in local},
+                         selected_ids | {entry["observationId"] for entry in other["observations"]})
+        self.assertEqual(len(local), 4)
+        for change in ({"sourceRevision": 2}, {"sourceRevision": 5},
+                       {"sourceGeneration": 3}, {"sourceGeneration": 5},
+                       {"sourceRecordId": "missing-source"}):
+            with self.subTest(selector=change):
+                self.assertEqual(self.call("search", source={**selector, **change}, **query)["candidates"], [])
+        for scope in ({"projectId": "project-b"}, {"environmentId": "environment-b"},
+                      {"projectId": "no-matching-owner"}):
+            with self.subTest(scope=scope):
+                self.assertEqual(self.call("search", source=selector, **query, **scope)["candidates"], [])
+        for scope in ({"projectId": "project-b"}, {"environmentId": "environment-b"}):
+            self.assertEqual({hit["observationId"] for hit in self.call("search", **query, **scope)["candidates"]},
+                             selected_ids)
+            self.assertTrue(self.call("reconcile", **neighbor, **scope)["complete"])
+
+    def test_native_source_filter_cannot_launder_existing_observation_identity(self):
+        from mem0_backend import native_store, point_id, scan
+        selected, other, _, selector = self.source_filter_fixture()
+        # Even a new caller hash cannot move a retained observation handle into
+        # another source or extraction. Reject the whole manifest before writes.
+        forged = {**other, "extractionId": "forged-extraction", "observations": [
+            self.entry("must-not-be-written"),
+            self.entry("selected-first", body="Forged source provenance", payloadHash="b" * 64),
+        ]}
+        self.assertEqual(dispatch(self.root, self.request("index", **forged))["error"]["code"], "conflict")
+        query = {"vector": self.entry()["vector"], "limit": 10}
+        self.assertEqual({hit["observationId"] for hit in self.call("search", source=selector, **query)["candidates"]},
+                         {entry["observationId"] for entry in selected["observations"]})
+        for data in (selected, other):
+            self.assertTrue(self.call("reconcile", **data)["complete"])
+        scope = Scope(environmentId="environment-a", projectId="project-a")
+        native = native_store(namespace_path(self.root, scope))
+        try:
+            points = list(scan(native, {}))
+            self.assertEqual(len(points), 4)
+            expected = {entry["observationId"]: data for data in (selected, other) for entry in data["observations"]}
+            for point in points:
+                payload = point.payload
+                self.assertEqual(str(point.id), point_id(scope, payload["observationId"]))
+                source = expected[payload["observationId"]]
+                for key in ("sourceRecordId", "sourceRevision", "sourceGeneration", "extractionId"):
+                    self.assertEqual(payload[key], source[key])
+        finally:
+            native.client.close()
+
+    def test_native_source_tombstone_blocks_stale_filtered_hits_before_and_after_cleanup(self):
+        from mem0_backend import native_store, scan
+        selected, other, neighbor, selector = self.source_filter_fixture()
+        query = {"source": selector, "vector": self.entry()["vector"], "limit": 10}
+        self.assertEqual(len(self.call("search", **query)["candidates"]), 2)
+        self.crash("delete-source", "after-delete-fence", **selector)
+        # The durable tombstone suppresses delayed reads even while the actual
+        # selected vectors still exist after the interrupted physical cleanup.
+        self.assertEqual(self.call("search", **query)["candidates"], [])
+        directory = namespace_path(self.root, Scope(environmentId="environment-a", projectId="project-a"))
+        native = native_store(directory)
+        try:
+            self.assertEqual(len([point for point in scan(native, {})
+                                  if point.payload["sourceRecordId"] == selector["sourceRecordId"]]), 2)
+        finally:
+            native.client.close()
+        for _ in range(2):
+            self.assertTrue(self.call("delete-source", **selector)["cleanupComplete"])
+            self.assertEqual(self.call("search", **query)["candidates"], [])
+        for change in ({}, {"sourceRevision": 5, "sourceGeneration": 6}):
+            self.assertEqual(dispatch(self.root, self.request("index", **{**selected, **change}))["error"]["code"], "fenced")
+            self.assertEqual(self.call("search", **{**query, "source": {**selector, **change}})["candidates"], [])
+        native = native_store(directory)
+        try:
+            self.assertEqual({point.payload["observationId"] for point in scan(native, {})},
+                             {entry["observationId"] for entry in other["observations"]})
+        finally:
+            native.client.close()
+        self.assertTrue(self.call("reconcile", **other)["complete"])
+        self.assertEqual(len(self.call("search", vector=self.entry()["vector"], limit=10)["candidates"]), 2)
+        for scope in ({"projectId": "project-b"}, {"environmentId": "environment-b"}):
+            self.assertTrue(self.call("reconcile", **neighbor, **scope)["complete"])
+
     def test_same_id_rejects_changed_body_vector_tuple_even_with_same_caller_hash(self):
         data = self.index_input()
         self.call("index", **data)
