@@ -921,3 +921,96 @@ it("accepts bounded source references while rejecting caller-frozen plan facts",
     }),
   ).toThrow();
 });
+
+describe("approved implementation child contracts", () => {
+  const parentPlan = {
+    recordId: "plan",
+    expectedRecordRevision: 2,
+    planRevision: 1,
+    gateId: "approved-plan",
+    expectedGateRevision: 1,
+  };
+  const request = {
+    type: "project-team.assignment.start",
+    assignmentKind: "implementation",
+    commandId: "start-child",
+    projectId: "project",
+    taskId: "parent",
+    expectedRevision: 4,
+    expectedTaskRevision: 2,
+    objective: "Implement the approved greeting behavior",
+    outputDescriptions: ["Greeting module", "Focused tests"],
+    specRevision: 1,
+    specificationGateId: "approved-spec",
+    expectedSpecificationGateRevision: 1,
+    parentPlan,
+    parentCriterionIds: ["criterion-a", "criterion-b"],
+  };
+
+  it("requires an exact parent plan and bounded selected criteria for writable children", () => {
+    expect(decodePublicWrite(request)).toEqual(request);
+    for (const change of [
+      { parentPlan: undefined },
+      { parentCriterionIds: undefined },
+      { parentCriterionIds: [] },
+      { parentCriterionIds: ["criterion-a", "criterion-a"] },
+      { parentCriterionIds: [""] },
+      { parentCriterionIds: Array.from({ length: 65 }, (_, i) => `criterion-${i}`) },
+      { parentPlan: { ...parentPlan, expectedRecordRevision: -1 } },
+      { parentPlan: { ...parentPlan, expectedGateRevision: -1 } },
+      { assignmentAuthorization: { assignmentKind: "implementation" } },
+      { maximumTokens: 128000 },
+    ])
+      expect(() => decodePublicWrite({ ...request, ...change })).toThrow();
+    expect(
+      decodePublicWrite({
+        ...request,
+        parentCriterionIds: Array.from({ length: 64 }, (_, i) => `criterion-${i}`),
+      }),
+    ).toBeDefined();
+    for (const assignmentKind of ["planning", "review"]) {
+      expect(() =>
+        decodeGuided({ ...request, assignmentKind, outputDescriptions: ["Output"] }),
+      ).toThrow();
+    }
+  });
+
+  it("retains selected criteria and the parent plan in implementation authorization", () => {
+    const { verificationJobId: _job, ...base } = verificationGate;
+    const authorization = {
+      assignmentKind: "implementation",
+      parentTaskId: "parent",
+      parentSpecRevision: 1,
+      parentSpecificationGateId: "approved-spec",
+      parentSpecificationHash: "spec-hash",
+      parentScopeHash: "scope-hash",
+      parentCriterionIds: ["criterion-a", "criterion-b"],
+      parentPlan: {
+        recordId: "plan",
+        planRevision: 1,
+        contentHash: "plan-hash",
+        gateId: "approved-plan",
+      },
+    };
+    const gate = { ...base, gate: "assignment", assignmentAuthorization: authorization };
+    expect(decodeTeamRecord(gate)).toEqual(gate);
+    for (const change of [
+      { parentPlan: undefined },
+      { parentCriterionIds: undefined },
+      { parentCriterionIds: [] },
+      { parentCriterionIds: ["criterion-a", "criterion-a"] },
+      { parentCriterionIds: Array.from({ length: 65 }, (_, i) => `criterion-${i}`) },
+    ])
+      expect(() =>
+        decodeTeamRecord({ ...gate, assignmentAuthorization: { ...authorization, ...change } }),
+      ).toThrow();
+    for (const assignmentKind of ["planning", "review"]) {
+      expect(() =>
+        decodeTeamRecord({
+          ...gate,
+          assignmentAuthorization: { ...authorization, assignmentKind },
+        }),
+      ).toThrow();
+    }
+  });
+});

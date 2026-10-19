@@ -1189,7 +1189,7 @@ export const ProjectTeamGuidedIntent = Schema.Union([
   Schema.Struct({
     ...GuidedFields,
     type: Schema.Literal("project-team.assignment.start"),
-    assignmentKind: Schema.Literals(["planning", "review"]),
+    assignmentKind: Schema.Literals(["planning", "review", "implementation"]),
     objective: GuidedBody,
     outputDescriptions: Schema.Array(GuidedText).check(
       Schema.isMinLength(1),
@@ -1198,6 +1198,13 @@ export const ProjectTeamGuidedIntent = Schema.Union([
     specRevision: NonNegativeInt,
     specificationGateId: GuidedId,
     expectedSpecificationGateRevision: NonNegativeInt,
+    parentCriterionIds: Schema.optionalKey(
+      Schema.Array(ProjectWorkCriterionId).check(
+        Schema.isMinLength(1),
+        Schema.isMaxLength(64),
+        Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+      ),
+    ),
     parentPlan: Schema.optionalKey(
       Schema.Struct({
         recordId: GuidedId,
@@ -1209,8 +1216,13 @@ export const ProjectTeamGuidedIntent = Schema.Union([
     ),
   }).check(
     Schema.makeFilter(
-      (input) => input.assignmentKind !== "review" || input.parentPlan !== undefined,
-      { message: "A review assignment requires its exact approved parent plan" },
+      (input) => input.assignmentKind === "planning" || input.parentPlan !== undefined,
+      { message: "Review and implementation assignments require their exact approved parent plan" },
+    ),
+    Schema.makeFilter(
+      (input) =>
+        (input.assignmentKind === "implementation") === (input.parentCriterionIds !== undefined),
+      { message: "Only implementation assignments require selected parent criteria" },
     ),
     Schema.makeFilter(
       (input) => input.assignmentKind !== "planning" || input.outputDescriptions.length === 1,

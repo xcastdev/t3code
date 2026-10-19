@@ -263,12 +263,19 @@ export const ProjectTeamGate = Schema.Struct({
   consumedByCommandId: Schema.optionalKey(CommandId),
   assignmentAuthorization: Schema.optionalKey(
     Schema.Struct({
-      assignmentKind: Schema.Literals(["planning", "review"]),
+      assignmentKind: Schema.Literals(["planning", "review", "implementation"]),
       parentTaskId: ProjectWorkTaskId,
       parentSpecRevision: NonNegativeInt,
       parentSpecificationGateId: Text.check(Schema.isMaxLength(256)),
       parentSpecificationHash: Text,
       parentScopeHash: Text,
+      parentCriterionIds: Schema.optionalKey(
+        Schema.Array(ProjectWorkCriterionId).check(
+          Schema.isMinLength(1),
+          Schema.isMaxLength(64),
+          Schema.makeFilter((ids) => new Set(ids).size === ids.length),
+        ),
+      ),
       parentPlan: Schema.optionalKey(
         Schema.Struct({
           recordId: Text.check(Schema.isMaxLength(256)),
@@ -277,7 +284,16 @@ export const ProjectTeamGate = Schema.Struct({
           gateId: Text.check(Schema.isMaxLength(256)),
         }),
       ),
-    }),
+    }).check(
+      Schema.makeFilter(
+        (authorization) =>
+          authorization.assignmentKind === "implementation"
+            ? authorization.parentPlan !== undefined &&
+              authorization.parentCriterionIds !== undefined
+            : authorization.parentCriterionIds === undefined,
+        { message: "Implementation authorization requires its parent plan and selected criteria" },
+      ),
+    ),
   ),
   repairAuthorization: Schema.optionalKey(
     Schema.Struct({
