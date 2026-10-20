@@ -1,3 +1,4 @@
+import * as Authorization from "./ProjectTeamAuthorization.ts";
 import * as Option from "effect/Option";
 import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
@@ -1056,3 +1057,123 @@ for (const timing of ["after-idle-before-wait", "after-backend-wait"] as const)
         ),
       ),
     );
+
+it.effect(
+  "two unavailable discovery reads cannot release a duplicate's original creator admission",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment();
+        const request = compactRequest();
+        const creator = yield* f.operations.reserveCompaction(identity, request);
+        expect(creator.created).toBe(true);
+        let remainingFailures = 0;
+        let injected = 0;
+        const observingSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (
+              remainingFailures > 0 &&
+              statement
+                .compile()[0]
+                .includes("SELECT DISTINCT project_id AS projectId FROM project_team_run_binding")
+            ) {
+              remainingFailures--;
+              injected++;
+              // Exercise the real driver failure and Authorization discovery error mapping.
+              return target`SELECT project_id FROM injected_compact_discovery_unavailable`;
+            }
+            return statement;
+          },
+        });
+        const pi = yield* makeProjectTeamPiRuntime();
+        yield* makeProjectTeamRuntime({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+        }).pipe(
+          Effect.provide(Authorization.layer),
+          Effect.provideService(ProjectTeamPiRuntime, pi),
+          Effect.provideService(SqlClient.SqlClient, observingSql),
+        );
+        expect(
+          yield* pi
+            .reserveCompaction(providerInstanceId, request)
+            .pipe(Effect.provideService(SqlClient.SqlClient, observingSql)),
+        ).toEqual({ ...creator, created: false });
+        const input = yield* f.reserveInput();
+        yield* f.complete(
+          f.prompt,
+          { ...native, leafId: "discovery-recovered-predecessor" },
+          "success",
+          [yield* input.settle],
+        );
+        const before = {
+          callers: yield* f.sql`SELECT * FROM project_team_compact_caller`,
+          operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+          processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+          charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+          budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+        };
+        remainingFailures = 2;
+        expect(
+          (yield* pi
+            .assertCompactionReady(providerInstanceId, request)
+            .pipe(Effect.provideService(SqlClient.SqlClient, observingSql), Effect.result))._tag,
+        ).toBe("Failure");
+        expect(injected).toBe(2);
+        expect(remainingFailures).toBe(0);
+        expect({
+          callers: yield* f.sql`SELECT * FROM project_team_compact_caller`,
+          operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+          processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+          charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+          budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+        }).toEqual(before);
+        const ready = yield* pi
+          .assertCompactionReady(providerInstanceId, request)
+          .pipe(Effect.provideService(SqlClient.SqlClient, observingSql), Effect.forkChild);
+        const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+          receiptId: "recovered-discovery-observed",
+          stage: "assignment-observed",
+          evidence: { bindingId: f.binding.recordId },
+        });
+        expect(yield* Fiber.join(ready)).toEqual({ ...creator, created: false });
+        expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("WaitingForCompact");
+        const boundary = yield* f.operations.readCompaction(identity, {
+          ...request,
+          kind: "compact",
+        });
+        const preparedRequest = {
+          ...request,
+          kind: "compact" as const,
+          operationId: boundary.operationId,
+        };
+        const compact = yield* f.operations.prepare(
+          identity,
+          preparedRequest,
+          hash(preparedRequest),
+          {
+            allocation: yield* f.allocation,
+            workerId: "discovery-recovered-compact",
+            operationId: boundary.operationId,
+            resourceHash: "a".repeat(64),
+            compactContext: { provenanceSha256: "b".repeat(64), textSha256: "c".repeat(64) },
+          },
+        );
+        expect(compact.deadlineAtMs).toBe(f.prompt.deadlineAtMs);
+        expect(compact.maximumTokens).toBe(f.prompt.maximumTokens);
+        expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("WaitingForCompact");
+        const compactInput = yield* f.reserveInput(compact);
+        yield* f.complete(
+          compact,
+          { ...native, leafId: "discovery-recovered-compact-terminal" },
+          "success",
+          [yield* compactInput.settle],
+        );
+        expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("Claimed");
+      }).pipe(
+        Effect.provide(layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true })),
+        Effect.scoped,
+      ),
+    ),
+);

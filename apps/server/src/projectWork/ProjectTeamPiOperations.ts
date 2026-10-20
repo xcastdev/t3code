@@ -69,7 +69,6 @@ import {
 } from "./memory/ProjectMemoryModelAccounting.ts";
 import {
   ProjectTeamAuthorization,
-  ProjectTeamAuthorizationError,
   inspectProjectTeamSessionAuthority,
   managedActorId,
   type ProjectTeamAuthority,
@@ -96,7 +95,6 @@ const decodeReviewWorkspace = Schema.decodeUnknownEffect(
   { onExcessProperty: "error" },
 );
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
-const isAuthorizationError = Schema.is(ProjectTeamAuthorizationError);
 const isWorkerIdentity = Schema.is(PiWorkerIdentity);
 const isWorkerOperation = Schema.is(PiWorkerOperation);
 const decodeNativeInput = Schema.decodeUnknownEffect(PiNativeReference, {
@@ -2660,9 +2658,44 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             if (!invalid) {
               const authority = yield* current(identity).pipe(Effect.result);
               if (authority._tag === "Failure") {
+                // Discovery also maps unavailable storage to authorization errors.
+                // Only successfully read exact durable records can prove revocation;
+                // these reads never grant forward authority after current() failed.
+                const original = yield* readRetained(caller.dispatch_id);
+                const claim = original.intent.compiledClaim.transition;
+                if (
+                  claim?.kind !== "claim" ||
+                  claim.binding.recordId !== caller.binding_id ||
+                  claim.binding.generation !== caller.generation ||
+                  claim.binding.providerInstanceId !== identity.providerInstanceId ||
+                  claim.binding.threadId !== identity.threadId
+                )
+                  return false;
+                const state = yield* readCurrentState(sql, claim.binding.projectId);
+                const bindings = (state.foundationRecords ?? []).filter(
+                  (record) =>
+                    record.kind === "run-binding" && record.recordId === caller.binding_id,
+                );
+                const binding = bindings[0];
+                if (bindings.length !== 1 || binding?.kind !== "run-binding") return false;
                 invalid =
-                  isAuthorizationError(authority.failure) ||
-                  (isRuntimeError(authority.failure) && authority.failure.code === "denied");
+                  binding.status !== "running" ||
+                  immutableBinding(binding) !== immutableBinding(claim.binding);
+                const role = (state.foundationRecords ?? []).find(
+                  (record) => record.recordId === binding.roleRevisionId,
+                );
+                if (role?.kind === "role-revision")
+                  invalid ||=
+                    caller.authority_json !==
+                    encode({
+                      intentSha256: digest(original.intent),
+                      binding: immutableBinding(binding),
+                      role,
+                    });
+                const member = (state.foundationRecords ?? []).find(
+                  (record) => record.recordId === binding.memberId,
+                );
+                if (member?.kind === "member" && member.status !== "active") invalid = true;
               } else {
                 const original = yield* readRetained(caller.dispatch_id);
                 const latest = yield* sql<{
