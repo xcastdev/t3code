@@ -4126,6 +4126,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         !/^[a-f0-9]{32}$/u.test(capturedOwner.invocation)
       )
         return yield* deny("Memory original process ownership is inconsistent");
+      yield* taskResources.pi(identity.operationId, allocation).assertOwned(capturedOwner);
       const attempt = authority.state.attempts.find(
         (entry) => entry.attemptId === authority.binding.attemptId,
       );

@@ -2994,6 +2994,130 @@ const activateStandalone = (
     yield* f.operations.persistNative(op, nativeReference);
     return owner;
   });
+const memoryOwnerFixture = Effect.gen(function* () {
+  const f = yield* fixture;
+  yield* restoreHistoricalBinding({
+    ...f.role,
+    revision: f.role.revision + 1,
+    tools: ["project-work.write"],
+    memoryAccess: "project",
+  });
+  yield* restoreHistoricalBinding({
+    ...f.binding,
+    revision: f.binding.revision + 1,
+    configuration: { ...f.binding.configuration, toolIds: ["project-work.write"] },
+  });
+  const initializeRequest = { threadId, kind: "initialize" as const };
+  const initialize = yield* f.operations.prepare(
+    f.identity,
+    initializeRequest,
+    NodeCrypto.createHash("sha256")
+      .update(canonicalProjectWorkPayload(initializeRequest))
+      .digest("hex"),
+    { allocation: f.allocation, workerId: "worker", operationId: "initialize" },
+  );
+  const initializeOwner = yield* activateStandalone(f, initialize);
+  const drainFor = (owner: typeof initializeOwner) => ({
+    unit: owner.unit,
+    invocation: owner.invocation,
+    cgroup: owner.cgroup,
+    ownerPid: owner.pid,
+    memoryBytes: owner.memoryBytes,
+    swapBytes: 0,
+    oomGroup: 1,
+    launcherPid: 124,
+    childPid: 125,
+    childExitCode: 0,
+    kernel: "removed",
+  });
+  yield* f.operations.persistTerminal(initialize, {
+    identity: { workerId: initialize.workerId, generation: 0 },
+    operation: initialize.operation,
+    outcome: "success",
+    ownerCaptured: true,
+    native: nativeReference,
+    drain: drainFor(initializeOwner),
+    accountingReceipts: [],
+  });
+  const nonce = yield* Effect.sync(() => NodeCrypto.randomUUID());
+  const allocation = {
+    ...f.allocation,
+    nonce,
+    unit: `t3-pi-managed-${nonce}.service`,
+  };
+  const request = { threadId, kind: "prompt" as const, prompt: "Read retained project memory" };
+  const op = yield* f.operations.prepare(
+    f.identity,
+    request,
+    NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(request)).digest("hex"),
+    { allocation, workerId: "memory-worker", operationId: "memory-owner" },
+  );
+  const owner = yield* activateStandalone(f, op);
+  const identity = {
+    environmentId: "environment",
+    projectId: op.authority.binding.projectId,
+    taskId: op.authority.binding.taskId,
+    bindingId: op.authority.binding.recordId,
+    generation: op.authority.binding.generation,
+    providerInstanceId,
+    threadId,
+    operationId: op.operation.operationId,
+    workerId: op.workerId,
+    ordinal: op.ordinal,
+  };
+  const read = f.operations.readMemoryOperationOwnerInTransaction(identity, op.principal);
+  return { ...f, op, owner, read, drain: drainFor(owner) };
+});
+
+for (const resource of ["current", "missing", "drained", "stale", "changed budget"] as const)
+  it.effect(`memory owner reader requires current task resource ownership: ${resource}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* memoryOwnerFixture;
+        const sql = yield* SqlClient.SqlClient;
+        const current = yield* sql.withTransaction(f.read);
+        expect(current.operationId).toBe(f.op.operation.operationId);
+        expect(current.allocation).toEqual(f.op.allocation);
+        switch (resource) {
+          case "current":
+            break;
+          case "missing":
+            // Corrupt only the resource journal; native process and operation stay captured/running.
+            yield* sql`DROP TRIGGER project_task_resource_child_no_delete`;
+            yield* sql`DELETE FROM project_task_resource_child WHERE unit=${f.owner.unit}`;
+            break;
+          case "drained": {
+            const resources = yield* makeProjectTaskResources("environment");
+            yield* sql.withTransaction(
+              resources.pi(f.op.operation.operationId, f.op.allocation).drain(f.drain),
+            );
+            break;
+          }
+          case "stale":
+            yield* sql`DROP TRIGGER project_task_resource_child_immutable`;
+            yield* sql`UPDATE project_task_resource_child SET owner_json=${encodeJson({ ...f.owner, invocation: "b".repeat(32) })} WHERE unit=${f.owner.unit}`;
+            break;
+          case "changed budget":
+            yield* sql`DROP TRIGGER project_task_resource_budget_immutable`;
+            yield* sql`PRAGMA ignore_check_constraints=ON`;
+            yield* sql`UPDATE project_task_resource_budget SET memory_bytes=4294967296`;
+            yield* sql`PRAGMA ignore_check_constraints=OFF`;
+            break;
+        }
+        const children = yield* sql`SELECT * FROM project_task_resource_child ORDER BY unit`;
+        const budgets = yield* sql`SELECT * FROM project_task_resource_budget`;
+        const writes = yield* sql`SELECT total_changes() AS writes`;
+        if (resource === "current") expect(yield* sql.withTransaction(f.read)).toEqual(current);
+        else yield* rejected(sql.withTransaction(f.read));
+        expect(yield* sql`SELECT total_changes() AS writes`).toEqual(writes);
+        expect(yield* sql`SELECT * FROM project_task_resource_child ORDER BY unit`).toEqual(
+          children,
+        );
+        expect(yield* sql`SELECT * FROM project_task_resource_budget`).toEqual(budgets);
+      }),
+    ),
+  );
+
 for (const tampered of [false, true]) {
   it.effect(`standalone root anchor keeps exhausted cumulative charges: ${tampered}`, () =>
     fileTest(
