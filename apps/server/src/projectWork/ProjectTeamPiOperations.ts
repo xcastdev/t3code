@@ -3464,6 +3464,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       if (terminal.outcome !== "success" || !terminal.native)
         return yield* deny("Successful native Pi terminal required");
       const native = terminal.native;
+      let publicationDeadlineAtMs = captured.deadlineAtMs;
       const validate = Effect.fn("ProjectTeamPiOperations.validatePublication")(function* (
         settled: boolean,
       ) {
@@ -3542,6 +3543,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             process[0]?.drain_json !== encode(terminal.drain)
           )
             return yield* deny("Compact publication owner or drain changed");
+          publicationDeadlineAtMs = Math.min(publicationDeadlineAtMs, caller.deadline_at_ms);
           yield* clockCheck(caller.deadline_at_ms);
         }
         const latest = yield* sql<{
@@ -3574,7 +3576,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
                   return yield* deny("Compact publication already released", "conflict");
                 const current = yield* validate(true);
                 yield* Effect.try({
-                  try: () => compactPublication!.check(current),
+                  try: () => {
+                    compactPublication!.check(current);
+                    if (clock.currentTimeMillisUnsafe() >= publicationDeadlineAtMs)
+                      throw deny("Pi operation deadline expired");
+                  },
                   catch: (error) =>
                     isRuntimeError(error)
                       ? error

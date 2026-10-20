@@ -1,3 +1,6 @@
+import * as CompactCaller from "./ProjectTeamCompactCaller.ts";
+import * as Clock from "effect/Clock";
+import { vi } from "vite-plus/test";
 import { makeProjectTeamContext } from "./ProjectTeamContext.ts";
 import * as Authorization from "./ProjectTeamAuthorization.ts";
 import * as Option from "effect/Option";
@@ -1496,10 +1499,34 @@ for (const change of [
       ),
   );
 
-const pendingPublicationFixture = Effect.fn("compactTest.pendingPublication")(function* () {
+const pendingPublicationFixture = Effect.fn("compactTest.pendingPublication")(function* (
+  callerDeadlineOffsetMs = 0,
+) {
   const f = yield* fixtureWithAssignment();
   const request = compactRequest();
-  yield* f.operations.reserveCompaction(identity, request);
+  // Narrow the deadline at admission, before its immutable pending row exists.
+  // The real reservation/consume/publication path still validates every receipt.
+  const reservationSql = new Proxy(f.sql, {
+    apply(target, _receiver, args) {
+      const statement = target(args[0], ...args.slice(1));
+      if (
+        callerDeadlineOffsetMs !== 0 &&
+        statement.compile()[0].includes("INSERT INTO project_team_compact_caller")
+      )
+        return target(
+          args[0],
+          ...args.slice(1, -1),
+          f.prompt.deadlineAtMs - callerDeadlineOffsetMs,
+        );
+      return statement;
+    },
+  });
+  const admission = yield* makeProjectTeamPiOperations({ environmentId: "environment" }).pipe(
+    Effect.provideService(SqlClient.SqlClient, reservationSql),
+  );
+  yield* admission
+    .reserveCompaction(identity, request)
+    .pipe(Effect.provideService(SqlClient.SqlClient, reservationSql));
   const snapshot = yield* observe(f);
   const boundary = yield* f.operations.readCompaction(identity, { ...request, kind: "compact" });
   const input = { ...request, kind: "compact" as const, operationId: boundary.operationId };
@@ -1737,3 +1764,100 @@ for (const mode of [
         }),
       ),
   );
+
+for (const deadlineOwner of ["operation", "earlier-caller"] as const)
+  for (const boundary of ["already-expired", "equal", "crossed", "before", "throw"] as const)
+    it.effect(
+      `compact final callback deadline ${deadlineOwner} ${boundary} preserves exact receipts and hint ownership`,
+      () =>
+        scoped(
+          Effect.gen(function* () {
+            const f = yield* pendingPublicationFixture(
+              deadlineOwner === "earlier-caller" ? 1000 : 0,
+            );
+            const readReceipts = Effect.gen(function* () {
+              return {
+                operation:
+                  yield* f.sql`SELECT * FROM project_team_pi_operation WHERE operation_id=${f.compact.operation.operationId}`,
+                processes:
+                  yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+                charges:
+                  yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+                caller: yield* f.sql`SELECT * FROM project_team_compact_caller`,
+                budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+                dispatch: yield* f.sql`SELECT * FROM project_team_dispatch`,
+              };
+            });
+            const before = yield* readReceipts;
+            const callerDeadline = before.caller[0]?.deadline_at_ms;
+            if (typeof callerDeadline !== "number")
+              return yield* Effect.die("Missing admitted caller deadline");
+            expect(callerDeadline).toBe(
+              f.compact.deadlineAtMs - (deadlineOwner === "earlier-caller" ? 1000 : 0),
+            );
+            const deadline = Math.min(f.compact.deadlineAtMs, callerDeadline);
+            let currentTime = boundary === "already-expired" ? deadline : now;
+            const baseClock = yield* Clock.Clock;
+            const capturedClock: Clock.Clock = {
+              ...baseClock,
+              currentTimeMillisUnsafe: () => currentTime,
+              currentTimeMillis: Effect.sync(() => currentTime),
+              currentTimeNanosUnsafe: () => BigInt(currentTime) * 1000000n,
+              currentTimeNanos: Effect.sync(() => BigInt(currentTime) * 1000000n),
+            };
+            const operations = yield* makeProjectTeamPiOperations({
+              environmentId: "environment",
+            }).pipe(Effect.provideService(Clock.Clock, capturedClock));
+            let hints = 0;
+            const realNotify = CompactCaller.notifyCompactCallerChange;
+            const hintSpy = vi
+              .spyOn(CompactCaller, "notifyCompactCallerChange", "get")
+              .mockReturnValue(
+                realNotify.pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      hints++;
+                    }),
+                  ),
+                ),
+              );
+            yield* Effect.addFinalizer(() => Effect.sync(() => hintSpy.mockRestore()));
+            let called = false;
+            const result = yield* operations
+              .publication(f.compact, f.terminal, {
+                resourceHash: "a".repeat(64),
+                check: () => {
+                  called = true;
+                  currentTime =
+                    boundary === "before"
+                      ? deadline - 1
+                      : boundary === "equal"
+                        ? deadline
+                        : deadline + 1;
+                  if (boundary === "throw") throw Error("Original final caller fence rejected");
+                },
+              })
+              .pipe(Effect.provideService(Clock.Clock, capturedClock), Effect.result);
+            expect(called).toBe(boundary !== "already-expired");
+            const after = yield* readReceipts;
+            expect({ result: result._tag, hints, status: after.operation[0]?.status }).toEqual({
+              result: boundary === "before" ? "Success" : "Failure",
+              hints: boundary === "before" ? 1 : 0,
+              status: boundary === "before" ? "settled" : "running",
+            });
+            if (result._tag === "Failure" && (boundary === "equal" || boundary === "crossed"))
+              expect(result.failure).toMatchObject({
+                code: "denied",
+                detail: "Pi operation deadline expired",
+              });
+            expect(after).toEqual(
+              boundary === "before"
+                ? {
+                    ...before,
+                    operation: before.operation.map((row) => ({ ...row, status: "settled" })),
+                  }
+                : before,
+            );
+          }),
+        ),
+    );
