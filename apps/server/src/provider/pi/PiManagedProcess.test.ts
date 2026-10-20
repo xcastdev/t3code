@@ -11,6 +11,7 @@ import * as Sink from "effect/Sink";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
+import * as PlatformError from "effect/PlatformError";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -21,6 +22,7 @@ import {
   preallocatePiManagedProcess,
   reconcilePiManagedProcess,
   PiManagedProcessError,
+  PiManagedProcessAllocationSchema,
   type PiManagedProcessPersistence,
   validatePiManagedLaunch,
   type PiManagedLaunch,
@@ -361,6 +363,129 @@ describe("managed bubblewrap compatibility", () => {
           expect(probeClosed).toBe(true);
           expect(probeScratch).toBeDefined();
           if (probeScratch) yield* absent(probeScratch);
+        }),
+      ),
+    );
+});
+
+describe("managed bootstrap size", () => {
+  const encodeSpec = Schema.encodeSync(
+    Schema.fromJsonString(
+      Schema.Struct({
+        ...PiManagedProcessAllocationSchema.fields.launch.fields,
+        unit: Schema.String,
+        nonce: Schema.String,
+      }),
+    ),
+  );
+  for (const encodedBytes of [75020, 131068, 131072])
+    check(`preserves a 245-file bootstrap at ${encodedBytes} encoded bytes`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let launch = {
+            ...input,
+            memoryBytes: 2147483648,
+            runtimeSeconds: 300,
+            runtimeFiles: Array.from({ length: 245 }, (_, index) => ({
+              source: input.runtimeFiles[0]!.source,
+              target: index === 0 ? "/runtime/program" : `/runtime/library-${index}`,
+            })),
+          };
+          const initial = yield* preallocatePiManagedProcess(launch);
+          const serialize = (allocation: typeof initial) =>
+            encodeSpec({ ...allocation.launch, unit: allocation.unit, nonce: allocation.nonce });
+          const padding = (encodedBytes / 4) * 3 - Buffer.byteLength(serialize(initial));
+          expect(padding).toBeGreaterThan(0);
+          // Spread realistic path growth across the closure without long path components.
+          launch = {
+            ...launch,
+            runtimeFiles: launch.runtimeFiles.map((file, index) => ({
+              ...file,
+              target:
+                file.target +
+                (index === 0
+                  ? ""
+                  : "x".repeat(Math.floor(padding / 244) + (index <= padding % 244 ? 1 : 0))),
+            })),
+          };
+          const allocation = yield* preallocatePiManagedProcess(launch);
+          const expectedText = serialize(allocation);
+          const expected = Buffer.from(expectedText).toString("base64");
+          expect(expected.length).toBe(encodedBytes);
+          let claims = 0;
+          let launches = 0;
+          const spawner = ChildProcessSpawner.make((command) => {
+            if (command._tag !== "StandardCommand") return Effect.die("Unexpected pipeline");
+            if (command.command === "/usr/bin/python3")
+              return Effect.succeed(
+                ChildProcessSpawner.makeHandle({
+                  pid: ChildProcessSpawner.ProcessId(100),
+                  exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                  isRunning: Effect.succeed(false),
+                  kill: () => Effect.void,
+                  stdin: Sink.drain,
+                  stdout: Stream.empty,
+                  stderr: Stream.empty,
+                  all: Stream.empty,
+                  getInputFd: () => Sink.drain,
+                  getOutputFd: () => Stream.empty,
+                  unref: Effect.succeed(Effect.void),
+                }),
+              );
+            if (command.command !== "/usr/bin/systemd-run")
+              return Effect.die("Unexpected native command");
+            launches++;
+            expect(claims).toBe(1);
+            expect(command.args.at(-1)).toBe(expected);
+            expect(Buffer.from(command.args.at(-1)!, "base64").toString()).toBe(expectedText);
+            expect(command.args).toContain("MemoryMax=2147483648");
+            expect(command.args).toContain("RuntimeMaxSec=300s");
+            // Stop at the platform launch boundary; no native process or owner is created.
+            return Effect.fail(
+              PlatformError.badArgument({ module: "bootstrap-test", method: "spawn" }),
+            );
+          });
+          const error = yield* acquirePiManagedProcess(launch, {
+            allocation,
+            claimActivation: (claimed) =>
+              Effect.sync(() => {
+                expect(claimed).toEqual(allocation);
+                claims++;
+              }),
+            beforeStart: () => Effect.die("Must not acquire an owner"),
+          }).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.flip,
+          );
+          const admitted = encodedBytes < 131072;
+          if (error.phase === "validation")
+            expect(error.message).toBe("Managed launch specification exceeds the bootstrap bound.");
+          expect(error.phase).toBe(admitted ? "startup" : "validation");
+          expect(claims).toBe(admitted ? 1 : 0);
+          expect(launches).toBe(admitted ? 1 : 0);
+          if (encodedBytes === 75020) {
+            yield* Effect.promise(async () => {
+              await NodeFSP.rename(
+                input.runtimeFiles[0]!.source,
+                NodePath.join(scratch, "old-runtime"),
+              );
+              await NodeFSP.writeFile(input.runtimeFiles[0]!.source, "replacement-runtime");
+            });
+            const changed = yield* acquirePiManagedProcess(launch, {
+              allocation,
+              claimActivation: () => Effect.die("Changed identity must not claim activation"),
+              beforeStart: () => Effect.die("Changed identity must not acquire an owner"),
+            }).pipe(
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.flip,
+            );
+            expect(changed.phase).toBe("validation");
+            expect(changed.message).toBe(
+              "Preallocated filesystem identity or launch policy changed.",
+            );
+            expect(claims).toBe(1);
+            expect(launches).toBe(1);
+          }
         }),
       ),
     );

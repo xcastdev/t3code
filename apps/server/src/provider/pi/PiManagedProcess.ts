@@ -382,6 +382,9 @@ const FrameSchema = Schema.Union([
   Schema.Struct({ type: Schema.Literal("exited"), code: Schema.Int }),
   Schema.Struct({ type: Schema.Literal("failed"), message: Schema.String }),
 ]);
+// A 245-file CPython/Mem0 closure exceeds a protocol frame. Keep the bootstrap
+// argument below Linux's 128 KiB per-string exec limit, including its trailing NUL.
+const MAX_BOOTSTRAP_ARGUMENT = 131071;
 const encodeBootstrap = Schema.encodeEffect(Schema.fromJsonString(BootstrapSchema));
 const encodeControl = Schema.encodeEffect(Schema.fromJsonString(ControlSchema));
 const decodeFrame = Schema.decodeEffect(Schema.fromJsonString(FrameSchema));
@@ -819,7 +822,7 @@ finally:
     ),
   );
   const spec = Buffer.from(specText).toString("base64");
-  if (spec.length > 65536)
+  if (spec.length > MAX_BOOTSTRAP_ARGUMENT)
     return yield* fail("validation", "Managed launch specification exceeds the bootstrap bound.");
   const readUnit = () =>
     readManagedUnit(unit).pipe(

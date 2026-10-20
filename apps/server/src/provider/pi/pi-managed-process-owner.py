@@ -9,6 +9,8 @@ import signal
 import subprocess
 import sys
 
+# Separate the launch argument from protocol frames; Linux allows 128 KiB including NUL.
+MAX_BOOTSTRAP_ARGUMENT = 131071
 MAX_FRAME = 65536
 CHUNK = 8192
 MAX_INPUT = 32 * CHUNK
@@ -101,7 +103,7 @@ def launch(spec):
 
 
 def main():
-    if len(sys.argv) != 2 or len(sys.argv[1]) > MAX_FRAME:
+    if len(sys.argv) != 2 or len(sys.argv[1]) > MAX_BOOTSTRAP_ARGUMENT:
         raise RuntimeError("bounded launch specification required")
     spec = json.loads(base64.b64decode(sys.argv[1], validate=True))
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
