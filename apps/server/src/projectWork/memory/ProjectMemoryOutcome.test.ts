@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 import { runMigrations } from "../../persistence/Migrations.ts";
 import * as Authorization from "../ProjectTeamAuthorization.ts";
 import * as ContentGuard from "../ProjectWorkContentGuard.ts";
@@ -1006,6 +1007,8 @@ for (const noFacts of [false, true])
           const pending = yield* f.pending.consume(f.projectId, f.effectId);
           if (pending.status !== "pending-reflection")
             return yield* Effect.die("Unsettled Liquid fixture");
+          const completed = yield* f.service.readWork(f.projectId, f.effectId);
+          yield* TestClock.adjust("1 second");
           const result = yield* f.outcomes
             .commitVerifiedOutcome(pending.receipt, Effect.void)
             .pipe(Effect.result);
@@ -1016,6 +1019,8 @@ for (const noFacts of [false, true])
             status: noFacts ? "no-facts" : "indexed",
           });
           expect(work.effect.status).toBe("succeeded");
+          if (!noFacts)
+            expect(work.extraction?.updatedAt).not.toBe(completed.extraction?.updatedAt);
           const before = yield* f.snapshot;
           const calls = f.counts();
           yield* makeProjectMemoryOutcome(f).commitVerifiedOutcome(pending.receipt, Effect.void);
@@ -1105,6 +1110,46 @@ for (const noFacts of [false, true])
             }),
           ),
       );
+
+for (const noFacts of [false, true])
+  for (const liquid of [false, true])
+    it.effect(
+      `${liquid ? "Liquid" : "CommandCode"} ${noFacts ? "no-facts" : "index"} rejects completed timestamp mutation before first reflection`,
+      () =>
+        database(
+          Effect.gen(function* () {
+            const f = yield* setup(noFacts, liquid);
+            const pending = yield* f.pending.consume(f.projectId, f.effectId);
+            if (pending.status !== "pending-reflection")
+              return yield* Effect.die("Unsettled timestamp fixture");
+            const work = yield* f.service.readWork(f.projectId, f.effectId);
+            if (work.extraction === undefined)
+              return yield* Effect.die("Missing performed extraction");
+            const original = yield* f.snapshot;
+            const calls = f.counts();
+            const substitute = "2099-10-03T00:00:01.000Z";
+            expect(work.extraction.updatedAt).not.toBe(substitute);
+            // Change both physical and checkpoint timestamps, leaving immutable
+            // completion evidence intact so projection agreement cannot mask it.
+            yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,
+              '$.foundationRecords[' || (SELECT key FROM json_each(state_json,'$.foundationRecords')
+                WHERE json_extract(value,'$.recordId')=${work.extraction.recordId}) || '].updatedAt',${substitute})
+              WHERE project_id=${f.projectId}`;
+            yield* f.sql`UPDATE project_team_memory_extraction
+              SET updated_at=${substitute},payload_json=json_set(payload_json,'$.updatedAt',${substitute})
+              WHERE record_id=${work.extraction.recordId}`;
+            const before = yield* f.snapshot;
+            expect(before.jobs).toEqual(original.jobs);
+            expect(before.events).toEqual(original.events);
+            const result = yield* f.outcomes
+              .commitVerifiedOutcome(pending.receipt, Effect.void)
+              .pipe(Effect.result);
+            expect(result._tag).toBe("Failure");
+            expect(yield* f.snapshot).toEqual(before);
+            expect(f.counts()).toEqual(calls);
+          }),
+        ),
+    );
 
 it.effect("completion lookup uses exact indexes with 32768 historical 4 KiB events", () =>
   database(

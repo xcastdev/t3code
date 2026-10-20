@@ -356,8 +356,9 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
       observations.find((observation) => observation.recordId === id)!,
     );
     const indexed = reflected && receipt.kind === "index-complete";
-    const completedAt =
-      receipt.kind === "no-facts" ? extraction.updatedAt : orderedObservations[0]!.updatedAt;
+    // Index reflection advances updatedAt; only replay must recover the original
+    // completion timestamp. First reflection must prove the retained timestamp.
+    const completedAt = indexed ? orderedObservations[0]!.updatedAt : extraction.updatedAt;
     const completed = {
       ...extraction,
       status: receipt.kind === "no-facts" ? "no-facts" : "extracted",
