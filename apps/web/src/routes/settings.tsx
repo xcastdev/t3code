@@ -218,16 +218,12 @@ function SettingsRouteLayout() {
 export const Route = createFileRoute("/settings")({
   validateSearch: validateSettingsRouteSearch,
   search: { middlewares: [retainSettingsScope] },
-  beforeLoad: async ({ context, location }) => {
+  beforeLoad: async ({ context }) => {
     if (
       context.authGateState.status !== "authenticated" &&
       context.authGateState.status !== "hosted-static"
     ) {
       throw redirect({ to: "/pair", replace: true });
-    }
-
-    if (location.pathname === "/settings") {
-      throw redirect({ to: "/settings/general", replace: true });
     }
   },
   component: SettingsRouteLayout,
