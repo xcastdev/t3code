@@ -7485,6 +7485,7 @@ type RuntimeFixtureProfile = {
   /** Two human-approved planning children; controlled parent receipts, real child SDK in the opt-in case. */
   readonly nativePlanningSiblings?: boolean;
   readonly memoryChild?: { readonly model: string; readonly maximumTokens: number };
+  readonly humanMemoryAssignment?: "implementation" | "planning";
 };
 const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   reviewer = false,
@@ -7497,6 +7498,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   revalidateRuntime?: PiManagedRuntimeLiveOptions["revalidateRuntime"],
 ) {
   const selectedModel = profile?.model ?? model;
+  const assignmentKind = profile?.humanMemoryAssignment ?? readonlyKind;
   if (reviewer || readonlyKind === "review") return yield* requiredReviewTransferFixture();
   const fixtureAt =
     profile?.originalClockAtMs === undefined
@@ -7722,8 +7724,15 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
                   : profile.durationMs,
             }
           : {}),
-        ...(memory ? { toolIds: [...role.tools] } : {}),
-        ...(readonlyKind === undefined || id === "required-root"
+        ...(memory
+          ? {
+              toolIds:
+                profile?.humanMemoryAssignment && id !== "required-root"
+                  ? [...claim.transition.binding.configuration.toolIds]
+                  : [...role.tools],
+            }
+          : {}),
+        ...(assignmentKind === undefined || id === "required-root"
           ? { instructionsHash: configuration.instructionsHash }
           : {}),
       },
@@ -7818,7 +7827,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       leafId: null,
       persisted: false,
     };
-    if (profile?.nativePlanningSiblings) {
+    if (profile?.nativePlanningSiblings || profile?.humanMemoryAssignment) {
       // Parent-only controlled history: no parent SDK/process is claimed. Use the real lifecycle
       // ports rather than changing stored authority, budgets or operation status with SQL.
       const owner = {
@@ -7885,13 +7894,14 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       yield* parentOperations.persistNative(parent, parentNative);
       yield* sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id=${parent.operation.operationId}`;
     }
+    if (profile?.humanMemoryAssignment) yield* TestClock.adjust(1);
     for (
       let siblingIndex = 0;
       siblingIndex < (profile?.nativePlanningSiblings ? 2 : 1);
       siblingIndex++
     ) {
       const suffix = siblingIndex === 0 ? "" : "-sibling";
-      if (readonlyKind !== undefined) {
+      if (assignmentKind !== undefined) {
         let state = yield* readCurrentState(sql, projectId);
         const previousTaskIds = new Set(state.tasks.map((task) => task.taskId));
         const previousRoleIds = new Set(
@@ -7945,7 +7955,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
             records: [],
             guided: {
               intent:
-                readonlyKind === "investigation"
+                assignmentKind === "investigation"
                   ? {
                       ...envelope,
                       type: "project-team.investigation.start",
@@ -7955,13 +7965,20 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
                   : {
                       ...envelope,
                       type: "project-team.assignment.start",
-                      assignmentKind: readonlyKind,
+                      assignmentKind,
+                      ...(assignmentKind === "implementation"
+                        ? {
+                            parentCriterionIds: state.criteria
+                              .filter((criterion) => criterion.taskId === parentTask.taskId)
+                              .map((criterion) => criterion.criterionId),
+                          }
+                        : {}),
                       objective:
-                        readonlyKind === "planning"
+                        assignmentKind === "planning"
                           ? "Draft the first child plan"
                           : "Review original approved scope",
                       outputDescriptions: [
-                        readonlyKind === "planning"
+                        assignmentKind === "planning"
                           ? "Proposed first plan"
                           : "Independent review findings",
                       ],
@@ -7999,7 +8016,13 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           recordId: "readonly-runtime-role" + suffix,
           roleId: "readonly-runtime-role" + suffix,
           revision: 0,
-          model: selectedModel,
+          model: profile?.memoryChild?.model ?? selectedModel,
+          ...(memory
+            ? {
+                memoryAccess: "project" as const,
+                tools: [...generatedRole.tools, "project-work.read-task"],
+              }
+            : {}),
           delegationDepth: role.delegationDepth,
         };
         yield* repository.execute(
@@ -8012,6 +8035,15 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
             committedAt: fixtureAt,
             records: [
               roleRecord,
+              ...(roleRecord.model === selectedModel
+                ? []
+                : (state.foundationRecords ?? [])
+                    .filter((r) => r.kind === "limits" && r.model === selectedModel)
+                    .map((policy) => ({
+                      ...policy,
+                      recordId: "human-memory-child-limits",
+                      model: roleRecord.model,
+                    }))),
               {
                 kind: "member",
                 projectId,
@@ -8028,25 +8060,35 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           }),
         );
         state = yield* readCurrentState(sql, projectId);
+        const childAt = profile?.humanMemoryAssignment
+          ? DateTime.formatIso(yield* DateTime.now)
+          : fixtureAt;
         const binding = {
           kind: "run-binding",
           projectId,
           recordId: "required-child-binding" + suffix,
           revision: 0,
           generation: 0,
-          updatedAt: fixtureAt,
+          updatedAt: childAt,
           status: "reserved",
           taskId: task.taskId,
           attemptId: "required-child-attempt" + suffix,
           memberId: "readonly-runtime-member" + suffix,
           roleRevisionId: roleRecord.recordId,
-          parentRunId: root.binding.recordId,
+          ...(profile?.humanMemoryAssignment ? {} : { parentRunId: root.binding.recordId }),
           providerInstanceId,
           threadId: siblingIndex === 0 ? threadId : ThreadId.make("required-sibling-thread"),
           environmentId: "environment",
           model: selectedModel,
           configuration: {
             ...configuration,
+            ...(profile?.humanMemoryAssignment
+              ? {
+                  toolIds: roleRecord.tools.filter(
+                    (tool) => tool.startsWith("pi.") || tool.startsWith("project-work."),
+                  ),
+                }
+              : {}),
             instructionsHash: NodeCrypto.createHash("sha256")
               .update(roleRecord.instructions)
               .digest("hex"),
@@ -8065,7 +8107,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           commandId: "readonly-runtime-claim" + suffix,
           expectedRevision: state.revision,
           attribution,
-          committedAt: fixtureAt,
+          committedAt: childAt,
           records: [],
           transition: {
             kind: "claim",
@@ -8082,7 +8124,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
               attemptId: binding.attemptId,
               leaseToken: "readonly-runtime-lease" + suffix,
               leasedUntil: "2030-01-01T00:00:00.000Z",
-              claimedAt: fixtureAt,
+              claimedAt: childAt,
             },
           },
         });
@@ -10102,6 +10144,9 @@ for (const compactProof of [
   "returnCancel",
   "memoryAdmission",
   "memoryAccounting",
+  "memoryRootHumanImplementation",
+  "memoryRootHumanMonitored",
+  "memoryRootHumanPlanning",
   "memoryRootLing1000",
   "memoryRootLing64000",
   "memoryRootLunaControl",
@@ -10229,15 +10274,24 @@ for (const compactProof of [
       scoped(
         Effect.gen(function* () {
           const memoryRoot = compactProof?.startsWith("memoryRoot") === true;
-          const hardRoot = compactProof?.startsWith("memoryRootHard") === true;
+          const humanMemory = compactProof?.startsWith("memoryRootHuman") === true;
+          const humanPlanning = compactProof === "memoryRootHumanPlanning";
+          const hardRoot =
+            compactProof?.startsWith("memoryRootHard") === true ||
+            (humanMemory && compactProof !== "memoryRootHumanMonitored");
           const forgedRoot = compactProof === "memoryRootHardForged";
           const memoryRootDenied =
             forgedRoot ||
             compactProof === "memoryRootMissingGrant" ||
             compactProof === "memoryRootDescendantGrant";
           const lunaChild = compactProof === "memoryRootLunaControl" || forgedRoot;
-          const childCeiling = compactProof === "memoryRootLing64000" ? 64_000 : 1000;
+          const childCeiling = humanMemory
+            ? 20_000
+            : compactProof === "memoryRootLing64000"
+              ? 64_000
+              : 1000;
           let memoryRootChecked = false;
+          let replayHumanMemory: Effect.Effect<void, ProjectMemoryServiceError> | undefined;
           const subscriptionMemory = compactProof?.startsWith("memorySubscription") === true;
           const memoryUnknown = compactProof === "memorySubscriptionUnknown";
           const piUnknown = compactProof === "memorySubscriptionPiUnknown";
@@ -10271,7 +10325,7 @@ for (const compactProof of [
             compactProof === "memoryCompanionSharedRoot";
           const sourceFailure =
             compactProof === "memoryFailure" || compactProof === "memorySourceJoinedRecovery";
-          const memoryProof = compactProof?.startsWith("memory") === true;
+          const memoryProof = compactProof?.startsWith("memory") === true && !humanPlanning;
           const accountingProof =
             memoryRoot ||
             subscriptionMemory ||
@@ -10550,6 +10604,13 @@ for (const compactProof of [
                     model: lunaChild ? "gpt-6-luna" : model,
                     maximumTokens: childCeiling,
                   },
+                  ...(humanMemory
+                    ? {
+                        humanMemoryAssignment: humanPlanning
+                          ? ("planning" as const)
+                          : ("implementation" as const),
+                      }
+                    : {}),
                 }
               : subscriptionMemory
                 ? { ...subscriptionRuntimeProfile, role: "implementer", maxInputTokens: 32_768 }
@@ -14353,7 +14414,109 @@ for (const compactProof of [
                                   ).toEqual(before);
                                   yield* f.sql`UPDATE project_work_events SET payload_json=${event.payload} WHERE event_id=${event.id}`;
                                 }
+                                if (humanMemory) {
+                                  expect(f.binding.parentRunId).toBeUndefined();
+                                  const state = yield* readCurrentState(f.sql, projectId);
+                                  const records = state.foundationRecords ?? [];
+                                  const memberIndex = records.findIndex(
+                                    (record) =>
+                                      record.kind === "task-membership" &&
+                                      record.taskId === f.binding.taskId,
+                                  );
+                                  const rootIndex = records.findIndex(
+                                    (record) =>
+                                      record.kind === "task-membership" &&
+                                      record.taskId === admitted.operation.rootTaskId,
+                                  );
+                                  const gateIndex = records.findIndex(
+                                    (record) => record.recordId === f.binding.authorizationGateId,
+                                  );
+                                  const roleIndex = records.findIndex(
+                                    (record) => record.recordId === f.binding.roleRevisionId,
+                                  );
+                                  expect(
+                                    [memberIndex, rootIndex, gateIndex, roleIndex].every(
+                                      (index) => index >= 0,
+                                    ),
+                                  ).toBe(true);
+                                  const checkpoints = yield* f.sql<{
+                                    state: string;
+                                  }>`SELECT state_json AS state FROM project_work_reducer_checkpoints WHERE project_id=${projectId}`;
+                                  const checkpoint = checkpoints[0];
+                                  if (checkpoints.length !== 1 || !checkpoint)
+                                    return yield* Effect.die("Exact authority checkpoint absent");
+                                  const memberPath = `$.foundationRecords[${memberIndex}]`;
+                                  const gatePath = `$.foundationRecords[${gateIndex}]`;
+                                  for (const [path, value] of [
+                                    [memberPath, null],
+                                    [memberPath + ".parentTaskId", "foreign-parent"],
+                                    [
+                                      memberPath + ".assignment.authorizationGateId",
+                                      "foreign-gate",
+                                    ],
+                                    [memberPath + ".deliverableKind", "plan"],
+                                    [gatePath, null],
+                                    [gatePath + ".status", "approved"],
+                                    [gatePath + ".consumedByRunId", "foreign-run"],
+                                    [gatePath + ".attribution.actor.kind", "agent"],
+                                    [
+                                      gatePath + ".assignmentAuthorization.parentTaskId",
+                                      "foreign-parent",
+                                    ],
+                                    [
+                                      gatePath + ".assignmentAuthorization.assignmentKind",
+                                      "planning",
+                                    ],
+                                    [
+                                      `$.foundationRecords[${rootIndex}].parentTaskId`,
+                                      f.binding.taskId,
+                                    ],
+                                    [
+                                      `$.foundationRecords[${roleIndex}].instructions`,
+                                      "corrupt original profile",
+                                    ],
+                                  ] as const) {
+                                    if (value === null)
+                                      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_remove(state_json,${path}) WHERE project_id=${projectId}`;
+                                    else
+                                      yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${path},${value}) WHERE project_id=${projectId}`;
+                                    expect(
+                                      (yield* ledger.settle(settlement).pipe(Effect.result))._tag,
+                                    ).toBe("Failure");
+                                    expect(
+                                      yield* f.sql`SELECT * FROM project_team_model_request`,
+                                    ).toEqual(before);
+                                    yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=${checkpoint.state} WHERE project_id=${projectId}`;
+                                  }
+                                  for (const [column, original, corrupt] of [
+                                    [
+                                      "maximum_tokens",
+                                      admitted.operation.rootMaximumTokens,
+                                      admitted.operation.rootMaximumTokens - 1,
+                                    ],
+                                    [
+                                      "deadline_at_ms",
+                                      admitted.operation.rootDeadlineAtMs,
+                                      admitted.operation.rootDeadlineAtMs + 1,
+                                    ],
+                                  ] as const) {
+                                    yield* f.sql`UPDATE project_team_model_budget SET ${f.sql(column)}=${corrupt}`;
+                                    expect(
+                                      (yield* ledger.settle(settlement).pipe(Effect.result))._tag,
+                                    ).toBe("Failure");
+                                    expect(
+                                      yield* f.sql`SELECT * FROM project_team_model_request`,
+                                    ).toEqual(before);
+                                    yield* f.sql`UPDATE project_team_model_budget SET ${f.sql(column)}=${original}`;
+                                  }
+                                }
                                 const receipt = yield* ledger.settle(settlement);
+                                if (humanMemory)
+                                  replayHumanMemory = ledger.settle(settlement).pipe(
+                                    Effect.map((replayed) => {
+                                      expect(replayed).toEqual(receipt);
+                                    }),
+                                  );
                                 expect(yield* ledger.settle(settlement)).toEqual(receipt);
                                 expect(
                                   yield* f.sql`SELECT status,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
@@ -14364,14 +14527,14 @@ for (const compactProof of [
                                     charged_output_tokens: 5,
                                   },
                                 ]);
-                                if (childCeiling === 1000)
+                                if (childCeiling < 64_000)
                                   expect(
                                     (yield* ledger
                                       .reserve(admitted, {
                                         phase: "extract",
                                         routeId: "controlled-command-code",
                                         requestId: 2,
-                                        maxInputTokens: 960,
+                                        maxInputTokens: childCeiling - 40,
                                         maxOutputTokens: 1,
                                         deadlineAtMs: row.deadline_at_ms,
                                       })
@@ -15128,10 +15291,31 @@ for (const compactProof of [
           );
           const assignmentResult = yield* assigned.run.pipe(Effect.result);
           if (memoryRoot) {
+            if (humanPlanning) {
+              expect(f.binding.parentRunId).toBeUndefined();
+              expect(assignmentResult._tag).toBe("Success");
+              expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
+              const current = yield* f.reader.readRequired(snapshot);
+              const fresh = yield* makeProjectTeamContext({
+                environmentId: "environment",
+                maximumEnvironmentModelCalls: 128,
+              });
+              expect((yield* fresh.readRequired(snapshot)).required.remaining).toEqual(
+                current.required.remaining,
+              );
+              expect(yield* readRecordedUsage()).toMatchObject([
+                { availability: "available", root: { chargedTokens: 0 } },
+              ]);
+              return;
+            }
+            if (!memoryRootDenied) expect(diagnostic).toBe("");
             expect(memoryRootChecked).toBe(true);
             if (!memoryRootDenied) {
-              expect(diagnostic).toBe("");
               expect(assignmentResult._tag).toBe("Success");
+              if (humanMemory) {
+                if (!replayHumanMemory) return yield* Effect.die("Human replay port absent");
+                yield* replayHumanMemory;
+              }
             }
             return;
           }

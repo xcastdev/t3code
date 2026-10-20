@@ -23,7 +23,8 @@ import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as Option from "effect/Option";
-import { ProjectWorkRepository } from "../ProjectWorkRepository.ts";
+import { ProjectWorkRepository, readCurrentState } from "../ProjectWorkRepository.ts";
+import { projectTeamAssignmentProfile } from "../ProjectTeamPolicy.ts";
 import type { ProjectTeamDispatchSnapshot } from "../ProjectTeamDispatchJournal.ts";
 import { PiManagedProcessAllocationSchema } from "../../provider/pi/PiManagedProcess.ts";
 import type { ProjectTeamPrincipal } from "../ProjectTeamAuthorization.ts";
@@ -280,6 +281,7 @@ const readOriginalDispatch = Effect.fn("ProjectMemoryModelAccounting.readOrigina
  * root claim. A descendant's model and later attempts cannot select root policy. */
 const readOriginalMemoryRoot = Effect.fn("ProjectMemoryModelAccounting.readOriginalMemoryRoot")(
   function* (sql: SqlClient.SqlClient, operation: ProjectMemoryTaskOwner) {
+    const dispatchesByBinding = new Map<string, ProjectTeamDispatchSnapshot>();
     const readBinding = Effect.fn("ProjectMemoryModelAccounting.readOriginalBinding")(function* (
       id: string,
     ) {
@@ -330,6 +332,7 @@ const readOriginalMemoryRoot = Effect.fn("ProjectMemoryModelAccounting.readOrigi
         original.intent.limits.rootDeadlineAtMs !== operation.rootDeadlineAtMs
       )
         return yield* deny("Original memory ancestor authority changed");
+      dispatchesByBinding.set(id, original);
       return binding;
     });
     let binding = yield* readBinding(operation.bindingId);
@@ -342,7 +345,104 @@ const readOriginalMemoryRoot = Effect.fn("ProjectMemoryModelAccounting.readOrigi
       visited.add(binding.recordId);
       binding = yield* readBinding(binding.parentRunId);
     }
-    if (binding.recordId !== operation.rootBindingId || binding.taskId !== operation.rootTaskId)
+    if (binding.taskId !== operation.rootTaskId) {
+      // Human assignment grants inherit task ancestry without a run-parent edge.
+      // This is the same distinct authority path admitted by Pi's inheritedHumanRoot.
+      const state = yield* readCurrentState(sql, operation.projectId);
+      const records = state.foundationRecords ?? [];
+      const memberships = records.filter(
+        (record) => record.kind === "task-membership" && record.taskId === binding.taskId,
+      );
+      const gates = records.filter(
+        (record) => record.kind === "gate" && record.recordId === binding.authorizationGateId,
+      );
+      const roles = records.filter(
+        (record) => record.kind === "role-revision" && record.recordId === binding.roleRevisionId,
+      );
+      const membership = memberships[0];
+      const gate = gates[0];
+      const role = roles[0];
+      if (
+        memberships.length !== 1 ||
+        membership?.kind !== "task-membership" ||
+        membership.status !== "active" ||
+        membership.parentTaskId === undefined ||
+        membership.assignment?.authorizationGateId !== binding.authorizationGateId ||
+        gates.length !== 1 ||
+        gate?.kind !== "gate" ||
+        gate.gate !== "assignment" ||
+        gate.status !== "consumed" ||
+        gate.projectId !== operation.projectId ||
+        gate.taskId !== binding.taskId ||
+        gate.consumedByRunId !== binding.recordId ||
+        gate.attribution.actor.kind !== "human" ||
+        gate.assignmentAuthorization?.parentTaskId !== membership.parentTaskId ||
+        roles.length !== 1 ||
+        role?.kind !== "role-revision" ||
+        role.model !== binding.model ||
+        binding.configuration.instructionsHash !==
+          NodeCrypto.createHash("sha256").update(role.instructions).digest("hex")
+      )
+        return yield* deny("Original memory human assignment authority is missing or changed");
+      const profile = projectTeamAssignmentProfile(gate.assignmentAuthorization.assignmentKind);
+      if (
+        membership.deliverableKind !== profile.deliverableKind ||
+        role.role !== profile.role ||
+        binding.configuration.toolIds.some((tool) => !profile.tools.includes(tool))
+      )
+        return yield* deny("Original memory human assignment profile changed");
+      let taskId = binding.taskId;
+      const tasks = new Set<string>();
+      while (taskId !== operation.rootTaskId) {
+        if (tasks.has(taskId) || tasks.size >= 8)
+          return yield* deny("Original memory human task ancestry is cyclic or exceeds its bound");
+        tasks.add(taskId);
+        const parents = records.filter(
+          (record) => record.kind === "task-membership" && record.taskId === taskId,
+        );
+        const parent = parents[0];
+        if (
+          parents.length !== 1 ||
+          parent?.kind !== "task-membership" ||
+          parent.status !== "active" ||
+          parent.parentTaskId === undefined
+        )
+          return yield* deny("Original memory human task ancestry changed");
+        taskId = parent.parentTaskId;
+      }
+      const roots = records.filter(
+        (record) => record.kind === "task-membership" && record.taskId === operation.rootTaskId,
+      );
+      if (
+        roots.length !== 1 ||
+        roots[0]?.kind !== "task-membership" ||
+        roots[0].parentTaskId !== undefined
+      )
+        return yield* deny("Original memory human task root changed");
+      const childDispatch = dispatchesByBinding.get(binding.recordId);
+      binding = yield* readBinding(operation.rootBindingId);
+      const rootDispatch = dispatchesByBinding.get(binding.recordId);
+      const budgets = yield* sql<{
+        maximum: number;
+        deadline: number;
+      }>`SELECT maximum_tokens AS maximum,deadline_at_ms AS deadline
+        FROM project_team_model_budget WHERE environment_id=${operation.environmentId}
+        AND project_id=${operation.projectId} AND root_task_id=${operation.rootTaskId} LIMIT 2`;
+      if (
+        !childDispatch ||
+        !rootDispatch ||
+        !same(childDispatch.intent.rootCaps, rootDispatch.intent.rootCaps) ||
+        budgets.length !== 1 ||
+        budgets[0]?.maximum !== operation.rootMaximumTokens ||
+        budgets[0].deadline !== operation.rootDeadlineAtMs
+      )
+        return yield* deny("Original memory human root budget or resource caps changed");
+    }
+    if (
+      binding.recordId !== operation.rootBindingId ||
+      binding.taskId !== operation.rootTaskId ||
+      binding.parentRunId !== undefined
+    )
       return yield* deny("Original memory ancestry differs from its captured root");
     // Event sequence defines the original root across retries; physical operation
     // order and the executing child's model carry no root authority.
