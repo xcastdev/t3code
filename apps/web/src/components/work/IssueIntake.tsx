@@ -15,6 +15,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
 import { WorkCard, WorkDataNotice } from "./WorkDataNotice";
+import { WorkSectionHeader, WorkTime } from "./WorkLayout";
 import { projectWorkCommandFailure, type ProjectWorkCommandFailure } from "./workCommandFailure";
 import { taskStateLabel, taskStateVariant } from "./workPresentation";
 
@@ -103,12 +104,10 @@ function IntakeQueue(props: IssueIntakeProps) {
           : null;
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <div>
-        <h2 className="text-lg font-semibold">Issue intake</h2>
-        <p className="text-sm text-muted-foreground">
-          GitHub issues ready to develop into project work.
-        </p>
-      </div>
+      <WorkSectionHeader
+        title="Issue intake"
+        description="GitHub issues ready to become tasks or missions. Refine an issue, then investigate it."
+      />
       <WorkDataNotice stale={!props.connected && props.issues.length > 0} waiting={false} />
       {unavailable ? <p className="text-sm text-muted-foreground">{unavailable}</p> : null}
       {props.issues.length === 0 ? (
@@ -344,7 +343,7 @@ function IssueRow({
             {issue.title}
           </h3>
           <p className="mt-1 break-words text-xs text-muted-foreground [overflow-wrap:anywhere]">
-            Observed {issue.observedAt} · Source revision {issue.sourceRevision}
+            Observed <WorkTime value={issue.observedAt} /> · Source revision {issue.sourceRevision}
           </p>
           {issue.body ? (
             <div className="mt-2">

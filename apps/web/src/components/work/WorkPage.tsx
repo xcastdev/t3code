@@ -3,6 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { ProjectWorkTaskId, type EnvironmentId, type ProjectId } from "@t3tools/contracts";
 import {
+  ActivityIcon,
   BookOpenIcon,
   BrainIcon,
   FileCheckIcon,
@@ -11,7 +12,7 @@ import {
   PanelTopIcon,
   UsersIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState, type KeyboardEvent } from "react";
 import { useCallback, useContext, useRef } from "react";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -45,10 +46,10 @@ const TAB_ITEMS: ReadonlyArray<{
   readonly icon: typeof PanelTopIcon;
 }> = [
   { id: "overview", label: "Overview", icon: PanelTopIcon },
-  { id: "supervision", label: "Supervision", icon: UsersIcon },
   { id: "tasks", label: "Tasks", icon: ListTodoIcon },
-  { id: "team", label: "Team", icon: UsersIcon },
   { id: "inbox", label: "Inbox", icon: InboxIcon },
+  { id: "supervision", label: "Supervision", icon: ActivityIcon },
+  { id: "team", label: "Team", icon: UsersIcon },
   { id: "knowledge", label: "Knowledge", icon: BookOpenIcon },
   { id: "memory", label: "Memory", icon: BrainIcon },
   { id: "evidence", label: "Evidence", icon: FileCheckIcon },
@@ -137,6 +138,30 @@ function ProjectWorkPage({
       });
     } else setTab(nextTab);
   };
+  const tabsId = useId();
+  const tabRefs = useRef(new Map<WorkTab, HTMLButtonElement>());
+  const activateTab = (nextTab: WorkTab) => {
+    if (nextTab === "inbox") setInboxVisited(true);
+    selectTab(nextTab);
+  };
+  // Roving focus: arrow keys move between sections and select them, as in a native tab strip.
+  const onTabKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const index = TAB_ITEMS.findIndex((item) => item.id === tab);
+    const next =
+      event.key === "ArrowRight"
+        ? TAB_ITEMS[(index + 1) % TAB_ITEMS.length]
+        : event.key === "ArrowLeft"
+          ? TAB_ITEMS[(index - 1 + TAB_ITEMS.length) % TAB_ITEMS.length]
+          : event.key === "Home"
+            ? TAB_ITEMS[0]
+            : event.key === "End"
+              ? TAB_ITEMS.at(-1)
+              : undefined;
+    if (!next) return;
+    event.preventDefault();
+    activateTab(next.id);
+    tabRefs.current.get(next.id)?.focus();
+  };
   const openTask = (taskId: ProjectWorkTaskId) => {
     if (onSelectionChange) {
       onSelectionChange({ tab: "tasks", taskId });
@@ -210,127 +235,97 @@ function ProjectWorkPage({
                 onState={onStreamState}
               />
             ) : null}
-            <div>
-              <p className="text-xs font-medium tracking-[0.16em] text-muted-foreground uppercase">
-                Project workspace
-              </p>
-              <h2 className="mt-1 text-2xl font-semibold tracking-tight">Work</h2>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                Keep the current objective, durable tasks, and project knowledge in one place.
-              </p>
-            </div>
-            <nav
-              className="flex min-w-0 shrink-0 gap-1 overflow-x-auto border-b border-border/70"
-              aria-label="Work sections"
-            >
-              {TAB_ITEMS.map(({ id, label, icon: Icon }) => (
-                <button
-                  key={id}
-                  type="button"
-                  role="tab"
-                  aria-selected={tab === id}
-                  className={`inline-flex h-9 shrink-0 items-center gap-2 border-b-2 px-3 text-sm font-medium transition-colors ${
-                    tab === id
-                      ? "border-primary text-foreground"
-                      : "border-transparent text-muted-foreground hover:text-foreground"
-                  }`}
-                  onClick={() => {
-                    if (id === "inbox") setInboxVisited(true);
-                    selectTab(id);
-                  }}
-                >
-                  <Icon className="size-4" />
-                  {label}
-                </button>
-              ))}
+            <nav aria-label="Work sections" className="min-w-0 shrink-0">
+              <div
+                role="tablist"
+                aria-orientation="horizontal"
+                className="flex min-w-0 gap-1 overflow-x-auto border-b border-border/70"
+                onKeyDown={onTabKeyDown}
+              >
+                {TAB_ITEMS.map(({ id, label, icon: Icon }) => (
+                  <button
+                    key={id}
+                    ref={(node) => {
+                      if (node) tabRefs.current.set(id, node);
+                      else tabRefs.current.delete(id);
+                    }}
+                    type="button"
+                    role="tab"
+                    id={`${tabsId}-${id}`}
+                    aria-selected={tab === id}
+                    aria-controls={`${tabsId}-panel`}
+                    tabIndex={tab === id ? 0 : -1}
+                    className={`-mb-px inline-flex h-9 shrink-0 items-center gap-2 rounded-t-md border-b-2 px-3 text-sm font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
+                      tab === id
+                        ? "border-primary text-foreground"
+                        : "border-transparent text-muted-foreground hover:text-foreground"
+                    }`}
+                    onClick={() => activateTab(id)}
+                  >
+                    <Icon className="size-4" aria-hidden />
+                    {label}
+                  </button>
+                ))}
+              </div>
             </nav>
-            {tab === "overview" ? (
-              <WorkOverview
-                environmentId={environmentId}
-                projectId={projectId}
-                connected={connected}
-                streamAvailable={!poll}
-              />
-            ) : tab === "supervision" ? (
-              <ProjectSupervision
-                environmentId={environmentId}
-                projectId={projectId}
-                title={projectTitle}
-                connected={connected}
-                enabled={enabled}
-                supported={
-                  serverConfig?.environment?.capabilities?.projectTeamSupervisionReads === true
-                }
-                onOpenTask={openTask}
-                onInspectProject={() => selectTab("team")}
-              />
-            ) : tab === "tasks" ? (
-              <WorkTasks
-                verifyVerificationAccess={verifyVerificationAccess}
-                verificationDrafts={verificationDrafts}
-                key={`${environmentId}:${projectId}:tasks`}
-                environmentId={environmentId}
-                projectId={projectId}
-                connected={connected}
-                enabled={enabled}
-                streamAvailable={!poll}
-                teamReadSupported={
-                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
-                }
-                guidedWritesSupported={
-                  serverConfig?.environment?.capabilities?.projectTeamGuidedWrites === true
-                }
-                {...(targetTask ? { targetTaskId: targetTask } : {})}
-              />
-            ) : tab === "team" ? (
-              <Team
-                environmentId={environmentId}
-                projectId={projectId}
-                connected={connected}
-                enabled={enabled}
-                supported={
-                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
-                }
-                onOpenTask={openTask}
-              />
-            ) : tab === "memory" ? (
-              <Memory
-                environmentId={environmentId}
-                projectId={projectId}
-                connected={connected}
-                enabled={enabled}
-                supported={
-                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
-                }
-                writesSupported={
-                  serverConfig?.environment?.capabilities?.projectTeamMemoryRetractions === true
-                }
-              />
-            ) : tab === "evidence" ? (
-              <Evidence
-                environmentId={environmentId}
-                projectId={projectId}
-                connected={connected}
-                enabled={enabled}
-                supported={
-                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
-                }
-                onOpenTask={openTask}
-              />
-            ) : tab === "inbox" ? null : (
-              <WorkKnowledge
-                key={`${environmentId}:${projectId}:knowledge`}
-                environmentId={environmentId}
-                projectId={projectId}
-                connected={connected}
-                canWrite={enabled && connected}
-                streamAvailable={!poll}
-              />
-            )}
-            {tab === "inbox" || inboxVisited ? (
-              <div hidden={tab !== "inbox"}>
-                <Inbox
-                  poll={poll}
+            <div
+              role="tabpanel"
+              id={`${tabsId}-panel`}
+              aria-labelledby={`${tabsId}-${tab}`}
+              className="flex min-w-0 flex-col gap-4"
+            >
+              {tab === "overview" ? (
+                <WorkOverview
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  connected={connected}
+                  streamAvailable={!poll}
+                  onOpenSection={activateTab}
+                />
+              ) : tab === "supervision" ? (
+                <ProjectSupervision
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  title={projectTitle}
+                  connected={connected}
+                  enabled={enabled}
+                  supported={
+                    serverConfig?.environment?.capabilities?.projectTeamSupervisionReads === true
+                  }
+                  onOpenTask={openTask}
+                  onInspectProject={() => selectTab("team")}
+                />
+              ) : tab === "tasks" ? (
+                <WorkTasks
+                  verifyVerificationAccess={verifyVerificationAccess}
+                  verificationDrafts={verificationDrafts}
+                  key={`${environmentId}:${projectId}:tasks`}
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  connected={connected}
+                  enabled={enabled}
+                  streamAvailable={!poll}
+                  teamReadSupported={
+                    serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                  }
+                  guidedWritesSupported={
+                    serverConfig?.environment?.capabilities?.projectTeamGuidedWrites === true
+                  }
+                  {...(targetTask ? { targetTaskId: targetTask } : {})}
+                />
+              ) : tab === "team" ? (
+                <Team
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  connected={connected}
+                  enabled={enabled}
+                  supported={
+                    serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                  }
+                  onOpenTask={openTask}
+                />
+              ) : tab === "memory" ? (
+                <Memory
                   environmentId={environmentId}
                   projectId={projectId}
                   connected={connected}
@@ -339,12 +334,49 @@ function ProjectWorkPage({
                     serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
                   }
                   writesSupported={
-                    serverConfig?.environment?.capabilities?.projectTeamGuidedWrites === true
+                    serverConfig?.environment?.capabilities?.projectTeamMemoryRetractions === true
+                  }
+                />
+              ) : tab === "evidence" ? (
+                <Evidence
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  connected={connected}
+                  enabled={enabled}
+                  supported={
+                    serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
                   }
                   onOpenTask={openTask}
                 />
-              </div>
-            ) : null}
+              ) : tab === "inbox" ? null : (
+                <WorkKnowledge
+                  key={`${environmentId}:${projectId}:knowledge`}
+                  environmentId={environmentId}
+                  projectId={projectId}
+                  connected={connected}
+                  canWrite={enabled && connected}
+                  streamAvailable={!poll}
+                />
+              )}
+              {tab === "inbox" || inboxVisited ? (
+                <div hidden={tab !== "inbox"}>
+                  <Inbox
+                    poll={poll}
+                    environmentId={environmentId}
+                    projectId={projectId}
+                    connected={connected}
+                    enabled={enabled}
+                    supported={
+                      serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                    }
+                    writesSupported={
+                      serverConfig?.environment?.capabilities?.projectTeamGuidedWrites === true
+                    }
+                    onOpenTask={openTask}
+                  />
+                </div>
+              ) : null}
+            </div>
           </>
         )}
       </WorkspacePageContainer>
@@ -423,8 +455,8 @@ function WorkDisabledState() {
       <div className="max-w-md rounded-2xl border border-border/70 bg-card/45 p-8 text-center shadow-sm/5">
         <h2 className="text-lg font-semibold">Project Work is turned off</h2>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          Enable the project-work setting on this environment to use durable tasks and knowledge.
-          Existing records remain stored while the feature is off.
+          Turn on Project Work in this environment's settings to use durable tasks, team runs and
+          knowledge. Existing records stay stored while it is off.
         </p>
       </div>
     </div>

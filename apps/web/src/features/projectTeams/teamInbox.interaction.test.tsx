@@ -755,9 +755,10 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
       );
       expect(host.textContent).toContain("Review retained publication");
       expect(host.textContent).toContain("Unsupported attention reason: future-reason");
-      expect(host.textContent).not.toContain("Resolved " + at);
+      expect(host.querySelector(`time[datetime="${at}"]`)).toBeNull();
       await click("Include resolved attention");
-      expect(host.textContent).toContain("Resolved " + at);
+      expect(host.textContent).toContain("Resolved ");
+      expect(host.querySelector(`time[datetime="${at}"]`)).not.toBeNull();
       expect(
         [...host.querySelectorAll("button")].filter(
           (item) => item.textContent === "Review task attention",
@@ -1367,8 +1368,10 @@ describe("Team and Inbox through mounted authenticated environment atoms", () =>
             : status[0]!.toUpperCase() + status.slice(1),
       );
       if (status === "failed") expect(host.textContent).toContain("Worker start rejected");
-      if (status === "disconnected")
-        expect(host.textContent).toContain("Last recorded update " + at);
+      if (status === "disconnected") {
+        expect(host.textContent).toContain("Last recorded update ");
+        expect(host.querySelector(`time[datetime="${at}"]`)).not.toBeNull();
+      }
       expect(reads.every((input) => input.operation === "foundation-records")).toBe(true);
       expect(writes).toEqual([]);
     });

@@ -34,6 +34,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
 import { WorkCard, WorkDataNotice } from "./WorkDataNotice";
+import { WorkSectionHeader } from "./WorkLayout";
 import { WorkCommandFailureNotice } from "./WorkCommandFailureNotice";
 import { projectWorkCommandFailure, type ProjectWorkCommandFailure } from "./workCommandFailure";
 import {
@@ -529,20 +530,20 @@ function WorkTaskQueue({
           onInvestigate={investigate}
         />
       ) : null}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">Tasks</h2>
-          <p className="text-sm text-muted-foreground">A bounded view of the project queue.</p>
-        </div>
-        <Button
-          size="sm"
-          onClick={() => setShowNewTask((current) => !current)}
-          disabled={!queueCanWrite}
-          title={!queueCanWrite ? "Reconnect to create a task" : undefined}
-        >
-          <PlusIcon /> New task
-        </Button>
-      </div>
+      <WorkSectionHeader
+        title="Tasks"
+        description="Open a task to scope it, plan it, approve execution and verify the result."
+        actions={
+          <Button
+            size="sm"
+            onClick={() => setShowNewTask((current) => !current)}
+            disabled={!queueCanWrite}
+            title={!queueCanWrite ? "Reconnect to create a task" : undefined}
+          >
+            <PlusIcon /> New task
+          </Button>
+        }
+      />
       {showNewTask ? (
         <NewTaskForm
           key={`${environmentId}:${projectId}`}
@@ -902,7 +903,7 @@ function TaskRow({
     <WorkCard className="p-0">
       <button
         type="button"
-        className="flex w-full items-start justify-between gap-3 p-4 text-left"
+        className="flex w-full items-start justify-between gap-3 rounded-xl p-4 text-left outline-none hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-ring"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
@@ -917,7 +918,8 @@ function TaskRow({
         <span className="flex shrink-0 items-center gap-2">
           <Badge variant={taskStateVariant(task.state)}>{taskStateLabel(task.state)}</Badge>
           <ChevronDownIcon
-            className={`size-4 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`}
+            aria-hidden
+            className={`size-4 text-muted-foreground ${open ? "rotate-180" : ""}`}
           />
         </span>
       </button>
@@ -1024,8 +1026,9 @@ function LinkedTaskDetail({
   )
     return <p>The linked task is unavailable or unsupported. Refresh the current project.</p>;
   return (
-    <WorkCard>
-      <h3 className="mb-3 font-medium">{context.task.title}</h3>
+    <WorkCard className="border-primary/30">
+      <p className="text-xs text-muted-foreground">Linked task</p>
+      <h3 className="mb-3 text-base font-semibold">{context.task.title}</h3>
       <ManagedTaskDetail
         {...props}
         task={context.task}

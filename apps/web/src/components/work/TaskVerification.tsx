@@ -20,6 +20,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
 import { WorkCard } from "./WorkDataNotice";
+import { WorkDetails, WorkDisclosure, workSelectClass } from "./WorkLayout";
 import { projectWorkCommandFailure } from "./workCommandFailure";
 import type {
   EnvironmentId,
@@ -639,8 +640,8 @@ function VerificationSession(props: TaskVerificationProps) {
   };
   return (
     <WorkCard>
-      <h4 className="font-medium">Verification</h4>
-      <p className="text-sm text-muted-foreground">
+      <h4 className="font-semibold">Verification</h4>
+      <p className="mt-0.5 text-sm text-muted-foreground">
         Prepare an exact command for human approval. Approval does not run it or record a
         verification result.
       </p>
@@ -670,110 +671,116 @@ function VerificationSession(props: TaskVerificationProps) {
         </p>
       )}
       {selected && !currentSelected && (
-        <p role="status">
+        <p role="status" className="mt-2 text-sm text-warning-foreground">
           The selected assignment changed. Select it again after reviewing the current work.
         </p>
       )}
-      <fieldset disabled={!access || busy || pending !== null} className="mt-3 space-y-3">
-        <label className="block text-sm">
-          Completed assignment
-          <select
-            aria-label="Completed assignment"
-            value={currentSelected?.recordId ?? ""}
-            onChange={(e) =>
-              setSelected(target?.bindings.find((b) => b.recordId === e.target.value) ?? null)
+      <WorkDisclosure
+        className="mt-3"
+        summary="Prepare a verification command"
+        hint="Exact executable, arguments and limits"
+      >
+        <fieldset disabled={!access || busy || pending !== null} className="space-y-3">
+          <label className="flex flex-col gap-1 text-sm">
+            Completed assignment
+            <select
+              aria-label="Completed assignment"
+              value={currentSelected?.recordId ?? ""}
+              onChange={(e) =>
+                setSelected(target?.bindings.find((b) => b.recordId === e.target.value) ?? null)
+              }
+              className={workSelectClass}
+            >
+              <option value="">Select the original completed assignment</option>
+              {target?.bindings.map((b) => (
+                <option key={b.recordId} value={b.recordId}>
+                  {b.recordId} · {b.worktree} · {b.branch}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            Absolute executable
+            <Input
+              aria-label="Verification executable"
+              value={executable}
+              onChange={(e) => setExecutable(e.target.value)}
+              placeholder="/absolute/path/to/test-runner"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            Literal arguments (JSON array)
+            <Textarea
+              aria-label="Verification arguments"
+              value={argv}
+              onChange={(e) => setArgv(e.target.value)}
+            />
+          </label>
+          <p className="text-xs text-muted-foreground">
+            For example ["--filter", "remote reconnect"]. Arguments are passed in order without a
+            shell, using a clean environment.
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="flex flex-col gap-1 text-sm">
+              Timeout (ms)
+              <Input
+                aria-label="Verification timeout"
+                type="number"
+                min={1}
+                max={3600000}
+                value={duration}
+                onChange={(e) => setDuration(e.target.value)}
+              />
+            </label>
+            <label className="flex flex-col gap-1 text-sm">
+              Output limit (bytes)
+              <Input
+                aria-label="Verification output limit"
+                type="number"
+                min={1}
+                max={1048576}
+                value={output}
+                onChange={(e) => setOutput(e.target.value)}
+              />
+            </label>
+          </div>
+          <div>
+            <p className="text-sm font-medium">Criterion coverage</p>
+            {target?.context.criteria
+              .filter((c) => target.task.specification?.criterionIds.includes(c.criterionId))
+              .map((c) => (
+                <label key={c.criterionId} className="mt-1 flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    aria-label={`Cover ${c.description}`}
+                    checked={covered.includes(c.criterionId)}
+                    onChange={(e) =>
+                      setCovered((ids) =>
+                        e.target.checked
+                          ? [...ids, c.criterionId]
+                          : ids.filter((id) => id !== c.criterionId),
+                      )
+                    }
+                  />
+                  {c.description}
+                </label>
+              ))}
+          </div>
+          <Button
+            size="sm"
+            disabled={
+              !target?.eligible ||
+              !currentSelected ||
+              covered.length === 0 ||
+              acceptedRevision === target?.context.revision ||
+              target.gates.some((g) => g.status === "pending")
             }
-            className="mt-1 block w-full rounded-md border bg-background p-2"
+            onClick={propose}
           >
-            <option value="">Select the original completed assignment</option>
-            {target?.bindings.map((b) => (
-              <option key={b.recordId} value={b.recordId}>
-                {b.recordId} · {b.worktree} · {b.branch}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="block text-sm">
-          Absolute executable
-          <Input
-            aria-label="Verification executable"
-            value={executable}
-            onChange={(e) => setExecutable(e.target.value)}
-            placeholder="/absolute/path/to/test-runner"
-          />
-        </label>
-        <label className="block text-sm">
-          Literal arguments (JSON array)
-          <Textarea
-            aria-label="Verification arguments"
-            value={argv}
-            onChange={(e) => setArgv(e.target.value)}
-          />
-        </label>
-        <p className="text-xs text-muted-foreground">
-          For example ["--filter", "remote reconnect"]. Arguments are passed in order without a
-          shell, using a clean environment.
-        </p>
-        <div className="flex flex-wrap gap-3">
-          <label className="text-sm">
-            Timeout (ms)
-            <Input
-              aria-label="Verification timeout"
-              type="number"
-              min={1}
-              max={3600000}
-              value={duration}
-              onChange={(e) => setDuration(e.target.value)}
-            />
-          </label>
-          <label className="text-sm">
-            Output limit (bytes)
-            <Input
-              aria-label="Verification output limit"
-              type="number"
-              min={1}
-              max={1048576}
-              value={output}
-              onChange={(e) => setOutput(e.target.value)}
-            />
-          </label>
-        </div>
-        <div>
-          <p className="text-sm">Criterion coverage</p>
-          {target?.context.criteria
-            .filter((c) => target.task.specification?.criterionIds.includes(c.criterionId))
-            .map((c) => (
-              <label key={c.criterionId} className="mt-1 flex items-start gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  aria-label={`Cover ${c.description}`}
-                  checked={covered.includes(c.criterionId)}
-                  onChange={(e) =>
-                    setCovered((ids) =>
-                      e.target.checked
-                        ? [...ids, c.criterionId]
-                        : ids.filter((id) => id !== c.criterionId),
-                    )
-                  }
-                />
-                {c.description}
-              </label>
-            ))}
-        </div>
-        <Button
-          size="sm"
-          disabled={
-            !target?.eligible ||
-            !currentSelected ||
-            covered.length === 0 ||
-            acceptedRevision === target?.context.revision ||
-            target.gates.some((g) => g.status === "pending")
-          }
-          onClick={propose}
-        >
-          Propose verification
-        </Button>
-      </fieldset>
+            Propose verification
+          </Button>
+        </fieldset>
+      </WorkDisclosure>
       {target?.gates.slice(visibleGatePage * 8, visibleGatePage * 8 + 8).map((gate) => {
         const currentReview = usableReview?.gateId === gate.recordId ? usableReview.record : null;
         const manifest = currentReview?.manifest;
@@ -786,9 +793,11 @@ function VerificationSession(props: TaskVerificationProps) {
                   ? "Approved"
                   : `Verification gate · ${gate.status}`}
             </h5>
-            <p className="break-all text-xs text-muted-foreground">
-              Job {gate.verificationJobId} · Hash {gate.contentHash}
-            </p>
+            <WorkDetails>
+              <p>
+                Job {gate.verificationJobId} · Hash {gate.contentHash}
+              </p>
+            </WorkDetails>
             {(gate.status === "pending" || gate.status === "approved") && (
               <Button
                 size="sm"
@@ -801,7 +810,7 @@ function VerificationSession(props: TaskVerificationProps) {
             )}
             {manifest && (
               <div className="space-y-2 text-sm">
-                <dl className="grid gap-1">
+                <dl className="grid gap-x-4 gap-y-1 sm:grid-cols-[minmax(10rem,auto)_1fr] [&_dt]:text-muted-foreground">
                   <dt>Verification type</dt>
                   <dd>
                     {manifest.integrationCoverage !== undefined
@@ -861,8 +870,8 @@ function VerificationSession(props: TaskVerificationProps) {
                     {manifest.executable.sha256} / {manifest.executable.runtimeClosureSha256}
                   </dd>
                 </dl>
-                <p>Criterion coverage</p>
-                <ul>
+                <p className="font-medium">Criterion coverage</p>
+                <ul className="space-y-1">
                   {manifest.criteria.map((item) => (
                     <li key={item.criterionId}>
                       {item.criterionId} · revision {item.revision} ·{" "}
@@ -876,7 +885,7 @@ function VerificationSession(props: TaskVerificationProps) {
               </div>
             )}
             {gate.status === "pending" && (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <Button
                   aria-label="Approve verification"
                   size="sm"
@@ -933,7 +942,7 @@ function VerificationSession(props: TaskVerificationProps) {
         </div>
       )}
       {pending?.uncertain && (
-        <div className="mt-3 flex gap-2">
+        <div className="mt-3 flex flex-wrap gap-2">
           <Button
             variant="outline"
             size="sm"

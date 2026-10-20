@@ -16,12 +16,19 @@ import {
   type ProjectWorkAttributionRead,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useContext, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+import { RefreshCwIcon } from "lucide-react";
+import { Fragment, useContext, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Checkbox } from "../../components/ui/checkbox";
 import { WorkCard } from "../../components/work/WorkDataNotice";
+import {
+  WorkLabel,
+  WorkSectionHeader,
+  WorkTime,
+  workStateLabel,
+} from "../../components/work/WorkLayout";
 import {
   WorkTeamFoundation,
   type WorkTeamFoundationView,
@@ -601,42 +608,203 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
       );
     }
   }
+  const inspection = selectedRecord ? (
+    <WorkCard className="ml-0 border-primary/30 sm:ml-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <h3 className="break-all font-medium">Inspecting {selectedRecord.recordId}</h3>
+        <Button size="xs" variant="ghost" onClick={() => setSelected(null)}>
+          Close inspection
+        </Button>
+      </div>
+      <RecordMetadata record={selectedRecord} />
+      {selectedRecord.kind === "memory-source" || selectedRecord.kind === "memory-observation" ? (
+        unavailable ? (
+          <p className="mt-3 text-sm text-warning-foreground">Content hidden: {unavailable}</p>
+        ) : (
+          <pre className="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border/60 bg-background/60 p-3 font-sans text-sm">
+            {selectedRecord.kind === "memory-source" ? selectedRecord.content : selectedRecord.body}
+          </pre>
+        )
+      ) : null}
+      {selectedRecord.kind === "memory-source" && sourceRecord(selectedRecord) ? (
+        <div className="mt-4 space-y-2 border-t border-border/60 pt-3 text-sm">
+          <WorkLabel>Sharing</WorkLabel>
+          <p className="text-muted-foreground">
+            Share this inspected source with projects in this environment. The source stays owned by
+            this project; no copy is created. Replacing the grant set removes projects you deselect.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={!sharingAllowed || sharingBusy}
+            onClick={() => {
+              if (!sharingAllowed || sharingBusy) return;
+              const snapshot = access.current.foundation.verify();
+              if (snapshot.revision === null) return;
+              setSharingReview({
+                source: selectedRecord,
+                revision: snapshot.revision,
+                grants: [...selectedRecord.sharedWithProjectIds],
+              });
+            }}
+          >
+            Review sharing
+          </Button>
+          {sharingReview && selectedRecord.recordId === sharingReview.source.recordId ? (
+            <div className="space-y-2 rounded-lg border border-border/60 p-3">
+              <p>
+                Reviewed grants: {sharingReview.source.sharedWithProjectIds.join(", ") || "None"}.
+                Choose the complete replacement set, then apply it. An empty set revokes all
+                sharing.
+              </p>
+              {!sharingReviewCurrent ? (
+                <p className="text-warning-foreground">
+                  Sharing changed. Review current sharing again.
+                </p>
+              ) : null}
+              {projects
+                .filter(
+                  (project) =>
+                    project.environmentId === props.environmentId && project.id !== props.projectId,
+                )
+                .map((project) => (
+                  <label key={project.id} className="flex items-center gap-2">
+                    <Checkbox
+                      aria-label={`Share with ${project.title}`}
+                      checked={sharingReview.grants.includes(project.id)}
+                      disabled={
+                        !sharingAllowed ||
+                        sharingBusy ||
+                        !sharingReviewCurrent ||
+                        (!sharingReview.grants.includes(project.id) &&
+                          sharingReview.grants.length >= 32)
+                      }
+                      onCheckedChange={(checked) =>
+                        setSharingReview((review) =>
+                          review === null
+                            ? null
+                            : {
+                                ...review,
+                                grants: checked
+                                  ? [...new Set([...review.grants, project.id])]
+                                  : review.grants.filter((id) => id !== project.id),
+                              },
+                        )
+                      }
+                    />
+                    {project.title}
+                  </label>
+                ))}
+              <p>New grants: {sharingReview.grants.join(", ") || "None (revoke all)"}</p>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!sharingAllowed || sharingBusy || !sharingReviewCurrent}
+                  onClick={() =>
+                    setSharingReview((review) =>
+                      review === null ? null : { ...review, grants: [] },
+                    )
+                  }
+                >
+                  Clear all grants
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={!sharingAllowed || sharingBusy || !sharingReviewCurrent}
+                  onClick={() => void replaceShares(false)}
+                >
+                  Apply sharing changes
+                </Button>
+              </div>
+            </div>
+          ) : null}
+          <WorkLabel className="pt-2">Retract</WorkLabel>
+          <p className="text-muted-foreground">
+            Retract this memory copy and revoke its shares. The underlying issue, decision or
+            evidence is preserved. Physical cleanup waits for an approved task.
+          </p>
+          <Button
+            size="sm"
+            variant="destructive-outline"
+            disabled={
+              !fresh ||
+              !props.writesSupported ||
+              sharingBusy ||
+              (submission !== null && !recordedRetraction) ||
+              unavailable !== null
+            }
+            onClick={() => void retract(false)}
+          >
+            Retract memory
+          </Button>
+          {!props.writesSupported ? (
+            <p className="text-muted-foreground">
+              This environment does not support human memory writes.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </WorkCard>
+  ) : null;
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <div>
-        <h2 className="text-lg font-semibold">Memory</h2>
-        <p className="text-sm text-muted-foreground">
-          {fresh ? "Current recorded memory" : "Cached or incomplete memory"}
-          {updatedAt ? ` · Last recorded update ${updatedAt}` : ""}
-        </p>
+      <div className="space-y-2">
+        <WorkSectionHeader
+          title="Memory"
+          status={
+            <>
+              {fresh ? "Current recorded memory" : "Cached or incomplete memory"}
+              {updatedAt ? (
+                <>
+                  {" · Last recorded update "}
+                  <WorkTime value={updatedAt} />
+                </>
+              ) : null}
+            </>
+          }
+          description="Sources the team learned from and the observations extracted from them. Observations are extracted knowledge, not accepted decisions."
+          actions={
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!active}
+              onClick={props.foundation.refresh}
+            >
+              <RefreshCwIcon aria-hidden />
+              Refresh memory
+            </Button>
+          }
+        />
         {!props.enabled ? (
-          <p>Project Work is disabled. Enable it to inspect current memory content.</p>
+          <p className="text-sm text-warning-foreground">
+            Project Work is disabled. Enable it to inspect current memory content.
+          </p>
         ) : null}
         {!fresh ? (
-          <p>
+          <p className="text-sm text-warning-foreground">
             Source and observation content is hidden until a complete fresh connected snapshot is
             available.
           </p>
         ) : null}
         {unknown ? (
-          <p>Unsupported records are present. Current memory content is unavailable.</p>
+          <p className="text-sm text-warning-foreground">
+            Unsupported records are present. Current memory content is unavailable.
+          </p>
         ) : null}
-        <p className="text-sm text-muted-foreground">
-          Observations are extracted knowledge, not accepted decisions. Index and deletion states
-          are recorded outcomes; retrieval health and physical cleanup are not verified here.
+        <p className="text-xs text-muted-foreground">
+          Index and deletion states are recorded outcomes; retrieval health and physical cleanup are
+          not verified here.
         </p>
-        <Button size="sm" variant="outline" disabled={!active} onClick={props.foundation.refresh}>
-          Refresh memory
-        </Button>
         {notice ? (
-          <p role="status">
+          <p role="status" className="text-sm">
             {recordedRetraction
               ? "Memory retracted locally. Backend cleanup requires an approved task; inspect its recorded deletion outcome."
               : notice}
           </p>
         ) : null}
         {sharingNotice ? (
-          <p role="status">
+          <p role="status" className="text-sm">
             {sharingRecorded
               ? "Sharing update recorded. Inspect current grants before another change."
               : sharingNotice}
@@ -644,6 +812,7 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
         ) : null}
         {sharing?.status === "uncertain" ? (
           <Button
+            size="sm"
             disabled={!fresh || !props.writesSupported}
             onClick={() => void replaceShares(true)}
           >
@@ -651,7 +820,11 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
           </Button>
         ) : null}
         {submission?.status === "uncertain" ? (
-          <Button disabled={!fresh || !props.writesSupported} onClick={() => void retract(true)}>
+          <Button
+            size="sm"
+            disabled={!fresh || !props.writesSupported}
+            onClick={() => void retract(true)}
+          >
             Retry exact retraction
           </Button>
         ) : null}
@@ -662,162 +835,48 @@ function MemorySnapshot(props: MemoryProps & { readonly foundation: WorkTeamFoun
         </p>
       ) : null}
       {records.slice(start, start + PAGE_SIZE).map((record) => (
-        <WorkCard key={record.recordId}>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="break-all font-medium">
-              {record.kind === "effect" ? record.effectKind : record.kind.slice(7)} ·{" "}
-              {record.recordId}
-            </h3>
-            <Badge variant="outline">Recorded {record.status}</Badge>
-          </div>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Revision {record.revision} · Generation {record.generation} · Updated {record.updatedAt}
-          </p>
-          <Button
-            className="mt-2"
-            size="sm"
-            variant="outline"
-            aria-pressed={selected === record.recordId}
-            onClick={() => {
-              setSharingReview(null);
-              setSelected(selected === record.recordId ? null : record.recordId);
-              setInspectedSource(record.kind === "memory-source" ? record : null);
-              if (recordedRetraction) store(null);
-            }}
-          >
-            Inspect {record.recordId}
-          </Button>
-        </WorkCard>
-      ))}
-      {selectedRecord ? (
-        <WorkCard>
-          <h3 className="break-all font-medium">Inspecting {selectedRecord.recordId}</h3>
-          <RecordMetadata record={selectedRecord} />
-          {selectedRecord.kind === "memory-source" ||
-          selectedRecord.kind === "memory-observation" ? (
-            unavailable ? (
-              <p className="mt-3">Content hidden: {unavailable}</p>
-            ) : (
-              <pre className="mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-all text-sm">
-                {selectedRecord.kind === "memory-source"
-                  ? selectedRecord.content
-                  : selectedRecord.body}
-              </pre>
-            )
-          ) : null}
-          {selectedRecord.kind === "memory-source" && sourceRecord(selectedRecord) ? (
-            <div className="mt-3">
-              <p>
-                Share this inspected source with projects in this environment. The source stays
-                owned by this project; no copy is created. Replacing the grant set removes projects
-                you deselect.
-              </p>
-              <Button
-                variant="outline"
-                disabled={!sharingAllowed || sharingBusy}
-                onClick={() => {
-                  if (!sharingAllowed || sharingBusy) return;
-                  const snapshot = access.current.foundation.verify();
-                  if (snapshot.revision === null) return;
-                  setSharingReview({
-                    source: selectedRecord,
-                    revision: snapshot.revision,
-                    grants: [...selectedRecord.sharedWithProjectIds],
-                  });
-                }}
-              >
-                Review sharing
-              </Button>
-              {sharingReview && selectedRecord.recordId === sharingReview.source.recordId ? (
-                <div>
-                  <p>
-                    Reviewed grants:{" "}
-                    {sharingReview.source.sharedWithProjectIds.join(", ") || "None"}. Choose the
-                    complete replacement set, then apply it. An empty set revokes all sharing.
-                  </p>
-                  {!sharingReviewCurrent ? (
-                    <p>Sharing changed. Review current sharing again.</p>
-                  ) : null}
-                  {projects
-                    .filter(
-                      (project) =>
-                        project.environmentId === props.environmentId &&
-                        project.id !== props.projectId,
-                    )
-                    .map((project) => (
-                      <label key={project.id} className="flex items-center gap-2">
-                        <Checkbox
-                          aria-label={`Share with ${project.title}`}
-                          checked={sharingReview.grants.includes(project.id)}
-                          disabled={
-                            !sharingAllowed ||
-                            sharingBusy ||
-                            !sharingReviewCurrent ||
-                            (!sharingReview.grants.includes(project.id) &&
-                              sharingReview.grants.length >= 32)
-                          }
-                          onCheckedChange={(checked) =>
-                            setSharingReview((review) =>
-                              review === null
-                                ? null
-                                : {
-                                    ...review,
-                                    grants: checked
-                                      ? [...new Set([...review.grants, project.id])]
-                                      : review.grants.filter((id) => id !== project.id),
-                                  },
-                            )
-                          }
-                        />
-                        {project.title}
-                      </label>
-                    ))}
-                  <p>New grants: {sharingReview.grants.join(", ") || "None (revoke all)"}</p>
-                  <Button
-                    variant="outline"
-                    disabled={!sharingAllowed || sharingBusy || !sharingReviewCurrent}
-                    onClick={() =>
-                      setSharingReview((review) =>
-                        review === null ? null : { ...review, grants: [] },
-                      )
-                    }
-                  >
-                    Clear all grants
-                  </Button>
-                  <Button
-                    disabled={!sharingAllowed || sharingBusy || !sharingReviewCurrent}
-                    onClick={() => void replaceShares(false)}
-                  >
-                    Apply sharing changes
-                  </Button>
-                </div>
-              ) : null}
-              <p>
-                Retract this memory copy and revoke its shares. The underlying issue, decision or
-                evidence is preserved. Physical cleanup waits for an approved task.
-              </p>
-              <Button
-                disabled={
-                  !fresh ||
-                  !props.writesSupported ||
-                  sharingBusy ||
-                  (submission !== null && !recordedRetraction) ||
-                  unavailable !== null
-                }
-                onClick={() => void retract(false)}
-              >
-                Retract memory
-              </Button>
-              {!props.writesSupported ? (
-                <p>This environment does not support human memory writes.</p>
-              ) : null}
+        <Fragment key={record.recordId}>
+          <WorkCard className="p-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h3 className="break-all font-medium">
+                  {record.kind === "effect"
+                    ? record.effectKind
+                    : workStateLabel(record.kind.slice(7))}{" "}
+                  · {record.recordId}
+                </h3>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Revision {record.revision} · Generation {record.generation} · Updated{" "}
+                  <WorkTime value={record.updatedAt} />
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <Badge variant="outline">Recorded {record.status}</Badge>
+                <Button
+                  size="xs"
+                  variant={selected === record.recordId ? "secondary" : "outline"}
+                  aria-pressed={selected === record.recordId}
+                  onClick={() => {
+                    setSharingReview(null);
+                    setSelected(selected === record.recordId ? null : record.recordId);
+                    setInspectedSource(record.kind === "memory-source" ? record : null);
+                    if (recordedRetraction) store(null);
+                  }}
+                >
+                  Inspect {record.recordId}
+                </Button>
+              </div>
             </div>
-          ) : null}
-          <Button className="mt-3" size="sm" variant="outline" onClick={() => setSelected(null)}>
-            Close inspection
-          </Button>
-        </WorkCard>
-      ) : null}
+          </WorkCard>
+          {selectedRecord?.recordId === record.recordId ? inspection : null}
+        </Fragment>
+      ))}
+      {selectedRecord &&
+      !records
+        .slice(start, start + PAGE_SIZE)
+        .some((record) => record.recordId === selectedRecord.recordId)
+        ? inspection
+        : null}
       <div className="flex gap-2">
         {start > 0 ? (
           <Button

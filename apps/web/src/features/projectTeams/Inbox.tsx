@@ -19,9 +19,18 @@ import * as Schema from "effect/Schema";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useContext, useLayoutEffect, useRef, useState } from "react";
 
+import { RefreshCwIcon } from "lucide-react";
+
+import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Textarea } from "../../components/ui/textarea";
 import { WorkCard } from "../../components/work/WorkDataNotice";
+import {
+  WorkDetails,
+  WorkSectionHeader,
+  WorkTime,
+  workStateLabel,
+} from "../../components/work/WorkLayout";
 import {
   WorkTeamFoundation,
   type WorkTeamFoundationView,
@@ -150,28 +159,32 @@ function InboxSession(props: InboxProps) {
         const question = questions.find((item) => item.recordId === selected);
         return (
           <div className="flex min-w-0 flex-col gap-4">
-            <div>
-              <h2 className="text-lg font-semibold">Questions</h2>
-              <p className="text-sm text-muted-foreground">
-                Human decisions linked to recorded tasks and gates.
-              </p>
+            <div className="space-y-1">
+              <WorkSectionHeader
+                title="Questions"
+                description="Decisions an agent is waiting on. Answering records the decision; the server rechecks eligibility before dependent work resumes."
+              />
               {!props.connected || !foundation.current ? (
-                <p className="text-sm text-muted-foreground">
+                <p className="text-sm text-warning-foreground">
                   Cached or incomplete questions. Reconnect and refresh before answering.
                 </p>
               ) : null}
               {!props.writesSupported ? (
-                <p>This environment does not support question answers.</p>
+                <p className="text-sm text-warning-foreground">
+                  This environment does not support question answers.
+                </p>
               ) : null}
               {foundation.snapshot.records.some((record) => !knownRecord(record)) ? (
-                <p>Unsupported team records are present. Answers are unavailable.</p>
+                <p className="text-sm text-warning-foreground">
+                  Unsupported team records are present. Answers are unavailable.
+                </p>
               ) : null}
               <p className="text-xs text-muted-foreground">
                 Mark seen is unavailable for questions on this environment. Opening a question does
                 not answer or resolve it.
               </p>
             </div>
-            <div className="flex gap-2" role="group" aria-label="Question status">
+            <div className="flex flex-wrap gap-2" role="group" aria-label="Question status">
               {(["pending", "answered", "canceled"] as const).map((status) => (
                 <Button
                   key={status}
@@ -192,26 +205,37 @@ function InboxSession(props: InboxProps) {
             ) : null}
             {filtered.slice(start, start + 128).map((item) => (
               <WorkCard key={item.recordId}>
-                <h3 className="whitespace-pre-wrap font-medium">{item.body}</h3>
-                <p className="mt-2 text-sm text-muted-foreground">
-                  {item.status} · From {item.senderId} · Task {item.taskId}
-                </p>
-                <p className="text-sm text-muted-foreground">
-                  Gate {item.targetGateId} · Revision {item.targetRevision} · Question revision{" "}
-                  {item.revision}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Last recorded update {item.updatedAt} ·{" "}
-                  {item.seenAt ? `Seen ${item.seenAt}` : "Not marked seen"}
-                </p>
-                <p className="mt-2 text-sm">
-                  Why: this question needs a human decision for the linked gate. Answering records
-                  the decision; the server rechecks eligibility before resuming dependent work.
+                <div className="flex items-start justify-between gap-3">
+                  <h3 className="min-w-0 whitespace-pre-wrap break-words font-medium">
+                    {item.body}
+                  </h3>
+                  <Badge variant={item.status === "pending" ? "warning" : "secondary"}>
+                    {workStateLabel(item.status)}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Last recorded update <WorkTime value={item.updatedAt} /> ·{" "}
+                  {item.seenAt ? (
+                    <>
+                      Seen <WorkTime value={item.seenAt} />
+                    </>
+                  ) : (
+                    "Not marked seen"
+                  )}
                 </p>
                 {item.choices.length > 0 ? (
-                  <p className="mt-1 text-sm">Choices: {item.choices.join(" · ")}</p>
+                  <p className="mt-2 text-sm">Choices: {item.choices.join(" · ")}</p>
                 ) : null}
                 {item.answer ? <p className="mt-2 text-sm">Answer: {item.answer}</p> : null}
+                <WorkDetails className="mt-2">
+                  <p>
+                    {item.status} · From {item.senderId} · Task {item.taskId}
+                  </p>
+                  <p>
+                    Gate {item.targetGateId} · Revision {item.targetRevision} · Question revision{" "}
+                    {item.revision}
+                  </p>
+                </WorkDetails>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button variant="outline" size="sm" onClick={() => props.onOpenTask(item.taskId)}>
                     Open task {item.taskId}
@@ -253,7 +277,7 @@ function InboxSession(props: InboxProps) {
                 onSend={sendAnswer}
               />
             ) : selected !== null && !question ? (
-              <p>
+              <p className="text-sm text-warning-foreground">
                 The selected question is no longer available. Its answer draft remains saved in this
                 view.
                 {selected && drafts.get(selected)?.command
@@ -279,15 +303,16 @@ function InboxSession(props: InboxProps) {
     </WorkTeamFoundation>
   );
   return (
-    <>
-      <h2 className="text-lg font-semibold">Inbox</h2>
+    <div className="flex min-w-0 flex-col gap-8">
       <TaskAttention {...props} />
       {props.supported ? (
         questionsInbox
       ) : (
-        <p>This environment does not support the question inbox.</p>
+        <p className="text-sm text-muted-foreground">
+          This environment does not support the question inbox.
+        </p>
       )}
-    </>
+    </div>
   );
 }
 
@@ -428,12 +453,14 @@ function TaskAttention(props: InboxProps) {
   }
   return (
     <div className="flex flex-col gap-3" aria-label="Task attention">
-      <h2 className="text-lg font-semibold">Task attention</h2>
-      <p className="text-sm text-muted-foreground">
-        Retained task notices. Marking seen records acknowledgment; the task stays unresolved.
-      </p>
+      <WorkSectionHeader
+        title="Task attention"
+        description="Task notices that need a look. Marking one seen records acknowledgment; the task stays unresolved."
+      />
       {!props.supported ? (
-        <p>This environment does not support task attention.</p>
+        <p className="text-sm text-muted-foreground">
+          This environment does not support task attention.
+        </p>
       ) : (
         <AttentionPage
           {...props}
@@ -558,21 +585,33 @@ function AttentionPage(
   return (
     <>
       {!props.connected || !current ? (
-        <p>Cached or unavailable task attention. Reconnect and refresh before marking seen.</p>
+        <p className="text-sm text-warning-foreground">
+          Cached or unavailable task attention. Reconnect and refresh before marking seen.
+        </p>
       ) : null}
       {!props.writesSupported ? (
-        <p>This environment does not support task attention acknowledgment.</p>
+        <p className="text-sm text-muted-foreground">
+          This environment does not support task attention acknowledgment.
+        </p>
       ) : null}
-      <Button
-        size="sm"
-        variant="outline"
-        aria-pressed={props.showResolved}
-        onClick={() => props.onShowResolved(!props.showResolved)}
-      >
-        Include resolved attention
-      </Button>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          size="sm"
+          variant={props.showResolved ? "secondary" : "outline"}
+          aria-pressed={props.showResolved}
+          onClick={() => props.onShowResolved(!props.showResolved)}
+        >
+          Include resolved attention
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => registry.refresh(atom)}>
+          <RefreshCwIcon aria-hidden />
+          Refresh task attention
+        </Button>
+      </div>
       {current && rows.length === 0 ? (
-        <p>No {props.showResolved ? "" : "unresolved "}task attention on this page.</p>
+        <p className="text-sm text-muted-foreground">
+          No {props.showResolved ? "" : "unresolved "}task attention on this page.
+        </p>
       ) : null}
       {rows.map((item) => (
         <WorkCard key={JSON.stringify([item.taskId, item.revision, item.resolvedAt])}>
@@ -581,15 +620,32 @@ function AttentionPage(
               ? item.reason
               : `Unsupported attention reason: ${item.reason}`}
           </h3>
-          {item.detail ? <p className="whitespace-pre-wrap text-sm">{item.detail}</p> : null}
-          <p className="text-xs text-muted-foreground">
-            Task {item.taskId} · Revision {item.revision}
+          {item.detail ? (
+            <p className="mt-1 whitespace-pre-wrap break-words text-sm">{item.detail}</p>
+          ) : null}
+          <p className="mt-1 text-xs text-muted-foreground">
+            {item.resolvedAt ? (
+              <>
+                Resolved <WorkTime value={item.resolvedAt} />
+              </>
+            ) : (
+              "Unresolved"
+            )}{" "}
+            ·{" "}
+            {item.seenAt ? (
+              <>
+                Seen <WorkTime value={item.seenAt} />
+              </>
+            ) : (
+              "Not marked seen"
+            )}
           </p>
-          <p className="text-sm">
-            {item.resolvedAt ? `Resolved ${item.resolvedAt}` : "Unresolved"} ·{" "}
-            {item.seenAt ? `Seen ${item.seenAt}` : "Not marked seen"}
-          </p>
-          <div className="flex gap-2">
+          <WorkDetails className="mt-1">
+            <p>
+              Task {item.taskId} · Revision {item.revision}
+            </p>
+          </WorkDetails>
+          <div className="mt-3 flex flex-wrap gap-2">
             <Button size="sm" variant="outline" onClick={() => props.onOpenTask(item.taskId)}>
               Open task {item.taskId}
             </Button>
@@ -607,7 +663,10 @@ function AttentionPage(
         </WorkCard>
       ))}
       {props.review ? (
-        <div className="flex flex-col gap-2" aria-label="Review task attention">
+        <div
+          className="flex flex-col gap-2 rounded-xl border border-primary/30 bg-card/50 p-4 text-sm"
+          aria-label="Review task attention"
+        >
           <p className="whitespace-pre-wrap">
             Reviewing task {props.review.occurrence.taskId}: {props.review.occurrence.reason}
             {props.review.occurrence.detail ? ` · ${props.review.occurrence.detail}` : ""}
@@ -617,7 +676,9 @@ function AttentionPage(
           ) : null}
           {props.review.notice ? <p>{props.review.notice}</p> : null}
           {props.review.command ? (
-            <p className="text-xs">Original command {props.review.command.commandId}</p>
+            <p className="break-all text-xs text-muted-foreground">
+              Original command {props.review.command.commandId}
+            </p>
           ) : null}
           {props.review.status === "uncertain" ? (
             <Button
@@ -640,7 +701,7 @@ function AttentionPage(
           )}
         </div>
       ) : null}
-      <div className="flex gap-2">
+      <div className="flex flex-wrap gap-2">
         {props.offset > 0 ? (
           <Button
             size="sm"
@@ -661,9 +722,6 @@ function AttentionPage(
             Next attention page
           </Button>
         ) : null}
-        <Button size="sm" variant="outline" onClick={() => registry.refresh(atom)}>
-          Refresh task attention
-        </Button>
       </div>
     </>
   );
@@ -891,10 +949,12 @@ function QuestionEditor(
   }
   const frozen = draft.command !== undefined;
   return (
-    <WorkCard>
+    <WorkCard className="border-primary/30">
       <h3 className="font-medium">Answer question</h3>
       {changed ? (
-        <p className="mt-2 text-sm">Question changed. Your answer draft is preserved.</p>
+        <p className="mt-2 text-sm text-warning-foreground">
+          Question changed. Your answer draft is preserved.
+        </p>
       ) : null}
       {draft.notice ? (
         <p role="status" className="mt-2 text-sm">

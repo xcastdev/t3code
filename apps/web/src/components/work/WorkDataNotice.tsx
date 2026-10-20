@@ -54,14 +54,17 @@ export function WorkDataNotice({
 }
 
 export function WorkCard({
+  id,
   className,
   children,
 }: {
-  readonly className?: string;
+  readonly id?: string;
+  readonly className?: string | undefined;
   readonly children: React.ReactNode;
 }) {
   return (
     <section
+      id={id}
       className={cn("rounded-xl border border-border/70 bg-card/50 p-4 shadow-sm/5", className)}
     >
       {children}

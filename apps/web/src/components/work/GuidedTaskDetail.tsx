@@ -19,13 +19,26 @@ import {
   type ProjectTeamBindingAccounting,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { RefreshCwIcon } from "lucide-react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import { randomUUID } from "../../lib/utils";
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
 import { IntegrationSources } from "./IntegrationSources";
+import { TaskStageRail } from "./TaskStageRail";
+import { taskStages, type TaskStageId } from "./taskStages";
 import { WorkCard } from "./WorkDataNotice";
+import {
+  WorkDetails,
+  WorkDisclosure,
+  WorkLabel,
+  WorkSectionHeader,
+  workSelectClass,
+  workStateLabel,
+} from "./WorkLayout";
+import { taskStateLabel, taskStateVariant } from "./workPresentation";
 import {
   beginGuidedTaskSubmission,
   compareGuidedTaskDraft,
@@ -102,6 +115,23 @@ const controls = [
   "cancel",
   "reassign",
 ] as const;
+const CONTROL_LABELS: Record<(typeof controls)[number], string> = {
+  defer: "Defer",
+  reopen: "Reopen",
+  pause: "Pause",
+  resume: "Resume",
+  "resolve-failure": "Resolve failure",
+  cancel: "Cancel",
+  reassign: "Reassign",
+};
+const gateVariant = (status: Gate["status"]) =>
+  status === "approved" || status === "consumed"
+    ? "success"
+    : status === "rejected"
+      ? "error"
+      : status === "invalidated"
+        ? "warning"
+        : "info";
 
 /** Ownership changes remount local drafts and fence callbacks from the previous task. */
 export function GuidedTaskDetail(props: GuidedTaskDetailProps) {
@@ -150,6 +180,10 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   } | null>(null);
   const [waiverCriterionId, setWaiverCriterionId] = useState<string | null>(null);
   const [newCriterionId] = useState(() => ProjectWorkCriterionId.make(randomUUID()));
+  const sectionPrefix = useId();
+  const sectionId = (stage: TaskStageId) => `${sectionPrefix}-${stage}`;
+  const jumpTo = (stage: TaskStageId) =>
+    document.getElementById(sectionId(stage))?.scrollIntoView({ block: "start" });
   useEffect(
     () => () => {
       lifetime.current += 1;
@@ -982,19 +1016,32 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   const extraCriteria = Object.keys(draftDescriptions).filter((field) =>
     field.startsWith("new-criterion:"),
   );
+  const stages = taskStages({
+    state: task.state,
+    hasSpecification: task.specification !== undefined,
+    specificationGate: specGate?.status,
+    hasPlan: plan !== undefined,
+    planGate: planGate?.status,
+    executionGranted,
+    workerActive: writer,
+  });
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-medium">{task.title}</h2>
-          <p className="text-xs text-muted-foreground">
-            {task.state} · Project revision {context?.revision} · Specification {task.specRevision}
-          </p>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <Badge variant={taskStateVariant(task.state)}>{taskStateLabel(task.state)}</Badge>
+          <WorkDetails summary="Revisions">
+            <p>
+              {task.state} · Project revision {context?.revision} · Specification{" "}
+              {task.specRevision}
+            </p>
+          </WorkDetails>
         </div>
         <Button size="sm" variant="outline" onClick={onRefresh}>
-          Refresh task
+          <RefreshCwIcon aria-hidden /> Refresh task
         </Button>
       </div>
+      <TaskStageRail stages={stages.stages} next={stages.next} onSelect={jumpTo} />
       {!access || !baselineReady ? (
         <p role="status" className="text-sm text-warning-foreground">
           {!props.connected
@@ -1022,7 +1069,8 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
       ) : null}
       {exhaustedEpisodes.length > 0 ? (
         <WorkCard>
-          <h3 className="mb-3 font-medium">Exhausted repair episode</h3>
+          <h3 className="mb-3 font-semibold">Repair decision needed</h3>
+          <p className="-mt-2 mb-3 text-xs text-muted-foreground">Exhausted repair episode</p>
           {repairDecisionEpisode && linkedRepairBlocker ? (
             <>
               <p className="text-sm">{linkedRepairBlocker.reason}</p>
@@ -1036,6 +1084,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
                   <span>Repair decision</span>
                   <select
                     aria-label="Repair decision"
+                    className={workSelectClass}
                     value={draftFor("project-team.repair.resolve")?.fields.decision ?? "diagnose"}
                     disabled={Boolean(draftFor("project-team.repair.resolve")?.pending)}
                     onChange={(event) =>
@@ -1077,268 +1126,32 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
           )}
         </WorkCard>
       ) : null}
-      <WorkCard>
-        <h3 className="mb-3 font-medium">Recorded workers</h3>
-        <p className="mb-3 text-xs text-muted-foreground">
-          {props.connected && complete
-            ? "Recorded worker history"
-            : "Cached or incomplete worker history"}
-        </p>
-        {workers.slice(visibleWorkerPage * 10, (visibleWorkerPage + 1) * 10).map((run) => {
-          if (run.kind !== "run-binding") return null;
-          const role = one(
-            records.filter(
-              (record) =>
-                record.kind === "role-revision" &&
-                record.projectId === projectId &&
-                record.recordId === run.roleRevisionId &&
-                recordCounts.get(record.recordId) === 1,
-            ),
-          );
-          return (
-            <div key={run.recordId} className="mb-3 space-y-1 text-sm">
-              <p>
-                {role?.kind === "role-revision" ? role.role : "Role unavailable"} · {run.model} ·{" "}
-                {run.status}
-              </p>
-              <p className="text-xs text-muted-foreground">
-                Run {run.recordId} · Attempt {run.attemptId}
-              </p>
-              {projectTeamAccountingCaptions(
-                asProjectTeamBindingAccounting(
-                  props.accounting?.find((item) => item.bindingId === run.recordId),
-                  run,
-                ),
-              ).map((caption) => (
-                <p key={caption} className="break-words text-xs text-muted-foreground">
-                  {caption}
-                </p>
-              ))}
-              <p className="text-xs text-muted-foreground">
-                Specification {run.specRevision} · plan {run.planRevision}
-              </p>
-              <p className="break-all text-xs text-muted-foreground">
-                {run.worktree} · {run.branch}
-              </p>
-              <a
-                className="text-primary underline"
-                href={`/${encodeURIComponent(environmentId)}/${encodeURIComponent(run.threadId)}`}
-              >
-                Worker thread {run.threadId}
-              </a>
-            </div>
-          );
-        })}
-        {workers.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No workers recorded for this task.</p>
-        ) : null}
-        {workerPages > 1 ? (
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={visibleWorkerPage === 0}
-              onClick={() => setWorkerPage(visibleWorkerPage - 1)}
-            >
-              Previous workers
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={visibleWorkerPage + 1 === workerPages}
-              onClick={() => setWorkerPage(visibleWorkerPage + 1)}
-            >
-              Next workers
-            </Button>
-            <span className="text-xs text-muted-foreground">
-              Page {visibleWorkerPage + 1} of {workerPages}
-            </span>
-          </div>
-        ) : null}
-      </WorkCard>
-      <WorkCard>
-        <h3 className="mb-3 font-medium">Internal findings</h3>
-        {[...commentsById.values()].map((comment) => (
-          <p key={comment.commentId} className="mb-2 whitespace-pre-wrap break-words text-sm">
-            {comment.body}
-          </p>
-        ))}
-        {[...evidenceById.values()].map((evidence) => (
-          <details key={evidence.evidenceId} className="mb-2 text-sm">
-            <summary>{evidence.summary}</summary>
-            <p className="whitespace-pre-wrap break-words">{evidence.detail ?? evidence.summary}</p>
-            <p className="text-xs text-muted-foreground">
-              Task {evidence.taskId} · Evidence {evidence.evidenceId}
-            </p>
-          </details>
-        ))}
-        {!commentsById.size && !evidenceById.size ? (
-          <p className="mb-3 text-sm text-muted-foreground">No findings have been recorded yet.</p>
-        ) : null}
-        <details className="mt-3">
-          <summary className="cursor-pointer text-sm font-medium">Investigate this task</summary>
-          <div className="mt-3 space-y-3">
-            {field(
-              "project-team.investigation.start",
-              "objective",
-              "Investigation objective",
-              task.summary ?? task.title,
-              32000,
-            )}
-            {field(
-              "project-team.investigation.start",
-              "outputs",
-              "Expected findings (one per line)",
-              "Findings, sources, and unresolved decisions",
-              64000,
-            )}
-            <p className="text-xs text-muted-foreground">
-              Starts linked research. Implementation still requires specification and plan approval.
-            </p>
-            <Button
-              size="sm"
-              disabled={
-                !canWrite ||
-                terminal ||
-                stopped ||
-                repair ||
-                blockedDraft("project-team.investigation.start")
-              }
-              onClick={() => submit("project-team.investigation.start")}
-            >
-              Start investigation
-            </Button>
-            {status("project-team.investigation.start")}
-          </div>
-        </details>
-        <details className="mt-3">
-          <summary className="cursor-pointer text-sm font-medium">Implementation subtask</summary>
-          <div className="mt-3 space-y-3">
-            <fieldset
-              disabled={
-                !canWrite ||
-                Boolean(implementationDraft?.pending) ||
-                !plan ||
-                plan.specRevision !== task.specRevision ||
-                specGate?.status !== "approved" ||
-                planGate?.status !== "approved" ||
-                specGate.attribution.actor.kind !== "human" ||
-                planGate.attribution.actor.kind !== "human"
-              }
-            >
-              <legend className="text-sm">Approved parent criteria (select 1–64)</legend>
-              {approvedCriteria.map((criterion) => (
-                <label key={criterion.criterionId} className="flex items-start gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={selectedImplementationCriteria.includes(criterion.criterionId)}
-                    disabled={
-                      !selectedImplementationCriteria.includes(criterion.criterionId) &&
-                      selectedImplementationCriteria.length >= 64
-                    }
-                    onChange={(event) => {
-                      if (!currentCallback() || implementationDraft?.pending) return;
-                      const selected = event.target.checked
-                        ? [...selectedImplementationCriteria, criterion.criterionId]
-                        : selectedImplementationCriteria.filter(
-                            (id) => id !== criterion.criterionId,
-                          );
-                      edit(implementationKind, {
-                        parentCriterionIds: encodeCriterionIds(selected),
-                      });
-                    }}
-                  />
-                  {criterion.description}
-                </label>
-              ))}
-            </fieldset>
-            {selectedImplementationCriteria.some(
-              (id) => !approvedCriteria.some((criterion) => criterion.criterionId === id),
-            ) ? (
-              <p role="status" className="text-sm text-warning-foreground">
-                Selected parent criteria changed. Review the selection or discard the local draft.
-              </p>
-            ) : null}
-            {field(
-              implementationKind,
-              "objective",
-              "Implementation objective",
-              "Implement the selected approved acceptance criteria.",
-              32000,
-            )}
-            {field(
-              implementationKind,
-              "outputs",
-              "Expected implementation outputs (one per line)",
-              "Implementation and focused validation results",
-              64000,
-            )}
-            <p className="text-xs text-muted-foreground">
-              Creates a linked implementation task from the selected approved criteria and current
-              approved plan. Uses the task's remaining budget and original deadline.
-            </p>
-            <Button
-              size="sm"
-              disabled={
-                !canWrite ||
-                !build(implementationKind, implementationDraft?.fields) ||
-                blockedDraft(implementationKind)
-              }
-              onClick={() => submit(implementationKind)}
-            >
-              Start implementation subtask
-            </Button>
-            {status(implementationKind)}
-          </div>
-        </details>
-        <details className="mt-3">
-          <summary className="cursor-pointer text-sm font-medium">Independent review</summary>
-          <div className="mt-3 space-y-3">
-            {field(
-              "project-team.assignment.start",
-              "objective",
-              "Review objective",
-              "Independently review the approved work and its verification evidence.",
-              32000,
-            )}
-            {field(
-              "project-team.assignment.start",
-              "outputs",
-              "Expected review findings (one per line)",
-              "Independent review findings",
-              64000,
-            )}
-            <p className="text-xs text-muted-foreground">
-              Creates a linked reviewer task within the current approved specification and plan.
-              Uses the task's remaining budget and original deadline.
-            </p>
-            <Button
-              size="sm"
-              disabled={
-                !canWrite ||
-                !build("project-team.assignment.start") ||
-                blockedDraft("project-team.assignment.start")
-              }
-              onClick={() => submit("project-team.assignment.start")}
-            >
-              Start independent review
-            </Button>
-            {status("project-team.assignment.start")}
-          </div>
-        </details>
-      </WorkCard>
-      <WorkCard>
-        <h3 className="mb-3 font-medium">Specification revision {task.specRevision}</h3>
+      <WorkCard id={sectionId("scope")} className="scroll-mt-4">
+        <WorkSectionHeader
+          level={3}
+          title="Scope"
+          status={`Specification revision ${task.specRevision}`}
+        />
+        <div className="mt-3" />
         {task.specification ? (
           <div className="mb-4 space-y-2 whitespace-pre-wrap break-words text-sm">
-            <p>{task.specification.objective}</p>
-            <p>Included: {task.specification.scopeIn}</p>
-            <p>Excluded: {task.specification.scopeOut}</p>
-            <ul className="list-disc pl-5">
+            <p className="font-medium">{task.specification.objective}</p>
+            <dl className="grid gap-x-4 gap-y-1 sm:grid-cols-[auto_1fr]">
+              <dt className="text-muted-foreground">Included</dt>
+              <dd>{task.specification.scopeIn}</dd>
+              <dt className="text-muted-foreground">Excluded</dt>
+              <dd>{task.specification.scopeOut}</dd>
+            </dl>
+            <WorkLabel className="pt-1">Acceptance criteria</WorkLabel>
+            <ul className="space-y-1">
               {criteria.map((criterion) => (
-                <li key={criterion.criterionId}>
-                  {criterion.description} · {criterion.status}
-                  {criterion.required ? " · required" : ""}
+                <li key={criterion.criterionId} className="flex items-start gap-2">
+                  <span className="min-w-0 flex-1">{criterion.description}</span>
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {" · "}
+                    {criterion.status}
+                    {criterion.required ? " · required" : ""}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -1359,11 +1172,8 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             Reopen this task before changing a criterion waiver.
           </p>
         ) : task.specification && criteria.length > 0 ? (
-          <details className="mb-4">
-            <summary className="cursor-pointer text-sm font-medium">
-              Change a criterion waiver
-            </summary>
-            <div className="mt-3 space-y-3 text-sm">
+          <WorkDisclosure className="mb-2" summary="Change a criterion waiver">
+            <div className="space-y-3 text-sm">
               <p className="text-muted-foreground">
                 Approvals must be renewed after waiving or revoking a criterion. Current work is
                 stopped and the changed specification needs approval.
@@ -1372,7 +1182,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
                 <span>Criterion to waive or revoke</span>
                 <select
                   aria-label="Criterion to waive or revoke"
-                  className="w-full rounded-md border bg-background p-2"
+                  className={workSelectClass}
                   value={selectedWaiverCriterion?.criterionId ?? ""}
                   disabled={Boolean(waiverDraft)}
                   onChange={(event) => setWaiverCriterionId(event.target.value)}
@@ -1459,73 +1269,78 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
               </div>
               {status(waiverKind)}
             </div>
-          </details>
+          </WorkDisclosure>
         ) : null}
-        <details>
-          <summary className="cursor-pointer text-sm font-medium">
-            Propose a revised specification
-          </summary>
-          <div className="mt-3 space-y-3">
-            {field(
-              specKind,
-              "objective",
-              "Specification objective",
-              task.specification?.objective ?? task.title,
-            )}
-            {field(specKind, "scopeIn", "Included scope", task.specification?.scopeIn ?? "")}
-            {field(specKind, "scopeOut", "Excluded scope", task.specification?.scopeOut ?? "")}
-            {(draftCriteria.length
-              ? draftCriteria
-              : [{ criterionId: newCriterionId, description: "" }]
-            ).map((criterion, index) => (
-              <div key={criterion.criterionId}>
-                {field(
-                  specKind,
-                  `criterion:${criterion.criterionId}`,
-                  `Acceptance criterion ${index + 1}`,
-                  criterion.description,
-                )}
-              </div>
-            ))}
-            {extraCriteria.map((name, index) => (
-              <div key={name}>{field(specKind, name, `Additional criterion ${index + 1}`, "")}</div>
-            ))}
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={Boolean(specDraft?.pending)}
-              onClick={() => edit(specKind, { [`new-criterion:${randomUUID()}`]: "" })}
-            >
-              Add acceptance criterion
-            </Button>
-            <p className="text-xs text-muted-foreground">
-              Proposing resets criterion satisfaction and invalidates approvals and execution for
-              the previous scope.
-            </p>
-            <Button
-              size="sm"
-              disabled={!canWrite || terminal || blockedDraft(specKind)}
-              onClick={() => submit(specKind)}
-            >
-              Propose specification
-            </Button>
-            {status(specKind)}
-          </div>
-        </details>
+        <WorkDisclosure
+          summary={
+            task.specification ? "Propose a revised specification" : "Propose a specification"
+          }
+          hint="Objective, boundaries and acceptance criteria"
+        >
+          {field(
+            specKind,
+            "objective",
+            "Specification objective",
+            task.specification?.objective ?? task.title,
+          )}
+          {field(specKind, "scopeIn", "Included scope", task.specification?.scopeIn ?? "")}
+          {field(specKind, "scopeOut", "Excluded scope", task.specification?.scopeOut ?? "")}
+          {(draftCriteria.length
+            ? draftCriteria
+            : [{ criterionId: newCriterionId, description: "" }]
+          ).map((criterion, index) => (
+            <div key={criterion.criterionId}>
+              {field(
+                specKind,
+                `criterion:${criterion.criterionId}`,
+                `Acceptance criterion ${index + 1}`,
+                criterion.description,
+              )}
+            </div>
+          ))}
+          {extraCriteria.map((name, index) => (
+            <div key={name}>{field(specKind, name, `Additional criterion ${index + 1}`, "")}</div>
+          ))}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={Boolean(specDraft?.pending)}
+            onClick={() => edit(specKind, { [`new-criterion:${randomUUID()}`]: "" })}
+          >
+            Add acceptance criterion
+          </Button>
+          <p className="text-xs text-muted-foreground">
+            Proposing resets criterion satisfaction and invalidates approvals and execution for the
+            previous scope.
+          </p>
+          <Button
+            size="sm"
+            disabled={!canWrite || terminal || blockedDraft(specKind)}
+            onClick={() => submit(specKind)}
+          >
+            Propose specification
+          </Button>
+          {status(specKind)}
+        </WorkDisclosure>
       </WorkCard>
-      <WorkCard>
-        <h3 className="mb-3 font-medium">
-          Proposed plan{plan ? ` revision ${plan.planRevision}` : ""}
-        </h3>
+      <WorkCard id={sectionId("plan")} className="scroll-mt-4">
+        <WorkSectionHeader
+          level={3}
+          title="Plan"
+          status={plan ? `Proposed plan revision ${plan.planRevision}` : "No plan yet"}
+        />
+        <div className="mt-3" />
         {plan ? (
           <>
             <p className="whitespace-pre-wrap break-words text-sm">{plan.content}</p>
-            <p className="mt-2 text-xs text-muted-foreground">
-              Specification {plan.specRevision} · Record revision {plan.revision}
-              {plan.dependencyTaskIds.length
-                ? ` · Dependencies: ${plan.dependencyTaskIds.join(", ")}`
-                : ""}
-            </p>
+            <WorkDetails className="mt-2">
+              <p>
+                Specification {plan.specRevision} · Record revision {plan.revision}
+                {plan.dependencyTaskIds.length
+                  ? ` · Dependencies: ${plan.dependencyTaskIds.join(", ")}`
+                  : ""}
+              </p>
+            </WorkDetails>
           </>
         ) : (
           <p className="text-sm text-muted-foreground">No current plan proposed.</p>
@@ -1550,67 +1365,74 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             </p>
           </div>
         )}
-        <details className="mt-3">
-          <summary className="cursor-pointer text-sm font-medium">Propose a plan</summary>
-          <div className="mt-3 space-y-3">
-            {field(
-              "project-team.plan.propose",
-              "content",
-              "Implementation and validation plan",
-              plan?.content ?? "",
-              32000,
-            )}
-            <IntegrationSources
-              environmentId={environmentId}
-              projectId={projectId}
-              taskId={task.taskId}
-              revision={context!.revision}
-              taskRevision={task.revision}
-              disabled={
-                !canWrite ||
-                terminal ||
-                membership?.deliverableKind !== "code" ||
-                !task.specification ||
-                Boolean(draftFor("project-team.plan.propose")?.pending)
-              }
-              selected={selectedSources(draftFor("project-team.plan.propose")?.fields ?? {})}
-              onChange={(selected) =>
-                edit("project-team.plan.propose", {
-                  integrationSourceRefs: JSON.stringify(selected),
-                })
-              }
-            />
-            <Button
-              size="sm"
-              disabled={
-                !canWrite ||
-                terminal ||
-                !task.specification ||
-                blockedDraft("project-team.plan.propose")
-              }
-              onClick={() => submit("project-team.plan.propose")}
-            >
-              Propose plan
-            </Button>
-            {status("project-team.plan.propose")}
-          </div>
-        </details>
+        <WorkDisclosure
+          className="mt-3"
+          summary={plan ? "Propose a revised plan" : "Propose a plan"}
+          hint={task.specification ? "Steps and validation" : "Needs a specification first"}
+        >
+          {field(
+            "project-team.plan.propose",
+            "content",
+            "Implementation and validation plan",
+            plan?.content ?? "",
+            32000,
+          )}
+          <IntegrationSources
+            environmentId={environmentId}
+            projectId={projectId}
+            taskId={task.taskId}
+            revision={context!.revision}
+            taskRevision={task.revision}
+            disabled={
+              !canWrite ||
+              terminal ||
+              membership?.deliverableKind !== "code" ||
+              !task.specification ||
+              Boolean(draftFor("project-team.plan.propose")?.pending)
+            }
+            selected={selectedSources(draftFor("project-team.plan.propose")?.fields ?? {})}
+            onChange={(selected) =>
+              edit("project-team.plan.propose", {
+                integrationSourceRefs: JSON.stringify(selected),
+              })
+            }
+          />
+          <Button
+            size="sm"
+            disabled={
+              !canWrite ||
+              terminal ||
+              !task.specification ||
+              blockedDraft("project-team.plan.propose")
+            }
+            onClick={() => submit("project-team.plan.propose")}
+          >
+            Propose plan
+          </Button>
+          {status("project-team.plan.propose")}
+        </WorkDisclosure>
       </WorkCard>
-      <WorkCard>
-        <h3 className="mb-3 font-medium">Approvals and execution</h3>
+      <WorkCard id={sectionId("execution")} className="scroll-mt-4">
+        <h3 className="mb-3 font-semibold">Approvals and execution</h3>
         {gates.length ? (
           gates.map((gate) => (
             <div
               key={gate.recordId}
-              className="mb-3 space-y-1 border-b border-border/60 pb-3 text-sm"
+              className="mb-3 space-y-1.5 border-b border-border/60 pb-3 text-sm"
             >
-              <p>
-                {gate.gate} · {gate.status} · specification {gate.specRevision} · plan{" "}
-                {gate.planRevision}
-              </p>
-              <p className="break-all text-xs text-muted-foreground">
-                Gate {gate.recordId} · revision {gate.revision} · content {gate.contentHash}
-              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-medium">{workStateLabel(gate.gate)}</span>
+                <Badge variant={gateVariant(gate.status)}>{workStateLabel(gate.status)}</Badge>
+              </div>
+              <WorkDetails>
+                <p>
+                  {gate.gate} · {gate.status} · specification {gate.specRevision} · plan{" "}
+                  {gate.planRevision}
+                </p>
+                <p>
+                  Gate {gate.recordId} · revision {gate.revision} · content {gate.contentHash}
+                </p>
+              </WorkDetails>
               {gate.status === "invalidated" ? (
                 <p className="text-warning-foreground">
                   This approval no longer authorizes execution. Review the current specification and
@@ -1667,16 +1489,273 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
         </Button>
         {status("project-team.execution.start")}
       </WorkCard>
+      <WorkCard id={sectionId("review")} className="scroll-mt-4 space-y-2">
+        <WorkSectionHeader
+          level={3}
+          title="Investigation, implementation and review"
+          description="Start linked work inside this task's approved scope and remaining budget."
+        />
+        <WorkDisclosure summary="Investigate this task" hint="Research before scoping">
+          {field(
+            "project-team.investigation.start",
+            "objective",
+            "Investigation objective",
+            task.summary ?? task.title,
+            32000,
+          )}
+          {field(
+            "project-team.investigation.start",
+            "outputs",
+            "Expected findings (one per line)",
+            "Findings, sources, and unresolved decisions",
+            64000,
+          )}
+          <p className="text-xs text-muted-foreground">
+            Starts linked research. Implementation still requires specification and plan approval.
+          </p>
+          <Button
+            size="sm"
+            disabled={
+              !canWrite ||
+              terminal ||
+              stopped ||
+              repair ||
+              blockedDraft("project-team.investigation.start")
+            }
+            onClick={() => submit("project-team.investigation.start")}
+          >
+            Start investigation
+          </Button>
+          {status("project-team.investigation.start")}
+        </WorkDisclosure>
+        <WorkDisclosure summary="Implementation subtask" hint="Needs approved scope and plan">
+          <fieldset
+            disabled={
+              !canWrite ||
+              Boolean(implementationDraft?.pending) ||
+              !plan ||
+              plan.specRevision !== task.specRevision ||
+              specGate?.status !== "approved" ||
+              planGate?.status !== "approved" ||
+              specGate.attribution.actor.kind !== "human" ||
+              planGate.attribution.actor.kind !== "human"
+            }
+          >
+            <legend className="text-sm">Approved parent criteria (select 1–64)</legend>
+            {approvedCriteria.map((criterion) => (
+              <label key={criterion.criterionId} className="flex items-start gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={selectedImplementationCriteria.includes(criterion.criterionId)}
+                  disabled={
+                    !selectedImplementationCriteria.includes(criterion.criterionId) &&
+                    selectedImplementationCriteria.length >= 64
+                  }
+                  onChange={(event) => {
+                    if (!currentCallback() || implementationDraft?.pending) return;
+                    const selected = event.target.checked
+                      ? [...selectedImplementationCriteria, criterion.criterionId]
+                      : selectedImplementationCriteria.filter((id) => id !== criterion.criterionId);
+                    edit(implementationKind, {
+                      parentCriterionIds: encodeCriterionIds(selected),
+                    });
+                  }}
+                />
+                {criterion.description}
+              </label>
+            ))}
+          </fieldset>
+          {selectedImplementationCriteria.some(
+            (id) => !approvedCriteria.some((criterion) => criterion.criterionId === id),
+          ) ? (
+            <p role="status" className="text-sm text-warning-foreground">
+              Selected parent criteria changed. Review the selection or discard the local draft.
+            </p>
+          ) : null}
+          {field(
+            implementationKind,
+            "objective",
+            "Implementation objective",
+            "Implement the selected approved acceptance criteria.",
+            32000,
+          )}
+          {field(
+            implementationKind,
+            "outputs",
+            "Expected implementation outputs (one per line)",
+            "Implementation and focused validation results",
+            64000,
+          )}
+          <p className="text-xs text-muted-foreground">
+            Creates a linked implementation task from the selected approved criteria and current
+            approved plan. Uses the task's remaining budget and original deadline.
+          </p>
+          <Button
+            size="sm"
+            disabled={
+              !canWrite ||
+              !build(implementationKind, implementationDraft?.fields) ||
+              blockedDraft(implementationKind)
+            }
+            onClick={() => submit(implementationKind)}
+          >
+            Start implementation subtask
+          </Button>
+          {status(implementationKind)}
+        </WorkDisclosure>
+        <WorkDisclosure summary="Independent review" hint="Check the approved work">
+          {field(
+            "project-team.assignment.start",
+            "objective",
+            "Review objective",
+            "Independently review the approved work and its verification evidence.",
+            32000,
+          )}
+          {field(
+            "project-team.assignment.start",
+            "outputs",
+            "Expected review findings (one per line)",
+            "Independent review findings",
+            64000,
+          )}
+          <p className="text-xs text-muted-foreground">
+            Creates a linked reviewer task within the current approved specification and plan. Uses
+            the task's remaining budget and original deadline.
+          </p>
+          <Button
+            size="sm"
+            disabled={
+              !canWrite ||
+              !build("project-team.assignment.start") ||
+              blockedDraft("project-team.assignment.start")
+            }
+            onClick={() => submit("project-team.assignment.start")}
+          >
+            Start independent review
+          </Button>
+          {status("project-team.assignment.start")}
+        </WorkDisclosure>
+      </WorkCard>
       <WorkCard>
-        <h3 className="mb-3 font-medium">
+        <h3 className="font-semibold">Recorded workers</h3>
+        <p className="mt-0.5 mb-3 text-xs text-muted-foreground">
+          {props.connected && complete
+            ? "Recorded worker history"
+            : "Cached or incomplete worker history"}
+        </p>
+        {workers.slice(visibleWorkerPage * 10, (visibleWorkerPage + 1) * 10).map((run) => {
+          if (run.kind !== "run-binding") return null;
+          const role = one(
+            records.filter(
+              (record) =>
+                record.kind === "role-revision" &&
+                record.projectId === projectId &&
+                record.recordId === run.roleRevisionId &&
+                recordCounts.get(record.recordId) === 1,
+            ),
+          );
+          return (
+            <div
+              key={run.recordId}
+              className="mb-3 space-y-1 border-t border-border/60 pt-3 text-sm first-of-type:border-t-0 first-of-type:pt-0"
+            >
+              <p className="font-medium">
+                {role?.kind === "role-revision" ? role.role : "Role unavailable"} · {run.model} ·{" "}
+                {run.status}
+              </p>
+
+              {projectTeamAccountingCaptions(
+                asProjectTeamBindingAccounting(
+                  props.accounting?.find((item) => item.bindingId === run.recordId),
+                  run,
+                ),
+              ).map((caption) => (
+                <p key={caption} className="break-words text-xs text-muted-foreground">
+                  {caption}
+                </p>
+              ))}
+              <WorkDetails>
+                <p>
+                  Run {run.recordId} · Attempt {run.attemptId}
+                </p>
+                <p>
+                  Specification {run.specRevision} · plan {run.planRevision}
+                </p>
+                <p>
+                  {run.worktree} · {run.branch}
+                </p>
+              </WorkDetails>
+              <a
+                className="inline-flex text-sm text-primary underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                href={`/${encodeURIComponent(environmentId)}/${encodeURIComponent(run.threadId)}`}
+              >
+                Worker thread {run.threadId}
+              </a>
+            </div>
+          );
+        })}
+        {workers.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No workers recorded for this task.</p>
+        ) : null}
+        {workerPages > 1 ? (
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={visibleWorkerPage === 0}
+              onClick={() => setWorkerPage(visibleWorkerPage - 1)}
+            >
+              Previous workers
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={visibleWorkerPage + 1 === workerPages}
+              onClick={() => setWorkerPage(visibleWorkerPage + 1)}
+            >
+              Next workers
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Page {visibleWorkerPage + 1} of {workerPages}
+            </span>
+          </div>
+        ) : null}
+      </WorkCard>
+      <WorkCard>
+        <h3 className="mb-3 font-semibold">Internal findings</h3>
+        {[...commentsById.values()].map((comment) => (
+          <p key={comment.commentId} className="mb-2 whitespace-pre-wrap break-words text-sm">
+            {comment.body}
+          </p>
+        ))}
+        {[...evidenceById.values()].map((evidence) => (
+          <details key={evidence.evidenceId} className="mb-2 text-sm">
+            <summary className="cursor-pointer font-medium">{evidence.summary}</summary>
+            <p className="mt-1 whitespace-pre-wrap break-words pl-4">
+              {evidence.detail ?? evidence.summary}
+            </p>
+            <p className="pl-4 text-xs break-all text-muted-foreground">
+              Task {evidence.taskId} · Evidence {evidence.evidenceId}
+            </p>
+          </details>
+        ))}
+        {!commentsById.size && !evidenceById.size ? (
+          <p className="text-sm text-muted-foreground">No findings have been recorded yet.</p>
+        ) : null}
+      </WorkCard>
+      <WorkCard>
+        <h3 className="font-semibold">
           Task controls{membership?.controlState ? ` · ${membership.controlState}` : ""}
         </h3>
+        <p className="mt-0.5 mb-3 text-xs text-muted-foreground">
+          Defer, pause, resume, cancel or reassign this task. Each change needs a reason.
+        </p>
         <div className="space-y-3">
-          <label className="block text-sm">
+          <label className="flex flex-col gap-1 text-sm sm:max-w-xs">
             Action
             <select
               aria-label="Task control action"
-              className="ml-2 rounded border border-border bg-background px-2 py-1"
+              className={workSelectClass}
               value={controlAction}
               disabled={Boolean(draftFor("project-team.task.control")?.pending)}
               onChange={(event) => {
@@ -1686,7 +1765,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             >
               {controls.map((action) => (
                 <option key={action} value={action}>
-                  {action}
+                  {CONTROL_LABELS[action]}
                 </option>
               ))}
             </select>
@@ -1701,10 +1780,11 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             ownership, drains, and approvals on the server.
           </p>
           {controlAction === "reassign" ? (
-            <label className="block text-sm">
+            <label className="flex flex-col gap-1 text-sm">
               Recipient
               <select
                 aria-label="Reassignment recipient"
+                className={workSelectClass}
                 value={recipient ? JSON.stringify([recipient.id, recipient.revision]) : ""}
                 disabled={
                   !access ||

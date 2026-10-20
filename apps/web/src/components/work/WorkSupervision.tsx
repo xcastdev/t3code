@@ -13,6 +13,7 @@ import { useEffectEvent, useLayoutEffect, useRef, type ReactNode } from "react";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { WorkCard } from "./WorkDataNotice";
+import { WorkDetails } from "./WorkLayout";
 
 type Owner = { readonly environmentId: EnvironmentId; readonly projectId: ProjectId };
 type Summary = Extract<ProjectTeamSupervisionSummary, { availability: "available" }>;
@@ -213,60 +214,75 @@ function SupervisionSession(props: WorkSupervisionProps) {
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <WorkCard className="space-y-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <h2 className="text-lg font-semibold">{props.title}</h2>
-          <Badge variant="outline">
-            {current ? "Current recorded summary" : "Cached or unavailable summary"}
-          </Badge>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="break-words text-lg font-semibold">{props.title}</h2>
+              <Badge variant={current ? "success" : "warning"}>
+                {current ? "Current recorded summary" : "Cached or unavailable summary"}
+              </Badge>
+            </div>
+            {snapshot ? (
+              <Notice>
+                {!current ? "Cached · " : ""}
+                {age === null
+                  ? "Receive age unavailable: invalid or future receive time."
+                  : `Received ${age} seconds ago.`}
+              </Notice>
+            ) : null}
+          </div>
+          <Button type="button" size="sm" variant="outline" onClick={() => inspect(owner)}>
+            Inspect project {props.title}
+          </Button>
         </div>
-        <Notice>
-          Environment {props.environmentId} · Project {props.projectId}
-        </Notice>
-        <Notice>Recorded counts and binding states do not verify execution health.</Notice>
-        {!props.connected ? <Notice>Disconnected. Recorded metadata may be stale.</Notice> : null}
-        {!props.enabled ? <Notice>Project Work is disabled.</Notice> : null}
-        {!props.supported ? <Notice>This environment does not support supervision.</Notice> : null}
-        {!props.current ? <Notice>Waiting for a current owner-scoped summary.</Notice> : null}
+        {!props.connected ? <Warning>Disconnected. Recorded metadata may be stale.</Warning> : null}
+        {!props.enabled ? <Warning>Project Work is disabled.</Warning> : null}
+        {!props.supported ? (
+          <Warning>This environment does not support supervision.</Warning>
+        ) : null}
+        {!props.current ? <Warning>Waiting for a current owner-scoped summary.</Warning> : null}
         {props.error !== undefined ? (
-          <Notice>Read error: {props.error.slice(0, 240) || "No details recorded"}</Notice>
+          <Warning>Read error: {props.error.slice(0, 240) || "No details recorded"}</Warning>
         ) : null}
         {!snapshot ? (
-          <Notice>No summary received.</Notice>
+          <Warning>No summary received.</Warning>
         ) : !ownerMatches ? (
-          <Notice>Snapshot owner mismatch. Waiting for this project's summary.</Notice>
+          <Warning>Snapshot owner mismatch. Waiting for this project's summary.</Warning>
         ) : !decoded ? (
-          <Notice>Malformed or incoherent summary metadata.</Notice>
-        ) : null}
-        {snapshot ? (
-          <Notice>
-            {!current ? "Cached · " : ""}
-            {age === null
-              ? "Receive age unavailable: invalid or future receive time."
-              : `Received ${age} seconds ago.`}
-          </Notice>
+          <Warning>Malformed or incoherent summary metadata.</Warning>
         ) : null}
         {decoded && decoded.availability !== "available" ? (
-          <Notice>Project {decoded.availability}.</Notice>
+          <Warning>Project {decoded.availability}.</Warning>
         ) : null}
-        {data ? (
-          <Notice>
-            Project revision {data.revision}
-            {data.lifecycleRevision !== undefined
-              ? ` · Lifecycle revision ${data.lifecycleRevision}`
-              : ""}
-          </Notice>
-        ) : null}
-        <Button type="button" size="sm" variant="outline" onClick={() => inspect(owner)}>
-          Inspect project {props.title}
-        </Button>
+        <p className="text-xs text-muted-foreground">
+          Recorded counts and binding states do not verify execution health.
+        </p>
+        <WorkDetails>
+          <p>
+            Environment {props.environmentId} · Project {props.projectId}
+          </p>
+          {data ? (
+            <p>
+              Project revision {data.revision}
+              {data.lifecycleRevision !== undefined
+                ? ` · Lifecycle revision ${data.lifecycleRevision}`
+                : ""}
+            </p>
+          ) : null}
+        </WorkDetails>
       </WorkCard>
       {data ? (
         <>
           <Section title="Recorded tasks">
-            <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3 lg:grid-cols-4">
+            <dl className="grid grid-cols-2 gap-1.5 text-sm sm:grid-cols-4 lg:grid-cols-6">
               {TASK_STATES.map((state) => (
-                <div key={state} className="flex gap-2">
-                  <dt className="text-muted-foreground">{state}</dt>
+                <div
+                  key={state}
+                  className={`flex items-baseline justify-between gap-2 rounded-md border border-border/60 px-2 py-1 ${
+                    data.taskCounts[state] === 0 && state !== "total" ? "opacity-60" : ""
+                  } ${state === "total" ? "bg-muted/50" : ""}`}
+                >
+                  <dt className="truncate text-xs text-muted-foreground">{state}</dt>
                   <dd className="font-medium tabular-nums">{data.taskCounts[state]}</dd>
                 </div>
               ))}
@@ -331,27 +347,32 @@ function SupervisionSession(props: WorkSupervisionProps) {
             </Notice>
             {data.bindings.items.map((binding) => (
               <div key={binding.recordId} className="space-y-2 border-t border-border/70 pt-3">
-                <Notice>
-                  {binding.recordId} · Recorded {binding.status}
-                </Notice>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">
+                    {"issue" in binding ? binding.recordId : `Task ${binding.taskId}`}
+                  </span>
+                  <Badge variant="outline">Recorded {binding.status}</Badge>
+                </div>
                 {"issue" in binding ? (
                   <Notice>Malformed binding metadata.</Notice>
                 ) : (
                   <>
                     <Notice>
-                      Task {binding.taskId} · Attempt {binding.attemptId} · Member{" "}
-                      {binding.memberId}
+                      Binding model: {binding.model} · Provider {binding.providerInstanceId}
                     </Notice>
                     {projectTeamAccountingCaptions(binding.accounting).map((caption) => (
                       <Notice key={caption}>{caption}</Notice>
                     ))}
-                    <Notice>
-                      Binding model: {binding.model} · Provider {binding.providerInstanceId} · Role
-                      revision {binding.roleRevisionId}
-                    </Notice>
-                    <Notice>
-                      Record revision {binding.revision} · Generation {binding.generation}
-                    </Notice>
+                    <WorkDetails>
+                      <p>
+                        {binding.recordId} · Task {binding.taskId} · Attempt {binding.attemptId} ·
+                        Member {binding.memberId}
+                      </p>
+                      <p>
+                        Role revision {binding.roleRevisionId} · Record revision {binding.revision}{" "}
+                        · Generation {binding.generation}
+                      </p>
+                    </WorkDetails>
                     <ProfileMetadata
                       profile={binding.profile}
                       roleRevisionId={binding.roleRevisionId}
@@ -407,10 +428,10 @@ function SupervisionSession(props: WorkSupervisionProps) {
             <Notice>{data.blockers.items.length} blockers in this bounded preview.</Notice>
             {data.blockers.items.map((blocker) => (
               <div key={blocker.recordId} className="space-y-1">
+                <p className="text-sm">{blocker.reason}</p>
                 <Notice>
-                  {blocker.reason} · Resolver {blocker.resolver}
+                  Resolver {blocker.resolver} · Task {blocker.taskId}
                 </Notice>
-                <Notice>Task {blocker.taskId}</Notice>
                 {taskControl("blockers", blocker)}
               </div>
             ))}
@@ -423,19 +444,24 @@ function SupervisionSession(props: WorkSupervisionProps) {
             <Notice>{data.questions.items.length} questions in this bounded preview.</Notice>
             {data.questions.items.map((question) => (
               <div key={question.recordId} className="space-y-1">
-                <Notice>
-                  {question.recordId} · Recorded {question.status}
-                </Notice>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">
+                    {"issue" in question ? question.recordId : `Task ${question.taskId}`}
+                  </span>
+                  <Badge variant="outline">Recorded {question.status}</Badge>
+                </div>
                 {"issue" in question ? (
                   <Notice>Malformed question metadata.</Notice>
                 ) : (
                   <>
-                    <Notice>
-                      Task {question.taskId} · Sender {question.senderId}
-                    </Notice>
-                    <Notice>
-                      Gate {question.targetGateId} · Target revision {question.targetRevision}
-                    </Notice>
+                    <WorkDetails>
+                      <p>
+                        {question.recordId} · Task {question.taskId} · Sender {question.senderId}
+                      </p>
+                      <p>
+                        Gate {question.targetGateId} · Target revision {question.targetRevision}
+                      </p>
+                    </WorkDetails>
                     {!knownQuestion(question) ? (
                       <Notice>Unsupported question metadata.</Notice>
                     ) : (
@@ -458,10 +484,13 @@ function SupervisionSession(props: WorkSupervisionProps) {
 function Notice({ children }: { readonly children: ReactNode }) {
   return <p className="break-words text-sm text-muted-foreground">{children}</p>;
 }
+function Warning({ children }: { readonly children: ReactNode }) {
+  return <p className="break-words text-sm text-warning-foreground">{children}</p>;
+}
 function Section({ title, children }: { readonly title: string; readonly children: ReactNode }) {
   return (
     <WorkCard className="space-y-3">
-      <h3 className="font-semibold">{title}</h3>
+      <h3 className="text-sm font-semibold">{title}</h3>
       {children}
     </WorkCard>
   );
