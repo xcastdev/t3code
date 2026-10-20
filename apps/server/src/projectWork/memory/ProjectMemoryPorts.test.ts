@@ -25,6 +25,189 @@ const request = (deadlineAtMs: number): ProjectMemoryModelExchange => ({
   input: "A retained exact source.",
 });
 
+it.effect("confirms rejected HTTP response drain before abort can error its body", () =>
+  Effect.gen(function* () {
+    const events: string[] = [];
+    const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async (_url, init) => {
+      const body = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          init?.signal?.addEventListener("abort", () => {
+            events.push("abort");
+            controller.error(new Error("Controlled transport abort"));
+          });
+        },
+        cancel: () => {
+          events.push("cancel");
+        },
+      });
+      return new Response(body, { status: 504 });
+    });
+    const result = yield* exchangeProjectMemoryModel(
+      request((yield* Clock.currentTimeMillis) + 1000),
+      () => events.push("drain"),
+    ).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch), Effect.result);
+    expect(result).toMatchObject({
+      _tag: "Failure",
+      failure: { reason: "Memory model outcome requires conservative accounting" },
+    });
+    expect(events).toEqual(["cancel", "abort", "drain"]);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  }),
+);
+
+for (const status of [200, 504])
+  it.effect(`cleans up HTTP ${status} cancellation failure without confirming drain`, () =>
+    Effect.gen(function* () {
+      let transportSignal: AbortSignal | null | undefined;
+      let body: ReadableStream<Uint8Array> | undefined;
+      let drains = 0;
+      const events: string[] = [];
+      const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async (_url, init) => {
+        transportSignal = init?.signal;
+        transportSignal?.addEventListener("abort", () => events.push("abort"));
+        body = new ReadableStream<Uint8Array>({
+          start: (controller) => controller.enqueue(new Uint8Array(1048577)),
+          cancel: () => {
+            events.push("cancel");
+            return Promise.reject(new Error("Controlled cancellation failure"));
+          },
+        });
+        return new Response(body, { status });
+      });
+      const remove = yield* Effect.acquireRelease(
+        Effect.sync(() => vi.spyOn(AbortSignal.prototype, "removeEventListener")),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const result = yield* exchangeProjectMemoryModel(
+        request((yield* Clock.currentTimeMillis) + 1000),
+        () => drains++,
+      ).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch), Effect.result);
+      expect(result).toMatchObject({
+        _tag: "Failure",
+        failure: { reason: "Memory model outcome requires conservative accounting" },
+      });
+      expect(events).toEqual(["cancel", "abort"]);
+      expect(transportSignal?.aborted).toBe(true);
+      expect(body?.locked).toBe(false);
+      expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+      expect(drains).toBe(0);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.scoped),
+  );
+
+for (const outcome of ["rejected fetch", "no body"])
+  it.effect(`confirms settled ${outcome} cleanup while preserving conservative failure`, () =>
+    Effect.gen(function* () {
+      let transportSignal: AbortSignal | null | undefined;
+      let drains = 0;
+      const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async (_url, init) => {
+        transportSignal = init?.signal;
+        if (outcome === "rejected fetch") throw new Error("Controlled fetch rejection");
+        return new Response(null, { status: 204 });
+      });
+      const result = yield* exchangeProjectMemoryModel(
+        request((yield* Clock.currentTimeMillis) + 1000),
+        () => {
+          expect(transportSignal?.aborted).toBe(true);
+          drains++;
+        },
+      ).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch), Effect.result);
+      expect(result).toMatchObject({
+        _tag: "Failure",
+        failure: { reason: "Memory model outcome requires conservative accounting" },
+      });
+      expect(drains).toBe(1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }),
+  );
+
+it.effect(
+  "interrupts an active read through the transport signal and confirms completed cleanup",
+  () =>
+    Effect.gen(function* () {
+      const reading = yield* Deferred.make<void>();
+      const drained = yield* Deferred.make<void>();
+      const events: string[] = [];
+      const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async (_url, init) => {
+        const body = new ReadableStream<Uint8Array>({
+          start: (controller) => {
+            init?.signal?.addEventListener("abort", () => {
+              events.push("abort");
+              controller.close();
+            });
+          },
+          pull: () => {
+            Deferred.doneUnsafe(reading, Effect.void);
+          },
+        });
+        return new Response(body);
+      });
+      const fiber = yield* exchangeProjectMemoryModel(
+        request((yield* Clock.currentTimeMillis) + 1000),
+        () => {
+          events.push("drain");
+          Deferred.doneUnsafe(drained, Effect.void);
+        },
+      ).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch), Effect.forkChild);
+      yield* Deferred.await(reading);
+      expect(events).toEqual([]);
+      yield* Fiber.interrupt(fiber);
+      expect((yield* Fiber.await(fiber))._tag).toBe("Failure");
+      yield* Deferred.await(drained);
+      expect(events).toEqual(["abort", "drain"]);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }),
+);
+
+it.effect("does not confirm drain when interruption errors an active response body", () =>
+  Effect.gen(function* () {
+    const reading = yield* Deferred.make<void>();
+    const cleaned = yield* Deferred.make<void>();
+    let transportSignal: AbortSignal | null | undefined;
+    let body: ReadableStream<Uint8Array> | undefined;
+    let drains = 0;
+    const removeListener = AbortSignal.prototype.removeEventListener;
+    yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        vi.spyOn(AbortSignal.prototype, "removeEventListener").mockImplementation(function (
+          this: AbortSignal,
+          ...args
+        ) {
+          removeListener.call(this, ...args);
+          if (transportSignal?.aborted && body?.locked === false)
+            Deferred.doneUnsafe(cleaned, Effect.void);
+        }),
+      ),
+      (spy) => Effect.sync(() => spy.mockRestore()),
+    );
+    const fetch = vi.fn<typeof globalThis.fetch>().mockImplementation(async (_url, init) => {
+      transportSignal = init?.signal;
+      body = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          transportSignal?.addEventListener("abort", () =>
+            controller.error(new Error("Controlled active read abort")),
+          );
+        },
+        pull: () => {
+          Deferred.doneUnsafe(reading, Effect.void);
+        },
+      });
+      return new Response(body);
+    });
+    const fiber = yield* exchangeProjectMemoryModel(
+      request((yield* Clock.currentTimeMillis) + 1000),
+      () => drains++,
+    ).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch), Effect.forkChild);
+    yield* Deferred.await(reading);
+    yield* Fiber.interrupt(fiber);
+    expect((yield* Fiber.await(fiber))._tag).toBe("Failure");
+    yield* Deferred.await(cleaned);
+    expect(drains).toBe(0);
+    expect(body?.locked).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  }).pipe(Effect.scoped),
+);
+
 for (const liquid of [false, true])
   it.effect(
     `observes ${liquid ? "Liquid" : "CommandCode"} memory transport drain only after delayed cancellation completes`,

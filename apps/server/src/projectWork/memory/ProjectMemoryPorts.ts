@@ -296,16 +296,20 @@ export const exchangeProjectMemoryModel = Effect.fn("exchangeProjectMemoryModel"
             const text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
             return HttpClientResponse.fromWeb(request, new Response(text));
           } finally {
-            controller.abort();
-            signal.removeEventListener("abort", abort);
-            if (reader !== undefined) {
-              try {
-                await reader.cancel();
-              } finally {
-                reader.releaseLock();
+            try {
+              // Cancel before aborting: abort can error an unread rejection body.
+              if (reader !== undefined) {
+                try {
+                  await reader.cancel();
+                } finally {
+                  reader.releaseLock();
+                }
+              } else if (response?.body !== null && response?.body !== undefined) {
+                await response.body.cancel();
               }
-            } else if (response?.body !== null && response?.body !== undefined) {
-              await response.body.cancel();
+            } finally {
+              controller.abort();
+              signal.removeEventListener("abort", abort);
             }
             onTransportDrained();
           }
