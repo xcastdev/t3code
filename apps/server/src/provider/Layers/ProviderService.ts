@@ -2572,9 +2572,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             );
           }
         }
+        // Pi discovers its latest committed native cursor through managed runtime authority;
+        // the directory may still contain the cursor returned by initialization.
         const effectiveResumeCursor =
           input.resumeCursor ??
-          (managed === undefined && persistedBinding?.providerInstanceId === resolvedInstanceId
+          (managed === undefined &&
+          resolvedProvider !== "piAgent" &&
+          persistedBinding?.providerInstanceId === resolvedInstanceId
             ? persistedBinding.resumeCursor
             : undefined);
         const effectiveCwd =

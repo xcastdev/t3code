@@ -1,5 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
+import * as NodeCrypto from "node:crypto";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
@@ -78,6 +80,18 @@ import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "./ProviderService.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
+import { makePiManagedRuntimeLive } from "../pi/PiManagedRuntimeLive.ts";
+import { preallocatePiManagedProcess } from "../pi/PiManagedProcess.ts";
+import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
+import { ProjectWorkGateway } from "../../projectWork/ProjectWorkGateway.ts";
+import {
+  seed as seedPiAuthority,
+  restoreHistoricalBinding,
+  runtime as piAuthorityLayer,
+  providerInstanceId as durablePiInstanceId,
+  threadId as durablePiThreadId,
+  at as piFixtureAt,
+} from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
 import {
   ProjectTeamPiRuntime,
   makeProjectTeamPiRuntime,
@@ -952,6 +966,267 @@ describe("ProviderService managed skill lifecycle", () => {
 
 const PI_DRIVER = ProviderDriverKind.make("piAgent");
 const piInstanceId = ProviderInstanceId.make("piAgent");
+
+describe("ProviderService committed Pi restoration", () => {
+  for (const scenario of [
+    "implicit",
+    "explicit current",
+    "explicit stale",
+    "revoked",
+    "wrong session",
+    "wrong provider",
+    "wrong generation",
+    "changed selection",
+  ] as const) {
+    it.effect(`restores through native authority with ${scenario} hints`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(piFixtureAt) + 100);
+          const f = yield* seedPiAuthority("investigator", "reserved", {
+            nativeSessionId: null,
+            roleTools: [],
+            toolIds: [],
+          });
+          const root = fixtureCwd(`pi-durable-${scenario}`);
+          const main = NodePath.join(root, "main");
+          const worktree = NodePath.join(root, "assigned");
+          const agentDirectory = fixtureCwd(`pi-durable-${scenario}/agent`);
+          const nativeStateRoot = fixtureCwd(`pi-durable-${scenario}/native`);
+          const protectedRoot = fixtureCwd(`pi-durable-${scenario}/protected`);
+          const git = (args: string[]) =>
+            NodeChildProcess.execFileSync("/usr/bin/git", args, { stdio: "pipe" });
+          git(["init", "-q", main]);
+          git([
+            "-C",
+            main,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+          ]);
+          git(["-C", main, "worktree", "add", "-qb", "task", worktree]);
+          const model = "inclusionai/ling-3.1-flash:free";
+          const role = { ...f.role, model, instructions: "Investigate current assignment" };
+          yield* restoreHistoricalBinding(role);
+          const binding = {
+            ...f.binding,
+            model,
+            worktree,
+            configuration: {
+              ...f.binding.configuration,
+              instructionsHash: NodeCrypto.createHash("sha256")
+                .update(role.instructions)
+                .digest("hex"),
+              runtimeVersion: "0.99.1",
+              maxDurationMs: 300000,
+              maxTokens: 20000,
+            },
+          };
+          yield* restoreHistoricalBinding(binding);
+          const runtimeFiles = [
+            { source: NodeFS.realpathSync("/usr/bin/true"), target: "/bin/true" },
+          ];
+          const allocation = yield* preallocatePiManagedProcess({
+            workspaceRoot: worktree,
+            workspaceAccess: "readonly",
+            nativeStateRoot,
+            protectedRoots: [protectedRoot],
+            runtimeFiles,
+            argv: ["/bin/true"],
+            memoryBytes: 33554432,
+            runtimeSeconds: 10,
+          });
+          const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+          const initialize = yield* operations.prepare(
+            { threadId: durablePiThreadId, providerInstanceId: durablePiInstanceId },
+            { threadId: durablePiThreadId, kind: "initialize" },
+            "durable-start-fixture",
+            { allocation, workerId: "durable-start-worker", operationId: "durable-initialize" },
+          );
+          const initial = {
+            sessionId: "durable-native-session",
+            sessionReference: "sessions/durable-native-session.jsonl",
+            leafId: "initialize-leaf",
+            persisted: true,
+          };
+          const latest = { ...initial, leafId: "prompt-leaf" };
+          yield* operations.persistNative(initialize, initial);
+          // Retained SQL fixture only: no process, native worker, model call or drain proof.
+          yield* f.sql`UPDATE project_team_pi_operation SET status='settled' WHERE operation_id='durable-initialize'`;
+          yield* f.sql`INSERT INTO project_team_pi_operation (operation_id, environment_id, project_id, binding_id, generation, provider_instance_id, thread_id, worker_id, operation_ordinal, operation_kind, request_hash, root_binding_id, root_task_id, maximum_tokens, deadline_at_ms, status, intent_json, native_json)
+          SELECT 'durable-prompt', environment_id, project_id, binding_id, generation, provider_instance_id, thread_id, worker_id, 2, 'prompt', 'durable-prompt-request', root_binding_id, root_task_id, maximum_tokens, deadline_at_ms, 'settled', intent_json, ${encodeJson(latest)} FROM project_team_pi_operation WHERE operation_id='durable-initialize'`;
+          const workerArgv = vi.fn(() => {
+            throw new Error("Restoration must not launch a worker");
+          });
+          const transport = vi.fn(async () => {
+            throw new Error("Restoration must not call a model");
+          });
+          const runtime = yield* makePiManagedRuntimeLive({
+            environmentId: "environment",
+            agentDirectory,
+            nativeStateRoot,
+            protectedRoots: [protectedRoot],
+            runtimeFiles,
+            workerArgv,
+            readCatalogue: Effect.die("Restoration must not fetch a model catalogue"),
+            memoryBytes: 33554432,
+            cleanupDeadlineMs: 1000,
+            maxInputTokens: 10000,
+            maxOutputTokens: 512,
+            transport,
+          });
+          const instance = yield* runtime.forInstance({
+            instanceId: durablePiInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          assert.deepStrictEqual(
+            (yield* instance.readSession(durablePiThreadId)).resumeCursor,
+            latest,
+          );
+          const adapter = yield* makePiAdapter({
+            instanceId: durablePiInstanceId,
+            runtime: instance,
+            resolveOperationId: () =>
+              Effect.fail(
+                new PiManagedRuntimeError({
+                  code: "denied",
+                  detail: "Restoration cannot initialize",
+                }),
+              ),
+          });
+          const directoryLayer = ProviderSessionDirectoryLive.pipe(
+            Layer.provide(ProviderSessionRuntime.layer),
+          );
+          const services = yield* Layer.build(
+            Layer.mergeAll(
+              directoryLayer,
+              makeProviderServiceLive().pipe(
+                Layer.provide(directoryLayer),
+                Layer.provide(
+                  Layer.succeed(
+                    ProviderAdapterRegistry.ProviderAdapterRegistry,
+                    makeStaticInstanceRegistry([[durablePiInstanceId, adapter]]),
+                  ),
+                ),
+                Layer.provide(AnalyticsService.layerTest),
+                Layer.provide(defaultServerSettingsLayer),
+                Layer.provide(serverConfigTestLayer),
+                Layer.provide(
+                  Layer.succeed(
+                    ProviderEventLoggers.ProviderEventLoggers,
+                    ProviderEventLoggers.NoOpProviderEventLoggers,
+                  ),
+                ),
+              ),
+            ),
+          );
+          const directory = Context.get(
+            services,
+            ProviderSessionDirectory.ProviderSessionDirectory,
+          );
+          const provider = Context.get(services, ProviderService.ProviderService);
+          yield* directory.upsert({
+            threadId: durablePiThreadId,
+            provider: PI_DRIVER,
+            providerInstanceId: durablePiInstanceId,
+            status: "stopped",
+            runtimeMode: "approval-required",
+            resumeCursor: initial,
+            runtimePayload: { cwd: worktree },
+          });
+          const currentBinding = (yield* f.repo.replay(binding.projectId))
+            .filter((event) => event.type === "project-work.foundation.recorded")
+            .map((event) => event.record);
+          const committedBinding = currentBinding.findLast(
+            (entry) => entry.kind === "run-binding" && entry.recordId === binding.recordId,
+          );
+          if (committedBinding?.kind !== "run-binding")
+            return yield* Effect.die("Missing fixture binding");
+          if (
+            [
+              "revoked",
+              "wrong session",
+              "wrong provider",
+              "wrong generation",
+              "changed selection",
+            ].includes(scenario)
+          )
+            yield* restoreHistoricalBinding({
+              ...committedBinding,
+              revision: committedBinding.revision + 1,
+              ...(scenario === "revoked" ? { status: "revoked" } : {}),
+              ...(scenario === "wrong session" ? { sessionId: "foreign-native-session" } : {}),
+              ...(scenario === "wrong provider"
+                ? { providerInstanceId: ProviderInstanceId.make("foreign-pi") }
+                : {}),
+              ...(scenario === "wrong generation"
+                ? { generation: committedBinding.generation + 1 }
+                : {}),
+              ...(scenario === "changed selection"
+                ? {
+                    configuration: {
+                      ...committedBinding.configuration,
+                      skillIds: ["changed-skill"],
+                    },
+                  }
+                : {}),
+            });
+          const before =
+            yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_ordinal`;
+          const processesBefore = yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY unit`;
+          const result = yield* provider
+            .startSession(durablePiThreadId, {
+              threadId: durablePiThreadId,
+              providerInstanceId: durablePiInstanceId,
+              runtimeMode: "approval-required",
+              ...(scenario === "explicit stale"
+                ? { resumeCursor: initial }
+                : scenario === "explicit current"
+                  ? { resumeCursor: latest }
+                  : {}),
+            })
+            .pipe(Effect.exit);
+          if (scenario === "implicit" || scenario === "explicit current") {
+            if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause);
+            assert.deepStrictEqual(result.value.resumeCursor, latest);
+            assert.deepStrictEqual(
+              Option.getOrThrow(yield* directory.getBinding(durablePiThreadId)).resumeCursor,
+              latest,
+            );
+          } else {
+            assert.isTrue(Exit.isFailure(result));
+            assert.equal((yield* adapter.listSessions()).length, 0);
+            assert.deepStrictEqual(
+              Option.getOrThrow(yield* directory.getBinding(durablePiThreadId)).resumeCursor,
+              initial,
+            );
+            if (scenario === "explicit stale" && Exit.isFailure(result))
+              assert.include(
+                String(Cause.squash(result.cause)),
+                "Requested session hints do not match",
+              );
+          }
+          assert.deepStrictEqual(
+            yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_ordinal`,
+            before,
+          );
+          assert.deepStrictEqual(yield* f.sql`SELECT * FROM project_team_model_request`, []);
+          assert.equal(workerArgv.mock.calls.length, 0);
+          assert.equal(transport.mock.calls.length, 0);
+          assert.deepStrictEqual(
+            yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY unit`,
+            processesBefore,
+          );
+        }),
+      ).pipe(Effect.provide(Layer.mergeAll(Layer.mock(ProjectWorkGateway)({}), piAuthorityLayer))),
+    );
+  }
+});
 
 const createManagedPiThread = Effect.gen(function* () {
   const engine = yield* OrchestrationEngineService;
