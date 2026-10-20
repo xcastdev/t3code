@@ -1,4 +1,5 @@
 import { makeProjectMemoryModelExchange } from "../../server.ts";
+import { sameProjectMemoryReportedModel } from "../../projectWork/memory/ProjectMemoryModelRoutes.ts";
 import * as MemoryModelPorts from "../../projectWork/memory/ProjectMemoryPorts.ts";
 import { projectMemorySourceSelection } from "../../projectWork/memory/ProjectMemorySharing.ts";
 import * as PiOperations from "../../projectWork/ProjectTeamPiOperations.ts";
@@ -10296,6 +10297,9 @@ for (const compactProof of [
           const memoryUnknown = compactProof === "memorySubscriptionUnknown";
           const piUnknown = compactProof === "memorySubscriptionPiUnknown";
           let subscriptionMemoryChecked = false;
+          const catalogCanonical = "nvidia/nemotron-3-embed-1b-20260716";
+          const catalogProof =
+            compactProof === "memoryPipeline" || compactProof === "memoryQueryPipeline";
           const liquidProof = compactProof?.startsWith("memoryLiquid") === true;
           const liquidDenied =
             compactProof === "memoryLiquidConfiguration" || compactProof === "memoryLiquidIdentity";
@@ -12199,7 +12203,9 @@ for (const compactProof of [
                                       );
                                     }
                                     return {
-                                      reportedModel: exchange.model,
+                                      reportedModel: catalogProof
+                                        ? catalogCanonical
+                                        : exchange.model,
                                       inputTokens: 25,
                                       outputTokens: 0,
                                       value: [Array.from({ length: 2048 }, () => 0.375)],
@@ -12292,7 +12298,10 @@ for (const compactProof of [
                                     reportedModel:
                                       compactProof === "memoryLiquidIdentity"
                                         ? "liquid/lfm-2.5-2.6b"
-                                        : exchange.model,
+                                        : compactProof === "memoryPipeline" &&
+                                            exchange.phase === "embed"
+                                          ? catalogCanonical
+                                          : exchange.model,
                                     inputTokens: 50,
                                     outputTokens: exchange.phase === "extract" ? 5 : 0,
                                     value:
@@ -14841,6 +14850,63 @@ for (const compactProof of [
                               expect(embedding.reservation.scope).not.toBe(
                                 memoryHeld.reservation.scope,
                               );
+                              drainedMemory.add(embedding.reservationId);
+                              const beforeAliasDenials =
+                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+                              const beforeAliasBudget =
+                                yield* f.sql`SELECT * FROM project_team_model_budget`;
+                              const aliasSettlement = {
+                                ...embedding.reservation,
+                                reservationId: embedding.reservationId,
+                                outcome: "reported" as const,
+                                chargedInputTokens: 15,
+                                chargedOutputTokens: 0,
+                                reportedInputTokens: 15,
+                                reportedOutputTokens: 0,
+                                reportedModel: catalogCanonical,
+                                transportDrained: true,
+                              };
+                              for (const reportedModel of [
+                                "nvidia/nemotron-3-embed-1b-20260715",
+                                "nvidia/nemotron-3-embed-1b-20260717",
+                                "nvidia/nemotron-3-embed-1b-20260716:free",
+                                "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+                                "unrelated-model",
+                              ]) {
+                                expect(
+                                  sameProjectMemoryReportedModel(
+                                    reportedModel,
+                                    embedding.reservation.model,
+                                  ),
+                                ).toBe(false);
+                                expect(
+                                  (yield* ledger
+                                    .settle({ ...aliasSettlement, reportedModel })
+                                    .pipe(Effect.result))._tag,
+                                ).toBe("Failure");
+                              }
+                              for (const model of [
+                                "nvidia/nemotron-3-embed-1b",
+                                catalogCanonical,
+                                "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+                                "inclusionai/ling-3.1-flash:free",
+                              ]) {
+                                expect(
+                                  sameProjectMemoryReportedModel(catalogCanonical, model),
+                                ).toBe(false);
+                                expect(
+                                  (yield* ledger
+                                    .settle({ ...aliasSettlement, model })
+                                    .pipe(Effect.result))._tag,
+                                ).toBe("Failure");
+                              }
+                              expect(
+                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+                              ).toEqual(beforeAliasDenials);
+                              expect(yield* f.sql`SELECT * FROM project_team_model_budget`).toEqual(
+                                beforeAliasBudget,
+                              );
+                              drainedMemory.delete(embedding.reservationId);
                               const uncertain = yield* ledger.settle({
                                 ...embedding.reservation,
                                 reservationId: embedding.reservationId,
@@ -15708,6 +15774,61 @@ for (const compactProof of [
             expect(replay).toMatchObject({ _tag: "Success", success: memoryReceipt });
             expect(yield* f.sql`SELECT * FROM project_team_memory_job`).toEqual(rows);
             expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(charges);
+            if (catalogProof) {
+              const embeddings = yield* f.sql<{
+                phase: string;
+                status: string;
+                capacity: string;
+                input: number;
+                output: number;
+                settlement: string;
+              }>`SELECT json_extract(reservation_json,'$.phase') AS phase,
+                status,capacity_state AS capacity,charged_input_tokens AS input,
+                charged_output_tokens AS output,settlement_json AS settlement
+                FROM project_team_model_request WHERE request_lane='memory'
+                AND json_extract(reservation_json,'$.phase') IN ('embed','query-embed')
+                ORDER BY phase`;
+              expect(
+                embeddings.map(({ settlement, ...row }) => ({
+                  ...row,
+                  settlement: decodeRequiredJson(settlement),
+                })),
+              ).toMatchObject([
+                {
+                  phase: "embed",
+                  status: "reported",
+                  capacity: "released",
+                  input: 50,
+                  output: 0,
+                  settlement: {
+                    reportedModel:
+                      compactProof === "memoryPipeline"
+                        ? catalogCanonical
+                        : "nvidia/nemotron-3-embed-1b:free",
+                    reportedInputTokens: 50,
+                    reportedOutputTokens: 0,
+                    transportDrained: true,
+                  },
+                },
+                ...(compactProof === "memoryQueryPipeline"
+                  ? [
+                      {
+                        phase: "query-embed",
+                        status: "reported",
+                        capacity: "released",
+                        input: 25,
+                        output: 0,
+                        settlement: {
+                          reportedModel: catalogCanonical,
+                          reportedInputTokens: 25,
+                          reportedOutputTokens: 0,
+                          transportDrained: true,
+                        },
+                      },
+                    ]
+                  : []),
+              ]);
+            }
             expect(runs).toBe(2);
             expect(f.transports).toBe(0);
             if (pipelineProof) {

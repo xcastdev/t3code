@@ -33,13 +33,15 @@ export const isProjectMemoryReservedRoute = (phase: string, provider: string, mo
     : (phase === "embed" || phase === "query-embed") &&
       provider === MEMORY_EMBEDDING.provider &&
       model === MEMORY_EMBEDDING.model;
-/** Only the two historical routes have observed unsuffixed response aliases. */
+/** Fixed response aliases, including the verified OpenRouter NVIDIA catalog canonical slug. */
 export const sameProjectMemoryReportedModel = (reported: string | undefined, requested: string) =>
   (requested === LIQUID_EXTRACTION.model && reported === requested) ||
   (requested === COMMAND_CODE_EXTRACTION.model &&
     (reported === requested || reported === "inclusionai/ling-3.1-flash")) ||
   (requested === MEMORY_EMBEDDING.model &&
-    (reported === requested || reported === "nvidia/nemotron-3-embed-1b"));
+    (reported === requested ||
+      reported === "nvidia/nemotron-3-embed-1b" ||
+      reported === "nvidia/nemotron-3-embed-1b-20260716"));
 
 export const withinProjectMemoryExtractionLimits = (
   endpoint: string,
