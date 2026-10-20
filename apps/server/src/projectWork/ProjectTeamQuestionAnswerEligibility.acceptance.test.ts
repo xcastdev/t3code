@@ -380,6 +380,17 @@ it.effect(
       ).not.toThrow();
       expect(yield* f.sql`SELECT task_id FROM project_team_dispatch`).toEqual([]);
       const attemptsBefore = before.attempts;
+      const ownerAttempts = before.attempts.filter((a) => a.taskId === questionTask);
+      expect(ownerAttempts).toHaveLength(1);
+      expect(ownerAttempts[0]?.attemptId).toBe(questionBinding.attemptId);
+      expect(
+        before.foundationRecords?.find((r) => r.recordId === questionBinding.recordId),
+      ).toEqual(questionBinding);
+      expect(questionBinding.status).toBe("running");
+      expect(deriveProjectWorkClaimPrerequisites(before, questionTask)).toEqual({
+        claimable: false,
+        reason: "task-not-ready",
+      });
 
       const question = before.foundationRecords?.find((r) => r.recordId === "wake-question");
       if (question?.kind !== "question") return yield* Effect.die("Pending question absent");
@@ -423,6 +434,14 @@ it.effect(
       );
       expect(awakened.blocked.map((b) => b.taskId)).toContain(ProjectWorkTaskId.make("pause-task"));
       const answered = yield* readCurrentState(f.sql, projectId);
+      expect(answered.attempts.filter((a) => a.taskId === questionTask)).toEqual(ownerAttempts);
+      expect(
+        answered.foundationRecords?.find((r) => r.recordId === questionBinding.recordId),
+      ).toEqual(questionBinding);
+      expect(deriveProjectWorkClaimPrerequisites(answered, questionTask)).toEqual({
+        claimable: false,
+        reason: "task-not-ready",
+      });
       expect(answered.tasks.filter((t) => t.taskId !== taskId)).toEqual(
         before.tasks.filter((t) => t.taskId !== taskId),
       );

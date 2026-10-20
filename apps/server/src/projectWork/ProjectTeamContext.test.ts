@@ -2919,6 +2919,112 @@ it.effect(
 );
 
 it.effect(
+  "the same owner snapshot reads a mobile human answer later without new execution or gate approval",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeFixture();
+      const gateway = yield* ProjectWorkGateway;
+      const claim = f.snapshot.intent.compiledClaim.transition;
+      if (claim?.kind !== "claim") return yield* Effect.die("Missing original owner claim");
+      yield* f.change({ ...claim.binding, revision: 1, status: "running" });
+      const current = yield* readCurrentState(f.sql, projectId);
+      const planGate = current.foundationRecords?.find(
+        (r) => r.kind === "gate" && r.taskId === claim.taskId && r.gate === "plan",
+      );
+      if (planGate?.kind !== "gate") return yield* Effect.die("Missing original owner plan gate");
+      const gate = {
+        ...planGate,
+        recordId: "mobile-answer-pending-gate",
+        revision: 0,
+        status: "pending",
+      };
+      yield* f.change(yield* decodeRecord(gate));
+      const pending = yield* decodeRecord({
+        kind: "question",
+        recordId: "mobile-owner-question",
+        projectId,
+        revision: 0,
+        generation: claim.binding.generation,
+        updatedAt: at,
+        status: "pending",
+        taskId: claim.taskId,
+        senderId: claim.binding.memberId,
+        targetGateId: gate.recordId,
+        targetRevision: gate.revision,
+        body: "Which history should this owner preserve?",
+        choices: ["Preserve the original history"],
+      });
+      yield* f.change(pending);
+      const before = yield* readCurrentState(f.sql, projectId);
+      expect(before.attempts).toMatchObject([
+        { taskId: claim.taskId, attemptId: claim.binding.attemptId },
+      ]);
+      expect(before.foundationRecords?.find((r) => r.recordId === claim.binding.recordId)).toEqual({
+        ...claim.binding,
+        revision: 1,
+        status: "running",
+      });
+      const dispatches = yield* f.sql`SELECT * FROM project_team_dispatch ORDER BY dispatch_id`;
+      const operations =
+        yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`;
+      expect(dispatches).toHaveLength(1);
+      const snapshot = structuredClone(f.snapshot);
+      const beforeContext = yield* f.reader.readRequired(f.snapshot);
+      expect(beforeContext.required.questions).toEqual([pending]);
+      const actor = { kind: "human" as const, id: "mobile-answer-human" };
+      const source = { kind: "mobile" as const, id: "mobile-answer-device" };
+      yield* gateway.write(
+        yield* decodeRetainedIntent({
+          type: "project-team.question.answer",
+          commandId: "same-owner-mobile-answer",
+          projectId,
+          taskId: claim.taskId,
+          expectedRevision: before.revision,
+          expectedTaskRevision: before.tasks.find((t) => t.taskId === claim.taskId)!.revision,
+          specRevision: claim.binding.specRevision,
+          planRevision: claim.binding.planRevision,
+          questionId: pending.recordId,
+          expectedQuestionRevision: pending.revision,
+          expectedGateRevision: gate.revision,
+          answer: "Preserve the original history",
+        }),
+        actor,
+        source,
+      );
+      // A later required-context read uses the exact retained owner snapshot;
+      // it does not deliver to or resume a live provider session.
+      const afterContext = yield* f.reader.readRequired(f.snapshot);
+      expect(afterContext.required.questions).toEqual([
+        {
+          ...pending,
+          revision: 1,
+          updatedAt: "2026-01-01T00:00:00.001Z",
+          status: "answered",
+          answer: "Preserve the original history",
+          answeredBy: { actor, source, recordedAt: "2026-01-01T00:00:00.001Z" },
+        },
+      ]);
+      expect(afterContext.text).toContain("Preserve the original history");
+      expect(afterContext.text).toContain("mobile-answer-human");
+      expect(afterContext.text).toContain("mobile-answer-device");
+      const after = yield* readCurrentState(f.sql, projectId);
+      expect(after.tasks).toEqual(before.tasks);
+      expect(after.attempts).toEqual(before.attempts);
+      expect(after.foundationRecords?.filter((r) => r.recordId !== pending.recordId)).toEqual(
+        before.foundationRecords?.filter((r) => r.recordId !== pending.recordId),
+      );
+      expect(after.foundationRecords?.find((r) => r.recordId === gate.recordId)).toEqual(gate);
+      expect(yield* f.sql`SELECT * FROM project_team_dispatch ORDER BY dispatch_id`).toEqual(
+        dispatches,
+      );
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`).toEqual(
+        operations,
+      );
+      expect(f.snapshot).toEqual(snapshot);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+it.effect(
   "denies substituted human answer attribution despite matching question projection and event",
   () =>
     scoped(
