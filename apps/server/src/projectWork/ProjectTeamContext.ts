@@ -1048,7 +1048,31 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
     let unknownChargedTokens = 0;
     let unknownOutcomeCalls = 0;
     let outstandingRequests = 0;
-    let accountingMode: "hard" | "openai-subscription-monitored" | undefined;
+    const monitoredGrant = yield* sql<{
+      model: string;
+      route_id: string;
+      maximum_tokens: number;
+      maximum_duration_ms: number;
+      deadline_at_ms: number;
+      stopped_at_ms: number | null;
+      stop_reason: string | null;
+    }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms,stop_reason
+      FROM project_team_pi_subscription_grant WHERE environment_id=${options.environmentId}
+      AND project_id=${binding.projectId} AND root_task_id=${limits.rootTaskId} LIMIT 2`;
+    const grant = monitoredGrant[0];
+    if (
+      monitoredGrant.length > 1 ||
+      (grant !== undefined &&
+        (grant.model !== "gpt-6-luna" ||
+          grant.route_id !== "openai-subscription-luna" ||
+          grant.maximum_tokens !== 64_000 ||
+          grant.maximum_tokens !== limits.maximumTokens ||
+          grant.maximum_duration_ms !== 300_000 ||
+          grant.deadline_at_ms !== limits.rootDeadlineAtMs))
+    )
+      return yield* deny("Subscription stopping record is invalid");
+    // The original root grant selects aggregate policy; memory retains its hard per-request mode.
+    const accountingMode = grant === undefined ? "hard" : "openai-subscription-monitored";
     const receipts: Array<{
       reservationId: string;
       runId: string;
@@ -1089,9 +1113,8 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         Buffer.byteLength(row.settlement_json ?? "") > 16384
       )
         return yield* deny("Remaining budget owner identity is invalid");
-      if (accountingMode !== undefined && accountingMode !== row.accounting_mode)
-        return yield* deny("Remaining budget ledger mixes accounting modes");
-      accountingMode = row.accounting_mode;
+      if (row.request_lane === "pi" && row.accounting_mode !== accountingMode)
+        return yield* deny("Remaining Pi accounting mode disagrees with the original root grant");
       if (row.request_lane === "memory") {
         let ledger = memoryLedgers.get(row.operation_id);
         if (ledger === undefined) {
@@ -1119,6 +1142,8 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           row.status === "held"
             ? add(row.maximum_input_tokens, row.maximum_output_tokens)
             : add(row.charged_input_tokens, row.charged_output_tokens);
+        if (row.status === "held") nominalHeldTokens = add(nominalHeldTokens, charged);
+        else observedChargedTokens = add(observedChargedTokens, charged);
         rootUsedTokens = add(rootUsedTokens, charged);
         if (row.attempt_id === binding.attemptId)
           attemptUsedTokens = add(attemptUsedTokens, charged);
@@ -1251,38 +1276,16 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
     }
     if (accountingMode !== "openai-subscription-monitored" && rootUsedTokens > limits.maximumTokens)
       return yield* deny("Root model budget is overdrawn");
-    const monitoredGrant = yield* sql<{
-      model: string;
-      route_id: string;
-      maximum_tokens: number;
-      maximum_duration_ms: number;
-      deadline_at_ms: number;
-      stopped_at_ms: number | null;
-      stop_reason: string | null;
-    }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms,stopped_at_ms,stop_reason
-      FROM project_team_pi_subscription_grant WHERE environment_id=${options.environmentId}
-      AND project_id=${binding.projectId} AND root_task_id=${limits.rootTaskId} LIMIT 2`;
     if (
-      monitoredGrant.length > 1 ||
-      (accountingMode === "openai-subscription-monitored" &&
-        (monitoredGrant.length !== 1 ||
-          monitoredGrant[0]?.model !== "gpt-6-luna" ||
-          monitoredGrant[0]?.route_id !== "openai-subscription-luna" ||
-          monitoredGrant[0]?.maximum_tokens !== 64_000 ||
-          monitoredGrant[0]?.maximum_tokens !== limits.maximumTokens ||
-          monitoredGrant[0]?.maximum_duration_ms !== 300_000 ||
-          monitoredGrant[0]?.deadline_at_ms !== limits.rootDeadlineAtMs ||
-          (monitoredGrant[0]?.stopped_at_ms === null) !==
-            (monitoredGrant[0]?.stop_reason === null) ||
-          (monitoredGrant[0]?.stop_reason !== null &&
-            monitoredGrant[0]?.stop_reason !== "threshold-reached" &&
-            monitoredGrant[0]?.stop_reason !== "unknown-usage") ||
-          (monitoredGrant[0]?.stop_reason === "threshold-reached" &&
-            observedChargedTokens < 64_000) ||
-          (monitoredGrant[0]?.stop_reason === "unknown-usage" && unknownOutcomeCalls === 0) ||
-          (monitoredGrant[0]?.stop_reason === null &&
-            (observedChargedTokens >= 64_000 || unknownOutcomeCalls > 0)))) ||
-      (accountingMode !== "openai-subscription-monitored" && monitoredGrant.length !== 0)
+      grant !== undefined &&
+      ((grant.stopped_at_ms === null) !== (grant.stop_reason === null) ||
+        (grant.stop_reason !== null &&
+          grant.stop_reason !== "threshold-reached" &&
+          grant.stop_reason !== "unknown-usage") ||
+        (grant.stop_reason === "threshold-reached" && observedChargedTokens < 64_000) ||
+        (grant.stop_reason === "unknown-usage" && unknownOutcomeCalls === 0) ||
+        (grant.stop_reason === null &&
+          (observedChargedTokens >= 64_000 || unknownOutcomeCalls > 0)))
     )
       return yield* deny("Subscription stopping record is invalid");
     return {

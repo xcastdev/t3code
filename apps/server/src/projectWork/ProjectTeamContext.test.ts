@@ -65,12 +65,25 @@ import type {
 } from "../provider/pi/PiModelBroker.ts";
 import type { PiSessionTerminal } from "../provider/pi/PiSessionRuntime.ts";
 import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
-import { ProjectMemoryServiceError, projectMemoryHash } from "./memory/ProjectMemoryService.ts";
+import {
+  makeProjectMemoryService,
+  ProjectMemoryServiceError,
+  projectMemoryHash,
+} from "./memory/ProjectMemoryService.ts";
 import {
   projectMemorySourceSelection,
   qualifyProjectMemorySharedSource,
   readProjectMemorySharedSources,
 } from "./memory/ProjectMemorySharing.ts";
+import { ProjectWorkContentGuard, layer as contentGuardLayer } from "./ProjectWorkContentGuard.ts";
+import { makeProjectMemoryProcessing } from "./memory/ProjectMemoryProcessing.ts";
+import {
+  ProjectMemoryOperation,
+  ProjectMemoryTaskOwner,
+  ProjectMemoryJobOwner,
+  makeProjectMemoryModelAccounting,
+  auditProjectMemoryTaskOwner,
+} from "./memory/ProjectMemoryModelAccounting.ts";
 import { readProjectMemoryObservations } from "./memory/ProjectMemoryRetrieval.ts";
 
 const encodeRetainedEvent = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -79,6 +92,10 @@ const decodeCommand = Schema.decodeUnknownEffect(ProjectWorkCommand);
 const decodeRecord = Schema.decodeUnknownEffect(TeamRecordSchema);
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 const decodeRetainedIntent = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
+const decodeMemoryTaskOwner = Schema.decodeUnknownEffect(ProjectMemoryTaskOwner);
+const decodeMemoryJobOwner = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectMemoryJobOwner),
+);
 
 const makeFixture = (
   role: "implementer" | "integrator" | "planner" | "reviewer" | "investigator" = "implementer",
@@ -1845,7 +1862,7 @@ it.effect("retained context preserves nested producer decorations and distinct t
   ),
 );
 
-const makeBudgetFixture = (writableWorkers = 1, subscription = false) =>
+const makeBudgetFixture = (writableWorkers = 1, subscription = false, memory = false) =>
   Effect.gen(function* () {
     if (subscription) yield* TestClock.setTime(Date.parse(at) + 1);
     const f = yield* makeFixture(
@@ -1853,8 +1870,8 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false) =>
       writableWorkers,
       undefined,
       false,
-      "none",
-      false,
+      memory ? "project" : "none",
+      memory,
       subscription,
     );
     const claim = f.snapshot.intent.compiledClaim.transition;
@@ -1891,9 +1908,11 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false) =>
           };
           const operation = yield* operations.prepare(
             identity,
-            { threadId: binding.threadId, kind: "initialize" },
-            "subscription-usage-reader",
-            { allocation, workerId: "worker", operationId: "initialize" },
+            memory
+              ? { threadId: binding.threadId, kind: "prompt", prompt: "Read retained memory" }
+              : { threadId: binding.threadId, kind: "initialize" },
+            memory ? "a".repeat(64) : "subscription-usage-reader",
+            { allocation, workerId: "worker", operationId: memory ? "assignment" : "initialize" },
           );
           const owner = {
             type: "owner" as const,
@@ -2046,6 +2065,387 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false) =>
     };
     return { ...f, reserve, settle, reservation, accounting, principal, piRuntime };
   });
+
+const makeMixedBudgetFixture = Effect.gen(function* () {
+  const f = yield* makeBudgetFixture(1, true, true);
+  const runtime = f.piRuntime;
+  if (!runtime) return yield* Effect.die("Missing Pi memory runtime");
+  const captured = runtime.operation;
+  const binding = captured.authority.binding;
+  const operation = yield* decodeMemoryTaskOwner({
+    version: 1,
+    environmentId: "environment",
+    projectId,
+    taskId: binding.taskId,
+    bindingId: binding.recordId,
+    generation: binding.generation,
+    providerInstanceId: binding.providerInstanceId,
+    threadId: binding.threadId,
+    operationId: captured.operation.operationId,
+    workerId: captured.workerId,
+    ordinal: captured.ordinal,
+    attemptId: binding.attemptId,
+    rootBindingId: binding.recordId,
+    rootTaskId: f.snapshot.intent.limits.rootTaskId,
+    rootMaximumTokens: f.snapshot.intent.limits.maximumTokens,
+    rootDeadlineAtMs: f.snapshot.intent.limits.rootDeadlineAtMs,
+    attemptMaximumTokens: f.snapshot.intent.limits.attemptMaximumTokens,
+    attemptDeadlineAtMs: f.snapshot.intent.limits.deadlineAtMs,
+    operationMaximumTokens: captured.maximumTokens,
+    operationDeadlineAtMs: captured.deadlineAtMs,
+    leaseDeadlineAtMs: Date.parse(
+      f.snapshot.intent.compiledClaim.transition?.kind === "claim"
+        ? f.snapshot.intent.compiledClaim.transition.claim.leasedUntil
+        : "",
+    ),
+    roleSha256: projectMemoryHash(captured.authority.role),
+    configurationSha256: projectMemoryHash(binding.configuration),
+    requestSha256: "a".repeat(64),
+    allocation: captured.allocation,
+  });
+  const identity = {
+    environmentId: operation.environmentId,
+    projectId,
+    taskId: operation.taskId,
+    bindingId: operation.bindingId,
+    generation: operation.generation,
+    providerInstanceId: operation.providerInstanceId,
+    threadId: operation.threadId,
+    operationId: operation.operationId,
+    workerId: operation.workerId,
+    ordinal: operation.ordinal,
+  };
+  const auth = yield* ProjectTeamAuthorization;
+  const guard = yield* ProjectWorkContentGuard;
+  const service = makeProjectMemoryService({
+    sql: f.sql,
+    repository: f.repository,
+    authorization: auth,
+    contentGuard: guard,
+    environmentId: "environment",
+  });
+  const writer = yield* retainedWriter();
+  yield* writer.propose("mixed-memory-source");
+  yield* writer.accept("mixed-memory-source");
+  yield* service.captureRetained(projectId, {
+    kind: "decision",
+    retainedId: "mixed-memory-source",
+  });
+  const processing = yield* makeProjectMemoryProcessing;
+  const authority = yield* auth.resolve(f.principal);
+  if (!authority) return yield* Effect.die("Missing memory authority");
+  const page = yield* f.sql.withTransaction(
+    processing.readSourcesInTransaction(
+      {
+        operation: "memory-sources",
+        projectId,
+        taskId: binding.taskId,
+      },
+      authority,
+    ),
+  );
+  const selection = page.items[0]?.selection;
+  if (!selection) return yield* Effect.die("Missing retained memory selection");
+  const request = yield* decodeVerificationIntent({
+    type: "project-team.memory.process",
+    commandId: "mixed-memory-admit",
+    projectId,
+    taskId: binding.taskId,
+    expectedRevision: authority.state.revision,
+    expectedTaskRevision: authority.state.tasks.find((t) => t.taskId === binding.taskId)!.revision,
+    specRevision: binding.specRevision,
+    planRevision: binding.planRevision,
+    selection,
+  });
+  if (request.type !== "project-team.memory.process")
+    return yield* Effect.die("Missing memory request");
+  const attribution = {
+    actor: f.principal.actor,
+    source: { kind: "mcp" as const, id: operation.workerId },
+    recordedAt: at,
+  };
+  const fingerprint =
+    "project-team-intent:" +
+    NodeCrypto.createHash("sha256")
+      .update(
+        canonicalProjectWorkPayload({
+          intent: request,
+          actor: f.principal.actor,
+          source: attribution.source,
+          managed: f.principal.managed,
+        }),
+      )
+      .digest("hex");
+  const command = yield* decodeCommit({
+    type: "project-work.foundation.commit",
+    commandId: request.commandId,
+    projectId,
+    expectedRevision: request.expectedRevision,
+    records: [
+      authority.state.foundationRecords!.find(
+        (r) => r.kind === "effect" && r.effectId === selection.effectId,
+      )!,
+    ],
+    attribution,
+    committedAt: at,
+  });
+  yield* f.repository
+    .executeAuthorized(
+      command,
+      () => processing.compileInTransaction(request, f.principal, attribution, auth.resolve, false),
+      undefined,
+      fingerprint,
+    )
+    .pipe(
+      Effect.provideService(ProjectMemoryOperation, {
+        identity,
+        assertForward: Effect.void,
+        readCurrentInTransaction: () =>
+          auditProjectMemoryTaskOwner(f.sql, operation).pipe(
+            Effect.as(operation),
+            Effect.mapError(
+              (error) =>
+                new ProjectMemoryServiceError({
+                  reason: "reason" in error ? String(error.reason) : String(error),
+                }),
+            ),
+          ),
+      }),
+      Effect.provideService(ProjectMemoryPorts, { assertConfigured: () => Effect.void }),
+    );
+  const saved = yield* f.sql<{
+    owner_json: string;
+  }>`SELECT owner_json FROM project_team_memory_job WHERE effect_id=${selection.effectId}`;
+  const owner = yield* decodeMemoryJobOwner(saved[0]!.owner_json);
+  const accounting = yield* makeProjectMemoryModelAccounting({
+    environmentId: "environment",
+    extractionEndpoint: "https://openrouter.ai/api/v1/chat/completions",
+    maximumConcurrentCalls: 4,
+    maximumConcurrentModelCalls: 4,
+    assertCurrentInTransaction: () =>
+      auditProjectMemoryTaskOwner(f.sql, operation).pipe(
+        Effect.mapError(
+          (error) =>
+            new ProjectMemoryServiceError({
+              reason: "reason" in error ? String(error.reason) : String(error),
+            }),
+        ),
+      ),
+    assertTransportDrainedInTransaction: () => Effect.void,
+  });
+  const reserveMemory = (requestId: number, maximum: number) =>
+    accounting.reserve(owner, {
+      phase: "extract",
+      routeId: "memory-extract",
+      requestId,
+      maxInputTokens: Math.max(maximum / 2, maximum - 8192),
+      maxOutputTokens: Math.min(maximum / 2, 8192),
+      deadlineAtMs: captured.deadlineAtMs,
+    });
+  const settleMemory = (
+    reserved: Effect.Success<ReturnType<typeof reserveMemory>>,
+    outcome: "reported" | "unknown",
+    charge: number,
+  ) =>
+    accounting.settle({
+      ...reserved.reservation,
+      reservationId: reserved.reservationId,
+      outcome,
+      chargedInputTokens: charge / 2,
+      chargedOutputTokens: charge / 2,
+      transportDrained: true,
+      ...(outcome === "reported"
+        ? {
+            reportedModel: reserved.reservation.model,
+            reportedInputTokens: charge / 2,
+            reportedOutputTokens: charge / 2,
+          }
+        : {}),
+    });
+  return { ...f, reserveMemory, settleMemory };
+});
+
+it.effect("reads subscription Pi and hard memory charges under the original root grant", () =>
+  withRetainedGateway(
+    Effect.gen(function* () {
+      const f = yield* makeMixedBudgetFixture;
+      const reported = yield* f.reserveMemory(1, 100);
+      yield* f.settleMemory(reported, "reported", 40);
+      const unknown = yield* f.reserveMemory(2, 200);
+      yield* f.settleMemory(unknown, "unknown", 200);
+      yield* f.reserveMemory(3, 300);
+      const pi = f.reservation(1);
+      const reserved = yield* f.accounting.reserve(f.principal, pi);
+      yield* f.accounting.settle({
+        ...pi,
+        reservationId: reserved.reservationId,
+        outcome: "reported",
+        chargedInputTokens: 180,
+        chargedOutputTokens: 180,
+        transportDrained: true,
+        reportedModel: "gpt-6-luna",
+        reportedUsage: { prompt_tokens: 180, completion_tokens: 180, total_tokens: 360 },
+      });
+      const context = yield* f.reader.readRequired(f.snapshot);
+      expect(context.required.remaining).toMatchObject({
+        rootUsedTokens: 900,
+        rootRemainingTokens: 63_400,
+        attemptUsedTokens: 900,
+        outstandingRequests: 1,
+        policy: {
+          accountingMode: "openai-subscription-monitored",
+          observedChargedTokens: 600,
+          nominalHeldTokens: 300,
+        },
+      });
+      const exhausted = yield* f.reserveMemory(4, 64_000).pipe(Effect.result);
+      expect(exhausted).toMatchObject({
+        _tag: "Failure",
+        failure: { reason: "Original memory operation, attempt or root budget exhausted" },
+      });
+      const held = { ...f.reservation(2), maxInputTokens: 500, maxOutputTokens: 500 };
+      yield* f.accounting.reserve(f.principal, held);
+      const fresh = yield* makeProjectTeamContext({
+        environmentId: "environment",
+        maximumEnvironmentModelCalls: 4,
+      });
+      expect((yield* fresh.readRequired(f.snapshot)).required.remaining).toMatchObject({
+        rootUsedTokens: 1900,
+        rootRemainingTokens: 63_400,
+        policy: { observedChargedTokens: 600, nominalHeldTokens: 1300 },
+      });
+    }).pipe(Effect.provide(contentGuardLayer)),
+  ),
+);
+
+it.effect(
+  "keeps subscription unknown charges and stopping distinct from hard memory unknowns",
+  () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeMixedBudgetFixture;
+        const memory = yield* f.reserveMemory(1, 200);
+        yield* f.settleMemory(memory, "unknown", 200);
+        const pi = f.reservation(1);
+        const reserved = yield* f.accounting.reserve(f.principal, pi);
+        yield* f.accounting.settle({
+          ...pi,
+          reservationId: reserved.reservationId,
+          outcome: "unknown",
+          chargedInputTokens: 16_384,
+          chargedOutputTokens: 64_000,
+          transportDrained: false,
+        });
+        expect((yield* f.reader.readRequired(f.snapshot)).required.remaining).toMatchObject({
+          rootUsedTokens: 80_584,
+          rootRemainingTokens: 0,
+          outstandingRequests: 1,
+          policy: {
+            accountingMode: "openai-subscription-monitored",
+            observedChargedTokens: 80_584,
+            nominalHeldTokens: 0,
+            stoppedReason: "unknown-usage",
+          },
+        });
+        expect(
+          yield* f.sql`SELECT accounting_mode,unknown_maximum_tokens,capacity_state FROM project_team_model_request WHERE request_lane='pi'`,
+        ).toEqual([
+          {
+            accounting_mode: "openai-subscription-monitored",
+            unknown_maximum_tokens: 64_000,
+            capacity_state: "quarantine",
+          },
+        ]);
+        yield* f.sql`UPDATE project_team_model_request SET charged_output_tokens=63999 WHERE request_lane='pi'`;
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }).pipe(Effect.provide(contentGuardLayer)),
+    ),
+);
+
+for (const corruption of [
+  "memory-mode",
+  "memory-charge",
+  "memory-owner",
+  "grant",
+  "request-hash",
+  "inherited-budget",
+] as const)
+  it.effect(`denies mixed ledger corruption ${corruption}`, () =>
+    withRetainedGateway(
+      Effect.gen(function* () {
+        const f = yield* makeMixedBudgetFixture;
+        const memory = yield* f.reserveMemory(1, 100);
+        yield* f.settleMemory(memory, "reported", 40);
+        yield* f.reserve(1);
+        yield* f.reader.readRequired(f.snapshot);
+        if (corruption === "memory-mode") {
+          expect(
+            (yield* f.sql`UPDATE project_team_model_request SET accounting_mode='openai-subscription-monitored',unknown_maximum_tokens=64000 WHERE request_lane='memory'`.pipe(
+              Effect.result,
+            ))._tag,
+          ).toBe("Failure");
+          yield* f.reader.readRequired(f.snapshot);
+          return;
+        }
+        if (corruption === "memory-charge")
+          yield* f.sql`UPDATE project_team_model_request SET charged_input_tokens=0 WHERE request_lane='memory'`;
+        if (corruption === "memory-owner") {
+          expect(
+            (yield* f.sql`UPDATE project_team_memory_job SET owner_json=json_set(owner_json,'$.operation.attemptId','foreign')`.pipe(
+              Effect.result,
+            ))._tag,
+          ).toBe("Failure");
+          yield* f.reader.readRequired(f.snapshot);
+          return;
+        }
+        if (corruption === "grant") {
+          expect(
+            (yield* f.sql`UPDATE project_team_pi_subscription_grant SET maximum_duration_ms=299999`.pipe(
+              Effect.result,
+            ))._tag,
+          ).toBe("Failure");
+          yield* f.reader.readRequired(f.snapshot);
+          return;
+        }
+        if (corruption === "request-hash")
+          yield* f.sql`UPDATE project_team_pi_operation SET request_hash=${"b".repeat(64)}`;
+        if (corruption === "inherited-budget")
+          yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=64001`;
+        yield* denied(f.reader.readRequired(f.snapshot));
+      }).pipe(Effect.provide(contentGuardLayer)),
+    ),
+  );
+
+it.effect("validates subscription threshold stopping against settled charges from both lanes", () =>
+  withRetainedGateway(
+    Effect.gen(function* () {
+      const f = yield* makeMixedBudgetFixture;
+      const memory = yield* f.reserveMemory(1, 300);
+      yield* f.settleMemory(memory, "reported", 240);
+      const pi = f.reservation(1);
+      const reserved = yield* f.accounting.reserve(f.principal, pi);
+      yield* f.accounting.settle({
+        ...pi,
+        reservationId: reserved.reservationId,
+        outcome: "reported",
+        chargedInputTokens: 31_880,
+        chargedOutputTokens: 31_880,
+        transportDrained: true,
+        reportedModel: "gpt-6-luna",
+        reportedUsage: { prompt_tokens: 31_880, completion_tokens: 31_880, total_tokens: 63_760 },
+      });
+      expect((yield* f.reader.readRequired(f.snapshot)).required.remaining).toMatchObject({
+        rootUsedTokens: 64_000,
+        rootRemainingTokens: 0,
+        policy: {
+          observedChargedTokens: 64_000,
+          nominalHeldTokens: 0,
+          stoppedReason: "threshold-reached",
+        },
+      });
+    }).pipe(Effect.provide(contentGuardLayer)),
+  ),
+);
 
 const budgetFixture = makeBudgetFixture();
 
@@ -2728,6 +3128,7 @@ it.effect("rejects mixed accounting modes under an authenticated subscription op
           }),
         );
       expect(accounting).toMatchObject([{ availability: "unavailable", reason: "ledger-invalid" }]);
+      yield* denied(f.reader.readRequired(f.snapshot));
     }),
   ),
 );
