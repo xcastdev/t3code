@@ -616,7 +616,6 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
       }
     }
     const state = yield* readCurrentState(sql, job.input.projectId);
-    const work = yield* current(job, state, true);
     const metadata = yield* sql<{
       bytes: number;
     }>`SELECT length(CAST(payload_json AS BLOB)) AS bytes FROM project_work_events
@@ -636,6 +635,25 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
     const events = yield* Effect.forEach(rows, (row) =>
       decode(Schema.fromJsonString(Recorded), row.payload),
     );
+    if (job.receipt.kind === "index-complete") {
+      const extractionId = job.input.extraction!.recordId;
+      const retained = state.foundationRecords?.filter(
+        (record) => record.recordId === extractionId,
+      );
+      const recorded = events.filter((event) => event.record.recordId === extractionId);
+      // Replay normalizes the completion timestamp below. First bind the current
+      // indexed timestamp to the immutable reflection record, before that value
+      // can be replaced. The full event/receipt proof remains required below.
+      if (
+        retained?.length !== 1 ||
+        retained[0]?.kind !== "memory-extraction" ||
+        recorded.length !== 1 ||
+        recorded[0]?.record.kind !== "memory-extraction" ||
+        retained[0].updatedAt !== recorded[0].record.updatedAt
+      )
+        return yield* deny("Memory indexed extraction timestamp differs from its reflection event");
+    }
+    const work = yield* current(job, state, true);
     const at = work.effect.updatedAt;
     const command = yield* decode(ProjectWorkFoundationCommitCommand, {
       type: "project-work.foundation.commit",
