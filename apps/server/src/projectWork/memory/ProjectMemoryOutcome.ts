@@ -67,6 +67,7 @@ const Recorded = Schema.Struct({
   occurredAt: Schema.String,
   record: ProjectTeamRecord,
 });
+const CompletionEventIds = Schema.Array(Id).check(Schema.isMinLength(1), Schema.isMaxLength(33));
 const RetainedBody = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("comment"), record: ProjectWorkComment }),
   Schema.Struct({ kind: Schema.Literal("evidence"), record: ProjectWorkEvidence }),
@@ -325,41 +326,6 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
     )
       return yield* deny("Memory reflection extraction tuple or completed manifest changed");
     yield* physical(extraction);
-    // Read the original facts commit, not either mutable read model. No-facts
-    // reflection writes only an effect event, so its replay needs this proof too.
-    const completions = yield* sql<{
-      payload: string | null;
-      eventId: string;
-      at: string;
-    }>`SELECT CASE WHEN length(CAST(e.payload_json AS BLOB))<=262144 THEN e.payload_json END AS payload,
-      e.event_id AS eventId,e.occurred_at AS at FROM project_work_events e
-      JOIN project_work_command_receipts c ON c.project_id=e.project_id AND c.command_id=e.command_id
-      WHERE e.project_id=${input.projectId} AND e.event_type='project-work.foundation.recorded'
-      AND json_extract(e.payload_json,'$.record.recordId')=${extraction.recordId}
-      AND json_extract(e.payload_json,'$.record.revision')=${input.extraction!.revision + 1}
-      AND c.actor_kind='system' AND c.actor_id='project-memory'
-      AND c.source_kind='system' AND c.source_id='project-memory'
-      AND c.created_at=e.occurred_at AND length(CAST(c.event_ids_json AS BLOB))<=262144
-      AND EXISTS (SELECT 1 FROM json_each(c.event_ids_json) WHERE value=e.event_id)
-      AND json_extract(c.result_json,'$.receipt.status')='accepted' LIMIT 2`;
-    const completion = completions[0];
-    if (completions.length !== 1 || completion === undefined || completion.payload === null)
-      return yield* deny("Memory extraction lacks its accepted completion event");
-    const event = yield* decode(Schema.fromJsonString(Recorded), completion.payload);
-    const indexed = reflected && receipt.kind === "index-complete";
-    if (
-      event.eventId !== completion.eventId ||
-      event.projectId !== input.projectId ||
-      event.occurredAt !== completion.at ||
-      !equal(event.record, {
-        ...extraction,
-        status: receipt.kind === "no-facts" ? "no-facts" : "extracted",
-        revision: extraction.revision - (indexed ? 1 : 0),
-        updatedAt: indexed ? event.occurredAt : extraction.updatedAt,
-        completedObservationIds: [],
-      })
-    )
-      return yield* deny("Memory reflection extraction tuple or completed manifest changed");
     const observations = records.filter(
       (record) =>
         record.kind === "memory-observation" && record.extractionId === extraction.recordId,
@@ -386,6 +352,105 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
         return yield* deny("Memory observation payload/provenance is stale or foreign");
       yield* physical(observation);
     }
+    const orderedObservations = extraction.expectedObservationIds.map((id) =>
+      observations.find((observation) => observation.recordId === id)!,
+    );
+    const indexed = reflected && receipt.kind === "index-complete";
+    const completedAt =
+      receipt.kind === "no-facts" ? extraction.updatedAt : orderedObservations[0]!.updatedAt;
+    const completed = {
+      ...extraction,
+      status: receipt.kind === "no-facts" ? "no-facts" : "extracted",
+      revision: extraction.revision - (indexed ? 1 : 0),
+      updatedAt: completedAt,
+      completedObservationIds: [],
+    };
+    const changed = [completed, ...orderedObservations];
+    // Timestamp is a hint into the existing receipt index, never authority. Bound
+    // even coincident timestamps before decoding or filtering private commands.
+    const candidates = yield* sql<{
+      commandId: string;
+      actorKind: string | null;
+      actorId: string | null;
+      sourceKind: string | null;
+      sourceId: string | null;
+      ids: string | null;
+      result: string | null;
+    }>`SELECT command_id AS commandId,actor_kind AS actorKind,actor_id AS actorId,
+      source_kind AS sourceKind,source_id AS sourceId,
+      CASE WHEN length(CAST(event_ids_json AS BLOB))<=262144 THEN event_ids_json END AS ids,
+      CASE WHEN length(CAST(result_json AS BLOB))<=262144 THEN result_json END AS result
+      FROM project_work_command_receipts
+      WHERE project_id=${input.projectId} AND created_at=${completedAt} LIMIT 257`;
+    if (candidates.length > 256)
+      return yield* deny("Memory extraction completion receipt candidates exceed bound");
+    let completionIdentity: { commandId: string; eventId: string; revision: number } | undefined;
+    for (const candidate of candidates) {
+      if (
+        !candidate.commandId.startsWith("memory-command:") ||
+        candidate.actorKind !== "system" ||
+        candidate.actorId !== "project-memory" ||
+        candidate.sourceKind !== "system" ||
+        candidate.sourceId !== "project-memory"
+      )
+        continue;
+      if (candidate.ids === null || candidate.result === null)
+        return yield* deny("Memory extraction completion receipt exceeds bound");
+      const result = yield* decode(Schema.fromJsonString(ProjectWorkWriteResult), candidate.result);
+      if (result.receipt.eventCount !== changed.length || result.revision < changed.length)
+        continue;
+      const beforeRevision = result.revision - changed.length;
+      // This is the service's immutable command derivation: extraction is first,
+      // followed by its ordered observations, all within one 64-record batch.
+      const commandId = projectMemoryId("memory-command", [
+        input.projectId,
+        beforeRevision,
+        0,
+        changed,
+      ]);
+      if (candidate.commandId !== commandId) continue;
+      const ids = yield* decode(Schema.fromJsonString(CompletionEventIds), candidate.ids);
+      const eventId = `${commandId}:project-work:0`;
+      if (
+        completionIdentity !== undefined ||
+        result.projectId !== input.projectId ||
+        result.receipt.projectId !== input.projectId ||
+        result.receipt.commandId !== commandId ||
+        result.receipt.status !== "accepted" ||
+        result.receipt.revision !== result.revision ||
+        result.delta.projectId !== input.projectId ||
+        result.delta.revision !== result.revision ||
+        ids.length !== changed.length ||
+        ids[0] !== eventId ||
+        new Set(ids).size !== ids.length ||
+        !equal(result.delta.eventIds, ids)
+      )
+        return yield* deny("Memory extraction lacks its accepted completion event");
+      completionIdentity = { commandId, eventId, revision: beforeRevision + 1 };
+    }
+    if (completionIdentity === undefined)
+      return yield* deny("Memory reflection extraction tuple or completed manifest changed");
+    // The deterministic identity now permits a unique event-index lookup. Never
+    // search project history for a record/model match, including no-facts replay.
+    const completions = yield* sql<{ payload: string | null; eventId: string; at: string }>`
+      SELECT CASE WHEN length(CAST(e.payload_json AS BLOB))<=262144 THEN e.payload_json END AS payload,
+      e.event_id AS eventId,e.occurred_at AS at FROM project_work_events e
+      WHERE e.event_id=${completionIdentity.eventId} AND e.project_id=${input.projectId}
+      AND e.command_id=${completionIdentity.commandId} AND e.event_type='project-work.foundation.recorded' LIMIT 2`;
+    const completion = completions[0];
+    if (completions.length !== 1 || completion === undefined || completion.payload === null)
+      return yield* deny("Memory extraction lacks its accepted completion event");
+    const event = yield* decode(Schema.fromJsonString(Recorded), completion.payload);
+    if (
+      event.eventId !== completion.eventId ||
+      event.projectId !== input.projectId ||
+      event.revision !== completionIdentity.revision ||
+      event.occurredAt !== completion.at ||
+      event.occurredAt !== completedAt ||
+      completed.revision !== input.extraction!.revision + 1 ||
+      !equal(event.record, completed)
+    )
+      return yield* deny("Memory reflection extraction tuple or completed manifest changed");
     const loadedManifest = yield* manifests.load(extraction.recordId);
     const manifest =
       loadedManifest === undefined ? undefined : yield* decode(MemoryIndexManifest, loadedManifest);

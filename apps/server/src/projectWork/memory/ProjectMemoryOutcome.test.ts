@@ -1,4 +1,6 @@
 import { expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
+import * as NodeSqlite from "node:sqlite";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
   CommandId,
@@ -1103,3 +1105,116 @@ for (const noFacts of [false, true])
             }),
           ),
       );
+
+it.effect("completion lookup uses exact indexes with 32768 historical 4 KiB events", () =>
+  database(
+    Effect.gen(function* () {
+      const prepare = NodeSqlite.DatabaseSync.prototype.prepare;
+      const lookups: Array<{
+        database: NodeSqlite.DatabaseSync;
+        statement: NodeSqlite.StatementSync;
+        query: string;
+      }> = [];
+      const spy = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(NodeSqlite.DatabaseSync.prototype, "prepare").mockImplementation(function (
+            this: NodeSqlite.DatabaseSync,
+            query: string,
+          ) {
+            const statement = prepare.call(this, query);
+            if (
+              (query.includes("e.event_id AS eventId") && query.includes("e.occurred_at AS at")) ||
+              (query.includes("FROM project_work_command_receipts") &&
+                /created_at\s*=/u.test(query))
+            )
+              lookups.push({ database: this, statement, query });
+            return statement;
+          }),
+        ),
+        (mock) => Effect.sync(() => mock.mockRestore()),
+      );
+      const f = yield* setup(true, true);
+      const pending = yield* f.pending.consume(f.projectId, f.effectId);
+      if (pending.status !== "pending-reflection")
+        return yield* Effect.die("Unsettled lookup fixture");
+      // The archive precedes the checkpoint cursor. This isolates completion lookup
+      // work from the separate cost of rebuilding the reducer from historical events.
+      yield* f.sql`WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<32768)
+    INSERT INTO project_work_events(sequence,event_id,project_id,event_type,occurred_at,command_id,payload_json)
+    SELECT -n,'lookup-history-' || n,${f.projectId},'project-work.foundation.recorded',${at},
+      'lookup-history-command-' || n,json_object('record',json_object('recordId','archive-' || n,'revision',1,
+        'body',replace(hex(zeroblob(2048)),'0','x'))) FROM history`;
+      expect(
+        yield* f.sql`SELECT COUNT(*) AS count FROM project_work_events WHERE sequence<0`,
+      ).toEqual([{ count: 32768 }]);
+      const calls = f.counts();
+      yield* f.outcomes.commitVerifiedOutcome(pending.receipt, Effect.void);
+      yield* makeProjectMemoryOutcome(f).commitVerifiedOutcome(pending.receipt, Effect.void);
+      expect(f.counts()).toEqual(calls);
+      expect(lookups.length).toBeGreaterThan(0);
+      const eventLookups = lookups.filter((lookup) =>
+        lookup.query.includes("FROM project_work_events e"),
+      );
+      const receiptLookups = lookups.filter((lookup) =>
+        lookup.query.includes("FROM project_work_command_receipts"),
+      );
+      expect(eventLookups.length).toBeGreaterThan(0);
+      for (const lookup of eventLookups) {
+        const plan = prepare
+          .call(lookup.database, "EXPLAIN QUERY PLAN " + lookup.statement.expandedSQL)
+          .all();
+        const searches = plan
+          .map((row) => String(row.detail))
+          .filter((detail) => detail.startsWith("SEARCH e ") || detail.startsWith("SCAN e "));
+        expect(searches).toHaveLength(1);
+        expect(searches[0]).toContain("SEARCH e ");
+        expect(searches[0]).toContain("event_id=?");
+      }
+      expect(receiptLookups.length).toBeGreaterThan(0);
+      for (const lookup of receiptLookups) {
+        const plan = prepare
+          .call(lookup.database, "EXPLAIN QUERY PLAN " + lookup.statement.expandedSQL)
+          .all();
+        expect(
+          plan.some((row) => String(row.detail).includes("(project_id=? AND created_at=?)")),
+        ).toBe(true);
+        const program = prepare
+          .call(lookup.database, "EXPLAIN " + lookup.statement.expandedSQL)
+          .all();
+        expect(program.some((row) => row.opcode === "Integer" && row.p1 === 257)).toBe(true);
+      }
+      expect(spy).toHaveBeenCalled();
+    }),
+  ).pipe(Effect.scoped),
+);
+
+it.effect(
+  "completion lookup denies an overflowing receipt timestamp without a history fallback",
+  () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* setup(true, true);
+        const pending = yield* f.pending.consume(f.projectId, f.effectId);
+        if (pending.status !== "pending-reflection")
+          return yield* Effect.die("Unsettled collision fixture");
+        const work = yield* f.service.readWork(f.projectId, f.effectId);
+        if (work.extraction === undefined) return yield* Effect.die("Missing completed extraction");
+        yield* f.sql`WITH RECURSIVE candidates(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM candidates WHERE n<257)
+      INSERT INTO project_work_command_receipts(project_id,command_id,payload_fingerprint,
+        actor_kind,actor_id,source_kind,source_id,event_ids_json,created_at,result_json)
+      SELECT ${f.projectId},'receipt-collision-' || n,'unrelated','system','unrelated','system','unrelated',
+        '[]',${work.extraction.updatedAt},'{}' FROM candidates`;
+        const before = yield* f.snapshot;
+        const calls = f.counts();
+        const result = yield* f.outcomes
+          .commitVerifiedOutcome(pending.receipt, Effect.void)
+          .pipe(Effect.result);
+        expect(result).toMatchObject({
+          _tag: "Failure",
+          failure: { reason: "Memory extraction completion receipt candidates exceed bound" },
+        });
+        expect(yield* f.snapshot).toEqual(before);
+        expect(f.counts()).toEqual(calls);
+      }),
+    ).pipe(Effect.scoped),
+);
