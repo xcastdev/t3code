@@ -1704,6 +1704,11 @@ it.effect(
             [41, "ProjectWorkManagedMerge"],
             [42, "ProjectMemoryProcessing"],
             [43, "ProjectMemoryQuery"],
+            [44, "ProjectTaskResources"],
+            [45, "ProjectMemoryCompanion"],
+            [46, "ProjectTeamPiSubscription"],
+            [47, "ProjectTeamDispatchCleanup"],
+            [48, "ProjectTeamCompactCallerReservations"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(
