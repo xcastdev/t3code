@@ -1084,8 +1084,13 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
     }> = [];
     const memoryLedgers = new Map<
       string,
-      Effect.Success<ReturnType<typeof auditProjectMemoryOperationLedger>>
+      Effect.Success<ReturnType<typeof auditProjectMemoryOperationLedger>> & {
+        maximumTokens: number;
+      }
     >();
+    let hardMemoryRootTokens = 0;
+    const hardMemoryAttemptTokens = new Map<string, number>();
+    const hardMemoryOperationTokens = new Map<string, number>();
     for (const [index, input] of rows.entries()) {
       const row = yield* decodeModelRow(input);
       const owner = owners.get(row.run_id);
@@ -1113,18 +1118,39 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
         Buffer.byteLength(row.settlement_json ?? "") > 16384
       )
         return yield* deny("Remaining budget owner identity is invalid");
-      if (row.request_lane === "pi" && row.accounting_mode !== accountingMode)
-        return yield* deny("Remaining Pi accounting mode disagrees with the original root grant");
+      if (
+        row.request_lane === "pi" &&
+        (row.accounting_mode !== accountingMode ||
+          row.accounting_mode !==
+            (claim.binding.model === "gpt-6-luna" ? "openai-subscription-monitored" : "hard"))
+      )
+        return yield* deny(
+          "Remaining Pi accounting mode disagrees with its original binding or root grant",
+        );
       if (row.request_lane === "memory") {
         let ledger = memoryLedgers.get(row.operation_id);
         if (ledger === undefined) {
-          ledger = yield* auditProjectMemoryOperationLedger(sql, {
+          const auditedLedger = yield* auditProjectMemoryOperationLedger(sql, {
             environmentId: options.environmentId,
             projectId: binding.projectId,
             bindingId: row.run_id,
             generation: row.generation,
             operationId: row.operation_id,
           });
+          // The memory audit binds every admitted owner to this exact original operation ceiling.
+          const operations = yield* sql<{ maximum_tokens: number }>`SELECT maximum_tokens
+            FROM project_team_pi_operation WHERE operation_id=${row.operation_id}
+            AND environment_id=${row.environment_id} AND project_id=${row.project_id}
+            AND binding_id=${row.run_id} AND generation=${row.generation} LIMIT 2`;
+          const operation = operations[0];
+          if (
+            operations.length !== 1 ||
+            operation === undefined ||
+            !Number.isSafeInteger(operation.maximum_tokens) ||
+            operation.maximum_tokens <= 0
+          )
+            return yield* deny("Remaining memory operation ceiling is invalid");
+          ledger = { ...auditedLedger, maximumTokens: operation.maximum_tokens };
           memoryLedgers.set(row.operation_id, ledger);
         }
         const audited = ledger.rows.find((entry) => entry.reservation_id === row.reservation_id);
@@ -1142,6 +1168,21 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
           row.status === "held"
             ? add(row.maximum_input_tokens, row.maximum_output_tokens)
             : add(row.charged_input_tokens, row.charged_output_tokens);
+        // Monitored Pi may overshoot and hold nominal capacity. Memory's hard
+        // operation, attempt and root ceilings still apply cumulatively to its own lane.
+        hardMemoryRootTokens = add(hardMemoryRootTokens, charged);
+        const attemptTokens = add(hardMemoryAttemptTokens.get(row.run_id) ?? 0, charged);
+        const operationTokens = add(hardMemoryOperationTokens.get(row.operation_id) ?? 0, charged);
+        if (
+          operationTokens > ledger.maximumTokens ||
+          attemptTokens > owner.intent.limits.attemptMaximumTokens ||
+          hardMemoryRootTokens > limits.maximumTokens
+        )
+          return yield* deny(
+            "Remaining hard memory operation, attempt or root budget is overdrawn",
+          );
+        hardMemoryAttemptTokens.set(row.run_id, attemptTokens);
+        hardMemoryOperationTokens.set(row.operation_id, operationTokens);
         if (row.status === "held") nominalHeldTokens = add(nominalHeldTokens, charged);
         else observedChargedTokens = add(observedChargedTokens, charged);
         rootUsedTokens = add(rootUsedTokens, charged);
@@ -1252,7 +1293,11 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
             : monitored
               ? row.charged_output_tokens
               : row.maximum_output_tokens;
-        if (monitored && row.status === "unknown" && outputCharge !== row.unknown_maximum_tokens)
+        if (
+          monitored &&
+          row.status === "unknown" &&
+          (inputCharge !== row.maximum_input_tokens || outputCharge !== row.unknown_maximum_tokens)
+        )
           return yield* deny("Unknown subscription usage lacks its conservative charge");
         if (inputCharge !== row.charged_input_tokens || outputCharge !== row.charged_output_tokens)
           return yield* deny("Uncertain model requests must retain their full charge");
