@@ -13,6 +13,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import math
 import pathlib
 import struct
@@ -221,7 +222,23 @@ def native_store(directory):
             raise BackendFailure("unavailable")
     finally:
         client.close()
-    store = Qdrant(collection_name=COLLECTION, embedding_model_dims=DIMENSIONS, path=str(native_path))
+    # Mem0 2.2.1 warns about the dense-only layout we just validated and require.
+    # Keep every other diagnostic visible to the caller's strict stderr guard.
+    logger = logging.getLogger("mem0.vector_stores.qdrant")
+    expected_warning = (
+        f"Collection '{COLLECTION}' predates v3 hybrid search (no 'bm25' sparse slot). "
+        "BM25 keyword scoring will be disabled for this collection; semantic search works normally. "
+        "To enable hybrid search, use a fresh collection."
+    )
+    def keep_diagnostic(record):
+        return not (record.name == logger.name and record.levelno == logging.WARNING
+                    and record.getMessage() == expected_warning)
+
+    logger.addFilter(keep_diagnostic)
+    try:
+        store = Qdrant(collection_name=COLLECTION, embedding_model_dims=DIMENSIONS, path=str(native_path))
+    finally:
+        logger.removeFilter(keep_diagnostic)
     if store._has_bm25_slot:
         store.client.close()
         raise BackendFailure("unavailable")

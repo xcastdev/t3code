@@ -1,5 +1,6 @@
 """Exercise the pinned native vector store without learned models or networking."""
 import json
+import logging
 import os
 import pathlib
 import subprocess
@@ -46,6 +47,120 @@ class Mem0BackendTest(unittest.TestCase):
         self.assertEqual(response["operation"], operation)
         self.assertNotIn("error", response, response)
         return response["result"]
+
+    def test_dense_cli_index_and_search_emit_no_stderr(self):
+        for operation, data in (("index", self.index_input()),
+                                ("search", {"vector": self.entry()["vector"], "limit": 10})):
+            with self.subTest(operation=operation):
+                child = subprocess.run(
+                    [sys.executable, str(pathlib.Path(__file__).with_name("mem0_backend.py")),
+                     "--store-dir", str(self.root)],
+                    input=json.dumps(self.request(operation, **data)), text=True,
+                    capture_output=True, check=False)
+                self.assertEqual(child.returncode, 0, child.stderr)
+                response = json.loads(child.stdout)
+                self.assertNotIn("error", response, response)
+                self.assertEqual(child.stderr, "")
+                if operation == "search":
+                    self.assertEqual([hit["observationId"] for hit in response["result"]["candidates"]],
+                                     ["observation-a"])
+
+    def test_constructor_filter_preserves_diagnostics_and_restores_logger_on_failure(self):
+        from mem0.vector_stores.qdrant import Qdrant
+        from mem0_backend import COLLECTION
+
+        logger = logging.getLogger("mem0.vector_stores.qdrant")
+        expected = (
+            f"Collection '{COLLECTION}' predates v3 hybrid search (no 'bm25' sparse slot). "
+            "BM25 keyword scoring will be disabled for this collection; semantic search works normally. "
+            "To enable hybrid search, use a fresh collection."
+        )
+        original = Qdrant._create_filter_indexes
+        for fail in (False, True):
+            with self.subTest(constructor_failure=fail):
+                def diagnostics(store):
+                    original(store)
+                    logger.warning("Unrelated constructor warning")
+                    logger.error(expected)
+                    logger.warning(expected + " Additional diagnostic")
+                    logger.warning(expected.replace(COLLECTION, "other_collection"))
+                    if fail:
+                        store.client.close()
+                        raise RuntimeError("Controlled constructor failure")
+
+                state = (list(logger.filters), list(logger.handlers), logger.level,
+                         logger.disabled, logger.propagate)
+                with self.assertLogs(logger, level="WARNING") as captured:
+                    with mock.patch.object(Qdrant, "_create_filter_indexes", diagnostics):
+                        response = dispatch(self.root, self.request("health"))
+                    # The same warning outside the validated constructor stays visible.
+                    logger.warning(expected)
+                self.assertEqual([(record.levelno, record.getMessage()) for record in captured.records], [
+                    (logging.WARNING, "Unrelated constructor warning"),
+                    (logging.ERROR, expected),
+                    (logging.WARNING, expected + " Additional diagnostic"),
+                    (logging.WARNING, expected.replace(COLLECTION, "other_collection")),
+                    (logging.WARNING, expected),
+                ])
+                self.assertEqual((list(logger.filters), list(logger.handlers), logger.level,
+                                  logger.disabled, logger.propagate), state)
+                if fail:
+                    self.assertEqual(response["error"]["code"], "unavailable")
+                else:
+                    self.assertNotIn("error", response)
+
+    def test_dense_store_uses_prepared_vectors_without_sparse_encoder(self):
+        from mem0.vector_stores.qdrant import Qdrant
+        from mem0_backend import COLLECTION, DIMENSIONS, native_store
+        from qdrant_client import models
+
+        with mock.patch.object(Qdrant, "_get_bm25_encoder", side_effect=AssertionError("Sparse encoder forbidden")):
+            self.call("index", **self.index_input())
+            result = self.call("search", vector=self.entry()["vector"], limit=10)
+            self.assertEqual([hit["observationId"] for hit in result["candidates"]], ["observation-a"])
+            directory = namespace_path(self.root, Scope(environmentId="environment-a", projectId="project-a"))
+            store = native_store(directory)
+            try:
+                params = store.client.get_collection(COLLECTION).config.params
+                self.assertIsInstance(params.vectors, models.VectorParams)
+                self.assertEqual(params.vectors.size, DIMENSIONS)
+                self.assertEqual(params.vectors.distance, models.Distance.COSINE)
+                self.assertFalse(params.sparse_vectors)
+                self.assertFalse(store._has_bm25_slot)
+                self.assertIsNone(store._bm25_encoder)
+            finally:
+                store.client.close()
+
+    def test_incompatible_dense_layout_never_enters_mem0_constructor(self):
+        from mem0.vector_stores.qdrant import Qdrant
+        from qdrant_client import QdrantClient, models
+        from mem0_backend import COLLECTION
+
+        self.call("health")
+        directory = namespace_path(self.root, Scope(environmentId="environment-a", projectId="project-a"))
+        for vectors in (models.VectorParams(size=16, distance=models.Distance.COSINE),
+                        models.VectorParams(size=2048, distance=models.Distance.DOT),
+                        {"named": models.VectorParams(size=2048, distance=models.Distance.COSINE)}):
+            with self.subTest(vectors=vectors):
+                client = QdrantClient(path=str(directory / "points"))
+                try:
+                    client.delete_collection(COLLECTION)
+                    client.create_collection(COLLECTION, vectors_config=vectors)
+                finally:
+                    client.close()
+                with mock.patch.object(Qdrant, "__init__", side_effect=AssertionError("Invalid layout")) as constructor:
+                    response = dispatch(self.root, self.request("health"))
+                self.assertEqual(response["error"]["code"], "unavailable")
+                constructor.assert_not_called()
+
+    def test_optional_local_model_dependencies_remain_forbidden(self):
+        for installed in ("fastembed", "spacy"):
+            with self.subTest(installed=installed):
+                with mock.patch("mem0_backend.importlib.util.find_spec",
+                                side_effect=lambda name: object() if name == installed else None):
+                    response = dispatch(self.root, self.request("health"))
+                self.assertEqual(response["error"]["code"], "unavailable")
+                self.assertFalse((self.root / "namespaces").exists())
 
     def test_native_index_reconcile_search_and_idempotent_replay(self):
         data = self.index_input()
