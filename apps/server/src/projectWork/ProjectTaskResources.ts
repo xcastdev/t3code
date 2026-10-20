@@ -426,6 +426,50 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
         return yield* deny("Original task child reservation unavailable or changed");
       return { row, authority };
     });
+    const assertBudget = (authority: { projectId: string; taskId: string; taskDeadline: number }) =>
+      Effect.gen(function* () {
+        const budgets = yield* sql<{
+          deadline_at_ms: number;
+          memory_bytes: number;
+        }>`SELECT deadline_at_ms,memory_bytes
+        FROM project_task_resource_budget WHERE environment_id=${environmentId} AND project_id=${authority.projectId} AND task_id=${authority.taskId} LIMIT 2`;
+        if (
+          budgets.length !== 1 ||
+          budgets[0]?.deadline_at_ms !== authority.taskDeadline ||
+          budgets[0].memory_bytes !== PROJECT_TASK_MEMORY_BYTES
+        )
+          return yield* deny("Original task resource budget cannot change or renew");
+      });
+    const matchesOwner = (row: Child, owner: PiManagedProcessOwner) =>
+      owner.unit === row.unit &&
+      owner.nonce === row.nonce &&
+      owner.memoryBytes === row.memory_bytes &&
+      owner.swapBytes === 0 &&
+      owner.oomGroup === 1 &&
+      Number.isSafeInteger(owner.pid) &&
+      owner.pid >= 1 &&
+      /^[a-f0-9]{32}$/u.test(owner.invocation) &&
+      owner.cgroup.startsWith("/sys/fs/cgroup/") &&
+      owner.cgroup.endsWith("/" + row.unit) &&
+      !owner.cgroup.split("/").some((part) => part === "." || part === "..") &&
+      (row.owner_json === null || row.owner_json === encode(owner));
+    const assertOwned = (owner: PiManagedProcessOwner) =>
+      Effect.gen(function* () {
+        const { row, authority } = yield* retained();
+        yield* assertBudget(authority);
+        const deleted =
+          yield* sql`SELECT 1 FROM project_lifecycle WHERE project_id=${authority.projectId} AND state='tombstoned' LIMIT 1`;
+        if (
+          deleted.length ||
+          !authority.active ||
+          authority.deadline > authority.taskDeadline ||
+          (yield* Clock.currentTimeMillis) >= row.deadline_at_ms ||
+          row.drain_json !== null ||
+          row.owner_json === null ||
+          !matchesOwner(row, owner)
+        )
+          return yield* deny("Task child ownership is absent, changed or expired");
+      });
     const reserve = Effect.gen(function* () {
       const authority = yield* identity();
       const deleted =
@@ -447,17 +491,7 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
         return yield* deny("Task child reservation is inactive, expired or inconsistent");
       if (kind === "pi" || kind === "setup")
         yield* sql`INSERT OR IGNORE INTO project_task_resource_budget VALUES(${environmentId},${authority.projectId},${authority.taskId},${authority.taskDeadline},${PROJECT_TASK_MEMORY_BYTES})`;
-      const budgets = yield* sql<{
-        deadline_at_ms: number;
-        memory_bytes: number;
-      }>`SELECT deadline_at_ms,memory_bytes
-        FROM project_task_resource_budget WHERE environment_id=${environmentId} AND project_id=${authority.projectId} AND task_id=${authority.taskId} LIMIT 2`;
-      if (
-        budgets.length !== 1 ||
-        budgets[0]?.deadline_at_ms !== authority.taskDeadline ||
-        budgets[0].memory_bytes !== PROJECT_TASK_MEMORY_BYTES
-      )
-        return yield* deny("Original task resource budget cannot change or renew");
+      yield* assertBudget(authority);
       const unaccountedMemory = yield* sql`SELECT 1 FROM project_memory_companion_invocation m
         WHERE m.environment_id=${environmentId} AND m.project_id=${authority.projectId}
         AND (json_extract(m.intent_json,'$.owner.operation.rootTaskId')=${authority.taskId}
@@ -568,18 +602,7 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
             !cleanup &&
             (!authority.active || (yield* Clock.currentTimeMillis) >= row.deadline_at_ms)) ||
           row.drain_json !== null ||
-          owner.unit !== row.unit ||
-          owner.nonce !== row.nonce ||
-          owner.memoryBytes !== row.memory_bytes ||
-          owner.swapBytes !== 0 ||
-          owner.oomGroup !== 1 ||
-          !Number.isSafeInteger(owner.pid) ||
-          owner.pid < 1 ||
-          !/^[a-f0-9]{32}$/u.test(owner.invocation) ||
-          !owner.cgroup.startsWith("/sys/fs/cgroup/") ||
-          !owner.cgroup.endsWith("/" + row.unit) ||
-          owner.cgroup.split("/").some((part) => part === "." || part === "..") ||
-          (row.owner_json !== null && row.owner_json !== encode(owner))
+          !matchesOwner(row, owner)
         )
           return yield* deny("Task child captured owner differs or expired");
         yield* sql`UPDATE project_task_resource_child SET owner_json=${encode(owner)} WHERE unit=${row.unit}`;
@@ -788,6 +811,7 @@ export const makeProjectTaskResources = Effect.fn("makeProjectTaskResources")(fu
     return {
       reserve: guard(reserve),
       capture: (owner: PiManagedProcessOwner) => guard(capture(owner)),
+      assertOwned: (owner: PiManagedProcessOwner) => guard(assertOwned(owner)),
       drain: (receipt: PiManagedDrain | PiManagedProcessReconciliation) =>
         guard(drain(receipt, kind === "memory-companion")),
       captureCleanup: (owner: PiManagedProcessOwner) => guard(captureCleanup(owner)),

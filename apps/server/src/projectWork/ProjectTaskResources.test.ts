@@ -160,6 +160,118 @@ const rejected = <A, E>(body: Effect.Effect<A, E>) =>
     Effect.map((result) => expect(result._tag).toBe("Failure")),
   );
 
+it.effect("assertOwned never creates reservations or captures absent owners", () =>
+  test(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const child = yield* f.child(1);
+      const absentWrites = yield* f.sql`SELECT total_changes() AS writes`;
+      yield* rejected(f.sql.withTransaction(child.loan.assertOwned(child.owner)));
+      expect(yield* f.sql`SELECT total_changes() AS writes`).toEqual(absentWrites);
+      expect(yield* f.sql`SELECT * FROM project_task_resource_child`).toEqual([]);
+      yield* f.sql.withTransaction(child.loan.reserve);
+      const reserved = yield* f.sql`SELECT * FROM project_task_resource_child`;
+      const reservedWrites = yield* f.sql`SELECT total_changes() AS writes`;
+      yield* rejected(f.sql.withTransaction(child.loan.assertOwned(child.owner)));
+      expect(yield* f.sql`SELECT total_changes() AS writes`).toEqual(reservedWrites);
+      expect(yield* f.sql`SELECT * FROM project_task_resource_child`).toEqual(reserved);
+      yield* f.sql.withTransaction(child.loan.capture(child.owner));
+      const captured = yield* f.sql`SELECT * FROM project_task_resource_child`;
+      const budgets = yield* f.sql`SELECT * FROM project_task_resource_budget`;
+      const resumed = yield* makeProjectTaskResources("environment");
+      const loan = resumed.verification(child.id, child.allocation);
+      const capturedWrites = yield* f.sql`SELECT total_changes() AS writes`;
+      yield* rejected(loan.assertOwned(child.owner));
+      yield* f.sql.withTransaction(loan.assertOwned(child.owner));
+      yield* f.sql.withTransaction(loan.assertOwned(child.owner));
+      expect(yield* f.sql`SELECT total_changes() AS writes`).toEqual(capturedWrites);
+      expect(yield* f.sql`SELECT * FROM project_task_resource_child`).toEqual(captured);
+      expect(yield* f.sql`SELECT * FROM project_task_resource_budget`).toEqual(budgets);
+    }),
+  ),
+);
+
+for (const change of [
+  "foreign owner",
+  "foreign allocation",
+  "foreign authority",
+  "stale authority",
+  "deleted project",
+  "drained",
+  "expired",
+  "changed root",
+  "changed root deadline",
+  "changed memory ceiling",
+] as const)
+  it.effect(`assertOwned rejects ${change} after current ownership succeeds`, () =>
+    test(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const child = yield* f.child(1);
+        yield* f.sql.withTransaction(child.loan.reserve);
+        yield* f.sql.withTransaction(child.loan.capture(child.owner));
+        yield* f.sql.withTransaction(child.loan.assertOwned(child.owner));
+        let loan = child.loan;
+        let owner = child.owner;
+        switch (change) {
+          case "foreign owner":
+            owner = { ...owner, invocation: "b".repeat(32) };
+            break;
+          case "foreign allocation":
+            loan = f.resources.verification(child.id, {
+              ...child.allocation,
+              launch: { ...child.allocation.launch, workspaceRoot: "/foreign" },
+            });
+            break;
+          case "foreign authority": {
+            const foreign = yield* f.child(2);
+            loan = f.resources.verification(foreign.id, child.allocation);
+            break;
+          }
+          case "stale authority":
+            yield* f.sql`UPDATE project_work_verification_execution SET phase='quarantine',reason='canceled',revision=revision+1 WHERE attempt_id=${child.id}`;
+            break;
+          case "deleted project":
+            yield* f.sql`INSERT INTO project_lifecycle(project_id,state,workspace_root,revision,changed_at,tombstone_json)
+              VALUES('project','tombstoned','/workspace',1,${at},'{}')`;
+            break;
+          case "drained":
+            yield* f.sql.withTransaction(child.loan.drain(child.drain));
+            break;
+          case "expired":
+            yield* TestClock.setTime(child.deadline);
+            break;
+          case "changed root":
+            // Corrupt frozen dispatch metadata to exercise the retained partition check.
+            yield* f.sql`DROP TRIGGER project_team_dispatch_immutable`;
+            yield* f.sql`INSERT INTO project_team_model_budget VALUES('environment','project','foreign-root',100,${f.taskDeadline})`;
+            yield* f.sql`UPDATE project_team_dispatch SET root_task_id='foreign-root',
+              intent_json=json_set(intent_json,'$.limits.rootTaskId','foreign-root') WHERE dispatch_id='custody-dispatch-1'`;
+            break;
+          case "changed root deadline":
+            yield* f.sql`DROP TRIGGER project_team_dispatch_immutable`;
+            yield* f.sql`UPDATE project_team_dispatch SET root_deadline_at_ms=${f.taskDeadline + 1},
+              intent_json=json_set(intent_json,'$.limits.rootDeadlineAtMs',${f.taskDeadline + 1}) WHERE dispatch_id='custody-dispatch-1'`;
+            break;
+          case "changed memory ceiling":
+            // Model a corrupt retained budget; production SQL forbids this mutation.
+            yield* f.sql`DROP TRIGGER project_task_resource_budget_immutable`;
+            yield* f.sql`PRAGMA ignore_check_constraints=ON`;
+            yield* f.sql`UPDATE project_task_resource_budget SET memory_bytes=${PROJECT_TASK_MEMORY_BYTES * 2}`;
+            yield* f.sql`PRAGMA ignore_check_constraints=OFF`;
+            break;
+        }
+        const children = yield* f.sql`SELECT * FROM project_task_resource_child`;
+        const budgets = yield* f.sql`SELECT * FROM project_task_resource_budget`;
+        const writes = yield* f.sql`SELECT total_changes() AS writes`;
+        yield* rejected(f.sql.withTransaction(loan.assertOwned(owner)));
+        expect(yield* f.sql`SELECT total_changes() AS writes`).toEqual(writes);
+        expect(yield* f.sql`SELECT * FROM project_task_resource_child`).toEqual(children);
+        expect(yield* f.sql`SELECT * FROM project_task_resource_budget`).toEqual(budgets);
+      }),
+    ),
+  );
+
 it.effect("task resources atomically admit two children and reject combined excess", () =>
   test(
     Effect.gen(function* () {
@@ -935,6 +1047,27 @@ const approvedPiResourceFixture = Effect.gen(function* () {
     verification,
   };
 });
+
+for (const change of ["expired", "stale"] as const)
+  it.effect(`assertOwned rejects ${change} setup despite cleanup capture authority`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* approvedPiResourceFixture;
+        const setup = yield* f.setup(f.child, 4, PROJECT_TASK_MEMORY_BYTES / 4);
+        yield* f.sql.withTransaction(setup.loan.reserve);
+        yield* f.sql.withTransaction(setup.loan.capture(setup.owner));
+        yield* setup.captureOwner;
+        yield* f.sql.withTransaction(setup.loan.assertOwned(setup.owner));
+        if (change === "expired") yield* TestClock.setTime(setup.deadline);
+        else
+          yield* f.sql`UPDATE project_team_dispatch SET stage='quarantine',revision=revision+1 WHERE dispatch_id=${f.child.request.dispatchId}`;
+        yield* f.sql.withTransaction(setup.loan.captureCleanup(setup.owner));
+        const writes = yield* f.sql`SELECT total_changes() AS writes`;
+        yield* rejected(f.sql.withTransaction(setup.loan.assertOwned(setup.owner)));
+        expect(yield* f.sql`SELECT total_changes() AS writes`).toEqual(writes);
+      }),
+    ),
+  );
 
 it.effect(
   "approved Pi descendants share the original 2 GiB cap and deadline until their exact kernel drain",
