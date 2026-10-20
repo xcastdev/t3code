@@ -2364,6 +2364,28 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                                       workerId: durable.workerId,
                                       ordinal: durable.ordinal,
                                     },
+                                    assertForward: Effect.gen(function* () {
+                                      const assertOwner = Effect.suspend(() =>
+                                        closing ||
+                                        preparation.canceled ||
+                                        cancellation.signal.aborted ||
+                                        active.get(request.threadId)?.prepared !== prepared
+                                          ? Effect.fail(
+                                              deny("Original memory runtime is no longer active"),
+                                            )
+                                          : Effect.void,
+                                      );
+                                      yield* assertOwner;
+                                      yield* check(signal, true, true);
+                                      yield* assertOwner;
+                                    }).pipe(
+                                      Effect.mapError(
+                                        () =>
+                                          new ProjectMemoryServiceError({
+                                            reason: "Original memory runtime cannot forward",
+                                          }),
+                                      ),
+                                    ),
                                     readCurrentInTransaction: (principal) =>
                                       operations
                                         .readMemoryOperationOwnerInTransaction(

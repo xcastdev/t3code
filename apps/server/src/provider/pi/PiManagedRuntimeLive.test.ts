@@ -193,6 +193,7 @@ import {
 } from "../../projectWork/memory/MemoryBackend.ts";
 import {
   ProjectMemoryJobOwner,
+  ProjectMemoryOperation,
   makeProjectMemoryModelAccounting,
   auditProjectMemoryOperationLedger,
   ProjectMemorySettlement,
@@ -7487,6 +7488,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   memoryPolicy: "project" | "shared" | "none" | "read-only" = "project",
   assignment = "Implement the approved retained context",
   profile?: RuntimeFixtureProfile,
+  revalidateRuntime?: PiManagedRuntimeLiveOptions["revalidateRuntime"],
 ) {
   const selectedModel = profile?.model ?? model;
   if (reviewer || readonlyKind === "review") return yield* requiredReviewTransferFixture();
@@ -8136,6 +8138,7 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   let transports = 0;
   const options: PiManagedRuntimeLiveOptions = {
     environmentId: "environment",
+    ...(revalidateRuntime ? { revalidateRuntime } : {}),
     agentDirectory,
     nativeStateRoot,
     protectedRoots: [main],
@@ -10043,6 +10046,11 @@ for (const compactProof of [
   "memoryAccounting",
   "memorySharedRoot",
   "memoryPipeline",
+  "memoryForwardExtract",
+  "memoryForwardEmbed",
+  "memoryForwardIndex",
+  "memoryForwardQueryEmbed",
+  "memoryForwardQuerySearch",
   "memoryCompanionIndex",
   "memoryCompanionSharedRoot",
   "memoryCompanionQuery",
@@ -10125,15 +10133,26 @@ for (const compactProof of [
                                                 ? "settles an uncertain query search only after its exact authenticated late drain"
                                                 : compactProof === "successorReplay"
                                                   ? "retained compact replay preserves the latest successful native head without another execution"
-                                                  : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+                                                  : compactProof?.startsWith("memoryForward")
+                                                    ? `captured runtime denies ${compactProof} before transport without holding SQL`
+                                                    : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
+          const forwardProof = compactProof?.startsWith("memoryForward") === true;
+          const forwardQuery = compactProof?.startsWith("memoryForwardQuery") === true;
+          let forwardArmed = false;
+          let forwardChecks = 0;
+          let forwardDeniedObserved = false;
+          let capturedMemoryOperation: ProjectMemoryOperation["Service"] | undefined;
+          const forwardEntered = yield* Deferred.make<void>();
+          const forwardRelease = yield* Deferred.make<void>();
           let memoryReady = false;
           const lateSecret = 'controlled-memory-"key\\tail';
           const companionProof = compactProof?.startsWith("memoryCompanion") === true;
           const pipelineProof =
             compactProof === "memoryPipeline" ||
+            (forwardProof && !forwardQuery) ||
             compactProof === "memoryCompanionIndex" ||
             compactProof === "memoryCompanionSharedRoot";
           const memoryProof = compactProof?.startsWith("memory") === true;
@@ -10204,7 +10223,7 @@ for (const compactProof of [
             compactProof === "memoryCompanionQuery" ||
             queryMixed;
           const queryForward =
-            queryCache || queryRecovery || queryNoForward || sharedDeliveryDenied;
+            queryCache || queryRecovery || queryNoForward || sharedDeliveryDenied || forwardQuery;
           let activeQuery = false;
           let failedUsageOperationId: string | undefined;
           const queryDrains = new Set<string>();
@@ -10307,6 +10326,30 @@ for (const compactProof of [
                 ),
               ),
           });
+          const forwardSql = yield* SqlClient.SqlClient;
+          const forwardRuntimeCheck = Effect.gen(function* () {
+            const atBoundary =
+              compactProof === "memoryForwardExtract"
+                ? memoryExchanges === 0
+                : compactProof === "memoryForwardEmbed"
+                  ? memoryExchanges === 1
+                  : compactProof === "memoryForwardIndex"
+                    ? memoryExchanges === 2 && memoryBackendCalls === 0
+                    : compactProof === "memoryForwardQueryEmbed"
+                      ? memoryExchanges === 2 && memoryBackendCalls === 3
+                      : memoryExchanges === 3 && memoryBackendCalls === 3;
+            if (!forwardArmed || !atBoundary) return;
+            expect(Option.isNone(yield* Effect.serviceOption(forwardSql.transactionService))).toBe(
+              true,
+            );
+            forwardChecks++;
+            yield* Deferred.succeed(forwardEntered, undefined);
+            yield* Deferred.await(forwardRelease);
+            return yield* new PiManagedRuntimeError({
+              code: "denied",
+              detail: "Captured original runtime was revoked while waiting",
+            });
+          });
           const f = yield* requiredTransferFixture(
             false,
             compactProof === "memorySharedRoot" || compactProof === "memoryCompanionSharedRoot",
@@ -10327,6 +10370,7 @@ for (const compactProof of [
                   skillIds: [selectedSkill.manifest.id],
                 }
               : undefined,
+            forwardProof ? forwardRuntimeCheck : undefined,
           ).pipe(
             Effect.provideService(Authorization.ProjectTeamAuthorization, returnAuthorization),
             Effect.provideService(ProjectMemoryPorts, {
@@ -10374,6 +10418,34 @@ for (const compactProof of [
               confirmation: "permanent-local-delete",
             });
           });
+          const probeForward = (
+            effect: Effect.Effect<void, ProjectMemoryServiceError>,
+            query: boolean,
+          ) =>
+            !forwardProof || query !== forwardQuery
+              ? effect
+              : Effect.gen(function* () {
+                  forwardArmed = true;
+                  const running = yield* Effect.forkChild(effect);
+                  const reached = yield* Effect.raceFirst(
+                    Deferred.await(forwardEntered).pipe(Effect.as(true)),
+                    Fiber.await(running).pipe(Effect.as(false)),
+                  );
+                  expect(reached).toBe(true);
+                  // The captured bridge is waiting; this separate connection use must finish.
+                  expect(
+                    yield* f.sql.withTransaction(f.sql`SELECT 1 AS available`).pipe(Effect.orDie),
+                  ).toEqual([{ available: 1 }]);
+                  yield* Deferred.succeed(forwardRelease, undefined);
+                  return yield* Fiber.join(running);
+                }).pipe(
+                  Effect.ensuring(Deferred.succeed(forwardRelease, undefined)),
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      forwardArmed = false;
+                    }),
+                  ),
+                );
           let runInstance = f.instance;
           let returnSkillPlan:
             | Effect.Success<ReturnType<typeof selectedRuntimeFixture>>["plan"]
@@ -10986,6 +11058,17 @@ for (const compactProof of [
                               ),
                             catch: controlledCallbackError,
                           }).pipe(Effect.result);
+                          if (forwardQuery) {
+                            expect(queryResult._tag).toBe("Success");
+                            expect(forwardChecks).toBe(1);
+                            expect(memoryPipelineError).toBeDefined();
+                            expect(memoryExchanges).toBe(
+                              compactProof === "memoryForwardQueryEmbed" ? 2 : 3,
+                            );
+                            expect(memoryBackendCalls).toBe(3);
+                            forwardDeniedObserved = true;
+                            return;
+                          }
                           if (!queryDenied) {
                             expect(
                               queryResult._tag === "Failure"
@@ -12503,7 +12586,18 @@ for (const compactProof of [
                             consumeMemory = (principal, effectId) =>
                               consumer.consume === undefined
                                 ? Effect.die("Configured consumer missing")
-                                : consumer.consume(principal, effectId).pipe(
+                                : Effect.gen(function* () {
+                                    const captured =
+                                      yield* Effect.serviceOption(ProjectMemoryOperation);
+                                    if (Option.isSome(captured))
+                                      capturedMemoryOperation = captured.value;
+                                    if (consumer.consume === undefined)
+                                      return yield* Effect.die("Configured consumer missing");
+                                    return yield* probeForward(
+                                      consumer.consume(principal, effectId),
+                                      false,
+                                    );
+                                  }).pipe(
                                     Effect.tapError((error) =>
                                       Effect.sync(() => {
                                         memoryPipelineError = error;
@@ -12522,7 +12616,10 @@ for (const compactProof of [
                                 : (principal, queryId) =>
                                     consumer.consumeQuery === undefined
                                       ? Effect.die("Configured query consumer missing")
-                                      : consumer.consumeQuery(principal, queryId).pipe(
+                                      : probeForward(
+                                          consumer.consumeQuery(principal, queryId),
+                                          true,
+                                        ).pipe(
                                           Effect.tapError((error) =>
                                             Effect.sync(() => {
                                               memoryPipelineError = error;
@@ -12569,7 +12666,21 @@ for (const compactProof of [
                               operationMaximumTokens: operationCaps[0]?.maximum,
                             },
                           });
-                          if (cleanupProof) {
+                          if (forwardProof && !forwardQuery) {
+                            expect(forwardChecks).toBe(1);
+                            expect(memoryExchanges).toBe(
+                              compactProof === "memoryForwardExtract"
+                                ? 0
+                                : compactProof === "memoryForwardEmbed"
+                                  ? 1
+                                  : 2,
+                            );
+                            expect(memoryBackendCalls).toBe(0);
+                            expect(
+                              yield* f.sql`SELECT status FROM project_team_memory_job WHERE effect_id=${selection.effectId}`,
+                            ).toEqual([{ status: "uncertain" }]);
+                            forwardDeniedObserved = true;
+                          } else if (cleanupProof) {
                             expect({ failure: memoryPipelineFailure }).toEqual({ failure: "" });
                             expect(jobs[0]?.status).toBe("settled");
                             expect(decodeRequiredJson(jobs[0]?.receipt ?? "null")).toMatchObject({
@@ -12607,7 +12718,7 @@ for (const compactProof of [
                                     : "live-memory-decision-replacement"),
                               ),
                             ).toMatchObject({ state: "accepted" });
-                          } else if (pipelineProof || queryForward) {
+                          } else if ((pipelineProof && !forwardProof) || queryForward) {
                             expect({ failure: memoryPipelineFailure }).toEqual({ failure: "" });
                             expect(jobs[0]?.status).toBe("settled");
                             expect(decodeRequiredJson(jobs[0]?.receipt ?? "null")).toMatchObject({
@@ -12661,6 +12772,11 @@ for (const compactProof of [
                               expect(
                                 yield* f.sql`SELECT status FROM project_team_memory_observation WHERE record_id=${obsolete.recordId}`,
                               ).toEqual([{ status: "superseded" }]);
+                            }
+                            if (forwardQuery) {
+                              activeQuery = true;
+                              yield* issueQuery();
+                              activeQuery = false;
                             }
                             if (queryNoForward) {
                               if (queryBudget)
@@ -13305,7 +13421,7 @@ for (const compactProof of [
                           expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(
                             charges,
                           );
-                          if (pipelineProof) {
+                          if (pipelineProof && !forwardProof) {
                             expect(memoryExchanges).toBe(2);
                             expect(memoryBackendCalls).toBe(3);
                           } else if (compactProof === "memoryFailure") {
@@ -13986,6 +14102,14 @@ for (const compactProof of [
             () => Effect.void,
           );
           const assignmentResult = yield* assigned.run.pipe(Effect.result);
+          if (forwardProof) {
+            expect({ forwardChecks, forwardDeniedObserved }).toEqual({
+              forwardChecks: 1,
+              forwardDeniedObserved: true,
+            });
+            expect(f.transports).toBe(0);
+            return;
+          }
           if (queryDenied) {
             expect(assignmentResult._tag).toBe("Success");
             expect(yield* f.sql`SELECT * FROM project_team_memory_query`).toEqual([]);
@@ -14054,6 +14178,14 @@ for (const compactProof of [
             runs: 2,
             result: { _tag: "Success", success: { terminal: { outcome: "success" } } },
           });
+          if (compactProof === "memoryPipeline" || compactProof === "memoryQueryPipeline") {
+            if (capturedMemoryOperation === undefined)
+              return yield* Effect.die("Original memory bridge was not captured");
+            expect(yield* capturedMemoryOperation.assertForward.pipe(Effect.result)).toMatchObject({
+              _tag: "Failure",
+              failure: { reason: "Original memory runtime cannot forward" },
+            });
+          }
           yield* stage("assignment-observed");
           if (memoryProof) {
             if (

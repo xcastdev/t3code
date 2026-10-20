@@ -1440,7 +1440,8 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
             return yield* Effect.uninterruptibleMask((restore) =>
               Effect.gen(function* () {
                 const result = yield* restore(
-                  sql.withTransaction(modelFence).pipe(
+                  executing.value.assertForward.pipe(
+                    Effect.andThen(sql.withTransaction(modelFence)),
                     Effect.andThen(
                       options.exchange(
                         {
@@ -1531,7 +1532,8 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
           environmentId: options.environmentId,
         });
         const guardedBackend = makeMem0Backend((request) =>
-          sql.withTransaction(fence).pipe(
+          executing.value.assertForward.pipe(
+            Effect.andThen(sql.withTransaction(fence)),
             Effect.andThen(options.companion(owner, configuration, request, fence)),
             Effect.tap(() => sql.withTransaction(fence)),
             Effect.mapError(

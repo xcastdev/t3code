@@ -73,6 +73,8 @@ export class ProjectMemoryOperation extends Context.Service<
   ProjectMemoryOperation,
   {
     readonly identity: ProjectMemoryOperationIdentity;
+    /** Revalidates the captured runtime outside SQL transactions. */
+    readonly assertForward: Effect.Effect<void, ProjectMemoryServiceError>;
     readonly readCurrentInTransaction: (
       principal: ProjectTeamPrincipal,
     ) => Effect.Effect<ProjectMemoryTaskOwner, ProjectMemoryServiceError>;

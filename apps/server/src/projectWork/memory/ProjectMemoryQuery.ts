@@ -1324,6 +1324,7 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
         });
         if (held.status !== "reserved")
           return yield* deny("Retained query reservation cannot be resent");
+        yield* executing.value.assertForward;
         yield* check();
         const response = yield* options
           .exchange(
@@ -1410,7 +1411,8 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
           }),
         );
         const backend = makeMem0Backend((bytes) =>
-          check().pipe(
+          executing.value.assertForward.pipe(
+            Effect.andThen(check()),
             Effect.flatMap(() => companion(owner, configuration, bytes, fence)),
             Effect.mapError(
               () =>
