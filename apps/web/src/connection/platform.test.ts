@@ -3,12 +3,18 @@ import {
   EnvironmentId,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
   type DesktopBridge,
+  type DesktopEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "@effect/vitest";
+import { afterEach, describe, expect, it, vi } from "@effect/vitest";
+import { PlatformConnectionSource } from "@t3tools/client-runtime/platform";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
+
+import { __resetDesktopPrimaryAuthForTests } from "../environments/primary/desktopAuth";
 
 import {
+  platformConnectionSourceLayer,
   canRetainCachedPlatformRegistrationAfterRefreshFailure,
   canReuseCachedPlatformRegistration,
   primaryRegistrationToRetainAfterTopologyRead,
@@ -221,5 +227,143 @@ describe("primary topology cache", () => {
         target: null,
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("platform discovery with managed local backends disabled", () => {
+  const attached: DesktopEnvironmentBootstrap = {
+    id: PRIMARY_LOCAL_ENVIRONMENT_ID,
+    label: "Attached environment",
+    runningDistro: null,
+    httpBaseUrl: "http://127.0.0.1:4321/",
+    wsBaseUrl: "ws://127.0.0.1:4321/",
+    ownership: "attached",
+  };
+  // Effect's HTTP layer can retain the fetch reference across test runtimes.
+  // Reset one transport mock so each case observes its own requests.
+  const fetch = vi.fn<typeof globalThis.fetch>();
+  function descriptorRequest() {
+    const call = fetch.mock.calls[0];
+    if (call === undefined) {
+      throw new Error("Expected a descriptor request.");
+    }
+    return new Request(...call);
+  }
+  function installHost(initial: DesktopEnvironmentBootstrap[]) {
+    let bootstraps = initial;
+    const bearer = vi.fn().mockResolvedValue("attached-bearer");
+    vi.stubGlobal("window", {
+      location: new URL("http://127.0.0.1:9000/work"),
+      desktopBridge: {
+        getLocalEnvironmentEnabled: () => false,
+        getLocalEnvironmentBootstraps: () => bootstraps,
+        getLocalEnvironmentBearerToken: bearer,
+      },
+    });
+    fetch.mockReset().mockImplementation(async () =>
+      Response.json({
+        environmentId: "environment-attached",
+        label: "Attached environment",
+        platform: { os: "linux", arch: "x64" },
+        serverVersion: "0.0.0-test",
+        capabilities: { repositoryIdentity: true },
+      }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    return {
+      fetch,
+      bearer,
+      setBootstraps: (next: DesktopEnvironmentBootstrap[]) => {
+        bootstraps = next;
+      },
+    };
+  }
+  afterEach(() => {
+    __resetDesktopPrimaryAuthForTests();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it.effect("discovers the attached primary with its bearer and removes it after detach", () => {
+    const host = installHost([
+      attached,
+      { ...attached, id: "wsl:Ubuntu", ownership: "managed", bootstrapToken: "unused" },
+    ]);
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const registrations = yield* Stream.runCollect(source.registrations.pipe(Stream.take(1)));
+      expect(registrations).toHaveLength(1);
+      expect(registrations[0]).toHaveLength(1);
+      expect(registrations[0]?.[0]?.target).toMatchObject({
+        _tag: "PrimaryConnectionTarget",
+        environmentId: "environment-attached",
+        httpBaseUrl: attached.httpBaseUrl,
+        wsBaseUrl: attached.wsBaseUrl,
+      });
+      expect(host.fetch).toHaveBeenCalledTimes(1);
+      const request = descriptorRequest();
+      expect(request.url).toBe("http://127.0.0.1:4321/.well-known/t3/environment");
+      expect(request.headers.get("authorization")).toBe("Bearer attached-bearer");
+      host.setBootstraps([{ ...attached, ownership: "managed" }]);
+      const detached = yield* Stream.runCollect(source.registrations.pipe(Stream.take(1)));
+      expect(detached).toEqual([[]]);
+      expect(host.fetch).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.provide(platformConnectionSourceLayer));
+  });
+
+  it.effect("emits no registrations or requests without an attached primary", () => {
+    const host = installHost([{ ...attached, ownership: "managed" }]);
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      expect(yield* Stream.runCollect(source.registrations.pipe(Stream.take(1)))).toEqual([[]]);
+      expect(host.fetch).not.toHaveBeenCalled();
+      expect(host.bearer).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(platformConnectionSourceLayer));
+  });
+
+  for (const unavailable of [
+    { httpBaseUrl: null, wsBaseUrl: null },
+    { httpBaseUrl: "/relative", wsBaseUrl: attached.wsBaseUrl },
+    { httpBaseUrl: attached.httpBaseUrl, wsBaseUrl: "file:///socket" },
+  ]) {
+    it.effect(
+      `drops the cached attached primary without fallback for ${JSON.stringify(unavailable)}`,
+      () => {
+        const host = installHost([attached]);
+        vi.stubEnv("VITE_HTTP_URL", "https://fallback.example.test");
+        return Effect.gen(function* () {
+          const source = yield* PlatformConnectionSource;
+          expect(yield* Stream.runCollect(source.registrations.pipe(Stream.take(1)))).toHaveLength(
+            1,
+          );
+          expect(host.fetch).toHaveBeenCalledTimes(1);
+          host.setBootstraps([{ ...attached, ...unavailable }]);
+          expect(yield* Stream.runCollect(source.registrations.pipe(Stream.take(1)))).toEqual([[]]);
+          expect(host.fetch).toHaveBeenCalledTimes(1);
+        }).pipe(Effect.provide(platformConnectionSourceLayer));
+      },
+    );
+  }
+
+  it.effect("does not fall back when the attached environment cannot be reached", () => {
+    const host = installHost([attached]);
+    host.fetch.mockRejectedValue(new TypeError("backend unavailable"));
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      expect(yield* Stream.runCollect(source.registrations.pipe(Stream.take(1)))).toEqual([[]]);
+      expect(host.fetch).toHaveBeenCalledTimes(1);
+      const request = descriptorRequest();
+      expect(request.url).toBe("http://127.0.0.1:4321/.well-known/t3/environment");
+    }).pipe(Effect.provide(platformConnectionSourceLayer));
+  });
+
+  it.effect("keeps hosted static web discovery empty", () => {
+    const host = installHost([attached]);
+    vi.stubEnv("VITE_HOSTED_APP_CHANNEL", "latest");
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      expect(yield* Stream.runCollect(source.registrations)).toEqual([]);
+      expect(host.fetch).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(platformConnectionSourceLayer));
   });
 });

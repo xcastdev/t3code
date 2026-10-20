@@ -462,10 +462,10 @@ export function secondaryRegistrationsToRetainAfterTopologyRead(
   );
 }
 
-const platformConnectionSourceLayer = Layer.effect(
+export const platformConnectionSourceLayer = Layer.effect(
   PlatformConnectionSource,
   Effect.gen(function* () {
-    if (isHostedStaticApp() || isLocalEnvironmentDisabled()) {
+    if (isHostedStaticApp()) {
       return PlatformConnectionSource.of({
         registrations: Stream.empty,
       });
@@ -483,10 +483,10 @@ const platformConnectionSourceLayer = Layer.effect(
       const registrations: Array<PlatformConnectionRegistration> = [];
 
       const primaryTopologyRead = readPrimaryEnvironmentTargetResult();
-      const retainedPrimary = primaryRegistrationToRetainAfterTopologyRead(
-        previous,
-        primaryTopologyRead,
-      );
+      const localDisabled = isLocalEnvironmentDisabled();
+      const retainedPrimary = localDisabled
+        ? undefined
+        : primaryRegistrationToRetainAfterTopologyRead(previous, primaryTopologyRead);
       if (retainedPrimary !== undefined) {
         next.set(PRIMARY_LOCAL_ENVIRONMENT_ID, retainedPrimary);
         registrations.push(retainedPrimary.registration);
@@ -521,7 +521,10 @@ const platformConnectionSourceLayer = Layer.effect(
         }
       }
 
-      const topologyRead = readDesktopSecondaryBootstrapsResult();
+      // The attached primary does not re-enable host-managed secondary backends.
+      const topologyRead: DesktopSecondaryBootstrapsRead = localDisabled
+        ? { _tag: "Success", bootstraps: [] }
+        : readDesktopSecondaryBootstrapsResult();
       for (const [id, cached] of secondaryRegistrationsToRetainAfterTopologyRead(
         previous,
         topologyRead,

@@ -252,6 +252,9 @@ function resolveWindowOriginPrimaryTarget(): PrimaryEnvironmentTarget {
 
 function resolveDesktopPrimaryTarget(): PrimaryEnvironmentTarget | null {
   const desktopBootstrap = getDesktopLocalEnvironmentBootstrap();
+  if (isLocalEnvironmentDisabled() && desktopBootstrap?.ownership !== "attached") {
+    return null;
+  }
   if (!desktopBootstrap) {
     return null;
   }
@@ -263,6 +266,23 @@ function resolveDesktopPrimaryTarget(): PrimaryEnvironmentTarget | null {
       hasHttpBaseUrl: Boolean(desktopBootstrap.httpBaseUrl),
       hasWsBaseUrl: Boolean(desktopBootstrap.wsBaseUrl),
     });
+  }
+
+  // Attached endpoints are explicit host authority. Never resolve relative or
+  // unsupported URLs against the renderer origin.
+  if (desktopBootstrap.ownership === "attached") {
+    for (const [rawValue, urlKind, protocols] of [
+      [desktopBootstrap.httpBaseUrl, "http-base-url", ["http:", "https:"]],
+      [desktopBootstrap.wsBaseUrl, "websocket-base-url", ["ws:", "wss:"]],
+    ] as const) {
+      const url = parseTargetUrl({ rawValue, source: "desktop-managed", urlKind });
+      if (!protocols.some((protocol) => protocol === url.protocol)) {
+        throw new PrimaryEnvironmentProtocolUnsupportedError({
+          source: "desktop-managed",
+          protocol: url.protocol,
+        });
+      }
+    }
   }
 
   return {
@@ -303,11 +323,11 @@ export function resolvePrimaryEnvironmentHttpUrl(
   return url.toString();
 }
 
-// Null only when the desktop app runs with its local environment disabled;
-// every other host has a primary (falling back to the page origin).
+// Disabling managed local backends still permits an explicitly attached primary.
+// Without one, do not fall back to configured endpoints or the renderer origin.
 export function readPrimaryEnvironmentTarget(): PrimaryEnvironmentTarget | null {
   if (isLocalEnvironmentDisabled()) {
-    return null;
+    return resolveDesktopPrimaryTarget();
   }
   return (
     resolveDesktopPrimaryTarget() ??
