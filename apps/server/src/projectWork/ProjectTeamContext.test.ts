@@ -2273,20 +2273,30 @@ const admitMemoryBudgetFixture = (
       outcome: "reported" | "unknown",
       charge: number,
     ) =>
-      accounting.settle({
-        ...reserved.reservation,
-        reservationId: reserved.reservationId,
-        outcome,
-        chargedInputTokens: charge / 2,
-        chargedOutputTokens: charge / 2,
-        transportDrained: true,
-        ...(outcome === "reported"
-          ? {
-              reportedModel: reserved.reservation.model,
-              reportedInputTokens: charge / 2,
-              reportedOutputTokens: charge / 2,
-            }
-          : {}),
+      Effect.gen(function* () {
+        if (binding.model === "gpt-6-luna") {
+          const grants = yield* f.sql`SELECT root_task_id FROM project_team_pi_subscription_grant
+            WHERE environment_id='environment' AND project_id=${projectId}
+            AND root_task_id=${f.snapshot.intent.limits.rootTaskId}`;
+          // Preserve memory-first admission while using the actual Pi producer
+          // to establish the original root's grant before settling memory usage.
+          if (grants.length === 0) yield* f.reserve(1);
+        }
+        return yield* accounting.settle({
+          ...reserved.reservation,
+          reservationId: reserved.reservationId,
+          outcome,
+          chargedInputTokens: charge / 2,
+          chargedOutputTokens: charge / 2,
+          transportDrained: true,
+          ...(outcome === "reported"
+            ? {
+                reportedModel: reserved.reservation.model,
+                reportedInputTokens: charge / 2,
+                reportedOutputTokens: charge / 2,
+              }
+            : {}),
+        });
       });
     return { ...f, reserveMemory, settleMemory };
   });
@@ -2564,6 +2574,8 @@ it.effect(
     withRetainedGateway(
       Effect.gen(function* () {
         const f = yield* makeMixedBudgetFixture;
+        const original = yield* f.reserve(2);
+        yield* f.reader.readRequired(f.snapshot);
         if (!f.piRuntime) return yield* Effect.die("Missing retained Pi operation");
         const hardAccounting = yield* Accounting.make({
           environmentId: "environment",
@@ -2586,6 +2598,10 @@ it.effect(
           deadlineAtMs: f.piRuntime.operation.deadlineAtMs,
         };
         yield* hardAccounting.reserve(f.principal, hard);
+        // Lose the genuine grant and its native row only after valid producer setup.
+        yield* f.sql`DROP TRIGGER project_team_pi_subscription_grant_no_delete`;
+        yield* f.sql`DELETE FROM project_team_pi_subscription_grant`;
+        yield* f.sql`DELETE FROM project_team_model_request WHERE reservation_id=${original.reservationId}`;
         expect(yield* f.sql`SELECT root_task_id FROM project_team_pi_subscription_grant`).toEqual(
           [],
         );
@@ -2818,6 +2834,11 @@ for (const grantScope of [
           const reported = yield* f.reserveMemory(1, 100);
           yield* f.settleMemory(reported, "reported", 40);
           yield* f.reserveMemory(2, 300);
+          if (!hard) {
+            // Simulate loss of native request rows only after the producer has
+            // established the valid grant and memory settlement has succeeded.
+            yield* f.sql`DELETE FROM project_team_model_request WHERE request_lane='pi'`;
+          }
           expect(
             yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='pi'`,
           ).toEqual([]);
@@ -2837,13 +2858,22 @@ for (const grantScope of [
             );
           }
           const limits = f.snapshot.intent.limits;
-          yield* f.sql`INSERT INTO project_team_pi_subscription_grant
-        (environment_id,project_id,root_task_id,model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms)
-        VALUES(${grantScope === "foreign-environment" ? "foreign" : "environment"},
-          ${grantScope === "foreign-project" ? "foreign" : projectId},
-          ${grantScope === "foreign-root" ? "foreign" : limits.rootTaskId},
-          'gpt-6-luna','openai-subscription-luna',64000,300000,
-          ${limits.rootDeadlineAtMs - (grantScope === "wrong-deadline" ? 1 : 0)})`;
+          if (hard) {
+            yield* f.sql`INSERT INTO project_team_pi_subscription_grant
+              (environment_id,project_id,root_task_id,model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms)
+              VALUES('environment',${projectId},${limits.rootTaskId},'gpt-6-luna',
+                'openai-subscription-luna',64000,300000,${limits.rootDeadlineAtMs})`;
+          } else if (grantScope !== "monitored-root") {
+            yield* f.sql`DROP TRIGGER project_team_pi_subscription_grant_immutable`;
+            if (grantScope === "foreign-environment")
+              yield* f.sql`UPDATE project_team_pi_subscription_grant SET environment_id='foreign'`;
+            if (grantScope === "foreign-project")
+              yield* f.sql`UPDATE project_team_pi_subscription_grant SET project_id='foreign'`;
+            if (grantScope === "foreign-root")
+              yield* f.sql`UPDATE project_team_pi_subscription_grant SET root_task_id='foreign'`;
+            if (grantScope === "wrong-deadline")
+              yield* f.sql`UPDATE project_team_pi_subscription_grant SET deadline_at_ms=deadline_at_ms-1`;
+          }
           if (grantScope === "monitored-root") {
             const current = yield* f.reader.readRequired(f.snapshot);
             expect(current.required.remaining).toMatchObject({
