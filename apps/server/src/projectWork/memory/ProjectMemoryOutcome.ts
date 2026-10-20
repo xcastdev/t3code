@@ -10,6 +10,7 @@ import {
   canonicalProjectWorkPayload,
   projectWorkPayloadFingerprint,
 } from "@t3tools/contracts";
+import { COMMAND_CODE_EXTRACTION, LIQUID_EXTRACTION } from "./ProjectMemoryModelRoutes.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -293,9 +294,17 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
     if (
       extractions.length !== 1 ||
       extraction?.kind !== "memory-extraction" ||
+      (extraction.extractionModel !== input.extraction!.extractionModel &&
+        !(
+          input.extraction!.extractionModel === COMMAND_CODE_EXTRACTION.model &&
+          extraction.extractionModel === LIQUID_EXTRACTION.model
+        )) ||
       !equal(
         {
           ...extraction,
+          // The immutable capture predates route selection. Only the fixed
+          // default-to-Liquid finalization above may differ from that input.
+          extractionModel: input.extraction!.extractionModel,
           status: input.extraction!.status,
           revision: input.extraction!.revision,
           updatedAt: input.extraction!.updatedAt,

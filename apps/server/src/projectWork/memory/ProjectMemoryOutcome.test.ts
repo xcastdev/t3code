@@ -53,7 +53,10 @@ const database = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect
 /** Actual migrated SQLite/repository/reactor; model and backend are prepared fakes.
  * These cases establish durable reflection semantics, never native runtime proof.
  */
-const setup = Effect.fn("ProjectMemoryOutcome.test.setup")(function* (noFacts = false) {
+const setup = Effect.fn("ProjectMemoryOutcome.test.setup")(function* (
+  noFacts = false,
+  liquid = false,
+) {
   yield* runMigrations();
   const sql = yield* SqlClient.SqlClient;
   const repository = yield* ProjectWorkRepository;
@@ -147,7 +150,11 @@ const setup = Effect.fn("ProjectMemoryOutcome.test.setup")(function* (noFacts = 
     deleteProject: () => Effect.succeed({ cleanupComplete: true }),
   };
   const dependencies = { sql, repository, contentGuard, authorization, environmentId };
-  const service = makeProjectMemoryService({ ...dependencies, models });
+  const service = makeProjectMemoryService({
+    ...dependencies,
+    models,
+    ...(liquid ? { selectedExtractionModel: "liquid/lfm-2.5-2.6b:free" as const } : {}),
+  });
   const source = yield* service.captureRetained(projectId, {
     kind: "comment",
     retainedId: comment.commentId,
@@ -981,3 +988,77 @@ for (const corruption of [
       }),
     ),
   );
+
+for (const noFacts of [false, true])
+  it.effect(
+    `Liquid ${noFacts ? "no-facts" : "index"} reflection retains completed model and immutable capture on replay`,
+    () =>
+      database(
+        Effect.gen(function* () {
+          const f = yield* setup(noFacts, true);
+          const original =
+            yield* f.sql`SELECT input_json FROM project_team_memory_job WHERE effect_id=${f.effectId}`;
+          expect(
+            yield* f.sql`SELECT json_extract(input_json,'$.extraction.extractionModel') AS model FROM project_team_memory_job WHERE effect_id=${f.effectId}`,
+          ).toEqual([{ model: "inclusionai/ling-3.1-flash:free" }]);
+          const pending = yield* f.pending.consume(f.projectId, f.effectId);
+          if (pending.status !== "pending-reflection")
+            return yield* Effect.die("Unsettled Liquid fixture");
+          const result = yield* f.outcomes
+            .commitVerifiedOutcome(pending.receipt, Effect.void)
+            .pipe(Effect.result);
+          expect(result).toMatchObject({ _tag: "Success" });
+          const work = yield* f.service.readWork(f.projectId, f.effectId);
+          expect(work.extraction).toMatchObject({
+            extractionModel: "liquid/lfm-2.5-2.6b:free",
+            status: noFacts ? "no-facts" : "indexed",
+          });
+          expect(work.effect.status).toBe("succeeded");
+          const before = yield* f.snapshot;
+          const calls = f.counts();
+          yield* makeProjectMemoryOutcome(f).commitVerifiedOutcome(pending.receipt, Effect.void);
+          expect(yield* f.snapshot).toEqual(before);
+          expect(f.counts()).toEqual(calls);
+          expect(
+            yield* f.sql`SELECT input_json FROM project_team_memory_job WHERE effect_id=${f.effectId}`,
+          ).toEqual(original);
+        }),
+      ),
+  );
+
+for (const noFacts of [false, true])
+  for (const model of ["liquid/lfm-2.5-2.6b", "arbitrary/model:free", "inclusionai/ling-3.1-flash"])
+    it.effect(
+      `Liquid ${noFacts ? "no-facts" : "index"} reflection rejects substituted model ${model}`,
+      () =>
+        database(
+          Effect.gen(function* () {
+            const f = yield* setup(noFacts, true);
+            const pending = yield* f.pending.consume(f.projectId, f.effectId);
+            if (pending.status !== "pending-reflection")
+              return yield* Effect.die("Unsettled Liquid fixture");
+            const work = yield* f.service.readWork(f.projectId, f.effectId);
+            if (work.extraction === undefined)
+              return yield* Effect.die("Missing Liquid extraction");
+            // Corrupt both read surfaces so the model comparison, rather than a
+            // physical/projection mismatch, must reject the unsupported identity.
+            yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,
+        '$.foundationRecords[' || (SELECT key FROM json_each(state_json,'$.foundationRecords')
+          WHERE json_extract(value,'$.recordId')=${work.extraction.recordId}) || '].extractionModel',${model})
+        WHERE project_id=${f.projectId}`;
+            yield* f.sql`UPDATE project_team_memory_extraction SET payload_json=json_set(payload_json,'$.extractionModel',${model})
+        WHERE record_id=${work.extraction.recordId}`;
+            const before = yield* f.snapshot;
+            const result = yield* f.outcomes
+              .commitVerifiedOutcome(pending.receipt, Effect.void)
+              .pipe(Effect.result);
+            expect(result).toMatchObject({
+              _tag: "Failure",
+              failure: {
+                reason: "Memory reflection extraction tuple or completed manifest changed",
+              },
+            });
+            expect(yield* f.snapshot).toEqual(before);
+          }),
+        ),
+    );

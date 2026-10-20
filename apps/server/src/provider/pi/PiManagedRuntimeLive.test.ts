@@ -14483,7 +14483,6 @@ for (const compactProof of [
               expect(memoryBackendCalls).toBe(3);
             } else if (accountingProof) {
               expect(runs).toBe(2);
-              if (liquidProof) return;
               const failedContext = yield* f.reader.readRequired(snapshot);
               expectedContext = failedContext.text;
               expectedProvenance = NodeCrypto.createHash("sha256")
@@ -14498,6 +14497,12 @@ for (const compactProof of [
               const failedOperations = yield* makeProjectTeamPiOperations({
                 environmentId: "environment",
               });
+              // Reading the boundary requires the same durable caller reservation
+              // as the production compaction entry point.
+              yield* failedOperations.reserveCompaction(
+                { providerInstanceId, threadId },
+                failedRequest,
+              );
               const failedBoundary = yield* failedOperations.readCompaction(
                 { providerInstanceId, threadId },
                 failedRequest,

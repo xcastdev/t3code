@@ -268,3 +268,182 @@ for (const kind of ["index-complete", "no-facts"] as const)
       ),
     ).toThrow();
   });
+
+const captureModel = "inclusionai/ling-3.1-flash:free";
+const liquidModel = "liquid/lfm-2.5-2.6b:free";
+const extractionAttribution = {
+  actor: { kind: "system", id: "project-memory" },
+  source: { kind: "system", id: "project-memory" },
+  recordedAt: at,
+} as const;
+const extractionCompletion = (status: "extracted" | "no-facts" = "extracted") => {
+  const f = fixture();
+  const { extractionHash: _hash, ...unfrozen } = f.extraction;
+  const pending = {
+    ...unfrozen,
+    status: "pending" as const,
+    extractionModel: captureModel,
+    expectedObservationIds: [],
+    completedObservationIds: [],
+  };
+  const completed = {
+    ...pending,
+    revision: pending.revision + 1,
+    status,
+    extractionModel: liquidModel,
+    extractionHash: "validated-facts-hash",
+    expectedObservationIds: status === "extracted" ? [f.observation.recordId] : [],
+  };
+  const state = { ...f.state, foundationRecords: [f.source, pending, f.effect] };
+  const { transition: _transition, ...originalCommand } = f.command;
+  const command = { ...originalCommand, attribution: extractionAttribution, records: [completed] };
+  return { ...f, state, command, pending, completed };
+};
+
+for (const status of ["extracted", "no-facts"] as const)
+  it(`finalizes pending Liquid model provenance with validated ${status} facts`, () => {
+    const f = extractionCompletion(status);
+    const next = applyProjectWorkEvents(f.state, decideProjectWorkCommand(f.state, f.command));
+    expect(next.foundationRecords?.find((r) => r.recordId === f.pending.recordId)).toEqual(
+      f.completed,
+    );
+    expect(next.foundationRecords?.find((r) => r.recordId === f.source.recordId)).toEqual(f.source);
+    expect(next.foundationRecords?.find((r) => r.recordId === f.effect.recordId)).toEqual(f.effect);
+  });
+
+for (const status of ["extracted", "no-facts", "indexed", "failed", "retracted"] as const)
+  it(`does not relabel an already ${status} extraction as Liquid`, () => {
+    const f = extractionCompletion();
+    const previous = {
+      ...f.pending,
+      status,
+      ...(status === "failed"
+        ? { error: "Failed extraction" }
+        : { extractionHash: "original-hash" }),
+      expectedObservationIds:
+        status === "extracted" || status === "indexed" ? [f.observation.recordId] : [],
+      completedObservationIds: status === "indexed" ? [f.observation.recordId] : [],
+    };
+    expect(() =>
+      decideProjectWorkCommand(
+        { ...f.state, foundationRecords: [f.source, previous, f.effect, f.observation] },
+        f.command,
+      ),
+    ).toThrow();
+  });
+
+for (const mutation of [
+  "source",
+  "source-revision",
+  "source-generation",
+  "generation",
+  "project",
+  "foreign-source",
+  "engine",
+  "embedding-model",
+  "unknown-model",
+  "unsuffixed-model",
+  "actor",
+  "source-actor",
+  "missing-hash",
+  "pending-output",
+  "failed-output",
+  "indexed-output",
+  "completed-observations",
+  "empty-extracted",
+  "nonempty-no-facts",
+] as const)
+  it(`rejects Liquid provenance finalization with ${mutation}`, () => {
+    const f = extractionCompletion();
+    const completed = {
+      ...f.completed,
+      ...(mutation === "source" ? { sourceId: "different-source" } : {}),
+      ...(mutation === "source-revision" ? { sourceRevision: f.source.sourceRevision + 1 } : {}),
+      ...(mutation === "source-generation" ? { sourceGeneration: f.source.generation + 1 } : {}),
+      ...(mutation === "generation" ? { generation: f.pending.generation + 1 } : {}),
+      ...(mutation === "project" ? { projectId: ProjectId.make("foreign") } : {}),
+      ...(mutation === "engine" ? { engineVersion: "changed" } : {}),
+      ...(mutation === "embedding-model" ? { embeddingModel: "changed" } : {}),
+      ...(mutation === "unknown-model" ? { extractionModel: "arbitrary/model:free" } : {}),
+      ...(mutation === "unsuffixed-model" ? { extractionModel: "liquid/lfm-2.5-2.6b" } : {}),
+      ...(mutation === "missing-hash" ? { extractionHash: undefined } : {}),
+      ...(mutation === "pending-output" ? { status: "pending" } : {}),
+      ...(mutation === "failed-output" ? { status: "failed" } : {}),
+      ...(mutation === "indexed-output"
+        ? { status: "indexed", completedObservationIds: [f.observation.recordId] }
+        : {}),
+      ...(mutation === "completed-observations"
+        ? { completedObservationIds: [f.observation.recordId] }
+        : {}),
+      ...(mutation === "empty-extracted" ? { expectedObservationIds: [] } : {}),
+      ...(mutation === "nonempty-no-facts" ? { status: "no-facts" } : {}),
+    };
+    const command = {
+      ...f.command,
+      records: [completed],
+      attribution: {
+        ...extractionAttribution,
+        ...(mutation === "actor" ? { actor: { kind: "human", id: "human" } } : {}),
+        ...(mutation === "source-actor" ? { source: { kind: "system", id: "other-system" } } : {}),
+      },
+    };
+    const source = {
+      ...f.source,
+      ...(mutation === "source" ? { recordId: "different-source" } : {}),
+      ...(mutation === "foreign-source" ? { projectId: ProjectId.make("foreign") } : {}),
+    };
+    expect(() =>
+      decideProjectWorkCommand(
+        { ...f.state, foundationRecords: [source, f.pending, f.effect] },
+        decodeCommand(command),
+      ),
+    ).toThrow();
+  });
+
+for (const mutation of [
+  "hash",
+  "expected-observations",
+  "completed-observations",
+  "error",
+  "unknown-model",
+] as const)
+  it(`rejects already populated pending extraction ${mutation} on Liquid finalization`, () => {
+    const f = extractionCompletion();
+    const pending = {
+      ...f.pending,
+      ...(mutation === "hash" ? { extractionHash: "old-hash" } : {}),
+      ...(mutation === "expected-observations"
+        ? { expectedObservationIds: [f.observation.recordId] }
+        : {}),
+      ...(mutation === "completed-observations"
+        ? { completedObservationIds: [f.observation.recordId] }
+        : {}),
+      ...(mutation === "error" ? { error: "previous error" } : {}),
+      ...(mutation === "unknown-model" ? { extractionModel: "unknown/model:free" } : {}),
+    };
+    expect(() =>
+      decideProjectWorkCommand(
+        { ...f.state, foundationRecords: [f.source, pending, f.effect] },
+        f.command,
+      ),
+    ).toThrow();
+  });
+
+for (const status of ["extracted", "no-facts"] as const)
+  it(`keeps finalized Liquid ${status} model and manifest immutable`, () => {
+    const f = extractionCompletion(status);
+    const finalized = applyProjectWorkEvents(f.state, decideProjectWorkCommand(f.state, f.command));
+    for (const change of [
+      { extractionModel: captureModel },
+      { extractionModel: "liquid/lfm-2.5-2.6b" },
+      { extractionHash: "replaced-hash" },
+      { expectedObservationIds: ["changed-observation"] },
+    ])
+      expect(() =>
+        decideProjectWorkCommand(finalized, {
+          ...f.command,
+          expectedRevision: finalized.revision,
+          records: [{ ...f.completed, revision: f.completed.revision + 1, ...change }],
+        }),
+      ).toThrow();
+  });

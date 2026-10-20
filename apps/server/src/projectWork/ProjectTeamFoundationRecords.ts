@@ -5,6 +5,7 @@ import {
   type ProjectWorkAttribution,
   type ProjectWorkTeamTransition,
 } from "@t3tools/contracts";
+import { COMMAND_CODE_EXTRACTION, LIQUID_EXTRACTION } from "./memory/ProjectMemoryModelRoutes.ts";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
@@ -622,6 +623,34 @@ export const validateProjectTeamRecord = (
       )
         reject("Memory source is stale or retracted");
       if (r.kind === "memory-extraction") {
+        // Capture has not called a model. Its default may be finalized once,
+        // alongside validated facts, by the selected fixed extraction route.
+        const finalizesSelectedModel =
+          old?.kind === "memory-extraction" &&
+          old.status === "pending" &&
+          old.extractionHash === undefined &&
+          old.expectedObservationIds.length === 0 &&
+          old.completedObservationIds.length === 0 &&
+          old.error === undefined &&
+          r.error === undefined &&
+          (r.status === "extracted" || r.status === "no-facts") &&
+          r.extractionHash !== undefined &&
+          r.completedObservationIds.length === 0 &&
+          r.generation === old.generation &&
+          old.projectId === r.projectId &&
+          source.projectId === r.projectId &&
+          old.extractionModel === COMMAND_CODE_EXTRACTION.model &&
+          r.extractionModel === LIQUID_EXTRACTION.model &&
+          origin.actor.kind === "system" &&
+          origin.actor.id === "project-memory" &&
+          origin.source.kind === "system" &&
+          origin.source.id === "project-memory";
+        if (
+          old?.kind === "memory-extraction" &&
+          old.extractionModel !== r.extractionModel &&
+          !finalizesSelectedModel
+        )
+          reject("Extraction model may only be finalized with its original pending capture");
         if (
           old?.kind === "memory-extraction" &&
           canonicalProjectWorkPayload([
@@ -630,7 +659,6 @@ export const validateProjectTeamRecord = (
             old.sourceGeneration,
             old.engine,
             old.engineVersion,
-            old.extractionModel,
             old.embeddingModel,
             old.embeddingDimensions,
           ]) !==
@@ -640,7 +668,6 @@ export const validateProjectTeamRecord = (
               r.sourceGeneration,
               r.engine,
               r.engineVersion,
-              r.extractionModel,
               r.embeddingModel,
               r.embeddingDimensions,
             ])
