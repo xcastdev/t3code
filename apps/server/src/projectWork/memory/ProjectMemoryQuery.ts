@@ -9,6 +9,7 @@ import {
   type ProjectWorkAttribution,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Exit from "effect/Exit";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -1204,311 +1205,338 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
     );
     const consumeQuery = Effect.fn("ProjectMemoryQuery.consume")(
       function* (principal: ProjectTeamPrincipal, queryId: string) {
-        if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
-          return yield* deny("Query processing follows its original commit");
-        const owner = yield* readProjectMemoryQueryOwnerById(sql, queryId);
-        const stages = yield* readStages(sql, queryId);
-        if (
-          stages.status !== "pending" ||
-          stages.embedding !== null ||
-          stages.search !== null ||
-          stages.result !== null
-        )
-          return yield* deny("Original query stages are retained without resend");
-        const executing = yield* Effect.serviceOption(ProjectMemoryOperation);
-        if (Option.isNone(executing)) return yield* deny("Query waits for its executing bridge");
-        const configured = Effect.gen(function* () {
-          const configuration = yield* options.readConfiguration;
+        let claimed = false;
+        const work = Effect.gen(function* () {
+          if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+            return yield* deny("Query processing follows its original commit");
+          const owner = yield* readProjectMemoryQueryOwnerById(sql, queryId);
+          const stages = yield* readStages(sql, queryId);
           if (
-            configuration === undefined ||
-            projectMemoryHash(configuration) !== owner.configurationSha256
+            stages.status !== "pending" ||
+            stages.embedding !== null ||
+            stages.search !== null ||
+            stages.result !== null
           )
-            return yield* deny("Original query configuration changed");
-          yield* options.assertAdmission;
-          return configuration;
-        });
-        const fence = Effect.gen(function* () {
-          yield* configured;
-          yield* auditProjectMemoryQueryAdmission(sql, owner);
-          const authority = yield* authorization.resolve(principal);
-          if (
-            authority === undefined ||
-            authority.role.memoryAccess === "none" ||
-            principal.actor.kind !== "agent" ||
-            principal.actor.id !== owner.actorId ||
-            principal.managed?.bindingId !== owner.operation.bindingId ||
-            principal.managed.generation !== owner.operation.generation ||
-            principal.managed.providerInstanceId !== owner.operation.providerInstanceId ||
-            principal.managed.threadId !== owner.operation.threadId ||
-            projectMemoryQueryTaskScope(authority) !== owner.taskScopeSha256 ||
-            !same(yield* executing.value.readCurrentInTransaction(principal), owner.operation)
-          )
-            return yield* deny("Original query owner, scope or grants changed");
-          if (owner.request.sharedSource !== undefined) {
+            return yield* deny("Original query stages are retained without resend");
+          const executing = yield* Effect.serviceOption(ProjectMemoryOperation);
+          if (Option.isNone(executing)) return yield* deny("Query waits for its executing bridge");
+          const configured = Effect.gen(function* () {
+            const configuration = yield* options.readConfiguration;
             if (
-              authority.role.memoryAccess !== "shared" ||
-              owner.sharedSource === undefined ||
-              !same(
-                owner.sharedSource,
-                yield* qualifyProjectMemorySharedSource(
-                  sql,
-                  owner.request.projectId,
-                  owner.request.sharedSource,
-                ),
-              )
+              configuration === undefined ||
+              projectMemoryHash(configuration) !== owner.configurationSha256
             )
-              return yield* deny("Original shared source grant changed");
-          } else if (owner.sharedSource !== undefined)
-            return yield* deny("Local query cannot have a shared source");
-          yield* guard.assertSafe(owner.request.query);
-        }).pipe(
-          Effect.provideService(SqlClient.SqlClient, sql),
-          Effect.provideService(ProjectWorkRepository, repository),
-          Effect.mapError((error) => (isServiceError(error) ? error : deny("Query fence denied"))),
-        );
-        const check = () => sql.withTransaction(fence);
-        const configuration = yield* configured;
-        const intent = {
-          version: 1,
-          queryId,
-          ownerSha256: projectMemoryHash(owner),
-          querySha256: projectMemoryHash(owner.request.query),
-          configuration,
-          requestId: 1,
-          maximumInputTokens: Math.min(
-            configuration.embedding.maximumInputTokens,
-            owner.operation.operationMaximumTokens - 1,
-          ),
-          maximumOutputTokens: 1,
-          deadlineAtMs: Math.min(
-            owner.operation.rootDeadlineAtMs,
-            owner.operation.attemptDeadlineAtMs,
-            owner.operation.operationDeadlineAtMs,
-            owner.operation.leaseDeadlineAtMs,
-          ),
-        };
-        yield* sql.withTransaction(
-          Effect.gen(function* () {
-            yield* fence;
-            const changed = yield* sql<{
-              id: string;
-            }>`UPDATE project_team_memory_query SET status='embedding',embedding_json=${canonicalProjectWorkPayload(intent)}
+              return yield* deny("Original query configuration changed");
+            yield* options.assertAdmission;
+            return configuration;
+          });
+          const fence = Effect.gen(function* () {
+            yield* configured;
+            yield* auditProjectMemoryQueryAdmission(sql, owner);
+            const authority = yield* authorization.resolve(principal);
+            if (
+              authority === undefined ||
+              authority.role.memoryAccess === "none" ||
+              principal.actor.kind !== "agent" ||
+              principal.actor.id !== owner.actorId ||
+              principal.managed?.bindingId !== owner.operation.bindingId ||
+              principal.managed.generation !== owner.operation.generation ||
+              principal.managed.providerInstanceId !== owner.operation.providerInstanceId ||
+              principal.managed.threadId !== owner.operation.threadId ||
+              projectMemoryQueryTaskScope(authority) !== owner.taskScopeSha256 ||
+              !same(yield* executing.value.readCurrentInTransaction(principal), owner.operation)
+            )
+              return yield* deny("Original query owner, scope or grants changed");
+            if (owner.request.sharedSource !== undefined) {
+              if (
+                authority.role.memoryAccess !== "shared" ||
+                owner.sharedSource === undefined ||
+                !same(
+                  owner.sharedSource,
+                  yield* qualifyProjectMemorySharedSource(
+                    sql,
+                    owner.request.projectId,
+                    owner.request.sharedSource,
+                  ),
+                )
+              )
+                return yield* deny("Original shared source grant changed");
+            } else if (owner.sharedSource !== undefined)
+              return yield* deny("Local query cannot have a shared source");
+            yield* guard.assertSafe(owner.request.query);
+          }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository),
+            Effect.mapError((error) =>
+              isServiceError(error) ? error : deny("Query fence denied"),
+            ),
+          );
+          const check = () => sql.withTransaction(fence);
+          const configuration = yield* configured;
+          const intent = {
+            version: 1,
+            queryId,
+            ownerSha256: projectMemoryHash(owner),
+            querySha256: projectMemoryHash(owner.request.query),
+            configuration,
+            requestId: 1,
+            maximumInputTokens: Math.min(
+              configuration.embedding.maximumInputTokens,
+              owner.operation.operationMaximumTokens - 1,
+            ),
+            maximumOutputTokens: 1,
+            deadlineAtMs: Math.min(
+              owner.operation.rootDeadlineAtMs,
+              owner.operation.attemptDeadlineAtMs,
+              owner.operation.operationDeadlineAtMs,
+              owner.operation.leaseDeadlineAtMs,
+            ),
+          };
+          yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* fence;
+                const changed = yield* sql<{
+                  id: string;
+                }>`UPDATE project_team_memory_query SET status='embedding',embedding_json=${canonicalProjectWorkPayload(intent)}
         WHERE query_id=${queryId} AND status='pending' AND embedding_json IS NULL RETURNING query_id AS id`;
-            if (changed.length !== 1) return yield* deny("Query embedding is already claimed");
-            yield* fence;
-          }),
-        );
-        const accounting = yield* makeProjectMemoryModelAccounting({
-          environmentId: options.environmentId,
-          maximumConcurrentCalls: options.maximumConcurrentCalls,
-          maximumConcurrentModelCalls: options.maximumConcurrentModelCalls,
-          assertCurrentInTransaction: () =>
-            Effect.fail(deny("Query cannot authorize a source stage")),
-          assertQueryCurrentInTransaction: (saved) =>
-            same(saved, owner) ? fence : Effect.fail(deny("Query model owner changed")),
-          assertTransportDrainedInTransaction: (id) => options.confirmModelTransportDrained(id),
-        }).pipe(
-          Effect.provideService(SqlClient.SqlClient, sql),
-          Effect.provideService(ProjectWorkRepository, repository),
-          Effect.provideService(Crypto.Crypto, crypto),
-        );
-        const credential = yield* options.readCredential(configuration.embedding.credentialRef);
-        yield* guard.registerKnownSecrets([credential]);
-        yield* check();
-        const held = yield* accounting.reserve(owner, {
-          phase: "query-embed",
-          requestId: 1,
-          routeId: configuration.embedding.routeId,
-          maxInputTokens: intent.maximumInputTokens,
-          maxOutputTokens: intent.maximumOutputTokens,
-          deadlineAtMs: intent.deadlineAtMs,
-        });
-        if (held.status !== "reserved")
-          return yield* deny("Retained query reservation cannot be resent");
-        yield* executing.value.assertForward;
-        yield* check();
-        const response = yield* options
-          .exchange(
-            {
-              phase: "embed",
-              endpoint: configuration.embedding.endpoint,
-              credential,
-              model: held.reservation.model,
-              maximumInputTokens: intent.maximumInputTokens,
-              maximumOutputTokens: intent.maximumOutputTokens,
-              deadlineAtMs: intent.deadlineAtMs,
-              input: [owner.request.query],
-            },
-            held.reservationId,
-            check().pipe(
-              Effect.mapError((error) =>
-                isServiceError(error) ? error : deny("Final query model fence denied"),
+                if (changed.length !== 1) return yield* deny("Query embedding is already claimed");
+                yield* fence;
+              }),
+            )
+            .pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  claimed = true;
+                }),
+              ),
+              Effect.uninterruptible,
+            );
+          const accounting = yield* makeProjectMemoryModelAccounting({
+            environmentId: options.environmentId,
+            maximumConcurrentCalls: options.maximumConcurrentCalls,
+            maximumConcurrentModelCalls: options.maximumConcurrentModelCalls,
+            assertCurrentInTransaction: () =>
+              Effect.fail(deny("Query cannot authorize a source stage")),
+            assertQueryCurrentInTransaction: (saved) =>
+              same(saved, owner) ? fence : Effect.fail(deny("Query model owner changed")),
+            assertTransportDrainedInTransaction: (id) => options.confirmModelTransportDrained(id),
+          }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+            Effect.provideService(ProjectWorkRepository, repository),
+            Effect.provideService(Crypto.Crypto, crypto),
+          );
+          const credential = yield* options.readCredential(configuration.embedding.credentialRef);
+          yield* guard.registerKnownSecrets([credential]);
+          yield* check();
+          const held = yield* accounting.reserve(owner, {
+            phase: "query-embed",
+            requestId: 1,
+            routeId: configuration.embedding.routeId,
+            maxInputTokens: intent.maximumInputTokens,
+            maxOutputTokens: intent.maximumOutputTokens,
+            deadlineAtMs: intent.deadlineAtMs,
+          });
+          if (held.status !== "reserved")
+            return yield* deny("Retained query reservation cannot be resent");
+          yield* executing.value.assertForward;
+          yield* check();
+          const response = yield* options
+            .exchange(
+              {
+                phase: "embed",
+                endpoint: configuration.embedding.endpoint,
+                credential,
+                model: held.reservation.model,
+                maximumInputTokens: intent.maximumInputTokens,
+                maximumOutputTokens: intent.maximumOutputTokens,
+                deadlineAtMs: intent.deadlineAtMs,
+                input: [owner.request.query],
+              },
+              held.reservationId,
+              check().pipe(
+                Effect.mapError((error) =>
+                  isServiceError(error) ? error : deny("Final query model fence denied"),
+                ),
+              ),
+            )
+            .pipe(Effect.result);
+          const drained =
+            (yield* options.confirmModelTransportDrained(held.reservationId).pipe(Effect.result))
+              ._tag === "Success";
+          const decoded =
+            response._tag === "Success"
+              ? yield* decodeVectors(response.success.value).pipe(Effect.result)
+              : undefined;
+          const reported = response._tag === "Success" && decoded?._tag === "Success";
+          const settlement = yield* accounting.settle({
+            ...held.reservation,
+            reservationId: held.reservationId,
+            outcome: reported ? "reported" : "unknown",
+            transportDrained: drained,
+            chargedInputTokens: reported
+              ? response.success.inputTokens
+              : held.reservation.maxInputTokens,
+            chargedOutputTokens: reported
+              ? response.success.outputTokens
+              : held.reservation.maxOutputTokens,
+            ...(reported
+              ? {
+                  reportedModel: response.success.reportedModel,
+                  reportedInputTokens: response.success.inputTokens,
+                  reportedOutputTokens: response.success.outputTokens,
+                }
+              : {}),
+          });
+          const vector = reported ? decoded.success[0] : undefined;
+          const embedded = {
+            version: 1,
+            queryId,
+            reservationId: held.reservationId,
+            reservationSha256: projectMemoryHash(held.reservation),
+            accountingReceiptId: settlement.accountingReceiptId,
+            outcome: reported ? "reported" : "unknown",
+            ...(vector === undefined ? {} : { vector }),
+          };
+          yield* sql`UPDATE project_team_memory_query SET embedding_result_json=${canonicalProjectWorkPayload(embedded)},status=${reported && drained ? "searching" : "embedding"}
+      WHERE query_id=${queryId} AND embedding_result_json IS NULL AND status='embedding'`;
+          if (!reported || !drained || vector === undefined)
+            return yield* deny("Query embedding is uncertain; no resend");
+          yield* check();
+          if ((yield* Clock.currentTimeMillis) >= intent.deadlineAtMs)
+            return yield* deny("Original query deadline expired");
+          const companion = options.companion;
+          const confirmSearchDrain = options.confirmSearchTransportDrained;
+          if (companion === undefined || confirmSearchDrain === undefined)
+            return yield* deny("Query search waits for captured resource and drain authority");
+          const search = {
+            version: 1,
+            queryId,
+            requestId: queryId + ":search",
+            ownerSha256: projectMemoryHash(owner),
+            configurationSha256: owner.configurationSha256,
+            vectorSha256: projectMemoryHash(vector),
+            deadlineAtMs: intent.deadlineAtMs,
+            limit: 12,
+          };
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              yield* fence;
+              const changed = yield* sql<{
+                id: string;
+              }>`UPDATE project_team_memory_query SET search_json=${canonicalProjectWorkPayload(search)}
+        WHERE query_id=${queryId} AND status='searching' AND search_json IS NULL RETURNING query_id AS id`;
+              if (changed.length !== 1) return yield* deny("Query search already claimed");
+              yield* fence;
+            }),
+          );
+          const backend = makeMem0Backend((bytes) =>
+            executing.value.assertForward.pipe(
+              Effect.andThen(check()),
+              Effect.flatMap(() => companion(owner, configuration, bytes, fence)),
+              Effect.mapError(
+                () =>
+                  new MemoryBackendError({
+                    code: "fenced",
+                    message: "Query companion fence denied",
+                  }),
               ),
             ),
-          )
-          .pipe(Effect.result);
-        const drained =
-          (yield* options.confirmModelTransportDrained(held.reservationId).pipe(Effect.result))
-            ._tag === "Success";
-        const decoded =
-          response._tag === "Success"
-            ? yield* decodeVectors(response.success.value).pipe(Effect.result)
-            : undefined;
-        const reported = response._tag === "Success" && decoded?._tag === "Success";
-        const settlement = yield* accounting.settle({
-          ...held.reservation,
-          reservationId: held.reservationId,
-          outcome: reported ? "reported" : "unknown",
-          transportDrained: drained,
-          chargedInputTokens: reported
-            ? response.success.inputTokens
-            : held.reservation.maxInputTokens,
-          chargedOutputTokens: reported
-            ? response.success.outputTokens
-            : held.reservation.maxOutputTokens,
-          ...(reported
-            ? {
-                reportedModel: response.success.reportedModel,
-                reportedInputTokens: response.success.inputTokens,
-                reportedOutputTokens: response.success.outputTokens,
-              }
-            : {}),
-        });
-        const vector = reported ? decoded.success[0] : undefined;
-        const embedded = {
-          version: 1,
-          queryId,
-          reservationId: held.reservationId,
-          reservationSha256: projectMemoryHash(held.reservation),
-          accountingReceiptId: settlement.accountingReceiptId,
-          outcome: reported ? "reported" : "unknown",
-          ...(vector === undefined ? {} : { vector }),
-        };
-        yield* sql`UPDATE project_team_memory_query SET embedding_result_json=${canonicalProjectWorkPayload(embedded)},status=${reported && drained ? "searching" : "uncertain"}
-      WHERE query_id=${queryId} AND embedding_result_json IS NULL AND status='embedding'`;
-        if (!reported || !drained || vector === undefined)
-          return yield* deny("Query embedding is uncertain; no resend");
-        yield* check();
-        if ((yield* Clock.currentTimeMillis) >= intent.deadlineAtMs)
-          return yield* deny("Original query deadline expired");
-        const companion = options.companion;
-        const confirmSearchDrain = options.confirmSearchTransportDrained;
-        if (companion === undefined || confirmSearchDrain === undefined)
-          return yield* deny("Query search waits for captured resource and drain authority");
-        const search = {
-          version: 1,
-          queryId,
-          requestId: queryId + ":search",
-          ownerSha256: projectMemoryHash(owner),
-          configurationSha256: owner.configurationSha256,
-          vectorSha256: projectMemoryHash(vector),
-          deadlineAtMs: intent.deadlineAtMs,
-          limit: 12,
-        };
-        yield* sql.withTransaction(
-          Effect.gen(function* () {
-            yield* fence;
-            const changed = yield* sql<{
-              id: string;
-            }>`UPDATE project_team_memory_query SET search_json=${canonicalProjectWorkPayload(search)}
-        WHERE query_id=${queryId} AND status='searching' AND search_json IS NULL RETURNING query_id AS id`;
-            if (changed.length !== 1) return yield* deny("Query search already claimed");
-            yield* fence;
-          }),
-        );
-        const backend = makeMem0Backend((bytes) =>
-          executing.value.assertForward.pipe(
-            Effect.andThen(check()),
-            Effect.flatMap(() => companion(owner, configuration, bytes, fence)),
-            Effect.mapError(
-              () =>
-                new MemoryBackendError({ code: "fenced", message: "Query companion fence denied" }),
-            ),
-          ),
-        );
-        const found = yield* backend
-          .search(search.requestId, {
-            environmentId: owner.operation.environmentId,
-            projectId: owner.sharedSource?.ownerProjectId ?? owner.operation.projectId,
-            ...(owner.sharedSource === undefined
-              ? {}
-              : {
-                  source: {
-                    sourceRecordId: owner.sharedSource.selection.sourceRecordId,
-                    sourceRevision: owner.sharedSource.selection.sourceRevision,
-                    sourceGeneration: owner.sharedSource.selection.sourceGeneration,
-                  },
-                }),
-            vector,
-            limit: 12,
-          })
-          .pipe(Effect.result);
-        const searchDrained =
-          (yield* confirmSearchDrain(search.requestId).pipe(Effect.result))._tag === "Success";
-        const searched = {
-          version: 1,
-          queryId,
-          requestId: search.requestId,
-          intentSha256: projectMemoryHash(search),
-          outcome: found._tag === "Success" ? "completed" : "unknown",
-          transportDrained: searchDrained,
-          candidates: found._tag === "Success" ? found.success.candidates : [],
-        };
-        yield* sql`UPDATE project_team_memory_query SET search_result_json=${canonicalProjectWorkPayload(searched)},status='uncertain'
+          );
+          const found = yield* backend
+            .search(search.requestId, {
+              environmentId: owner.operation.environmentId,
+              projectId: owner.sharedSource?.ownerProjectId ?? owner.operation.projectId,
+              ...(owner.sharedSource === undefined
+                ? {}
+                : {
+                    source: {
+                      sourceRecordId: owner.sharedSource.selection.sourceRecordId,
+                      sourceRevision: owner.sharedSource.selection.sourceRevision,
+                      sourceGeneration: owner.sharedSource.selection.sourceGeneration,
+                    },
+                  }),
+              vector,
+              limit: 12,
+            })
+            .pipe(Effect.result);
+          const searchDrained =
+            (yield* confirmSearchDrain(search.requestId).pipe(Effect.result))._tag === "Success";
+          const searched = {
+            version: 1,
+            queryId,
+            requestId: search.requestId,
+            intentSha256: projectMemoryHash(search),
+            outcome: found._tag === "Success" ? "completed" : "unknown",
+            transportDrained: searchDrained,
+            candidates: found._tag === "Success" ? found.success.candidates : [],
+          };
+          yield* sql`UPDATE project_team_memory_query SET search_result_json=${canonicalProjectWorkPayload(searched)}
       WHERE query_id=${queryId} AND search_result_json IS NULL`;
-        if (found._tag !== "Success" || !searchDrained)
-          return yield* deny("Query search is uncertain; no resend");
-        const hits = found.success.candidates.filter(
-          (hit) =>
-            hit.environmentId === owner.operation.environmentId &&
-            hit.projectId === (owner.sharedSource?.ownerProjectId ?? owner.operation.projectId),
-        );
-        const hitIds = [...new Set(hits.map((hit) => hit.observationId))];
-        yield* publishFinal(
-          owner,
-          Effect.gen(function* () {
-            yield* fence;
-            const hydrated = yield* readProjectMemoryObservations(
-              sql,
-              owner.request.projectId,
-              owner.request.query,
-              hitIds,
-              owner.sharedSource,
-            );
-            if (hydrated.status !== "available")
-              return yield* deny("Current query hit authority unavailable");
-            if (
-              hydrated.records.some(
-                (record) =>
-                  !hits.some(
-                    (hit) =>
-                      hit.observationId === record.recordId &&
-                      hit.sourceRecordId === record.sourceId &&
-                      hit.sourceRevision === record.sourceRevision &&
-                      hit.sourceGeneration === record.sourceGeneration &&
-                      hit.extractionId === record.extractionId,
-                  ),
+          if (found._tag !== "Success" || !searchDrained)
+            return yield* deny("Query search is uncertain; no resend");
+          const hits = found.success.candidates.filter(
+            (hit) =>
+              hit.environmentId === owner.operation.environmentId &&
+              hit.projectId === (owner.sharedSource?.ownerProjectId ?? owner.operation.projectId),
+          );
+          const hitIds = [...new Set(hits.map((hit) => hit.observationId))];
+          yield* publishFinal(
+            owner,
+            Effect.gen(function* () {
+              yield* fence;
+              const hydrated = yield* readProjectMemoryObservations(
+                sql,
+                owner.request.projectId,
+                owner.request.query,
+                hitIds,
+                owner.sharedSource,
+              );
+              if (hydrated.status !== "available")
+                return yield* deny("Current query hit authority unavailable");
+              if (
+                hydrated.records.some(
+                  (record) =>
+                    !hits.some(
+                      (hit) =>
+                        hit.observationId === record.recordId &&
+                        hit.sourceRecordId === record.sourceId &&
+                        hit.sourceRevision === record.sourceRevision &&
+                        hit.sourceGeneration === record.sourceGeneration &&
+                        hit.extractionId === record.extractionId,
+                    ),
+                )
               )
-            )
-              return yield* deny("Backend selectors disagree with current source tuples");
-            yield* guard.assertSafe(hydrated.records);
-            return {
-              kind: "memory-query-result" as const,
-              version: 1 as const,
-              queryId,
-              outcome: "completed" as const,
-              embeddingSha256: projectMemoryHash(embedded),
-              searchSha256: projectMemoryHash(searched),
-              snapshotSha256: hydrated.provenance.snapshotSha256,
-              // Cache hydration must audit the same candidates and rejections.
-              hitIds,
-            };
-          }).pipe(
-            Effect.mapError((error) =>
-              isServiceError(error) ? error : deny("Current query hydration is unavailable"),
+                return yield* deny("Backend selectors disagree with current source tuples");
+              yield* guard.assertSafe(hydrated.records);
+              return {
+                kind: "memory-query-result" as const,
+                version: 1 as const,
+                queryId,
+                outcome: "completed" as const,
+                embeddingSha256: projectMemoryHash(embedded),
+                searchSha256: projectMemoryHash(searched),
+                snapshotSha256: hydrated.provenance.snapshotSha256,
+                // Cache hydration must audit the same candidates and rejections.
+                hitIds,
+              };
+            }).pipe(
+              Effect.mapError((error) =>
+                isServiceError(error) ? error : deny("Current query hydration is unavailable"),
+              ),
             ),
+            fence,
+          );
+        });
+        return yield* work.pipe(
+          Effect.onExit((exit) =>
+            claimed && Exit.isFailure(exit)
+              ? sql
+                  .withTransaction(sql`UPDATE project_team_memory_query SET status='uncertain'
+                WHERE query_id=${queryId} AND status IN ('embedding','searching') AND result_json IS NULL`)
+                  .pipe(Effect.mapError(() => deny("Query owner relinquishment failed")))
+              : Effect.void,
           ),
-          fence,
         );
       },
       Effect.mapError((error) =>
@@ -1529,7 +1557,13 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
         WHERE environment_id=${owner.operation.environmentId} AND project_id=${owner.operation.projectId}
         AND operation_id=${owner.operation.operationId} AND request_lane='memory'
         AND json_extract(reservation_json,'$.effectId')=${queryId} LIMIT 1`;
-                  if (reservations.length === 0 && stages.search === null && stages.result === null)
+                  if (
+                    reservations.length === 0 &&
+                    stages.status === "pending" &&
+                    stages.embedding === null &&
+                    stages.search === null &&
+                    stages.result === null
+                  )
                     return owner;
                   return undefined;
                 }),
@@ -1558,7 +1592,12 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
                       WHERE environment_id=${owner.operation.environmentId} AND project_id=${owner.operation.projectId}
                       AND operation_id=${owner.operation.operationId} AND request_lane='memory'
                       AND json_extract(reservation_json,'$.effectId')=${queryId} LIMIT 1`;
-                          if (reservations.length !== 0 || stages.search !== null)
+                          if (
+                            reservations.length !== 0 ||
+                            stages.status !== "pending" ||
+                            stages.embedding !== null ||
+                            stages.search !== null
+                          )
                             return yield* deny("Query failure cannot settle a forwarded stage");
                         }).pipe(
                           Effect.mapError((failure) =>
@@ -1690,6 +1729,8 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
         const original = yield* readStages(sql, queryId);
         let ledger = yield* auditProjectMemoryOperationLedger(sql, owner.operation);
         if (original.result !== null) return;
+        if (original.status !== "uncertain")
+          return yield* deny("Query owner has not relinquished unfinished work");
         const models = [];
         for (const row of ledger.rows) {
           const reservation = yield* decodeReservationJson(row.reservation_json);
@@ -1835,7 +1876,20 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
     return {
       consumeQuery: (principal: ProjectTeamPrincipal, queryId: string) =>
         consumeQuery(principal, queryId).pipe(
-          Effect.onExit(() => options.observeCompanionCleanup?.(queryId) ?? Effect.void),
+          Effect.onExit(() =>
+            sql<{
+              status: string;
+            }>`SELECT status FROM project_team_memory_query WHERE query_id=${queryId}`.pipe(
+              Effect.flatMap((rows) =>
+                rows[0]?.status === "uncertain" ||
+                rows[0]?.status === "completed" ||
+                rows[0]?.status === "failed"
+                  ? (options.observeCompanionCleanup?.(queryId) ?? Effect.void)
+                  : Effect.void,
+              ),
+              Effect.ignore,
+            ),
+          ),
         ),
       readQueryCache,
       reconcileQuery,

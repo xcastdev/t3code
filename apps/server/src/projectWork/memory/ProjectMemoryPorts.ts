@@ -19,6 +19,7 @@ import type { ProjectTeamPrincipal } from "../ProjectTeamAuthorization.ts";
 import { canonicalProjectWorkPayload } from "@t3tools/contracts";
 import { ProjectMemoryExtractedFacts, ProjectMemoryServiceError } from "./ProjectMemoryService.ts";
 import type { ProjectMemoryRetrieval } from "./ProjectMemoryRetrieval.ts";
+import type { ProjectMemoryOperationIdentity } from "./ProjectMemoryModelAccounting.ts";
 
 /** Readiness checks never activate a companion or make a model request. */
 export class ProjectMemoryPorts extends Context.Service<
@@ -46,6 +47,9 @@ export class ProjectMemoryPorts extends Context.Service<
     >;
     readonly reconcileTransportDrain?: (
       reservationOrEffectId: string,
+    ) => Effect.Effect<void, ProjectMemoryServiceError>;
+    readonly recoverJoinedOperation?: (
+      identity: ProjectMemoryOperationIdentity,
     ) => Effect.Effect<void, ProjectMemoryServiceError>;
   }
 >()("t3/projectWork/memory/ProjectMemoryPorts") {}

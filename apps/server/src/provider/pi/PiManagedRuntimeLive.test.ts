@@ -196,6 +196,7 @@ import {
 import {
   ProjectMemoryJobOwner,
   ProjectMemoryOperation,
+  ProjectMemoryOperationIdentity,
   makeProjectMemoryModelAccounting,
   auditProjectMemoryOperationLedger,
   ProjectMemorySettlement,
@@ -6618,6 +6619,8 @@ for (const mode of ["fresh", "fresh-prompt", "inherited", "wrong-briefing"] as c
 }
 
 const decodeRequiredFoundation = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const decodeMemoryRecoveryIdentity = Schema.decodeUnknownEffect(ProjectMemoryOperationIdentity);
+const isMemoryRecoveryError = Schema.is(ProjectMemoryServiceError);
 const decodeRequiredJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeQueryRecoverySettlement = Schema.decodeUnknownSync(
   Schema.fromJsonString(ProjectMemorySettlement),
@@ -10032,6 +10035,7 @@ it.effect(
 
 for (const compactProof of [
   undefined,
+  "joinedNoMemory",
   "beforeAcquire",
   "beforeStart",
   "afterAwait",
@@ -10070,6 +10074,7 @@ for (const compactProof of [
   "memoryCompanionExpired",
   "memoryCompanionDelete",
   "memoryFailure",
+  "memorySourceJoinedRecovery",
   "memorySecret",
   "memoryEmbeddingSecret",
   "memoryCleanup",
@@ -10077,6 +10082,9 @@ for (const compactProof of [
   "memoryHumanRetraction",
   "memoryQuery",
   "memoryQueryPipeline",
+  "memoryQueryActiveDrain",
+  "memoryQueryJoinedRecovery",
+  "memoryQueryInterruptedRecovery",
   "memoryQueryShared",
   "memoryCompanionSharedQuery",
   "memoryQuerySharedProject",
@@ -10179,6 +10187,8 @@ for (const compactProof of [
             (forwardProof && !forwardQuery) ||
             compactProof === "memoryCompanionIndex" ||
             compactProof === "memoryCompanionSharedRoot";
+          const sourceFailure =
+            compactProof === "memoryFailure" || compactProof === "memorySourceJoinedRecovery";
           const memoryProof = compactProof?.startsWith("memory") === true;
           const accountingProof =
             compactProof === "memoryAccounting" ||
@@ -10209,6 +10219,10 @@ for (const compactProof of [
                 principal: Authorization.ProjectTeamPrincipal,
               ) => Effect.Effect<ProjectMemoryRetrieval | undefined, ProjectMemoryServiceError>)
             | undefined;
+          const joinedRecovery =
+            compactProof === "memoryQueryJoinedRecovery" ||
+            compactProof === "memoryQueryInterruptedRecovery";
+          const queryInterrupted = yield* Deferred.make<void>();
           const captureFailure = compactProof === "memoryCompanionCapture";
           const expiryFailure = compactProof === "memoryCompanionExpired";
           const startFailure = captureFailure || expiryFailure;
@@ -10216,7 +10230,8 @@ for (const compactProof of [
             compactProof === "memoryQuerySearchUnknown" ||
             compactProof === "memoryCompanionRecovery" ||
             startFailure;
-          const queryRecovery = compactProof === "memoryQueryModelUnknown" || searchUnknown;
+          const queryRecovery =
+            compactProof === "memoryQueryModelUnknown" || joinedRecovery || searchUnknown;
           const queryBudget = compactProof === "memoryQueryBudget";
           const querySecret = compactProof === "memoryQuerySecret";
           const sharedBeforeSearchDenied = compactProof === "memoryQuerySharedRevokeBeforeSearch";
@@ -10250,6 +10265,7 @@ for (const compactProof of [
               !sharedDenied &&
               !sharedDeliveryDenied) ||
             compactProof === "memoryQueryPipeline" ||
+            compactProof === "memoryQueryActiveDrain" ||
             compactProof === "memoryCompanionQuery" ||
             queryMixed;
           const queryForward =
@@ -10290,6 +10306,9 @@ for (const compactProof of [
           let reconcileMemory:
             | ((id: string) => Effect.Effect<void, ProjectMemoryServiceError>)
             | undefined;
+          let recoverMemory: MemoryModelPorts.ProjectMemoryPorts["Service"]["recoverJoinedOperation"];
+          const recoveryWakes: string[] = [];
+          let joinedTerminal: SessionRuntime.PiSessionTerminal | undefined;
           const returnEntered = yield* Deferred.make<void>();
           const returnProof = compactProof?.startsWith("return") === true;
           const selectedSkill = compactProof?.startsWith("returnSource")
@@ -11206,6 +11225,7 @@ for (const compactProof of [
                               : queryForward &&
                                   !sharedBeforeSearchDenied &&
                                   compactProof !== "memoryQueryModelUnknown" &&
+                                  !joinedRecovery &&
                                   !startFailure
                                 ? 4
                                 : queryRecovery || sharedBeforeSearchDenied
@@ -11219,7 +11239,7 @@ for (const compactProof of [
                             generation: f.binding.generation,
                             operationId: input.operation.operationId,
                           });
-                          expect(ledger.settled).toBe(queryCache || queryNoForward);
+                          expect(ledger.settled).toBe(queryCache);
                           if (queryAdmissionOnly) memoryReady = false;
                         });
                         if (queryAdmissionOnly) yield* issueQuery();
@@ -11672,7 +11692,7 @@ for (const compactProof of [
                           if (
                             pipelineProof ||
                             liquidDenied ||
-                            compactProof === "memoryFailure" ||
+                            sourceFailure ||
                             compactProof === "memorySecret" ||
                             compactProof === "memoryEmbeddingSecret" ||
                             queryForward ||
@@ -11726,6 +11746,10 @@ for (const compactProof of [
                                       ? lateSecret
                                       : "controlled-memory-credential",
                                 ),
+                              observeCompanionCleanup: (id) =>
+                                Effect.sync(() => {
+                                  recoveryWakes.push(id);
+                                }),
                               confirmModelTransportDrained: (id) =>
                                 drained.has(id)
                                   ? Effect.void
@@ -11758,7 +11782,14 @@ for (const compactProof of [
                                       },
                                     ]);
                                     memoryExchanges++;
-                                    if (compactProof === "memoryQueryModelUnknown")
+                                    if (compactProof === "memoryQueryInterruptedRecovery") {
+                                      yield* Deferred.succeed(queryInterrupted, undefined);
+                                      return yield* Effect.never;
+                                    }
+                                    if (
+                                      compactProof === "memoryQueryModelUnknown" ||
+                                      joinedRecovery
+                                    )
                                       return yield* new ProjectMemoryServiceError({
                                         reason: "Controlled query exchange is unknown",
                                       });
@@ -11795,6 +11826,87 @@ for (const compactProof of [
                                         );
                                     }
                                     drained.add(id);
+                                    if (compactProof === "memoryQueryActiveDrain") {
+                                      const entered = yield* Deferred.make<void>();
+                                      const release = yield* Deferred.make<void>();
+                                      const released = Promise.withResolvers<void>();
+                                      yield* Deferred.await(release).pipe(
+                                        Effect.andThen(Effect.sync(() => released.resolve())),
+                                        Effect.forkChild,
+                                      );
+                                      const responseBuffer = Response.prototype.arrayBuffer;
+                                      const decoder = vi
+                                        .spyOn(Response.prototype, "arrayBuffer")
+                                        .mockImplementation(async function (this: Response) {
+                                          const buffer = await responseBuffer.call(this);
+                                          Deferred.doneUnsafe(entered, Effect.void);
+                                          await released.promise;
+                                          return buffer;
+                                        });
+                                      const pending =
+                                        yield* MemoryModelPorts.exchangeProjectMemoryModel(
+                                          exchange,
+                                          () => drained.add(id),
+                                        ).pipe(
+                                          Effect.provideService(
+                                            FetchHttpClient.Fetch,
+                                            async () =>
+                                              new Response(
+                                                json({
+                                                  model: exchange.model,
+                                                  data: [
+                                                    {
+                                                      index: 0,
+                                                      embedding: Array.from(
+                                                        { length: 2048 },
+                                                        () => 0.375,
+                                                      ),
+                                                    },
+                                                  ],
+                                                  usage: { prompt_tokens: 25, total_tokens: 25 },
+                                                }),
+                                              ),
+                                          ),
+                                          Effect.forkChild,
+                                        );
+                                      yield* Effect.gen(function* () {
+                                        yield* Deferred.await(entered);
+                                        const before =
+                                          yield* f.sql`SELECT * FROM project_team_model_request WHERE reservation_id=${id}`;
+                                        const queries = yield* f.sql<{
+                                          id: string;
+                                        }>`SELECT query_id AS id FROM project_team_memory_query WHERE status='embedding'`;
+                                        if (!queries[0] || !reconcileMemory || !consumeQuery)
+                                          return yield* Effect.die("Active query probe missing");
+                                        for (const wake of [id, queries[0].id, id])
+                                          expect(
+                                            (yield* reconcileMemory(wake).pipe(Effect.result))._tag,
+                                          ).toBe("Failure");
+                                        expect(
+                                          (yield* consumer.consumeQuery!(
+                                            principal,
+                                            queries[0].id,
+                                          ).pipe(Effect.result))._tag,
+                                        ).toBe("Failure");
+                                        expect(
+                                          yield* f.sql`SELECT * FROM project_team_model_request WHERE reservation_id=${id}`,
+                                        ).toEqual(before);
+                                        expect(
+                                          yield* f.sql`SELECT status,result_json,embedding_result_json FROM project_team_memory_query`,
+                                        ).toEqual([
+                                          {
+                                            status: "embedding",
+                                            result_json: null,
+                                            embedding_result_json: null,
+                                          },
+                                        ]);
+                                      }).pipe(
+                                        Effect.ensuring(Deferred.succeed(release, undefined)),
+                                      );
+                                      return yield* Fiber.join(pending).pipe(
+                                        Effect.ensuring(Effect.sync(() => decoder.mockRestore())),
+                                      );
+                                    }
                                     return {
                                       reportedModel: exchange.model,
                                       inputTokens: 25,
@@ -11830,12 +11942,30 @@ for (const compactProof of [
                                       : "controlled-memory-credential",
                                   );
                                   memoryExchanges += 1;
-                                  if (compactProof === "memoryFailure")
+                                  if (sourceFailure)
                                     return yield* new ProjectMemoryServiceError({
                                       reason:
                                         "Controlled exchange outcome is unknown; cancellation has not drained",
                                     });
                                   drained.add(id);
+                                  if (compactProof === "memoryQueryActiveDrain") {
+                                    const before =
+                                      yield* f.sql`SELECT * FROM project_team_model_request WHERE reservation_id=${id}`;
+                                    const wakes = recoveryWakes.length;
+                                    if (!reconcileMemory || !consumer.consume)
+                                      return yield* Effect.die("Source active probe missing");
+                                    for (let wake = 0; wake < 2; wake++)
+                                      expect(
+                                        (yield* reconcileMemory(selection.effectId).pipe(
+                                          Effect.result,
+                                        ))._tag,
+                                      ).toBe("Failure");
+                                    yield* consumer.consume(principal, selection.effectId);
+                                    expect(recoveryWakes.length).toBe(wakes);
+                                    expect(
+                                      yield* f.sql`SELECT * FROM project_team_model_request WHERE reservation_id=${id}`,
+                                    ).toEqual(before);
+                                  }
                                   if (liquidProof) {
                                     expect(exchange.model).toBe(
                                       exchange.phase === "extract"
@@ -12119,13 +12249,43 @@ for (const compactProof of [
                                   ),
                                 ),
                               confirmQueryTransportDrained: (id) =>
-                                queryDrains.has(id)
-                                  ? Effect.void
-                                  : Effect.fail(
-                                      new ProjectMemoryServiceError({
-                                        reason: "Controlled query drain absent",
-                                      }),
-                                    ),
+                                Effect.gen(function* () {
+                                  if (compactProof === "memoryQueryActiveDrain") {
+                                    const queries = yield* f.sql<{
+                                      id: string;
+                                    }>`SELECT query_id AS id FROM project_team_memory_query WHERE status='searching'`;
+                                    if (!queries[0] || !reconcileMemory || !consumeQuery)
+                                      return yield* Effect.die("Searching query probe missing");
+                                    for (let wake = 0; wake < 2; wake++)
+                                      expect(
+                                        (yield* reconcileMemory(queries[0].id).pipe(Effect.result))
+                                          ._tag,
+                                      ).toBe("Failure");
+                                    expect(
+                                      (yield* consumer.consumeQuery!(principal, queries[0].id).pipe(
+                                        Effect.result,
+                                      ))._tag,
+                                    ).toBe("Failure");
+                                    expect(
+                                      yield* f.sql`SELECT status,result_json FROM project_team_memory_query`,
+                                    ).toEqual([{ status: "searching", result_json: null }]);
+                                  }
+                                  return yield* queryDrains.has(id)
+                                    ? Effect.void
+                                    : Effect.fail(
+                                        new ProjectMemoryServiceError({
+                                          reason: "Controlled query drain absent",
+                                        }),
+                                      );
+                                }).pipe(
+                                  Effect.mapError((error) =>
+                                    isMemoryRecoveryError(error)
+                                      ? error
+                                      : new ProjectMemoryServiceError({
+                                          reason: "Controlled query drain SQL failed",
+                                        }),
+                                  ),
+                                ),
                             };
                             if (companionProof) {
                               const storeRoot = yield* f.fs.makeTempDirectoryScoped();
@@ -12755,15 +12915,50 @@ for (const compactProof of [
                                     ),
                                   );
                             reconcileMemory = consumer.reconcileTransportDrain;
+                            recoverMemory = consumer.recoverJoinedOperation;
                             consumeQuery =
                               consumer.consumeQuery === undefined
                                 ? undefined
                                 : (principal, queryId) =>
                                     consumer.consumeQuery === undefined
                                       ? Effect.die("Configured query consumer missing")
-                                      : probeForward(
-                                          consumer.consumeQuery(principal, queryId),
-                                          true,
+                                      : (compactProof === "memoryQueryInterruptedRecovery"
+                                          ? Effect.gen(function* () {
+                                              if (!consumer.consumeQuery)
+                                                return yield* Effect.die(
+                                                  "Interrupt query port missing",
+                                                );
+                                              const child = yield* consumer
+                                                .consumeQuery(principal, queryId)
+                                                .pipe(Effect.forkChild);
+                                              yield* Deferred.await(queryInterrupted);
+                                              const before =
+                                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+                                              expect(
+                                                (yield* consumer
+                                                  .consumeQuery(principal, queryId)
+                                                  .pipe(Effect.result))._tag,
+                                              ).toBe("Failure");
+                                              yield* Fiber.interrupt(child);
+                                              const interrupted = yield* Fiber.await(child);
+                                              expect(interrupted._tag).toBe("Failure");
+                                              if (interrupted._tag === "Failure")
+                                                expect(Cause.hasInterrupts(interrupted.cause)).toBe(
+                                                  true,
+                                                );
+                                              expect(
+                                                yield* f.sql`SELECT status,result_json FROM project_team_memory_query`,
+                                              ).toEqual([
+                                                { status: "uncertain", result_json: null },
+                                              ]);
+                                              expect(
+                                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+                                              ).toEqual(before);
+                                            }).pipe(Effect.orDie)
+                                          : probeForward(
+                                              consumer.consumeQuery(principal, queryId),
+                                              true,
+                                            )
                                         ).pipe(
                                           Effect.tapError((error) =>
                                             Effect.sync(() => {
@@ -12988,12 +13183,18 @@ for (const compactProof of [
                                 return yield* Effect.die(
                                   "Original budget-denied query receipt missing",
                                 );
-                              expect(retained.status).toBe("failed");
+                              if (retained.status === "uncertain" && reconcileMemory)
+                                yield* reconcileMemory(retained.id);
+                              const settled = yield* f.sql<{
+                                status: string;
+                                result: string;
+                              }>`SELECT status,result_json AS result FROM project_team_memory_query WHERE query_id=${retained.id}`;
+                              expect(settled[0]?.status).toBe("failed");
                               expect(decodeRequiredJson(retained.embedding)).toMatchObject({
                                 maximumInputTokens: queryBudget ? 999 : 400,
                                 maximumOutputTokens: 1,
                               });
-                              expect(decodeRequiredJson(retained.result)).toMatchObject({
+                              expect(decodeRequiredJson(settled[0]?.result)).toMatchObject({
                                 queryId: retained.id,
                                 outcome: "failed",
                                 hitIds: [],
@@ -13028,9 +13229,7 @@ for (const compactProof of [
                                 id: string;
                                 status: string;
                               }>`SELECT query_id AS id,status FROM project_team_memory_query`;
-                              expect(queries).toMatchObject([
-                                { status: sharedBeforeSearchDenied ? "searching" : "uncertain" },
-                              ]);
+                              expect(queries).toMatchObject([{ status: "uncertain" }]);
                               if (!queries[0] || reconcileMemory === undefined)
                                 return yield* Effect.die("Missing delayed query cleanup");
                               yield* reconcileMemory(queries[0].id);
@@ -13307,7 +13506,12 @@ for (const compactProof of [
                               yield* queryGuard.registerKnownSecrets([queryRequest.query]);
                               yield* expectFallback();
                             }
-                            if (queryRecovery) {
+                            if (joinedRecovery) {
+                              activeQuery = true;
+                              yield* issueQuery();
+                              activeQuery = false;
+                            }
+                            if (queryRecovery && !joinedRecovery) {
                               activeQuery = true;
                               yield* issueQuery();
                               activeQuery = false;
@@ -13510,7 +13714,7 @@ for (const compactProof of [
                               )
                               .pipe(Effect.flatMap(decodeMemorySources));
                             expect(available.items[0]?.status).toBe("indexed");
-                          } else if (compactProof === "memoryFailure") {
+                          } else if (sourceFailure) {
                             expect(jobs[0]).toMatchObject({ status: "uncertain", receipt: null });
                             expect(memoryReceipt.receipt.status).toBe("accepted");
                             expect(memoryPipelineError).toMatchObject({
@@ -13601,7 +13805,7 @@ for (const compactProof of [
                           if (pipelineProof && !forwardProof) {
                             expect(memoryExchanges).toBe(2);
                             expect(memoryBackendCalls).toBe(3);
-                          } else if (compactProof === "memoryFailure") {
+                          } else if (sourceFailure) {
                             expect(memoryExchanges).toBe(1);
                             expect(memoryBackendCalls).toBe(0);
                           } else if (cleanupProof) {
@@ -14181,7 +14385,11 @@ for (const compactProof of [
                       const terminal: SessionRuntime.PiSessionTerminal = {
                         identity: input.identity,
                         operation: input.operation,
-                        outcome: failedUsage ? "failed" : "success",
+                        outcome:
+                          failedUsage ||
+                          (joinedRecovery && input.operation.operationKind === "prompt")
+                            ? "failed"
+                            : "success",
                         ownerCaptured: true,
                         native,
                         accountingReceipts,
@@ -14199,6 +14407,8 @@ for (const compactProof of [
                           kernel: "removed",
                         },
                       };
+                      if (joinedRecovery && input.operation.operationKind === "prompt")
+                        joinedTerminal = terminal;
                       yield* Effect.tryPromise(() => input.persistTerminal(terminal, signal));
                       if (returnProof && input.operation.operationKind === "compact") {
                         if (compactProof === "returnRevoked") {
@@ -14344,6 +14554,73 @@ for (const compactProof of [
             () => Effect.void,
           );
           const assignmentResult = yield* assigned.run.pipe(Effect.result);
+          if (compactProof === "joinedNoMemory") {
+            if (assignmentResult._tag !== "Success")
+              return yield* Effect.die("No-memory prompt failed");
+            const consumer = yield* makeProjectMemoryProcessingConsumer({
+              environmentId: f.binding.environmentId,
+              maximumConcurrentCalls: 1,
+              maximumConcurrentModelCalls: 1,
+              readConfiguration: Effect.succeed(undefined),
+              assertAdmission: Effect.die("No-memory recovery must not assert current admission"),
+              readCredential: () => Effect.die("No-memory recovery must not read credentials"),
+              exchange: () => Effect.die("No-memory recovery must not exchange"),
+              confirmModelTransportDrained: () =>
+                Effect.die("No-memory recovery must not infer model drain"),
+              companion: () => Effect.die("No-memory recovery must not start a companion"),
+              observeCompanionCleanup: () => Effect.die("No-memory recovery must not wake cleanup"),
+            }).pipe(Effect.provideService(ProjectWorkContentGuard, queryGuard));
+            const recover = consumer.recoverJoinedOperation;
+            if (!recover) return yield* Effect.die("No-memory recovery port missing");
+            const rows = yield* f.sql<{
+              ordinal: number;
+              terminal: string;
+            }>`SELECT operation_ordinal AS ordinal,terminal_json AS terminal FROM project_team_pi_operation WHERE operation_id=${f.request.assignmentOperationId}`;
+            if (!rows[0]) return yield* Effect.die("No-memory operation missing");
+            const identity = yield* decodeMemoryRecoveryIdentity({
+              environmentId: f.binding.environmentId,
+              projectId,
+              taskId: f.binding.taskId,
+              bindingId: f.binding.recordId,
+              generation: f.binding.generation,
+              providerInstanceId,
+              threadId: f.binding.threadId,
+              operationId: f.request.assignmentOperationId,
+              workerId: assignmentResult.success.terminal.identity.workerId,
+              ordinal: rows[0].ordinal,
+            });
+            expect(yield* f.sql`SELECT * FROM project_team_memory_query`).toEqual([]);
+            expect(yield* f.sql`SELECT * FROM project_team_memory_job`).toEqual([]);
+            for (const terminal of [
+              null,
+              json({
+                ...assignmentResult.success.terminal,
+                outcome: "quarantine",
+                failureCode: "CALLBACK_DRAIN_UNKNOWN",
+              }),
+            ]) {
+              yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${terminal} WHERE operation_id=${identity.operationId}`;
+              yield* recover(identity);
+              expect(
+                (yield* recover({ ...identity, workerId: "foreign" }).pipe(Effect.result))._tag,
+              ).toBe("Failure");
+              expect(
+                (yield* recover({ ...identity, environmentId: "foreign" }).pipe(Effect.result))
+                  ._tag,
+              ).toBe("Failure");
+              expect(
+                (yield* f.sql.withTransaction(recover(identity)).pipe(Effect.result))._tag,
+              ).toBe("Failure");
+            }
+            yield* f.sql`INSERT INTO project_team_memory_job(effect_id,environment_id,project_id,input_json,claim_generation,status,receipt_json,owner_json)
+              VALUES('malformed-recovery',${identity.environmentId},${identity.projectId},'{}',0,'pending',NULL,'{"version":1,"operation":{}}')`;
+            expect((yield* recover(identity).pipe(Effect.result))._tag).toBe("Failure");
+            expect(yield* f.sql`SELECT status FROM project_team_memory_job`).toEqual([
+              { status: "pending" },
+            ]);
+            return;
+          }
+
           if (forwardProof) {
             if (!forwardDeniedObserved)
               return yield* Effect.die({
@@ -14419,6 +14696,138 @@ for (const compactProof of [
             expect(memoryBackendCalls).toBe(0);
             expect(runs).toBe(2);
             expect(f.transports).toBe(0);
+            return;
+          }
+          if (compactProof === "memorySourceJoinedRecovery") {
+            if (!recoverMemory) return yield* Effect.die("Source recovery port missing");
+            const jobs = yield* f.sql<{
+              id: string;
+              owner: string;
+              generation: number;
+            }>`SELECT effect_id AS id,owner_json AS owner,claim_generation AS generation FROM project_team_memory_job WHERE status='uncertain'`;
+            const job = jobs[0];
+            if (!job)
+              return yield* Effect.die({ message: "Source recovery owner missing", diagnostic });
+            const owner = yield* decodeMemoryLedgerOwner(job.owner);
+            const identity = yield* decodeMemoryRecoveryIdentity(owner.operation);
+            const operations = yield* f.sql<{
+              terminal: string;
+            }>`SELECT terminal_json AS terminal FROM project_team_pi_operation WHERE operation_id=${identity.operationId}`;
+            const original = operations[0];
+            if (!original?.terminal)
+              return yield* Effect.die({ message: "Source recovery terminal missing", diagnostic });
+            // Retain a crash-left recovery claim at its actual next generation.
+            yield* f.sql`UPDATE project_team_memory_job SET status='claimed',claim_generation=${job.generation + 1} WHERE effect_id=${job.id}`;
+            const charges =
+              yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+            recoveryWakes.length = 0;
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=NULL WHERE operation_id=${identity.operationId}`;
+            expect((yield* recoverMemory(identity).pipe(Effect.result))._tag).toBe("Failure");
+            expect(
+              yield* f.sql`SELECT status,claim_generation FROM project_team_memory_job`,
+            ).toEqual([{ status: "claimed", claim_generation: job.generation + 1 }]);
+            expect(recoveryWakes).toEqual([]);
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${original.terminal} WHERE operation_id=${identity.operationId}`;
+            yield* recoverMemory(identity);
+            yield* recoverMemory(identity);
+            expect(
+              yield* f.sql`SELECT status,claim_generation,receipt_json FROM project_team_memory_job`,
+            ).toEqual([
+              { status: "uncertain", claim_generation: job.generation + 1, receipt_json: null },
+            ]);
+            expect(recoveryWakes).toEqual([job.id, job.id]);
+            expect(
+              yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+            ).toEqual(charges);
+            return;
+          }
+          if (joinedRecovery) {
+            if (!recoverMemory || !joinedTerminal)
+              return yield* Effect.die({
+                message: "Joined recovery port missing",
+                diagnostic,
+                hasPort: recoverMemory !== undefined,
+                hasTerminal: joinedTerminal !== undefined,
+              });
+            const jobs = yield* f.sql<{
+              id: string;
+              owner: string;
+              status: string;
+              receipt: string;
+              generation: number;
+            }>`SELECT effect_id AS id,owner_json AS owner,status,receipt_json AS receipt,claim_generation AS generation FROM project_team_memory_job`;
+            const queries = yield* f.sql<{
+              id: string;
+              status: string;
+              result: string;
+            }>`SELECT query_id AS id,status,result_json AS result FROM project_team_memory_query`;
+            const job = jobs[0];
+            const query = queries[0];
+            if (!job || !query) return yield* Effect.die("Joined recovery rows missing");
+            const owner = yield* decodeMemoryLedgerOwner(job.owner);
+            const identity = yield* decodeMemoryRecoveryIdentity(owner.operation);
+            const terminal = joinedTerminal;
+            const modelRows =
+              yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+            const operation = yield* f.sql<{
+              terminal: string;
+            }>`SELECT terminal_json AS terminal FROM project_team_pi_operation WHERE operation_id=${identity.operationId}`;
+            const process = yield* f.sql<{
+              drain: string;
+            }>`SELECT drain_json AS drain FROM project_team_pi_process WHERE operation_id=${identity.operationId}`;
+            if (!operation[0] || !process[0])
+              return yield* Effect.die("Joined recovery receipts missing");
+            // A crash can retain an unfinished stage flag after the joined terminal was persisted.
+            yield* f.sql`UPDATE project_team_memory_query SET status='embedding' WHERE query_id=${query.id}`;
+            const retainedQueries = yield* f.sql`SELECT * FROM project_team_memory_query`;
+            const retainedJobs = yield* f.sql`SELECT * FROM project_team_memory_job`;
+            recoveryWakes.length = 0;
+            for (const changed of [
+              null,
+              json({ ...terminal, outcome: "quarantine" }),
+              json({ ...terminal, failureCode: "CALLBACK_DRAIN_UNKNOWN" }),
+              json({ ...terminal, identity: { ...terminal.identity, workerId: "foreign" } }),
+            ]) {
+              yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${changed} WHERE operation_id=${identity.operationId}`;
+              expect((yield* recoverMemory(identity).pipe(Effect.result))._tag).toBe("Failure");
+              expect(yield* f.sql`SELECT * FROM project_team_memory_query`).toEqual(
+                retainedQueries,
+              );
+              expect(yield* f.sql`SELECT * FROM project_team_memory_job`).toEqual(retainedJobs);
+            }
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=${operation[0].terminal} WHERE operation_id=${identity.operationId}`;
+            yield* f.sql`UPDATE project_team_pi_process SET drain_json=${json({ ...terminal.drain, invocation: "f".repeat(32) })} WHERE operation_id=${identity.operationId}`;
+            expect((yield* recoverMemory(identity).pipe(Effect.result))._tag).toBe("Failure");
+            yield* f.sql`UPDATE project_team_pi_process SET drain_json=${process[0].drain} WHERE operation_id=${identity.operationId}`;
+            expect(
+              (yield* recoverMemory({ ...identity, ordinal: identity.ordinal + 1 }).pipe(
+                Effect.result,
+              ))._tag,
+            ).toBe("Failure");
+            expect(
+              (yield* f.sql.withTransaction(recoverMemory(identity)).pipe(Effect.result))._tag,
+            ).toBe("Failure");
+            expect(recoveryWakes).toEqual([]);
+            yield* recoverMemory(identity);
+            yield* recoverMemory(identity);
+            expect(yield* f.sql`SELECT * FROM project_team_memory_job`).toEqual(retainedJobs);
+            expect(yield* f.sql`SELECT status,result_json FROM project_team_memory_query`).toEqual([
+              { status: "uncertain", result_json: null },
+            ]);
+            expect(recoveryWakes).toEqual([query.id, query.id]);
+            expect(
+              yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+            ).toEqual(modelRows);
+            if (compactProof === "memoryQueryInterruptedRecovery") {
+              if (!reconcileMemory) return yield* Effect.die("Interrupted query cleanup missing");
+              expect((yield* reconcileMemory(query.id).pipe(Effect.result))._tag).toBe("Failure");
+              expect(
+                yield* f.sql`SELECT status,capacity_state FROM project_team_model_request WHERE json_extract(reservation_json,'$.effectId')=${query.id}`,
+              ).toEqual([{ status: "unknown", capacity_state: "quarantine" }]);
+              expect(yield* f.sql`SELECT result_json FROM project_team_memory_query`).toEqual([
+                { result_json: null },
+              ]);
+            }
             return;
           }
           expect({
@@ -14708,7 +15117,7 @@ for (const compactProof of [
               expect(
                 (yield* f.reader.readRequired(snapshot)).observations.provenance.queryId,
               ).toBeUndefined();
-            } else if (compactProof === "memoryFailure") {
+            } else if (sourceFailure) {
               expect(memoryExchanges).toBe(1);
               expect(memoryBackendCalls).toBe(0);
               const waiting = yield* gateway

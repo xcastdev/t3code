@@ -798,7 +798,7 @@ for (const kind of ["model", "delete"] as const)
     );
 
 it.effect(
-  "repair interrupted extraction remains claimed and drained recovery does not repeat extraction",
+  "repair interrupted extraction relinquishes its generation and drained recovery does not repeat extraction",
   () =>
     withMemoryDatabase(
       Effect.gen(function* () {
@@ -830,7 +830,7 @@ it.effect(
         const child = yield* reactor.consume(f.projectId, effect.recordId).pipe(Effect.forkChild);
         yield* Deferred.await(entered);
         yield* Fiber.interrupt(child);
-        expect((yield* reactor.load(effect.recordId))?.status).toBe("claimed");
+        expect((yield* reactor.load(effect.recordId))?.status).toBe("uncertain");
         const resumed = yield* reactor
           .consume(f.projectId, effect.recordId, { generation: 1, confirmDrained: Effect.void })
           .pipe(Effect.exit);

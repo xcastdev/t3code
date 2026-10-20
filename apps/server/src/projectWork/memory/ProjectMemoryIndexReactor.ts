@@ -171,7 +171,6 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
       readonly confirmDrained: Effect.Effect<void, ProjectMemoryServiceError>;
     },
   ) {
-    if (recover !== undefined) yield* recover.confirmDrained;
     let owner: number | undefined;
     yield* repository.executeAtomic(
       Effect.gen(function* () {
@@ -397,18 +396,22 @@ export const makeProjectMemoryIndexReactor = (dependencies: {
       !service.modelsEnabled
     )
       return { status: "disabled" as const };
-    const generation = yield* claim(effectId, recovery);
-    if (generation === undefined) return { status: "owned-elsewhere" as const };
-    const result = yield* perform(effectId, generation, recovery !== undefined).pipe(Effect.exit);
-    if (Exit.isSuccess(result)) return result.value;
-    // Interruptions retain the claimed owner until Root confirms its drain. Do
-    // not issue more SQL work from an interrupted owner or repeat unknown calls.
-    if (Cause.hasInterrupts(result.cause)) return yield* Effect.failCause(result.cause);
-    const recorded = yield* uncertain(effectId, generation).pipe(Effect.exit);
-    return yield* Effect.failCause(
-      Exit.isFailure(recorded)
-        ? Cause.fromReasons([...result.cause.reasons, ...recorded.cause.reasons])
-        : result.cause,
+    if (recovery !== undefined) yield* recovery.confirmDrained;
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const generation = yield* claim(effectId, recovery);
+        if (generation === undefined) return { status: "owned-elsewhere" as const };
+        const result = yield* restore(perform(effectId, generation, recovery !== undefined)).pipe(
+          Effect.exit,
+        );
+        if (Exit.isSuccess(result)) return result.value;
+        const recorded = yield* uncertain(effectId, generation).pipe(Effect.exit);
+        return yield* Effect.failCause(
+          Exit.isFailure(recorded)
+            ? Cause.fromReasons([...result.cause.reasons, ...recorded.cause.reasons])
+            : result.cause,
+        );
+      }),
     );
   });
   /** One bounded pass over committed jobs; Root owns wake scheduling and lifetime. */

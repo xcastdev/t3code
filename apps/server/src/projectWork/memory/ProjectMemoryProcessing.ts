@@ -6,6 +6,7 @@ import {
   canonicalProjectWorkPayload,
   EventId,
   ProjectTeamRecord,
+  ProjectTeamRunBinding,
   ProjectTeamMemorySourcesRead,
   ProjectWorkComment,
   ProjectWorkDecision,
@@ -32,6 +33,7 @@ import { ProjectWorkRepository, readCurrentState } from "../ProjectWorkRepositor
 import { applyProjectWorkEvents, emptyProjectWorkReducerState } from "../ProjectWorkDecider.ts";
 import {
   ProjectMemoryOperation,
+  ProjectMemoryOperationIdentity,
   ProjectMemoryJobOwner,
   ProjectMemoryReservation,
   makeProjectMemoryModelAccounting,
@@ -60,8 +62,17 @@ import * as Exit from "effect/Exit";
 import * as Crypto from "effect/Crypto";
 import {
   makeProjectMemoryQueryConsumer,
+  readProjectMemoryQueryOwnerById,
+  auditProjectMemoryQueryAdmission,
   type ProjectMemoryQueryConsumerOptions,
 } from "./ProjectMemoryQuery.ts";
+
+import { PiManagedProcessAllocationSchema } from "../../provider/pi/PiManagedProcess.ts";
+import {
+  PiNativeReference,
+  PiWorkerIdentity,
+  PiWorkerOperation,
+} from "../../provider/pi/PiWorkerProtocol.ts";
 
 const strict = { onExcessProperty: "error" } as const;
 const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
@@ -1162,6 +1173,79 @@ export interface ProjectMemoryProcessingConsumerOptions {
   ) => ReturnType<MemoryBackendTransport>;
 }
 
+const JoinedDrain = Schema.Struct({
+  unit: Id,
+  invocation: Id,
+  cgroup: Schema.String.check(Schema.isMaxLength(4096)),
+  ownerPid: Schema.NullOr(Safe),
+  memoryBytes: Safe,
+  swapBytes: Schema.Literal(0),
+  oomGroup: Schema.Literal(1),
+  launcherPid: Safe,
+  childPid: Schema.NullOr(Safe),
+  childExitCode: Schema.NullOr(Schema.Int),
+  kernel: Schema.String.check(Schema.isMaxLength(128)),
+});
+const decodeJoinedTerminal = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      identity: PiWorkerIdentity,
+      operation: PiWorkerOperation,
+      outcome: Schema.Literals(["success", "failed", "canceled"]),
+      ownerCaptured: Schema.Literal(true),
+      native: Schema.NullOr(PiNativeReference),
+      drain: JoinedDrain,
+      accountingReceipts: Schema.Array(Schema.Json).check(Schema.isMaxLength(256)),
+      failureCode: Schema.optionalKey(Id),
+    }),
+  ),
+  strict,
+);
+const decodeJoinedProcessOwner = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("owner"),
+      unit: Id,
+      nonce: Id,
+      invocation: Id,
+      cgroup: Schema.String.check(Schema.isMaxLength(4096)),
+      pid: Safe,
+      memoryBytes: Safe,
+      swapBytes: Schema.Literal(0),
+      oomGroup: Schema.Literal(1),
+    }),
+  ),
+  strict,
+);
+const decodeJoinedIntent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      request: Schema.JsonObject,
+      binding: ProjectTeamRunBinding,
+      allocation: PiManagedProcessAllocationSchema,
+    }),
+  ),
+);
+const decodeJoinedIdentity = Schema.decodeUnknownEffect(ProjectMemoryOperationIdentity, strict);
+const decodeMemoryIdentity = Schema.decodeUnknownEffect(ProjectMemoryOperationIdentity);
+const decodeClaimGeneration = Schema.decodeUnknownEffect(Safe);
+const decodeJoinedAllocation = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(PiManagedProcessAllocationSchema),
+  strict,
+);
+const decodeJoinedDrain = Schema.decodeUnknownEffect(Schema.fromJsonString(JoinedDrain), strict);
+const validJoinedKernelDrain = (kernel: string) => {
+  if (kernel === "removed") return true;
+  if (kernel.length > 128) return false;
+  const fields = new Map<string, string>();
+  for (const line of (kernel.endsWith("\n") ? kernel.slice(0, -1) : kernel).split("\n")) {
+    const match = /^(populated|frozen) ([01])$/.exec(line);
+    if (!match || fields.has(match[1]!)) return false;
+    fields.set(match[1]!, match[2]!);
+  }
+  return fields.get("populated") === "0";
+};
+
 /** The real gateway invokes this consumer after the original admission commits.
  * Context fetching never joins it; ownerless/stopped/uncertain jobs stay retained. */
 export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryProcessingConsumer")(
@@ -1191,6 +1275,200 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
             ),
       ),
     );
+    const recoverJoinedOperation = Effect.fn("ProjectMemoryProcessing.recoverJoinedOperation")(
+      function* (supplied: ProjectMemoryOperationIdentity) {
+        if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+          return yield* deny("Joined memory recovery owns its original SQL transaction");
+        const identity = yield* decodeJoinedIdentity(supplied);
+        if (identity.environmentId !== options.environmentId)
+          return yield* deny("Joined memory recovery environment changed");
+        yield* Effect.uninterruptibleMask(() =>
+          Effect.gen(function* () {
+            const wakes = yield* sql.withTransaction(
+              Effect.gen(function* () {
+                const operations = yield* sql<{
+                  environment_id: string;
+                  project_id: string;
+                  binding_id: string;
+                  generation: number;
+                  provider_instance_id: string;
+                  thread_id: string;
+                  operation_id: string;
+                  worker_id: string;
+                  operation_ordinal: number;
+                  operation_kind: string;
+                  request_hash: string;
+                  intent: string | null;
+                  terminal: string | null;
+                }>`SELECT environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,
+              operation_id,worker_id,operation_ordinal,operation_kind,request_hash,
+              CASE WHEN length(CAST(intent_json AS BLOB))<=262144 THEN intent_json END AS intent,
+              CASE WHEN length(CAST(terminal_json AS BLOB))<=262144 THEN terminal_json END AS terminal
+              FROM project_team_pi_operation WHERE environment_id=${identity.environmentId}
+              AND operation_id=${identity.operationId} LIMIT 2`;
+                const row = operations[0];
+                if (
+                  operations.length !== 1 ||
+                  !row ||
+                  !row.intent ||
+                  row.project_id !== identity.projectId ||
+                  row.binding_id !== identity.bindingId ||
+                  row.generation !== identity.generation ||
+                  row.provider_instance_id !== identity.providerInstanceId ||
+                  row.thread_id !== identity.threadId ||
+                  row.worker_id !== identity.workerId ||
+                  row.operation_ordinal !== identity.ordinal ||
+                  row.operation_kind !== "prompt"
+                )
+                  return yield* deny("Joined memory recovery original operation is unavailable");
+                const intent = yield* decodeJoinedIntent(row.intent);
+                const binding = intent.binding;
+                if (
+                  binding.environmentId !== identity.environmentId ||
+                  binding.projectId !== identity.projectId ||
+                  binding.taskId !== identity.taskId ||
+                  binding.recordId !== identity.bindingId ||
+                  binding.generation !== identity.generation ||
+                  binding.providerInstanceId !== identity.providerInstanceId ||
+                  binding.threadId !== identity.threadId ||
+                  intent.request.kind !== "prompt" ||
+                  intent.request.threadId !== identity.threadId ||
+                  intent.request.operationId !== identity.operationId ||
+                  projectMemoryHash(intent.request) !== row.request_hash
+                )
+                  return yield* deny("Joined memory recovery original identity changed");
+                const queries = yield* sql<{
+                  id: string;
+                  status: string;
+                  result: string | null;
+                }>`SELECT query_id AS id,status,result_json AS result FROM project_team_memory_query
+              WHERE operation_id=${identity.operationId} LIMIT 129`;
+                if (queries.length > 128)
+                  return yield* deny("Joined memory query recovery exceeds its bound");
+                const jobs = yield* sql<{
+                  id: string;
+                  generation: number;
+                  owner: string | null;
+                  status: string;
+                  receipt: string | null;
+                }>`SELECT effect_id AS id,claim_generation AS generation,status,receipt_json AS receipt,
+              CASE WHEN length(CAST(owner_json AS BLOB))<=262144 THEN owner_json END AS owner
+              FROM project_team_memory_job WHERE json_extract(owner_json,'$.operation.operationId')=${identity.operationId}
+                OR (environment_id=${identity.environmentId} AND project_id=${identity.projectId} AND owner_json IS NOT NULL
+                  AND (length(CAST(owner_json AS BLOB))>262144
+                    OR COALESCE(json_type(owner_json,'$.operation.operationId'),'')<>'text'
+                    OR length(json_extract(owner_json,'$.operation.operationId')) NOT BETWEEN 1 AND 256)) LIMIT 129`;
+                if (jobs.length > 128)
+                  return yield* deny("Joined memory source recovery exceeds its bound");
+                if (queries.length === 0 && jobs.length === 0) return [];
+                if (!row.terminal)
+                  return yield* deny("Joined memory recovery terminal is unavailable");
+                const terminal = yield* decodeJoinedTerminal(row.terminal);
+                if (
+                  terminal.identity.workerId !== identity.workerId ||
+                  terminal.identity.generation !== identity.generation ||
+                  terminal.operation.operationId !== identity.operationId ||
+                  terminal.operation.operationKind !== "prompt" ||
+                  terminal.failureCode === "CALLBACK_DRAIN_UNKNOWN"
+                )
+                  return yield* deny("Joined memory recovery callback join changed");
+                const processes = yield* sql<{
+                  unit: string;
+                  allocation: string | null;
+                  owner: string | null;
+                  drain: string | null;
+                }>`
+              SELECT unit,
+              CASE WHEN length(CAST(allocation_json AS BLOB))<=262144 THEN allocation_json END AS allocation,
+              CASE WHEN length(CAST(owner_json AS BLOB))<=32768 THEN owner_json END AS owner,
+              CASE WHEN length(CAST(drain_json AS BLOB))<=32768 THEN drain_json END AS drain
+              FROM project_team_pi_process WHERE operation_id=${identity.operationId} LIMIT 2`;
+                const process = processes[0];
+                if (
+                  processes.length !== 1 ||
+                  !process?.allocation ||
+                  !process.owner ||
+                  !process.drain
+                )
+                  return yield* deny("Joined memory recovery process receipts are unavailable");
+                const allocation = yield* decodeJoinedAllocation(process.allocation);
+                const owner = yield* decodeJoinedProcessOwner(process.owner);
+                const drain = yield* decodeJoinedDrain(process.drain);
+                if (
+                  !same(allocation, intent.allocation) ||
+                  !same(drain, terminal.drain) ||
+                  !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+                    allocation.nonce,
+                  ) ||
+                  allocation.unit !== `t3-pi-managed-${allocation.nonce}.service` ||
+                  process.unit !== allocation.unit ||
+                  owner.unit !== allocation.unit ||
+                  owner.nonce !== allocation.nonce ||
+                  !/^[a-f0-9]{32}$/.test(owner.invocation) ||
+                  !owner.cgroup.startsWith("/sys/fs/cgroup/") ||
+                  !owner.cgroup.endsWith(`/${owner.unit}`) ||
+                  owner.cgroup.split("/").some((part) => part === "." || part === "..") ||
+                  owner.pid <= 0 ||
+                  allocation.policy.memoryBytes !== allocation.launch.memoryBytes ||
+                  allocation.policy.runtimeSeconds !== allocation.launch.runtimeSeconds ||
+                  owner.memoryBytes !== allocation.policy.memoryBytes ||
+                  owner.memoryBytes <= 0 ||
+                  allocation.launch.workspaceRoot !== binding.worktree ||
+                  allocation.launch.workspace.path !== binding.worktree ||
+                  drain.unit !== owner.unit ||
+                  drain.invocation !== owner.invocation ||
+                  drain.cgroup !== owner.cgroup ||
+                  drain.ownerPid !== owner.pid ||
+                  drain.memoryBytes !== owner.memoryBytes ||
+                  drain.launcherPid <= 0 ||
+                  !validJoinedKernelDrain(drain.kernel)
+                )
+                  return yield* deny("Joined memory recovery process evidence changed");
+                const ids: string[] = [];
+                for (const query of queries) {
+                  const owner = yield* readProjectMemoryQueryOwnerById(sql, query.id);
+                  if (
+                    !same(yield* decodeMemoryIdentity(owner.operation), identity) ||
+                    !same(owner.operation.allocation, allocation) ||
+                    owner.operation.requestSha256 !== row.request_hash
+                  )
+                    return yield* deny("Joined memory query original owner changed");
+                  yield* auditProjectMemoryQueryAdmission(sql, owner);
+                  yield* sql`UPDATE project_team_memory_query SET status='uncertain' WHERE query_id=${query.id}
+                AND status IN ('embedding','searching') AND result_json IS NULL`;
+                  if (
+                    query.result === null &&
+                    ["embedding", "searching", "uncertain"].includes(query.status)
+                  )
+                    ids.push(query.id);
+                }
+                for (const job of jobs) {
+                  if (!job.owner) return yield* deny("Joined memory source owner unavailable");
+                  const owner = yield* decodeOwnerJson(job.owner);
+                  if (
+                    !same(yield* decodeMemoryIdentity(owner.operation), identity) ||
+                    !same(owner.operation.allocation, allocation) ||
+                    owner.operation.requestSha256 !== row.request_hash
+                  )
+                    return yield* deny("Joined memory source original owner changed");
+                  yield* auditProjectMemoryAdmission(sql, owner);
+                  const generation = yield* decodeClaimGeneration(job.generation);
+                  yield* sql`UPDATE project_team_memory_job SET status='uncertain' WHERE effect_id=${job.id}
+                AND claim_generation=${generation} AND status='claimed' AND receipt_json IS NULL AND owner_json=${job.owner}`;
+                  if (job.receipt === null && ["claimed", "uncertain"].includes(job.status))
+                    ids.push(job.id);
+                }
+                return ids;
+              }),
+            );
+            for (const id of wakes) yield* options.observeCompanionCleanup?.(id) ?? Effect.void;
+          }),
+        );
+      },
+      Effect.mapError((error) =>
+        isServiceError(error) ? error : deny("Joined memory recovery evidence unavailable"),
+      ),
+    );
     const reconcileTransportDrain = Effect.fn("ProjectMemoryProcessing.reconcileTransportDrain")(
       function* (reservationId: string) {
         if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
@@ -1200,7 +1478,8 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
         if (query.length === 1) return yield* queries.reconcileQuery(reservationId);
         const jobs = yield* sql<{
           owner: string | null;
-        }>`SELECT CASE WHEN length(CAST(owner_json AS BLOB))<=262144 THEN owner_json END AS owner FROM project_team_memory_job WHERE environment_id=${options.environmentId} AND effect_id=${reservationId} LIMIT 2`;
+          status: string;
+        }>`SELECT status, CASE WHEN length(CAST(owner_json AS BLOB))<=262144 THEN owner_json END AS owner FROM project_team_memory_job WHERE environment_id=${options.environmentId} AND effect_id=${reservationId} LIMIT 2`;
         if (jobs.length !== 0) {
           if (
             jobs.length !== 1 ||
@@ -1208,6 +1487,8 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
             options.confirmCompanionTransportDrained === undefined
           )
             return yield* deny("Original job companion cleanup is unavailable");
+          if (jobs[0].status !== "uncertain" && jobs[0].status !== "settled")
+            return yield* deny("Memory job owner has not relinquished unfinished work");
           const owner = yield* decodeOwnerJson(jobs[0].owner);
           yield* auditProjectMemoryAdmission(sql, owner);
           yield* options.confirmCompanionTransportDrained(reservationId);
@@ -1585,7 +1866,7 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
           assertProcessingInTransaction: fence,
         });
         const original = yield* guarded.load(effectId);
-        if (original?.status === "uncertain" || original?.status === "claimed") {
+        if (original?.status === "uncertain") {
           // An explicit retry consumes cleanup proof, then the original reactor retains
           // its new claim generation under the still-current original task fence.
           yield* reconcileTransportDrain(effectId);
@@ -1632,9 +1913,21 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
       availability,
       consume: (principal, effectId) =>
         consume(principal, effectId).pipe(
-          Effect.onExit(() => options.observeCompanionCleanup?.(effectId) ?? Effect.void),
+          Effect.onExit(() =>
+            sql<{
+              status: string;
+            }>`SELECT status FROM project_team_memory_job WHERE effect_id=${effectId}`.pipe(
+              Effect.flatMap((rows) =>
+                rows[0]?.status === "uncertain" || rows[0]?.status === "settled"
+                  ? (options.observeCompanionCleanup?.(effectId) ?? Effect.void)
+                  : Effect.void,
+              ),
+              Effect.ignore,
+            ),
+          ),
         ),
       reconcileTransportDrain,
+      recoverJoinedOperation,
     });
   },
 );
