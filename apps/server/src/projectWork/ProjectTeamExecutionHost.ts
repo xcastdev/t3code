@@ -1,3 +1,7 @@
+import {
+  notifyCompactCallerChange,
+  subscribeCompactCallerChanges,
+} from "./ProjectTeamCompactCaller.ts";
 import { makeProjectTaskResources } from "./ProjectTaskResources.ts";
 import {
   canonicalProjectWorkPayload,
@@ -277,12 +281,24 @@ export const waitForProjectTeamRetainedCompaction = Effect.fn(
   const engine = yield* OrchestrationEngineService;
   const binding = bindingFor(input.snapshot);
   const changes = yield* engine.subscribeDomainEvents;
+  const callerChanges = yield* subscribeCompactCallerChanges;
   const pull = yield* Stream.toPull(
     changes.pipe(
       Stream.filter(
         (event) => "threadId" in event.payload && event.payload.threadId === binding.threadId,
       ),
+      Stream.map(() => undefined),
+      Stream.merge(callerChanges),
     ),
+  );
+  yield* Effect.addFinalizer((exit) =>
+    exit._tag === "Success"
+      ? Effect.void
+      : sql
+          .withTransaction(sql`UPDATE project_team_compact_caller SET status='released'
+      WHERE environment_id=${input.environmentId} AND binding_id=${binding.recordId}
+      AND generation=${binding.generation} AND status='pending'`)
+          .pipe(Effect.andThen(notifyCompactCallerChange), Effect.orDie),
   );
   for (;;) {
     yield* input.assertCurrent;
@@ -291,18 +307,27 @@ export const waitForProjectTeamRetainedCompaction = Effect.fn(
       input.environmentId,
       input.snapshot,
     );
+    const callers = yield* sql<{
+      deadline_at_ms: number;
+    }>`SELECT deadline_at_ms FROM project_team_compact_caller
+      WHERE environment_id=${input.environmentId} AND binding_id=${binding.recordId}
+      AND generation=${binding.generation} AND status='pending' LIMIT 2`;
+    if (callers.length > 1)
+      return yield* denied("Compact caller ownership requires reconciliation");
     const compacts = rows.filter((row) => row.operation_kind === "compact");
     if (compacts.some((row) => row.status === "quarantine"))
       return yield* denied("Retained compact requires physical reconciliation");
     if (compacts.every((row) => row.status === "settled")) {
-      if (input.claimCleanup === undefined) return;
-      if ((yield* input.claimCleanup)._tag === "Claimed") return;
+      if (input.claimCleanup === undefined && callers.length === 0) return;
+      if (input.claimCleanup !== undefined && (yield* input.claimCleanup)._tag === "Claimed")
+        return;
     }
     yield* waitForProjectTeamAssignmentChange(
       pull,
       Math.min(
         input.snapshot.intent.limits.deadlineAtMs,
         input.snapshot.intent.limits.rootDeadlineAtMs,
+        callers[0]?.deadline_at_ms ?? Number.MAX_SAFE_INTEGER,
       ),
       { projectId: binding.projectId, assertCurrent: input.assertCurrent },
     );
@@ -772,6 +797,11 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       yield* owned(owner);
       const snapshot = yield* journal.readRetained(owner.snapshot.fence.dispatchId);
       owner.snapshot = snapshot;
+      const binding = bindingFor(snapshot);
+      yield* sql.withTransaction(sql`UPDATE project_team_compact_caller SET status='released'
+        WHERE environment_id=${options.environmentId} AND binding_id=${binding.recordId}
+        AND generation=${binding.generation} AND status='pending'`);
+      yield* notifyCompactCallerChange;
       const operations = yield* operationRows(snapshot);
       // Stop only this exact registered thread; retained physical reconciliation still decides release.
       if (operations.some((row) => row.status !== "settled"))

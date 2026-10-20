@@ -1,3 +1,11 @@
+import * as Stream from "effect/Stream";
+import { ProjectWorkEventBus } from "./ProjectWorkEventBus.ts";
+import {
+  notifyCompactCallerChange,
+  subscribeCompactCallerChanges,
+  type CompactCallerRequest,
+  type CompactCallerReservation,
+} from "./ProjectTeamCompactCaller.ts";
 import { projectTeamAssignmentProfile } from "./ProjectTeamPolicy.ts";
 import * as NodeCrypto from "node:crypto";
 import {
@@ -1649,6 +1657,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             (ordinals[0] !== undefined && ordinals[0].ordinal !== compaction.predecessorOrdinal + 1)
           )
             return yield* deny("Compaction predecessor receipt changed");
+          maximumTokens = Math.min(maximumTokens, predecessor.maximum_tokens);
+          deadlineAtMs = Math.min(deadlineAtMs, predecessor.deadline_at_ms);
         } else if (operation.operationId !== originalOperationId) {
           const validateMailbox = Effect.gen(function* () {
             const decision = yield* mailboxDecisions
@@ -2563,6 +2573,178 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           "unavailable",
         );
     });
+    type CallerRow = {
+      dispatch_id: string;
+      binding_id: string;
+      generation: number;
+      request_id: MessageId;
+      request_json: string;
+      predecessor_operation_id: string;
+      authority_json: string;
+      admission_revision: number;
+      claim_generation: number;
+      deadline_at_ms: number;
+      status: "pending" | "consumed" | "released";
+      operation_id: string | null;
+    };
+    const callerRequest = (request: CompactCallerRequest): CompactCallerRequest => ({
+      threadId: request.threadId,
+      requestId: request.requestId,
+      ...(request.modelSelection === undefined ? {} : { modelSelection: request.modelSelection }),
+    });
+    const callerRows = (identity: Parameters<typeof current>[0], request: CompactCallerRequest) =>
+      sql<CallerRow>`SELECT * FROM project_team_compact_caller
+        WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId}
+        AND thread_id=${identity.threadId} AND request_id=${request.requestId} LIMIT 2`;
+    const callerResult = (row: CallerRow, created: boolean): CompactCallerReservation => ({
+      dispatchId: row.dispatch_id,
+      bindingId: row.binding_id,
+      generation: row.generation,
+      requestId: row.request_id,
+      predecessorOperationId: row.predecessor_operation_id,
+      deadlineAtMs: row.deadline_at_ms,
+      created,
+    });
+    const callerAuthority = (
+      original: ProjectTeamDispatchSnapshot,
+      authority: ProjectTeamAuthority,
+    ) =>
+      encode({
+        intentSha256: digest(original.intent),
+        binding: immutableBinding(authority.binding),
+        role: authority.role,
+      });
+    const abandonCompaction = Effect.fn("ProjectTeamPiOperations.abandonCompaction")(function* (
+      identity: Parameters<typeof current>[0],
+      request: CompactCallerRequest,
+    ) {
+      yield* ownTransaction();
+      if (request.threadId !== identity.threadId)
+        return yield* deny("Compact caller thread differs");
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const rows = yield* callerRows(identity, request);
+          if (rows.length > 1) return yield* deny("Compact caller identity is ambiguous");
+          const row = rows[0];
+          if (!row) return;
+          if (row.request_json !== encode(callerRequest(request)))
+            return yield* deny("Compact caller request changed", "conflict");
+          if (row.status === "pending")
+            yield* sql`UPDATE project_team_compact_caller SET status='released'
+          WHERE environment_id=${options.environmentId} AND dispatch_id=${row.dispatch_id}
+          AND request_id=${request.requestId} AND status='pending'`;
+        }),
+      );
+      yield* notifyCompactCallerChange;
+    });
+    const reserveCompaction = Effect.fn("ProjectTeamPiOperations.reserveCompaction")(function* (
+      identity: Parameters<typeof current>[0],
+      supplied: CompactCallerRequest,
+    ) {
+      yield* ownTransaction();
+      const request = callerRequest(supplied);
+      yield* decodeCompactMessageId(request.requestId);
+      if (request.threadId !== identity.threadId)
+        return yield* deny("Compact caller thread differs");
+      const result = yield* withCompactionPermit(
+        identity,
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const authority = yield* current(identity);
+            if (
+              request.modelSelection !== undefined &&
+              (request.modelSelection.instanceId !== identity.providerInstanceId ||
+                request.modelSelection.model !== authority.binding.model)
+            )
+              return yield* deny("Compact caller model differs");
+            const rows = yield* sql<{
+              dispatch_id: string;
+              cleanup_claim_revision: number | null;
+            }>`SELECT dispatch_id,cleanup_claim_revision
+          FROM project_team_dispatch WHERE environment_id=${options.environmentId}
+          AND binding_id=${authority.binding.recordId} AND generation=${authority.binding.generation} LIMIT 2`;
+            if (rows.length !== 1 || !rows[0])
+              return yield* deny("Compact caller requires one original dispatch");
+            const original = yield* inspectDispatch(rows[0].dispatch_id, { requireClaim: true });
+            const transition = original.intent.compiledClaim.transition;
+            if (
+              transition?.kind !== "claim" ||
+              immutableBinding(transition.binding) !== immutableBinding(authority.binding) ||
+              (original.fence.stage !== "assignment-intent" &&
+                original.fence.stage !== "assignment-observed")
+            )
+              return yield* deny("Compact caller requires its original assignment");
+            const existing = yield* callerRows(identity, request);
+            if (existing.length > 1) return yield* deny("Compact caller identity is ambiguous");
+            const saved = existing[0];
+            if (saved) {
+              if (
+                saved.binding_id !== authority.binding.recordId ||
+                saved.generation !== authority.binding.generation ||
+                saved.request_json !== encode(request) ||
+                saved.authority_json !== callerAuthority(original, authority) ||
+                saved.claim_generation !== original.fence.claimGeneration ||
+                saved.status === "released"
+              )
+                return yield* deny("Compact caller reservation changed or released", "conflict");
+              yield* clockCheck(saved.deadline_at_ms);
+              return callerResult(saved, false);
+            }
+            if (rows[0].cleanup_claim_revision !== null)
+              return yield* deny("Original dispatch has claimed cleanup", "conflict");
+            yield* assertHistoryCapacity(authority.binding.recordId, authority.binding.generation);
+            const pending =
+              yield* sql`SELECT 1 FROM project_team_compact_caller WHERE environment_id=${options.environmentId}
+          AND binding_id=${authority.binding.recordId} AND generation=${authority.binding.generation} AND status='pending' LIMIT 1`;
+            if (pending.length)
+              return yield* deny("Another compact caller owns this assignment", "conflict");
+            const predecessors = yield* sql<Row>`SELECT * FROM project_team_pi_operation
+          WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
+          AND generation=${authority.binding.generation} ORDER BY operation_ordinal DESC LIMIT 1`;
+            const predecessor = predecessors[0];
+            if (
+              !predecessor ||
+              (predecessor.operation_kind !== "prompt" &&
+                predecessor.operation_kind !== "compact") ||
+              predecessor.status === "quarantine"
+            )
+              return yield* deny("Compact caller predecessor unavailable");
+            if (
+              original.fence.stage === "assignment-observed" ||
+              predecessor.status === "settled"
+            ) {
+              const intent = yield* decodeReplayIntent(predecessor.intent_json);
+              const checked = yield* lookupInside(
+                identity,
+                yield* decodeStoredRequest(intent.request),
+                predecessor.request_hash,
+                intent.resourceHash,
+              );
+              if (!checked) return yield* deny("Compact caller predecessor receipt unavailable");
+            }
+            const root = yield* roots(authority);
+            yield* operationBudget(authority, root, predecessor);
+            const deadline = Math.min(
+              predecessor.deadline_at_ms,
+              original.intent.limits.deadlineAtMs,
+              original.intent.limits.rootDeadlineAtMs,
+              root.deadlineAtMs,
+            );
+            yield* clockCheck(deadline);
+            const inserted = yield* sql<CallerRow>`INSERT INTO project_team_compact_caller
+          (environment_id,dispatch_id,binding_id,generation,provider_instance_id,thread_id,request_id,request_json,
+          predecessor_operation_id,authority_json,admission_revision,claim_generation,deadline_at_ms,status)
+          VALUES (${options.environmentId},${original.fence.dispatchId},${authority.binding.recordId},${authority.binding.generation},
+          ${identity.providerInstanceId},${identity.threadId},${request.requestId},${encode(request)},${predecessor.operation_id},
+          ${callerAuthority(original, authority)},${original.fence.revision},${original.fence.claimGeneration},${deadline},'pending') RETURNING *`;
+            if (!inserted[0]) return yield* deny("Compact caller admission lost", "conflict");
+            return callerResult(inserted[0], true);
+          }),
+        ),
+      ).pipe(Effect.onError(() => abandonCompaction(identity, request).pipe(Effect.ignore)));
+      yield* notifyCompactCallerChange;
+      return result;
+    });
     const compactInside = Effect.fn("ProjectTeamPiOperations.compactInside")(function* (
       identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
       request: PiManagedOperationRequest,
@@ -2579,7 +2761,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         AND generation=${authority.binding.generation} LIMIT 2`;
       if (dispatches.length !== 1 || !dispatches[0])
         return yield* deny("Compaction requires one original dispatch");
-      const original = yield* readRetained(dispatches[0].dispatch_id);
+      const original = yield* inspectDispatch(dispatches[0].dispatch_id, { requireClaim: true });
       yield* readStageReceipts(original.fence.dispatchId);
       const claim = original.intent.compiledClaim.transition;
       if (
@@ -2605,7 +2787,31 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       }>`SELECT operation_id FROM project_team_pi_operation
         WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
         AND generation=${authority.binding.generation} ORDER BY operation_ordinal DESC LIMIT 1`;
-      const selectedId = saved[0]?.operation_id ?? rows[0]?.operation_id;
+      const callers = yield* callerRows(
+        identity,
+        callerRequest({ ...request, requestId: request.requestId }),
+      );
+      if (callers.length > 1) return yield* deny("Compact caller identity is ambiguous");
+      const caller = callers[0];
+      if (!saved.length) {
+        if (
+          !caller ||
+          caller.status !== "pending" ||
+          caller.request_json !==
+            encode(callerRequest({ ...request, requestId: request.requestId })) ||
+          caller.authority_json !== callerAuthority(original, authority) ||
+          caller.claim_generation !== original.fence.claimGeneration ||
+          (caller.admission_revision !== original.fence.revision &&
+            caller.admission_revision + 1 !== original.fence.revision) ||
+          caller.predecessor_operation_id !== rows[0]?.operation_id
+        )
+          return yield* deny(
+            "Compaction requires its exact pending caller and predecessor",
+            "conflict",
+          );
+        yield* clockCheck(caller.deadline_at_ms);
+      }
+      const selectedId = saved[0]?.operation_id ?? caller?.predecessor_operation_id;
       if (!selectedId) return yield* deny("Compaction predecessor unavailable");
       const row = yield* getRow(selectedId);
       const intent = yield* decodeReplayIntent(row.intent_json);
@@ -2626,6 +2832,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       return {
         operationId,
         original,
+        caller,
         predecessor: {
           operationId: row.operation_id,
           ordinal: row.operation_ordinal,
@@ -2639,13 +2846,134 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         ...(saved.length && intent.compaction ? { association: intent.compaction } : {}),
       };
     });
+    const withCompactionPermit = <A, E, R>(
+      identity: Parameters<typeof current>[0],
+      effect: Effect.Effect<A, E, R>,
+    ) =>
+      Effect.gen(function* () {
+        const targets = yield* sql<{ manifest_json: string | null; sha256: string }>`SELECT
+          CASE WHEN length(CAST(t.manifest_json AS BLOB))<=65536 THEN t.manifest_json END AS manifest_json,t.sha256
+          FROM project_team_review_target t JOIN project_team_run_binding b ON b.record_id=t.binding_id
+          JOIN project_team_dispatch d ON d.binding_id=t.binding_id AND d.generation=t.generation AND d.environment_id=t.environment_id
+          WHERE t.environment_id=${options.environmentId} AND json_extract(b.payload_json,'$.providerInstanceId')=${identity.providerInstanceId}
+          AND json_extract(b.payload_json,'$.threadId')=${identity.threadId} LIMIT 2`;
+        if (!targets.length) return yield* effect;
+        if (
+          targets.length !== 1 ||
+          typeof targets[0]?.manifest_json !== "string" ||
+          Option.isNone(workflow)
+        )
+          return yield* deny("Stable review target repository is unavailable");
+        const target = yield* decodeAllocationReviewTarget(targets[0].manifest_json);
+        if (
+          encode(target) !== targets[0].manifest_json ||
+          digest(target) !== targets[0].sha256 ||
+          target.environmentId !== options.environmentId
+        )
+          return yield* deny("Stable review target repository changed", "conflict");
+        return yield* workflow.value.withRepositoryPermit(
+          "review.replay",
+          target.prepared.manifest.target.repository,
+          effect,
+        );
+      });
     const readCompaction = Effect.fn("ProjectTeamPiOperations.readCompaction")(function* (
       identity: { readonly providerInstanceId: ProviderInstanceId; readonly threadId: ThreadId },
       request: PiManagedOperationRequest,
     ) {
       yield* ownTransaction();
-      return yield* sql.withTransaction(compactInside(identity, request));
+      return yield* withCompactionPermit(
+        identity,
+        sql.withTransaction(compactInside(identity, request)),
+      );
     });
+    const assertCompactionReady = Effect.fn("ProjectTeamPiOperations.assertCompactionReady")(
+      function* (identity: Parameters<typeof current>[0], request: CompactCallerRequest) {
+        yield* ownTransaction();
+        // Subscribe before the first SQL read, so observation committed between the
+        // read and pull remains queued. No permit, SQL loan or assets survive a pull.
+        const hints = yield* subscribeCompactCallerChanges;
+        const bus = yield* Effect.serviceOption(ProjectWorkEventBus);
+        const controls = Option.isSome(bus) ? yield* bus.value.subscribe : Stream.empty;
+        const pull = yield* Stream.toPull(
+          Stream.merge(hints, controls.pipe(Stream.map(() => undefined))),
+        );
+        return yield* Effect.gen(function* () {
+          for (;;) {
+            const checked = yield* withCompactionPermit(
+              identity,
+              sql.withTransaction(
+                Effect.gen(function* () {
+                  const authority = yield* current(identity);
+                  const rows = yield* callerRows(identity, request);
+                  const caller = rows[0];
+                  if (
+                    rows.length !== 1 ||
+                    !caller ||
+                    caller.status === "released" ||
+                    caller.binding_id !== authority.binding.recordId ||
+                    caller.generation !== authority.binding.generation ||
+                    caller.request_json !== encode(callerRequest(request))
+                  )
+                    return yield* deny("Compact caller reservation is unavailable", "conflict");
+                  const original = yield* inspectDispatch(caller.dispatch_id, {
+                    requireClaim: true,
+                  });
+                  if (
+                    caller.authority_json !== callerAuthority(original, authority) ||
+                    caller.claim_generation !== original.fence.claimGeneration ||
+                    (caller.admission_revision !== original.fence.revision &&
+                      caller.admission_revision + 1 !== original.fence.revision)
+                  )
+                    return yield* deny("Compact caller authority changed", "conflict");
+                  yield* clockCheck(caller.deadline_at_ms);
+                  if (original.fence.stage === "assignment-intent" && caller.status === "pending") {
+                    const latest = yield* sql<{
+                      operation_id: string;
+                    }>`SELECT operation_id FROM project_team_pi_operation
+                WHERE environment_id=${options.environmentId} AND binding_id=${caller.binding_id}
+                AND generation=${caller.generation} ORDER BY operation_ordinal DESC LIMIT 1`;
+                    if (latest[0]?.operation_id !== caller.predecessor_operation_id)
+                      return yield* deny("Compact caller predecessor changed", "conflict");
+                    const predecessor = yield* getRow(caller.predecessor_operation_id);
+                    const intent = yield* decodeReplayIntent(predecessor.intent_json);
+                    const qualified = yield* lookupInside(
+                      identity,
+                      yield* decodeStoredRequest(intent.request),
+                      predecessor.request_hash,
+                      intent.resourceHash,
+                    );
+                    if (!qualified) return yield* deny("Compact caller predecessor is not ready");
+                    return { caller, ready: false };
+                  }
+                  const boundary = yield* compactInside(identity, {
+                    threadId: request.threadId,
+                    requestId: request.requestId,
+                    kind: "compact",
+                    ...(request.modelSelection === undefined
+                      ? {}
+                      : { modelSelection: request.modelSelection }),
+                  });
+                  if (!boundary.caller)
+                    return yield* deny("Compact caller reservation is unavailable");
+                  return { caller, ready: true };
+                }),
+              ),
+            );
+            if (checked.ready) return callerResult(checked.caller, false);
+            const remaining = checked.caller.deadline_at_ms - (yield* Clock.currentTimeMillis);
+            if (remaining <= 0) return yield* deny("Pi operation deadline expired");
+            yield* pull.pipe(
+              Effect.timeoutOrElse({
+                duration: remaining,
+                orElse: () => Effect.fail(deny("Pi operation deadline expired")),
+              }),
+            );
+          }
+        }).pipe(Effect.onError(() => abandonCompaction(identity, request).pipe(Effect.ignore)));
+      },
+      Effect.scoped,
+    );
     const lookup = Effect.fn("ProjectTeamPiOperations.lookup")(function* (
       identity: Parameters<typeof lookupInside>[0],
       request: PiManagedOperationRequest,
@@ -2734,112 +3062,126 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           ? undefined
           : yield* decodeResourceIdentity(allocated.resourceHash);
       yield* ownTransaction();
-      const result = yield* sql.withTransaction(
-        Effect.gen(function* () {
-          const authority = yield* current(identity, request.kind === "initialize");
-          const cleanup = yield* sql`SELECT dispatch_id FROM project_team_dispatch
+      const result = yield* withCompactionPermit(
+        identity,
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const authority = yield* current(identity, request.kind === "initialize");
+            const cleanup = yield* sql`SELECT dispatch_id FROM project_team_dispatch
             WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
             AND generation=${authority.binding.generation} AND cleanup_claim_revision IS NOT NULL LIMIT 1`;
-          if (cleanup.length)
-            return yield* deny("Original dispatch has claimed cleanup", "conflict");
-          if (allocation.launch.workspaceRoot !== authority.binding.worktree)
-            return yield* deny("Allocated workspace differs from durable assignment");
-          yield* assertReviewAllocation(authority.binding, allocation);
-          const root = yield* roots(authority);
-          yield* clockCheck(root.deadlineAtMs);
-          let compaction: typeof CompactAssociation.Type | undefined;
-          if (request.kind === "compact") {
-            const boundary = yield* compactInside(identity, request);
-            if (
-              !allocated.compactContext ||
-              boundary.association ||
-              boundary.operationId !== operationId ||
-              resourceHash !== boundary.predecessor.resourceHash
-            )
-              return yield* deny("Compaction requires its frozen current context and predecessor");
-            compaction = yield* decodeCompactAssociation({
-              version: 1,
-              requestId: request.requestId,
-              dispatchId: boundary.original.fence.dispatchId,
-              dispatchIntentSha256: digest(boundary.original.intent),
-              claimGeneration: boundary.original.fence.claimGeneration,
-              fenceRevision: boundary.original.fence.revision,
-              predecessorOperationId: boundary.predecessor.operationId,
-              predecessorOrdinal: boundary.predecessor.ordinal,
-              predecessorReceiptSha256: boundary.predecessor.receiptSha256,
-              contextProvenanceSha256: allocated.compactContext.provenanceSha256,
-              contextTextSha256: allocated.compactContext.textSha256,
-            });
-          }
-          if (request.operationId !== undefined) {
-            const existing =
-              yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE operation_id=${operationId}`;
-            if (existing.length)
+            if (cleanup.length)
+              return yield* deny("Original dispatch has claimed cleanup", "conflict");
+            if (allocation.launch.workspaceRoot !== authority.binding.worktree)
+              return yield* deny("Allocated workspace differs from durable assignment");
+            yield* assertReviewAllocation(authority.binding, allocation);
+            const root = yield* roots(authority);
+            yield* clockCheck(root.deadlineAtMs);
+            let compaction: typeof CompactAssociation.Type | undefined;
+            if (request.kind === "compact") {
+              const boundary = yield* compactInside(identity, request);
+              if (
+                !allocated.compactContext ||
+                boundary.association ||
+                boundary.operationId !== operationId ||
+                resourceHash !== boundary.predecessor.resourceHash
+              )
+                return yield* deny(
+                  "Compaction requires its frozen current context and predecessor",
+                );
+              compaction = yield* decodeCompactAssociation({
+                version: 1,
+                requestId: request.requestId,
+                dispatchId: boundary.original.fence.dispatchId,
+                dispatchIntentSha256: digest(boundary.original.intent),
+                claimGeneration: boundary.original.fence.claimGeneration,
+                fenceRevision: boundary.original.fence.revision,
+                predecessorOperationId: boundary.predecessor.operationId,
+                predecessorOrdinal: boundary.predecessor.ordinal,
+                predecessorReceiptSha256: boundary.predecessor.receiptSha256,
+                contextProvenanceSha256: allocated.compactContext.provenanceSha256,
+                contextTextSha256: allocated.compactContext.textSha256,
+              });
+            }
+            if (request.operationId !== undefined) {
+              const existing =
+                yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE operation_id=${operationId}`;
+              if (existing.length)
+                return yield* deny(
+                  "Stable Pi operation already recorded; lookup required",
+                  "conflict",
+                );
+            }
+            const active =
+              yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId} AND status IN ('prepared','starting','running','quarantine')`;
+            if (active.length)
               return yield* deny(
-                "Stable Pi operation already recorded; lookup required",
-                "conflict",
+                active[0]?.request_hash === requestHash
+                  ? "Duplicate Pi operation cannot replay"
+                  : "Pi thread already has an owner",
+                active[0]?.status === "quarantine" ? "uncertain" : "conflict",
               );
-          }
-          const active =
-            yield* sql<Row>`SELECT * FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId} AND status IN ('prepared','starting','running','quarantine')`;
-          if (active.length)
-            return yield* deny(
-              active[0]?.request_hash === requestHash
-                ? "Duplicate Pi operation cannot replay"
-                : "Pi thread already has an owner",
-              active[0]?.status === "quarantine" ? "uncertain" : "conflict",
+            yield* assertHistoryCapacity(authority.binding.recordId, authority.binding.generation);
+            const previous = yield* sql<{
+              ordinal: number;
+            }>`SELECT COALESCE(MAX(operation_ordinal),-1)+1 AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
+            const ordinal = previous[0]?.ordinal;
+            if (ordinal === undefined || !Number.isSafeInteger(ordinal))
+              return yield* deny("Pi operation ordinal exhausted");
+            const operation = { operationId, operationKind: request.kind };
+            const limits = yield* rootBudget(
+              authority,
+              root,
+              operation,
+              undefined,
+              request,
+              resourceHash,
+              compaction,
             );
-          yield* assertHistoryCapacity(authority.binding.recordId, authority.binding.generation);
-          const previous = yield* sql<{
-            ordinal: number;
-          }>`SELECT COALESCE(MAX(operation_ordinal),-1)+1 AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
-          const ordinal = previous[0]?.ordinal;
-          if (ordinal === undefined || !Number.isSafeInteger(ordinal))
-            return yield* deny("Pi operation ordinal exhausted");
-          const operation = { operationId, operationKind: request.kind };
-          const limits = yield* rootBudget(
-            authority,
-            root,
-            operation,
-            undefined,
-            request,
-            resourceHash,
-            compaction,
-          );
-          const { maximumTokens, deadlineAtMs } = limits;
-          yield* clockCheck(deadlineAtMs);
-          if (!limits.exists)
-            yield* sql`INSERT INTO project_team_model_budget VALUES(${options.environmentId},${authority.binding.projectId},${root.rootTaskId},${limits.rootBudget.maximumTokens},${limits.rootBudget.deadlineAtMs})`;
-          const principal = {
-            actor: { kind: "agent" as const, id: managedActorId(authority.credential) },
-            managed: authority.credential,
-          };
-          const intent = encode({
-            request,
-            binding: authority.binding,
-            role: authority.role,
-            allocation,
-            rootBudget: limits.rootBudget,
-            operationLimits: { maximumTokens, deadlineAtMs },
-            ...(compaction === undefined ? {} : { compaction }),
-            ...(resourceHash === undefined ? {} : { resourceHash }),
-          });
-          yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json) VALUES (${operationId},${options.environmentId},${authority.binding.projectId},${authority.binding.recordId},${authority.binding.generation},${identity.providerInstanceId},${identity.threadId},${workerId},${ordinal},${request.kind},${requestHash},${root.root.recordId},${root.root.taskId},${maximumTokens},${deadlineAtMs},'prepared',${intent})`;
-          yield* sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status) VALUES(${allocation.unit},${operationId},${encode(allocation)},'allocated')`;
-          const captured = {
-            operation,
-            workerId,
-            ordinal,
-            authority,
-            principal,
-            maximumTokens,
-            deadlineAtMs,
-            allocation,
-          };
-          yield* authorize(captured);
-          return captured;
-        }),
+            const { maximumTokens, deadlineAtMs } = limits;
+            yield* clockCheck(deadlineAtMs);
+            if (!limits.exists)
+              yield* sql`INSERT INTO project_team_model_budget VALUES(${options.environmentId},${authority.binding.projectId},${root.rootTaskId},${limits.rootBudget.maximumTokens},${limits.rootBudget.deadlineAtMs})`;
+            const principal = {
+              actor: { kind: "agent" as const, id: managedActorId(authority.credential) },
+              managed: authority.credential,
+            };
+            const intent = encode({
+              request,
+              binding: authority.binding,
+              role: authority.role,
+              allocation,
+              rootBudget: limits.rootBudget,
+              operationLimits: { maximumTokens, deadlineAtMs },
+              ...(compaction === undefined ? {} : { compaction }),
+              ...(resourceHash === undefined ? {} : { resourceHash }),
+            });
+            yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json) VALUES (${operationId},${options.environmentId},${authority.binding.projectId},${authority.binding.recordId},${authority.binding.generation},${identity.providerInstanceId},${identity.threadId},${workerId},${ordinal},${request.kind},${requestHash},${root.root.recordId},${root.root.taskId},${maximumTokens},${deadlineAtMs},'prepared',${intent})`;
+            yield* sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status) VALUES(${allocation.unit},${operationId},${encode(allocation)},'allocated')`;
+            if (request.kind === "compact") {
+              const consumed =
+                yield* sql`UPDATE project_team_compact_caller SET status='consumed',operation_id=${operationId}
+              WHERE environment_id=${options.environmentId} AND binding_id=${authority.binding.recordId}
+              AND generation=${authority.binding.generation} AND request_id=${request.requestId} AND status='pending' RETURNING request_id`;
+              if (consumed.length !== 1)
+                return yield* deny("Compact caller consumption lost", "conflict");
+            }
+            const captured = {
+              operation,
+              workerId,
+              ordinal,
+              authority,
+              principal,
+              maximumTokens,
+              deadlineAtMs,
+              allocation,
+            };
+            yield* authorize(captured);
+            return captured;
+          }),
+        ),
       );
+      yield* notifyCompactCallerChange;
       yield* authorize(result);
       return result;
     });
@@ -3283,9 +3625,14 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               threadId: captured.authority.binding.threadId,
             });
           }
+          if (terminal.outcome !== "success" || uncertain)
+            yield* sql`UPDATE project_team_compact_caller SET status='released'
+              WHERE environment_id=${options.environmentId} AND binding_id=${row.binding_id}
+              AND generation=${row.generation} AND predecessor_operation_id=${row.operation_id} AND status='pending'`;
           return uncertain ? ("uncertain" as const) : ("drained" as const);
         }),
       );
+      yield* notifyCompactCallerChange;
       if (terminal.outcome === "success") {
         yield* current({
           providerInstanceId: captured.authority.binding.providerInstanceId,
@@ -3651,6 +3998,12 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         ),
       lookup: (...args: Parameters<typeof lookup>) => guard(lookup(...args)),
       lookupInTransaction,
+      reserveCompaction: (...args: Parameters<typeof reserveCompaction>) =>
+        guard(reserveCompaction(...args)),
+      assertCompactionReady: (...args: Parameters<typeof assertCompactionReady>) =>
+        guard(assertCompactionReady(...args)),
+      abandonCompaction: (...args: Parameters<typeof abandonCompaction>) =>
+        guard(abandonCompaction(...args)),
       readCompaction: (...args: Parameters<typeof readCompaction>) =>
         guard(readCompaction(...args)),
       readCompactionAnchorInTransaction: (

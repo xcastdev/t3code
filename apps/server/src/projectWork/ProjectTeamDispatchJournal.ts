@@ -1,3 +1,4 @@
+import { notifyCompactCallerChange } from "./ProjectTeamCompactCaller.ts";
 import {
   canonicalProjectWorkPayload,
   ProjectTeamIntegrationSources,
@@ -1527,7 +1528,8 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
         return yield* deny("Stage evidence exceeds its storage bound");
       const verifyStage = options.verifyStage;
       if (!verifyStage) return yield* deny("Actual stage verification is unavailable");
-      return yield* sql.withTransaction(
+      const independent = Option.isNone(yield* Effect.serviceOption(sql.transactionService));
+      const result = yield* sql.withTransaction(
         Effect.gen(function* () {
           const value = yield* read(expected.dispatchId);
           const history = yield* readStageHistory(value.row, value.intent);
@@ -1622,6 +1624,8 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
           };
         }),
       );
+      if (independent) yield* notifyCompactCallerChange;
+      return result;
     });
     const readHistoricalInTransaction = Effect.fn(
       "ProjectTeamDispatchJournal.readHistoricalInTransaction",
@@ -1678,6 +1682,14 @@ export const makeProjectTeamDispatchJournal = Effect.fn("makeProjectTeamDispatch
               return yield* deny("Cleanup claim belongs to another revision");
             return { _tag: "Claimed" as const, snapshot };
           }
+          const now = yield* Clock.currentTimeMillis;
+          yield* sql`UPDATE project_team_compact_caller SET status='released'
+            WHERE environment_id=${environmentId} AND binding_id=${value.row.binding_id}
+            AND generation=${value.row.generation} AND status='pending' AND deadline_at_ms<=${now}`;
+          const callers = yield* sql`SELECT 1 FROM project_team_compact_caller
+            WHERE environment_id=${environmentId} AND binding_id=${value.row.binding_id}
+            AND generation=${value.row.generation} AND status='pending' LIMIT 1`;
+          if (callers.length) return { _tag: "WaitingForCompact" as const };
           const operations = yield* sql<{
             operation_kind: string;
             status: string;

@@ -1,3 +1,5 @@
+import * as Deferred from "effect/Deferred";
+import type { CompactCallerRequest } from "./ProjectTeamCompactCaller.ts";
 import type { ProviderInstanceId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
@@ -45,6 +47,7 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
     maximumEnvironmentModelCalls,
   });
   let stopped = false;
+  const stopSignal = yield* Deferred.make<void>();
   const resolveOperationId = Effect.fn("ProjectTeamRuntime.resolveOperationId")(function* (
     providerInstanceId: ProviderInstanceId,
     request: PiManagedOperationRequest,
@@ -133,6 +136,47 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
       return yield* denied("Original dispatch changed during provider identity lookup");
     return operationId;
   });
+  const compactionCall = Effect.fn("ProjectTeamRuntime.compactionCall")(function* (
+    providerInstanceId: ProviderInstanceId,
+    request: CompactCallerRequest,
+    ready: boolean,
+  ) {
+    const identity = { providerInstanceId, threadId: request.threadId };
+    return yield* Effect.gen(function* () {
+      const enabled = yield* settings.getSettings;
+      if (stopped || !enabled.projectWorkEnabled || !enabled.projectTeamExecutionEnabled)
+        return yield* denied("Project team execution is disabled");
+      const result = yield* Effect.raceFirst(
+        ready
+          ? operations.assertCompactionReady(identity, request)
+          : operations.reserveCompaction(identity, request),
+        Deferred.await(stopSignal).pipe(
+          Effect.andThen(Effect.fail(denied("Project team execution is disabled"))),
+        ),
+      );
+      const currentSettings = yield* settings.getSettings;
+      if (
+        stopped ||
+        !currentSettings.projectWorkEnabled ||
+        !currentSettings.projectTeamExecutionEnabled
+      )
+        return yield* denied("Project team execution is disabled");
+      return result;
+    }).pipe(
+      Effect.onError(() => operations.abandonCompaction(identity, request).pipe(Effect.ignore)),
+      Effect.mapError((error) =>
+        isManagedRuntimeError(error) ? error : denied("Compact caller authority unavailable"),
+      ),
+    );
+  });
+  yield* pi.installCompactionHandlers({
+    reserveCompaction: (providerInstanceId, request) =>
+      compactionCall(providerInstanceId, request, false),
+    assertCompactionReady: (providerInstanceId, request) =>
+      compactionCall(providerInstanceId, request, true),
+    abandonCompaction: (providerInstanceId, request) =>
+      operations.abandonCompaction({ providerInstanceId, threadId: request.threadId }, request),
+  });
   yield* pi.installOperationResolver((instanceId, request) =>
     resolveOperationId(instanceId, request).pipe(
       Effect.mapError((error) =>
@@ -144,7 +188,7 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
   );
   const stop = Effect.sync(() => {
     stopped = true;
-  });
+  }).pipe(Effect.andThen(Deferred.succeed(stopSignal, undefined)), Effect.asVoid);
   yield* Effect.addFinalizer(() => stop);
   return { stop };
 });

@@ -1,3 +1,4 @@
+import type { CompactCallerHandlers, CompactCallerRequest } from "./ProjectTeamCompactCaller.ts";
 import type { ProviderInstanceId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -43,6 +44,51 @@ export const makeProjectTeamPiRuntime = Effect.fn("makeProjectTeamPiRuntime")(fu
           if (resolver === owned) resolver = undefined;
         }),
     ).pipe(Effect.asVoid);
+  let compactionHandlers: CompactCallerHandlers | undefined;
+  const installCompactionHandlers = (callbacks: CompactCallerHandlers) =>
+    Effect.acquireRelease(
+      Effect.suspend(() => {
+        if (compactionHandlers !== undefined) return Effect.fail(denied());
+        const owned = Object.freeze({ ...callbacks });
+        compactionHandlers = owned;
+        return Effect.succeed(owned);
+      }),
+      (owned) =>
+        Effect.sync(() => {
+          if (compactionHandlers === owned) compactionHandlers = undefined;
+        }),
+    ).pipe(Effect.asVoid);
+  // Reservation waits must never borrow runtime assets: the adapter may still be
+  // draining the predecessor or replacing this instance while the caller is idle.
+  const callCompaction = <A>(
+    instanceId: ProviderInstanceId,
+    request: CompactCallerRequest,
+    select: (
+      handlers: CompactCallerHandlers,
+    ) => (
+      instanceId: ProviderInstanceId,
+      request: CompactCallerRequest,
+    ) => Effect.Effect<A, PiManagedRuntimeError>,
+  ) =>
+    Effect.suspend(() => {
+      const owned = compactionHandlers;
+      if (!owned) return Effect.fail(denied());
+      return select(owned)(instanceId, request).pipe(
+        Effect.tap(() =>
+          Effect.suspend(() =>
+            compactionHandlers === owned ? Effect.void : Effect.fail(denied()),
+          ),
+        ),
+      );
+    });
+  const compaction: CompactCallerHandlers = {
+    reserveCompaction: (instanceId, request) =>
+      callCompaction(instanceId, request, (handlers) => handlers.reserveCompaction),
+    assertCompactionReady: (instanceId, request) =>
+      callCompaction(instanceId, request, (handlers) => handlers.assertCompactionReady),
+    abandonCompaction: (instanceId, request) =>
+      callCompaction(instanceId, request, (handlers) => handlers.abandonCompaction),
+  };
   const publishAssets: NonNullable<PiProductionRuntimeHooks["publishAssets"]> = (
     instanceId,
     assets,
@@ -97,6 +143,8 @@ export const makeProjectTeamPiRuntime = Effect.fn("makeProjectTeamPiRuntime")(fu
       }),
     );
   return {
+    installCompactionHandlers,
+    ...compaction,
     publishAssets,
     withInstance,
     installOperationResolver,
