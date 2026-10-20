@@ -27,8 +27,8 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
 import { IntegrationSources } from "./IntegrationSources";
-import { TaskStageRail } from "./TaskStageRail";
-import { taskStages, type TaskStageId } from "./taskStages";
+import { LinkedTaskSummary, TaskStageRail } from "./TaskStageRail";
+import { linkedTaskProvenance, taskStages, type TaskStageId } from "./taskStages";
 import { WorkCard } from "./WorkDataNotice";
 import {
   WorkDetails,
@@ -1023,8 +1023,20 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     hasPlan: plan !== undefined,
     planGate: planGate?.status,
     executionGranted,
-    workerActive: writer,
+    // Display only: the conservative `writer` write fence also counts reserved and stopping runs.
+    workersRunning: taskRecords.some(
+      (record) => record.kind === "run-binding" && record.status === "running",
+    ),
   });
+  const linked = linkedTaskProvenance(
+    membership?.kind === "task-membership" ? membership : undefined,
+    records.filter(
+      (record): record is Gate =>
+        record.kind === "gate" &&
+        record.projectId === projectId &&
+        recordCounts.get(record.recordId) === 1,
+    ),
+  );
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1041,7 +1053,11 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
           <RefreshCwIcon aria-hidden /> Refresh task
         </Button>
       </div>
-      <TaskStageRail stages={stages.stages} next={stages.next} onSelect={jumpTo} />
+      {linked ? (
+        <LinkedTaskSummary provenance={linked} />
+      ) : (
+        <TaskStageRail stages={stages.stages} next={stages.next} onSelect={jumpTo} />
+      )}
       {!access || !baselineReady ? (
         <p role="status" className="text-sm text-warning-foreground">
           {!props.connected

@@ -2007,4 +2007,135 @@ describe("GuidedTaskDetail human interactions", () => {
     expect(button("Apply resume").disabled).toBe(true);
     expect(button("Start execution").disabled).toBe(true);
   });
+  describe("task workflow guidance", () => {
+    const fields = { projectId, revision: 1, generation: 0, updatedAt: at };
+    function executionGate() {
+      const specificationHash = hash({
+        specification: current.task.specification,
+        criteria: current.criteria.map(({ criterionId, description, required, waiver }) => ({
+          criterionId,
+          description,
+          required,
+          waiver,
+        })),
+      });
+      const planHash = hash({
+        content: "Implement reconnect, then exercise a remote disconnect",
+        dependencyTaskIds: [],
+      });
+      return decodeRecord({
+        ...fields,
+        recordId: "execution-gate",
+        kind: "gate",
+        status: "approved",
+        taskId: current.task.taskId,
+        gate: "execution",
+        specRevision: current.task.specRevision,
+        planRevision: 3,
+        contentHash: hash({
+          specificationHash,
+          plan: { planRevision: 3, contentHash: planHash, dependencyTaskIds: [] },
+        }),
+        evidenceIds: [],
+        attribution,
+      });
+    }
+    const rail = () => host.querySelector('[aria-label="Task workflow"]');
+
+    it("guides a root task through its own scope, plan and execution", async () => {
+      await render();
+      expect(rail()?.textContent).toContain("Approve or reject the specification");
+      expect(host.textContent).toContain("Next step: Approve or reject the specification");
+      expect(host.querySelector('[aria-label="Linked assignment"]')).toBeNull();
+    });
+
+    it("replaces root scope guidance with recorded provenance for an authorized child", async () => {
+      const [membership, ...rest] = records(current);
+      foundation = [
+        decodeRecord({
+          ...membership,
+          deliverableKind: "review",
+          parentTaskId: "parent-task",
+          assignment: {
+            authorizationGateId: "child-grant",
+            outputDescriptions: ["Independent review findings"],
+          },
+        }),
+        ...rest,
+        decodeRecord({
+          ...fields,
+          recordId: "child-grant",
+          kind: "gate",
+          status: "approved",
+          taskId: current.task.taskId,
+          gate: "assignment",
+          specRevision: current.task.specRevision,
+          planRevision: 0,
+          contentHash: "child-scope",
+          evidenceIds: [],
+          attribution,
+          assignmentAuthorization: {
+            assignmentKind: "review",
+            parentTaskId: "parent-task",
+            parentSpecRevision: 1,
+            parentSpecificationGateId: "parent-spec-gate",
+            parentSpecificationHash: "parent-spec-hash",
+            parentScopeHash: "parent-scope-hash",
+          },
+        }),
+      ];
+      await render();
+      expect(rail()).toBeNull();
+      expect(host.textContent).not.toContain("Next step:");
+      const linked = host.querySelector('[aria-label="Linked assignment"]');
+      expect(linked?.textContent).toContain("Review assignment");
+      expect(linked?.textContent).toContain("Linked to parent task parent-task.");
+      expect(linked?.textContent).toContain(
+        "Authorized by assignment gate child-grant · Recorded approved.",
+      );
+    });
+
+    it("does not invent an authorization gate missing from the snapshot", async () => {
+      const [membership, ...rest] = records(current);
+      foundation = [
+        decodeRecord({
+          ...membership,
+          parentTaskId: "parent-task",
+          assignment: { authorizationGateId: "absent-grant", outputDescriptions: ["Findings"] },
+        }),
+        ...rest,
+      ];
+      await render();
+      expect(rail()).toBeNull();
+      const linked = host.querySelector('[aria-label="Linked assignment"]');
+      expect(linked?.textContent).toContain("Linked assignment");
+      expect(linked?.textContent).toContain(
+        "Authorization gate absent-grant is not in this snapshot.",
+      );
+      expect(linked?.textContent).not.toContain("Recorded approved");
+    });
+
+    it.each(["reserved", "stopping", "quarantined", "revoked"])(
+      "does not report a %s binding as running while still fencing writes",
+      async (status) => {
+        foundation = [
+          ...records(current, "approved"),
+          executionGate(),
+          ...workerRecords({ status }),
+        ];
+        await render();
+        expect(rail()?.textContent).toContain("Execution authorized");
+        expect(rail()?.textContent).not.toContain("Workers recorded as running");
+        await action("resume");
+        await fill("Control reason", "Continue the reviewed work");
+        expect(button("Apply resume").disabled).toBe(true);
+      },
+    );
+
+    it("reports workers as running only for a running binding", async () => {
+      foundation = [...records(current, "approved"), executionGate(), ...workerRecords()];
+      await render();
+      expect(rail()?.textContent).toContain("Workers recorded as running");
+    });
+  });
 });

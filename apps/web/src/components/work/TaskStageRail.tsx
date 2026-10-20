@@ -1,7 +1,7 @@
 import { CheckIcon } from "lucide-react";
 
 import { cn } from "../../lib/utils";
-import type { TaskStage, TaskStageId } from "./taskStages";
+import type { LinkedTaskProvenance, TaskStage, TaskStageId } from "./taskStages";
 
 /** Recorded task progress with the next step spelled out; each stage jumps to its section. */
 export function TaskStageRail({
@@ -52,6 +52,36 @@ export function TaskStageRail({
       <p className="text-sm">
         <span className="font-medium">Next step: </span>
         <span className="text-muted-foreground">{next}</span>
+      </p>
+    </div>
+  );
+}
+
+/** Replaces the stage rail for linked child tasks, naming the recorded authorization source. */
+export function LinkedTaskSummary({ provenance }: { readonly provenance: LinkedTaskProvenance }) {
+  const kind = provenance.kind
+    ? `${provenance.kind.charAt(0).toUpperCase()}${provenance.kind.slice(1)}`
+    : "Linked";
+  return (
+    <div
+      role="group"
+      aria-label="Linked assignment"
+      className="space-y-1 rounded-lg border border-border/60 bg-background/40 px-3 py-2 text-sm"
+    >
+      <p className="font-medium">{kind} assignment</p>
+      <p className="break-all text-muted-foreground">
+        {provenance.parentTaskId
+          ? `Linked to parent task ${provenance.parentTaskId}.`
+          : "Parent task not recorded."}{" "}
+        {provenance.gateId === undefined
+          ? "No authorization gate is recorded for this assignment."
+          : provenance.gateStatus === undefined
+            ? `Authorization gate ${provenance.gateId} is not in this snapshot.`
+            : `Authorized by ${provenance.gateKind} gate ${provenance.gateId} · Recorded ${provenance.gateStatus}.`}
+      </p>
+      <p className="text-xs text-muted-foreground">
+        This work was authorized when it was started from the parent task, not through this task's
+        own scope and plan approvals. The server rechecks that authorization before each action.
       </p>
     </div>
   );

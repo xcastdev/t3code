@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { taskStages, type TaskStageInput } from "./taskStages";
+import { ProjectTeamRecord } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+
+import { linkedTaskProvenance, taskStages, type TaskStageInput } from "./taskStages";
 
 const base: TaskStageInput = {
   state: "draft",
@@ -9,7 +12,7 @@ const base: TaskStageInput = {
   hasPlan: false,
   planGate: undefined,
   executionGranted: false,
-  workerActive: false,
+  workersRunning: false,
 };
 const statuses = (input: TaskStageInput) =>
   taskStages(input).stages.map((stage) => `${stage.id}:${stage.status}`);
@@ -72,5 +75,88 @@ describe("taskStages", () => {
   it("names blocked and canceled tasks instead of a stage action", () => {
     expect(taskStages({ ...base, state: "blocked" }).next).toMatch(/^Blocked/);
     expect(taskStages({ ...base, state: "canceled" }).next).toMatch(/^Canceled/);
+  });
+});
+
+describe("taskStages worker display", () => {
+  const approved = {
+    ...base,
+    state: "in-progress",
+    hasSpecification: true,
+    specificationGate: "approved",
+    hasPlan: true,
+    planGate: "approved",
+    executionGranted: true,
+  } as const;
+  it("names running workers only when a binding is running", () => {
+    expect(taskStages({ ...approved, workersRunning: true }).next).toBe(
+      "Workers recorded as running",
+    );
+    expect(taskStages({ ...approved, workersRunning: false }).next).toBe("Execution authorized");
+  });
+});
+
+describe("linkedTaskProvenance", () => {
+  const decode = Schema.decodeUnknownSync(ProjectTeamRecord);
+  const at = "2026-10-01T10:00:00.000Z";
+  const fields = { projectId: "project-1", revision: 1, generation: 0, updatedAt: at };
+  const membership = (extra: Record<string, unknown> = {}) => {
+    const record = decode({
+      ...fields,
+      recordId: "membership",
+      kind: "task-membership",
+      status: "active",
+      taskId: "child",
+      executionKind: "managed",
+      deliverableKind: "plan",
+      ...extra,
+    });
+    if (record.kind !== "task-membership") throw new Error("membership expected");
+    return record;
+  };
+  const gate = (recordId: string) => {
+    const record = decode({
+      ...fields,
+      recordId,
+      kind: "gate",
+      status: "approved",
+      taskId: "child",
+      gate: "investigation",
+      specRevision: 1,
+      planRevision: 0,
+      contentHash: "scope",
+      evidenceIds: [],
+      attribution: { actor: { kind: "human" }, source: { kind: "web" }, recordedAt: at },
+    });
+    if (record.kind !== "gate") throw new Error("gate expected");
+    return record;
+  };
+  const child = {
+    parentTaskId: "parent",
+    assignment: { authorizationGateId: "grant", outputDescriptions: ["Findings"] },
+  };
+
+  it("returns null for a root task so the stage rail applies", () => {
+    expect(linkedTaskProvenance(membership(), [gate("grant")])).toBeNull();
+    expect(linkedTaskProvenance(undefined, [])).toBeNull();
+  });
+
+  it("reports the single recorded authorization gate", () => {
+    expect(linkedTaskProvenance(membership(child), [gate("grant")])).toEqual({
+      parentTaskId: "parent",
+      kind: "investigation",
+      gateId: "grant",
+      gateKind: "investigation",
+      gateStatus: "approved",
+    });
+  });
+
+  it("leaves the gate unknown when it is missing or ambiguous", () => {
+    for (const gates of [[], [gate("grant"), gate("grant")]])
+      expect(linkedTaskProvenance(membership(child), gates)).toMatchObject({
+        gateId: "grant",
+        gateKind: undefined,
+        gateStatus: undefined,
+      });
   });
 });

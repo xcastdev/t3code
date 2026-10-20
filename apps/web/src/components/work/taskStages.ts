@@ -1,6 +1,8 @@
 import type { ProjectTeamRecord } from "@t3tools/contracts";
 
-type GateStatus = Extract<ProjectTeamRecord, { kind: "gate" }>["status"];
+type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
+type GateStatus = Gate["status"];
+type Membership = Extract<ProjectTeamRecord, { kind: "task-membership" }>;
 
 export type TaskStageId = "scope" | "plan" | "execution" | "review";
 export type TaskStageStatus = "done" | "current" | "upcoming";
@@ -19,7 +21,8 @@ export interface TaskStageInput {
   readonly hasPlan: boolean;
   readonly planGate: GateStatus | undefined;
   readonly executionGranted: boolean;
-  readonly workerActive: boolean;
+  /** True only when a recorded binding is running; reserved or stopping bindings do not count. */
+  readonly workersRunning: boolean;
 }
 
 const granted = (status: GateStatus | undefined) => status === "approved" || status === "consumed";
@@ -67,7 +70,7 @@ export function taskStages(input: TaskStageInput): {
       detail: executionDone
         ? "Execution recorded"
         : input.executionGranted
-          ? input.workerActive
+          ? input.workersRunning
             ? "Workers recorded as running"
             : "Execution authorized"
           : "Start execution after approvals",
@@ -99,4 +102,38 @@ export function taskStages(input: TaskStageInput): {
           ? "Completed. No further step is recorded."
           : (stages[currentIndex]?.detail ?? "No further step is recorded.");
   return { stages, next };
+}
+
+export interface LinkedTaskProvenance {
+  readonly parentTaskId: string | undefined;
+  readonly kind: string | undefined;
+  readonly gateId: string | undefined;
+  readonly gateKind: Gate["gate"] | undefined;
+  readonly gateStatus: GateStatus | undefined;
+}
+
+/**
+ * Investigation, implementation and review children run under the authorization gate recorded
+ * when they were started from their parent, so the root scope/plan/execution rail does not
+ * describe them. Returns null for root
+ * tasks. The gate is reported only when exactly one matching record is present; nothing is
+ * inferred when it is missing.
+ */
+export function linkedTaskProvenance(
+  membership: Membership | undefined,
+  gates: ReadonlyArray<Gate>,
+): LinkedTaskProvenance | null {
+  if (!membership || (membership.parentTaskId === undefined && !membership.assignment)) return null;
+  const gateId = membership.assignment?.authorizationGateId;
+  const matches = gateId === undefined ? [] : gates.filter((gate) => gate.recordId === gateId);
+  const gate = matches.length === 1 ? matches[0] : undefined;
+  return {
+    parentTaskId: membership.parentTaskId ?? gate?.assignmentAuthorization?.parentTaskId,
+    kind:
+      gate?.assignmentAuthorization?.assignmentKind ??
+      (gate?.gate === "investigation" ? "investigation" : undefined),
+    gateId,
+    gateKind: gate?.gate,
+    gateStatus: gate?.status,
+  };
 }

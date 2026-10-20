@@ -749,7 +749,7 @@ function ConfigurationForm(
                 <label className="flex flex-col gap-1 text-sm">
                   Memory access
                   <select
-                    aria-label={`${profile.role} memory`}
+                    aria-label={`${profile.role} memory access`}
                     className={workSelectClass}
                     value={profile.memoryAccess}
                     onChange={(event) =>

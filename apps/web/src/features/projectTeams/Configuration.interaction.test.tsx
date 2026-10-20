@@ -582,7 +582,11 @@ describe("Configuration through mounted foundation, shared atoms and encoded RPC
       await change("investigator instructions", "New sourced investigation");
       await change("investigator skills", "first\nsecond");
       await change("investigator tools", "pi.read\npi.search");
-      await change("investigator memory", "shared");
+      const memory = host.querySelector('select[aria-label="investigator memory access"]');
+      // The accessible name must contain the visible "Memory access" label (WCAG label in name).
+      expect(memory?.closest("label")?.firstChild?.textContent?.trim()).toBe("Memory access");
+      expect(memory?.getAttribute("aria-label")?.toLowerCase()).toContain("memory access");
+      await change("investigator memory access", "shared");
       await change("Task priorities", "task-1: 42");
       await change("investigator delegation depth", "4");
       await save();
