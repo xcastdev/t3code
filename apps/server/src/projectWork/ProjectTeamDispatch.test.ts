@@ -524,6 +524,36 @@ for (const stage of ["workspace-ready", "setup-complete", "session-bound"] as co
   );
 }
 
+for (const joined of [true, false]) {
+  it.effect(
+    `controlled assignment stop ${joined ? "joins without uncertainty" : "retains failed cleanup"}`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const h = yield* harness;
+          h.ports.sendAssignment = () => Effect.fail(h.failure);
+          h.ports.isControlledStop = (cause) =>
+            cause.reasons.length === 1 &&
+            cause.reasons.some(
+              (reason) => Cause.isFailReason(reason) && reason.error === h.failure,
+            );
+          if (!joined) h.ports.stopAndJoin = () => Effect.fail(h.cleanupFailure);
+          const exit = yield* h.make().dispatch(h.request.dispatchId).pipe(Effect.exit);
+          expect(Exit.isFailure(exit)).toBe(true);
+          expect(h.events.includes("uncertain")).toBe(!joined);
+          expect(h.events).not.toContain("assignment-observed");
+          expect(h.getSnapshot().fence.stage).toBe("assignment-intent");
+          if (joined) expect(h.events.at(-1)).toBe("joined");
+          else if (Exit.isFailure(exit))
+            expect(
+              exit.cause.reasons.filter(Cause.isFailReason).map((reason) => reason.error),
+            ).toEqual([h.failure, h.cleanupFailure]);
+          expect((yield* h.make().dispatch(h.request.dispatchId))._tag).toBe("RecoveryRequired");
+        }),
+      ),
+  );
+}
+
 it.effect("uncertain assignment is retained and never blindly resent", () =>
   scoped(
     Effect.gen(function* () {

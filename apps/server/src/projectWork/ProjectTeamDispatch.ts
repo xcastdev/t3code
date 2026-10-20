@@ -119,6 +119,8 @@ export interface ProjectTeamDispatchPorts<
     snapshot: ProjectTeamDispatchSnapshot,
     session: Session,
   ) => Effect.Effect<Assignment | undefined, Error, Services>;
+  // Only a cause produced by an exact retained control revocation may bypass delivery uncertainty.
+  readonly isControlledStop?: (cause: Cause.Cause<Error | ProjectTeamDispatchError>) => boolean;
   // These use retained cleanup ownership, including after cancellation or authority loss.
   readonly recordUncertain: (
     owner: Owner,
@@ -264,7 +266,8 @@ export function makeProjectTeamDispatch<
         ).pipe(Effect.exit);
         if (Exit.isSuccess(result)) return result.value;
         let cause = result.cause;
-        if (assignmentMayHaveBeenSent && !assignmentObserved) {
+        const controlledStop = ports.isControlledStop?.(cause) === true;
+        if (assignmentMayHaveBeenSent && !assignmentObserved && !controlledStop) {
           const recorded = yield* Effect.suspend(() =>
             ports.recordUncertain(owner, snapshot, cause),
           ).pipe(Effect.exit);
@@ -273,7 +276,15 @@ export function makeProjectTeamDispatch<
         const cleanup = yield* Effect.suspend(() => ports.stopAndJoin(owner, snapshot, cause)).pipe(
           Effect.exit,
         );
-        if (Exit.isFailure(cleanup)) cause = Cause.combine(cause, cleanup.cause);
+        if (Exit.isFailure(cleanup)) {
+          cause = Cause.combine(cause, cleanup.cause);
+          if (controlledStop && assignmentMayHaveBeenSent && !assignmentObserved) {
+            const recorded = yield* Effect.suspend(() =>
+              ports.recordUncertain(owner, snapshot, cause),
+            ).pipe(Effect.exit);
+            if (Exit.isFailure(recorded)) cause = Cause.combine(cause, recorded.cause);
+          }
+        }
         return yield* Effect.failCause(cause);
       }),
     );

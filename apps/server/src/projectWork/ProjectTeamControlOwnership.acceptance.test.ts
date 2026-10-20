@@ -6,9 +6,12 @@ import {
   type ProjectTeamGuidedIntent,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import {
+  assertProjectTeamDispatchAuthority,
+  isProjectTeamControlledStop,
   stopProjectTeamOwnedThread,
   waitForProjectTeamAssignmentChange,
 } from "./ProjectTeamExecutionHost.ts";
@@ -301,19 +304,26 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
           Date.parse(at) + 300000,
           {
             projectId,
-            assertCurrent: f.journal.inspect(claimed.fence.dispatchId).pipe(
+            assertCurrent: assertProjectTeamDispatchAuthority(f.sql, f.journal, claimed).pipe(
               Effect.asVoid,
-              Effect.mapError(
-                () =>
-                  new ProjectTeamDispatchJournalError({
-                    reason: "Current dispatch authority changed",
-                  }),
-              ),
             ),
           },
         ).pipe(
-          Effect.onError(() =>
+          Effect.onError((cause) =>
             Effect.gen(function* () {
+              expect(isProjectTeamControlledStop(cause)).toBe(true);
+              expect(
+                isProjectTeamControlledStop(
+                  Cause.combine(
+                    cause,
+                    Cause.fail(
+                      new ProjectTeamDispatchJournalError({
+                        reason: "Uncontrolled native failure",
+                      }),
+                    ),
+                  ),
+                ),
+              ).toBe(false);
               yield* stopProjectTeamOwnedThread(pi, claimed);
               yield* journal.settleAfterJoined(claimed.fence, terminal);
             }).pipe(Effect.orDie),
@@ -332,6 +342,21 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
               }
             : { action, reason: "Stop exact owner" },
         );
+        expect(
+          isProjectTeamControlledStop(
+            Cause.fail(
+              new ProjectTeamDispatchJournalError({
+                reason: "Dispatch grant or assignment is stale",
+              }),
+            ),
+          ),
+        ).toBe(false);
+        const stale = yield* assertProjectTeamDispatchAuthority(f.sql, f.journal, {
+          ...claimed,
+          fence: { ...claimed.fence, revision: claimed.fence.revision + 1 },
+        }).pipe(Effect.exit);
+        expect(Exit.isFailure(stale)).toBe(true);
+        if (Exit.isFailure(stale)) expect(isProjectTeamControlledStop(stale.cause)).toBe(false);
         const stopped = yield* readCurrentState(f.sql, projectId);
         expect(stopped.foundationRecords?.find((r) => r.recordId === "binding")).toMatchObject({
           status: "stopping",
@@ -364,6 +389,9 @@ for (const action of ["pause", "cancel", "reassign"] as const) {
         yield* Deferred.succeed(ownerJoined, terminal.evidence);
         expect(Exit.isFailure(yield* Fiber.await(settlement))).toBe(true);
         expect((yield* journal.readRetained(claimed.fence.dispatchId)).fence.stage).toBe("settled");
+        expect(
+          yield* f.sql`SELECT * FROM project_team_dispatch_receipt WHERE stage='quarantine'`,
+        ).toEqual([]);
         const drained = yield* readCurrentState(f.sql, projectId);
         expect(drained.foundationRecords?.find((r) => r.recordId === "binding")).toMatchObject({
           status: "settled",

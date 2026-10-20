@@ -121,6 +121,70 @@ const bindingFor = (snapshot: Snapshot) => {
   return transition.binding;
 };
 
+// Preserve the exact authority-check failure identity; matching text cannot qualify another cause.
+const controlledStops = new WeakSet<ProjectTeamDispatchJournalError>();
+
+/** Qualifies authority loss at its source, never a later native failure or a successful join. */
+export const assertProjectTeamDispatchAuthority = Effect.fn(
+  "ProjectTeamExecutionHost.assertDispatchAuthority",
+)(function* (
+  sql: SqlClient.SqlClient,
+  journal: Pick<Journal, "inspect" | "readRetained">,
+  snapshot: Snapshot,
+) {
+  return yield* boundary(journal.inspect(snapshot.fence.dispatchId, { requireClaim: true })).pipe(
+    Effect.catch((error) =>
+      Effect.gen(function* () {
+        if (error.reason !== "Dispatch grant or assignment is stale")
+          return yield* Effect.fail(error);
+        const retained = yield* journal.readRetained(snapshot.fence.dispatchId);
+        if (!same(retained.fence, snapshot.fence) || !same(retained.intent, snapshot.intent))
+          return yield* Effect.fail(error);
+        const binding = bindingFor(snapshot);
+        const state = yield* readCurrentState(sql, binding.projectId);
+        const records = state.foundationRecords ?? [];
+        const run = records.find((record) => record.recordId === binding.recordId);
+        const stop = records.some(
+          (record) =>
+            record.kind === "effect" &&
+            record.effectKind === "stop" &&
+            record.runId === binding.recordId &&
+            record.targetId === binding.recordId &&
+            record.taskId === binding.taskId &&
+            record.claimGeneration === binding.generation &&
+            (record.status === "pending" || record.status === "claimed"),
+        );
+        if (
+          run?.kind === "run-binding" &&
+          run.status === "stopping" &&
+          same(
+            {
+              ...run,
+              status: binding.status,
+              revision: binding.revision,
+              updatedAt: binding.updatedAt,
+              sessionId: binding.sessionId,
+            },
+            binding,
+          ) &&
+          stop
+        )
+          controlledStops.add(error);
+        return yield* Effect.fail(error);
+      }),
+    ),
+  );
+}, boundary);
+
+export const isProjectTeamControlledStop = (cause: Cause.Cause<unknown>) =>
+  cause.reasons.length > 0 &&
+  cause.reasons.every(
+    (reason) =>
+      Cause.isFailReason(reason) &&
+      isJournalError(reason.error) &&
+      controlledStops.has(reason.error),
+  );
+
 /** Reads the bounded ownership history; individual receipts still require reconciliation. */
 export const readProjectTeamOwnedOperationHistory = Effect.fn(
   "ProjectTeamExecutionHost.operationRows",
@@ -501,10 +565,9 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       yield* owned(owner);
       if (stopping) return yield* denied("Executor is stopping");
       yield* options.assertEnabled;
-      const current = yield* journal.inspect(
-        expected.dispatchId,
-        expected.claimGeneration > 0 ? { requireClaim: true } : undefined,
-      );
+      const current = yield* expected.claimGeneration > 0
+        ? assertProjectTeamDispatchAuthority(sql, journal, { ...owner.snapshot, fence: expected })
+        : journal.inspect(expected.dispatchId);
       if (!same(current.fence, expected) || !same(current.intent, owner.snapshot.intent))
         return yield* denied("Executor fence changed");
       owner.snapshot = current;
@@ -1007,6 +1070,7 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
         ),
       readAssignmentObservation: (_owner, snapshot) =>
         boundary(readAssignmentObservation(snapshot)),
+      isControlledStop: isProjectTeamControlledStop,
       recordUncertain: (owner) => boundary(quarantine(owner)),
       stopAndJoin: (owner) => boundary(stopAndJoin(owner)),
     });
