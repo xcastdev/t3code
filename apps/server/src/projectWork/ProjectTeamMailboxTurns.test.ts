@@ -61,9 +61,32 @@ import {
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
 import { makeProjectTeamContext } from "./ProjectTeamContext.ts";
-import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { layerTest, ServerSettingsService } from "../serverSettings.ts";
 import type { PiProductionRuntimeHooks } from "../provider/pi/PiProductionRuntime.ts";
+
+const installRuntime = Effect.fn("mailboxTest.installRuntime")(function* () {
+  const pi = yield* makeProjectTeamPiRuntime();
+  let resolve: NonNullable<PiProductionRuntimeHooks["resolveOperationId"]> | undefined;
+  const runtime = yield* makeProjectTeamRuntime({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 2,
+  }).pipe(
+    Effect.provideService(ProjectTeamPiRuntime, {
+      ...pi,
+      installOperationResolver: (callback) =>
+        pi.installOperationResolver(callback).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              resolve = callback;
+            }),
+          ),
+        ),
+    }),
+  );
+  if (!resolve) return yield* Effect.die("Resolver was not installed");
+  return { ...runtime, pi, resolve };
+});
 
 const model = "inclusionai/ling-3.1-flash:free";
 const now = Date.parse(at) + 100;
@@ -1261,34 +1284,31 @@ it.effect(
         const operationRows =
           yield* f.sql`SELECT operation_id, maximum_tokens, deadline_at_ms, status
           FROM project_team_pi_operation WHERE project_id=${projectId} ORDER BY operation_ordinal`;
-        let resolve: NonNullable<PiProductionRuntimeHooks["resolveOperationId"]> | undefined;
-        const pi = Layer.mock(ProjectTeamPiRuntime)({
-          installOperationResolver: (callback) =>
-            Effect.sync(() => {
-              resolve = callback;
-            }),
-        });
-        const runtime = yield* makeProjectTeamRuntime({
-          environmentId: "environment",
-          maximumEnvironmentModelCalls: 2,
-        }).pipe(Effect.provide(pi));
-        if (!resolve) return yield* Effect.die("Resolver was not installed");
+        let runtime = yield* installRuntime();
+        let resolve = runtime.resolve;
         const compactRequest = {
           threadId,
           kind: "compact" as const,
           requestId: MessageId.make("managed-compact-one"),
           modelSelection: { instanceId: providerInstanceId, model, options: [] },
         };
+        const reservation = yield* runtime.pi.reserveCompaction(providerInstanceId, compactRequest);
+        expect(reservation.created).toBe(true);
+        expect(
+          (yield* runtime.pi.assertCompactionReady(providerInstanceId, compactRequest))
+            .predecessorOperationId,
+        ).toBe(f.prompt.operation.operationId);
         const operationId = yield* resolve(providerInstanceId, compactRequest);
         expect(typeof operationId).toBe("string");
         expect(operationId).not.toBe(f.prompt.operation.operationId);
         expect(yield* resolve(providerInstanceId, compactRequest)).toBe(operationId);
         yield* runtime.stop;
-        yield* makeProjectTeamRuntime({
-          environmentId: "environment",
-          maximumEnvironmentModelCalls: 2,
-        }).pipe(Effect.provide(pi));
-        if (!resolve) return yield* Effect.die("Restarted resolver was not installed");
+        runtime = yield* installRuntime();
+        resolve = runtime.resolve;
+        expect(yield* runtime.pi.reserveCompaction(providerInstanceId, compactRequest)).toEqual({
+          ...reservation,
+          created: false,
+        });
         expect(yield* resolve(providerInstanceId, compactRequest)).toBe(operationId);
         const settings = yield* ServerSettingsService;
         yield* settings.updateSettings({ projectTeamExecutionEnabled: false });
@@ -1348,6 +1368,7 @@ it.effect(
             requestId: MessageId.make(`sql-compact-${index}`),
             modelSelection: { instanceId: providerInstanceId, model, options: [] },
           };
+          yield* f.operations.reserveCompaction({ providerInstanceId, threadId }, supplied);
           const boundary = yield* f.operations.readCompaction(
             { providerInstanceId, threadId },
             supplied,
@@ -1408,6 +1429,11 @@ it.effect(
           latest = { ...native, leafId: `compact-leaf-${index}` };
           const terminal = yield* f.complete(compact, latest, "success", [yield* input.settle]);
           if (index === 1) firstCompact = { request, terminal };
+          const beforeReplay = {
+            operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+            processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+            charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+          };
           const replay = yield* f.operations.lookup(
             { providerInstanceId, threadId },
             request,
@@ -1431,6 +1457,11 @@ it.effect(
           expect(
             yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`,
           ).toEqual(budget);
+          expect({
+            operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+            processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+            charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+          }).toEqual(beforeReplay);
           finalOperationId = request.operationId;
         }
         if (!firstCompact) return yield* Effect.die("Missing original compact receipt");
@@ -1515,6 +1546,7 @@ it.effect(
           kind: "compact" as const,
           requestId: MessageId.make("compact-after-message"),
         };
+        yield* f.operations.reserveCompaction({ providerInstanceId, threadId }, supplied);
         const boundary = yield* f.operations.readCompaction(
           { providerInstanceId, threadId },
           supplied,
@@ -1622,6 +1654,7 @@ it.effect(
         expect(
           yield* f.sql`SELECT binding_id,operation_ordinal FROM project_team_pi_operation WHERE operation_id='older-binding-operation'`,
         ).toEqual([{ binding_id: "older-binding", operation_ordinal: 1000 }]);
+        yield* f.operations.reserveCompaction({ providerInstanceId, threadId }, supplied);
         const boundary = yield* f.operations.readCompaction(
           { providerInstanceId, threadId },
           supplied,
@@ -1652,6 +1685,7 @@ it.effect(
           kind: "compact" as const,
           requestId: MessageId.make("capacity-new-compact"),
         };
+        yield* f.operations.reserveCompaction({ providerInstanceId, threadId }, next);
         const nextId = (yield* f.operations.readCompaction({ providerInstanceId, threadId }, next))
           .operationId;
         // Metadata occupants test cleanup capacity only; their copied bodies are never execution authority.
@@ -1756,6 +1790,7 @@ it.effect("compact cannot reopen an immutable empty mailbox boundary", () =>
         kind: "compact" as const,
         requestId: MessageId.make("compact-after-empty"),
       };
+      yield* f.operations.reserveCompaction({ providerInstanceId, threadId }, supplied);
       const boundary = yield* f.operations.readCompaction(
         { providerInstanceId, threadId },
         supplied,
@@ -1800,10 +1835,9 @@ for (const outcome of ["failed", "canceled", "quarantine"] as const)
           yield* f.sql`SELECT operation_id,status FROM project_team_pi_operation ORDER BY operation_ordinal`;
         expect(
           (yield* f.operations
-            .readCompaction(
+            .reserveCompaction(
               { providerInstanceId, threadId },
               {
-                kind: "compact",
                 threadId,
                 requestId: MessageId.make(`denied-compact-${outcome}`),
               },
@@ -1826,21 +1860,8 @@ it.effect(
         yield* f.addMessage("next", "Installed resolver selects this message");
         const selected = yield* f.turns.claim(f.snapshot);
         if (selected._tag !== "Selected") return yield* Effect.die("Expected selected message");
-        let resolve: NonNullable<PiProductionRuntimeHooks["resolveOperationId"]> | undefined;
-        const runtime = yield* makeProjectTeamRuntime({
-          environmentId: "environment",
-          maximumEnvironmentModelCalls: 2,
-        }).pipe(
-          Effect.provide(
-            Layer.mock(ProjectTeamPiRuntime)({
-              installOperationResolver: (callback) =>
-                Effect.sync(() => {
-                  resolve = callback;
-                }),
-            }),
-          ),
-        );
-        if (!resolve) return yield* Effect.die("Resolver was not installed");
+        const runtime = yield* installRuntime();
+        const resolve = runtime.resolve;
         const request = selected.decision.request;
         // Actual PiAdapter.sendTurn shape: no ID, workspace/runtime hints or resume cursor.
         const ordinaryRequest = {
@@ -1893,21 +1914,7 @@ it.effect(
         const commands: OrchestrationCommand[] = [];
         const firstSent = yield* Deferred.make<OrchestrationCommand>();
         const secondSent = yield* Deferred.make<OrchestrationCommand>();
-        let resolve: NonNullable<PiProductionRuntimeHooks["resolveOperationId"]> | undefined;
-        yield* makeProjectTeamRuntime({
-          environmentId: "environment",
-          maximumEnvironmentModelCalls: 2,
-        }).pipe(
-          Effect.provide(
-            Layer.mock(ProjectTeamPiRuntime)({
-              installOperationResolver: (callback) =>
-                Effect.sync(() => {
-                  resolve = callback;
-                }),
-            }),
-          ),
-        );
-        if (!resolve) return yield* Effect.die("Resolver was not installed");
+        const { resolve } = yield* installRuntime();
         const events = yield* PubSub.unbounded<typeof OrchestrationEvent.Type>();
         let subscribed = false;
         const engine = Layer.mock(OrchestrationEngineService)({
@@ -2447,27 +2454,31 @@ for (const order of ["cleanup-first", "compact-first"] as const) {
           requestId: MessageId.make("atomic-compact"),
           modelSelection: { instanceId: providerInstanceId, model, options: [] },
         };
-        const boundary = yield* f.operations.readCompaction(
-          { providerInstanceId, threadId },
-          supplied,
-        );
-        const request = { ...supplied, operationId: boundary.operationId };
-        const allocation = yield* f.allocation;
-        const prepare = f.operations.prepare(
-          { providerInstanceId, threadId },
-          request,
-          hash(request),
-          {
-            allocation,
-            workerId: "atomic-compact-worker",
-            operationId: request.operationId,
-            resourceHash: "a".repeat(64),
-            compactContext: {
-              provenanceSha256: hash(current.provenance),
-              textSha256: NodeCrypto.createHash("sha256").update(current.text).digest("hex"),
+        const prepare = Effect.gen(function* () {
+          yield* f.operations.reserveCompaction({ providerInstanceId, threadId }, supplied);
+          yield* f.operations.assertCompactionReady({ providerInstanceId, threadId }, supplied);
+          const boundary = yield* f.operations.readCompaction(
+            { providerInstanceId, threadId },
+            supplied,
+          );
+          const request = { ...supplied, operationId: boundary.operationId };
+          const compact = yield* f.operations.prepare(
+            { providerInstanceId, threadId },
+            request,
+            hash(request),
+            {
+              allocation: yield* f.allocation,
+              workerId: "atomic-compact-worker",
+              operationId: request.operationId,
+              resourceHash: "a".repeat(64),
+              compactContext: {
+                provenanceSha256: hash(current.provenance),
+                textSha256: NodeCrypto.createHash("sha256").update(current.text).digest("hex"),
+              },
             },
-          },
-        );
+          );
+          return { compact, request };
+        });
         const budget = yield* f.sql`SELECT * FROM project_team_model_budget`;
         const processRows =
           yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`;
@@ -2528,7 +2539,7 @@ for (const order of ["cleanup-first", "compact-first"] as const) {
             Effect.forkChild,
           );
           yield* Deferred.await(readFinal);
-          const compact = yield* prepare;
+          const { compact, request } = yield* prepare;
           yield* Deferred.succeed(releaseClaim, undefined);
           yield* Deferred.await(waiting);
           expect(cleanupStarted).toBe(false);
@@ -2583,7 +2594,7 @@ for (const order of ["cleanup-first", "compact-first"] as const) {
           ).toBe(request.operationId);
         } else {
           yield* wait;
-          // The context and stable request were obtained before cleanup claimed the boundary.
+          // Context discovery cannot admit a caller after cleanup has claimed the boundary.
           expect((yield* prepare.pipe(Effect.result))._tag).toBe("Failure");
           expect(
             yield* f.sql`SELECT operation_id FROM project_team_pi_operation ORDER BY operation_ordinal`,

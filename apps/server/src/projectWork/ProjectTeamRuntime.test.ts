@@ -2,10 +2,10 @@ import { expect, it } from "@effect/vitest";
 import {
   ProjectWorkFoundationCommitCommand,
   ProviderInstanceId,
+  MessageId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -31,7 +31,7 @@ import {
   type ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatchJournal.ts";
 import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
-import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
+import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
@@ -47,21 +47,26 @@ const stages = [
 ] as const;
 type Resolver = NonNullable<PiProductionRuntimeHooks["resolveOperationId"]>;
 
-// Capture the installed private callback only; this fixture does not publish assets or run Pi.
+// Use the real scoped registry while retaining the private resolver for identity checks.
+// No runtime assets or Pi processes are published by this fixture.
 const install = Effect.fn("runtimeTest.install")(function* (supplied = options) {
+  const pi = yield* makeProjectTeamPiRuntime();
   let resolver: Resolver | undefined;
   const runtime = yield* makeProjectTeamRuntime(supplied).pipe(
-    Effect.provide(
-      Layer.mock(ProjectTeamPiRuntime)({
-        installOperationResolver: (resolve) =>
-          Effect.sync(() => {
-            resolver = resolve;
-          }),
-      }),
-    ),
+    Effect.provideService(ProjectTeamPiRuntime, {
+      ...pi,
+      installOperationResolver: (resolve) =>
+        pi.installOperationResolver(resolve).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              resolver = resolve;
+            }),
+          ),
+        ),
+    }),
   );
   if (resolver === undefined) return yield* Effect.die("Resolver was not installed");
-  return { ...runtime, resolve: resolver };
+  return { ...runtime, pi, resolve: resolver };
 });
 
 const managedFixture = Effect.fn("runtimeTest.managedFixture")(function* () {
@@ -626,3 +631,53 @@ for (const proof of ["receipt", "event"] as const)
       }),
     ),
   );
+
+it.effect(
+  "acquires compact handlers exclusively, releases with scope, and permits genuine reinstallation",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const pi = yield* makeProjectTeamPiRuntime();
+        const request = { threadId, requestId: MessageId.make("handler-lifetime") };
+        const installRuntime = makeProjectTeamRuntime(options).pipe(
+          Effect.provideService(ProjectTeamPiRuntime, pi),
+        );
+        const absent = yield* pi.abandonCompaction(providerInstanceId, request).pipe(Effect.result);
+        expect(absent).toMatchObject({
+          _tag: "Failure",
+          failure: { detail: "Pi instance ownership changed" },
+        });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const runtime = yield* installRuntime;
+            yield* pi.abandonCompaction(providerInstanceId, request);
+            const duplicate = yield* Effect.scoped(installRuntime).pipe(Effect.result);
+            expect(duplicate).toMatchObject({
+              _tag: "Failure",
+              failure: { detail: "Pi instance ownership changed" },
+            });
+            // A rejected second acquisition cannot unregister the first owner's handlers.
+            yield* pi.abandonCompaction(providerInstanceId, request);
+            yield* runtime.stop;
+            yield* pi.abandonCompaction(providerInstanceId, request);
+          }),
+        );
+        expect(
+          yield* pi.abandonCompaction(providerInstanceId, request).pipe(Effect.result),
+        ).toMatchObject({ _tag: "Failure", failure: { detail: "Pi instance ownership changed" } });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* installRuntime;
+            yield* pi.abandonCompaction(providerInstanceId, request);
+          }),
+        );
+        expect(
+          yield* pi.abandonCompaction(providerInstanceId, request).pipe(Effect.result),
+        ).toMatchObject({ _tag: "Failure", failure: { detail: "Pi instance ownership changed" } });
+        const sql = yield* SqlClient.SqlClient;
+        expect(yield* sql`SELECT * FROM project_team_compact_caller`).toEqual([]);
+        expect(yield* sql`SELECT * FROM project_team_pi_operation`).toEqual([]);
+        expect(yield* sql`SELECT * FROM project_team_model_request`).toEqual([]);
+      }),
+    ),
+);
