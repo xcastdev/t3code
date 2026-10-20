@@ -2653,16 +2653,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   (entry) =>
                     entry.threadId === threadId && entry.providerInstanceId === resolvedInstanceId,
                 );
-                const desiredRevision = SkillCatalogRevision.make(
+                let desiredRevision = SkillCatalogRevision.make(
                   managed === undefined
                     ? (current?.desiredRevision ?? 0) + 1
                     : Math.max(current?.desiredRevision ?? 0, 1),
                 );
-                const appliedRevision = current?.appliedRevision ?? SkillCatalogRevision.make(0);
-                const projectId = readModel.threads.find(
+                let appliedRevision = current?.appliedRevision ?? SkillCatalogRevision.make(0);
+                let projectId = readModel.threads.find(
                   (thread) => thread.id === threadId,
                 )?.projectId;
-                const desired = yield* skillCatalog.value.describeSession({
+                let desired = yield* skillCatalog.value.describeSession({
                   threadId,
                   providerInstanceId: resolvedInstanceId,
                   projectRoot: skillProjectRoot,
@@ -2679,15 +2679,81 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                     current === undefined ||
                     current.desiredRevision === 0
                   ) {
-                    yield* orchestrationEngine.value.dispatch({
-                      type: "thread.skill-application.desire",
-                      commandId: CommandId.make(
-                        `server:skill-application-desire:${threadId}:${resolvedInstanceId}:${desiredRevision}`,
+                    const engine = orchestrationEngine.value;
+                    const projections = projectionQuery.value;
+                    const catalog = skillCatalog.value;
+                    const dispatchDesire = Effect.fn("ProviderService.dispatchSkillDesire")(
+                      function* (retry: boolean) {
+                        if (retry && managed !== undefined) yield* managed.assertCurrent;
+                        return yield* engine.dispatch({
+                          type: "thread.skill-application.desire",
+                          commandId: CommandId.make(
+                            `server:skill-application-desire:${threadId}:${resolvedInstanceId}:${desiredRevision}${retry ? ":retry" : ""}`,
+                          ),
+                          threadId,
+                          application: desired,
+                          updatedAt: retry ? yield* nowIso : updatedAt,
+                        });
+                      },
+                    );
+                    yield* dispatchDesire(false).pipe(
+                      Effect.catchTag("OrchestrationCommandInvariantError", (error) =>
+                        Effect.gen(function* () {
+                          if (
+                            desired.threadId !== threadId ||
+                            desired.providerInstanceId !== resolvedInstanceId ||
+                            error.commandType !== "thread.skill-application.desire" ||
+                            error.detail !==
+                              "Skill desired state must advance once without changing applied state."
+                          )
+                            return yield* error;
+                          const latestModel = yield* projections.getCommandReadModel();
+                          const latest = (latestModel.skillApplications ?? []).find(
+                            (entry) =>
+                              entry.threadId === threadId &&
+                              entry.providerInstanceId === resolvedInstanceId,
+                          );
+                          if (
+                            latest === undefined ||
+                            (latest.desiredRevision < desiredRevision &&
+                              latest.appliedRevision === appliedRevision)
+                          )
+                            return yield* error;
+                          if (managed !== undefined) yield* managed.assertCurrent;
+                          // A catalog change can win the same revision while startup is describing it.
+                          if (
+                            latest.desiredRevision === desiredRevision &&
+                            latest.appliedRevision === appliedRevision &&
+                            (latest.status === "pending_new_session" ||
+                              latest.status === "pending_restart") &&
+                            latest.status === desired.status &&
+                            canonicalProjectWorkPayload(latest.outcomes) ===
+                              canonicalProjectWorkPayload(desired.outcomes) &&
+                            canonicalProjectWorkPayload(latest.failure ?? null) ===
+                              canonicalProjectWorkPayload(desired.failure ?? null)
+                          ) {
+                            desired = latest;
+                            return;
+                          }
+                          desiredRevision = SkillCatalogRevision.make(latest.desiredRevision + 1);
+                          appliedRevision = latest.appliedRevision;
+                          projectId = latestModel.threads.find(
+                            (thread) => thread.id === threadId,
+                          )?.projectId;
+                          desired = yield* catalog.describeSession({
+                            threadId,
+                            providerInstanceId: resolvedInstanceId,
+                            projectRoot: skillProjectRoot,
+                            ...(projectId === undefined ? {} : { projectId }),
+                            cwd: effectiveCwd,
+                            desiredRevision,
+                            appliedRevision,
+                          });
+                          // A second collision is surfaced; startup must not chase catalog churn.
+                          yield* dispatchDesire(true);
+                        }),
                       ),
-                      threadId,
-                      application: desired,
-                      updatedAt,
-                    });
+                    );
                   }
                   if (Option.isSome(skillApplicationReactor)) {
                     yield* skillApplicationReactor.value.drain;

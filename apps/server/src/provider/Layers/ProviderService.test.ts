@@ -19,6 +19,7 @@ import {
   EnvironmentId,
   EventId,
   MessageId,
+  ManagedSkillKey,
   OrchestrationThreadShell,
   ProjectId,
   ProjectWorkDecisionId,
@@ -132,6 +133,7 @@ import {
   type SkillCatalogServiceShape,
 } from "../../skills/SkillCatalogService.ts";
 
+const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 const serverConfigTestLayer = ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
@@ -489,15 +491,16 @@ function makeManagedSkillLifecycleFixture(
   const dispose = vi.fn(
     (_input: Parameters<SkillCatalogServiceShape["disposeSession"]>[0]) => Effect.void,
   );
-  const describe: SkillCatalogServiceShape["describeSession"] = (input) =>
+  const describe = vi.fn<SkillCatalogServiceShape["describeSession"]>((input) =>
     Effect.succeed({
       threadId: ThreadId.make(input.threadId),
       providerInstanceId: input.providerInstanceId,
       desiredRevision: input.desiredRevision,
       appliedRevision: input.appliedRevision,
       status: "pending_new_session",
-      outcomes: [],
-    });
+      outcomes: [{ key: ManagedSkillKey.make("fixture-skill"), status: "pending_new_session" }],
+    }),
+  );
   const prepare = vi.fn(
     (
       input: Parameters<SkillCatalogServiceShape["prepareSession"]>[0],
@@ -509,7 +512,7 @@ function makeManagedSkillLifecycleFixture(
             providerInstanceId: input.providerInstanceId,
             desiredRevision: input.desiredRevision,
             applicationMode: "new_session_required",
-            skillKeys: [],
+            skillKeys: application.outcomes.map((outcome) => outcome.key),
             payload: { kind: "test-managed-skills" },
           },
         })),
@@ -571,7 +574,7 @@ function makeManagedSkillLifecycleFixture(
     Layer.provide(serverConfigTestLayer),
     Layer.provide(NodeServices.layer),
   );
-  return { codex, dispose, prepare, registry, layer: provider };
+  return { codex, describe, dispose, prepare, registry, layer: provider };
 }
 
 const createManagedSkillThread = Effect.gen(function* () {
@@ -611,6 +614,236 @@ const createManagedSkillThread = Effect.gen(function* () {
 });
 
 describe("ProviderService managed skill lifecycle", () => {
+  for (const collision of [
+    "matching winner",
+    "fresh selection",
+    "applied change",
+    "second conflict",
+  ] as const) {
+    const changedSelection = collision === "fresh selection" || collision === "second conflict";
+    it.effect(
+      `restores a durable session after a pre-dispatch catalog collision (${collision})`,
+      () =>
+        Effect.gen(function* () {
+          const databasePath = NodePath.join(
+            fixtureCwd(`desire-collision-${collision}`),
+            "state.sqlite",
+          );
+          const first = makeManagedSkillLifecycleFixture(databasePath);
+          const input = yield* Effect.gen(function* () {
+            const input = yield* createManagedSkillThread;
+            const provider = yield* ProviderService.ProviderService;
+            yield* provider.startSession(input.threadId, input);
+            return input;
+          }).pipe(Effect.provide(first.layer));
+          const restored = makeManagedSkillLifecycleFixture(databasePath);
+          yield* Effect.gen(function* () {
+            const provider = yield* ProviderService.ProviderService;
+            const engine = yield* OrchestrationEngineService;
+            const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+            const describe = restored.describe.getMockImplementation()!;
+            restored.describe.mockImplementationOnce((request) =>
+              Effect.gen(function* () {
+                const stale = yield* describe(request);
+                assert.equal(stale.desiredRevision, 2);
+                assert.equal(stale.appliedRevision, 1);
+                const winner: SkillApplicationDetail = {
+                  ...stale,
+                  outcomes: changedSelection
+                    ? [
+                        {
+                          key: ManagedSkillKey.make("replacement-skill"),
+                          status: "pending_new_session",
+                        },
+                      ]
+                    : stale.outcomes,
+                };
+                yield* engine.dispatch({
+                  type: "thread.skill-application.desire",
+                  commandId: CommandId.make(
+                    `server:skill-catalog-change:${input.threadId}:codex:2`,
+                  ),
+                  threadId: input.threadId,
+                  application: winner,
+                  updatedAt: "2026-01-01T00:00:01.000Z",
+                });
+                if (collision === "applied change")
+                  yield* engine.dispatch({
+                    type: "thread.skill-application.receipt",
+                    commandId: CommandId.make("catalog-winner-applied"),
+                    threadId: input.threadId,
+                    application: {
+                      ...winner,
+                      appliedRevision: SkillCatalogRevision.make(2),
+                      status: "applied",
+                    },
+                    updatedAt: "2026-01-01T00:00:02.000Z",
+                  });
+                if (changedSelection)
+                  restored.describe.mockImplementation((fresh) =>
+                    Effect.gen(function* () {
+                      const application: SkillApplicationDetail = {
+                        ...(yield* describe(fresh)),
+                        outcomes: [
+                          {
+                            key: ManagedSkillKey.make("replacement-skill"),
+                            status: "pending_new_session",
+                          },
+                        ],
+                      };
+                      if (collision === "second conflict")
+                        yield* engine.dispatch({
+                          type: "thread.skill-application.desire",
+                          commandId: CommandId.make("catalog-second-collision"),
+                          threadId: input.threadId,
+                          application,
+                          updatedAt: "2026-01-01T00:00:02.000Z",
+                        });
+                      return application;
+                    }).pipe(Effect.orDie),
+                  );
+                return stale;
+              }).pipe(Effect.orDie),
+            );
+            const result = yield* provider.startSession(input.threadId, input).pipe(Effect.exit);
+            if (collision === "second conflict") {
+              assert.isTrue(Exit.isFailure(result));
+              if (Exit.isFailure(result))
+                assert.include(
+                  String(Cause.squash(result.cause)),
+                  "Skill desired state must advance once",
+                );
+              assert.equal(restored.codex.startSession.mock.calls.length, 0);
+              assert.equal(restored.prepare.mock.calls.length, 0);
+              const application = (yield* query.getCommandReadModel()).skillApplications![0]!;
+              assert.equal(application.desiredRevision, 3);
+              assert.equal(application.appliedRevision, 1);
+              return;
+            }
+            if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause);
+            const expectedRevision = collision === "matching winner" ? 2 : 3;
+            const started = restored.codex.startSession.mock.calls[0]![0];
+            assert.isDefined(started.resumeCursor);
+            assert.equal(started.skillPlan?.desiredRevision, expectedRevision);
+            assert.deepStrictEqual(started.skillPlan?.skillKeys, [
+              ManagedSkillKey.make(changedSelection ? "replacement-skill" : "fixture-skill"),
+            ]);
+            assert.equal(restored.prepare.mock.calls.length, 1);
+            assert.equal(restored.prepare.mock.calls[0]?.[0].projectRoot, input.cwd);
+            assert.equal(restored.prepare.mock.calls[0]?.[0].cwd, input.cwd);
+            assert.equal(
+              restored.prepare.mock.calls[0]?.[0].appliedRevision,
+              collision === "applied change" ? 2 : 1,
+            );
+            const application = (yield* query.getCommandReadModel()).skillApplications![0]!;
+            assert.equal(application.desiredRevision, expectedRevision);
+            assert.equal(application.appliedRevision, expectedRevision);
+            assert.equal(application.status, "applied");
+            assert.deepStrictEqual(
+              application.outcomes.map((outcome) => outcome.key),
+              [ManagedSkillKey.make(changedSelection ? "replacement-skill" : "fixture-skill")],
+            );
+          }).pipe(Effect.provide(restored.layer));
+        }),
+    );
+  }
+
+  it.effect(
+    "keeps the startup winner when a catalog producer dispatches its stale revision second",
+    () => {
+      const fixture = makeManagedSkillLifecycleFixture();
+      return Effect.gen(function* () {
+        const input = yield* createManagedSkillThread;
+        const provider = yield* ProviderService.ProviderService;
+        const engine = yield* OrchestrationEngineService;
+        const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+        yield* provider.startSession(input.threadId, input);
+        const current = (yield* query.getCommandReadModel()).skillApplications![0]!;
+        const stale: SkillApplicationDetail = {
+          ...current,
+          desiredRevision: SkillCatalogRevision.make(2),
+          status: "pending_new_session",
+        };
+        const prepare = fixture.prepare.getMockImplementation()!;
+        fixture.prepare.mockImplementationOnce((request) =>
+          Effect.gen(function* () {
+            const collision = yield* engine
+              .dispatch({
+                type: "thread.skill-application.desire",
+                commandId: CommandId.make("catalog-producer-dispatches-second"),
+                threadId: input.threadId,
+                application: stale,
+                updatedAt: "2026-01-01T00:00:01.000Z",
+              })
+              .pipe(Effect.exit);
+            assert.isTrue(Exit.isFailure(collision));
+            if (Exit.isFailure(collision))
+              assert.include(
+                String(Cause.squash(collision.cause)),
+                "Skill desired state must advance once",
+              );
+            return yield* prepare(request);
+          }).pipe(Effect.orDie),
+        );
+        yield* provider.startSession(input.threadId, input);
+        const application = (yield* query.getCommandReadModel()).skillApplications![0]!;
+        assert.equal(application.desiredRevision, 2);
+        assert.equal(application.appliedRevision, 2);
+        assert.equal(application.status, "applied");
+        assert.deepStrictEqual(fixture.codex.startSession.mock.calls[1]?.[0].skillPlan?.skillKeys, [
+          ManagedSkillKey.make("fixture-skill"),
+        ]);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  for (const invalid of ["wrong thread", "wrong instance", "unrelated error"] as const) {
+    it.effect(`propagates skill desire failures for ${invalid}`, () => {
+      const fixture = makeManagedSkillLifecycleFixture();
+      return Effect.gen(function* () {
+        const input = yield* createManagedSkillThread;
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(input.threadId, input);
+        const engine = yield* OrchestrationEngineService;
+        const describe = fixture.describe.getMockImplementation()!;
+        const unrelated = new SkillRpcError({
+          code: "catalog_unavailable",
+          message: "Catalog is unavailable",
+        });
+        fixture.describe.mockImplementationOnce((request) =>
+          invalid === "unrelated error"
+            ? Effect.fail(unrelated)
+            : Effect.gen(function* () {
+                const application = yield* describe(request);
+                yield* engine.dispatch({
+                  type: "thread.skill-application.desire",
+                  commandId: CommandId.make("valid-catalog-winner"),
+                  threadId: input.threadId,
+                  application,
+                  updatedAt: "2026-01-01T00:00:01.000Z",
+                });
+                return {
+                  ...application,
+                  ...(invalid === "wrong thread"
+                    ? { threadId: asThreadId("foreign-thread") }
+                    : { providerInstanceId: claudeAgentInstanceId }),
+                };
+              }).pipe(Effect.orDie),
+        );
+        const result = yield* provider.startSession(input.threadId, input).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(result));
+        if (Exit.isFailure(result)) {
+          const error = Cause.squash(result.cause);
+          assert.instanceOf(error, ProviderAdapterRequestError);
+          if (isProviderAdapterRequestError(error) && invalid === "unrelated error")
+            assert.strictEqual(error.cause, unrelated);
+        }
+        assert.equal(fixture.codex.startSession.mock.calls.length, 1);
+        assert.equal(fixture.prepare.mock.calls.length, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    });
+  }
+
   it.effect("reapplies the managed plan during lazy recovery after a server restart", () =>
     Effect.gen(function* () {
       const databasePath = NodePath.join(fixtureCwd("managed-restart"), "state.sqlite");
@@ -791,6 +1024,81 @@ const assertManagedDenial = <A, E>(exit: Exit.Exit<A, E>, issue?: string) => {
 };
 
 describe("ProviderService private managed sessions", () => {
+  for (const revoke of [false, true]) {
+    it.effect(
+      `rechecks managed authority after a pre-dispatch collision (${revoke ? "revoked" : "current"})`,
+      () => {
+        const pi = makeFakeCodexAdapter(PI_DRIVER);
+        const fixture = makeManagedSkillLifecycleFixture(undefined, { pi });
+        return Effect.gen(function* () {
+          const request = yield* createManagedPiThread;
+          const engine = yield* OrchestrationEngineService;
+          const provider = yield* ProviderService.ProviderService;
+          let published: SkillApplicationDetail | undefined;
+          let checksAfterPublish = 0;
+          const describe = fixture.describe.getMockImplementation()!;
+          fixture.describe.mockImplementationOnce((input) =>
+            Effect.gen(function* () {
+              const application = yield* describe(input);
+              yield* engine.dispatch({
+                type: "thread.skill-application.desire",
+                commandId: CommandId.make("managed-catalog-winner"),
+                threadId: request.input.threadId,
+                application,
+                updatedAt: "2026-01-01T00:00:01.000Z",
+              });
+              published = application;
+              return application;
+            }).pipe(Effect.orDie),
+          );
+          const result = yield* startManagedProviderSession(provider, {
+            ...request,
+            assertCurrent: Effect.suspend(() => {
+              // A managed guard checks caller authority twice. Let the guard before
+              // dispatch pass, then revoke authority at the recovery guard.
+              if (published !== undefined) checksAfterPublish++;
+              return revoke && checksAfterPublish > 2
+                ? Effect.fail(expiredManagedAuthority)
+                : Effect.void;
+            }),
+          }).pipe(Effect.exit);
+          assert.equal(Exit.isFailure(result), revoke);
+          assert.isDefined(published);
+          // Replaying the losing command proves the decider rejected it before revocation.
+          const rejected = yield* engine
+            .dispatch({
+              type: "thread.skill-application.desire",
+              commandId: CommandId.make(
+                `server:skill-application-desire:${request.input.threadId}:${piInstanceId}:1`,
+              ),
+              threadId: request.input.threadId,
+              application: published!,
+              updatedAt: "2026-01-01T00:00:01.000Z",
+            })
+            .pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(rejected));
+          if (Exit.isFailure(rejected))
+            assert.include(String(Cause.squash(rejected.cause)), "Command previously rejected");
+          if (Exit.isFailure(result))
+            assert.include(
+              String(Cause.squash(result.cause)),
+              "Original managed authority expired",
+            );
+          assert.equal(fixture.prepare.mock.calls.length, revoke ? 0 : 1);
+          assert.equal(pi.startSession.mock.calls.length, revoke ? 0 : 1);
+          if (!revoke) {
+            assert.equal(
+              fixture.prepare.mock.calls[0]?.[0].projectRoot,
+              request.primaryProjectRoot,
+            );
+            assert.equal(fixture.prepare.mock.calls[0]?.[0].cwd, request.input.cwd);
+            assert.equal(pi.startSession.mock.calls[0]?.[0].skillPlan?.desiredRevision, 1);
+          }
+        }).pipe(Effect.provide(fixture.layer));
+      },
+    );
+  }
+
   for (const code of ["denied", "conflict", "unavailable", "uncertain", "unknown"] as const) {
     it.effect(`retains only safe startup classification after skill preparation: ${code}`, () => {
       const pi = makeFakeCodexAdapter(PI_DRIVER);
