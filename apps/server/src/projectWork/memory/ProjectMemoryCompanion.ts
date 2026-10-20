@@ -306,7 +306,8 @@ export const makeProjectMemoryCompanion = Effect.fn("makeProjectMemoryCompanion"
           return yield* deny(
             "Uncaptured companion retains capacity until genuine owner evidence exists",
           );
-        yield* options.assertAdmission;
+        // Retained allocation and captured ownership authorize stopping the original
+        // process even when forward admission has been revoked.
         const receipt = yield* provideNative(
           (options.reconcile ?? reconcilePiManagedProcess)(
             { allocation: row.intent.allocation, activation: "owned", owner: row.owner },
