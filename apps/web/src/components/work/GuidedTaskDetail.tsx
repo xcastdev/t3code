@@ -1145,10 +1145,13 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
             <WorkLabel className="pt-1">Acceptance criteria</WorkLabel>
             <ul className="space-y-1">
               {criteria.map((criterion) => (
-                <li key={criterion.criterionId} className="flex items-start gap-2">
-                  <span className="min-w-0 flex-1">{criterion.description}</span>
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    {" · "}
+                <li
+                  key={criterion.criterionId}
+                  className="flex flex-col gap-0.5 sm:flex-row sm:items-start sm:gap-2"
+                >
+                  <span className="min-w-0 sm:flex-1">{criterion.description}</span>
+                  <span className="text-xs text-muted-foreground sm:shrink-0">
+                    <span className="hidden sm:inline">{" · "}</span>
                     {criterion.status}
                     {criterion.required ? " · required" : ""}
                   </span>
