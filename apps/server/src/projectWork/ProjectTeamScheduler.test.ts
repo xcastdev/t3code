@@ -918,131 +918,145 @@ it.effect("a reservation cap preserves the remaining task window and current wri
   ),
 );
 
+const readOnlySibling = Effect.gen(function* () {
+  const f = yield* fixture;
+  const before = yield* readCurrentState(f.sql, projectId);
+  const human = {
+    actor: { kind: "human", id: "human" },
+    source: { kind: "web", id: "browser" },
+    recordedAt: at,
+  };
+  yield* f.repository.execute(
+    yield* decodeCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "start-research",
+      expectedRevision: before.revision,
+      attribution: human,
+      committedAt: at,
+      records: [],
+      guided: {
+        intent: {
+          type: "project-team.investigation.start",
+          projectId,
+          taskId,
+          commandId: "start-research",
+          expectedRevision: before.revision,
+          expectedTaskRevision: before.tasks[0]!.revision,
+          objective: "Investigate the bounded report",
+          outputDescriptions: ["Sourced findings"],
+        },
+      },
+    }),
+  );
+  let state = yield* readCurrentState(f.sql, projectId);
+  const membership = state.foundationRecords?.find(
+    (r) => r.kind === "task-membership" && r.deliverableKind === "research",
+  );
+  const role = state.foundationRecords?.find(
+    (r) => r.kind === "role-revision" && r.role === "investigator",
+  );
+  if (membership?.kind !== "task-membership" || role?.kind !== "role-revision")
+    return yield* Effect.die("Missing research assignment");
+  yield* f.repository.execute(
+    yield* decodeCommit({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: "configure-investigator",
+      expectedRevision: state.revision,
+      attribution,
+      committedAt: at,
+      records: [
+        {
+          ...role,
+          recordId: "research-role",
+          roleRevision: role.roleRevision + 1,
+          model: "test",
+          delegationDepth: 2,
+          revision: 0,
+        },
+        {
+          kind: "member",
+          projectId,
+          recordId: "read-member",
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          status: "active",
+          name: "Investigator",
+          coordinator: false,
+          roleRevisionId: "research-role",
+        },
+      ],
+    }),
+  );
+  state = yield* readCurrentState(f.sql, projectId);
+  const first = f.request.claim.transition;
+  const grant = state.foundationRecords?.find(
+    (r) => r.kind === "gate" && r.recordId === membership.assignment?.authorizationGateId,
+  );
+  if (first?.kind !== "claim" || grant?.kind !== "gate")
+    return yield* Effect.die("Missing explicit research grant");
+  const { specificationGateId: _, planGateId: __, ...baseBinding } = first.binding;
+  const researchId = membership.taskId;
+  const binding = {
+    ...baseBinding,
+    recordId: "research-binding",
+    worktree: "/workspace-research",
+    branch: "research-branch",
+    memberId: "read-member",
+    taskId: researchId,
+    attemptId: ProjectWorkAttemptId.make("research-attempt"),
+    roleRevisionId: "research-role",
+    threadId: ThreadId.make("research-thread"),
+    planRevision: 0,
+    authorizationGateId: grant.recordId,
+    scopeHash: projectTeamScopeHash(state, researchId),
+    configuration: { ...first.binding.configuration, toolIds: ["read"] },
+  };
+  const request: ProjectTeamDispatchRequest = {
+    ...f.request,
+    dispatchId: "research-dispatch",
+    claim: {
+      ...f.request.claim,
+      commandId: CommandId.make("research-dispatch"),
+      expectedRevision: state.revision,
+      transition: {
+        ...first,
+        taskId: researchId,
+        expectedTaskRevision: state.tasks.find((t) => t.taskId === researchId)!.revision,
+        authorizationGateId: grant.recordId,
+        expectedGateRevision: grant.revision,
+        binding,
+        claim: {
+          ...first.claim,
+          commandId: CommandId.make("research-dispatch"),
+          taskId: researchId,
+          attemptId: binding.attemptId,
+        },
+      },
+    },
+    git: {
+      ...f.request.git,
+      effectId: "research-dispatch",
+      runId: "research-binding",
+      worktreePath: binding.worktree,
+      branchRef: binding.branch,
+    },
+    setupId: "research-setup",
+    initializeOperationId: "research-initialize",
+    assignmentOperationId: "research-assignment",
+  };
+  return { ...f, researchId, researchRequest: request };
+});
+
 it.effect(
   "explicit investigation dispatches a bounded read-only child without authorizing the parent",
   () =>
     scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
-        const before = yield* readCurrentState(f.sql, projectId);
-        const human = {
-          actor: { kind: "human", id: "human" },
-          source: { kind: "web", id: "browser" },
-          recordedAt: at,
-        };
-        yield* f.repository.execute(
-          yield* decodeCommit({
-            type: "project-work.foundation.commit",
-            projectId,
-            commandId: "start-research",
-            expectedRevision: before.revision,
-            attribution: human,
-            committedAt: at,
-            records: [],
-            guided: {
-              intent: {
-                type: "project-team.investigation.start",
-                projectId,
-                taskId,
-                commandId: "start-research",
-                expectedRevision: before.revision,
-                expectedTaskRevision: before.tasks[0]!.revision,
-                objective: "Investigate the bounded report",
-                outputDescriptions: ["Sourced findings"],
-              },
-            },
-          }),
-        );
-        let state = yield* readCurrentState(f.sql, projectId);
-        const membership = state.foundationRecords?.find(
-          (r) => r.kind === "task-membership" && r.deliverableKind === "research",
-        );
-        const role = state.foundationRecords?.find(
-          (r) => r.kind === "role-revision" && r.role === "investigator",
-        );
-        if (membership?.kind !== "task-membership" || role?.kind !== "role-revision")
-          return yield* Effect.die("Missing research assignment");
-        yield* f.repository.execute(
-          yield* decodeCommit({
-            type: "project-work.foundation.commit",
-            projectId,
-            commandId: "configure-investigator",
-            expectedRevision: state.revision,
-            attribution,
-            committedAt: at,
-            records: [
-              {
-                ...role,
-                recordId: "research-role",
-                roleRevision: role.roleRevision + 1,
-                model: "test",
-                delegationDepth: 2,
-                revision: 0,
-              },
-              {
-                kind: "member",
-                projectId,
-                recordId: "read-member",
-                revision: 0,
-                generation: 0,
-                updatedAt: at,
-                status: "active",
-                name: "Investigator",
-                coordinator: false,
-                roleRevisionId: "research-role",
-              },
-            ],
-          }),
-        );
-        state = yield* readCurrentState(f.sql, projectId);
-        const first = f.request.claim.transition;
-        const grant = state.foundationRecords?.find(
-          (r) => r.kind === "gate" && r.recordId === membership.assignment?.authorizationGateId,
-        );
-        if (first?.kind !== "claim" || grant?.kind !== "gate")
-          return yield* Effect.die("Missing explicit research grant");
-        const { specificationGateId: _, planGateId: __, ...baseBinding } = first.binding;
-        const researchId = membership.taskId;
-        const binding = {
-          ...baseBinding,
-          recordId: "research-binding",
-          memberId: "read-member",
-          taskId: researchId,
-          attemptId: ProjectWorkAttemptId.make("research-attempt"),
-          roleRevisionId: "research-role",
-          threadId: ThreadId.make("research-thread"),
-          planRevision: 0,
-          authorizationGateId: grant.recordId,
-          scopeHash: projectTeamScopeHash(state, researchId),
-          configuration: { ...first.binding.configuration, toolIds: ["read"] },
-        };
-        const request: ProjectTeamDispatchRequest = {
-          ...f.request,
-          dispatchId: "research-dispatch",
-          claim: {
-            ...f.request.claim,
-            commandId: CommandId.make("research-dispatch"),
-            expectedRevision: state.revision,
-            transition: {
-              ...first,
-              taskId: researchId,
-              expectedTaskRevision: state.tasks.find((t) => t.taskId === researchId)!.revision,
-              authorizationGateId: grant.recordId,
-              expectedGateRevision: grant.revision,
-              binding,
-              claim: {
-                ...first.claim,
-                commandId: CommandId.make("research-dispatch"),
-                taskId: researchId,
-                attemptId: binding.attemptId,
-              },
-            },
-          },
-          git: { ...f.request.git, effectId: "research-dispatch", runId: "research-binding" },
-          setupId: "research-setup",
-          initializeOperationId: "research-initialize",
-          assignmentOperationId: "research-assignment",
-        };
+        const f = yield* readOnlySibling;
+        const { researchId, researchRequest: request } = f;
         const scheduler = yield* schedulerWith(f, {
           readProjectState: () =>
             readCurrentState(f.sql, projectId).pipe(
@@ -1778,10 +1792,12 @@ for (const phase of ["prepare", "reserve"] as const) {
               ? Effect.fail(new ProjectWorkPolicyError("invalid-state", "Capacity unavailable"))
               : f.journal.reserve(request),
         });
-        const first = yield* scheduler.sweep({ tasksPerProject: 1 });
+        const first = yield* scheduler.sweep();
         expect(first.committed).toHaveLength(0);
+        expect(first.tasksScanned).toBe(2);
+        expect(first.hasMore).toBe(false);
         denied = false;
-        const retry = yield* scheduler.sweep({ tasksPerProject: 1 });
+        const retry = yield* scheduler.sweep();
         expect(retry.committed.map((item) => item.fence.dispatchId)).toEqual([
           f.request.dispatchId,
         ]);
@@ -1968,3 +1984,169 @@ it.effect(
       }),
     ),
 );
+
+for (const phase of ["prepare", "reserve"] as const) {
+  it.effect(
+    `${phase} capacity denial of a writer admits a later read-only sibling and retries the writer on a later wake`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* readOnlySibling;
+          const setCapacity = Effect.fn("schedulerTest.setCapacity")(function* (capacity: number) {
+            const state = yield* readCurrentState(f.sql, projectId);
+            const limits = state.foundationRecords!.find((r) => r.kind === "limits");
+            if (limits?.kind !== "limits") return yield* Effect.die("Missing limits");
+            yield* f.repository.execute(
+              yield* decodeCommit({
+                type: "project-work.foundation.commit",
+                projectId,
+                commandId: `capacity-${capacity}`,
+                expectedRevision: state.revision,
+                attribution,
+                committedAt: at,
+                records: [
+                  { ...limits, revision: limits.revision + 1, projectWritableWorkers: capacity },
+                ],
+              }),
+            );
+          });
+          yield* setCapacity(0);
+          const prepared: string[] = [];
+          const scheduler = yield* schedulerWith(f, {
+            notifyCommittedDispatch: () => Effect.void,
+            readProjectState: ({ afterTaskId, limit }) =>
+              readCurrentState(f.sql, projectId).pipe(
+                Effect.map((state) => ({
+                  state,
+                  candidates: [
+                    { taskId, priority: 100 },
+                    { taskId: f.researchId, priority: 0 },
+                  ]
+                    .sort((a, b) => (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0))
+                    .filter((c) => afterTaskId === undefined || c.taskId > afterTaskId)
+                    .slice(0, limit),
+                })),
+              ),
+            prepareRequest: ({ state, taskId: selected }) =>
+              Effect.sync(() => {
+                prepared.push(selected);
+                const limits = state.foundationRecords!.find((r) => r.kind === "limits");
+                if (
+                  phase === "prepare" &&
+                  selected === taskId &&
+                  limits?.kind === "limits" &&
+                  limits.projectWritableWorkers === 0
+                )
+                  return { _tag: "Blocked" as const, reason: "writable-capacity-exhausted" };
+                const request = selected === taskId ? f.request : f.researchRequest;
+                return {
+                  _tag: "Prepared" as const,
+                  request: {
+                    ...request,
+                    claim: { ...request.claim, expectedRevision: state.revision },
+                  },
+                };
+              }),
+          });
+          const admitted = yield* scheduler.sweep();
+          expect(admitted.blocked).toMatchObject([{ taskId, phase }]);
+          expect(admitted.committed.map((r) => r.fence.dispatchId)).toEqual(["research-dispatch"]);
+          expect(prepared).toEqual([taskId, f.researchId]);
+          expect(admitted.hasMore).toBe(false);
+          expect(
+            yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+          ).toHaveLength(0);
+          expect(
+            (yield* readCurrentState(f.sql, projectId)).tasks.find((t) => t.taskId === taskId)
+              ?.state,
+          ).toBe("ready");
+          const retried = yield* scheduler.sweep();
+          expect(retried.committed).toHaveLength(0);
+          expect(retried.blocked).toContainEqual(expect.objectContaining({ taskId, phase }));
+          expect(retried.hasMore).toBe(false);
+          expect(prepared).toEqual([taskId, f.researchId, taskId]);
+          expect(
+            yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+          ).toHaveLength(0);
+          expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toHaveLength(1);
+        }),
+      ),
+  );
+}
+
+for (const phase of ["prepare", "reserve"] as const) {
+  it.effect(
+    `${phase} capacity denial preserves later candidates when the scan budget shrinks`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* threeTasks;
+          const prepared: string[] = [];
+          const scheduler = yield* schedulerWith(f, {
+            notifyCommittedDispatch: () => Effect.void,
+            readProjectState: ({ afterTaskId, limit }) =>
+              readCurrentState(f.sql, projectId).pipe(
+                Effect.map((state) => ({
+                  state,
+                  candidates: [taskId, f.otherId, f.thirdId]
+                    .filter((id) => afterTaskId === undefined || id > afterTaskId)
+                    .slice(0, limit)
+                    .map((taskId, i) => ({ taskId, priority: 10 - i })),
+                })),
+              ),
+            prepareRequest: ({ state, taskId: selected }) =>
+              Effect.sync(() => {
+                prepared.push(selected);
+                if (selected === f.otherId && phase === "prepare")
+                  return { _tag: "Blocked" as const, reason: "writable-capacity-exhausted" };
+                const request =
+                  selected === taskId
+                    ? f.request
+                    : selected === f.otherId
+                      ? f.otherRequest
+                      : f.thirdRequest;
+                return {
+                  _tag: "Prepared" as const,
+                  request: {
+                    ...request,
+                    claim: { ...request.claim, expectedRevision: state.revision },
+                  },
+                };
+              }),
+            reserve: (request) =>
+              request.dispatchId === f.otherRequest.dispatchId
+                ? Effect.fail(
+                    new ProjectWorkPolicyError(
+                      "invalid-state",
+                      "Controlled writer capacity denial",
+                    ),
+                  )
+                : f.journal.reserve(request),
+          });
+          expect(
+            (yield* scheduler.sweep({ tasksPerProject: 3, maximumReservations: 1 })).committed,
+          ).toHaveLength(1);
+          const denied = yield* scheduler.sweep({ tasksPerProject: 1 });
+          expect(denied.committed).toHaveLength(0);
+          expect(denied.tasksScanned).toBe(1);
+          expect(denied.hasMore).toBe(true);
+          const continued = yield* scheduler.sweep({ tasksPerProject: 1 });
+          expect(continued.tasksScanned).toBe(1);
+          expect(continued.committed.map((r) => r.fence.dispatchId)).toEqual([
+            f.thirdRequest.dispatchId,
+          ]);
+          expect(prepared).toEqual([taskId, f.otherId, f.thirdId]);
+          // The full page's keyset advances once; the next empty page wraps without retry spinning.
+          const exhausted = yield* scheduler.sweep({ tasksPerProject: 1 });
+          expect(exhausted.projectsScanned).toBe(1);
+          expect(exhausted.tasksScanned).toBe(0);
+          expect(exhausted.hasMore).toBe(false);
+          const retry = yield* scheduler.sweep();
+          expect(retry.committed).toHaveLength(0);
+          expect(retry.hasMore).toBe(false);
+          expect(prepared).toEqual([taskId, f.otherId, f.thirdId, f.otherId]);
+          expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
+        }),
+      ),
+  );
+}
