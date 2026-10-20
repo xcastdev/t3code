@@ -967,7 +967,8 @@ describe("ProviderService managed skill lifecycle", () => {
 const PI_DRIVER = ProviderDriverKind.make("piAgent");
 const piInstanceId = ProviderInstanceId.make("piAgent");
 
-describe("ProviderService committed Pi restoration", () => {
+// oxlint-disable-next-line t3code/no-global-process-runtime -- Suite collection must use the real host for Linux-only allocation.
+describe.runIf(process.platform === "linux")("ProviderService committed Pi restoration", () => {
   for (const scenario of [
     "implicit",
     "explicit current",
