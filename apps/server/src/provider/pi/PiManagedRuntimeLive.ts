@@ -1923,11 +1923,28 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   const selected = options.subscriptionTest;
                   if (!selected || !subscriptionPolicy)
                     return yield* deny("Pi subscription selection unavailable");
+                  const compactBudgetContext =
+                    compactBoundary === undefined
+                      ? undefined
+                      : yield* Effect.gen(function* () {
+                          const fresh = yield* readOperationContext;
+                          if (protectedContext(fresh) !== requiredIdentity)
+                            return yield* deny(
+                              "Required context changed before compact budget preflight",
+                              "conflict",
+                            );
+                          return {
+                            provenanceSha256: digest(encode(required.provenance)),
+                            textSha256: digest(requiredText),
+                            sourceRevision: fresh.provenance.sourceRevision,
+                          };
+                        });
                   const original = yield* operations.readRootBudget(
                     authority,
                     operation,
                     request,
                     resourceHash,
+                    compactBudgetContext,
                   );
                   if (
                     original.rootTaskId !== selected.selection.rootTaskId ||

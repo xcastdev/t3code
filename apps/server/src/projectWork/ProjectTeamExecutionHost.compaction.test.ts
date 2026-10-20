@@ -1,3 +1,4 @@
+import { makeProjectTeamContext } from "./ProjectTeamContext.ts";
 import * as Authorization from "./ProjectTeamAuthorization.ts";
 import * as Option from "effect/Option";
 import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
@@ -50,6 +51,7 @@ import { waitForProjectTeamRetainedCompaction } from "./ProjectTeamExecutionHost
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 
 const model = "inclusionai/ling-3.1-flash:free";
+const defaultModel = model;
 const now = Date.parse(at) + 100;
 const canonical = canonicalProjectWorkPayload;
 const hash = (value: unknown) =>
@@ -66,7 +68,10 @@ const native: PiNativeReference = {
 const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
   assignment = "Investigate the original approved task",
   priorHistoryOrdinal?: number,
+  subscription = false,
 ) {
+  const model = subscription ? "gpt-6-luna" : defaultModel;
+  const maximumTokens = subscription ? 64000 : 20000;
   const repository = yield* ProjectWorkRepository;
   const sql = yield* SqlClient.SqlClient;
   let claim: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
@@ -109,7 +114,7 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
     model,
     configuration: {
       ...claim.transition.binding.configuration,
-      maxTokens: 20000,
+      maxTokens: maximumTokens,
       maxDurationMs: 300000,
       runtimeVersion: "0.99.1",
       instructionsHash: NodeCrypto.createHash("sha256").update(role.instructions).digest("hex"),
@@ -142,7 +147,7 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
         updatedAt: at,
         status: "configured",
         model,
-        tokenLimit: 20000,
+        tokenLimit: maximumTokens,
         durationLimitMs: 300000,
         environmentModelCalls: 2,
         modelCalls: 2,
@@ -324,9 +329,20 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
     yield* activate(op, native);
     const accounting = yield* makeAccounting({
       environmentId: "environment",
-      routeId: "command-code-ling-free",
+      routeId: subscription ? "openai-subscription-luna" : "command-code-ling-free",
       model,
       acceptedReportedModels: [model],
+      ...(subscription
+        ? {
+            subscriptionTest: {
+              projectId,
+              rootTaskId: prompt.authority.binding.taskId,
+              model: "gpt-6-luna" as const,
+              maximumTokens: 64000 as const,
+              maximumDurationMs: 300000 as const,
+            },
+          }
+        : {}),
       resolveOperation: operations.resolveOperation,
     });
     const fields = {
@@ -334,8 +350,14 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
       operationId: op.operation.operationId,
       generation: 0,
       requestId: 1,
-      routeId: "command-code-ling-free",
-      provider: "command-code" as const,
+      routeId: subscription ? "openai-subscription-luna" : "command-code-ling-free",
+      provider: subscription ? ("openai-codex" as const) : ("command-code" as const),
+      ...(subscription
+        ? {
+            accountingMode: "openai-subscription-monitored" as const,
+            unknownMaximumTokens: 64000 as const,
+          }
+        : {}),
       model,
       maxInputTokens: Math.max(1000, usage.prompt_tokens),
       maxOutputTokens: Math.max(100, usage.completion_tokens),
@@ -1296,4 +1318,174 @@ for (const kind of ["role-revision", "member"] as const)
         ]);
       }),
     ),
+  );
+
+const budgetPreflightFixture = Effect.fn("budgetPreflightFixture")(function* () {
+  const f = yield* fixtureWithAssignment(undefined, undefined, true);
+  const request = {
+    threadId,
+    requestId: MessageId.make("subscription-preflight"),
+    modelSelection: { instanceId: providerInstanceId, model: "gpt-6-luna", options: [] },
+  };
+  const reservation = yield* f.operations.reserveCompaction(identity, request);
+  const snapshot = yield* observe(f);
+  const context = yield* makeProjectTeamContext({
+    environmentId: "environment",
+    maximumEnvironmentModelCalls: 2,
+  });
+  const required = yield* context.readRequired(snapshot);
+  const boundary = yield* f.operations.readCompaction(identity, {
+    ...request,
+    kind: "compact",
+  });
+  const supplied = {
+    ...request,
+    kind: "compact" as const,
+    operationId: boundary.operationId,
+  };
+  const authority = yield* f.operations.current(identity);
+  return { f, request, reservation, snapshot, required, supplied, authority };
+});
+
+it.effect(
+  "subscription compact budget preflight qualifies the admitted predecessor before allocation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const { f, reservation, snapshot, required, supplied, authority } =
+          yield* budgetPreflightFixture();
+        const before = {
+          operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+          processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+          callers: yield* f.sql`SELECT * FROM project_team_compact_caller`,
+          charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+          budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+        };
+        const budget = yield* f.operations.readRootBudget(
+          authority,
+          { operationId: supplied.operationId, operationKind: "compact" },
+          supplied,
+          "a".repeat(64),
+          {
+            provenanceSha256: hash(required.provenance),
+            sourceRevision: required.provenance.sourceRevision,
+            textSha256: NodeCrypto.createHash("sha256").update(required.text).digest("hex"),
+          },
+        );
+        expect(budget).toEqual({
+          rootTaskId: snapshot.intent.limits.rootTaskId,
+          maximumTokens: 64000,
+          deadlineAtMs: snapshot.intent.limits.rootDeadlineAtMs,
+        });
+        expect(reservation.deadlineAtMs).toBeLessThanOrEqual(budget.deadlineAtMs);
+        expect({
+          operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+          processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+          callers: yield* f.sql`SELECT * FROM project_team_compact_caller`,
+          charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+          budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+        }).toEqual(before);
+      }),
+    ),
+);
+
+for (const change of [
+  "missing-context",
+  "tampered-context",
+  "stale-context",
+  "operation",
+  "request",
+  "resource",
+  "receipt",
+  "abandoned",
+  "revoked",
+  "deadline",
+  "root-tokens",
+  "root-deadline",
+] as const)
+  it.effect(
+    `subscription compact budget preflight refuses ${change} without allocation or charge`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const { f, request, reservation, supplied, authority, required } =
+            yield* budgetPreflightFixture();
+          const context = {
+            provenanceSha256: hash(required.provenance),
+            textSha256: NodeCrypto.createHash("sha256").update(required.text).digest("hex"),
+            sourceRevision: required.provenance.sourceRevision,
+          };
+          if (change === "receipt")
+            yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=json_set(terminal_json,'$.native.leafId','stale-predecessor-leaf') WHERE operation_id=${reservation.predecessorOperationId}`;
+          if (change === "abandoned") yield* f.operations.abandonCompaction(identity, request);
+          if (change === "revoked")
+            yield* restoreHistoricalBinding({
+              ...authority.binding,
+              status: "stopping",
+              revision: authority.binding.revision + 1,
+            });
+          if (change === "deadline") yield* TestClock.setTime(reservation.deadlineAtMs);
+          if (change === "root-tokens")
+            yield* f.sql`UPDATE project_team_model_budget SET maximum_tokens=maximum_tokens+1`;
+          if (change === "root-deadline")
+            yield* f.sql`UPDATE project_team_model_budget SET deadline_at_ms=deadline_at_ms+1`;
+          if (change === "stale-context")
+            yield* f.commit(
+              [
+                {
+                  kind: "message",
+                  projectId,
+                  recordId: "changed-budget-context",
+                  revision: 0,
+                  generation: 0,
+                  updatedAt: at,
+                  status: "queued",
+                  commandId: "changed-budget-context",
+                  senderId: "member",
+                  recipientId: f.binding.memberId,
+                  taskId: f.binding.taskId,
+                  body: "New required current communication",
+                  evidenceIds: [],
+                  deliveryGeneration: 0,
+                  deliveryCursor: 0,
+                },
+              ],
+              "changed-budget-context",
+            );
+          const before = {
+            operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+            processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+            callers: yield* f.sql`SELECT * FROM project_team_compact_caller`,
+            charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+            budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+          };
+          expect(
+            (yield* f.operations
+              .readRootBudget(
+                authority,
+                {
+                  operationId: change === "operation" ? "foreign-operation" : supplied.operationId,
+                  operationKind: "compact",
+                },
+                change === "request"
+                  ? { ...supplied, requestId: MessageId.make("foreign-request") }
+                  : supplied,
+                (change === "resource" ? "d" : "a").repeat(64),
+                change === "missing-context"
+                  ? undefined
+                  : change === "tampered-context"
+                    ? { ...context, provenanceSha256: "invalid" }
+                    : context,
+              )
+              .pipe(Effect.exit))._tag,
+          ).toBe("Failure");
+          expect({
+            operations: yield* f.sql`SELECT * FROM project_team_pi_operation ORDER BY operation_id`,
+            processes: yield* f.sql`SELECT * FROM project_team_pi_process ORDER BY operation_id`,
+            callers: yield* f.sql`SELECT * FROM project_team_compact_caller`,
+            charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+            budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
+          }).toEqual(before);
+        }),
+      ),
   );

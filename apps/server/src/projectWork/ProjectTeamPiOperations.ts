@@ -150,6 +150,14 @@ const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX
 const Positive = Safe.check(Schema.isGreaterThan(0));
 const OperationLimits = Schema.Struct({ maximumTokens: Positive, deadlineAtMs: Positive });
 const RootBudget = Schema.Struct({ rootTaskId: Schema.String, ...OperationLimits.fields });
+const decodeCompactBudgetContext = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    provenanceSha256: ResourceIdentity,
+    textSha256: ResourceIdentity,
+    sourceRevision: Safe,
+  }),
+  { onExcessProperty: "error" },
+);
 const CompactAssociation = Schema.Struct({
   version: Schema.Literal(1),
   requestId: MessageId,
@@ -2962,6 +2970,24 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         ...(saved.length && intent.compaction ? { association: intent.compaction } : {}),
       };
     });
+    const associateCompaction = (
+      boundary: Effect.Success<ReturnType<typeof compactInside>>,
+      requestId: MessageId,
+      context: { readonly provenanceSha256: string; readonly textSha256: string },
+    ) =>
+      decodeCompactAssociation({
+        version: 1,
+        requestId,
+        dispatchId: boundary.original.fence.dispatchId,
+        dispatchIntentSha256: digest(boundary.original.intent),
+        claimGeneration: boundary.original.fence.claimGeneration,
+        fenceRevision: boundary.original.fence.revision,
+        predecessorOperationId: boundary.predecessor.operationId,
+        predecessorOrdinal: boundary.predecessor.ordinal,
+        predecessorReceiptSha256: boundary.predecessor.receiptSha256,
+        contextProvenanceSha256: context.provenanceSha256,
+        contextTextSha256: context.textSha256,
+      });
     const withCompactionPermit = <A, E, R>(
       identity: Parameters<typeof current>[0],
       effect: Effect.Effect<A, E, R>,
@@ -3212,19 +3238,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
                 return yield* deny(
                   "Compaction requires its frozen current context and predecessor",
                 );
-              compaction = yield* decodeCompactAssociation({
-                version: 1,
-                requestId: request.requestId,
-                dispatchId: boundary.original.fence.dispatchId,
-                dispatchIntentSha256: digest(boundary.original.intent),
-                claimGeneration: boundary.original.fence.claimGeneration,
-                fenceRevision: boundary.original.fence.revision,
-                predecessorOperationId: boundary.predecessor.operationId,
-                predecessorOrdinal: boundary.predecessor.ordinal,
-                predecessorReceiptSha256: boundary.predecessor.receiptSha256,
-                contextProvenanceSha256: allocated.compactContext.provenanceSha256,
-                contextTextSha256: allocated.compactContext.textSha256,
-              });
+              compaction = yield* associateCompaction(
+                boundary,
+                yield* decodeCompactMessageId(request.requestId),
+                allocated.compactContext,
+              );
             }
             if (request.operationId !== undefined) {
               const existing =
@@ -4085,6 +4103,79 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         operationDeadlineAtMs: row.deadline_at_ms,
       };
     });
+    const readRootBudget = Effect.fn("ProjectTeamPiOperations.readRootBudget")(function* (
+      authority: ProjectTeamAuthority,
+      operation: PiWorkerOperation,
+      request: unknown,
+      resourceHash: string,
+      compactContext?: {
+        readonly provenanceSha256: string;
+        readonly textSha256: string;
+        readonly sourceRevision: number;
+      },
+    ) {
+      yield* ownTransaction();
+      const identity = {
+        providerInstanceId: authority.binding.providerInstanceId,
+        threadId: authority.binding.threadId,
+      };
+      return yield* withCompactionPermit(
+        identity,
+        sql.withTransaction(
+          Effect.gen(function* () {
+            let currentAuthority = authority;
+            let compaction: typeof CompactAssociation.Type | undefined;
+            let callerDeadline = Number.MAX_SAFE_INTEGER;
+            if (operation.operationKind === "compact") {
+              if (!compactContext)
+                return yield* deny("Compact budget requires its verified current context");
+              const verifiedContext = yield* decodeCompactBudgetContext(compactContext);
+              const supplied = yield* decodeStoredRequest(request);
+              if (supplied.kind !== "compact" || supplied.requestId === undefined)
+                return yield* deny("Compact budget requires its original request");
+              currentAuthority = yield* current(identity);
+              if (
+                immutableBinding(currentAuthority.binding) !==
+                  immutableBinding(authority.binding) ||
+                encode(currentAuthority.role) !== encode(authority.role)
+              )
+                return yield* deny("Compact budget authority changed", "conflict");
+              if (currentAuthority.state.revision !== verifiedContext.sourceRevision)
+                return yield* deny("Compact budget current context changed", "conflict");
+              const boundary = yield* compactInside(identity, supplied);
+              if (
+                boundary.association ||
+                boundary.operationId !== operation.operationId ||
+                resourceHash !== boundary.predecessor.resourceHash ||
+                !boundary.caller
+              )
+                return yield* deny(
+                  "Compact budget requires its pending caller and exact predecessor",
+                  "conflict",
+                );
+              compaction = yield* associateCompaction(
+                boundary,
+                supplied.requestId,
+                verifiedContext,
+              );
+              callerDeadline = boundary.caller.deadline_at_ms;
+            }
+            const root = yield* roots(currentAuthority);
+            const limits = yield* rootBudget(
+              currentAuthority,
+              root,
+              operation,
+              undefined,
+              request,
+              resourceHash,
+              compaction,
+            );
+            yield* clockCheck(Math.min(limits.deadlineAtMs, callerDeadline));
+            return limits.rootBudget;
+          }),
+        ),
+      );
+    });
     const mailboxDecisions = yield* makeProjectTeamMailboxTurnDecisionReader({
       environmentId: options.environmentId,
     });
@@ -4093,32 +4184,8 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       current: (...args: Parameters<typeof current>) =>
         guard(ownTransaction().pipe(Effect.andThen(current(...args)))),
       admitCurrent,
-      readRootBudget: (
-        authority: ProjectTeamAuthority,
-        operation: PiWorkerOperation,
-        request: unknown,
-        resourceHash: string,
-      ) =>
-        guard(
-          ownTransaction().pipe(
-            Effect.andThen(
-              sql.withTransaction(
-                Effect.gen(function* () {
-                  const root = yield* roots(authority);
-                  const limits = yield* rootBudget(
-                    authority,
-                    root,
-                    operation,
-                    undefined,
-                    request,
-                    resourceHash,
-                  );
-                  return limits.rootBudget;
-                }),
-              ),
-            ),
-          ),
-        ),
+      readRootBudget: (...args: Parameters<typeof readRootBudget>) =>
+        guard(readRootBudget(...args)),
       lookup: (...args: Parameters<typeof lookup>) => guard(lookup(...args)),
       lookupInTransaction,
       reserveCompaction: (...args: Parameters<typeof reserveCompaction>) =>
