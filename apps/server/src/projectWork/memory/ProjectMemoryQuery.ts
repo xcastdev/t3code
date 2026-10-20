@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Exit from "effect/Exit";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -1205,7 +1206,7 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
     );
     const consumeQuery = Effect.fn("ProjectMemoryQuery.consume")(
       function* (principal: ProjectTeamPrincipal, queryId: string) {
-        let claimed = false;
+        let claimed: ProjectMemoryQueryOwner | undefined;
         const work = Effect.gen(function* () {
           if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
             return yield* deny("Query processing follows its original commit");
@@ -1307,7 +1308,7 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
             .pipe(
               Effect.tap(() =>
                 Effect.sync(() => {
-                  claimed = true;
+                  claimed = owner;
                 }),
               ),
               Effect.uninterruptible,
@@ -1529,14 +1530,70 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
           );
         });
         return yield* work.pipe(
-          Effect.onExit((exit) =>
-            claimed && Exit.isFailure(exit)
-              ? sql
+          Effect.onExit((exit) => {
+            if (claimed === undefined || Exit.isSuccess(exit)) return Effect.void;
+            const owner = claimed;
+            const unreserved = Effect.gen(function* () {
+              yield* auditProjectMemoryQueryAdmission(sql, owner);
+              const stages = yield* readStages(sql, queryId);
+              const reservations = yield* sql`SELECT 1 FROM project_team_model_request
+                WHERE environment_id=${owner.operation.environmentId} AND project_id=${owner.operation.projectId}
+                AND operation_id=${owner.operation.operationId} AND request_lane='memory'
+                AND json_extract(reservation_json,'$.effectId')=${queryId} LIMIT 1`;
+              return (
+                reservations.length === 0 &&
+                stages.embedding !== null &&
+                stages.embedded === null &&
+                stages.search === null &&
+                stages.searched === null &&
+                stages.drained === null &&
+                ((stages.status === "embedding" && stages.result === null) ||
+                  (stages.status === "failed" && stages.result !== null))
+              );
+            }).pipe(
+              Effect.mapError((error) =>
+                isServiceError(error) ? error : deny("Query failure provenance denied"),
+              ),
+            );
+            const finish = Effect.gen(function* () {
+              if (Cause.hasInterrupts(exit.cause)) return;
+              const eligible = yield* sql.withTransaction(
+                Effect.gen(function* () {
+                  const stages = yield* readStages(sql, queryId);
+                  return (
+                    stages.status === "embedding" && stages.result === null && (yield* unreserved)
+                  );
+                }),
+              );
+              if (!eligible) return;
+              yield* publishFinal(
+                owner,
+                Effect.succeed({
+                  kind: "memory-query-result",
+                  version: 1,
+                  queryId,
+                  outcome: "failed",
+                  hitIds: [],
+                  reason: "Query stopped before its first reservation",
+                }),
+                unreserved.pipe(
+                  Effect.flatMap((eligible) =>
+                    eligible
+                      ? Effect.void
+                      : Effect.fail(deny("Query failure cannot settle a forwarded stage")),
+                  ),
+                ),
+              );
+            });
+            return finish.pipe(
+              Effect.onExit(() =>
+                sql
                   .withTransaction(sql`UPDATE project_team_memory_query SET status='uncertain'
                 WHERE query_id=${queryId} AND status IN ('embedding','searching') AND result_json IS NULL`)
-                  .pipe(Effect.mapError(() => deny("Query owner relinquishment failed")))
-              : Effect.void,
-          ),
+                  .pipe(Effect.mapError(() => deny("Query owner relinquishment failed"))),
+              ),
+            );
+          }),
         );
       },
       Effect.mapError((error) =>

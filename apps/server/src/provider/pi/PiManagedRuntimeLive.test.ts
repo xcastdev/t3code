@@ -10308,6 +10308,20 @@ for (const compactProof of [
             | undefined;
           let recoverMemory: MemoryModelPorts.ProjectMemoryPorts["Service"]["recoverJoinedOperation"];
           const recoveryWakes: string[] = [];
+          const queryCleanupQueued = yield* Deferred.make<string>();
+          const queryCleanupRelease = yield* Deferred.make<void>();
+          let delayedQueryCleanupRan = false;
+          const delayedQueryCleanup = queryNoForward
+            ? yield* Effect.gen(function* () {
+                const id = yield* Deferred.await(queryCleanupQueued);
+                yield* Deferred.await(queryCleanupRelease);
+                delayedQueryCleanupRan = true;
+                if (!reconcileMemory)
+                  return yield* Effect.die("Delayed query cleanup port missing");
+                yield* reconcileMemory(id);
+              }).pipe(Effect.forkChild)
+            : undefined;
+
           let joinedTerminal: SessionRuntime.PiSessionTerminal | undefined;
           const returnEntered = yield* Deferred.make<void>();
           const returnProof = compactProof?.startsWith("return") === true;
@@ -11239,7 +11253,7 @@ for (const compactProof of [
                             generation: f.binding.generation,
                             operationId: input.operation.operationId,
                           });
-                          expect(ledger.settled).toBe(queryCache);
+                          if (!queryNoForward) expect(ledger.settled).toBe(queryCache);
                           if (queryAdmissionOnly) memoryReady = false;
                         });
                         if (queryAdmissionOnly) yield* issueQuery();
@@ -11737,18 +11751,39 @@ for (const compactProof of [
                               ),
                               assertAdmission: Effect.void,
                               readCredential: (reference) =>
-                                Effect.succeed(
-                                  activeQuery && querySecret
+                                Effect.gen(function* () {
+                                  if (queryNoForward && activeQuery) {
+                                    const queries = yield* f.sql<{
+                                      id: string;
+                                    }>`SELECT query_id AS id FROM project_team_memory_query WHERE status='embedding' AND embedding_result_json IS NULL AND result_json IS NULL`;
+                                    if (!queries[0] || !consumer.consumeQuery)
+                                      return yield* Effect.die("Unreserved winner missing");
+                                    const wakes = recoveryWakes.length;
+                                    const duplicate = yield* consumer
+                                      .consumeQuery(principal, queries[0].id)
+                                      .pipe(Effect.result, Effect.forkChild);
+                                    expect((yield* Fiber.join(duplicate))._tag).toBe("Failure");
+                                    expect(recoveryWakes.length).toBe(wakes);
+                                    expect(
+                                      yield* f.sql`SELECT status,result_json FROM project_team_memory_query`,
+                                    ).toEqual([{ status: "embedding", result_json: null }]);
+                                    expect(
+                                      yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE json_extract(reservation_json,'$.effectId')=${queries[0].id}`,
+                                    ).toEqual([]);
+                                  }
+                                  return activeQuery && querySecret
                                     ? queryText
                                     : compactProof === "memorySecret" ||
                                         (compactProof === "memoryEmbeddingSecret" &&
                                           reference === "controlled-embedding")
                                       ? lateSecret
-                                      : "controlled-memory-credential",
-                                ),
+                                      : "controlled-memory-credential";
+                                }).pipe(Effect.orDie),
                               observeCompanionCleanup: (id) =>
-                                Effect.sync(() => {
+                                Effect.gen(function* () {
                                   recoveryWakes.push(id);
+                                  if (queryNoForward && activeQuery)
+                                    yield* Deferred.succeed(queryCleanupQueued, id);
                                 }),
                               confirmModelTransportDrained: (id) =>
                                 drained.has(id)
@@ -13183,21 +13218,9 @@ for (const compactProof of [
                                 return yield* Effect.die(
                                   "Original budget-denied query receipt missing",
                                 );
-                              if (retained.status === "uncertain" && reconcileMemory)
-                                yield* reconcileMemory(retained.id);
-                              const settled = yield* f.sql<{
-                                status: string;
-                                result: string;
-                              }>`SELECT status,result_json AS result FROM project_team_memory_query WHERE query_id=${retained.id}`;
-                              expect(settled[0]?.status).toBe("failed");
                               expect(decodeRequiredJson(retained.embedding)).toMatchObject({
                                 maximumInputTokens: queryBudget ? 999 : 400,
                                 maximumOutputTokens: 1,
-                              });
-                              expect(decodeRequiredJson(settled[0]?.result)).toMatchObject({
-                                queryId: retained.id,
-                                outcome: "failed",
-                                hitIds: [],
                               });
                               expect(
                                 yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='memory'
@@ -14854,6 +14877,39 @@ for (const compactProof of [
               _tag: "Failure",
               failure: { reason: "Original memory runtime cannot forward" },
             });
+          }
+          if (queryNoForward) {
+            yield* Deferred.await(queryCleanupQueued);
+            expect(delayedQueryCleanupRan).toBe(false);
+            const queryRows = yield* f.sql<{
+              status: string;
+              result: string;
+            }>`SELECT status,result_json AS result FROM project_team_memory_query`;
+            expect(queryRows).toHaveLength(1);
+            expect(queryRows[0]?.status).toBe("failed");
+            expect(decodeRequiredJson(queryRows[0]?.result)).toMatchObject({
+              outcome: "failed",
+              hitIds: [],
+            });
+            const terminals = yield* f.sql<{
+              terminal: string | null;
+            }>`SELECT terminal_json AS terminal FROM project_team_pi_operation WHERE operation_id=${f.request.assignmentOperationId}`;
+            expect(decodeRequiredJson(terminals[0]?.terminal)).toMatchObject({
+              outcome: "success",
+            });
+            const charges =
+              yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+            yield* Deferred.succeed(queryCleanupRelease, undefined);
+            if (!delayedQueryCleanup)
+              return yield* Effect.die("Delayed query cleanup worker missing");
+            yield* Fiber.join(delayedQueryCleanup);
+            expect(delayedQueryCleanupRan).toBe(true);
+            expect(
+              yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+            ).toEqual(charges);
+            expect(
+              yield* f.sql`SELECT status,result_json AS result FROM project_team_memory_query`,
+            ).toEqual(queryRows);
           }
           yield* stage("assignment-observed");
           if (memoryProof) {
