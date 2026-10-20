@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { isPiBrokerManagedModel, piBrokerModelRoute } from "../provider/pi/PiManagedModels.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { ProjectTeamAuthorization } from "./ProjectTeamAuthorization.ts";
 import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
@@ -46,9 +47,8 @@ const recordedUsage = (
   stoppedReason?: "threshold-reached" | "unknown-usage",
   monitoredGrant = false,
 ) => {
-  const modes = new Set(rows.map((row) => row.accounting_mode));
-  if (modes.size > 1) return undefined;
-  const monitored = modes.has("openai-subscription-monitored") || monitoredGrant;
+  const monitored = monitoredGrant;
+  let hardUsedTokens = 0;
   let chargedTokens = 0;
   let reservedTokens = 0;
   let unknownChargedTokens = 0;
@@ -56,6 +56,11 @@ const recordedUsage = (
   let quarantinedCalls = 0;
   for (const row of rows) {
     chargedTokens += row.charged_input_tokens + row.charged_output_tokens;
+    if (row.accounting_mode === "hard")
+      hardUsedTokens +=
+        row.status === "held"
+          ? row.maximum_input_tokens + row.maximum_output_tokens
+          : row.charged_input_tokens + row.charged_output_tokens;
     if (row.status === "held")
       reservedTokens += row.maximum_input_tokens + row.maximum_output_tokens;
     else if (row.status !== "reported")
@@ -63,14 +68,24 @@ const recordedUsage = (
     if (row.capacity_state === "held") heldCalls++;
     if (row.capacity_state === "quarantine") quarantinedCalls++;
     if (
-      [chargedTokens, reservedTokens, unknownChargedTokens, heldCalls, quarantinedCalls].some(
-        (value) => !Number.isSafeInteger(value),
-      )
+      [
+        hardUsedTokens,
+        chargedTokens,
+        reservedTokens,
+        unknownChargedTokens,
+        heldCalls,
+        quarantinedCalls,
+      ].some((value) => !Number.isSafeInteger(value))
     )
       return undefined;
   }
   const total = chargedTokens + reservedTokens;
-  if (!Number.isSafeInteger(total) || (!monitored && total > maximumTokens)) return undefined;
+  if (
+    !Number.isSafeInteger(total) ||
+    hardUsedTokens > maximumTokens ||
+    (!monitored && total > maximumTokens)
+  )
+    return undefined;
   return {
     maximumTokens,
     deadlineAtMs,
@@ -301,7 +316,10 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
           [...historyMetadata, ...proofMetadata].reduce((total, row) => total + row.bytes, 0) *
             memoryProofReads <=
           4194304;
-      const originalProofs = new Map<string, ProjectTeamPiUsageHistory>();
+      const originalProofs = new Map<
+        string,
+        ProjectTeamPiUsageHistory & { readonly binding: typeof ProjectTeamRunBinding.Type }
+      >();
       let historyAttempted = false;
       const rootModels = new Map<string, readonly ModelRow[]>();
       const modelRootsAttempted = new Set<string>();
@@ -399,8 +417,40 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
             const proofs = yield* services(
               operations.readUsageHistoryBatchInTransaction(projectId, identities),
             );
-            for (const proof of proofs)
-              originalProofs.set(proof.bindingId + ":" + proof.generation, proof);
+            for (const proof of proofs) {
+              // These intents have just passed the historical reader's owner,
+              // hash and allocation audit. Mutable binding rows are not grants.
+              let owners = yield* sql<{ payload: string | null }>`SELECT
+                json_extract(intent_json,'$.binding') AS payload
+                FROM project_team_pi_operation WHERE project_id=${projectId}
+                AND binding_id=${proof.bindingId} AND generation=${proof.generation}
+                ORDER BY operation_ordinal LIMIT 1`;
+              if (owners.length === 0)
+                owners = yield* sql<{ payload: string | null }>`SELECT
+                  json_extract(intent_json,'$.compiledClaim.transition.binding') AS payload
+                  FROM project_team_dispatch WHERE project_id=${projectId}
+                  AND binding_id=${proof.bindingId} AND generation=${proof.generation} LIMIT 2`;
+              if (owners.length !== 1 || owners[0]?.payload == null)
+                return yield* new ProjectTeamUsageReadError({
+                  reason: "Historical binding unavailable",
+                });
+              const ownerBinding = yield* decodeBinding(owners[0].payload);
+              if (
+                ownerBinding.recordId !== proof.bindingId ||
+                ownerBinding.generation !== proof.generation ||
+                ownerBinding.projectId !== projectId ||
+                ownerBinding.environmentId !== environmentId ||
+                ownerBinding.taskId !== proof.taskId ||
+                ownerBinding.attemptId !== proof.attemptId
+              )
+                return yield* new ProjectTeamUsageReadError({
+                  reason: "Historical binding owner differs",
+                });
+              originalProofs.set(proof.bindingId + ":" + proof.generation, {
+                ...proof,
+                binding: ownerBinding,
+              });
+            }
             const proof = originalProofs.get(key);
             if (proof === undefined)
               return yield* new ProjectTeamUsageReadError({
@@ -428,6 +478,28 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
             )
               return unavailable(selected, "budget-invalid");
           }
+          const anchors = yield* sql<{ bindingId: string }>`SELECT root_binding_id AS bindingId
+            FROM project_team_pi_operation WHERE project_id=${projectId}
+            AND root_task_id=${original.rootTaskId} ORDER BY rowid LIMIT 1`;
+          const rootOwners =
+            anchors.length > 0
+              ? anchors
+              : yield* sql<{ bindingId: string }>`SELECT binding_id AS bindingId
+            FROM project_team_dispatch WHERE project_id=${projectId}
+            AND root_task_id=${original.rootTaskId} AND task_id=${original.rootTaskId}
+            ORDER BY rowid LIMIT 1`;
+          const rootProofs = [...originalProofs.values()].filter(
+            (proof) => proof.bindingId === rootOwners[0]?.bindingId,
+          );
+          const rootProof = rootProofs[0];
+          if (
+            rootProofs.length !== 1 ||
+            rootProof === undefined ||
+            rootProof.taskId !== original.rootTaskId ||
+            rootProof.binding.parentRunId !== undefined
+          )
+            return unavailable(selected, "budget-invalid");
+          const monitored = rootProof.binding.model === "gpt-6-luna";
           const budgets = yield* sql<{
             environmentId: string | null;
             maximumTokens: number | null;
@@ -496,16 +568,34 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
               )
                 return unavailable(selected, "ledger-invalid");
               if (model.request_lane === "pi") {
+                if (!isPiBrokerManagedModel(owner.binding.model))
+                  return unavailable(selected, "ledger-invalid");
+                const route = piBrokerModelRoute(owner.binding.model);
+                if (
+                  model.model !== owner.binding.model ||
+                  model.provider !== route.provider ||
+                  model.route_id !== route.routeId ||
+                  model.request_scope !== "" ||
+                  model.accounting_mode !==
+                    (owner.binding.model === "gpt-6-luna"
+                      ? "openai-subscription-monitored"
+                      : "hard")
+                )
+                  return unavailable(selected, "ledger-invalid");
                 yield* auditProjectTeamRecordedPiModelRow(model, operation.terminalAccounting);
-              } else if (!memoryAudited.has(model.operation_id)) {
-                yield* auditProjectMemoryOperationLedger(sql, {
-                  environmentId,
-                  projectId,
-                  bindingId: model.run_id,
-                  generation: model.generation,
-                  operationId: model.operation_id,
-                });
-                memoryAudited.add(model.operation_id);
+              } else {
+                if (model.accounting_mode !== "hard" || model.unknown_maximum_tokens !== null)
+                  return unavailable(selected, "ledger-invalid");
+                if (!memoryAudited.has(model.operation_id)) {
+                  yield* auditProjectMemoryOperationLedger(sql, {
+                    environmentId,
+                    projectId,
+                    bindingId: model.run_id,
+                    generation: model.generation,
+                    operationId: model.operation_id,
+                  });
+                  memoryAudited.add(model.operation_id);
+                }
               }
               decodedRows.push(model);
             }
@@ -531,15 +621,14 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
             CASE WHEN stop_reason IS NULL OR stop_reason IN ('threshold-reached','unknown-usage') THEN stop_reason ELSE '__invalid__' END AS stopReason
             FROM project_team_pi_subscription_grant WHERE environment_id=${environmentId}
             AND project_id=${projectId} AND root_task_id=${original.rootTaskId} LIMIT 2`;
-          const modes = new Set(modelRows.map((model) => model.accounting_mode));
-          if (modes.size > 1 || subscriptionGrants.length > 1)
-            return unavailable(selected, "ledger-invalid");
+          if (subscriptionGrants.length > 1) return unavailable(selected, "ledger-invalid");
           const grant = subscriptionGrants[0];
-          const hasMonitoredRows = modes.has("openai-subscription-monitored");
-          const monitored = grant !== undefined;
+          const hasMonitoredRows = modelRows.some(
+            (model) => model.accounting_mode === "openai-subscription-monitored",
+          );
           if (
             (hasMonitoredRows && !monitored) ||
-            (modelRows.length > 0 && monitored !== hasMonitoredRows) ||
+            monitored !== (grant !== undefined) ||
             (grant !== undefined &&
               (grant.model !== "gpt-6-luna" ||
                 grant.routeId !== "openai-subscription-luna" ||
@@ -561,7 +650,11 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
             (total, model) => total + model.charged_input_tokens + model.charged_output_tokens,
             0,
           );
-          const hasUnknown = modelRows.some((model) => model.status === "unknown");
+          const hasUnknown = modelRows.some(
+            (model) =>
+              model.accounting_mode === "openai-subscription-monitored" &&
+              model.status === "unknown",
+          );
           if (
             grant !== undefined &&
             (!Number.isSafeInteger(chargedTotal) ||
@@ -570,6 +663,28 @@ export const readProjectTeamBindingAccountingInTransaction = Effect.fn("ProjectT
               (stoppedReason === undefined && (chargedTotal >= 64_000 || hasUnknown)))
           )
             return unavailable(selected, "ledger-invalid");
+          for (const member of members) {
+            if (member.bindingId === null || member.generation === null)
+              return unavailable(selected, "owner-invalid");
+            const owner = yield* readOriginal(member.bindingId, member.generation);
+            const hardRows = modelRows.filter(
+              (model) =>
+                model.accounting_mode === "hard" &&
+                model.run_id === owner.bindingId &&
+                model.generation === owner.generation,
+            );
+            if (!recordedUsage(hardRows, owner.attemptMaximumTokens, owner.attemptDeadlineAtMs))
+              return unavailable(selected, "limit-exceeded");
+            for (const operation of owner.operations)
+              if (
+                !recordedUsage(
+                  hardRows.filter((model) => model.operation_id === operation.operationId),
+                  operation.maximumTokens,
+                  operation.deadlineAtMs,
+                )
+              )
+                return unavailable(selected, "limit-exceeded");
+          }
           const root = recordedUsage(
             modelRows,
             original.rootMaximumTokens,
