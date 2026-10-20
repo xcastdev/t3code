@@ -15,7 +15,10 @@ import * as ServerConfig from "../config.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as Settings from "../serverSettings.ts";
 import { ProjectWorkEventBus, ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
-import { makeProjectTeamExecutionReactor } from "./ProjectTeamExecutionReactor.ts";
+import {
+  ProjectTeamExecutionWake,
+  makeProjectTeamExecutionReactor,
+} from "./ProjectTeamExecutionReactor.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 
 const services = () =>
@@ -662,3 +665,29 @@ it.layer(NodeServices.layer)("project team execution reactor", (it) => {
       }).pipe(Effect.scoped, Effect.provide(services())),
   );
 });
+
+it.effect("owned continuation completion wakes discovery without another domain event", () =>
+  Effect.gen(function* () {
+    yield* enable;
+    const next = yield* Deferred.make<void>();
+    let sweeps = 0;
+    let completed = Effect.void;
+    const reactor = yield* makeProjectTeamExecutionReactor({
+      start: Effect.gen(function* () {
+        completed = yield* ProjectTeamExecutionWake;
+        return {
+          ready: Effect.void,
+          sweep: Effect.suspend(() =>
+            ++sweeps === 2 ? Deferred.succeed(next, undefined).pipe(Effect.asVoid) : Effect.void,
+          ),
+          stop: Effect.void,
+        };
+      }),
+    });
+    yield* reactor.ready;
+    yield* completed;
+    yield* Deferred.await(next);
+    assert.strictEqual(sweeps, 2);
+    yield* reactor.stop;
+  }).pipe(Effect.scoped, Effect.provide(services().pipe(Layer.provideMerge(NodeServices.layer)))),
+);

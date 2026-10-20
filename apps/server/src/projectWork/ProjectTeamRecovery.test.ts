@@ -15,7 +15,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import type * as Scope from "effect/Scope";
+import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
@@ -43,6 +43,7 @@ import {
 } from "./ProjectTeamDispatchJournal.ts";
 import type { ProjectTeamDispatchSnapshot } from "./ProjectTeamDispatch.ts";
 import {
+  ProjectTeamRecoveryExecution,
   makeProjectTeamRecovery,
   ProjectTeamRecoveryError,
   type ProjectTeamRecoveryDiscovery,
@@ -1585,6 +1586,43 @@ it.effect("retains an accepted SQL compact through its terminal event before Hos
       yield* Fiber.join(fiber);
       expect(cleanupStarted).toBe(true);
       expect(checks).toBe(3);
+    }),
+  ),
+);
+
+it.effect("rolling recovery returns while the original continuation holds its claim", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const h = harness(yield* f.journal.reserve(f.request));
+      h.state("session-bound");
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const scope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      h.ports.resume = (claim) =>
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as({ _tag: "Observed" as const, fence: claim.original.fence }),
+        );
+      const recovery = makeProjectTeamRecovery(h.ports);
+      const sweep = recovery.sweep().pipe(
+        Effect.provideService(ProjectTeamRecoveryExecution, {
+          scope,
+          completed: Effect.void,
+        }),
+      );
+      const first = yield* sweep.pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      // The handoff receipt, rather than a timer, establishes whether discovery was released.
+      yield* Effect.yieldNow;
+      expect(first.pollUnsafe()).toBeDefined();
+      expect(h.events).not.toContain("release");
+      yield* sweep;
+      expect(h.claims).toHaveLength(1);
+      yield* Deferred.succeed(release, undefined);
+      yield* Scope.close(scope, Exit.void);
+      expect(h.events).toContain("release");
     }),
   ),
 );

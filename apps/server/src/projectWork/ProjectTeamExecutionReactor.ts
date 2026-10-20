@@ -1,4 +1,5 @@
 import type { ServerSettings, ServerSettingsError } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -10,6 +11,12 @@ import * as Stream from "effect/Stream";
 import { ServerSettingsService } from "../serverSettings.ts";
 import { ProjectWorkEventBus } from "./ProjectWorkEventBus.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
+
+/** Completion of owned execution work wakes the existing coalescing queue. */
+export const ProjectTeamExecutionWake = Context.Reference<Effect.Effect<void>>(
+  "ProjectTeamExecutionWake",
+  { defaultValue: () => Effect.void },
+);
 
 export interface ProjectTeamExecutionOwner<E, R> {
   /** Resolves only after retained startup work has been reconciled. */
@@ -301,6 +308,10 @@ export const makeProjectTeamExecutionReactor = Effect.fn("ProjectTeamExecutionRe
                                   start.pipe(
                                     Scope.provide(current.scope),
                                     Effect.provideContext(context),
+                                    Effect.provideService(
+                                      ProjectTeamExecutionWake,
+                                      Queue.offer(wake, undefined).pipe(Effect.asVoid),
+                                    ),
                                   ),
                                 );
                                 current.owner = owner;

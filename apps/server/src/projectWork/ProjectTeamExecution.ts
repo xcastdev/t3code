@@ -1,5 +1,9 @@
 import { canonicalProjectWorkPayload, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Exit from "effect/Exit";
+import * as Scope from "effect/Scope";
+import { ProjectTeamRecoveryExecution } from "./ProjectTeamRecovery.ts";
+import { ProjectTeamExecutionWake } from "./ProjectTeamExecutionReactor.ts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -78,6 +82,8 @@ export const makeProjectTeamExecution = Effect.fn("makeProjectTeamExecution")(
       | Effect.Services<ReturnType<typeof makeProjectTeamExecutionHost>>
     >();
     const serial = yield* Semaphore.make(1);
+    const executionScope = yield* Scope.make();
+    const completed = yield* ProjectTeamExecutionWake;
     const admission = yield* (
       options.admissionFacts === undefined
         ? makeProjectTeamAdmissionFacts({ ...options, journal }).pipe(Effect.provide(services))
@@ -235,7 +241,7 @@ export const makeProjectTeamExecution = Effect.fn("makeProjectTeamExecution")(
             }),
         ),
       ),
-    }).pipe(Effect.provide(services), Effect.cached);
+    }).pipe(Effect.provide(services), Scope.provide(executionScope), Effect.cached);
     const sweep = () =>
       serial.withPermits(1)(
         Effect.gen(function* () {
@@ -258,7 +264,12 @@ export const makeProjectTeamExecution = Effect.fn("makeProjectTeamExecution")(
                 },
               ],
             };
-          const recovery = yield* (yield* host).recover();
+          const recovery = yield* (yield* host).recover().pipe(
+            Effect.provideService(ProjectTeamRecoveryExecution, {
+              scope: executionScope,
+              completed,
+            }),
+          );
           const scheduled = yield* schedule();
           return {
             hasMore:
@@ -272,15 +283,18 @@ export const makeProjectTeamExecution = Effect.fn("makeProjectTeamExecution")(
         }).pipe(Effect.mapError(() => denied("Project team execution sweep is unavailable"))),
       );
     let hostStopped = false;
-    const stop = Effect.gen(function* () {
+    const stop = yield* Effect.gen(function* () {
       if (stopped) return;
       stopped = true;
       // Closing a never-activated service must not construct/acquire its native dependencies.
       if (hostStopped) yield* (yield* host).stop;
     }).pipe(
+      Effect.ensuring(Scope.close(executionScope, Exit.void)),
       Effect.catchCause((cause) =>
         Effect.logWarning("Project team stop retained uncertainty", cause),
       ),
+      Effect.uninterruptible,
+      Effect.cached,
     );
     const runSweep = () =>
       Effect.gen(function* () {

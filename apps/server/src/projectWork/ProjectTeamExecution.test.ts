@@ -1,3 +1,7 @@
+import * as ExecutionHost from "./ProjectTeamExecutionHost.ts";
+import { makeProjectTeamRecovery } from "./ProjectTeamRecovery.ts";
+import type { ProjectTeamDispatchSnapshot } from "./ProjectTeamDispatch.ts";
+import * as Queue from "effect/Queue";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -7,14 +11,16 @@ import { ManagedSkillRepository } from "../skills/ManagedSkillRepository.ts";
 import { PiModelCatalogue } from "../provider/pi/PiModelCatalogue.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
-import { expect, it } from "@effect/vitest";
+import { expect, it, vi } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
   ProjectWorkTaskId,
+  ProjectWorkCriterionId,
   ProviderInstanceId,
   type ProjectTeamConfigurationIntent,
 } from "@t3tools/contracts";
+import * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
@@ -25,7 +31,10 @@ import { runMigrations } from "../persistence/Migrations.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { gatewayRuntime, projectId, at } from "./ProjectTeamAuthorization.testFixtures.ts";
-import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
+import {
+  ProjectTeamDispatchJournalError,
+  makeProjectTeamDispatchJournal,
+} from "./ProjectTeamDispatchJournal.ts";
 import { type ProjectTeamConfiguredAdmissionFacts } from "./ProjectTeamConfiguredAdmission.ts";
 import { waitForProjectTeamAssignmentChange } from "./ProjectTeamExecutionHost.ts";
 import { PiManagedRuntimeError } from "../provider/pi/PiManagedRuntime.ts";
@@ -143,13 +152,15 @@ it.effect(
       });
     }).pipe(Effect.scoped),
 );
-const fixture = Effect.fn("executionTest.fixture")(function* () {
+const fixture = Effect.fn("executionTest.fixture")(function* (research = true) {
   yield* runMigrations();
   const sql = yield* SqlClient.SqlClient;
   const gateway = yield* ProjectWorkGateway;
   const repository = yield* ProjectWorkRepository;
   yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${projectId},'Project','/workspace','[]',${at},${at})`;
-  yield* gateway.write(configuration, human, source, { actor: human });
+  yield* gateway.write({ ...configuration, projectWritableWorkers: 2 }, human, source, {
+    actor: human,
+  });
   yield* repository.execute({
     type: "project-work.task.create",
     projectId,
@@ -159,23 +170,24 @@ const fixture = Effect.fn("executionTest.fixture")(function* () {
     createdAt: at,
   });
   let state = yield* readCurrentState(sql, projectId);
-  yield* gateway.write(
-    {
-      type: "project-team.investigation.start",
-      commandId: CommandId.make("investigate"),
-      projectId,
-      taskId: parentId,
-      expectedRevision: state.revision,
-      expectedTaskRevision: state.tasks[0]!.revision,
-      objective: "Find the cause",
-      outputDescriptions: ["Sourced findings"],
-    },
-    human,
-    source,
-    { actor: human },
-  );
+  if (research)
+    yield* gateway.write(
+      {
+        type: "project-team.investigation.start",
+        commandId: CommandId.make("investigate"),
+        projectId,
+        taskId: parentId,
+        expectedRevision: state.revision,
+        expectedTaskRevision: state.tasks[0]!.revision,
+        objective: "Find the cause",
+        outputDescriptions: ["Sourced findings"],
+      },
+      human,
+      source,
+      { actor: human },
+    );
   state = yield* readCurrentState(sql, projectId);
-  const taskId = state.tasks.find((task) => task.taskId !== parentId)!.taskId;
+  const taskId = state.tasks.find((task) => task.taskId !== parentId)?.taskId ?? parentId;
   yield* TestClock.setTime(nowMs);
   const journal = yield* makeProjectTeamDispatchJournal({
     environmentId: "environment",
@@ -193,12 +205,28 @@ import { ServerSettingsService } from "../serverSettings.ts";
 
 const makeService = Effect.fn("executionTest.makeService")(function* (
   gate: Effect.Effect<void, ProjectTeamExecutionError> = Effect.void,
+  distinctWorkspaces = false,
+  writable = false,
+  readAnchor = () => facts.rootAnchor,
 ) {
   const settings = yield* ServerSettingsService;
   yield* settings.updateSettings({ projectTeamExecutionEnabled: true });
+  const forTask = (taskId: ProjectWorkTaskId) =>
+    distinctWorkspaces
+      ? {
+          ...facts,
+          rootAnchor: readAnchor(),
+          git: {
+            ...facts.git,
+            writable,
+            worktreePath: `${facts.git.worktreePath}-${taskId}`,
+            branchRef: `${facts.git.branchRef}-${taskId}`,
+          },
+        }
+      : facts;
   const admission: ProjectTeamExecutionAdmission = {
-    read: () => Effect.succeed({ _tag: "Facts", facts }),
-    withCurrent: (_input, run) => run(facts, Effect.void),
+    read: ({ taskId }) => Effect.succeed({ _tag: "Facts", facts: forTask(taskId) }),
+    withCurrent: ({ taskId }, run) => run(forTask(taskId), Effect.void),
   };
   return yield* makeProjectTeamExecution({
     environmentId: "environment",
@@ -369,6 +397,7 @@ it.effect(
         const service = yield* makeService(gate);
         const scheduled = yield* service.schedule();
         yield* service.sweep();
+        yield* service.stop;
         const retained = yield* f.journal.readRetained(scheduled.committed[0]!.fence.dispatchId);
         expect(retained.fence.claimGeneration).toBe(1);
         expect(retained.fence.stage).toBe("quarantine");
@@ -477,6 +506,224 @@ it.effect(
         }
         expect(hasMore).toBe(false);
         yield* service.stop;
+      }),
+    ),
+);
+
+it.effect(
+  "execution admits another configured sibling while a host continuation is held and concurrent stops join",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture(false);
+        const entered = yield* Queue.unbounded<string>();
+        const joining = yield* Deferred.make<void>();
+        const joined = yield* Deferred.make<void>();
+        type Claim = { snapshot: ProjectTeamDispatchSnapshot };
+        const failure = () =>
+          new ProjectTeamDispatchJournalError({ reason: "Controlled host SQL failed" });
+        const recovery = makeProjectTeamRecovery<Claim, Claim, ProjectTeamDispatchJournalError>({
+          readPage: (input) =>
+            f.journal.readRecoveryCandidates(input).pipe(
+              Effect.map((items) =>
+                items.map((item) => ({ ...item, snapshot: Exit.mapError(item.snapshot, failure) })),
+              ),
+              Effect.mapError(failure),
+            ),
+          recordDiscoveryFailure: () => Effect.void,
+          withClaim: (snapshot, run) => run({ snapshot }),
+          assess: (claim) =>
+            Effect.gen(function* () {
+              claim.snapshot = yield* f.journal
+                .claimEffect(claim.snapshot.fence)
+                .pipe(Effect.mapError(failure));
+              return { _tag: "Resume" as const, claim, snapshot: claim.snapshot };
+            }),
+          resume: (claim) =>
+            Queue.offer(entered, claim.snapshot.fence.dispatchId).pipe(
+              Effect.andThen(Effect.never),
+            ),
+          joinCleanup: (claim) =>
+            Deferred.succeed(joining, undefined).pipe(
+              Effect.andThen(Deferred.await(joined)),
+              Effect.as({ _tag: "Joined" as const, receipt: claim }),
+            ),
+          // This test controls host joins only; actual SQL settlement is covered with the scheduler.
+          settle: () => Effect.void,
+          quarantine: () => Effect.die("Controlled host must join"),
+        });
+        const host = vi
+          .spyOn(ExecutionHost, "makeProjectTeamExecutionHost")
+          .mockImplementationOnce(() =>
+            Effect.succeed({ recover: recovery.sweep, stop: Effect.void }),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => host.mockRestore()));
+        let rootAnchor = facts.rootAnchor;
+        const service = yield* makeService(Effect.void, true, true, () => rootAnchor);
+        const envelope = Effect.gen(function* () {
+          const state = yield* readCurrentState(f.sql, projectId);
+          return {
+            projectId,
+            taskId: parentId,
+            expectedRevision: state.revision,
+            expectedTaskRevision: state.tasks.find((task) => task.taskId === parentId)!.revision,
+          };
+        });
+        const criterionId = ProjectWorkCriterionId.make("sibling-requirement");
+        yield* f.gateway.write(
+          {
+            ...(yield* envelope),
+            type: "project-team.specification.propose",
+            commandId: CommandId.make("sibling-spec"),
+            expectedSpecRevision: 0,
+            specification: {
+              objective: "Two independent changes",
+              scopeIn: "Approved files",
+              scopeOut: "Other files",
+              criterionIds: [criterionId],
+              revision: 1,
+              protected: false,
+            },
+            criterionSnapshots: [
+              {
+                criterionId,
+                taskId: parentId,
+                description: "Both changes pass",
+                required: true,
+                status: "unsatisfied",
+                satisfiedByEvidenceIds: [],
+                revision: 0,
+                updatedAt: at,
+              },
+            ],
+          },
+          human,
+          source,
+          { actor: human },
+        );
+        const approve = Effect.fn("executionTest.approve")(function* (
+          kind: "specification" | "plan",
+        ) {
+          const state = yield* readCurrentState(f.sql, projectId);
+          const gate = state.foundationRecords!.find(
+            (r) => r.kind === "gate" && r.gate === kind && r.status === "pending",
+          );
+          if (gate?.kind !== "gate") return yield* Effect.die("Missing approval");
+          yield* f.gateway.write(
+            {
+              ...(yield* envelope),
+              type: "project-team.gate.respond",
+              commandId: CommandId.make(`sibling-approve-${kind}`),
+              gateId: gate.recordId,
+              expectedGateRevision: gate.revision,
+              specRevision: gate.specRevision,
+              planRevision: gate.planRevision,
+              response: "approved",
+            },
+            human,
+            source,
+            { actor: human },
+          );
+        });
+        yield* approve("specification");
+        yield* f.gateway.write(
+          {
+            ...(yield* envelope),
+            type: "project-team.plan.propose",
+            commandId: CommandId.make("sibling-plan"),
+            specRevision: 1,
+            content: "Implement both independently",
+            dependencyTaskIds: [],
+          },
+          human,
+          source,
+          { actor: human },
+        );
+        yield* approve("plan");
+        const startChild = Effect.fn("executionTest.startChild")(function* (name: string) {
+          const state = yield* readCurrentState(f.sql, projectId);
+          const spec = state.foundationRecords!.find(
+            (r) => r.kind === "gate" && r.gate === "specification",
+          );
+          const planGate = state.foundationRecords!.find(
+            (r) => r.kind === "gate" && r.gate === "plan",
+          );
+          const plan = state.foundationRecords!.find((r) => r.kind === "plan-revision");
+          if (spec?.kind !== "gate" || planGate?.kind !== "gate" || plan?.kind !== "plan-revision")
+            return yield* Effect.die("Missing exact human approvals");
+          yield* f.gateway.write(
+            {
+              ...(yield* envelope),
+              type: "project-team.assignment.start",
+              assignmentKind: "implementation",
+              commandId: CommandId.make(name),
+              objective: name,
+              outputDescriptions: ["Tested implementation"],
+              parentCriterionIds: [criterionId],
+              specRevision: 1,
+              specificationGateId: spec.recordId,
+              expectedSpecificationGateRevision: spec.revision,
+              parentPlan: {
+                recordId: plan.recordId,
+                expectedRecordRevision: plan.revision,
+                planRevision: plan.planRevision,
+                gateId: planGate.recordId,
+                expectedGateRevision: planGate.revision,
+              },
+            },
+            human,
+            source,
+            { actor: human },
+          );
+        });
+        yield* startChild("first-implementation");
+        yield* Effect.addFinalizer(() => Deferred.succeed(joined, undefined));
+        yield* service.schedule();
+        const initialSweep = yield* service.sweep().pipe(Effect.forkChild);
+        const first = yield* Queue.take(entered);
+        yield* Effect.yieldNow;
+        const handedOff = initialSweep.pollUnsafe() !== undefined;
+        if (!handedOff) {
+          yield* Deferred.succeed(joined, undefined);
+          yield* Fiber.interrupt(initialSweep);
+        }
+        expect(handedOff).toBe(true);
+        const retained = yield* f.journal.readRetained(first);
+        rootAnchor = {
+          _tag: "RetainedRoot",
+          budget: {
+            rootTaskId: retained.intent.limits.rootTaskId,
+            maximumTokens: retained.intent.limits.maximumTokens,
+            deadlineAtMs: retained.intent.limits.rootDeadlineAtMs,
+          },
+          caps: retained.intent.rootCaps,
+        };
+        yield* startChild("second-implementation");
+        const next = yield* service.sweep();
+        expect(
+          next.blocked.filter((item) => "phase" in item && item.phase !== "eligibility"),
+        ).toEqual([]);
+        expect(next.committed).toHaveLength(1);
+        yield* service.sweep();
+        expect(yield* Queue.take(entered)).not.toBe(first);
+        expect(yield* f.sql`SELECT * FROM project_team_dispatch`).toHaveLength(2);
+        const bindings = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.filter(
+          (r) => r.kind === "run-binding",
+        );
+        expect(bindings).toHaveLength(2);
+        expect(
+          new Set(bindings?.map((r) => (r.kind === "run-binding" ? r.memberId : ""))).size,
+        ).toBe(1);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+        ).toHaveLength(2);
+        const stops = yield* Effect.all([service.stop, service.stop], { concurrency: 2 }).pipe(
+          Effect.forkChild,
+        );
+        yield* Deferred.await(joining);
+        expect(stops.pollUnsafe()).toBeUndefined();
+        yield* Deferred.succeed(joined, undefined);
+        yield* Fiber.join(stops);
       }),
     ),
 );

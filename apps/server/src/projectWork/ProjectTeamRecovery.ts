@@ -1,3 +1,6 @@
+import * as Deferred from "effect/Deferred";
+import * as Context from "effect/Context";
+import type * as Scope from "effect/Scope";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -11,6 +14,15 @@ import type {
 } from "./ProjectTeamDispatch.ts";
 
 import type { ProjectTeamDispatchRecoveryPosition } from "./ProjectTeamDispatchJournal.ts";
+
+/** The execution generation owns rolling continuations and receives completion wakes. */
+export const ProjectTeamRecoveryExecution = Context.Reference<
+  | {
+      readonly scope: Scope.Scope;
+      readonly completed: Effect.Effect<void>;
+    }
+  | undefined
+>("ProjectTeamRecoveryExecution", { defaultValue: () => undefined });
 
 const DispatchId = Schema.String.check(
   Schema.isTrimmed(),
@@ -114,6 +126,7 @@ export function makeProjectTeamRecovery<
     readonly position?: ProjectTeamDispatchRecoveryPosition;
   };
   let cursor: Cursor | undefined;
+  const running = new Set<string>();
   type Outcome = ProjectTeamRecoveryOutcome<Error>;
   const reject = (reason: string) => new ProjectTeamRecoveryError({ reason });
 
@@ -144,6 +157,7 @@ export function makeProjectTeamRecovery<
 
   const recover = Effect.fn("ProjectTeamRecovery.recover")(function* (
     discovered: ProjectTeamDispatchSnapshot,
+    handoff: Effect.Effect<void> = Effect.void,
   ) {
     return yield* ports.withClaim(discovered, (claim) =>
       Effect.uninterruptibleMask((restore) =>
@@ -164,6 +178,7 @@ export function makeProjectTeamRecovery<
               Cause.fail(reject("Root returned an invalid continuation claim")),
             );
           }
+          yield* handoff;
           const resumed = yield* restore(
             Effect.suspend(() => ports.resume(continuation.claim)),
           ).pipe(Effect.exit);
@@ -257,11 +272,19 @@ export function makeProjectTeamRecovery<
         validated.push(item);
       }
     }
+    const execution = yield* ProjectTeamRecoveryExecution;
     const items = yield* Effect.forEach(
       validated,
       (item) =>
         Effect.gen(function* () {
-          const result = yield* Effect.scoped(
+          const ready =
+            yield* Deferred.make<Exit.Exit<Outcome, Error | ProjectTeamRecoveryError>>();
+          let resumed = false;
+          const handoff = Effect.sync(() => {
+            resumed = true;
+            Deferred.doneUnsafe(ready, Effect.succeed(Exit.succeed({ _tag: "Busy" })));
+          });
+          const work = Effect.scoped(
             Effect.suspend(() => {
               if (Exit.isFailure(item.snapshot)) return discoveryFailure(item, item.snapshot.cause);
               if (!isDispatchId(item.dispatchId))
@@ -274,16 +297,43 @@ export function makeProjectTeamRecovery<
                   item,
                   Cause.fail(reject("Root discovery identity does not match its snapshot")),
                 );
-              return recover(item.snapshot.value);
+              return recover(item.snapshot.value, execution === undefined ? Effect.void : handoff);
             }),
-          ).pipe(Effect.exit);
+          );
+          const result = yield* Effect.gen(function* () {
+            if (execution === undefined || !isDispatchId(item.dispatchId))
+              return yield* work.pipe(Effect.exit);
+            const dispatchId = item.dispatchId;
+            if (running.has(dispatchId) || running.size >= pageSize)
+              return Exit.succeed({ _tag: "Busy" as const });
+            // Register before forking. Scope owns interruption and joins; the claim stays inside work.
+            return yield* Effect.uninterruptibleMask(function (restore) {
+              return Effect.gen(function* () {
+                running.add(dispatchId);
+                yield* Effect.forkIn(
+                  restore(work).pipe(
+                    Effect.exit,
+                    Effect.flatMap((result) =>
+                      Effect.gen(function* () {
+                        running.delete(dispatchId);
+                        yield* Deferred.succeed(ready, result);
+                        if (resumed) yield* execution.completed;
+                      }),
+                    ),
+                  ),
+                  execution.scope,
+                );
+                return yield* restore(Deferred.await(ready));
+              });
+            });
+          });
           if (Exit.isFailure(result) && Cause.hasInterrupts(result.cause))
             return yield* Effect.failCause(result.cause);
           return { dispatchId: item.dispatchId, result };
         }),
       { concurrency: pageSize },
     );
-    // Advance only after every bounded owner has joined. Retrying earlier completed items is safe.
+    // Advance after bounded discovery hands off ownership. Live claims remain in the generation scope.
     const last = validated.at(-1);
     if (last !== undefined)
       cursor = {

@@ -12,6 +12,11 @@ import {
   ProjectWorkFoundationCommitCommand,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Scope from "effect/Scope";
+import * as Queue from "effect/Queue";
+import { makeProjectTeamRecovery, ProjectTeamRecoveryExecution } from "./ProjectTeamRecovery.ts";
+import type { ProjectTeamDispatchSnapshot } from "./ProjectTeamDispatch.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
@@ -1113,116 +1118,121 @@ it.effect(
     ),
 );
 
-const twoTasks = Effect.gen(function* () {
-  const f = yield* fixture;
-  const original = f.request.claim.transition;
-  const state = yield* readCurrentState(f.sql, projectId);
-  const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
-  const limits = state.foundationRecords?.find((r) => r.kind === "limits");
-  const member = state.foundationRecords?.find((r) => r.kind === "member");
-  if (
-    original?.kind !== "claim" ||
-    role?.kind !== "role-revision" ||
-    limits?.kind !== "limits" ||
-    member?.kind !== "member"
-  )
-    return yield* Effect.die("Fixture lacks frozen role, limits or claim");
-  yield* f.repository.execute(
-    yield* decodeCommit({
-      type: "project-work.foundation.commit",
-      projectId,
-      commandId: "two-writer-policy",
-      expectedRevision: state.revision,
-      attribution,
-      committedAt: at,
-      records: [
-        { ...limits, revision: limits.revision + 1, projectWritableWorkers: 2 },
-        { ...member, recordId: "continuation-other-member", revision: 0 },
-      ],
-    }),
-  );
-  const otherId = ProjectWorkTaskId.make("zzz-continuation-other");
-  let retained: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
-  yield* createManagedAssignment({
-    taskId: otherId,
-    recordId: "continuation-other-binding",
-    attemptId: "continuation-other-attempt",
-    commandId: "continuation-other-dispatch",
-    providerInstanceId: ProviderInstanceId.make("pi"),
-    threadId: ThreadId.make("continuation-other-thread"),
-    memberId: "continuation-other-member",
-    role,
-    status: "reserved",
-    configuration: original.binding.configuration,
-  }).pipe(
-    Effect.provideService(ProjectWorkRepository, {
-      ...f.repository,
-      execute: (command) => {
-        if (
-          command.type === "project-work.foundation.commit" &&
-          command.transition?.kind === "claim"
-        ) {
-          retained = command;
-          return Effect.fail(
-            new ProjectWorkPolicyError("invalid-state", "Retain approved continuation claim"),
-          );
-        }
-        return f.repository.execute(command);
-      },
-    }),
-    Effect.result,
-  );
-  if (!retained || retained.transition?.kind !== "claim")
-    return yield* Effect.die("Missing retained second claim");
-  const otherRequest: ProjectTeamDispatchRequest = {
-    ...f.request,
-    dispatchId: "continuation-other-dispatch",
-    claim: {
-      ...retained,
-      transition: {
-        ...retained.transition,
-        binding: {
-          ...retained.transition.binding,
-          worktree: "/workspace/continuation-other",
-          branch: "continuation-other-branch",
+const twoTasksForMember = (sameMember = false) =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    const original = f.request.claim.transition;
+    const state = yield* readCurrentState(f.sql, projectId);
+    const role = state.foundationRecords?.find((r) => r.kind === "role-revision");
+    const limits = state.foundationRecords?.find((r) => r.kind === "limits");
+    const member = state.foundationRecords?.find((r) => r.kind === "member");
+    if (
+      original?.kind !== "claim" ||
+      role?.kind !== "role-revision" ||
+      limits?.kind !== "limits" ||
+      member?.kind !== "member"
+    )
+      return yield* Effect.die("Fixture lacks frozen role, limits or claim");
+    yield* f.repository.execute(
+      yield* decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "two-writer-policy",
+        expectedRevision: state.revision,
+        attribution,
+        committedAt: at,
+        records: [
+          { ...limits, revision: limits.revision + 1, projectWritableWorkers: 2 },
+          ...(sameMember
+            ? []
+            : [{ ...member, recordId: "continuation-other-member", revision: 0 }]),
+        ],
+      }),
+    );
+    const otherId = ProjectWorkTaskId.make("zzz-continuation-other");
+    let retained: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+    yield* createManagedAssignment({
+      taskId: otherId,
+      recordId: "continuation-other-binding",
+      attemptId: "continuation-other-attempt",
+      commandId: "continuation-other-dispatch",
+      providerInstanceId: ProviderInstanceId.make("pi"),
+      threadId: ThreadId.make("continuation-other-thread"),
+      memberId: sameMember ? original.binding.memberId : "continuation-other-member",
+      role,
+      status: "reserved",
+      configuration: original.binding.configuration,
+    }).pipe(
+      Effect.provideService(ProjectWorkRepository, {
+        ...f.repository,
+        execute: (command) => {
+          if (
+            command.type === "project-work.foundation.commit" &&
+            command.transition?.kind === "claim"
+          ) {
+            retained = command;
+            return Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Retain approved continuation claim"),
+            );
+          }
+          return f.repository.execute(command);
+        },
+      }),
+      Effect.result,
+    );
+    if (!retained || retained.transition?.kind !== "claim")
+      return yield* Effect.die("Missing retained second claim");
+    const otherRequest: ProjectTeamDispatchRequest = {
+      ...f.request,
+      dispatchId: "continuation-other-dispatch",
+      claim: {
+        ...retained,
+        transition: {
+          ...retained.transition,
+          binding: {
+            ...retained.transition.binding,
+            worktree: "/workspace/continuation-other",
+            branch: "continuation-other-branch",
+          },
         },
       },
-    },
-    git: {
-      ...f.request.git,
-      effectId: "continuation-other-dispatch",
-      runId: "continuation-other-binding",
-      worktreePath: "/workspace/continuation-other",
-      branchRef: "continuation-other-branch",
-      ownershipToken: "continuation-other-owner",
-    },
-    setupId: "continuation-other-setup",
-    initializeOperationId: "continuation-other-initialize",
-    assignmentOperationId: "continuation-other-assignment",
-  };
-  const prepared: Array<string> = [];
-  return {
-    ...f,
-    otherId,
-    otherRequest,
-    prepared,
-    prepare: ({
-      state,
-      taskId: id,
-    }: {
-      state: ProjectWorkReducerState;
-      taskId: ProjectWorkTaskId;
-    }) =>
-      Effect.sync(() => {
-        prepared.push(id);
-        const request = id === otherId ? otherRequest : f.request;
-        return {
-          _tag: "Prepared" as const,
-          request: { ...request, claim: { ...request.claim, expectedRevision: state.revision } },
-        };
-      }),
-  };
-});
+      git: {
+        ...f.request.git,
+        effectId: "continuation-other-dispatch",
+        runId: "continuation-other-binding",
+        worktreePath: "/workspace/continuation-other",
+        branchRef: "continuation-other-branch",
+        ownershipToken: "continuation-other-owner",
+      },
+      setupId: "continuation-other-setup",
+      initializeOperationId: "continuation-other-initialize",
+      assignmentOperationId: "continuation-other-assignment",
+    };
+    const prepared: Array<string> = [];
+    return {
+      ...f,
+      otherId,
+      otherRequest,
+      prepared,
+      prepare: ({
+        state,
+        taskId: id,
+      }: {
+        state: ProjectWorkReducerState;
+        taskId: ProjectWorkTaskId;
+      }) =>
+        Effect.sync(() => {
+          prepared.push(id);
+          const request = id === otherId ? otherRequest : f.request;
+          return {
+            _tag: "Prepared" as const,
+            request: { ...request, claim: { ...request.claim, expectedRevision: state.revision } },
+          };
+        }),
+    };
+  });
+
+const twoTasks = twoTasksForMember();
 
 const continuationPorts = (f: Effect.Success<typeof twoTasks>) => ({
   readProjectState: ({ afterTaskId, limit }: { afterTaskId?: ProjectWorkTaskId; limit: number }) =>
@@ -1344,87 +1354,90 @@ it.effect("a fresh candidate page excludes a retained task before preparation or
   ),
 );
 
-const threeTasks = Effect.gen(function* () {
-  const f = yield* twoTasks;
-  const before = yield* readCurrentState(f.sql, projectId);
-  const role = before.foundationRecords?.find((r) => r.kind === "role-revision");
-  const member = before.foundationRecords?.find((r) => r.kind === "member");
-  const first = f.request.claim.transition;
-  if (role?.kind !== "role-revision" || member?.kind !== "member" || first?.kind !== "claim")
-    return yield* Effect.die("Missing third-task prerequisites");
-  yield* f.repository.execute(
-    yield* decodeCommit({
-      type: "project-work.foundation.commit",
-      projectId,
-      commandId: "third-member",
-      expectedRevision: before.revision,
-      attribution,
-      committedAt: at,
-      records: [{ ...member, recordId: "continuation-third-member", revision: 0 }],
-    }),
-  );
-  const thirdId = ProjectWorkTaskId.make("zzz-continuation-third");
-  let retained: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
-  yield* createManagedAssignment({
-    taskId: thirdId,
-    recordId: "continuation-third-binding",
-    attemptId: "continuation-third-attempt",
-    commandId: "continuation-third-dispatch",
-    providerInstanceId: ProviderInstanceId.make("pi"),
-    threadId: ThreadId.make("continuation-third-thread"),
-    memberId: "continuation-third-member",
-    role,
-    status: "reserved",
-    configuration: first.binding.configuration,
-  }).pipe(
-    Effect.provideService(ProjectWorkRepository, {
-      ...f.repository,
-      execute: (command) => {
-        if (
-          command.type === "project-work.foundation.commit" &&
-          command.transition?.kind === "claim"
-        ) {
-          retained = command;
-          return Effect.fail(
-            new ProjectWorkPolicyError("invalid-state", "Retain third approved claim"),
-          );
-        }
-        return f.repository.execute(command);
-      },
-    }),
-    Effect.result,
-  );
-  if (!retained || retained.transition?.kind !== "claim")
-    return yield* Effect.die("Missing third claim");
-  const thirdRequest: ProjectTeamDispatchRequest = {
-    ...f.request,
-    dispatchId: "continuation-third-dispatch",
-    claim: {
-      ...retained,
-      transition: {
-        ...retained.transition,
-        binding: {
-          ...retained.transition.binding,
-          worktree: "/workspace/continuation-third",
-          branch: "continuation-third-branch",
+const threeTasksForMember = (sameMember = false) =>
+  Effect.gen(function* () {
+    const f = yield* twoTasksForMember(sameMember);
+    const before = yield* readCurrentState(f.sql, projectId);
+    const role = before.foundationRecords?.find((r) => r.kind === "role-revision");
+    const member = before.foundationRecords?.find((r) => r.kind === "member");
+    const first = f.request.claim.transition;
+    if (role?.kind !== "role-revision" || member?.kind !== "member" || first?.kind !== "claim")
+      return yield* Effect.die("Missing third-task prerequisites");
+    yield* f.repository.execute(
+      yield* decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "third-member",
+        expectedRevision: before.revision,
+        attribution,
+        committedAt: at,
+        records: [{ ...member, recordId: "continuation-third-member", revision: 0 }],
+      }),
+    );
+    const thirdId = ProjectWorkTaskId.make("zzz-continuation-third");
+    let retained: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+    yield* createManagedAssignment({
+      taskId: thirdId,
+      recordId: "continuation-third-binding",
+      attemptId: "continuation-third-attempt",
+      commandId: "continuation-third-dispatch",
+      providerInstanceId: ProviderInstanceId.make("pi"),
+      threadId: ThreadId.make("continuation-third-thread"),
+      memberId: sameMember ? first.binding.memberId : "continuation-third-member",
+      role,
+      status: "reserved",
+      configuration: first.binding.configuration,
+    }).pipe(
+      Effect.provideService(ProjectWorkRepository, {
+        ...f.repository,
+        execute: (command) => {
+          if (
+            command.type === "project-work.foundation.commit" &&
+            command.transition?.kind === "claim"
+          ) {
+            retained = command;
+            return Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Retain third approved claim"),
+            );
+          }
+          return f.repository.execute(command);
+        },
+      }),
+      Effect.result,
+    );
+    if (!retained || retained.transition?.kind !== "claim")
+      return yield* Effect.die("Missing third claim");
+    const thirdRequest: ProjectTeamDispatchRequest = {
+      ...f.request,
+      dispatchId: "continuation-third-dispatch",
+      claim: {
+        ...retained,
+        transition: {
+          ...retained.transition,
+          binding: {
+            ...retained.transition.binding,
+            worktree: "/workspace/continuation-third",
+            branch: "continuation-third-branch",
+          },
         },
       },
-    },
-    git: {
-      ...f.request.git,
-      effectId: "continuation-third-dispatch",
-      runId: "continuation-third-binding",
-      worktreePath: "/workspace/continuation-third",
-      branchRef: "continuation-third-branch",
-      ownershipToken: "continuation-third-owner",
-    },
-    setupId: "continuation-third-setup",
-    initializeOperationId: "continuation-third-initialize",
-    assignmentOperationId: "continuation-third-assignment",
-  };
+      git: {
+        ...f.request.git,
+        effectId: "continuation-third-dispatch",
+        runId: "continuation-third-binding",
+        worktreePath: "/workspace/continuation-third",
+        branchRef: "continuation-third-branch",
+        ownershipToken: "continuation-third-owner",
+      },
+      setupId: "continuation-third-setup",
+      initializeOperationId: "continuation-third-initialize",
+      assignmentOperationId: "continuation-third-assignment",
+    };
 
-  return { ...f, thirdId, thirdRequest };
-});
+    return { ...f, thirdId, thirdRequest };
+  });
+
+const threeTasks = threeTasksForMember();
 
 for (const reprioritize of [false, true]) {
   it.effect(
@@ -1741,6 +1754,217 @@ it.effect(
         ]);
         expect(prepared).toEqual([taskId, f.otherId, f.thirdId]);
         expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(2);
+      }),
+    ),
+);
+
+for (const phase of ["prepare", "reserve"] as const) {
+  it.effect(`capacity denial during ${phase} retries the same candidate on the next wake`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* twoTasks;
+        let denied = true;
+        const scheduler = yield* schedulerWith(f, {
+          ...continuationPorts(f),
+          prepareRequest: (input) =>
+            denied && phase === "prepare"
+              ? Effect.succeed({
+                  _tag: "Blocked" as const,
+                  reason: "configured-capacity-unavailable",
+                })
+              : f.prepare(input),
+          reserve: (request) =>
+            denied && phase === "reserve"
+              ? Effect.fail(new ProjectWorkPolicyError("invalid-state", "Capacity unavailable"))
+              : f.journal.reserve(request),
+        });
+        const first = yield* scheduler.sweep({ tasksPerProject: 1 });
+        expect(first.committed).toHaveLength(0);
+        denied = false;
+        const retry = yield* scheduler.sweep({ tasksPerProject: 1 });
+        expect(retry.committed.map((item) => item.fence.dispatchId)).toEqual([
+          f.request.dispatchId,
+        ]);
+        expect((yield* readCurrentState(f.sql, projectId)).attempts).toHaveLength(1);
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "same-member SQL siblings roll into a freed slot while another continuation stays held, and stop joins",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* threeTasksForMember(true);
+        const requests = [f.request, f.otherRequest, f.thirdRequest];
+        const scheduler = yield* schedulerWith(f, {
+          ...continuationPorts(f),
+          readProjectState: ({ afterTaskId, limit }) =>
+            readCurrentState(f.sql, projectId).pipe(
+              Effect.map((state) => ({
+                state,
+                candidates: [taskId, f.otherId, f.thirdId]
+                  .filter((id) => afterTaskId === undefined || id > afterTaskId)
+                  .slice(0, limit)
+                  .map((taskId) => ({ taskId, priority: 0 })),
+              })),
+            ),
+          prepareRequest: ({ state, taskId }) => {
+            const request = requests.find(
+              (request) =>
+                request.claim.transition?.kind === "claim" &&
+                request.claim.transition.taskId === taskId,
+            )!;
+            return Effect.succeed({
+              _tag: "Prepared" as const,
+              request: {
+                ...request,
+                claim: { ...request.claim, expectedRevision: state.revision },
+              },
+            });
+          },
+        });
+        const scope = yield* Scope.make();
+        const entered = yield* Queue.unbounded<string>();
+        const completed = yield* Queue.unbounded<void>();
+        const stopping = yield* Queue.unbounded<string>();
+        const allowJoin = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() =>
+          Deferred.succeed(allowJoin, undefined).pipe(
+            Effect.andThen(Scope.close(scope, Exit.void)),
+          ),
+        );
+        const releases = new Map<string, Deferred.Deferred<void>>();
+        const owned = new Set<string>();
+        const resumes: string[] = [];
+        const journal = yield* makeProjectTeamDispatchJournal({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+          // Controlled host drain seam only; all claims, reservations and settlements use actual SQL.
+          verifyStage: () => Effect.void,
+          verifySettlement: () => Effect.void,
+        });
+        type Claim = { snapshot: ProjectTeamDispatchSnapshot };
+        const settle = (claim: Claim) =>
+          journal
+            .settleAfterJoined(claim.snapshot.fence, {
+              receiptId: `${claim.snapshot.fence.dispatchId}-joined`,
+              stage: "settled",
+              evidence: {},
+            })
+            .pipe(Effect.asVoid);
+        const recovery = makeProjectTeamRecovery<
+          Claim,
+          Claim,
+          | Effect.Error<ReturnType<typeof journal.claimEffect>>
+          | Effect.Error<ReturnType<typeof journal.settleAfterJoined>>
+        >(
+          {
+            readPage: (input) => journal.readRecoveryCandidates(input),
+            recordDiscoveryFailure: () => Effect.void,
+            withClaim: (snapshot, run) =>
+              Effect.acquireUseRelease(
+                Effect.sync(() => {
+                  expect(owned.has(snapshot.fence.dispatchId)).toBe(false);
+                  owned.add(snapshot.fence.dispatchId);
+                  return { snapshot };
+                }),
+                run,
+                () =>
+                  Effect.sync(() => {
+                    owned.delete(snapshot.fence.dispatchId);
+                  }),
+              ),
+            assess: (claim) =>
+              Effect.gen(function* () {
+                claim.snapshot = yield* journal.claimEffect(claim.snapshot.fence);
+                return { _tag: "Resume" as const, claim, snapshot: claim.snapshot };
+              }),
+            resume: (claim) =>
+              Effect.gen(function* () {
+                const id = claim.snapshot.fence.dispatchId;
+                const release = yield* Deferred.make<void>();
+                releases.set(id, release);
+                resumes.push(id);
+                yield* Queue.offer(entered, id);
+                yield* Deferred.await(release);
+                yield* settle(claim);
+                return { _tag: "Observed" as const, fence: claim.snapshot.fence };
+              }),
+            joinCleanup: (claim) =>
+              Effect.gen(function* () {
+                yield* Queue.offer(stopping, claim.snapshot.fence.dispatchId);
+                yield* Deferred.await(allowJoin);
+                return { _tag: "Joined" as const, receipt: claim };
+              }),
+            settle: (claim) => settle(claim),
+            quarantine: () => Effect.die("Controlled host should join"),
+          },
+          { pageSize: 2 },
+        );
+        const recover = recovery.sweep().pipe(
+          Effect.provideService(ProjectTeamRecoveryExecution, {
+            scope,
+            completed: Queue.offer(completed, undefined).pipe(Effect.asVoid),
+          }),
+        );
+        const first = yield* scheduler.sweep();
+        expect(first.committed).toHaveLength(1);
+        yield* recover;
+        const firstId = yield* Queue.take(entered);
+        const sibling = yield* scheduler.sweep();
+        expect(sibling.committed).toHaveLength(1);
+        yield* recover;
+        const secondId = yield* Queue.take(entered);
+        const bindings = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.filter(
+          (r) => r.kind === "run-binding",
+        );
+        expect(bindings).toHaveLength(2);
+        expect(
+          new Set(bindings?.map((r) => (r.kind === "run-binding" ? r.memberId : ""))).size,
+        ).toBe(1);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+        ).toHaveLength(2);
+        // Repeated discovery and direct duplicate admission cannot create another task/attempt owner.
+        yield* recover;
+        expect(resumes).toHaveLength(2);
+        expect(
+          (yield* journal
+            .reserve({ ...f.request, dispatchId: "duplicate-task-dispatch" })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        const denied = yield* scheduler.sweep();
+        expect(denied.committed).toHaveLength(0);
+        expect(denied.hasMore).toBe(false);
+        yield* Deferred.succeed(releases.get(firstId)!, undefined);
+        yield* Queue.take(completed);
+        expect(owned.has(secondId)).toBe(true);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+        ).toHaveLength(1);
+        const replacement = yield* scheduler.sweep();
+        expect(replacement.committed).toHaveLength(1);
+        // Positioned discovery advances past held owners; wrapping is bounded and wake-driven.
+        yield* recover;
+        yield* recover;
+        const thirdId = yield* Queue.take(entered);
+        expect(thirdId).not.toBe(secondId);
+        expect(owned.has(secondId)).toBe(true);
+        expect(resumes).toHaveLength(3);
+        const stop = yield* Scope.close(scope, Exit.void).pipe(Effect.forkChild);
+        yield* Queue.take(stopping);
+        expect(stop.pollUnsafe()).toBeUndefined();
+        expect(
+          yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+        ).toHaveLength(2);
+        yield* Deferred.succeed(allowJoin, undefined);
+        yield* Fiber.join(stop);
+        expect(owned.size).toBe(0);
+        expect(
+          yield* f.sql`SELECT * FROM project_team_reservation WHERE status='held'`,
+        ).toHaveLength(0);
       }),
     ),
 );

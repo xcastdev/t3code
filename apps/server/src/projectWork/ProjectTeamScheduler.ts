@@ -107,6 +107,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
   const taskCursors = new Map<ProjectId, ProjectWorkTaskId>();
   const windows = new Map<ProjectId, TaskWindow>();
   const seenProjects = new Set<ProjectId>();
+  const stalled = new Set<ProjectId>();
 
   const sweep = Effect.fn("ProjectTeamScheduler.sweep")(function* (input: typeof Sweep.Type = {}) {
     const limits = yield* decodeSweep(input).pipe(
@@ -147,6 +148,7 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
     const visits = Math.min(projectLimit, projects.length);
     for (let visit = 0; visit < visits && committed.length < reservationLimit; visit++) {
       const project = projects.shift()!;
+      stalled.delete(project.projectId);
       projectsScanned++;
       const window = windows.get(project.projectId);
       const afterTaskId =
@@ -306,6 +308,10 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             phase: "prepare",
             reason: prepared.success.reason,
           });
+          if (prepared.success.reason.toLowerCase().includes("capacity")) {
+            stalled.add(project.projectId);
+            break;
+          }
           consumeCandidate();
           continue;
         }
@@ -356,8 +362,10 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
             reason: "reservation-denied",
             error: reserved.failure,
           });
-          consumeCandidate();
-          continue;
+          // A failed reservation grants no authority and may be a transient capacity denial.
+          // Keep its identity for the next wake without requesting an immediate retry loop.
+          stalled.add(project.projectId);
+          break;
         }
         consumeCandidate();
         committed.push(reserved.success);
@@ -389,8 +397,8 @@ export const makeProjectTeamScheduler = Effect.fn("makeProjectTeamScheduler")(fu
       hasMore:
         projects.length > 0 ||
         afterProjectId !== undefined ||
-        taskCursors.size > 0 ||
-        windows.size > 0,
+        [...taskCursors.keys()].some((id) => !stalled.has(id)) ||
+        [...windows.keys()].some((id) => !stalled.has(id)),
     };
   });
   return { sweep: (input: typeof Sweep.Type = {}) => lock.withPermits(1)(sweep(input)) };
