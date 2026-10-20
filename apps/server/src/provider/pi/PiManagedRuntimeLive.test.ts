@@ -10161,6 +10161,7 @@ for (const compactProof of [
   "memorySubscriptionPiUnknown",
   "memorySharedRoot",
   "memoryPipeline",
+  "memoryPrivatePipeline",
   "memoryLiquidPipeline",
   "memoryLiquidAccounting",
   "memoryLiquidConfiguration",
@@ -10191,6 +10192,7 @@ for (const compactProof of [
   "memoryHumanRetraction",
   "memoryQuery",
   "memoryQueryPipeline",
+  "memoryQueryPrivatePipeline",
   "memoryQueryActiveDrain",
   "memoryQueryDrainCapacity",
   "memoryQueryJoinedRecovery",
@@ -10270,7 +10272,11 @@ for (const compactProof of [
                                                         ? `production memory model forwarding fences the final wait: ${compactProof}`
                                                         : compactProof?.startsWith("memoryForward")
                                                           ? `captured runtime denies ${compactProof} before transport without holding SQL`
-                                                          : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+                                                          : compactProof?.includes(
+                                                                "PrivatePipeline",
+                                                              )
+                                                            ? `settles observed private NVIDIA identifier through retained consumers: ${compactProof}`
+                                                            : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
@@ -10297,6 +10303,10 @@ for (const compactProof of [
           const memoryUnknown = compactProof === "memorySubscriptionUnknown";
           const piUnknown = compactProof === "memorySubscriptionPiUnknown";
           let subscriptionMemoryChecked = false;
+          const observedPrivateModel = "private/openrouter/nvidia/nemotron-3-embed-1b";
+          const privateSourceProof = compactProof === "memoryPrivatePipeline";
+          const privateQueryProof = compactProof === "memoryQueryPrivatePipeline";
+          const privateProof = privateSourceProof || privateQueryProof;
           const catalogCanonical = "nvidia/nemotron-3-embed-1b-20260716";
           const catalogProof =
             compactProof === "memoryPipeline" || compactProof === "memoryQueryPipeline";
@@ -10321,6 +10331,7 @@ for (const compactProof of [
           const lateSecret = 'controlled-memory-"key\\tail';
           const companionProof = compactProof?.startsWith("memoryCompanion") === true;
           const pipelineProof =
+            privateSourceProof ||
             compactProof === "memoryPipeline" ||
             compactProof === "memoryLiquidPipeline" ||
             compactProof === "memoryServerCurrent" ||
@@ -10402,6 +10413,7 @@ for (const compactProof of [
           const queryMixed =
             compactProof === "memoryQueryMixed" || compactProof === "memoryCompanionQuery";
           const queryCache =
+            privateQueryProof ||
             (sharedQuery &&
               (!serverQuery || !serverDeny) &&
               !sharedDenied &&
@@ -12203,9 +12215,11 @@ for (const compactProof of [
                                       );
                                     }
                                     return {
-                                      reportedModel: catalogProof
-                                        ? catalogCanonical
-                                        : exchange.model,
+                                      reportedModel: privateQueryProof
+                                        ? observedPrivateModel
+                                        : catalogProof
+                                          ? catalogCanonical
+                                          : exchange.model,
                                       inputTokens: 25,
                                       outputTokens: 0,
                                       value: [Array.from({ length: 2048 }, () => 0.375)],
@@ -12298,10 +12312,12 @@ for (const compactProof of [
                                     reportedModel:
                                       compactProof === "memoryLiquidIdentity"
                                         ? "liquid/lfm-2.5-2.6b"
-                                        : compactProof === "memoryPipeline" &&
-                                            exchange.phase === "embed"
-                                          ? catalogCanonical
-                                          : exchange.model,
+                                        : privateSourceProof && exchange.phase === "embed"
+                                          ? observedPrivateModel
+                                          : compactProof === "memoryPipeline" &&
+                                              exchange.phase === "embed"
+                                            ? catalogCanonical
+                                            : exchange.model,
                                     inputTokens: 50,
                                     outputTokens: exchange.phase === "extract" ? 5 : 0,
                                     value:
@@ -14863,7 +14879,7 @@ for (const compactProof of [
                                 chargedOutputTokens: 0,
                                 reportedInputTokens: 15,
                                 reportedOutputTokens: 0,
-                                reportedModel: catalogCanonical,
+                                reportedModel: observedPrivateModel,
                                 transportDrained: true,
                               };
                               for (const reportedModel of [
@@ -14872,6 +14888,14 @@ for (const compactProof of [
                                 "nvidia/nemotron-3-embed-1b-20260716:free",
                                 "nvidia/llama-nemotron-embed-vl-1b-v2:free",
                                 "unrelated-model",
+                                "private/openrouter/nvidia/nemotron-3-embed-1b:free",
+                                "private/openrouter/nvidia/nemotron-3-embed-1b-20260716",
+                                "private/openrouter/nvidia/nemotron-3-embed-1b-20260717",
+                                "private/openrouter/nvidia/llama-nemotron-embed-vl-1b-v2",
+                                "private/openrouter/other/nemotron-3-embed-1b",
+                                "private/other/nvidia/nemotron-3-embed-1b",
+                                "public/openrouter/nvidia/nemotron-3-embed-1b",
+                                "private/openrouter/nvidia/nemotron-3-embed-1b/extra",
                               ]) {
                                 expect(
                                   sameProjectMemoryReportedModel(
@@ -14888,17 +14912,23 @@ for (const compactProof of [
                               for (const model of [
                                 "nvidia/nemotron-3-embed-1b",
                                 catalogCanonical,
+                                observedPrivateModel,
                                 "nvidia/llama-nemotron-embed-vl-1b-v2:free",
                                 "inclusionai/ling-3.1-flash:free",
                               ]) {
-                                expect(
-                                  sameProjectMemoryReportedModel(catalogCanonical, model),
-                                ).toBe(false);
-                                expect(
-                                  (yield* ledger
-                                    .settle({ ...aliasSettlement, model })
-                                    .pipe(Effect.result))._tag,
-                                ).toBe("Failure");
+                                for (const reportedModel of [
+                                  catalogCanonical,
+                                  observedPrivateModel,
+                                ]) {
+                                  expect(sameProjectMemoryReportedModel(reportedModel, model)).toBe(
+                                    false,
+                                  );
+                                  expect(
+                                    (yield* ledger
+                                      .settle({ ...aliasSettlement, model, reportedModel })
+                                      .pipe(Effect.result))._tag,
+                                  ).toBe("Failure");
+                                }
                               }
                               expect(
                                 yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
@@ -15700,6 +15730,7 @@ for (const compactProof of [
             result: { _tag: "Success", success: { terminal: { outcome: "success" } } },
           });
           if (
+            privateProof ||
             compactProof === "memoryPipeline" ||
             compactProof === "memoryQueryPipeline" ||
             compactProof === "memoryServerCurrent"
@@ -15774,7 +15805,7 @@ for (const compactProof of [
             expect(replay).toMatchObject({ _tag: "Success", success: memoryReceipt });
             expect(yield* f.sql`SELECT * FROM project_team_memory_job`).toEqual(rows);
             expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(charges);
-            if (catalogProof) {
+            if (catalogProof || privateProof) {
               const embeddings = yield* f.sql<{
                 phase: string;
                 status: string;
@@ -15801,8 +15832,9 @@ for (const compactProof of [
                   input: 50,
                   output: 0,
                   settlement: {
-                    reportedModel:
-                      compactProof === "memoryPipeline"
+                    reportedModel: privateSourceProof
+                      ? observedPrivateModel
+                      : compactProof === "memoryPipeline"
                         ? catalogCanonical
                         : "nvidia/nemotron-3-embed-1b:free",
                     reportedInputTokens: 50,
@@ -15810,7 +15842,7 @@ for (const compactProof of [
                     transportDrained: true,
                   },
                 },
-                ...(compactProof === "memoryQueryPipeline"
+                ...(compactProof === "memoryQueryPipeline" || privateQueryProof
                   ? [
                       {
                         phase: "query-embed",
@@ -15819,7 +15851,9 @@ for (const compactProof of [
                         input: 25,
                         output: 0,
                         settlement: {
-                          reportedModel: catalogCanonical,
+                          reportedModel: privateQueryProof
+                            ? observedPrivateModel
+                            : catalogCanonical,
                           reportedInputTokens: 25,
                           reportedOutputTokens: 0,
                           transportDrained: true,

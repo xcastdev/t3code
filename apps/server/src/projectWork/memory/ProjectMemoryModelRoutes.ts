@@ -33,7 +33,7 @@ export const isProjectMemoryReservedRoute = (phase: string, provider: string, mo
     : (phase === "embed" || phase === "query-embed") &&
       provider === MEMORY_EMBEDDING.provider &&
       model === MEMORY_EMBEDDING.model;
-/** Fixed response aliases, including the verified OpenRouter NVIDIA catalog canonical slug. */
+/** Fixed response aliases from the OpenRouter catalog and an isolated production exchange. */
 export const sameProjectMemoryReportedModel = (reported: string | undefined, requested: string) =>
   (requested === LIQUID_EXTRACTION.model && reported === requested) ||
   (requested === COMMAND_CODE_EXTRACTION.model &&
@@ -41,7 +41,8 @@ export const sameProjectMemoryReportedModel = (reported: string | undefined, req
   (requested === MEMORY_EMBEDDING.model &&
     (reported === requested ||
       reported === "nvidia/nemotron-3-embed-1b" ||
-      reported === "nvidia/nemotron-3-embed-1b-20260716"));
+      reported === "nvidia/nemotron-3-embed-1b-20260716" ||
+      reported === "private/openrouter/nvidia/nemotron-3-embed-1b"));
 
 export const withinProjectMemoryExtractionLimits = (
   endpoint: string,
