@@ -142,17 +142,21 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
     ready: boolean,
   ) {
     const identity = { providerInstanceId, threadId: request.threadId };
+    const revoked = operations
+      .abandonCompaction(identity, request)
+      .pipe(
+        Effect.ignore,
+        Effect.andThen(Effect.fail(denied("Project team execution is disabled"))),
+      );
     return yield* Effect.gen(function* () {
       const enabled = yield* settings.getSettings;
       if (stopped || !enabled.projectWorkEnabled || !enabled.projectTeamExecutionEnabled)
-        return yield* denied("Project team execution is disabled");
+        return yield* revoked;
       const result = yield* Effect.raceFirst(
         ready
           ? operations.assertCompactionReady(identity, request)
           : operations.reserveCompaction(identity, request),
-        Deferred.await(stopSignal).pipe(
-          Effect.andThen(Effect.fail(denied("Project team execution is disabled"))),
-        ),
+        Deferred.await(stopSignal).pipe(Effect.andThen(revoked)),
       );
       const currentSettings = yield* settings.getSettings;
       if (
@@ -160,10 +164,9 @@ export const makeProjectTeamRuntime = Effect.fn("makeProjectTeamRuntime")(functi
         !currentSettings.projectWorkEnabled ||
         !currentSettings.projectTeamExecutionEnabled
       )
-        return yield* denied("Project team execution is disabled");
+        return yield* revoked;
       return result;
     }).pipe(
-      Effect.onError(() => operations.abandonCompaction(identity, request).pipe(Effect.ignore)),
       Effect.mapError((error) =>
         isManagedRuntimeError(error) ? error : denied("Compact caller authority unavailable"),
       ),

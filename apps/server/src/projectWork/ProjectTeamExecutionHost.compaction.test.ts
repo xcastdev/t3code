@@ -1,3 +1,4 @@
+import * as Option from "effect/Option";
 import { makeProjectTeamPiRuntime, ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { makeProjectTeamRuntime } from "./ProjectTeamRuntime.ts";
 import { layerTest } from "../serverSettings.ts";
@@ -581,7 +582,7 @@ it.effect("deadline releases pending caller and cannot renew the same identity",
 );
 
 it.effect(
-  "active predecessor cannot qualify readiness and a failed caller releases without charging",
+  "active predecessor cannot qualify readiness and its creating scope releases without charging",
   () =>
     scoped(
       Effect.gen(function* () {
@@ -591,6 +592,10 @@ it.effect(
         expect(
           (yield* f.operations.assertCompactionReady(identity, request).pipe(Effect.result))._tag,
         ).toBe("Failure");
+        expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+          { status: "pending" },
+        ]);
+        yield* f.operations.abandonCompaction(identity, request);
         expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
           { status: "released" },
         ]);
@@ -777,9 +782,16 @@ for (const reason of ["cancel", "revoke", "deadline"] as const)
         const operations = yield* makeProjectTeamPiOperations({
           environmentId: "environment",
         }).pipe(Effect.provideService(SqlClient.SqlClient, observingSql));
-        const fiber = yield* operations
-          .assertCompactionReady(identity, request)
-          .pipe(Effect.provideService(SqlClient.SqlClient, observingSql), Effect.forkChild);
+        const fiber = yield* operations.assertCompactionReady(identity, request).pipe(
+          // This scope created the admission; readiness alone owns no cancellation cleanup.
+          Effect.onError(() =>
+            reason === "cancel" && reservation.created
+              ? operations.abandonCompaction(identity, request).pipe(Effect.ignore)
+              : Effect.void,
+          ),
+          Effect.provideService(SqlClient.SqlClient, observingSql),
+          Effect.forkChild,
+        );
         yield* Deferred.await(read);
         yield* f.sql`SELECT * FROM project_team_compact_caller`;
         if (reason === "cancel") yield* Fiber.interrupt(fiber);
@@ -910,3 +922,137 @@ it.effect(
       }),
     ),
 );
+
+for (const timing of ["after-idle-before-wait", "after-backend-wait"] as const)
+  for (const ownerOutcome of ["prepare", "abandon"] as const)
+    it.effect(`duplicate cancellation ${timing} preserves creator ${ownerOutcome} ownership`, () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* fixtureWithAssignment();
+          const request = compactRequest();
+          const creator = yield* f.operations.reserveCompaction(identity, request);
+          expect(creator.created).toBe(true);
+          const entered = yield* Deferred.make<void>();
+          const releaseRead = yield* Deferred.make<void>();
+          let armed = false;
+          const observingSql = new Proxy(f.sql, {
+            apply(target, _receiver, args) {
+              const statement = target(args[0], ...args.slice(1));
+              if (
+                armed &&
+                timing === "after-idle-before-wait" &&
+                statement.compile()[0].includes("FROM project_team_review_target t JOIN")
+              )
+                return statement.pipe(
+                  Effect.tap(() =>
+                    Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(releaseRead)),
+                    ),
+                  ),
+                );
+              return statement;
+            },
+            get(target, property, receiver) {
+              if (property === "withTransaction")
+                return <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+                  Effect.gen(function* () {
+                    const nested = Option.isSome(
+                      yield* Effect.serviceOption(target.transactionService),
+                    );
+                    const result = yield* target.withTransaction(effect);
+                    if (armed && !nested && timing === "after-backend-wait")
+                      yield* Deferred.succeed(entered, undefined);
+                    return result;
+                  });
+              return Reflect.get(target, property, receiver);
+            },
+          });
+          const pi = yield* makeProjectTeamPiRuntime();
+          yield* makeProjectTeamRuntime({
+            environmentId: "environment",
+            maximumEnvironmentModelCalls: 2,
+          }).pipe(
+            Effect.provideService(ProjectTeamPiRuntime, pi),
+            Effect.provideService(SqlClient.SqlClient, observingSql),
+          );
+          const duplicate = yield* pi
+            .reserveCompaction(providerInstanceId, request)
+            .pipe(Effect.provideService(SqlClient.SqlClient, observingSql));
+          expect(duplicate).toEqual({ ...creator, created: false });
+          const input = yield* f.reserveInput();
+          yield* f.complete(
+            f.prompt,
+            { ...native, leafId: "duplicate-idle-predecessor" },
+            "success",
+            [yield* input.settle],
+          );
+          const creatorReady = yield* f.operations
+            .assertCompactionReady(identity, request)
+            .pipe(Effect.forkChild);
+          armed = true;
+          const duplicateReady = yield* pi
+            .assertCompactionReady(providerInstanceId, request)
+            .pipe(Effect.provideService(SqlClient.SqlClient, observingSql), Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(duplicateReady);
+          expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+            { status: "pending" },
+          ]);
+          expect(
+            yield* f.sql`SELECT operation_id FROM project_team_pi_operation WHERE operation_kind='compact'`,
+          ).toEqual([]);
+          const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+            receiptId: "duplicate-observed",
+            stage: "assignment-observed",
+            evidence: { bindingId: f.binding.recordId },
+          });
+          expect(yield* Fiber.join(creatorReady)).toEqual({ ...creator, created: false });
+          expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("WaitingForCompact");
+          if (ownerOutcome === "abandon") {
+            yield* f.operations.abandonCompaction(identity, request);
+            expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+              { status: "released" },
+            ]);
+          } else {
+            const boundary = yield* f.operations.readCompaction(identity, {
+              ...request,
+              kind: "compact",
+            });
+            const compactRequest = {
+              ...request,
+              kind: "compact" as const,
+              operationId: boundary.operationId,
+            };
+            const compact = yield* f.operations.prepare(
+              identity,
+              compactRequest,
+              hash(compactRequest),
+              {
+                allocation: yield* f.allocation,
+                workerId: "creator-compact-worker",
+                operationId: boundary.operationId,
+                resourceHash: "a".repeat(64),
+                compactContext: { provenanceSha256: "b".repeat(64), textSha256: "c".repeat(64) },
+              },
+            );
+            expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+              { status: "consumed" },
+            ]);
+            expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("WaitingForCompact");
+            const compactInput = yield* f.reserveInput(compact);
+            yield* f.complete(
+              compact,
+              { ...native, leafId: "creator-compact-terminal" },
+              "success",
+              [yield* compactInput.settle],
+            );
+          }
+          expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("Claimed");
+        }).pipe(
+          Effect.provide(
+            layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true }),
+          ),
+          Effect.scoped,
+        ),
+      ),
+    );

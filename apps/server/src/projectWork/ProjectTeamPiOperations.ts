@@ -69,6 +69,7 @@ import {
 } from "./memory/ProjectMemoryModelAccounting.ts";
 import {
   ProjectTeamAuthorization,
+  ProjectTeamAuthorizationError,
   inspectProjectTeamSessionAuthority,
   managedActorId,
   type ProjectTeamAuthority,
@@ -95,6 +96,7 @@ const decodeReviewWorkspace = Schema.decodeUnknownEffect(
   { onExcessProperty: "error" },
 );
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
+const isAuthorizationError = Schema.is(ProjectTeamAuthorizationError);
 const isWorkerIdentity = Schema.is(PiWorkerIdentity);
 const isWorkerOperation = Schema.is(PiWorkerOperation);
 const decodeNativeInput = Schema.decodeUnknownEffect(PiNativeReference, {
@@ -2637,6 +2639,59 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       );
       yield* notifyCompactCallerChange;
     });
+    // Invalid durable authority can be released by any observer. Readiness errors
+    // and waiter interruption do not themselves transfer caller ownership.
+    const releaseInvalidCompaction = Effect.fn("ProjectTeamPiOperations.releaseInvalidCompaction")(
+      function* (identity: Parameters<typeof current>[0], request: CompactCallerRequest) {
+        yield* ownTransaction();
+        const released = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const rows = yield* callerRows(identity, request);
+            const caller = rows[0];
+            if (
+              rows.length !== 1 ||
+              !caller ||
+              caller.status !== "pending" ||
+              request.threadId !== identity.threadId ||
+              caller.request_json !== encode(callerRequest(request))
+            )
+              return false;
+            let invalid = (yield* Clock.currentTimeMillis) >= caller.deadline_at_ms;
+            if (!invalid) {
+              const authority = yield* current(identity).pipe(Effect.result);
+              if (authority._tag === "Failure") {
+                invalid =
+                  isAuthorizationError(authority.failure) ||
+                  (isRuntimeError(authority.failure) && authority.failure.code === "denied");
+              } else {
+                const original = yield* readRetained(caller.dispatch_id);
+                const latest = yield* sql<{
+                  operation_id: string;
+                }>`SELECT operation_id FROM project_team_pi_operation
+              WHERE environment_id=${options.environmentId} AND binding_id=${caller.binding_id}
+              AND generation=${caller.generation} ORDER BY operation_ordinal DESC LIMIT 1`;
+                invalid =
+                  caller.binding_id !== authority.success.binding.recordId ||
+                  caller.generation !== authority.success.binding.generation ||
+                  caller.authority_json !== callerAuthority(original, authority.success) ||
+                  caller.claim_generation !== original.fence.claimGeneration ||
+                  (caller.admission_revision !== original.fence.revision &&
+                    caller.admission_revision + 1 !== original.fence.revision) ||
+                  (original.fence.stage !== "assignment-intent" &&
+                    original.fence.stage !== "assignment-observed") ||
+                  latest[0]?.operation_id !== caller.predecessor_operation_id;
+              }
+            }
+            if (!invalid) return false;
+            const changed = yield* sql`UPDATE project_team_compact_caller SET status='released'
+          WHERE environment_id=${options.environmentId} AND dispatch_id=${caller.dispatch_id}
+          AND request_id=${request.requestId} AND status='pending' RETURNING request_id`;
+            return changed.length === 1;
+          }),
+        );
+        if (released) yield* notifyCompactCallerChange;
+      },
+    );
     const reserveCompaction = Effect.fn("ProjectTeamPiOperations.reserveCompaction")(function* (
       identity: Parameters<typeof current>[0],
       supplied: CompactCallerRequest,
@@ -2741,7 +2796,14 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             return callerResult(inserted[0], true);
           }),
         ),
-      ).pipe(Effect.onError(() => abandonCompaction(identity, request).pipe(Effect.ignore)));
+      ).pipe(
+        Effect.catch((error) =>
+          releaseInvalidCompaction(identity, request).pipe(
+            Effect.ignore,
+            Effect.andThen(Effect.fail(error)),
+          ),
+        ),
+      );
       yield* notifyCompactCallerChange;
       return result;
     });
@@ -2970,7 +3032,14 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               }),
             );
           }
-        }).pipe(Effect.onError(() => abandonCompaction(identity, request).pipe(Effect.ignore)));
+        }).pipe(
+          Effect.catch((error) =>
+            releaseInvalidCompaction(identity, request).pipe(
+              Effect.ignore,
+              Effect.andThen(Effect.fail(error)),
+            ),
+          ),
+        );
       },
       Effect.scoped,
     );
