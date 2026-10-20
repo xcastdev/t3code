@@ -13,6 +13,7 @@ import {
   GitCommandError,
   ProjectTeamRunBinding,
   ProjectTeamRoleRevision,
+  ProjectTeamMember,
   CommandId,
   MessageId,
   ThreadId,
@@ -92,6 +93,14 @@ const decodeAllocationReviewTarget = Schema.decodeUnknownEffect(
 );
 const decodeReviewWorkspace = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectTeamWorkspaceReceipt),
+  { onExcessProperty: "error" },
+);
+const decodeCompactAuthorityRecords = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    binding: ProjectTeamRunBinding,
+    role: ProjectTeamRoleRevision,
+    member: ProjectTeamMember,
+  }),
   { onExcessProperty: "error" },
 );
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
@@ -2656,53 +2665,65 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
               return false;
             let invalid = (yield* Clock.currentTimeMillis) >= caller.deadline_at_ms;
             if (!invalid) {
+              const original = yield* readRetained(caller.dispatch_id);
+              const claim = original.intent.compiledClaim.transition;
+              if (
+                claim?.kind !== "claim" ||
+                claim.binding.recordId !== caller.binding_id ||
+                claim.binding.generation !== caller.generation ||
+                claim.binding.providerInstanceId !== identity.providerInstanceId ||
+                claim.binding.threadId !== identity.threadId
+              )
+                return false;
+              const state = yield* readCurrentState(sql, claim.binding.projectId);
+              const records = state.foundationRecords ?? [];
+              const bindings = records.filter((record) => record.recordId === caller.binding_id);
+              const roles = records.filter(
+                (record) => record.recordId === claim.binding.roleRevisionId,
+              );
+              const members = records.filter(
+                (record) => record.recordId === claim.binding.memberId,
+              );
+              if (bindings.length !== 1 || roles.length !== 1 || members.length !== 1) return false;
+              // Checkpoints intentionally tolerate unknown statuses. Invalidation
+              // needs strict, unique, related records before interpreting a status.
+              const { binding, role, member } = yield* decodeCompactAuthorityRecords({
+                binding: bindings[0],
+                role: roles[0],
+                member: members[0],
+              });
+              if (
+                binding.projectId !== claim.binding.projectId ||
+                binding.environmentId !== options.environmentId ||
+                binding.providerInstanceId !== identity.providerInstanceId ||
+                binding.threadId !== identity.threadId ||
+                binding.roleRevisionId !== role.recordId ||
+                binding.memberId !== member.recordId ||
+                member.roleRevisionId !== role.recordId ||
+                role.projectId !== binding.projectId ||
+                member.projectId !== binding.projectId
+              )
+                return false;
               const authority = yield* current(identity).pipe(Effect.result);
               if (authority._tag === "Failure") {
-                // Discovery also maps unavailable storage to authorization errors.
-                // Only successfully read exact durable records can prove revocation;
-                // these reads never grant forward authority after current() failed.
-                const original = yield* readRetained(caller.dispatch_id);
-                const claim = original.intent.compiledClaim.transition;
-                if (
-                  claim?.kind !== "claim" ||
-                  claim.binding.recordId !== caller.binding_id ||
-                  claim.binding.generation !== caller.generation ||
-                  claim.binding.providerInstanceId !== identity.providerInstanceId ||
-                  claim.binding.threadId !== identity.threadId
-                )
-                  return false;
-                const state = yield* readCurrentState(sql, claim.binding.projectId);
-                const bindings = (state.foundationRecords ?? []).filter(
-                  (record) =>
-                    record.kind === "run-binding" && record.recordId === caller.binding_id,
-                );
-                const binding = bindings[0];
-                if (bindings.length !== 1 || binding?.kind !== "run-binding") return false;
+                // Failed discovery grants nothing. Only validated durable changes
+                // below can release; error classes and messages supply no proof.
                 invalid =
                   binding.status !== "running" ||
-                  immutableBinding(binding) !== immutableBinding(claim.binding);
-                const role = (state.foundationRecords ?? []).find(
-                  (record) => record.recordId === binding.roleRevisionId,
-                );
-                if (role?.kind === "role-revision")
-                  invalid ||=
-                    caller.authority_json !==
+                  member.status !== "active" ||
+                  immutableBinding(binding) !== immutableBinding(claim.binding) ||
+                  caller.authority_json !==
                     encode({
                       intentSha256: digest(original.intent),
                       binding: immutableBinding(binding),
                       role,
                     });
-                const member = (state.foundationRecords ?? []).find(
-                  (record) => record.recordId === binding.memberId,
-                );
-                if (member?.kind === "member" && member.status !== "active") invalid = true;
               } else {
-                const original = yield* readRetained(caller.dispatch_id);
                 const latest = yield* sql<{
                   operation_id: string;
                 }>`SELECT operation_id FROM project_team_pi_operation
-              WHERE environment_id=${options.environmentId} AND binding_id=${caller.binding_id}
-              AND generation=${caller.generation} ORDER BY operation_ordinal DESC LIMIT 1`;
+                  WHERE environment_id=${options.environmentId} AND binding_id=${caller.binding_id}
+                  AND generation=${caller.generation} ORDER BY operation_ordinal DESC LIMIT 1`;
                 invalid =
                   caller.binding_id !== authority.success.binding.recordId ||
                   caller.generation !== authority.success.binding.generation ||

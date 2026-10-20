@@ -1177,3 +1177,123 @@ it.effect(
       ),
     ),
 );
+
+for (const corruption of [
+  "role-status",
+  "binding-status",
+  "member-status",
+  "duplicate-role",
+  "duplicate-binding",
+  "duplicate-member",
+  "foreign-role",
+  "foreign-binding",
+  "foreign-member",
+  "foreign-member-role",
+] as const)
+  it.effect(`unvalidated ${corruption} cannot invalidate the original compact caller`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment();
+        const request = compactRequest();
+        const creator = yield* f.operations.reserveCompaction(identity, request);
+        const pi = yield* makeProjectTeamPiRuntime();
+        yield* makeProjectTeamRuntime({
+          environmentId: "environment",
+          maximumEnvironmentModelCalls: 2,
+        }).pipe(Effect.provideService(ProjectTeamPiRuntime, pi));
+        expect(yield* pi.reserveCompaction(providerInstanceId, request)).toEqual({
+          ...creator,
+          created: false,
+        });
+        const input = yield* f.reserveInput();
+        yield* f.complete(
+          f.prompt,
+          { ...native, leafId: "cached-corruption-predecessor" },
+          "success",
+          [yield* input.settle],
+        );
+        const saved = yield* f.sql<{
+          state_json: string;
+        }>`SELECT state_json FROM project_work_reducer_checkpoints WHERE project_id=${projectId}`;
+        const records = (yield* readCurrentState(f.sql, projectId)).foundationRecords ?? [];
+        const kind = corruption.includes("binding")
+          ? "run-binding"
+          : corruption.includes("member")
+            ? "member"
+            : "role-revision";
+        const index = records.findIndex((record) => record.kind === kind);
+        expect(index).toBeGreaterThanOrEqual(0);
+        const recordPath = `$.foundationRecords[${index}]`;
+        if (corruption.startsWith("duplicate-")) {
+          const status =
+            kind === "run-binding" ? "stopping" : kind === "member" ? "paused" : "retired";
+          yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${recordPath + ".status"},${status}) WHERE project_id=${projectId}`;
+          yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_insert(state_json,'$.foundationRecords[#]',json_extract(state_json,${recordPath})) WHERE project_id=${projectId}`;
+        } else if (corruption.startsWith("foreign-")) {
+          const field = corruption === "foreign-member-role" ? ".roleRevisionId" : ".projectId";
+          const status =
+            kind === "run-binding" ? "stopping" : kind === "member" ? "paused" : "retired";
+          yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${recordPath + field},'foreign-owner',${recordPath + ".status"},${status}) WHERE project_id=${projectId}`;
+        } else
+          yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,${recordPath + ".status"},'corrupt-status') WHERE project_id=${projectId}`;
+        expect(
+          (yield* pi.assertCompactionReady(providerInstanceId, request).pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+          { status: "pending" },
+        ]);
+        expect(
+          yield* f.sql`SELECT operation_id FROM project_team_pi_operation WHERE operation_kind='compact'`,
+        ).toEqual([]);
+        yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=${saved[0]!.state_json} WHERE project_id=${projectId}`;
+        const observed = yield* f.journal.advanceStage(f.snapshot.fence, {
+          receiptId: "restored-cache-observed",
+          stage: "assignment-observed",
+          evidence: { bindingId: f.binding.recordId },
+        });
+        expect(yield* pi.assertCompactionReady(providerInstanceId, request)).toEqual({
+          ...creator,
+          created: false,
+        });
+        expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("WaitingForCompact");
+        yield* f.operations.abandonCompaction(identity, request);
+        expect((yield* f.journal.claimCleanup(observed.fence))._tag).toBe("Claimed");
+      }).pipe(
+        Effect.provide(layerTest({ projectWorkEnabled: true, projectTeamExecutionEnabled: true })),
+        Effect.scoped,
+      ),
+    ),
+  );
+
+for (const kind of ["role-revision", "member"] as const)
+  it.effect(`validated ${kind} revocation releases the exact caller`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixtureWithAssignment();
+        const request = compactRequest();
+        yield* f.operations.reserveCompaction(identity, request);
+        const record = (yield* readCurrentState(f.sql, projectId)).foundationRecords?.find(
+          (record) => record.kind === kind,
+        );
+        if (record?.kind === "role-revision")
+          yield* restoreHistoricalBinding({
+            ...record,
+            status: "retired",
+            revision: record.revision + 1,
+          });
+        else if (record?.kind === "member")
+          yield* restoreHistoricalBinding({
+            ...record,
+            status: "paused",
+            revision: record.revision + 1,
+          });
+        else return yield* Effect.die("Missing revocation control record");
+        expect(
+          (yield* f.operations.assertCompactionReady(identity, request).pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+          { status: "released" },
+        ]);
+      }),
+    ),
+  );
