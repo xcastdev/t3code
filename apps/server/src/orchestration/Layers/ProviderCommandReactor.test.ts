@@ -415,6 +415,8 @@ describe("ProviderCommandReactor", () => {
       startSession: startSession as ProviderServiceShape["startSession"],
       sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
       continueFromTerminalCompletion,
+      reserveThreadCompaction: () => Effect.die("Unused compaction reservation in test"),
+      awaitThreadCompactionReady: () => Effect.die("Unused compaction readiness wait in test"),
       compactThread,
       interruptTurn: interruptTurn as ProviderServiceShape["interruptTurn"],
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],

@@ -59,6 +59,8 @@ const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
     startSession: () => Effect.die("unused"),
     sendTurn: () => Effect.die("unused"),
     continueFromTerminalCompletion: () => Effect.die("unused"),
+    reserveThreadCompaction: () => Effect.die("Unused compaction reservation in test"),
+    awaitThreadCompactionReady: () => Effect.die("Unused compaction readiness wait in test"),
     compactThread: () => Effect.die("unused"),
     interruptTurn: () => Effect.die("unused"),
     respondToRequest: () => Effect.die("unused"),

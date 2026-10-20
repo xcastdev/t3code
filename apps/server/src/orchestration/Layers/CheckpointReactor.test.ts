@@ -149,6 +149,8 @@ function createProviderServiceHarness(
     messageAgent: () => unsupported(),
     stopAgent: () => unsupported(),
     getAgentCapabilities: () => unsupported(),
+    reserveThreadCompaction: () => Effect.die("Unused compaction reservation in test"),
+    awaitThreadCompactionReady: () => Effect.die("Unused compaction readiness wait in test"),
     compactThread: () => unsupported(),
     interruptTurn: () => unsupported(),
     respondToRequest: () => unsupported(),
