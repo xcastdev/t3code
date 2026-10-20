@@ -102,8 +102,11 @@ for the security model.
 When diagnosing waiting memory work, separate capture from processing readiness. Capture catches
 up retained sources on startup and settings changes. Check `project-memory-processing.json` in
 the configured server base directory: a missing file disables processing; invalid configuration
-makes it unavailable. The [server composition](../../apps/server/src/server.ts) also blocks model
-exchange and companion startup. Supplying configuration does not bypass those admission checks.
+makes it unavailable. The [server composition](../../apps/server/src/server.ts) requires Linux,
+a valid host user, and both project work and team execution enabled. Forwarding additionally
+requires the original live task bridge and its current resource owner; configuration alone grants
+no execution authority. Retained captured companions can still be cleaned up after processing is
+disabled.
 
 Inspect [recorded memory and outcomes](../user/project-work.md#inspect-and-retract-project-memory)
 before attempting recovery. Processing requires explicit selection by an agent on an approved

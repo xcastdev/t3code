@@ -57,6 +57,7 @@ import {
   HostProcessExecutablePath,
   HostProcessIsExecutable,
   HostProcessPlatform,
+  HostProcessUserId,
 } from "@t3tools/shared/hostProcess";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -173,6 +174,8 @@ import {
   exchangeProjectMemoryModel,
 } from "./projectWork/memory/ProjectMemoryPorts.ts";
 import { ProjectMemoryServiceError } from "./projectWork/memory/ProjectMemoryService.ts";
+import { makeProjectMemoryRuntimeAdmission } from "./projectWork/memory/ProjectMemoryRuntimeAdmission.ts";
+import { ProjectMemoryOperation } from "./projectWork/memory/ProjectMemoryModelAccounting.ts";
 import { makeProjectMemoryCompanion } from "./projectWork/memory/ProjectMemoryCompanion.ts";
 import * as Queue from "effect/Queue";
 import * as ProjectWorkPublicationGuard from "./projectWork/ProjectWorkPublicationGuard.ts";
@@ -792,6 +795,7 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const secrets = yield* ServerSecretStore.ServerSecretStore;
+    const settings = yield* ServerSettings.ServerSettingsService;
     const configurationPath = path.join(config.baseDir, "project-memory-processing.json");
     const readConfiguration = Effect.gen(function* () {
       if (!(yield* fs.exists(configurationPath))) return undefined;
@@ -835,12 +839,16 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
     );
     const drained = new Set<string>();
     const drainObservations = yield* Queue.make<string>({ capacity: 256, strategy: "dropping" });
-    const assertAdmission = Effect.fail(
-      new ProjectMemoryServiceError({
-        reason:
-          "Memory processing awaits authorized runtime activation, companion provisioning and runtime proof",
-      }),
-    );
+    const { assertAdmission } = makeProjectMemoryRuntimeAdmission({
+      platform: yield* HostProcessPlatform,
+      userId: yield* HostProcessUserId,
+      readSettings: settings.getSettings.pipe(
+        Effect.mapError(
+          () =>
+            new ProjectMemoryServiceError({ reason: "Memory runtime settings are unavailable" }),
+        ),
+      ),
+    });
     const companion = yield* makeProjectMemoryCompanion({
       environmentId: yield* environment.getEnvironmentId,
       protectedRoots: [config.stateDir, config.secretsDir],
@@ -871,6 +879,16 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
         ),
       exchange: (request, id) =>
         assertAdmission.pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              const operation = yield* Effect.serviceOption(ProjectMemoryOperation);
+              if (Option.isNone(operation))
+                return yield* new ProjectMemoryServiceError({
+                  reason: "Memory transport requires its captured executing bridge",
+                });
+              yield* operation.value.assertForward;
+            }),
+          ),
           Effect.andThen(
             exchangeProjectMemoryModel(request, () => {
               // Observed promise/stream cleanup is local drain, never abort intent.
@@ -916,6 +934,7 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
   Layer.provide(ProjectWorkContentGuardLive),
   Layer.provide(ServerEnvironmentLayerLive),
   Layer.provide(ServerSecretStore.layer),
+  Layer.provide(ServerSettingsLayerLive),
 );
 
 const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
