@@ -1,4 +1,8 @@
 import {
+  projectMemoryExtractionRoute,
+  withinProjectMemoryExtractionLimits,
+} from "./ProjectMemoryModelRoutes.ts";
+import {
   canonicalProjectWorkPayload,
   EventId,
   ProjectTeamRecord,
@@ -1286,6 +1290,9 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
         if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
           return yield* deny("Memory processing must follow the owning admission commit");
         const configuration = yield* configured();
+        const extractionRoute = projectMemoryExtractionRoute(configuration.extraction.endpoint);
+        if (extractionRoute === undefined)
+          return yield* deny("Memory extraction endpoint is unavailable");
         const executing = yield* Effect.serviceOption(ProjectMemoryOperation);
         if (Option.isNone(executing))
           return yield* deny("Memory processing waits for its captured executing bridge");
@@ -1379,6 +1386,7 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
         yield* sql.withTransaction(fence);
         const accounting = yield* makeProjectMemoryModelAccounting({
           environmentId: options.environmentId,
+          extractionEndpoint: configuration.extraction.endpoint,
           maximumConcurrentCalls: options.maximumConcurrentCalls,
           maximumConcurrentModelCalls: options.maximumConcurrentModelCalls,
           assertCurrentInTransaction: () => fence,
@@ -1408,6 +1416,15 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
             )
               return yield* deny("Model stage changed its admitted source");
             const port = phase === "extract" ? configuration.extraction : configuration.embedding;
+            if (
+              phase === "extract" &&
+              !withinProjectMemoryExtractionLimits(
+                port.endpoint,
+                port.maximumInputTokens,
+                port.maximumOutputTokens,
+              )
+            )
+              return yield* deny("Memory extraction exceeds endpoint limits");
             const credential = yield* options.readCredential(port.credentialRef);
             yield* contentGuard.registerKnownSecrets([credential]);
             const deadlineAtMs = Math.min(
@@ -1528,6 +1545,7 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
           authorization,
           contentGuard,
           environmentId: options.environmentId,
+          selectedExtractionModel: extractionRoute.model,
           manifests: makeProjectMemoryManifestStore(sql),
           authorizeCapture: () => fence,
           assertProcessingInTransaction: fence,

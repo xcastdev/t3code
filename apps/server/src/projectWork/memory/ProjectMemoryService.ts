@@ -1,3 +1,4 @@
+import type { ProjectMemoryExtractionModel } from "./ProjectMemoryModelRoutes.ts";
 import * as NodeCrypto from "node:crypto";
 import {
   CommandId,
@@ -160,6 +161,7 @@ export interface ProjectMemoryServiceDependencies {
   ) => Effect.Effect<void, ProjectMemoryServiceError | ServerSettingsError | SqlError>;
   readonly manifests?: ProjectMemoryManifestStore;
   readonly models?: ProjectMemoryModelPorts;
+  readonly selectedExtractionModel?: ProjectMemoryExtractionModel;
   readonly assertProcessingInTransaction?: Effect.Effect<void, ProjectMemoryServiceError>;
 }
 const RetainedSourceBody = Schema.Union([
@@ -1049,6 +1051,7 @@ export const makeProjectMemoryService = (dependencies: ProjectMemoryServiceDepen
           revision: fresh.extraction!.revision + 1,
           updatedAt: at,
           status: facts.length === 0 ? "no-facts" : "extracted",
+          extractionModel: dependencies.selectedExtractionModel ?? PROJECT_MEMORY_MODELS.extraction,
           expectedObservationIds: observationIds,
           extractionHash: projectMemoryHash(facts),
         };

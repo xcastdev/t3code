@@ -29,6 +29,17 @@ import { PiManagedProcessAllocationSchema } from "../../provider/pi/PiManagedPro
 import type { ProjectTeamPrincipal } from "../ProjectTeamAuthorization.ts";
 import { ProjectMemoryServiceError, projectMemoryHash } from "./ProjectMemoryService.ts";
 
+import {
+  COMMAND_CODE_EXTRACTION,
+  LIQUID_EXTRACTION,
+  withinProjectMemoryExtractionLimits,
+  MEMORY_EMBEDDING,
+  projectMemoryExtractionRoute,
+  isProjectMemoryReservedRoute,
+  sameProjectMemoryReportedModel,
+  type ProjectMemoryExtractionEndpoint,
+} from "./ProjectMemoryModelRoutes.ts";
+
 const Id = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(256));
 const Safe = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }));
 const Positive = Safe.check(Schema.isGreaterThan(0));
@@ -225,8 +236,7 @@ const deny = (reason: string) => new ProjectMemoryServiceError({ reason });
 const isMemoryServiceError = Schema.is(ProjectMemoryServiceError);
 const same = (a: unknown, b: unknown) =>
   canonicalProjectWorkPayload(a) === canonicalProjectWorkPayload(b);
-const sameReportedModel = (reported: string | undefined, requested: string) =>
-  reported === requested || (requested.endsWith(":free") && reported === requested.slice(0, -5));
+
 const readOriginalDispatch = Effect.fn("ProjectMemoryModelAccounting.readOriginalDispatch")(
   function* (
     sql: SqlClient.SqlClient,
@@ -648,11 +658,13 @@ export const auditProjectMemoryOperationLedger = Effect.fn("auditProjectMemoryOp
           ) ||
         reservation.maxInputTokens + reservation.maxOutputTokens >
           operation.operationMaximumTokens ||
-        (reservation.phase === "extract"
-          ? reservation.provider !== "command-code" ||
-            reservation.model !== "inclusionai/ling-3.1-flash:free"
-          : reservation.provider !== "openrouter" ||
-            reservation.model !== "nvidia/nemotron-3-embed-1b:free")
+        !isProjectMemoryReservedRoute(reservation.phase, reservation.provider, reservation.model) ||
+        (reservation.model === LIQUID_EXTRACTION.model &&
+          !withinProjectMemoryExtractionLimits(
+            LIQUID_EXTRACTION.endpoint,
+            reservation.maxInputTokens,
+            reservation.maxOutputTokens,
+          ))
       )
         return yield* deny("Memory reservation disagrees with its original operation owner");
       if (row.status === "held") {
@@ -689,7 +701,7 @@ export const auditProjectMemoryOperationLedger = Effect.fn("auditProjectMemoryOp
         settlement.chargedOutputTokens !== row.charged_output_tokens ||
         row.capacity_state !== (settlement.transportDrained ? "released" : "quarantine") ||
         (settlement.outcome === "reported"
-          ? !sameReportedModel(settlement.reportedModel, reservation.model) ||
+          ? !sameProjectMemoryReportedModel(settlement.reportedModel, reservation.model) ||
             settlement.reportedInputTokens !== settlement.chargedInputTokens ||
             settlement.reportedOutputTokens !== settlement.chargedOutputTokens ||
             settlement.chargedInputTokens > reservation.maxInputTokens ||
@@ -720,6 +732,7 @@ export const auditProjectMemoryOperationLedger = Effect.fn("auditProjectMemoryOp
 );
 
 export interface ProjectMemoryModelAccountingOptions {
+  readonly extractionEndpoint?: ProjectMemoryExtractionEndpoint;
   readonly environmentId: string;
   readonly maximumConcurrentCalls: number;
   readonly maximumConcurrentModelCalls: number;
@@ -820,11 +833,24 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
             if ((owner.version === 2) !== (stage.phase === "query-embed"))
               return yield* deny("Memory stage kind differs from its admitted owner");
             const operation = owner.operation;
-            const provider = stage.phase === "extract" ? "command-code" : "openrouter";
-            const model =
+            const route =
               stage.phase === "extract"
-                ? "inclusionai/ling-3.1-flash:free"
-                : "nvidia/nemotron-3-embed-1b:free";
+                ? projectMemoryExtractionRoute(
+                    options.extractionEndpoint ?? COMMAND_CODE_EXTRACTION.endpoint,
+                  )
+                : MEMORY_EMBEDDING;
+            if (route === undefined)
+              return yield* deny("Memory extraction endpoint is unavailable");
+            if (
+              stage.phase === "extract" &&
+              !withinProjectMemoryExtractionLimits(
+                route.endpoint,
+                stage.maxInputTokens,
+                stage.maxOutputTokens,
+              )
+            )
+              return yield* deny("Memory extraction exceeds endpoint limits");
+            const { provider, model } = route;
             const scope = projectMemoryHash({
               version: owner.version,
               ownerSha256: projectMemoryHash(owner),
@@ -981,7 +1007,7 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
         } = settlement;
         if (
           outcome === "reported"
-            ? !sameReportedModel(reportedModel, reservation.model) ||
+            ? !sameProjectMemoryReportedModel(reportedModel, reservation.model) ||
               reportedInputTokens !== chargedInputTokens ||
               reportedOutputTokens !== chargedOutputTokens ||
               chargedInputTokens > reservation.maxInputTokens ||

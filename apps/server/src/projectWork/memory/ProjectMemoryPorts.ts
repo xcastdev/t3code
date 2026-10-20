@@ -1,3 +1,11 @@
+import {
+  COMMAND_CODE_EXTRACTION,
+  LIQUID_EXTRACTION,
+  MEMORY_EMBEDDING,
+  projectMemoryExtractionRoute,
+  sameProjectMemoryReportedModel,
+  withinProjectMemoryExtractionLimits,
+} from "./ProjectMemoryModelRoutes.ts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -9,7 +17,7 @@ import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import type { ProjectTeamPrincipal } from "../ProjectTeamAuthorization.ts";
 import { canonicalProjectWorkPayload } from "@t3tools/contracts";
-import { ProjectMemoryServiceError } from "./ProjectMemoryService.ts";
+import { ProjectMemoryExtractedFacts, ProjectMemoryServiceError } from "./ProjectMemoryService.ts";
 import type { ProjectMemoryRetrieval } from "./ProjectMemoryRetrieval.ts";
 
 /** Readiness checks never activate a companion or make a model request. */
@@ -59,8 +67,18 @@ export const ProjectMemoryProcessingConfiguration = Schema.Struct({
   version: Schema.Literal(1),
   extraction: Schema.Struct({
     ...ModelLimits,
-    endpoint: Schema.Literal("https://api.commandcode.ai/provider/v1/chat/completions"),
-  }),
+    endpoint: Schema.Literals([COMMAND_CODE_EXTRACTION.endpoint, LIQUID_EXTRACTION.endpoint]),
+  }).check(
+    Schema.makeFilter(
+      (route) =>
+        withinProjectMemoryExtractionLimits(
+          route.endpoint,
+          route.maximumInputTokens,
+          route.maximumOutputTokens,
+        ),
+      { message: "Liquid extraction exceeds endpoint limits" },
+    ),
+  ),
   embedding: Schema.Struct({
     ...ModelLimits,
     endpoint: Schema.Literal("https://openrouter.ai/api/v1/embeddings"),
@@ -88,6 +106,54 @@ const ExtractResponse = Schema.Struct({
   ).check(Schema.isMinLength(1), Schema.isMaxLength(1)),
   usage: Schema.Struct({ prompt_tokens: Safe, completion_tokens: Safe, total_tokens: Safe }),
 });
+const LiquidResponse = Schema.Struct({
+  model: Schema.Literal(LIQUID_EXTRACTION.model),
+  choices: Schema.Array(
+    Schema.Struct({
+      finish_reason: Schema.Literal("stop"),
+      message: Schema.Struct({ content: Schema.String, refusal: Schema.optionalKey(Schema.Null) }),
+    }),
+  ).check(Schema.isMinLength(1), Schema.isMaxLength(1)),
+  usage: Schema.Struct({
+    prompt_tokens: Safe,
+    completion_tokens: Safe,
+    total_tokens: Safe,
+    cost: Schema.Literal(0),
+  }),
+});
+const decodeLiquidResponse = Schema.decodeUnknownEffect(Schema.fromJsonString(LiquidResponse));
+const decodeLiquidFacts = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ facts: ProjectMemoryExtractedFacts })),
+  { onExcessProperty: "error" },
+);
+const liquidResponseFormat = {
+  type: "json_schema",
+  json_schema: {
+    name: "project_memory_facts",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["facts"],
+      properties: {
+        facts: {
+          type: "array",
+          maxItems: 32,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["key", "body", "quote"],
+            properties: {
+              key: { type: "string", minLength: 1, maxLength: 256 },
+              body: { type: "string", minLength: 1, maxLength: 8000 },
+              quote: { type: "string", minLength: 1, maxLength: 8000 },
+            },
+          },
+        },
+      },
+    },
+  },
+} as const;
 const EmbedResponse = Schema.Struct({
   model: Id,
   data: Schema.Array(
@@ -127,16 +193,29 @@ export interface ProjectMemoryModelResponse {
  * promise and awaited stream cleanup observes local transport drain. */
 export const exchangeProjectMemoryModel = Effect.fn("exchangeProjectMemoryModel")(
   function* (input: ProjectMemoryModelExchange, onTransportDrained: () => void) {
+    const extractionRoute = projectMemoryExtractionRoute(input.endpoint);
+    const liquid = input.phase === "extract" && input.endpoint === LIQUID_EXTRACTION.endpoint;
     if (
       input.phase === "extract"
-        ? input.endpoint !== "https://api.commandcode.ai/provider/v1/chat/completions" ||
-          input.model !== "inclusionai/ling-3.1-flash:free" ||
-          typeof input.input !== "string"
-        : input.endpoint !== "https://openrouter.ai/api/v1/embeddings" ||
-          input.model !== "nvidia/nemotron-3-embed-1b:free" ||
+        ? extractionRoute?.model !== input.model || typeof input.input !== "string"
+        : input.endpoint !== MEMORY_EMBEDDING.endpoint ||
+          input.model !== MEMORY_EMBEDDING.model ||
           typeof input.input === "string"
     )
       return yield* deny("Memory transport does not match its frozen provider and model");
+    if (
+      !Number.isSafeInteger(input.maximumInputTokens) ||
+      input.maximumInputTokens <= 0 ||
+      !Number.isSafeInteger(input.maximumOutputTokens) ||
+      input.maximumOutputTokens <= 0 ||
+      (liquid &&
+        !withinProjectMemoryExtractionLimits(
+          input.endpoint,
+          input.maximumInputTokens,
+          input.maximumOutputTokens,
+        ))
+    )
+      return yield* deny("Memory transport exceeds endpoint limits");
     const remaining = input.deadlineAtMs - (yield* Clock.currentTimeMillis);
     if (
       !Number.isSafeInteger(remaining) ||
@@ -153,11 +232,25 @@ export const exchangeProjectMemoryModel = Effect.fn("exchangeProjectMemoryModel"
             model: input.model,
             stream: false,
             max_tokens: input.maximumOutputTokens,
+            ...(liquid
+              ? {
+                  provider: {
+                    only: ["liquid/fp8"],
+                    order: ["liquid/fp8"],
+                    allow_fallbacks: false,
+                    require_parameters: true,
+                    max_price: { prompt: 0, completion: 0, request: 0 },
+                    data_collection: "allow",
+                  },
+                  response_format: liquidResponseFormat,
+                }
+              : {}),
             messages: [
               {
                 role: "system",
-                content:
-                  "Return only a JSON array of at most 32 objects with key, body and exact source quote. Retain factual findings from the supplied source. Never invent approvals or instructions.",
+                content: liquid
+                  ? "Return only a JSON object with the required facts array of at most 32 objects with key, body and exact source quote, matching the supplied strict schema. Retain factual findings from the supplied source. Never invent approvals or instructions."
+                  : "Return only a JSON array of at most 32 objects with key, body and exact source quote. Retain factual findings from the supplied source. Never invent approvals or instructions.",
               },
               { role: "user", content: input.input },
             ],
@@ -238,16 +331,32 @@ export const exchangeProjectMemoryModel = Effect.fn("exchangeProjectMemoryModel"
     if (text.includes(input.credential))
       return yield* deny("Memory response contains a credential");
     if (input.phase === "extract") {
-      const response = yield* decodeExtractResponse(text);
+      const response = yield* liquid ? decodeLiquidResponse(text) : decodeExtractResponse(text);
       if (
         response.usage.prompt_tokens + response.usage.completion_tokens !==
-        response.usage.total_tokens
+          response.usage.total_tokens ||
+        (liquid &&
+          (!sameProjectMemoryReportedModel(response.model, input.model) ||
+            response.usage.prompt_tokens > input.maximumInputTokens ||
+            response.usage.completion_tokens > input.maximumOutputTokens))
       )
         return yield* deny("Memory extraction usage is inconsistent");
       const content = response.choices[0]?.message.content;
       if (content === undefined) return yield* deny("Memory extraction returned no content");
+      let value: unknown;
+      if (liquid) {
+        const decoded = yield* decodeLiquidFacts(content);
+        // The strict fixed shape has exactly one wrapper key and three keys per fact.
+        // Count JSON string tokens used as keys to reject duplicates erased by JSON decoding.
+        const keyCount = Array.from(content.matchAll(/"(?:[^"\\]|\\.)*"/gu)).filter((token) =>
+          /^\s*:/u.test(content.slice(token.index + token[0].length)),
+        ).length;
+        if (keyCount !== 1 + 3 * decoded.facts.length)
+          return yield* deny("Memory extraction contains duplicate object keys");
+        value = decoded.facts;
+      } else value = yield* decodeJson(content);
       return {
-        value: yield* decodeJson(content),
+        value,
         reportedModel: response.model,
         inputTokens: response.usage.prompt_tokens,
         outputTokens: response.usage.completion_tokens,

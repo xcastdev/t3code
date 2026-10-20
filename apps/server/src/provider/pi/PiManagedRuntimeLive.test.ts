@@ -10048,6 +10048,10 @@ for (const compactProof of [
   "memoryAccounting",
   "memorySharedRoot",
   "memoryPipeline",
+  "memoryLiquidPipeline",
+  "memoryLiquidAccounting",
+  "memoryLiquidConfiguration",
+  "memoryLiquidIdentity",
   "memoryServerExtract",
   "memoryServerEmbed",
   "memoryServerQuery",
@@ -10100,8 +10104,8 @@ for (const compactProof of [
         ? "managed compact transfers current required context after durable association and replays without another execution"
         : compactProof === "memoryAdmission"
           ? "retains exact memory selection against the executing operation before processing and replays after terminal"
-          : compactProof === "memoryAccounting"
-            ? "accounts memory and ordinary stages against the same executing operation and shared capacity"
+          : compactProof === "memoryAccounting" || compactProof === "memoryLiquidAccounting"
+            ? `accounts memory and ordinary stages against the same executing operation and shared capacity: ${compactProof}`
             : compactProof === "memorySharedRoot"
               ? "reads shared root usage outside the charged child binding page without assigning parent charges"
               : compactProof === "memoryPipeline"
@@ -10148,6 +10152,9 @@ for (const compactProof of [
     () =>
       scoped(
         Effect.gen(function* () {
+          const liquidProof = compactProof?.startsWith("memoryLiquid") === true;
+          const liquidDenied =
+            compactProof === "memoryLiquidConfiguration" || compactProof === "memoryLiquidIdentity";
           const serverProof = compactProof?.startsWith("memoryServer") === true;
           const serverQuery = compactProof?.startsWith("memoryServerQuery") === true;
           const serverCurrent = serverProof && compactProof?.endsWith("Current");
@@ -10167,13 +10174,16 @@ for (const compactProof of [
           const companionProof = compactProof?.startsWith("memoryCompanion") === true;
           const pipelineProof =
             compactProof === "memoryPipeline" ||
+            compactProof === "memoryLiquidPipeline" ||
             compactProof === "memoryServerCurrent" ||
             (forwardProof && !forwardQuery) ||
             compactProof === "memoryCompanionIndex" ||
             compactProof === "memoryCompanionSharedRoot";
           const memoryProof = compactProof?.startsWith("memory") === true;
           const accountingProof =
-            compactProof === "memoryAccounting" || compactProof === "memorySharedRoot";
+            compactProof === "memoryAccounting" ||
+            compactProof === "memoryLiquidAccounting" ||
+            compactProof === "memorySharedRoot";
           const humanRetraction =
             compactProof === "memoryHumanRetraction" || compactProof === "memoryCompanionDelete";
           const cleanupProof =
@@ -11661,6 +11671,7 @@ for (const compactProof of [
                           );
                           if (
                             pipelineProof ||
+                            liquidDenied ||
                             compactProof === "memoryFailure" ||
                             compactProof === "memorySecret" ||
                             compactProof === "memoryEmbeddingSecret" ||
@@ -11672,8 +11683,10 @@ for (const compactProof of [
                             let configuration: ProjectMemoryProcessingConfiguration = {
                               version: 1,
                               extraction: {
-                                endpoint: "https://api.commandcode.ai/provider/v1/chat/completions",
-                                routeId: "controlled-ling",
+                                endpoint: liquidProof
+                                  ? "https://openrouter.ai/api/v1/chat/completions"
+                                  : "https://api.commandcode.ai/provider/v1/chat/completions",
+                                routeId: liquidProof ? "controlled-liquid" : "controlled-ling",
                                 credentialRef: "controlled-extraction",
                                 maximumInputTokens: 800,
                                 maximumOutputTokens: 50,
@@ -11823,8 +11836,42 @@ for (const compactProof of [
                                         "Controlled exchange outcome is unknown; cancellation has not drained",
                                     });
                                   drained.add(id);
+                                  if (liquidProof) {
+                                    expect(exchange.model).toBe(
+                                      exchange.phase === "extract"
+                                        ? "liquid/lfm-2.5-2.6b:free"
+                                        : "nvidia/nemotron-3-embed-1b:free",
+                                    );
+                                    const reserved =
+                                      yield* f.sql`SELECT provider,model,route_id FROM project_team_model_request WHERE reservation_id=${id}`;
+                                    expect(reserved).toEqual([
+                                      {
+                                        provider: "openrouter",
+                                        model: exchange.model,
+                                        route_id:
+                                          exchange.phase === "extract"
+                                            ? "controlled-liquid"
+                                            : "controlled-nvidia",
+                                      },
+                                    ]);
+                                  }
+                                  if (compactProof === "memoryLiquidConfiguration") {
+                                    // Awaited configuration mutation must deny before facts can commit.
+                                    yield* Effect.yieldNow;
+                                    configuration = {
+                                      ...configuration,
+                                      extraction: {
+                                        ...configuration.extraction,
+                                        endpoint:
+                                          "https://api.commandcode.ai/provider/v1/chat/completions",
+                                      },
+                                    };
+                                  }
                                   return {
-                                    reportedModel: exchange.model,
+                                    reportedModel:
+                                      compactProof === "memoryLiquidIdentity"
+                                        ? "liquid/lfm-2.5-2.6b"
+                                        : exchange.model,
                                     inputTokens: 50,
                                     outputTokens: exchange.phase === "extract" ? 5 : 0,
                                     value:
@@ -12764,7 +12811,26 @@ for (const compactProof of [
                               operationMaximumTokens: operationCaps[0]?.maximum,
                             },
                           });
-                          if (forwardProof && !forwardQuery) {
+                          if (liquidDenied) {
+                            expect(jobs[0]).toMatchObject({ status: "uncertain", receipt: null });
+                            expect(memoryExchanges).toBe(1);
+                            expect(memoryBackendCalls).toBe(0);
+                            const current = yield* readCurrentState(f.sql, projectId);
+                            expect(
+                              current.foundationRecords?.filter(
+                                (r) => r.kind === "memory-observation",
+                              ),
+                            ).toEqual([]);
+                            expect(
+                              current.foundationRecords?.find(
+                                (r) => r.kind === "memory-extraction",
+                              ),
+                            ).toMatchObject({
+                              status: "pending",
+                              extractionModel: "inclusionai/ling-3.1-flash:free",
+                            });
+                            expect(memoryPipelineError).toBeDefined();
+                          } else if (forwardProof && !forwardQuery) {
                             expect(forwardChecks).toBe(1);
                             expect(memoryExchanges).toBe(
                               compactProof === "memoryForwardExtract" ||
@@ -12831,6 +12897,17 @@ for (const compactProof of [
                             expect(
                               observed.filter((row) => row.kind === "memory-observation"),
                             ).toHaveLength(queryMixed ? 2 : 1);
+                            if (liquidProof) {
+                              expect(
+                                observed.find((r) => r.kind === "memory-extraction"),
+                              ).toMatchObject({
+                                status: "indexed",
+                                extractionModel: "liquid/lfm-2.5-2.6b:free",
+                              });
+                              expect(yield* readRecordedUsage()).toMatchObject([
+                                { availability: "available" },
+                              ]);
+                            }
                             if (queryMixed) {
                               const obsolete = observed.find(
                                 (record) =>
@@ -13642,8 +13719,15 @@ for (const compactProof of [
                               environmentId: "environment",
                             });
                             const drainedMemory = new Set<string>();
+                            let extractionEndpoint: ProjectMemoryProcessingConfiguration["extraction"]["endpoint"] =
+                              liquidProof
+                                ? "https://openrouter.ai/api/v1/chat/completions"
+                                : "https://api.commandcode.ai/provider/v1/chat/completions";
                             const ledger = yield* makeProjectMemoryModelAccounting({
                               environmentId: "environment",
+                              get extractionEndpoint() {
+                                return extractionEndpoint;
+                              },
                               maximumConcurrentCalls: 2,
                               maximumConcurrentModelCalls: 2,
                               assertCurrentInTransaction: (saved) =>
@@ -13756,12 +13840,32 @@ for (const compactProof of [
                               chargedInputTokens: 100,
                               chargedOutputTokens: 10,
                               transportDrained: true,
-                              reportedModel:
-                                stage.phase === "extract" ? "inclusionai/ling-3.1-flash:free" : "",
+                              reportedModel: memoryHeld.reservation.model,
                               reportedInputTokens: 100,
                               reportedOutputTokens: 10,
                             };
                             drainedMemory.add(memoryHeld.reservationId);
+                            if (liquidProof) {
+                              expect(memoryHeld.reservation).toMatchObject({
+                                provider: "openrouter",
+                                model: "liquid/lfm-2.5-2.6b:free",
+                                routeId: stage.routeId,
+                              });
+                              expect(
+                                (yield* ledger
+                                  .settle({ ...memorySettlement, provider: "command-code" })
+                                  .pipe(Effect.result))._tag,
+                              ).toBe("Failure");
+                              for (const wrong of [
+                                "liquid/lfm-2.5-2.6b",
+                                "inclusionai/ling-3.1-flash:free",
+                              ])
+                                expect(
+                                  (yield* ledger
+                                    .settle({ ...memorySettlement, reportedModel: wrong })
+                                    .pipe(Effect.result))._tag,
+                                ).toBe("Failure");
+                            }
                             const settledMemory = yield* ledger.settle(memorySettlement);
                             expect(yield* ledger.settle(memorySettlement)).toEqual(settledMemory);
                             const usage = {
@@ -13839,7 +13943,10 @@ for (const compactProof of [
                                 },
                               },
                             ]);
-                            if (compactProof === "memoryAccounting") {
+                            if (
+                              compactProof === "memoryAccounting" ||
+                              compactProof === "memoryLiquidAccounting"
+                            ) {
                               const originalJobs =
                                 yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
                               const originalModels =
@@ -13969,6 +14076,41 @@ for (const compactProof of [
                                 reportedOutputTokens: 0,
                                 transportDrained: true,
                               });
+                            }
+                            if (liquidProof) {
+                              // Auditing follows each saved triple across a route switch.
+                              extractionEndpoint =
+                                "https://api.commandcode.ai/provider/v1/chat/completions";
+                              const legacy = yield* ledger.reserve(admitted, {
+                                ...stage,
+                                routeId: "legacy-history",
+                                requestId: 4,
+                                maxInputTokens: 1,
+                                maxOutputTokens: 1,
+                              });
+                              expect(legacy.reservation).toMatchObject({
+                                provider: "command-code",
+                                model: "inclusionai/ling-3.1-flash:free",
+                              });
+                              drainedMemory.add(legacy.reservationId);
+                              yield* ledger.settle({
+                                ...legacy.reservation,
+                                reservationId: legacy.reservationId,
+                                outcome: "reported",
+                                chargedInputTokens: 0,
+                                chargedOutputTokens: 0,
+                                reportedModel: "inclusionai/ling-3.1-flash",
+                                reportedInputTokens: 0,
+                                reportedOutputTokens: 0,
+                                transportDrained: true,
+                              });
+                              extractionEndpoint = "https://openrouter.ai/api/v1/chat/completions";
+                              expect((yield* ledger.reserve(admitted, stage)).status).toBe(
+                                "existing",
+                              );
+                              expect(yield* readRecordedUsage()).toMatchObject([
+                                { availability: "available" },
+                              ]);
                             }
                             // This is a genuinely accepted broker alias. Its durable
                             // terminal, rather than today's policy, proves it on replay.
@@ -14135,7 +14277,7 @@ for (const compactProof of [
             ),
           );
           yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
-          if (compactProof === "memoryAccounting") {
+          if (compactProof === "memoryAccounting" || compactProof === "memoryLiquidAccounting") {
             // Dispatch admission retains the original budget before the first model request.
             expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
             expect(yield* readRecordedUsage()).toMatchObject([
@@ -14341,6 +14483,7 @@ for (const compactProof of [
               expect(memoryBackendCalls).toBe(3);
             } else if (accountingProof) {
               expect(runs).toBe(2);
+              if (liquidProof) return;
               const failedContext = yield* f.reader.readRequired(snapshot);
               expectedContext = failedContext.text;
               expectedProvenance = NodeCrypto.createHash("sha256")

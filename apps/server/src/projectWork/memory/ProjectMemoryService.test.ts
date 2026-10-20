@@ -30,6 +30,7 @@ import {
   makeProjectMemoryManifestStore,
   type ProjectMemoryModelPorts,
   projectMemoryHash,
+  ProjectMemoryServiceError,
 } from "./ProjectMemoryService.ts";
 import * as ManagedFixture from "../ProjectTeamAuthorization.testFixtures.ts";
 import { hydrateProjectMemoryHits } from "./ProjectMemoryHitHydration.ts";
@@ -881,6 +882,88 @@ for (const scenario of ["plain", "escaped", "absent", "metadata"] as const)
         expect(work.source.contentHash).toBe(projectMemoryHash(work.source.content));
         expect(work.source.sourceRevision).toBe(comment.revision);
         expect(work.source.attribution).toEqual(comment.attribution);
+      }),
+    ),
+  );
+
+for (const scenario of ["facts", "empty", "invalid", "failed"] as const)
+  it.effect(`Liquid extraction provenance commits atomically for ${scenario}`, () =>
+    withMemoryDatabase(
+      Effect.gen(function* () {
+        const f = yield* memorySetup();
+        const model = "liquid/lfm-2.5-2.6b:free";
+        const base = memoryModels(
+          scenario === "empty"
+            ? []
+            : scenario === "invalid"
+              ? [{ key: "bad", body: "Invented", quote: "absent quote" }]
+              : undefined,
+        );
+        let calls = 0;
+        const service = makeProjectMemoryService({
+          ...f,
+          environmentId: "fixture-environment",
+          selectedExtractionModel: model,
+          models: {
+            ...base,
+            extract: (input) => {
+              calls++;
+              return scenario === "failed"
+                ? Effect.fail(new ProjectMemoryServiceError({ reason: "Controlled failed port" }))
+                : base.extract(input);
+            },
+          },
+        });
+        const source = yield* service.captureRetained(f.projectId, {
+          kind: "comment",
+          retainedId: "memory-comment",
+        });
+        const effect = (yield* readCurrentState(f.sql, f.projectId)).foundationRecords?.find(
+          (r) => r.kind === "effect" && r.effectKind === "memory-index",
+        );
+        if (effect?.kind !== "effect") return yield* Effect.die("Missing extraction effect");
+        const owner = yield* service.claim(f.projectId, effect.effectId);
+        const before = yield* service.readWork(f.projectId, effect.effectId);
+        expect(before.extraction?.extractionModel).toBe("inclusionai/ling-3.1-flash:free");
+        const originalInput =
+          yield* f.sql`SELECT input_json FROM project_team_memory_job WHERE effect_id=${effect.effectId}`;
+        const result = yield* service
+          .extract(f.projectId, effect.effectId, owner!)
+          .pipe(Effect.result);
+        const after = yield* service.readWork(f.projectId, effect.effectId);
+        if (scenario === "invalid" || scenario === "failed") {
+          expect(result._tag).toBe("Failure");
+          expect(after.extraction).toEqual(before.extraction);
+          expect(after.observations).toEqual([]);
+        } else {
+          expect(result._tag).toBe("Success");
+          expect(after.extraction).toMatchObject({
+            recordId: before.extraction!.recordId,
+            sourceId: source.recordId,
+            sourceRevision: source.sourceRevision,
+            sourceGeneration: source.generation,
+            extractionModel: model,
+            status: scenario === "empty" ? "no-facts" : "extracted",
+          });
+          if (scenario === "facts")
+            expect(after.observations[0]).toMatchObject({
+              sourceId: source.recordId,
+              provenance: source.attribution,
+            });
+          const replay = makeProjectMemoryService({
+            ...f,
+            environmentId: "fixture-environment",
+            models: base,
+          });
+          yield* replay.extract(f.projectId, effect.effectId, owner!);
+          expect((yield* replay.readWork(f.projectId, effect.effectId)).extraction).toEqual(
+            after.extraction,
+          );
+        }
+        expect(calls).toBe(1);
+        expect(
+          yield* f.sql`SELECT input_json FROM project_team_memory_job WHERE effect_id=${effect.effectId}`,
+        ).toEqual(originalInput);
       }),
     ),
   );
