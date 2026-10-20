@@ -13,12 +13,27 @@ import {
   type ProviderDriverKind,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+import { RefreshCwIcon } from "lucide-react";
+import {
+  useEffect,
+  useEffectEvent,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { Button } from "../../components/ui/button";
 import { Input } from "../../components/ui/input";
 import { Textarea } from "../../components/ui/textarea";
 import { WorkCard } from "../../components/work/WorkDataNotice";
+import {
+  WorkDisclosure,
+  WorkSectionHeader,
+  WorkTime,
+  workSelectClass,
+  workStateLabel,
+} from "../../components/work/WorkLayout";
 import {
   WorkTeamFoundation,
   type WorkTeamFoundationView,
@@ -506,52 +521,73 @@ function ConfigurationForm(
   );
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <div>
-        <h2 className="text-lg font-semibold">Team configuration</h2>
-        <p className="text-sm text-muted-foreground">
-          {fresh ? "Current recorded configuration" : "Cached or incomplete configuration"}
-          {updatedAt ? ` · Last recorded update ${updatedAt}` : ""}
-        </p>
-        <p className="text-sm text-muted-foreground">
+      <div className="space-y-2">
+        <WorkSectionHeader
+          title="Team configuration"
+          status={
+            <>
+              {fresh ? "Current recorded configuration" : "Cached or incomplete configuration"}
+              {updatedAt ? (
+                <>
+                  {" · Last recorded update "}
+                  <WorkTime value={updatedAt} />
+                </>
+              ) : null}
+            </>
+          }
+          description="Choose the Pi provider, a model and instructions for each role, and the limits each model runs under."
+          actions={
+            <>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={!props.connected || !props.enabled}
+                onClick={props.foundation.refresh}
+              >
+                <RefreshCwIcon aria-hidden />
+                Refresh configuration
+              </Button>
+              <Button
+                size="sm"
+                variant={values ? "outline" : "default"}
+                disabled={!available || (submission !== null && !superseded)}
+                onClick={load}
+              >
+                {values
+                  ? "Reload configuration"
+                  : recorded?.values
+                    ? "Edit configuration"
+                    : "Set up team"}
+              </Button>
+            </>
+          }
+        />
+        <p className="text-xs text-muted-foreground">
           Saving installs new immutable role profiles and limits. It never starts assignments or
           changes a running profile.
         </p>
         {!props.enabled ? (
-          <p>Project Work is disabled. Enable it before configuring a team.</p>
+          <Warning>Project Work is disabled. Enable it before configuring a team.</Warning>
         ) : null}
         {!props.writesSupported ? (
-          <p>This environment does not support configuration writes.</p>
+          <Warning>This environment does not support configuration writes.</Warning>
         ) : null}
-        {occupied ? <p>Stop and drain existing team work before changing configuration.</p> : null}
+        {occupied ? (
+          <Warning>Stop and drain existing team work before changing configuration.</Warning>
+        ) : null}
         {!recorded ? (
-          <p>Configuration lineage is incomplete or unsupported. Refresh before making changes.</p>
+          <Warning>
+            Configuration lineage is incomplete or unsupported. Refresh before making changes.
+          </Warning>
         ) : null}
         {changed ? (
-          <p>The recorded revision or generation changed. Reload configuration before saving.</p>
+          <Warning>
+            The recorded revision or generation changed. Reload configuration before saving.
+          </Warning>
         ) : null}
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={!props.connected || !props.enabled}
-          onClick={props.foundation.refresh}
-        >
-          Refresh configuration
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={!available || (submission !== null && !superseded)}
-          onClick={load}
-        >
-          {values
-            ? "Reload configuration"
-            : recorded?.values
-              ? "Edit configuration"
-              : "Set up team"}
-        </Button>
       </div>
       {recorded?.values && !values ? (
-        <p>
+        <p className="text-sm text-muted-foreground">
           Recorded team {recorded.values.enabled ? "enabled" : "disabled"} · Provider{" "}
           {recorded.values.providerInstanceId} · Models{" "}
           {recorded.values.modelPolicies.map((policy) => policy.model).join(", ")} · Generation{" "}
@@ -560,8 +596,9 @@ function ConfigurationForm(
       ) : null}
       {values ? (
         <fieldset key={editorEpoch} disabled={locked} className="flex min-w-0 flex-col gap-4">
-          <WorkCard>
-            <label className="flex items-center gap-2">
+          <WorkCard className="space-y-3">
+            <h3 className="font-medium">Team</h3>
+            <label className="flex items-center gap-2 text-sm">
               <input
                 aria-label="Enable team"
                 type="checkbox"
@@ -570,7 +607,7 @@ function ConfigurationForm(
               />
               Enable team
             </label>
-            <label className="mt-3 flex flex-col gap-1">
+            <label className="flex flex-col gap-1 text-sm">
               Pi provider
               <select
                 aria-label="Pi provider"
@@ -581,7 +618,7 @@ function ConfigurationForm(
                     providerInstanceId: event.target.value,
                   })
                 }
-                className="rounded-md border border-input bg-background p-2 text-sm"
+                className={workSelectClass}
               >
                 <option value="">Select a provider</option>
                 {!selectable.some((item) => item.instanceId === values.providerInstanceId) &&
@@ -598,112 +635,160 @@ function ConfigurationForm(
               </select>
             </label>
             {!provider || provider.models.length === 0 ? (
-              <p>
+              <p className="text-sm text-warning-foreground">
                 Pi model catalogue unavailable. Configure an enabled Pi provider with model metadata
                 in provider settings.
               </p>
             ) : null}
             {!catalogueValid ? (
-              <p>
+              <p className="text-sm text-warning-foreground">
                 Select available models explicitly. Saved models remain visible and are never
                 replaced automatically.
               </p>
             ) : null}
-            <NumberInput
-              label="Project priority"
-              value={values.projectPriority}
-              min={Number.MIN_SAFE_INTEGER}
-              max={Number.MAX_SAFE_INTEGER}
-              onChange={(value) => update({ ...values, projectPriority: value })}
-            />
-            {(
-              [
-                ["environmentModelCalls", "Environment model calls", 128],
-                ["projectWritableWorkers", "Project writable workers", 64],
-                ["delegationDepth", "Team delegation depth", 8],
-                ["repairAllowance", "Repair allowance", 16],
-              ] as const
-            ).map(([key, label, max]) => (
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               <NumberInput
-                key={key}
-                label={label}
-                value={values[key] ?? 0}
-                min={0}
-                max={max}
-                onChange={(value) => update({ ...values, [key]: value })}
+                label="Project priority"
+                value={values.projectPriority}
+                min={Number.MIN_SAFE_INTEGER}
+                max={Number.MAX_SAFE_INTEGER}
+                onChange={(value) => update({ ...values, projectPriority: value })}
               />
-            ))}
-            <label className="mt-3 flex flex-col gap-1">
-              Task priorities (task ID: priority, one per line)
-              <Textarea
-                aria-label="Task priorities"
-                maxLength={40000}
-                defaultValue={values.taskPriorities
-                  .map((entry) => `${entry.taskId}: ${entry.priority}`)
-                  .join("\n")}
-                onChange={(event) => {
-                  const entries = event.target.value
-                    .split("\n")
-                    .filter(Boolean)
-                    .slice(0, 129)
-                    .map((line) => {
-                      const separator = line.lastIndexOf(":");
-                      return {
-                        taskId: (separator < 0 ? line : line.slice(0, separator)).trim(),
-                        priority: separator < 0 ? NaN : Number(line.slice(separator + 1)),
-                      };
-                    });
-                  update({ ...values, taskPriorities: entries });
-                }}
-              />
-            </label>
-            <p className="text-sm text-muted-foreground">
-              Use current project task IDs. The server checks membership before recording
-              priorities.
-            </p>
+              {(
+                [
+                  ["environmentModelCalls", "Environment model calls", 128],
+                  ["projectWritableWorkers", "Project writable workers", 64],
+                  ["delegationDepth", "Team delegation depth", 8],
+                  ["repairAllowance", "Repair allowance", 16],
+                ] as const
+              ).map(([key, label, max]) => (
+                <NumberInput
+                  key={key}
+                  label={label}
+                  value={values[key] ?? 0}
+                  min={0}
+                  max={max}
+                  onChange={(value) => update({ ...values, [key]: value })}
+                />
+              ))}
+            </div>
+            <WorkDisclosure summary="Task priorities" hint="Optional ordering for current tasks">
+              <label className="flex flex-col gap-1 text-sm">
+                Task priorities (task ID: priority, one per line)
+                <Textarea
+                  aria-label="Task priorities"
+                  maxLength={40000}
+                  defaultValue={values.taskPriorities
+                    .map((entry) => `${entry.taskId}: ${entry.priority}`)
+                    .join("\n")}
+                  onChange={(event) => {
+                    const entries = event.target.value
+                      .split("\n")
+                      .filter(Boolean)
+                      .slice(0, 129)
+                      .map((line) => {
+                        const separator = line.lastIndexOf(":");
+                        return {
+                          taskId: (separator < 0 ? line : line.slice(0, separator)).trim(),
+                          priority: separator < 0 ? NaN : Number(line.slice(separator + 1)),
+                        };
+                      });
+                    update({ ...values, taskPriorities: entries });
+                  }}
+                />
+              </label>
+              <p className="text-xs text-muted-foreground">
+                Use current project task IDs. The server checks membership before recording
+                priorities.
+              </p>
+            </WorkDisclosure>
           </WorkCard>
           {values.profiles.map((profile, index) => (
-            <WorkCard key={profile.role}>
-              <h3 className="font-medium">{profile.role}</h3>
-              <label className="mt-2 flex flex-col gap-1">
-                {profile.role} model
-                <select
-                  aria-label={`${profile.role} model`}
-                  value={profile.model}
-                  className="rounded-md border border-input bg-background p-2 text-sm"
-                  onChange={(event) => {
-                    const profiles = values.profiles.map((item, position) =>
-                      position === index ? { ...item, model: event.target.value } : item,
-                    );
-                    const models = [...new Set(profiles.map((item) => item.model).filter(Boolean))];
+            <WorkCard key={profile.role} className="space-y-3">
+              <h3 className="font-medium">{workStateLabel(profile.role)}</h3>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <label className="flex flex-col gap-1 text-sm">
+                  Model
+                  <select
+                    aria-label={`${profile.role} model`}
+                    value={profile.model}
+                    className={workSelectClass}
+                    onChange={(event) => {
+                      const profiles = values.profiles.map((item, position) =>
+                        position === index ? { ...item, model: event.target.value } : item,
+                      );
+                      const models = [
+                        ...new Set(profiles.map((item) => item.model).filter(Boolean)),
+                      ];
+                      update({
+                        ...values,
+                        profiles,
+                        modelPolicies: models.map(
+                          (model) =>
+                            values.modelPolicies.find((policy) => policy.model === model) ?? {
+                              model,
+                              tokenLimit: NaN,
+                              durationLimitMs: NaN,
+                              modelCalls: NaN,
+                            },
+                        ),
+                      });
+                    }}
+                  >
+                    <option value="">Select a model</option>
+                    {profile.model && !provider?.models.includes(profile.model) ? (
+                      <option value={profile.model}>{profile.model} (unavailable)</option>
+                    ) : null}
+                    {[...new Set(provider?.models ?? [])].map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 text-sm">
+                  Memory access
+                  <select
+                    aria-label={`${profile.role} memory`}
+                    className={workSelectClass}
+                    value={profile.memoryAccess}
+                    onChange={(event) =>
+                      update({
+                        ...values,
+                        profiles: values.profiles.map((item, position) =>
+                          position === index
+                            ? {
+                                ...item,
+                                memoryAccess: event.target.value as Profile["memoryAccess"],
+                              }
+                            : item,
+                        ),
+                      })
+                    }
+                  >
+                    <option value="none">None</option>
+                    <option value="project">Project</option>
+                    <option value="shared">Explicitly shared</option>
+                  </select>
+                </label>
+                <NumberInput
+                  label={`${profile.role} delegation depth`}
+                  visibleLabel="Delegation depth"
+                  value={profile.delegationDepth}
+                  min={0}
+                  max={8}
+                  onChange={(value) =>
                     update({
                       ...values,
-                      profiles,
-                      modelPolicies: models.map(
-                        (model) =>
-                          values.modelPolicies.find((policy) => policy.model === model) ?? {
-                            model,
-                            tokenLimit: NaN,
-                            durationLimitMs: NaN,
-                            modelCalls: NaN,
-                          },
+                      profiles: values.profiles.map((item, position) =>
+                        position === index ? { ...item, delegationDepth: value } : item,
                       ),
-                    });
-                  }}
-                >
-                  <option value="">Select a model</option>
-                  {profile.model && !provider?.models.includes(profile.model) ? (
-                    <option value={profile.model}>{profile.model} (unavailable)</option>
-                  ) : null}
-                  {[...new Set(provider?.models ?? [])].map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="mt-2 flex flex-col gap-1">
-                {profile.role} instructions
+                    })
+                  }
+                />
+              </div>
+              <label className="flex flex-col gap-1 text-sm">
+                Instructions
                 <Textarea
                   aria-label={`${profile.role} instructions`}
                   maxLength={32000}
@@ -718,123 +803,112 @@ function ConfigurationForm(
                   }
                 />
               </label>
-              {(["skills", "tools"] as const).map((key) => (
-                <label key={key} className="mt-2 flex flex-col gap-1">
-                  {profile.role} {key} (one per line)
-                  <Textarea
-                    aria-label={`${profile.role} ${key}`}
-                    maxLength={17000}
-                    defaultValue={profile[key].join("\n")}
-                    onChange={(event) =>
+              <WorkDisclosure
+                summary="Skills and tools"
+                hint={`${profile.skills.length} skills · ${profile.tools.length} tools`}
+              >
+                {(["skills", "tools"] as const).map((key) => (
+                  <label key={key} className="flex flex-col gap-1 text-sm">
+                    {key === "skills" ? "Skills" : "Tools"} (one per line)
+                    <Textarea
+                      aria-label={`${profile.role} ${key}`}
+                      maxLength={17000}
+                      defaultValue={profile[key].join("\n")}
+                      onChange={(event) =>
+                        update({
+                          ...values,
+                          profiles: values.profiles.map((item, position) =>
+                            position === index
+                              ? {
+                                  ...item,
+                                  [key]: event.target.value
+                                    .split("\n")
+                                    .map((entry) => entry.trim())
+                                    .filter(Boolean),
+                                }
+                              : item,
+                          ),
+                        })
+                      }
+                    />
+                  </label>
+                ))}
+              </WorkDisclosure>
+            </WorkCard>
+          ))}
+          {values.modelPolicies.map((policy, index) => (
+            <WorkCard key={policy.model} className="space-y-3">
+              <h3 className="font-medium">Limits · {policy.model}</h3>
+              <div className="grid gap-3 sm:grid-cols-3">
+                {(
+                  [
+                    ["tokenLimit", "Token limit", Number.MAX_SAFE_INTEGER],
+                    ["durationLimitMs", "Time limit (ms)", Number.MAX_SAFE_INTEGER],
+                    ["modelCalls", "Concurrent model calls", 128],
+                  ] as const
+                ).map(([key, label, max]) => (
+                  <NumberInput
+                    key={key}
+                    label={`${policy.model} ${label}`}
+                    visibleLabel={label}
+                    value={policy[key]}
+                    min={1}
+                    max={max}
+                    onChange={(value) =>
                       update({
                         ...values,
-                        profiles: values.profiles.map((item, position) =>
-                          position === index
-                            ? {
-                                ...item,
-                                [key]: event.target.value
-                                  .split("\n")
-                                  .map((entry) => entry.trim())
-                                  .filter(Boolean),
-                              }
-                            : item,
+                        modelPolicies: values.modelPolicies.map((item, position) =>
+                          position === index ? { ...item, [key]: value } : item,
                         ),
                       })
                     }
                   />
-                </label>
-              ))}
-              <label className="mt-2 flex flex-col gap-1">
-                {profile.role} memory
-                <select
-                  aria-label={`${profile.role} memory`}
-                  value={profile.memoryAccess}
-                  onChange={(event) =>
-                    update({
-                      ...values,
-                      profiles: values.profiles.map((item, position) =>
-                        position === index
-                          ? { ...item, memoryAccess: event.target.value as Profile["memoryAccess"] }
-                          : item,
-                      ),
-                    })
-                  }
-                >
-                  <option value="none">None</option>
-                  <option value="project">Project</option>
-                  <option value="shared">Explicitly shared</option>
-                </select>
-              </label>
-              <NumberInput
-                label={`${profile.role} delegation depth`}
-                value={profile.delegationDepth}
-                min={0}
-                max={8}
-                onChange={(value) =>
-                  update({
-                    ...values,
-                    profiles: values.profiles.map((item, position) =>
-                      position === index ? { ...item, delegationDepth: value } : item,
-                    ),
-                  })
-                }
-              />
-            </WorkCard>
-          ))}
-          {values.modelPolicies.map((policy, index) => (
-            <WorkCard key={policy.model}>
-              <h3 className="font-medium">Limits · {policy.model}</h3>
-              {(
-                [
-                  ["tokenLimit", "Token limit", Number.MAX_SAFE_INTEGER],
-                  ["durationLimitMs", "Time limit (ms)", Number.MAX_SAFE_INTEGER],
-                  ["modelCalls", "Concurrent model calls", 128],
-                ] as const
-              ).map(([key, label, max]) => (
-                <NumberInput
-                  key={key}
-                  label={`${policy.model} ${label}`}
-                  value={policy[key]}
-                  min={1}
-                  max={max}
-                  onChange={(value) =>
-                    update({
-                      ...values,
-                      modelPolicies: values.modelPolicies.map((item, position) =>
-                        position === index ? { ...item, [key]: value } : item,
-                      ),
-                    })
-                  }
-                />
-              ))}
+                ))}
+              </div>
             </WorkCard>
           ))}
         </fieldset>
       ) : null}
       {values ? (
-        <Button disabled={locked || !catalogueValid || !valid} onClick={() => void send(false)}>
-          Save configuration
-        </Button>
+        <div className="sticky bottom-0 z-10 flex flex-wrap items-center gap-3 border-t border-border/70 bg-background/95 py-3">
+          <Button disabled={locked || !catalogueValid || !valid} onClick={() => void send(false)}>
+            Save configuration
+          </Button>
+          {!catalogueValid || !valid ? (
+            <span className="text-xs text-muted-foreground">
+              Complete every model and limit before saving.
+            </span>
+          ) : null}
+        </div>
       ) : null}
       {superseded ? (
-        <p>
+        <p className="text-sm text-warning-foreground">
           Your configuration was accepted, then replaced by a newer recorded generation. Reload the
           current configuration to continue.
         </p>
       ) : null}
-      {notice ? <p role="status">{notice}</p> : null}
+      {notice ? (
+        <p role="status" className="text-sm">
+          {notice}
+        </p>
+      ) : null}
       {submission ? (
-        <p>
+        <p className="break-all text-xs text-muted-foreground">
           Original command {submission.command.commandId} · {submission.status}
         </p>
       ) : null}
       {submission?.status === "uncertain" ? (
         <>
-          <p>
+          <p className="text-sm text-warning-foreground">
             The outcome is uncertain. The original payload is locked. Refresh recorded state, then
             reconcile the exact command receipt.
           </p>
-          <Button disabled={!canReconcile} onClick={() => void send(true)}>
+          <Button
+            size="sm"
+            className="self-start"
+            disabled={!canReconcile}
+            onClick={() => void send(true)}
+          >
             Reconcile original command
           </Button>
         </>
@@ -843,16 +917,21 @@ function ConfigurationForm(
   );
 }
 
+function Warning({ children }: { readonly children: ReactNode }) {
+  return <p className="text-sm text-warning-foreground">{children}</p>;
+}
+
 function NumberInput(props: {
   readonly label: string;
+  readonly visibleLabel?: string;
   readonly value: number;
   readonly min: number;
   readonly max: number;
   readonly onChange: (value: number) => void;
 }) {
   return (
-    <label className="mt-2 flex flex-col gap-1">
-      {props.label}
+    <label className="flex flex-col gap-1 text-sm">
+      {props.visibleLabel ?? props.label}
       <Input
         aria-label={props.label}
         type="number"

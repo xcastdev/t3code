@@ -19,8 +19,10 @@ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime"
 import { projectWorkEnvironment } from "../../state/projectWork";
 import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
 import { Input } from "../ui/input";
+import { Textarea } from "../ui/textarea";
 import { Button } from "../ui/button";
 import { WorkCard, WorkDataNotice } from "./WorkDataNotice";
+import { workSelectClass } from "./WorkLayout";
 import { WorkCommandFailureNotice } from "./WorkCommandFailureNotice";
 import { projectWorkCommandFailure, type ProjectWorkCommandFailure } from "./workCommandFailure";
 import { workReadStatus } from "./workPresentation";
@@ -407,15 +409,15 @@ function DecisionPage({
     <div key={decision.decisionId}>
       <WorkCard>
         <div className="flex items-start justify-between gap-3">
-          <div>
-            <h3 className="font-medium">{decision.title}</h3>
-            <p className="mt-2 text-sm">{decision.body}</p>
+          <div className="min-w-0">
+            <h3 className="break-words font-medium">{decision.title}</h3>
+            <p className="mt-2 whitespace-pre-wrap break-words text-sm">{decision.body}</p>
             <p className="mt-2 text-xs text-muted-foreground">
               {decision.state} · revision {decision.revision}
             </p>
           </div>
           {decision.state === "proposed" ? (
-            <div className="flex gap-2">
+            <div className="flex shrink-0 flex-wrap gap-2">
               <Button
                 disabled={!canWrite}
                 size="sm"
@@ -541,13 +543,20 @@ function KnowledgePage({
       {filtered.length > 0 ? (
         <div className="grid min-w-0 gap-3 lg:grid-cols-2">
           {filtered.map((entry) => (
-            <WorkCard key={entry.knowledgeId}>
+            <WorkCard
+              key={entry.knowledgeId}
+              className={
+                filtered.some((record) => record.supersedesKnowledgeId === entry.knowledgeId)
+                  ? "opacity-70"
+                  : undefined
+              }
+            >
               <div className="flex items-start gap-3">
                 <span className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-background text-muted-foreground">
                   <BookOpenIcon className="size-4" />
                 </span>
-                <div className="min-w-0">
-                  <h3 className="font-medium">{entry.title}</h3>
+                <div className="min-w-0 flex-1">
+                  <h3 className="break-words font-medium">{entry.title}</h3>
                   <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-foreground/80">
                     {entry.body}
                   </p>
@@ -887,24 +896,29 @@ function PromoteKnowledge({
         </p>
       ) : null}
       <div className="mt-3 grid gap-3">
-        <Input
-          disabled={!canWrite || pending || retryCommand !== null}
-          value={title}
-          onChange={(event) => setTitle(event.target.value)}
-          placeholder="Title"
-        />
-        <textarea
-          className="min-h-24 rounded-md border border-input bg-background p-2 text-sm"
-          disabled={!canWrite || pending || retryCommand !== null}
-          value={body}
-          onChange={(event) => setBody(event.target.value)}
-          placeholder="Durable project context"
-        />
+        <label className="flex flex-col gap-1 text-sm font-medium">
+          Title
+          <Input
+            disabled={!canWrite || pending || retryCommand !== null}
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            placeholder="Title"
+          />
+        </label>
+        <label className="flex flex-col gap-1 text-sm font-medium">
+          Knowledge
+          <Textarea
+            disabled={!canWrite || pending || retryCommand !== null}
+            value={body}
+            onChange={(event) => setBody(event.target.value)}
+            placeholder="Durable project context"
+          />
+        </label>
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="text-sm font-medium">
             Source kind
             <select
-              className="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+              className={`mt-1 ${workSelectClass}`}
               value={sourceKind}
               onChange={(event) => setSourceKind(event.target.value as typeof sourceKind)}
               disabled={!canWrite || pending || retryCommand !== null}
@@ -929,6 +943,7 @@ function PromoteKnowledge({
         </div>
         <Button
           size="sm"
+          className="justify-self-start"
           onClick={() => void submit()}
           disabled={
             !canWrite ||

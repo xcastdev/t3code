@@ -119,14 +119,10 @@ export function WorkDisclosure({
   );
 }
 
-/** Readable local time; the exact recorded value stays available on hover and to assistive tech. */
+/** Readable local time; the exact recorded value stays in the machine-readable dateTime. */
 export function WorkTime({ value }: { readonly value: string }) {
   const label = parseTimestampDate(value) ? formatDayAwareTimestamp(value, "locale") : value;
-  return (
-    <time dateTime={value} title={value}>
-      {label}
-    </time>
-  );
+  return <time dateTime={value}>{label}</time>;
 }
 
 /** Compact counts that skip zeros; the total is always shown so an empty set reads honestly. */
@@ -139,20 +135,18 @@ export function WorkCounts({
   readonly total: number;
   readonly label: string;
 }) {
-  const shown = counts.filter(([, count]) => count > 0);
   return (
     <ul aria-label={label} className="flex flex-wrap gap-1.5 text-xs">
-      <li className="rounded-md border border-border/70 px-1.5 py-0.5 font-medium tabular-nums">
-        {total} total
+      {counts
+        .filter(([, count]) => count > 0)
+        .map(([name, count]) => (
+          <li key={name} className="rounded-md bg-muted/60 px-1.5 py-0.5 text-muted-foreground">
+            {name} <span className="font-medium text-foreground tabular-nums">{count}</span>
+          </li>
+        ))}
+      <li className="rounded-md border border-border/70 px-1.5 py-0.5 text-muted-foreground">
+        total <span className="font-medium text-foreground tabular-nums">{total}</span>
       </li>
-      {shown.map(([name, count]) => (
-        <li
-          key={name}
-          className="rounded-md bg-muted/60 px-1.5 py-0.5 text-muted-foreground tabular-nums"
-        >
-          {count} {name}
-        </li>
-      ))}
     </ul>
   );
 }

@@ -568,7 +568,8 @@ describe("Evidence through mounted environment foundation atoms", () => {
     expect(host.textContent).toContain("Cached or incomplete evidence");
     expect(host.textContent).toContain("Recorded finding status: resolved");
     expect(host.textContent).toContain("resolution-artifact-1");
-    expect(host.textContent).toContain("Last recorded update " + at);
+    expect(host.textContent).toContain("Last recorded update ");
+    expect(host.querySelector(`time[datetime="${at}"]`)).not.toBeNull();
     expect(button("Refresh evidence")?.disabled).toBe(true);
     expect(otherRequests).toEqual([]);
   });
@@ -785,7 +786,8 @@ describe("Evidence through mounted environment foundation atoms", () => {
       await render();
       await render({ connected: false });
       expect(host.textContent).toContain("Cached or incomplete evidence");
-      expect(host.textContent).toContain("Last recorded update " + at);
+      expect(host.textContent).toContain("Last recorded update ");
+      expect(host.querySelector(`time[datetime="${at}"]`)).not.toBeNull();
       expect(button("Refresh evidence")?.disabled).toBe(true);
       records = [{ ...evidence, status: "rejected" }];
       revision = 11;

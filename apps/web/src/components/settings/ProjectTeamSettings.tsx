@@ -12,6 +12,7 @@ import {
 import { useEnvironments } from "../../state/environments";
 import { projectEnvironment } from "../../state/projects";
 import { SettingsSection } from "./settingsLayout";
+import { workSelectClass } from "../work/WorkLayout";
 
 interface Checkout {
   readonly environmentId: EnvironmentId;
@@ -60,7 +61,7 @@ export function ProjectTeamSettings({
           Team checkout
           <select
             aria-label="Team checkout"
-            className="rounded-md border border-input bg-background p-2"
+            className={workSelectClass}
             value={checkout ? keyOf(checkout) : ""}
             onChange={(event) => select({ key: event.target.value, explicit: true })}
           >

@@ -9,11 +9,13 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { useOpenLink } from "../../browser/useOpenLink";
+import { RefreshCwIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { WorkCard } from "../../components/work/WorkDataNotice";
+import { WorkDetails, WorkSectionHeader, WorkTime } from "../../components/work/WorkLayout";
 import { WorkTeamFoundation } from "../../components/work/WorkTeamFoundation";
 
 const knownRecord = Schema.is(ProjectTeamRecord);
@@ -76,42 +78,56 @@ function EvidenceSession(props: EvidenceViewProps) {
         );
         return (
           <div className="flex min-w-0 flex-col gap-4">
-            <div>
-              <h2 className="text-lg font-semibold">Evidence and delivery records</h2>
-              <p className="text-sm text-muted-foreground">
-                {complete ? "Complete recorded snapshot" : "Cached or incomplete evidence"}
-                {snapshot.revision !== null
-                  ? ` · Project revision ${snapshot.revision}`
-                  : " · Revision unknown"}
-                {updatedAt ? ` · Last recorded update ${updatedAt}` : ""}
-              </p>
-              <p className="text-sm text-muted-foreground">
+            <div className="space-y-2">
+              <WorkSectionHeader
+                title="Evidence and delivery records"
+                status={
+                  <>
+                    {complete ? "Complete recorded snapshot" : "Cached or incomplete evidence"}
+                    {snapshot.revision !== null
+                      ? ` · Project revision ${snapshot.revision}`
+                      : " · Revision unknown"}
+                    {updatedAt ? (
+                      <>
+                        {" · Last recorded update "}
+                        <WorkTime value={updatedAt} />
+                      </>
+                    ) : null}
+                  </>
+                }
+                description="Test results, review findings and publications recorded for this project's tasks."
+                actions={
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!props.connected || !props.enabled}
+                    onClick={refresh}
+                  >
+                    <RefreshCwIcon aria-hidden />
+                    Refresh evidence
+                  </Button>
+                }
+              />
+              <p className="text-xs text-muted-foreground">
                 Recorded applicability does not establish current approval or delivery. Publication
                 receipts do not confirm a merge.
               </p>
               {!props.enabled ? (
-                <p>Project Work is disabled. Recorded metadata may be cached.</p>
+                <p className="text-sm text-warning-foreground">
+                  Project Work is disabled. Recorded metadata may be cached.
+                </p>
               ) : null}
               {records.length !== snapshot.records.length ? (
-                <p>
+                <p className="text-sm text-warning-foreground">
                   Unsupported or malformed records are present. Applicability is unknown for those
                   records.
                 </p>
               ) : null}
               {!complete ? (
-                <p className="text-sm text-muted-foreground">
+                <p className="text-sm text-warning-foreground">
                   Reconnect and refresh a complete snapshot to inspect the latest recorded metadata.
                 </p>
               ) : null}
-              <Button
-                className="mt-2"
-                size="sm"
-                variant="outline"
-                disabled={!props.connected || !props.enabled}
-                onClick={refresh}
-              >
-                Refresh evidence
-              </Button>
             </div>
             {evidence.length === 0 ? (
               <p className="text-sm text-muted-foreground">No evidence records in this snapshot.</p>
@@ -125,15 +141,17 @@ function EvidenceSession(props: EvidenceViewProps) {
               if (item.kind === "review-finding")
                 return (
                   <WorkCard key={item.recordId}>
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h3 className="break-all font-medium">Review finding {item.findingId}</h3>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="mr-auto break-all font-medium">
+                        Review finding {item.findingId}
+                      </h3>
                       <Badge variant="outline">Severity: {item.severity}</Badge>
                       <Badge variant="outline">Recorded finding status: {item.status}</Badge>
                     </div>
-                    <p className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-all text-sm">
+                    <p className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-words text-sm">
                       {item.detail}
                     </p>
-                    <dl className="mt-3 grid gap-2 text-sm">
+                    <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
                       <Metadata label="Parent task" value={item.taskId} />
                       <Metadata label="Parent criteria" value={item.criterionIds.join(" · ")} />
                       <Metadata
@@ -148,22 +166,24 @@ function EvidenceSession(props: EvidenceViewProps) {
                       Recorded resolution does not establish current approval or verify the
                       referenced artifacts.
                     </p>
-                    <dl className="mt-3 grid gap-2 text-xs text-muted-foreground">
-                      <Metadata
-                        label="Finding record"
-                        value={`${item.recordId} · Revision ${item.revision}`}
-                      />
-                      <Metadata
-                        label="Frozen target revisions"
-                        value={`Spec revision ${item.target.specRevision} · Plan revision ${item.target.planRevision}`}
-                      />
-                      <Metadata label="Frozen base" value={item.target.baseSha} />
-                      <Metadata label="Frozen head" value={item.target.headSha} />
-                    </dl>
-                    <FindingReviewer label="Original reviewer" reviewer={item.originReviewer} />
-                    <FindingReviewer label="Latest reporter" reviewer={item.reportedBy} />
+                    <WorkDetails className="mt-3" summary="Review provenance">
+                      <dl className="grid gap-2 sm:grid-cols-2">
+                        <Metadata
+                          label="Finding record"
+                          value={`${item.recordId} · Revision ${item.revision}`}
+                        />
+                        <Metadata
+                          label="Frozen target revisions"
+                          value={`Spec revision ${item.target.specRevision} · Plan revision ${item.target.planRevision}`}
+                        />
+                        <Metadata label="Frozen base" value={item.target.baseSha} />
+                        <Metadata label="Frozen head" value={item.target.headSha} />
+                      </dl>
+                      <FindingReviewer label="Original reviewer" reviewer={item.originReviewer} />
+                      <FindingReviewer label="Latest reporter" reviewer={item.reportedBy} />
+                    </WorkDetails>
                     <p className="mt-2 text-xs text-muted-foreground">
-                      Last recorded update {item.updatedAt}
+                      Last recorded update <WorkTime value={item.updatedAt} />
                     </p>
                     <Button
                       className="mt-3"
@@ -191,26 +211,20 @@ function EvidenceSession(props: EvidenceViewProps) {
                     <>
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <h3 className="break-all font-medium">Evidence {item.evidenceId}</h3>
-                        <Badge variant="outline">Recorded applicability: {item.status}</Badge>
+                        <Badge variant={item.status === "current" ? "success" : "outline"}>
+                          Recorded applicability: {item.status}
+                        </Badge>
                       </div>
-                      <p className="mt-2 break-all text-sm">
-                        Record {item.recordId} · Revision {item.revision} · Task {item.taskId}
-                      </p>
                       <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 text-xs">
                         {item.command || "Command not recorded"}
                       </pre>
-                      <dl className="mt-3 grid gap-2 text-sm">
+                      <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
                         <Metadata label="Command result" value={`Exit code ${item.exitCode}`} />
-                        <Metadata label="Raw artifact ID" value={item.artifactId} />
                         <Metadata label="Repository" value={item.repository} />
-                        <Metadata label="Tested worktree" value={item.worktree} />
-                        <Metadata label="Tested tree" value={item.testedTree} />
                         <Metadata
                           label="Tested commit"
                           value={item.testedCommit ?? "Tested commit not recorded"}
                         />
-                        <Metadata label="Recorded base" value={item.baseSha} />
-                        <Metadata label="Recorded head" value={item.headSha} />
                         <Metadata
                           label="Applicable revisions"
                           value={`Spec revision ${item.specRevision} · Plan revision ${item.planRevision}`}
@@ -220,14 +234,26 @@ function EvidenceSession(props: EvidenceViewProps) {
                           label="Integration"
                           value={`Integration evidence: ${item.integration ? "yes" : "no"}`}
                         />
-                        {item.scopeHash ? (
-                          <Metadata label="Recorded scope hash" value={item.scopeHash} />
-                        ) : null}
                       </dl>
-                      <p className="mt-2 text-sm text-muted-foreground">
+                      <p className="mt-2 text-xs text-muted-foreground">
                         A tested tree does not qualify a later commit. Artifact retention and
                         reviewed source qualification are not provided by this snapshot.
                       </p>
+                      <WorkDetails className="mt-3" summary="Tested source and record details">
+                        <p>
+                          Record {item.recordId} · Revision {item.revision} · Task {item.taskId}
+                        </p>
+                        <dl className="grid gap-2 sm:grid-cols-2">
+                          <Metadata label="Raw artifact ID" value={item.artifactId} />
+                          <Metadata label="Tested worktree" value={item.worktree} />
+                          <Metadata label="Tested tree" value={item.testedTree} />
+                          <Metadata label="Recorded base" value={item.baseSha} />
+                          <Metadata label="Recorded head" value={item.headSha} />
+                          {item.scopeHash ? (
+                            <Metadata label="Recorded scope hash" value={item.scopeHash} />
+                          ) : null}
+                        </dl>
+                      </WorkDetails>
                       <div className="mt-3 text-sm">
                         <p className="font-medium">Recorded task plans</p>
                         {plans
@@ -250,10 +276,14 @@ function EvidenceSession(props: EvidenceViewProps) {
                     </>
                   ) : (
                     <>
-                      <h3 className="break-all font-medium">Publication effect {item.effectId}</h3>
-                      <Badge variant="outline">Recorded publication status: {item.status}</Badge>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h3 className="break-all font-medium">
+                          Publication effect {item.effectId}
+                        </h3>
+                        <Badge variant="outline">Recorded publication status: {item.status}</Badge>
+                      </div>
                       <PublicationHistory key={`${item.recordId}:${item.revision}`} effect={item} />
-                      <dl className="mt-3 grid gap-2 text-sm">
+                      <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
                         <Metadata
                           label="Effect record"
                           value={`${item.recordId} · Revision ${item.revision}`}
@@ -290,7 +320,7 @@ function EvidenceSession(props: EvidenceViewProps) {
                     ) : null}
                   </div>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    Last recorded update {item.updatedAt}
+                    Last recorded update <WorkTime value={item.updatedAt} />
                   </p>
                   {itemTaskId ? (
                     <Button
@@ -305,7 +335,7 @@ function EvidenceSession(props: EvidenceViewProps) {
                 </WorkCard>
               );
             })}
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {start > 0 ? (
                 <Button variant="outline" size="sm" onClick={() => setOffset(start - PAGE_SIZE)}>
                   Previous evidence page
@@ -334,7 +364,7 @@ function FindingReviewer({
   return (
     <div className="mt-3 text-xs text-muted-foreground">
       <p className="font-medium">{label}</p>
-      <dl className="mt-1 grid gap-1">
+      <dl className="mt-1 grid gap-1 sm:grid-cols-2">
         <Metadata
           label="Member and review task"
           value={`${reviewer.memberId} · Review task ${reviewer.reviewTaskId}`}

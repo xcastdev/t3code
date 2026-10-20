@@ -2,6 +2,7 @@ import { RegistryContext, useAtomRefresh, useAtomValue } from "@effect/atom-reac
 import { asProjectTeamSupervisionSummary } from "@t3tools/client-runtime/project-work";
 import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
+import { RefreshCwIcon } from "lucide-react";
 import { useContext, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import { WorkSupervision, type WorkSupervisionProps } from "./WorkSupervision";
 import { Button } from "../ui/button";
@@ -113,15 +114,18 @@ function SupervisionRead(props: WorkSupervisionSourceProps) {
   });
   return (
     <>
-      <Button
-        type="button"
-        size="sm"
-        variant="outline"
-        disabled={!props.connected || !props.enabled || !props.supported}
-        onClick={() => refreshCurrent()}
-      >
-        Refresh summary
-      </Button>
+      <div className="flex justify-end">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          disabled={!props.connected || !props.enabled || !props.supported}
+          onClick={() => refreshCurrent()}
+        >
+          <RefreshCwIcon aria-hidden />
+          Refresh summary
+        </Button>
+      </div>
       <WorkSupervision
         {...props}
         current={current}
