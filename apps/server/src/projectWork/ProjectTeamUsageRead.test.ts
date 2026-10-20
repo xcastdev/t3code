@@ -1,28 +1,40 @@
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  CommandId,
+  ProjectWorkComment,
   ProjectWorkFoundationCommitCommand,
-  ProjectTeamEffect,
   ProjectTeamMemoryProcessIntent,
-  canonicalProjectWorkPayload,
 } from "@t3tools/contracts";
 import * as NodeCrypto from "node:crypto";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import {
-  restoreHistoricalBinding,
+  attribution,
   providerInstanceId,
   threadId,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { makeProjectTeamDispatchJournal } from "./ProjectTeamDispatchJournal.ts";
+import { ProjectTeamAuthorization } from "./ProjectTeamAuthorization.ts";
+import * as ContentGuard from "./ProjectWorkContentGuard.ts";
+import { makeProjectMemoryProcessing } from "./memory/ProjectMemoryProcessing.ts";
+import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { preallocatePiManagedProcess } from "../provider/pi/PiManagedProcess.ts";
 import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import * as Accounting from "./ProjectTeamModelAccounting.ts";
 import {
   ProjectMemoryJobOwner,
+  ProjectMemoryOperation,
   makeProjectMemoryModelAccounting,
 } from "./memory/ProjectMemoryModelAccounting.ts";
-import { projectMemoryHash } from "./memory/ProjectMemoryService.ts";
+import {
+  makeProjectMemoryService,
+  ProjectMemoryServiceError,
+  projectMemoryHash,
+} from "./memory/ProjectMemoryService.ts";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
@@ -78,39 +90,131 @@ it.effect(
     ),
 );
 
-const decodeMemoryIntent = Schema.decodeUnknownEffect(ProjectTeamMemoryProcessIntent);
+const decodeComment = Schema.decodeUnknownEffect(ProjectWorkComment);
 
-const decodeEffect = Schema.decodeUnknownEffect(ProjectTeamEffect);
+const decodeMemoryIntent = Schema.decodeUnknownEffect(ProjectTeamMemoryProcessIntent);
 
 const decodeCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 
-const decodeMemoryOwner = Schema.decodeUnknownEffect(ProjectMemoryJobOwner);
+const decodeMemoryOwner = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectMemoryJobOwner));
 
 const mixedUsageFixture = (piOutcome: "reported" | "unknown" | "overshoot" = "reported") =>
   Effect.gen(function* () {
     yield* TestClock.setTime(Date.parse(at) + 1);
-    const f = yield* seed("investigator", "reserved", {
+    const repository = yield* ProjectWorkRepository;
+    const sql = yield* SqlClient.SqlClient;
+    const f = { sql };
+    let pending: typeof ProjectWorkFoundationCommitCommand.Type | undefined;
+    yield* seed("investigator", "reserved", {
       nativeSessionId: null,
-      roleTools: [],
-      toolIds: [],
+      roleTools: ["project-work.write"],
+      toolIds: ["project-work.write"],
       issueCredential: false,
-    });
+    }).pipe(
+      Effect.provideService(ProjectWorkRepository, {
+        ...repository,
+        execute: (command) => {
+          if (command.type === "project-work.foundation.commit" && command.commandId === "setup")
+            return repository.execute({
+              ...command,
+              records: command.records.map((record) =>
+                record.kind === "role-revision"
+                  ? { ...record, model: "gpt-6-luna", memoryAccess: "project" }
+                  : record,
+              ),
+            });
+          if (
+            command.type === "project-work.foundation.commit" &&
+            command.transition?.kind === "claim"
+          ) {
+            pending = command;
+            return Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Retain claim for dispatch admission"),
+            );
+          }
+          return repository.execute(command);
+        },
+      }),
+      Effect.result,
+    );
+    if (!pending || pending.transition?.kind !== "claim")
+      return yield* Effect.die("Missing original usage claim");
     const fs = yield* FileSystem.FileSystem;
     const worktree = yield* fs.makeTempDirectoryScoped();
-    const role = { ...f.role, model: "gpt-6-luna", memoryAccess: "project" as const };
-    yield* restoreHistoricalBinding(role);
-    const binding = {
-      ...f.binding,
+    yield* repository.execute(
+      yield* decodeCommit({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: "usage-limits",
+        expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+        attribution,
+        committedAt: at,
+        records: [
+          {
+            kind: "limits",
+            projectId,
+            recordId: "limits",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            status: "configured",
+            model: "gpt-6-luna",
+            tokenLimit: 64_000,
+            durationLimitMs: 300_000,
+            environmentModelCalls: 4,
+            modelCalls: 4,
+            projectWritableWorkers: 1,
+            delegationDepth: 2,
+            repairAllowance: 2,
+          },
+        ],
+      }),
+    );
+    const claimBinding = {
+      ...pending.transition.binding,
       worktree,
+      branch: "refs/heads/assigned",
       model: "gpt-6-luna",
       configuration: {
-        ...f.binding.configuration,
-        instructionsHash: NodeCrypto.createHash("sha256").update(role.instructions).digest("hex"),
+        ...pending.transition.binding.configuration,
+        instructionsHash: NodeCrypto.createHash("sha256").update("Task").digest("hex"),
         maxTokens: 64_000,
         maxDurationMs: 300_000,
       },
     };
-    yield* restoreHistoricalBinding(binding);
+    const journal = yield* makeProjectTeamDispatchJournal({
+      environmentId: "environment",
+      maximumEnvironmentModelCalls: 4,
+    });
+    const reserved = yield* journal.reserve({
+      dispatchId: "usage-dispatch",
+      claim: {
+        ...pending,
+        expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+        transition: { ...pending.transition, binding: claimBinding },
+      },
+      git: {
+        effectId: "usage-dispatch",
+        runId: claimBinding.recordId,
+        generation: 0,
+        primaryRoot: "/workspace",
+        commonGitDirectory: "/workspace/.git",
+        worktreePath: worktree,
+        branchRef: claimBinding.branch,
+        baseRef: "refs/heads/main",
+        baseOid: "a".repeat(40),
+        ownershipToken: "owner",
+        policyHash: "b".repeat(64),
+      },
+      setupId: "usage-setup",
+      initializeOperationId: "initialize",
+      assignmentOperationId: "prompt",
+      assignment: "Read retained memory for the approved task",
+    });
+    const snapshot = yield* journal.claimEffect(reserved.fence);
+    const claim = snapshot.intent.compiledClaim.transition;
+    if (claim?.kind !== "claim") return yield* Effect.die("Missing admitted usage claim");
+    const binding = claim.binding;
     const allocation = yield* preallocatePiManagedProcess({
       workspaceRoot: worktree,
       workspaceAccess: "readonly",
@@ -123,6 +227,7 @@ const mixedUsageFixture = (piOutcome: "reported" | "unknown" | "overshoot" = "re
     });
     const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
     const identity = { providerInstanceId, threadId };
+    const auth = yield* ProjectTeamAuthorization;
     const native = {
       sessionId: "usage-native",
       sessionReference: "sessions/usage-native.jsonl",
@@ -214,52 +319,82 @@ const mixedUsageFixture = (piOutcome: "reported" | "unknown" | "overshoot" = "re
     });
     const request = piRequest(1);
     const reservation = yield* accounting.reserve(op.principal, request);
-    // Retain an authenticated admission at the repository seam, then use the real
-    // memory accounting producer for every reservation and settlement.
-    const repository = yield* ProjectWorkRepository;
-    const current = yield* readCurrentState(f.sql, projectId);
-    const selection = {
-      kind: "comment" as const,
-      retainedId: "comment",
-      retainedRevision: 0,
-      sourceRecordId: "source",
-      expectedSourceRecordRevision: 0,
-      sourceRevision: 0,
-      sourceGeneration: 0,
-      contentHash: "a".repeat(64),
-      effectId: "memory-effect",
-      expectedEffectRevision: 0,
-      expectedClaimGeneration: 0,
-    };
+    const guard = yield* ContentGuard.ProjectWorkContentGuard.pipe(
+      Effect.provide(ContentGuard.layer),
+    );
+    yield* repository.execute({
+      type: "project-work.comment.add",
+      projectId,
+      commandId: CommandId.make("usage-comment"),
+      comment: yield* decodeComment({
+        commentId: "usage-comment",
+        projectId,
+        taskId: binding.taskId,
+        body: "Retain exact original usage and memory ownership.",
+        revision: 0,
+        createdAt: at,
+        attribution,
+      }),
+      addedAt: at,
+      attribution,
+    });
+    const service = makeProjectMemoryService({
+      sql,
+      repository,
+      authorization: auth,
+      contentGuard: guard,
+      environmentId: "environment",
+    });
+    yield* service.captureRetained(projectId, { kind: "comment", retainedId: "usage-comment" });
+    const processing = yield* makeProjectMemoryProcessing;
+    const authority = yield* auth.resolve(op.principal);
+    if (!authority) return yield* Effect.die("Missing executing memory authority");
+    const page = yield* sql.withTransaction(
+      processing.readSourcesInTransaction(
+        {
+          operation: "memory-sources",
+          projectId,
+          taskId: binding.taskId,
+        },
+        authority,
+      ),
+    );
+    const selection = page.items.find(
+      (item) => item.selection.retainedId === "usage-comment",
+    )?.selection;
+    if (!selection) return yield* Effect.die("Missing captured memory selection");
     const intent = yield* decodeMemoryIntent({
       type: "project-team.memory.process",
       commandId: "memory-admission",
       projectId,
       taskId: binding.taskId,
-      expectedRevision: current.revision,
-      expectedTaskRevision: current.tasks[0]!.revision,
+      expectedRevision: authority.state.revision,
+      expectedTaskRevision: authority.state.tasks.find((task) => task.taskId === binding.taskId)!
+        .revision,
       specRevision: binding.specRevision,
       planRevision: binding.planRevision,
       selection,
     });
-    const admittedEffect = yield* decodeEffect({
-      kind: "effect",
-      recordId: "memory-effect",
-      effectId: "memory-effect",
+    const memoryIdentity = {
+      environmentId: "environment",
       projectId,
-      revision: 0,
-      generation: 0,
-      updatedAt: at,
-      status: "pending",
-      effectKind: "memory-index",
       taskId: binding.taskId,
-      runId: binding.recordId,
-      targetId: "source",
-      payload: { recordIds: [], expectedRevision: current.revision },
-      claimGeneration: 0,
-      availableAt: at,
-    });
-    const attribution = {
+      bindingId: binding.recordId,
+      generation: binding.generation,
+      providerInstanceId,
+      threadId,
+      operationId: op.operation.operationId,
+      workerId: op.workerId,
+      ordinal: op.ordinal,
+    };
+    const readMemoryOwner = operations
+      .readMemoryOperationOwnerInTransaction(memoryIdentity, op.principal)
+      .pipe(
+        Effect.mapError(
+          (error) => new ProjectMemoryServiceError({ reason: error.detail ?? error.code }),
+        ),
+      );
+    const memoryAttribution = {
       actor: op.principal.actor,
       source: { kind: "mcp" as const, id: op.workerId },
       recordedAt: at,
@@ -268,75 +403,61 @@ const mixedUsageFixture = (piOutcome: "reported" | "unknown" | "overshoot" = "re
       "project-team-intent:" +
       projectMemoryHash({
         intent,
-        actor: attribution.actor,
-        source: attribution.source,
+        actor: memoryAttribution.actor,
+        source: memoryAttribution.source,
         managed: op.principal.managed,
       });
     const command = yield* decodeCommit({
       type: "project-work.foundation.commit",
       commandId: intent.commandId,
       projectId,
-      expectedRevision: current.revision,
-      attribution,
+      expectedRevision: intent.expectedRevision,
+      attribution: memoryAttribution,
       committedAt: at,
-      records: [admittedEffect],
+      records: [
+        authority.state.foundationRecords!.find(
+          (record) => record.kind === "effect" && record.effectId === selection.effectId,
+        )!,
+      ],
     });
-    yield* repository.executeAuthorized(
-      command,
-      () => Effect.succeed(command),
-      undefined,
-      fingerprint,
-    );
-    const rows = yield* f.sql<{
-      request: string;
-    }>`SELECT request_hash AS request FROM project_team_pi_operation WHERE operation_id=${op.operation.operationId}`;
-    const owner = yield* decodeMemoryOwner({
-      version: 1,
-      operation: {
-        version: 1,
-        environmentId: "environment",
-        projectId,
-        taskId: binding.taskId,
-        bindingId: binding.recordId,
-        generation: 0,
-        providerInstanceId,
-        threadId,
-        operationId: op.operation.operationId,
-        workerId: op.workerId,
-        ordinal: op.ordinal,
-        attemptId: binding.attemptId,
-        rootBindingId: binding.recordId,
-        rootTaskId: binding.taskId,
-        rootMaximumTokens: 64_000,
-        rootDeadlineAtMs: op.deadlineAtMs,
-        attemptMaximumTokens: 64_000,
-        attemptDeadlineAtMs: op.deadlineAtMs,
-        operationMaximumTokens: op.maximumTokens,
-        operationDeadlineAtMs: op.deadlineAtMs,
-        leaseDeadlineAtMs: op.deadlineAtMs,
-        roleSha256: projectMemoryHash(op.authority.role),
-        configurationSha256: projectMemoryHash(op.authority.binding.configuration),
-        requestSha256: rows[0]!.request,
-        allocation: op.allocation,
-      },
-      selection,
-      request: intent,
-      admittedEffect,
-      commandId: intent.commandId,
-      intentFingerprint: fingerprint,
-      actorId: op.principal.actor.id,
-      sourceKind: "mcp",
-      sourceId: op.workerId,
-      admittedAt: at,
-    });
-    yield* f.sql`INSERT INTO project_team_memory_job
-    (effect_id,environment_id,project_id,input_json,status,owner_json)
-    VALUES ('memory-effect','environment',${projectId},'{}','pending',${canonicalProjectWorkPayload(owner)})`;
+    yield* repository
+      .executeAuthorized(
+        command,
+        () =>
+          processing.compileInTransaction(
+            intent,
+            op.principal,
+            memoryAttribution,
+            auth.resolve,
+            false,
+          ),
+        undefined,
+        fingerprint,
+      )
+      .pipe(
+        Effect.provideService(ProjectMemoryOperation, {
+          identity: memoryIdentity,
+          assertForward: sql.withTransaction(readMemoryOwner).pipe(
+            Effect.asVoid,
+            Effect.mapError((error) =>
+              error._tag === "ProjectMemoryServiceError"
+                ? error
+                : new ProjectMemoryServiceError({ reason: String(error) }),
+            ),
+          ),
+          readCurrentInTransaction: () => readMemoryOwner,
+        }),
+        Effect.provideService(ProjectMemoryPorts, { assertConfigured: () => Effect.void }),
+      );
+    const savedOwners = yield* sql<{
+      owner: string;
+    }>`SELECT owner_json AS owner FROM project_team_memory_job WHERE effect_id=${selection.effectId}`;
+    const owner = yield* decodeMemoryOwner(savedOwners[0]!.owner);
     const memory = yield* makeProjectMemoryModelAccounting({
       environmentId: "environment",
       maximumConcurrentCalls: 4,
       maximumConcurrentModelCalls: 4,
-      assertCurrentInTransaction: () => Effect.void,
+      assertCurrentInTransaction: () => readMemoryOwner.pipe(Effect.asVoid),
       assertTransportDrainedInTransaction: () => Effect.void,
     });
     const reserveMemory = (requestId: number, maximum: number) =>
