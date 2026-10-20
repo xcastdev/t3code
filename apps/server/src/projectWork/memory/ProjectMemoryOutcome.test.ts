@@ -1062,3 +1062,44 @@ for (const noFacts of [false, true])
           }),
         ),
     );
+
+for (const noFacts of [false, true])
+  for (const liquid of [false, true])
+    for (const reflected of [false, true])
+      it.effect(
+        `${noFacts ? "no-facts" : "indexed"} rejects supported-route substitution ${liquid ? "Liquid to CommandCode" : "CommandCode to Liquid"} ${reflected ? "on replay" : "before first reflection"}`,
+        () =>
+          database(
+            Effect.gen(function* () {
+              const f = yield* setup(noFacts, liquid);
+              const pending = yield* f.pending.consume(f.projectId, f.effectId);
+              if (pending.status !== "pending-reflection")
+                return yield* Effect.die("Unsettled substitution fixture");
+              if (reflected) yield* f.outcomes.commitVerifiedOutcome(pending.receipt, Effect.void);
+              const work = yield* f.service.readWork(f.projectId, f.effectId);
+              if (work.extraction === undefined)
+                return yield* Effect.die("Missing performed extraction");
+              const original = yield* f.snapshot;
+              const calls = f.counts();
+              const substitute = liquid
+                ? "inclusionai/ling-3.1-flash:free"
+                : "liquid/lfm-2.5-2.6b:free";
+              yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=json_set(state_json,
+                '$.foundationRecords[' || (SELECT key FROM json_each(state_json,'$.foundationRecords')
+                  WHERE json_extract(value,'$.recordId')=${work.extraction.recordId}) || '].extractionModel',${substitute})
+                WHERE project_id=${f.projectId}`;
+              yield* f.sql`UPDATE project_team_memory_extraction
+                SET payload_json=json_set(payload_json,'$.extractionModel',${substitute})
+                WHERE record_id=${work.extraction.recordId}`;
+              const before = yield* f.snapshot;
+              expect(before.jobs).toEqual(original.jobs);
+              expect(before.events).toEqual(original.events);
+              const result = yield* f.outcomes
+                .commitVerifiedOutcome(pending.receipt, Effect.void)
+                .pipe(Effect.result);
+              expect(result._tag).toBe("Failure");
+              expect(yield* f.snapshot).toEqual(before);
+              expect(f.counts()).toEqual(calls);
+            }),
+          ),
+      );

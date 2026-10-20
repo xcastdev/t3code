@@ -10,7 +10,6 @@ import {
   canonicalProjectWorkPayload,
   projectWorkPayloadFingerprint,
 } from "@t3tools/contracts";
-import { COMMAND_CODE_EXTRACTION, LIQUID_EXTRACTION } from "./ProjectMemoryModelRoutes.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -294,16 +293,11 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
     if (
       extractions.length !== 1 ||
       extraction?.kind !== "memory-extraction" ||
-      (extraction.extractionModel !== input.extraction!.extractionModel &&
-        !(
-          input.extraction!.extractionModel === COMMAND_CODE_EXTRACTION.model &&
-          extraction.extractionModel === LIQUID_EXTRACTION.model
-        )) ||
       !equal(
         {
           ...extraction,
-          // The immutable capture predates route selection. Only the fixed
-          // default-to-Liquid finalization above may differ from that input.
+          // Capture predates extraction. The accepted completion event below
+          // proves the performed model, independently of this placeholder.
           extractionModel: input.extraction!.extractionModel,
           status: input.extraction!.status,
           revision: input.extraction!.revision,
@@ -331,6 +325,41 @@ const makeProjectMemoryOutcomeAudit = (dependencies: {
     )
       return yield* deny("Memory reflection extraction tuple or completed manifest changed");
     yield* physical(extraction);
+    // Read the original facts commit, not either mutable read model. No-facts
+    // reflection writes only an effect event, so its replay needs this proof too.
+    const completions = yield* sql<{
+      payload: string | null;
+      eventId: string;
+      at: string;
+    }>`SELECT CASE WHEN length(CAST(e.payload_json AS BLOB))<=262144 THEN e.payload_json END AS payload,
+      e.event_id AS eventId,e.occurred_at AS at FROM project_work_events e
+      JOIN project_work_command_receipts c ON c.project_id=e.project_id AND c.command_id=e.command_id
+      WHERE e.project_id=${input.projectId} AND e.event_type='project-work.foundation.recorded'
+      AND json_extract(e.payload_json,'$.record.recordId')=${extraction.recordId}
+      AND json_extract(e.payload_json,'$.record.revision')=${input.extraction!.revision + 1}
+      AND c.actor_kind='system' AND c.actor_id='project-memory'
+      AND c.source_kind='system' AND c.source_id='project-memory'
+      AND c.created_at=e.occurred_at AND length(CAST(c.event_ids_json AS BLOB))<=262144
+      AND EXISTS (SELECT 1 FROM json_each(c.event_ids_json) WHERE value=e.event_id)
+      AND json_extract(c.result_json,'$.receipt.status')='accepted' LIMIT 2`;
+    const completion = completions[0];
+    if (completions.length !== 1 || completion === undefined || completion.payload === null)
+      return yield* deny("Memory extraction lacks its accepted completion event");
+    const event = yield* decode(Schema.fromJsonString(Recorded), completion.payload);
+    const indexed = reflected && receipt.kind === "index-complete";
+    if (
+      event.eventId !== completion.eventId ||
+      event.projectId !== input.projectId ||
+      event.occurredAt !== completion.at ||
+      !equal(event.record, {
+        ...extraction,
+        status: receipt.kind === "no-facts" ? "no-facts" : "extracted",
+        revision: extraction.revision - (indexed ? 1 : 0),
+        updatedAt: indexed ? event.occurredAt : extraction.updatedAt,
+        completedObservationIds: [],
+      })
+    )
+      return yield* deny("Memory reflection extraction tuple or completed manifest changed");
     const observations = records.filter(
       (record) =>
         record.kind === "memory-observation" && record.extractionId === extraction.recordId,
