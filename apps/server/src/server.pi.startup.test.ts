@@ -4,6 +4,14 @@ import { RepositoryIdentityResolver } from "./project/RepositoryIdentityResolver
 import { TerminalManager } from "./terminal/Manager.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import { expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
+import { ServerActivation } from "./serverActivation.ts";
+import { ProviderService } from "./provider/Services/ProviderService.ts";
+import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine.ts";
+import * as MemoryProcessing from "./projectWork/memory/ProjectMemoryProcessing.ts";
+import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
+import { ProjectMemoryPorts } from "./projectWork/memory/ProjectMemoryPorts.ts";
+import { ProjectTeamAuthorization } from "./projectWork/ProjectTeamAuthorization.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Context from "effect/Context";
@@ -13,7 +21,11 @@ import * as Option from "effect/Option";
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import { HostProcessArguments, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { ProviderInstanceId, ProviderDriverKind } from "@t3tools/contracts";
-import { PiProductionRuntimeLayerLive, GitWorkflowLayerLive } from "./server.ts";
+import {
+  PiProductionRuntimeLayerLive,
+  GitWorkflowLayerLive,
+  ProjectTeamExecutionLayerLive,
+} from "./server.ts";
 import * as ServerConfig from "./config.ts";
 import { ProviderInstanceRegistryMutableLayer } from "./provider/Layers/ProviderInstanceRegistryLive.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
@@ -35,6 +47,37 @@ for (const platform of ["linux", "win32"] as const)
         Effect.gen(function* () {
           const fs = yield* FileSystem.FileSystem;
           const root = yield* fs.makeTempDirectoryScoped();
+          let constructedMemory: ProjectMemoryPorts["Service"] | undefined;
+          let executionMemory: ProjectMemoryPorts["Service"] | undefined;
+          const makeConsumer = MemoryProcessing.makeProjectMemoryProcessingConsumer;
+          const memoryConsumer = vi
+            .spyOn(MemoryProcessing, "makeProjectMemoryProcessingConsumer")
+            .mockImplementation((...args) =>
+              makeConsumer(...args).pipe(
+                Effect.tap((consumer) =>
+                  Effect.sync(() => {
+                    constructedMemory = consumer;
+                  }),
+                ),
+              ),
+            );
+          const makeWorker = ProjectWorkRuntime.makeProjectTeamExecutionWorker;
+          const observeWorker: typeof makeWorker = (start, ready) =>
+            Effect.gen(function* () {
+              executionMemory = Option.getOrUndefined(
+                yield* Effect.serviceOption(ProjectMemoryPorts),
+              );
+              return yield* makeWorker(start, ready);
+            });
+          const executionWorker = vi
+            .spyOn(ProjectWorkRuntime, "makeProjectTeamExecutionWorker")
+            .mockImplementation(observeWorker);
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              memoryConsumer.mockRestore();
+              executionWorker.mockRestore();
+            }),
+          );
           let productionPermits: GitRepositoryPermits["Service"] | undefined;
           const production = PiProductionRuntimeLayerLive.pipe(
             Layer.tap((services) =>
@@ -53,7 +96,7 @@ for (const platform of ["linux", "win32"] as const)
               },
             },
           }).pipe(Layer.provideMerge(production));
-          const graph = GitWorkflowLayerLive.pipe(
+          const graph = Layer.mergeAll(GitWorkflowLayerLive, ProjectTeamExecutionLayerLive).pipe(
             Layer.provideMerge(ProviderRegistryLive),
             Layer.provideMerge(registry),
             Layer.provideMerge(SkillMaterializationService.layer),
@@ -63,6 +106,10 @@ for (const platform of ["linux", "win32"] as const)
             Layer.provide(
               Layer.mergeAll(
                 Layer.mock(EnvironmentAuth)({}),
+                Layer.mock(ProviderService)({}),
+                Layer.mock(ProjectTeamAuthorization)({}),
+                Layer.mock(OrchestrationEngineService)({}),
+                Layer.succeed(ServerActivation, Effect.never),
                 Layer.mock(ProjectionSnapshotQuery)({}),
                 Layer.mock(RepositoryIdentityResolver)({}),
                 Layer.mock(TerminalManager)({}),
@@ -72,6 +119,10 @@ for (const platform of ["linux", "win32"] as const)
             Layer.provide(ServerConfig.layerTest(root, { prefix: "pi-startup-graph-" })),
           );
           const acquired = yield* Layer.build(graph);
+          // The production gateway and execution worker use the same memoized processing layer.
+          expect(memoryConsumer).toHaveBeenCalledTimes(1);
+          expect(constructedMemory).toBeDefined();
+          expect(executionMemory).toBe(constructedMemory);
           expect(Context.get(acquired, PiManagedRuntime)).toBeDefined();
           const instances = Context.get(acquired, ProviderInstanceRegistry);
           const selected = yield* instances.getInstance(ProviderInstanceId.make("piAgent"));

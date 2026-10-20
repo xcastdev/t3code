@@ -65,6 +65,7 @@ import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import { makeProjectTeamIntegrationSources } from "./ProjectTeamIntegrationSources.ts";
 import { ProjectTeamPiRuntime } from "./ProjectTeamPiRuntime.ts";
 import { ProjectWorkEventBus } from "./ProjectWorkEventBus.ts";
+import { ProjectMemoryPorts } from "./memory/ProjectMemoryPorts.ts";
 
 type Snapshot = ProjectTeamDispatchSnapshot;
 type ReviewCompletion = Effect.Success<ReturnType<typeof makeProjectTeamReviewCompletion>>;
@@ -198,7 +199,9 @@ export const readProjectTeamOwnedOperationHistory = Effect.fn(
     operation_id: string;
     status: string;
     operation_kind: string;
-  }>`SELECT operation_id,status,operation_kind FROM project_team_pi_operation
+    worker_id: string;
+    operation_ordinal: number;
+  }>`SELECT operation_id,status,operation_kind,worker_id,operation_ordinal FROM project_team_pi_operation
     WHERE environment_id=${environmentId} AND binding_id=${binding.recordId} AND generation=${binding.generation}
     ORDER BY operation_ordinal LIMIT 131`;
   // Initialization and assignment precede at most 128 later mailbox prompts.
@@ -446,6 +449,8 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
     const engine = yield* OrchestrationEngineService;
     const query = yield* ProjectionSnapshotQuery;
     const scope = yield* Scope.Scope;
+    const memoryPorts = yield* Effect.serviceOption(ProjectMemoryPorts);
+    const recoverJoinedOperation = Option.getOrUndefined(memoryPorts)?.recoverJoinedOperation;
     const services = yield* Effect.context<
       | Effect.Services<ReturnType<typeof makeProjectTeamWorkspace>>
       | Effect.Services<ReturnType<typeof reconcilePiManagedProcess>>
@@ -809,6 +814,30 @@ export const makeProjectTeamExecutionHost = Effect.fn("makeProjectTeamExecutionH
       const evidence = yield* boundary(collectDrain(snapshot)).pipe(Effect.result);
       if (evidence._tag === "Failure")
         return { _tag: "Uncertain" as const, cause: Cause.fail(evidence.failure) };
+      if (recoverJoinedOperation !== undefined) {
+        const recovery = yield* boundary(
+          Effect.forEach(
+            operations.filter((operation) => operation.operation_kind === "prompt"),
+            (operation) =>
+              // This identity only selects retained evidence. Processing validates the joined terminal.
+              recoverJoinedOperation({
+                environmentId: options.environmentId,
+                projectId: binding.projectId,
+                taskId: binding.taskId,
+                bindingId: binding.recordId,
+                generation: binding.generation,
+                providerInstanceId: binding.providerInstanceId,
+                threadId: binding.threadId,
+                operationId: operation.operation_id,
+                workerId: operation.worker_id,
+                ordinal: operation.operation_ordinal,
+              }),
+            { discard: true },
+          ),
+        ).pipe(Effect.result);
+        if (recovery._tag === "Failure")
+          return { _tag: "Uncertain" as const, cause: Cause.fail(recovery.failure) };
+      }
       const decision = yield* sql.withTransaction(
         mailboxTurnDecisions.readHeadInTransaction({ dispatchId: snapshot.fence.dispatchId }),
       );

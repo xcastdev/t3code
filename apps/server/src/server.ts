@@ -1063,7 +1063,7 @@ const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
   ),
 );
 
-const ProjectTeamExecutionLayerLive = Layer.effectDiscard(
+export const ProjectTeamExecutionLayerLive = Layer.effectDiscard(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     const environment = yield* ServerEnvironment.ServerEnvironment;
@@ -1086,6 +1086,7 @@ const ProjectTeamExecutionLayerLive = Layer.effectDiscard(
   }),
 ).pipe(
   Layer.provide(ProjectTeamPiRuntimeLayerLive),
+  Layer.provide(ProjectMemoryProcessingLayerLive),
   Layer.provide(ProjectWorkCoreLive),
   Layer.provide(GitWorkflowLayerLive),
   Layer.provide(PiModelCatalogueLayerLive),
