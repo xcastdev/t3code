@@ -206,6 +206,19 @@ const decodeAdmittedEvent = Schema.decodeUnknownEffect(
   ),
   strict,
 );
+const decodeOriginalBindingEvent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("project-work.foundation.recorded"),
+      eventId: EventId,
+      projectId: ProjectId,
+      revision: Safe,
+      occurredAt: Schema.String,
+      record: ProjectTeamRunBinding,
+    }),
+  ),
+  strict,
+);
 const decodeAcceptedResult = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ProjectWorkWriteResult),
   strict,
@@ -260,6 +273,96 @@ const readOriginalDispatch = Effect.fn("ProjectMemoryModelAccounting.readOrigina
     return yield* journal
       .readRetained(dispatchId)
       .pipe(Effect.mapError(() => deny("Original memory dispatch history changed")));
+  },
+);
+
+/** Follow original admitted claims, then qualify policy from the earliest top-level
+ * root claim. A descendant's model and later attempts cannot select root policy. */
+const readOriginalMemoryRoot = Effect.fn("ProjectMemoryModelAccounting.readOriginalMemoryRoot")(
+  function* (sql: SqlClient.SqlClient, operation: ProjectMemoryTaskOwner) {
+    const readBinding = Effect.fn("ProjectMemoryModelAccounting.readOriginalBinding")(function* (
+      id: string,
+    ) {
+      const events = yield* sql<{
+        id: string;
+        at: string;
+        command: string;
+        payload: string | null;
+      }>`SELECT
+        event_id AS id,occurred_at AS at,command_id AS command,
+        CASE WHEN length(CAST(payload_json AS BLOB))<=262144 THEN payload_json END AS payload
+        FROM project_work_events WHERE project_id=${operation.projectId}
+        AND event_type='project-work.foundation.recorded'
+        AND json_extract(payload_json,'$.record.kind')='run-binding'
+        AND json_extract(payload_json,'$.record.recordId')=${id}
+        AND json_extract(payload_json,'$.record.revision')=0 LIMIT 2`;
+      const saved = events[0];
+      if (events.length !== 1 || !saved || saved.payload === null)
+        return yield* deny("Original memory ancestor claim is missing or ambiguous");
+      const event = yield* decodeOriginalBindingEvent(saved.payload);
+      const binding = event.record;
+      if (
+        event.eventId !== saved.id ||
+        event.occurredAt !== saved.at ||
+        event.projectId !== operation.projectId ||
+        binding.projectId !== operation.projectId ||
+        binding.environmentId !== operation.environmentId ||
+        binding.recordId !== id ||
+        binding.revision !== 0
+      )
+        return yield* deny("Original memory ancestor claim identity changed");
+      const dispatches = yield* sql<{
+        id: string;
+      }>`SELECT dispatch_id AS id FROM project_team_dispatch
+        WHERE environment_id=${operation.environmentId} AND project_id=${operation.projectId}
+        AND binding_id=${id} AND generation=${binding.generation} LIMIT 2`;
+      const dispatchId = dispatches[0]?.id;
+      if (dispatches.length !== 1 || dispatchId === undefined)
+        return yield* deny("Original memory ancestor dispatch is missing or ambiguous");
+      const original = yield* readOriginalDispatch(sql, operation, dispatchId);
+      const claim = original.intent.compiledClaim.transition;
+      if (
+        claim?.kind !== "claim" ||
+        !same(claim.binding, binding) ||
+        original.intent.compiledClaim.commandId !== saved.command ||
+        original.intent.limits.rootTaskId !== operation.rootTaskId ||
+        original.intent.limits.maximumTokens !== operation.rootMaximumTokens ||
+        original.intent.limits.rootDeadlineAtMs !== operation.rootDeadlineAtMs
+      )
+        return yield* deny("Original memory ancestor authority changed");
+      return binding;
+    });
+    let binding = yield* readBinding(operation.bindingId);
+    if (binding.generation !== operation.generation || binding.taskId !== operation.taskId)
+      return yield* deny("Original memory child claim changed");
+    const visited = new Set<string>();
+    while (binding.parentRunId !== undefined) {
+      if (visited.has(binding.recordId) || visited.size >= 8)
+        return yield* deny("Original memory ancestry is cyclic or exceeds its bound");
+      visited.add(binding.recordId);
+      binding = yield* readBinding(binding.parentRunId);
+    }
+    if (binding.recordId !== operation.rootBindingId || binding.taskId !== operation.rootTaskId)
+      return yield* deny("Original memory ancestry differs from its captured root");
+    // Event sequence defines the original root across retries; physical operation
+    // order and the executing child's model carry no root authority.
+    const originals = yield* sql<{ id: string | null }>`SELECT
+      CASE WHEN length(json_extract(payload_json,'$.record.recordId')) BETWEEN 1 AND 256
+        THEN json_extract(payload_json,'$.record.recordId') END AS id
+      FROM project_work_events WHERE project_id=${operation.projectId}
+      AND event_type='project-work.foundation.recorded'
+      AND json_extract(payload_json,'$.record.kind')='run-binding'
+      AND json_extract(payload_json,'$.record.environmentId')=${operation.environmentId}
+      AND json_extract(payload_json,'$.record.taskId')=${operation.rootTaskId}
+      AND json_extract(payload_json,'$.record.revision')=0
+      AND json_extract(payload_json,'$.record.parentRunId') IS NULL ORDER BY sequence LIMIT 1`;
+    const originalId = originals[0]?.id;
+    if (originalId === undefined || originalId === null)
+      return yield* deny("Original memory root claim is missing");
+    const root = originalId === binding.recordId ? binding : yield* readBinding(originalId);
+    if (root.taskId !== operation.rootTaskId || root.parentRunId !== undefined)
+      return yield* deny("Original memory root authority changed");
+    return root;
   },
 );
 
@@ -1038,14 +1141,11 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
               AND project_id=${operation.projectId} AND root_task_id=${operation.rootTaskId} LIMIT 2`;
             const grant = grants[0];
             if (grants.length > 1) return yield* deny("Memory subscription grant is ambiguous");
+            const root = yield* readOriginalMemoryRoot(sql, operation);
+            const subscriptionRoot = root.model === "gpt-6-luna";
             if (grant !== undefined) {
-              const originals = yield* sql<{ model: string }>`SELECT
-                json_extract(intent_json,'$.binding.model') AS model FROM project_team_pi_operation
-                WHERE environment_id=${operation.environmentId} AND project_id=${operation.projectId}
-                AND operation_id=${operation.operationId} LIMIT 2`;
               if (
-                originals.length !== 1 ||
-                originals[0]?.model !== grant.model ||
+                !subscriptionRoot ||
                 grant.model !== "gpt-6-luna" ||
                 grant.route_id !== "openai-subscription-luna" ||
                 grant.maximum_tokens !== 64_000 ||
@@ -1054,13 +1154,8 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
                 grant.deadline_at_ms !== operation.rootDeadlineAtMs
               )
                 return yield* deny("Original memory subscription grant changed");
-            } else {
-              const monitored = yield* sql`SELECT 1 FROM project_team_model_request
-                WHERE environment_id=${operation.environmentId} AND project_id=${operation.projectId}
-                AND root_task_id=${operation.rootTaskId}
-                AND accounting_mode='openai-subscription-monitored' LIMIT 1`;
-              if (monitored.length > 0)
-                return yield* deny("Original memory subscription grant is missing");
+            } else if (subscriptionRoot) {
+              return yield* deny("Original memory subscription grant is missing");
             }
             if (row.status !== "held") {
               if (

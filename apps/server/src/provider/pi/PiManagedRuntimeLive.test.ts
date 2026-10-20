@@ -7484,6 +7484,7 @@ type RuntimeFixtureProfile = {
   readonly model?: string;
   /** Two human-approved planning children; controlled parent receipts, real child SDK in the opt-in case. */
   readonly nativePlanningSiblings?: boolean;
+  readonly memoryChild?: { readonly model: string; readonly maximumTokens: number };
 };
 const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
   reviewer = false,
@@ -7702,7 +7703,8 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
       ...claim.transition.binding,
       worktree: path,
       branch,
-      model: selectedModel,
+      model:
+        id === "required-root" ? selectedModel : (profile?.memoryChild?.model ?? selectedModel),
       configuration: {
         ...claim.transition.binding.configuration,
         runtimeVersion: "0.99.1",
@@ -7710,7 +7712,10 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           ? {
               toolIds: [...profile.toolIds],
               skillIds: [...profile.skillIds],
-              maxTokens: profile.maximumTokens,
+              maxTokens:
+                id === "required-root"
+                  ? profile.maximumTokens
+                  : (profile.memoryChild?.maximumTokens ?? profile.maximumTokens),
               maxDurationMs:
                 profile.nativePlanningSiblings && id !== "required-root"
                   ? 60_000
@@ -8116,6 +8121,52 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
             ],
           }),
         );
+        let childRole = role;
+        if (profile?.memoryChild) {
+          childRole = {
+            ...role,
+            recordId: "required-memory-child-role",
+            roleId: "memory-child-role",
+            model: profile.memoryChild.model,
+          };
+          const state = yield* readCurrentState(sql, projectId);
+          const member = state.foundationRecords?.find(
+            (r) => r.kind === "member" && r.recordId === "member",
+          );
+          if (member?.kind !== "member") return yield* Effect.die("Original member absent");
+          const policy = state.foundationRecords?.find(
+            (r) => r.kind === "limits" && r.model === selectedModel,
+          );
+          if (policy?.kind !== "limits")
+            return yield* Effect.die("Original root model policy absent");
+          yield* repository.execute(
+            yield* decodeRequiredFoundation({
+              type: "project-work.foundation.commit",
+              projectId,
+              commandId: "required-memory-child-role",
+              expectedRevision: state.revision,
+              attribution,
+              committedAt: fixtureAt,
+              records: [
+                childRole,
+                {
+                  ...member,
+                  recordId: "required-memory-child-member",
+                  roleRevisionId: childRole.recordId,
+                },
+                ...(childRole.model === selectedModel
+                  ? []
+                  : [
+                      {
+                        ...policy,
+                        recordId: "required-memory-child-limits",
+                        model: childRole.model,
+                      },
+                    ]),
+              ],
+            }),
+          );
+        }
         pending = undefined;
         yield* createManagedAssignment({
           taskId: ProjectWorkTaskId.make("required-child"),
@@ -8124,7 +8175,8 @@ const requiredTransferFixture = Effect.fn("requiredTransferFixture")(function* (
           commandId: "required-child-claim",
           providerInstanceId,
           threadId,
-          role,
+          role: childRole,
+          ...(profile?.memoryChild ? { memberId: "required-memory-child-member" } : {}),
           status: "reserved",
           configuration,
           parentRunId: root.binding.recordId,
@@ -10050,6 +10102,13 @@ for (const compactProof of [
   "returnCancel",
   "memoryAdmission",
   "memoryAccounting",
+  "memoryRootLing1000",
+  "memoryRootLing64000",
+  "memoryRootLunaControl",
+  "memoryRootHardForged",
+  "memoryRootHardControl",
+  "memoryRootMissingGrant",
+  "memoryRootDescendantGrant",
   "memorySubscriptionPiFirst",
   "memorySubscriptionMemoryFirst",
   "memorySubscriptionUnknown",
@@ -10110,63 +10169,75 @@ for (const compactProof of [
   "memoryQueryMixed",
 ] as const)
   it.effect(
-    compactProof?.startsWith("memorySubscription")
-      ? `settles memory and monitored Pi usage atomically: ${compactProof}`
-      : (compactProof?.includes("Shared") && compactProof.includes("Query")) ||
-          compactProof?.startsWith("memoryQueryShared")
-        ? `shared semantic query preserves recipient accounting and exact owner authority: ${compactProof}`
-        : compactProof === undefined
-          ? "managed compact transfers current required context after durable association and replays without another execution"
-          : compactProof === "memoryAdmission"
-            ? "retains exact memory selection against the executing operation before processing and replays after terminal"
-            : compactProof === "memoryAccounting" || compactProof === "memoryLiquidAccounting"
-              ? `accounts memory and ordinary stages against the same executing operation and shared capacity: ${compactProof}`
-              : compactProof === "memorySharedRoot"
-                ? "reads shared root usage outside the charged child binding page without assigning parent charges"
-                : compactProof === "memoryPipeline"
-                  ? "processes an exact admitted source through shared model accounting and the configured index consumer"
-                  : compactProof === "memoryFailure"
-                    ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
-                    : compactProof === "memorySecret"
-                      ? "rejects a newly learned escaped source secret before memory extraction reservation"
-                      : compactProof === "memoryEmbeddingSecret"
-                        ? "rejects newly learned escaped embedding text before its memory reservation"
-                        : compactProof === "memoryCleanup"
-                          ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
-                          : compactProof === "memoryHumanRetraction"
-                            ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
-                            : compactProof === "memoryCleanupGuards"
-                              ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
-                              : compactProof === "memoryQuery"
-                                ? "admits an explicit semantic query through the executing task bridge before forward stages"
-                                : compactProof === "memoryQueryPipeline"
-                                  ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
-                                  : compactProof === "memoryQueryMixed"
-                                    ? "retains current semantic context when completed search also returns a genuinely superseded observation"
-                                    : compactProof === "memoryQueryGuards"
-                                      ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
-                                      : compactProof === "memoryQueryNoGrant"
-                                        ? "denies semantic query admission without the original frozen write intersection"
-                                        : compactProof === "memoryQueryNoAccess"
-                                          ? "denies semantic query admission for an original no-memory role"
-                                          : compactProof === "memoryQueryBudget"
-                                            ? "retains authenticated query failure when the original operation budget cannot fund embedding"
-                                            : compactProof === "memoryQuerySecret"
-                                              ? "rejects a newly learned escaped query credential before embedding reservation"
-                                              : compactProof === "memoryQueryModelUnknown"
-                                                ? "retains an unknown query embedding charge until authenticated drain without resend"
-                                                : compactProof === "memoryQuerySearchUnknown"
-                                                  ? "settles an uncertain query search only after its exact authenticated late drain"
-                                                  : compactProof === "successorReplay"
-                                                    ? "retained compact replay preserves the latest successful native head without another execution"
-                                                    : compactProof?.startsWith("memoryServer")
-                                                      ? `production memory model forwarding fences the final wait: ${compactProof}`
-                                                      : compactProof?.startsWith("memoryForward")
-                                                        ? `captured runtime denies ${compactProof} before transport without holding SQL`
-                                                        : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+    compactProof?.startsWith("memoryRoot")
+      ? `qualifies memory settlement against original root authority: ${compactProof}`
+      : compactProof?.startsWith("memorySubscription")
+        ? `settles memory and monitored Pi usage atomically: ${compactProof}`
+        : (compactProof?.includes("Shared") && compactProof.includes("Query")) ||
+            compactProof?.startsWith("memoryQueryShared")
+          ? `shared semantic query preserves recipient accounting and exact owner authority: ${compactProof}`
+          : compactProof === undefined
+            ? "managed compact transfers current required context after durable association and replays without another execution"
+            : compactProof === "memoryAdmission"
+              ? "retains exact memory selection against the executing operation before processing and replays after terminal"
+              : compactProof === "memoryAccounting" || compactProof === "memoryLiquidAccounting"
+                ? `accounts memory and ordinary stages against the same executing operation and shared capacity: ${compactProof}`
+                : compactProof === "memorySharedRoot"
+                  ? "reads shared root usage outside the charged child binding page without assigning parent charges"
+                  : compactProof === "memoryPipeline"
+                    ? "processes an exact admitted source through shared model accounting and the configured index consumer"
+                    : compactProof === "memoryFailure"
+                      ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
+                      : compactProof === "memorySecret"
+                        ? "rejects a newly learned escaped source secret before memory extraction reservation"
+                        : compactProof === "memoryEmbeddingSecret"
+                          ? "rejects newly learned escaped embedding text before its memory reservation"
+                          : compactProof === "memoryCleanup"
+                            ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
+                            : compactProof === "memoryHumanRetraction"
+                              ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
+                              : compactProof === "memoryCleanupGuards"
+                                ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
+                                : compactProof === "memoryQuery"
+                                  ? "admits an explicit semantic query through the executing task bridge before forward stages"
+                                  : compactProof === "memoryQueryPipeline"
+                                    ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
+                                    : compactProof === "memoryQueryMixed"
+                                      ? "retains current semantic context when completed search also returns a genuinely superseded observation"
+                                      : compactProof === "memoryQueryGuards"
+                                        ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
+                                        : compactProof === "memoryQueryNoGrant"
+                                          ? "denies semantic query admission without the original frozen write intersection"
+                                          : compactProof === "memoryQueryNoAccess"
+                                            ? "denies semantic query admission for an original no-memory role"
+                                            : compactProof === "memoryQueryBudget"
+                                              ? "retains authenticated query failure when the original operation budget cannot fund embedding"
+                                              : compactProof === "memoryQuerySecret"
+                                                ? "rejects a newly learned escaped query credential before embedding reservation"
+                                                : compactProof === "memoryQueryModelUnknown"
+                                                  ? "retains an unknown query embedding charge until authenticated drain without resend"
+                                                  : compactProof === "memoryQuerySearchUnknown"
+                                                    ? "settles an uncertain query search only after its exact authenticated late drain"
+                                                    : compactProof === "successorReplay"
+                                                      ? "retained compact replay preserves the latest successful native head without another execution"
+                                                      : compactProof?.startsWith("memoryServer")
+                                                        ? `production memory model forwarding fences the final wait: ${compactProof}`
+                                                        : compactProof?.startsWith("memoryForward")
+                                                          ? `captured runtime denies ${compactProof} before transport without holding SQL`
+                                                          : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
+          const memoryRoot = compactProof?.startsWith("memoryRoot") === true;
+          const hardRoot = compactProof?.startsWith("memoryRootHard") === true;
+          const forgedRoot = compactProof === "memoryRootHardForged";
+          const memoryRootDenied =
+            forgedRoot ||
+            compactProof === "memoryRootMissingGrant" ||
+            compactProof === "memoryRootDescendantGrant";
+          const lunaChild = compactProof === "memoryRootLunaControl" || forgedRoot;
+          const childCeiling = compactProof === "memoryRootLing64000" ? 64_000 : 1000;
+          let memoryRootChecked = false;
           const subscriptionMemory = compactProof?.startsWith("memorySubscription") === true;
           const memoryUnknown = compactProof === "memorySubscriptionUnknown";
           const piUnknown = compactProof === "memorySubscriptionPiUnknown";
@@ -10202,6 +10273,7 @@ for (const compactProof of [
             compactProof === "memoryFailure" || compactProof === "memorySourceJoinedRecovery";
           const memoryProof = compactProof?.startsWith("memory") === true;
           const accountingProof =
+            memoryRoot ||
             subscriptionMemory ||
             compactProof === "memoryAccounting" ||
             compactProof === "memoryLiquidAccounting" ||
@@ -10454,7 +10526,9 @@ for (const compactProof of [
           });
           const f = yield* requiredTransferFixture(
             false,
-            compactProof === "memorySharedRoot" || compactProof === "memoryCompanionSharedRoot",
+            memoryRoot ||
+              compactProof === "memorySharedRoot" ||
+              compactProof === "memoryCompanionSharedRoot",
             undefined,
             memoryProof,
             compactProof === "memoryQueryNoGrant"
@@ -10465,15 +10539,27 @@ for (const compactProof of [
                   ? "shared"
                   : "project",
             undefined,
-            subscriptionMemory
-              ? { ...subscriptionRuntimeProfile, role: "implementer", maxInputTokens: 32_768 }
-              : selectedSkill
-                ? {
-                    ...basicRuntimeProfile,
-                    roleSkillIds: [selectedSkill.manifest.id],
-                    skillIds: [selectedSkill.manifest.id],
-                  }
-                : undefined,
+            memoryRoot
+              ? {
+                  ...subscriptionRuntimeProfile,
+                  role: "implementer",
+                  model: hardRoot ? model : "gpt-6-luna",
+                  maxInputTokens: lunaChild ? 16_384 : 100,
+                  maxOutputTokens: lunaChild ? 2048 : 100,
+                  memoryChild: {
+                    model: lunaChild ? "gpt-6-luna" : model,
+                    maximumTokens: childCeiling,
+                  },
+                }
+              : subscriptionMemory
+                ? { ...subscriptionRuntimeProfile, role: "implementer", maxInputTokens: 32_768 }
+                : selectedSkill
+                  ? {
+                      ...basicRuntimeProfile,
+                      roleSkillIds: [selectedSkill.manifest.id],
+                      skillIds: [selectedSkill.manifest.id],
+                    }
+                  : undefined,
             forwardProof || serverCurrent ? forwardRuntimeCheck : undefined,
           ).pipe(
             Effect.provideService(Authorization.ProjectTeamAuthorization, returnAuthorization),
@@ -10573,7 +10659,7 @@ for (const compactProof of [
                   ),
                 );
           let runInstance = f.instance;
-          if (subscriptionMemory) {
+          if (subscriptionMemory || (memoryRoot && lunaChild)) {
             const deadline = f.snapshot.intent.limits.rootDeadlineAtMs;
             const access = `header.${Buffer.from(
               json({
@@ -10886,7 +10972,7 @@ for (const compactProof of [
                       let settleSubscriptionPi: Effect.Effect<void, Cause.UnknownError> | undefined;
                       const failedUsage =
                         accountingProof && input.operation.operationId === failedUsageOperationId;
-                      if (input.operation.operationKind !== "initialize") {
+                      if (input.operation.operationKind !== "initialize" && !memoryRoot) {
                         for (const requestId of subscriptionMemory ? [1, 2] : [1]) {
                           const fields = {
                             workerId: input.identity.workerId,
@@ -14173,7 +14259,144 @@ for (const compactProof of [
                                       }),
                                     ),
                             });
-                            if (subscriptionMemory) {
+                            if (memoryRoot) {
+                              expect(admitted.operation.operationMaximumTokens).toBe(childCeiling);
+                              const held = yield* ledger.reserve(admitted, {
+                                phase: "extract",
+                                routeId: "controlled-command-code",
+                                requestId: 1,
+                                maxInputTokens: 90,
+                                maxOutputTokens: 10,
+                                deadlineAtMs: row.deadline_at_ms,
+                              });
+                              const settlement = {
+                                ...held.reservation,
+                                reservationId: held.reservationId,
+                                outcome: "reported" as const,
+                                chargedInputTokens: 35,
+                                chargedOutputTokens: 5,
+                                reportedModel: held.reservation.model,
+                                reportedInputTokens: 35,
+                                reportedOutputTokens: 5,
+                                transportDrained: true,
+                              };
+                              drainedMemory.add(held.reservationId);
+                              if (forgedRoot)
+                                yield* f.sql`INSERT INTO project_team_pi_subscription_grant
+                                (environment_id,project_id,root_task_id,model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms)
+                                VALUES('environment',${projectId},${f.snapshot.intent.limits.rootTaskId},'gpt-6-luna','openai-subscription-luna',64000,300000,${admitted.operation.rootDeadlineAtMs})`;
+                              if (memoryRootDenied) {
+                                const before =
+                                  yield* f.sql`SELECT * FROM project_team_model_request`;
+                                expect(
+                                  (yield* ledger.settle(settlement).pipe(Effect.result))._tag,
+                                ).toBe("Failure");
+                                expect(
+                                  yield* f.sql`SELECT * FROM project_team_model_request`,
+                                ).toEqual(before);
+                              } else {
+                                const fresh = yield* makeProjectTeamContext({
+                                  environmentId: "environment",
+                                  maximumEnvironmentModelCalls: 128,
+                                });
+                                const heldContext = yield* f.reader.readRequired(snapshot);
+                                expect(
+                                  (yield* fresh.readRequired(snapshot)).required.remaining,
+                                ).toEqual(heldContext.required.remaining);
+                                expect(heldContext.required.remaining).toMatchObject(
+                                  hardRoot
+                                    ? { rootRemainingTokens: 63_900 }
+                                    : {
+                                        rootRemainingTokens: 64_000,
+                                        policy: {
+                                          observedChargedTokens: 0,
+                                          nominalHeldTokens: 100,
+                                        },
+                                      },
+                                );
+                                expect(yield* readRecordedUsage()).toMatchObject([
+                                  {
+                                    availability: "available",
+                                    root: { chargedTokens: 0, reservedTokens: 100 },
+                                  },
+                                ]);
+                                const before =
+                                  yield* f.sql`SELECT * FROM project_team_model_request`;
+                                for (const [bindingId, property, corrupt] of [
+                                  [f.binding.recordId, "parentRunId", "foreign-parent"],
+                                  [
+                                    admitted.operation.rootBindingId,
+                                    "model",
+                                    hardRoot ? "gpt-6-luna" : model,
+                                  ],
+                                ] as const) {
+                                  const events = yield* f.sql<{
+                                    id: string;
+                                    payload: string;
+                                  }>`SELECT event_id AS id,payload_json AS payload
+                                    FROM project_work_events WHERE project_id=${projectId}
+                                    AND event_type='project-work.foundation.recorded'
+                                    AND json_extract(payload_json,'$.record.recordId')=${bindingId}
+                                    AND json_extract(payload_json,'$.record.revision')=0`;
+                                  if (events.length !== 1 || !events[0])
+                                    return yield* Effect.die(
+                                      "Exact original ancestry event absent",
+                                    );
+                                  const event = events[0];
+                                  yield* f.sql`UPDATE project_work_events SET payload_json=json_set(payload_json,${"$.record." + property},${corrupt})
+                                    WHERE event_id=${event.id}`;
+                                  expect(
+                                    (yield* ledger.settle(settlement).pipe(Effect.result))._tag,
+                                  ).toBe("Failure");
+                                  expect(
+                                    yield* f.sql`SELECT * FROM project_team_model_request`,
+                                  ).toEqual(before);
+                                  yield* f.sql`UPDATE project_work_events SET payload_json=${event.payload} WHERE event_id=${event.id}`;
+                                }
+                                const receipt = yield* ledger.settle(settlement);
+                                expect(yield* ledger.settle(settlement)).toEqual(receipt);
+                                expect(
+                                  yield* f.sql`SELECT status,charged_input_tokens,charged_output_tokens FROM project_team_model_request`,
+                                ).toEqual([
+                                  {
+                                    status: "reported",
+                                    charged_input_tokens: 35,
+                                    charged_output_tokens: 5,
+                                  },
+                                ]);
+                                if (childCeiling === 1000)
+                                  expect(
+                                    (yield* ledger
+                                      .reserve(admitted, {
+                                        phase: "extract",
+                                        routeId: "controlled-command-code",
+                                        requestId: 2,
+                                        maxInputTokens: 960,
+                                        maxOutputTokens: 1,
+                                        deadlineAtMs: row.deadline_at_ms,
+                                      })
+                                      .pipe(Effect.result))._tag,
+                                  ).toBe("Failure");
+                                const current = yield* f.reader.readRequired(snapshot);
+                                expect(
+                                  (yield* fresh.readRequired(snapshot)).required.remaining,
+                                ).toEqual(current.required.remaining);
+                                expect(current.required.remaining).toMatchObject(
+                                  hardRoot
+                                    ? { rootRemainingTokens: 63_960 }
+                                    : {
+                                        rootRemainingTokens: 63_960,
+                                        policy: { observedChargedTokens: 40 },
+                                      },
+                                );
+                                if (hardRoot)
+                                  expect(current.required.remaining.policy).toBeUndefined();
+                                expect(yield* readRecordedUsage()).toMatchObject([
+                                  { availability: "available", root: { chargedTokens: 40 } },
+                                ]);
+                              }
+                              memoryRootChecked = true;
+                            } else if (subscriptionMemory) {
                               const held = yield* ledger.reserve(admitted, {
                                 phase: "extract",
                                 routeId: "controlled-command-code",
@@ -14846,6 +15069,12 @@ for (const compactProof of [
               },
             ]);
           }
+          if (memoryRoot && !hardRoot && compactProof !== "memoryRootMissingGrant") {
+            yield* f.sql`INSERT INTO project_team_pi_subscription_grant
+              (environment_id,project_id,root_task_id,model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms)
+              VALUES('environment',${projectId},${compactProof === "memoryRootDescendantGrant" ? f.binding.taskId : f.snapshot.intent.limits.rootTaskId},
+              'gpt-6-luna','openai-subscription-luna',64000,300000,${f.root.snapshot.intent.limits.rootDeadlineAtMs})`;
+          }
           const initialized = yield* runInstance.prepareOperation(
             {
               threadId,
@@ -14873,7 +15102,7 @@ for (const compactProof of [
           });
           yield* stage("session-bound");
           yield* stage("assignment-intent");
-          if (accountingProof && !subscriptionMemory) {
+          if (accountingProof && !subscriptionMemory && !memoryRoot) {
             expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
             expect(yield* readRecordedUsage()).toMatchObject([
               {
@@ -14898,6 +15127,14 @@ for (const compactProof of [
             () => Effect.void,
           );
           const assignmentResult = yield* assigned.run.pipe(Effect.result);
+          if (memoryRoot) {
+            expect(memoryRootChecked).toBe(true);
+            if (!memoryRootDenied) {
+              expect(diagnostic).toBe("");
+              expect(assignmentResult._tag).toBe("Success");
+            }
+            return;
+          }
           if (subscriptionMemory) {
             expect(diagnostic).toBe("");
             expect(subscriptionMemoryChecked).toBe(true);
