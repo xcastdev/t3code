@@ -10,6 +10,7 @@
  * @module ProviderServiceLive
  */
 import {
+  canonicalProjectWorkPayload,
   CommandId,
   EventId,
   MessageId,
@@ -100,6 +101,12 @@ import {
 } from "../ProviderTurnPublications.ts";
 import { makeProviderManagedSessions } from "../ProviderManagedSessions.ts";
 import { getPiAdapterFailureCode } from "./PiAdapter.ts";
+import type { PiManagedRuntimeError } from "../pi/PiManagedRuntime.ts";
+import { ProjectTeamPiRuntime } from "../../projectWork/ProjectTeamPiRuntime.ts";
+import type {
+  CompactCallerRequest,
+  CompactCallerReservation,
+} from "../../projectWork/ProjectTeamCompactCaller.ts";
 import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
@@ -590,6 +597,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const pathService = yield* Path.Path;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const turnPublications = yield* makeProviderTurnPublications();
+  const piRuntime = yield* Effect.serviceOption(ProjectTeamPiRuntime);
   const managedSessions = yield* makeProviderManagedSessions((id) =>
     Effect.gen(function* () {
       const info = yield* registry.getInstanceInfo(id);
@@ -3338,7 +3346,189 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
-  const compactThread: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThread")(
+  // Open-scope correlation only; durable reservation and readiness checks own authority.
+  const compactReservations = new Map<
+    ThreadId,
+    Map<
+      MessageId,
+      {
+        readonly instanceId: ProviderInstanceId;
+        readonly request: CompactCallerRequest;
+        readonly reservation: CompactCallerReservation;
+        users: number;
+        released: boolean;
+      }
+    >
+  >();
+  const sameCompactReceipt = (left: CompactCallerReservation, right: CompactCallerReservation) =>
+    left.dispatchId === right.dispatchId &&
+    left.bindingId === right.bindingId &&
+    left.generation === right.generation &&
+    left.requestId === right.requestId &&
+    left.predecessorOperationId === right.predecessorOperationId &&
+    left.deadlineAtMs === right.deadlineAtMs;
+  const compactCallerError = (cause: PiManagedRuntimeError) =>
+    new ProviderAdapterRequestError({
+      provider: "piAgent",
+      method: "thread/compact",
+      detail: cause.detail,
+      cause,
+    });
+  const reserveThreadCompaction: ProviderServiceMethod<"reserveThreadCompaction"> = Effect.fn(
+    "ProviderService.reserveThreadCompaction",
+  )(function* (rawRequest) {
+    const request = yield* Effect.try({
+      try: () => structuredClone(rawRequest),
+      catch: (cause) =>
+        toValidationError(
+          "ProviderService.reserveThreadCompaction",
+          "Invalid compaction request.",
+          cause,
+        ),
+    });
+    const routed = yield* resolveRoutableSession({
+      threadId: request.threadId,
+      operation: "ProviderService.reserveThreadCompaction",
+      allowRecovery: false,
+    });
+    if (routed.adapter.provider !== "piAgent" || Option.isNone(piRuntime))
+      return yield* toValidationError(
+        "ProviderService.reserveThreadCompaction",
+        "Managed Pi compaction is unavailable.",
+      );
+    const runtime = piRuntime.value;
+    const previous = compactReservations.get(request.threadId)?.get(request.requestId);
+    if (
+      previous &&
+      (previous.released ||
+        previous.instanceId !== routed.instanceId ||
+        canonicalProjectWorkPayload(previous.request) !== canonicalProjectWorkPayload(request))
+    )
+      return yield* toValidationError(
+        "ProviderService.reserveThreadCompaction",
+        "Compaction reservation request changed or was released.",
+      );
+    const reservation = yield* Effect.acquireRelease(
+      runtime
+        .reserveCompaction(routed.instanceId, request)
+        .pipe(Effect.mapError(compactCallerError)),
+      (receipt) =>
+        receipt.created
+          ? Effect.gen(function* () {
+              const entry = compactReservations.get(request.threadId)?.get(request.requestId);
+              if (entry && sameCompactReceipt(entry.reservation, receipt)) entry.released = true;
+              yield* runtime.abandonCompaction(routed.instanceId, request).pipe(
+                Effect.catch((cause) =>
+                  Effect.logWarning("managed compaction abandonment failed", {
+                    threadId: request.threadId,
+                    cause,
+                  }),
+                ),
+              );
+            })
+          : Effect.void,
+    );
+    yield* Effect.acquireRelease(
+      Effect.suspend(() => {
+        let requests = compactReservations.get(request.threadId);
+        let entry = requests?.get(request.requestId);
+        if (
+          entry &&
+          (entry.released ||
+            entry.instanceId !== routed.instanceId ||
+            canonicalProjectWorkPayload(entry.request) !== canonicalProjectWorkPayload(request) ||
+            !sameCompactReceipt(entry.reservation, reservation))
+        )
+          return Effect.fail(
+            toValidationError(
+              "ProviderService.reserveThreadCompaction",
+              "Compaction reservation receipt changed.",
+            ),
+          );
+        if (!requests) {
+          requests = new Map();
+          compactReservations.set(request.threadId, requests);
+        }
+        if (!entry) {
+          entry = {
+            instanceId: routed.instanceId,
+            request,
+            reservation: { ...reservation },
+            users: 0,
+            released: false,
+          };
+          requests.set(request.requestId, entry);
+        }
+        entry.users++;
+        return Effect.succeed(entry);
+      }),
+      (entry) =>
+        Effect.sync(() => {
+          entry.users--;
+          const requests = compactReservations.get(request.threadId);
+          if (entry.users === 0 && requests?.get(request.requestId) === entry) {
+            requests.delete(request.requestId);
+            if (requests.size === 0) compactReservations.delete(request.threadId);
+          }
+        }),
+    );
+    return { ...reservation };
+  });
+
+  const awaitThreadCompactionReady: ProviderServiceMethod<"awaitThreadCompactionReady"> = Effect.fn(
+    "ProviderService.awaitThreadCompactionReady",
+  )(function* (threadId, requestId) {
+    const held = compactReservations.get(threadId)?.get(requestId);
+    if (!held || held.released || Option.isNone(piRuntime))
+      return yield* toValidationError(
+        "ProviderService.awaitThreadCompactionReady",
+        "Compaction requires an open reservation scope.",
+      );
+    const routed = yield* resolveRoutableSession({
+      threadId,
+      operation: "ProviderService.awaitThreadCompactionReady",
+      allowRecovery: false,
+    });
+    const compaction = routed.adapter.compaction;
+    if (
+      routed.instanceId !== held.instanceId ||
+      routed.adapter.provider !== "piAgent" ||
+      compaction?.type !== "native" ||
+      !compaction.awaitIdle
+    )
+      return yield* toValidationError(
+        "ProviderService.awaitThreadCompactionReady",
+        "Managed Pi compaction adapter changed.",
+      );
+    yield* compaction.awaitIdle(threadId, held.reservation.predecessorOperationId);
+    const current = yield* registry.getByInstance(held.instanceId);
+    if (current !== routed.adapter)
+      return yield* toValidationError(
+        "ProviderService.awaitThreadCompactionReady",
+        "Pi adapter changed while awaiting compaction idle.",
+      );
+    if (held.released || compactReservations.get(threadId)?.get(requestId) !== held)
+      return yield* toValidationError(
+        "ProviderService.awaitThreadCompactionReady",
+        "Compaction reservation scope closed.",
+      );
+    const ready = yield* piRuntime.value
+      .assertCompactionReady(held.instanceId, held.request)
+      .pipe(Effect.mapError(compactCallerError));
+    const readyAdapter = yield* registry.getByInstance(held.instanceId);
+    if (
+      held.released ||
+      compactReservations.get(threadId)?.get(requestId) !== held ||
+      readyAdapter !== routed.adapter ||
+      !sameCompactReceipt(held.reservation, ready)
+    )
+      return yield* toValidationError(
+        "ProviderService.awaitThreadCompactionReady",
+        "Compaction readiness receipt changed.",
+      );
+  });
+
+  const compactThreadNow: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThreadNow")(
     function* (threadId, modelSelection, requestId) {
       const routed = yield* resolveRoutableSession({
         threadId,
@@ -3466,6 +3656,41 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* analytics.record("provider.thread.compacted", {
         provider: routed.adapter.provider,
       });
+    },
+  );
+
+  const compactThread: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThread")(
+    function* (threadId, modelSelection, requestId) {
+      const routed = yield* resolveRoutableSession({
+        threadId,
+        operation: "ProviderService.compactThread",
+        allowRecovery: false,
+      });
+      if (routed.adapter.provider !== "piAgent")
+        return yield* compactThreadNow(threadId, modelSelection, requestId);
+      if (!requestId)
+        return yield* toValidationError(
+          "ProviderService.compactThread",
+          "Pi compaction requires a durable request identity.",
+        );
+      const request = yield* Effect.try({
+        try: () =>
+          structuredClone({
+            threadId,
+            requestId,
+            ...(modelSelection === undefined ? {} : { modelSelection }),
+          }),
+        catch: (cause) =>
+          toValidationError("ProviderService.compactThread", "Invalid compaction request.", cause),
+      });
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* reserveThreadCompaction(request);
+          yield* awaitThreadCompactionReady(threadId, requestId);
+          // Resolve the current adapter instead of lending the reservation-time adapter.
+          yield* compactThreadNow(threadId, request.modelSelection, requestId);
+        }),
+      );
     },
   );
 
@@ -4085,6 +4310,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     stopAgent,
     getAgentCapabilities,
     readAgentTranscriptPage,
+    reserveThreadCompaction,
+    awaitThreadCompactionReady,
     compactThread,
     interruptTurn,
     respondToRequest,

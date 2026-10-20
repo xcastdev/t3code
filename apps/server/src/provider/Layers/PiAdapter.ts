@@ -1143,6 +1143,25 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
     sendTurn,
     compaction: {
       type: "native",
+      awaitIdle: Effect.fn("PiAdapter.awaitCompactionIdle")(
+        function* (threadId, predecessorOperationId) {
+          const context = yield* owned(threadId);
+          const active = context.active;
+          const operation = active?.operation;
+          const expectedHead = context.lastOperationId;
+          if (active !== undefined && operation?.operation.operationId !== predecessorOperationId)
+            return yield* invalid("compact", "Pi compaction predecessor changed.");
+          if (active) yield* Deferred.await(active.done);
+          const current = yield* owned(threadId);
+          if (
+            current !== context ||
+            current.active !== undefined ||
+            current.lastOperationId !== expectedHead ||
+            active?.operation !== operation
+          )
+            return yield* invalid("compact", "Pi session changed while awaiting compaction idle.");
+        },
+      ),
       start: Effect.fn("PiAdapter.compact")(function* (threadId, modelSelection, requestId) {
         const context = yield* owned(threadId);
         if (!context.session)

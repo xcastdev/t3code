@@ -34,6 +34,11 @@ import type {
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
+import type * as Scope from "effect/Scope";
+import type {
+  CompactCallerRequest,
+  CompactCallerReservation,
+} from "../../projectWork/ProjectTeamCompactCaller.ts";
 
 import type { ProviderServiceError } from "../Errors.ts";
 import type {
@@ -97,6 +102,15 @@ export interface ProviderServiceShape {
     readonly sourceCursor?: string;
     readonly limit: number;
   }) => Effect.Effect<ProviderAgentTranscriptPage | undefined, ProviderServiceError>;
+
+  readonly reserveThreadCompaction: (
+    request: CompactCallerRequest,
+  ) => Effect.Effect<CompactCallerReservation, ProviderServiceError, Scope.Scope>;
+
+  readonly awaitThreadCompactionReady: (
+    threadId: ThreadId,
+    requestId: MessageId,
+  ) => Effect.Effect<void, ProviderServiceError>;
 
   readonly compactThread: (
     threadId: ThreadId,

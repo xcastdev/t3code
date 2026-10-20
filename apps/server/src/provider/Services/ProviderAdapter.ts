@@ -68,6 +68,12 @@ export const projectMcpTokenEnvironmentKey = (server: Pick<McpIssuedProjectServe
 export type ProviderCompaction<TError> =
   | {
       readonly type: "native";
+      /** Wait for the captured predecessor to leave the adapter's active slot.
+       * Durable success/accounting remains the managed caller's responsibility. */
+      readonly awaitIdle?: (
+        threadId: ThreadId,
+        predecessorOperationId: string,
+      ) => Effect.Effect<void, TError>;
       readonly start: (
         threadId: ThreadId,
         modelSelection?: ProviderSendTurnInput["modelSelection"],

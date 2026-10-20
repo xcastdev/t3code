@@ -832,6 +832,147 @@ const makeFake = Effect.fn("PiAdapter.test.makeFake")(function* (instance = inst
   };
 });
 
+for (const outcome of ["success", "canceled", "failed"] as const)
+  it.effect(`compaction idle waits for the captured live prompt and rechecks ${outcome}`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      yield* adapter.startSession(startInput);
+      yield* adapter.sendTurn({ threadId, input: "prompt" });
+      const operation = fake.operations[1]!;
+      const compaction = adapter.compaction;
+      if (compaction?.type !== "native" || !compaction.awaitIdle)
+        return yield* Effect.die("Missing native idle wait");
+      const waiting = yield* Effect.forkScoped(
+        Effect.exit(compaction.awaitIdle(threadId, operation.prepared.operation.operationId)),
+        { startImmediately: true },
+      );
+      expect(waiting.pollUnsafe()).toBeUndefined();
+      expect(Exit.isFailure(yield* Effect.exit(compaction.awaitIdle(threadId, "foreign")))).toBe(
+        true,
+      );
+      // A producer terminal event is not the adapter's operation completion.
+      yield* operation.observe({
+        ...item(operation),
+        type: "turn.completed",
+        payload: { state: "completed" },
+      });
+      expect(waiting.pollUnsafe()).toBeUndefined();
+      yield* fake.settle(operation, outcome);
+      const result = yield* Fiber.join(waiting);
+      expect(Exit.isSuccess(result)).toBe(outcome !== "failed");
+      if (outcome !== "failed") {
+        expect(
+          Exit.isSuccess(
+            yield* Effect.exit(
+              compaction.awaitIdle(threadId, operation.prepared.operation.operationId),
+            ),
+          ),
+        ).toBe(true);
+      }
+      expect(fake.requests).toHaveLength(2);
+    }).pipe(Effect.scoped),
+  );
+
+it.effect("published adapter terminal precedes compaction idle completion", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    let finishing = false;
+    let observedPublication = false;
+    let pendingAtPublication = false;
+    let waiting: Fiber.Fiber<void, ProviderAdapterError> | undefined;
+    const original = yield* Effect.tracer;
+    // Inspect the actual terminal publisher's return before the operation's
+    // finalizer clears active and completes done.
+    const tracer: Tracer.Tracer = {
+      span(options) {
+        const span = original.span(options);
+        if (options.name !== "PiAdapter.emit" || !finishing) return span;
+        return {
+          ...span,
+          end(endTime, exit) {
+            span.end(endTime, exit);
+            observedPublication = true;
+            pendingAtPublication = waiting !== undefined && waiting.pollUnsafe() === undefined;
+          },
+        };
+      },
+      context: (primitive, fiber) => primitive["~effect/Effect/evaluate"](fiber),
+    };
+    yield* Effect.gen(function* () {
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      yield* adapter.startSession(startInput);
+      const events = yield* subscribe(adapter.streamEvents);
+      yield* adapter.sendTurn({ threadId, input: "prompt" });
+      const operation = fake.operations[1]!;
+      const compaction = adapter.compaction;
+      if (compaction?.type !== "native" || !compaction.awaitIdle)
+        return yield* Effect.die("Missing native idle wait");
+      const started = yield* Queue.take(events);
+      expect(started.type).toBe("turn.started");
+      waiting = yield* Effect.forkScoped(
+        compaction.awaitIdle(threadId, operation.prepared.operation.operationId),
+        { startImmediately: true },
+      );
+      expect(waiting.pollUnsafe()).toBeUndefined();
+      finishing = true;
+      yield* fake.settle(operation, "success");
+      const terminal = yield* Queue.take(events);
+      expect(terminal.type).toBe("turn.completed");
+      yield* Fiber.join(waiting);
+      expect(observedPublication).toBe(true);
+      expect(pendingAtPublication).toBe(true);
+      expect(fake.requests).toHaveLength(2);
+    }).pipe(Effect.provideService(Tracer.Tracer, tracer));
+  }).pipe(Effect.scoped),
+);
+
+for (const stop of ["stopSession", "stopAll"] as const)
+  it.effect(`compaction idle rejects a predecessor whose context closes through ${stop}`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      yield* adapter.startSession(startInput);
+      yield* adapter.sendTurn({ threadId, input: "prompt" });
+      const operation = fake.operations[1]!;
+      const compaction = adapter.compaction;
+      if (compaction?.type !== "native" || !compaction.awaitIdle)
+        return yield* Effect.die("Missing native idle wait");
+      const waiting = yield* Effect.forkScoped(
+        Effect.exit(compaction.awaitIdle(threadId, operation.prepared.operation.operationId)),
+        { startImmediately: true },
+      );
+      expect(waiting.pollUnsafe()).toBeUndefined();
+      if (stop === "stopSession") yield* adapter.stopSession(threadId);
+      else yield* adapter.stopAll();
+      expect(Exit.isFailure(yield* Fiber.join(waiting))).toBe(true);
+      expect(fake.requests).toHaveLength(2);
+    }).pipe(Effect.scoped),
+  );
+
+it.effect("canceling an idle waiter leaves the original prompt running", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    yield* adapter.startSession(startInput);
+    yield* adapter.sendTurn({ threadId, input: "prompt" });
+    const operation = fake.operations[1]!;
+    const compaction = adapter.compaction;
+    if (compaction?.type !== "native" || !compaction.awaitIdle)
+      return yield* Effect.die("Missing native idle wait");
+    const waiting = yield* Effect.forkScoped(
+      compaction.awaitIdle(threadId, operation.prepared.operation.operationId),
+      { startImmediately: true },
+    );
+    yield* Fiber.interrupt(waiting);
+    expect(fake.state.interruptCalls).toBe(0);
+    expect(fake.state.stopCalls).toBe(0);
+    expect(yield* Deferred.isDone(operation.result)).toBe(false);
+    yield* fake.settle(operation, "success");
+    yield* compaction.awaitIdle(threadId, operation.prepared.operation.operationId);
+  }).pipe(Effect.scoped),
+);
+
 it.effect(
   "native compact retains its request identity and publishes only a joined successful terminal",
   () =>
@@ -939,6 +1080,8 @@ it.effect("retained compact receipt keeps the adapter at its audited successor s
     yield* Fiber.join(two);
     expect((yield* Queue.take(events)).type).toBe("thread.state.changed");
     const latest = yield* adapter.listSessions();
+    if (!compaction.awaitIdle) return yield* Effect.die("Missing native idle wait");
+    yield* compaction.awaitIdle(threadId, first.prepared.operation.operationId);
     expect(yield* compaction.start(threadId, undefined, MessageId.make("adapter-first"))).toEqual({
       kind: "retained",
     });
@@ -957,7 +1100,9 @@ it.effect("retained compact receipt keeps the adapter at its audited successor s
       resumeCursor: fake.state.session.resumeCursor,
     });
     const replay = replacement.compaction;
-    if (replay?.type !== "native") return yield* Effect.die("Missing replacement compact port");
+    if (replay?.type !== "native" || !replay.awaitIdle)
+      return yield* Effect.die("Missing replacement compact port");
+    yield* replay.awaitIdle(threadId, first.prepared.operation.operationId);
     expect(yield* replay.start(threadId, undefined, MessageId.make("adapter-first"))).toEqual({
       kind: "retained",
     });

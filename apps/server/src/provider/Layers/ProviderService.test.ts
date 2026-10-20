@@ -44,6 +44,7 @@ import { it, assert, describe, vi } from "@effect/vitest";
 import { afterAll } from "vite-plus/test";
 
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -76,6 +77,14 @@ import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
 import { makeProviderServiceLive } from "./ProviderService.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
+import {
+  ProjectTeamPiRuntime,
+  makeProjectTeamPiRuntime,
+} from "../../projectWork/ProjectTeamPiRuntime.ts";
+import type {
+  CompactCallerRequest,
+  CompactCallerReservation,
+} from "../../projectWork/ProjectTeamCompactCaller.ts";
 import { PiManagedRuntimeError, type PiManagedRuntimeInstance } from "../pi/PiManagedRuntime.ts";
 import {
   sendManagedProviderAssignment,
@@ -2578,6 +2587,366 @@ agentActionsService.layer("ProviderService child actions and transcript routing"
     }),
   );
 });
+
+const makeCompactCallerFixture = Effect.fn("ProviderService.test.compactCaller")(function* () {
+  const instanceId = ProviderInstanceId.make("managed-compact-pi");
+  const pi = makeFakeCodexAdapter(ProviderDriverKind.make("piAgent"));
+  const idleEntered = yield* Deferred.make<void>();
+  const idleRelease = yield* Deferred.make<void>();
+  const readyEntered = yield* Deferred.make<void>();
+  const readyRelease = yield* Deferred.make<void>();
+  const calls: string[] = [];
+  const state = { authority: true, consumed: false, released: false, holdReady: false };
+  const receipts = new Map<MessageId, CompactCallerReservation>();
+  let adapter: ProviderAdapterShape<ProviderAdapterError> = {
+    ...pi.adapter,
+    compaction: {
+      type: "native",
+      awaitIdle: (_threadId, predecessor) =>
+        Effect.gen(function* () {
+          calls.push(`idle:${predecessor}`);
+          yield* Deferred.succeed(idleEntered, undefined);
+          yield* Deferred.await(idleRelease);
+        }),
+      start: (threadId, selection, requestId) =>
+        Effect.gen(function* () {
+          calls.push("original:start");
+          state.consumed = true;
+          yield* pi.compactThread(threadId, selection, requestId);
+        }),
+    },
+  };
+  const registry = makeStaticInstanceRegistry([[instanceId, adapter]]);
+  const runtime = yield* makeProjectTeamPiRuntime();
+  const denied = () =>
+    new PiManagedRuntimeError({
+      code: "denied",
+      detail: "Compaction authority is no longer current",
+    });
+  const reserveCompaction = (_instanceId: ProviderInstanceId, request: CompactCallerRequest) =>
+    Effect.gen(function* () {
+      calls.push("reserve");
+      if (!state.authority || state.released) return yield* denied();
+      const previous = receipts.get(request.requestId);
+      if (previous) return { ...previous, created: false };
+      const reservation: CompactCallerReservation = {
+        dispatchId: "dispatch",
+        bindingId: "binding",
+        generation: 7,
+        requestId: request.requestId,
+        predecessorOperationId: "prompt-predecessor",
+        deadlineAtMs: 300_000,
+        created: true,
+      };
+      receipts.set(request.requestId, reservation);
+      return reservation;
+    });
+  const assertCompactionReady = (_instanceId: ProviderInstanceId, request: CompactCallerRequest) =>
+    Effect.gen(function* () {
+      calls.push("ready");
+      yield* Deferred.succeed(readyEntered, undefined);
+      if (state.holdReady) yield* Deferred.await(readyRelease);
+      if (!state.authority || state.released) return yield* denied();
+      const reservation = receipts.get(request.requestId);
+      if (!reservation) return yield* denied();
+      return { ...reservation, created: false };
+    });
+  const handlersScope = yield* Scope.make();
+  yield* Effect.addFinalizer(() => Scope.close(handlersScope, Exit.void));
+  yield* runtime
+    .installCompactionHandlers({
+      reserveCompaction,
+      assertCompactionReady,
+      abandonCompaction: () =>
+        Effect.sync(() => {
+          calls.push("abandon");
+          if (!state.consumed) state.released = true;
+        }),
+    })
+    .pipe(Effect.provideService(Scope.Scope, handlersScope));
+  const serviceLayer = makeProviderServiceLive().pipe(
+    Layer.provide(NodeServices.layer),
+    Layer.provide(
+      Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, {
+        ...registry,
+        getByInstance: () => Effect.sync(() => adapter),
+      }),
+    ),
+    Layer.provide(
+      ProviderSessionDirectoryLive.pipe(
+        Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+      ),
+    ),
+    Layer.provide(defaultServerSettingsLayer),
+    Layer.provide(serverConfigTestLayer),
+    Layer.provide(AnalyticsService.layerTest),
+    Layer.provide(
+      Layer.succeed(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+    ),
+    Layer.provide(Layer.succeed(ProjectTeamPiRuntime, runtime)),
+  );
+  const context = yield* Layer.build(serviceLayer);
+  const service = Context.get(context, ProviderService.ProviderService);
+  const threadId = asThreadId("managed-compact-thread");
+  yield* service.startSession(threadId, {
+    threadId,
+    providerInstanceId: instanceId,
+    runtimeMode: "full-access",
+  });
+  return {
+    service,
+    threadId,
+    instanceId,
+    calls,
+    state,
+    receipts,
+    idleEntered,
+    idleRelease,
+    readyEntered,
+    readyRelease,
+    handlersScope,
+    pi,
+    replace: () => {
+      adapter = {
+        ...adapter,
+        compaction: {
+          type: "native",
+          awaitIdle: () => Effect.void,
+          start: () =>
+            Effect.sync(() => {
+              calls.push("replacement:start");
+              return { kind: "retained" as const };
+            }),
+        },
+      };
+    },
+  };
+});
+
+it.effect("managed compact reserves before idle and checks durable readiness before starting", () =>
+  Effect.gen(function* () {
+    const f = yield* makeCompactCallerFixture();
+    const requestId = MessageId.make("managed-compact-normal");
+    const running = yield* f.service
+      .compactThread(f.threadId, undefined, requestId)
+      .pipe(Effect.forkScoped);
+    yield* Deferred.await(f.idleEntered);
+    assert.deepEqual(f.calls, ["reserve", "idle:prompt-predecessor"]);
+    yield* Deferred.succeed(f.idleRelease, undefined);
+    yield* Fiber.join(running);
+    assert.deepEqual(f.calls, [
+      "reserve",
+      "idle:prompt-predecessor",
+      "ready",
+      "original:start",
+      "abandon",
+    ]);
+  }).pipe(Effect.scoped),
+);
+
+for (const closeCreatorFirst of [false, true])
+  it.effect(
+    `managed compact duplicate scopes preserve creator abandonment ownership (${closeCreatorFirst})`,
+    () =>
+      Effect.gen(function* () {
+        const f = yield* makeCompactCallerFixture();
+        const request = {
+          threadId: f.threadId,
+          requestId: MessageId.make("managed-compact-duplicate"),
+        };
+        const creator = yield* Scope.make();
+        const duplicate = yield* Scope.make();
+        assert.isTrue(
+          (yield* f.service
+            .reserveThreadCompaction(request)
+            .pipe(Effect.provideService(Scope.Scope, creator))).created,
+        );
+        assert.isFalse(
+          (yield* f.service
+            .reserveThreadCompaction(request)
+            .pipe(Effect.provideService(Scope.Scope, duplicate))).created,
+        );
+        yield* Scope.close(closeCreatorFirst ? creator : duplicate, Exit.void);
+        assert.equal(
+          f.calls.filter((call) => call === "abandon").length,
+          closeCreatorFirst ? 1 : 0,
+        );
+        if (closeCreatorFirst) {
+          const failure = yield* f.service
+            .awaitThreadCompactionReady(f.threadId, request.requestId)
+            .pipe(Effect.exit);
+          assert.isTrue(Exit.isFailure(failure));
+        }
+        yield* Scope.close(closeCreatorFirst ? duplicate : creator, Exit.void);
+        assert.equal(f.calls.filter((call) => call === "abandon").length, 1);
+      }).pipe(Effect.scoped),
+  );
+
+it.effect("managed compact rejects changed model duplicates and readiness receipt identity", () =>
+  Effect.gen(function* () {
+    const f = yield* makeCompactCallerFixture();
+    const request = { threadId: f.threadId, requestId: MessageId.make("managed-compact-identity") };
+    yield* f.service.reserveThreadCompaction(request);
+    const changed = yield* Effect.scoped(
+      f.service.reserveThreadCompaction({
+        ...request,
+        modelSelection: createModelSelection(f.instanceId, "another-model"),
+      }),
+    ).pipe(Effect.exit);
+    assert.isTrue(Exit.isFailure(changed));
+    assert.equal(f.calls.filter((call) => call === "reserve").length, 1);
+    const receipt = f.receipts.get(request.requestId)!;
+    f.receipts.set(request.requestId, { ...receipt, generation: 8 });
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.scoped(f.service.reserveThreadCompaction(request)).pipe(Effect.exit),
+      ),
+    );
+    assert.notInclude(f.calls, "abandon");
+    yield* Deferred.succeed(f.idleRelease, undefined);
+    assert.isTrue(
+      Exit.isFailure(
+        yield* f.service
+          .awaitThreadCompactionReady(f.threadId, request.requestId)
+          .pipe(Effect.exit),
+      ),
+    );
+    assert.notInclude(f.calls, "original:start");
+  }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "canceling a duplicate compact waiter cannot abandon the creating caller's reservation",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeCompactCallerFixture();
+      const request = { threadId: f.threadId, requestId: MessageId.make("managed-compact-cancel") };
+      const creator = yield* Scope.make();
+      yield* f.service
+        .reserveThreadCompaction(request)
+        .pipe(Effect.provideService(Scope.Scope, creator));
+      const duplicate = yield* f.service
+        .compactThread(f.threadId, undefined, request.requestId)
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(f.idleEntered);
+      yield* Fiber.interrupt(duplicate);
+      assert.notInclude(f.calls, "abandon");
+      assert.notInclude(f.calls, "original:start");
+      yield* Scope.close(creator, Exit.void);
+      assert.equal(f.calls.filter((call) => call === "abandon").length, 1);
+    }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "managed compact rejects adapter replacement while its predecessor idle wait is held",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeCompactCallerFixture();
+      const running = yield* f.service
+        .compactThread(f.threadId, undefined, MessageId.make("managed-compact-idle-replacement"))
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(f.idleEntered);
+      f.replace();
+      yield* Deferred.succeed(f.idleRelease, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(running)));
+      assert.notInclude(f.calls, "ready");
+      assert.notInclude(f.calls, "replacement:start");
+      assert.equal(f.calls.filter((call) => call === "abandon").length, 1);
+    }).pipe(Effect.scoped),
+);
+
+for (const change of ["release", "replacement", "handlers"] as const)
+  it.effect(`managed compaction rechecks ${change} after durable readiness waits`, () =>
+    Effect.gen(function* () {
+      const f = yield* makeCompactCallerFixture();
+      f.state.holdReady = true;
+      const request = {
+        threadId: f.threadId,
+        requestId: MessageId.make("managed-compact-held-ready"),
+      };
+      const creator = yield* Scope.make();
+      yield* f.service
+        .reserveThreadCompaction(request)
+        .pipe(Effect.provideService(Scope.Scope, creator));
+      yield* Deferred.succeed(f.idleRelease, undefined);
+      const ready = yield* f.service
+        .awaitThreadCompactionReady(f.threadId, request.requestId)
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(f.readyEntered);
+      if (change === "release") yield* Scope.close(creator, Exit.void);
+      else if (change === "handlers") yield* Scope.close(f.handlersScope, Exit.void);
+      else f.replace();
+      yield* Deferred.succeed(f.readyRelease, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(ready)));
+      assert.notInclude(f.calls, "original:start");
+      if (change !== "release") yield* Scope.close(creator, Exit.void);
+    }).pipe(Effect.scoped),
+  );
+
+it.effect("managed compact snapshots model selection before awaiting its predecessor", () =>
+  Effect.gen(function* () {
+    const f = yield* makeCompactCallerFixture();
+    const selection = { ...createModelSelection(f.instanceId, "original-model") };
+    const requestId = MessageId.make("managed-compact-model-snapshot");
+    const running = yield* f.service
+      .compactThread(f.threadId, selection, requestId)
+      .pipe(Effect.forkScoped);
+    yield* Deferred.await(f.idleEntered);
+    selection.model = "mutated-model";
+    yield* Deferred.succeed(f.idleRelease, undefined);
+    yield* Fiber.join(running);
+    assert.equal(f.pi.compactThread.mock.calls[0]?.[1]?.model, "original-model");
+    assert.equal(f.pi.compactThread.mock.calls[0]?.[2], requestId);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("managed compact revalidates authority after idle before starting", () =>
+  Effect.gen(function* () {
+    const f = yield* makeCompactCallerFixture();
+    const running = yield* f.service
+      .compactThread(f.threadId, undefined, MessageId.make("managed-compact-denied"))
+      .pipe(Effect.exit, Effect.forkScoped);
+    yield* Deferred.await(f.idleEntered);
+    f.state.authority = false;
+    yield* Deferred.succeed(f.idleRelease, undefined);
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(running)));
+    assert.notInclude(f.calls, "original:start");
+    assert.equal(f.calls.filter((call) => call === "abandon").length, 1);
+  }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "managed compact uses the replacement adapter and retained replay still checks authority",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* makeCompactCallerFixture();
+      const request = {
+        threadId: f.threadId,
+        requestId: MessageId.make("managed-compact-replacement"),
+      };
+      yield* f.service.reserveThreadCompaction(request);
+      yield* Deferred.succeed(f.idleRelease, undefined);
+      yield* f.service.awaitThreadCompactionReady(f.threadId, request.requestId);
+      f.replace();
+      yield* f.service.compactThread(f.threadId, undefined, request.requestId);
+      yield* f.service.compactThread(f.threadId, undefined, request.requestId);
+      assert.equal(f.calls.filter((call) => call === "replacement:start").length, 2);
+      assert.notInclude(f.calls, "original:start");
+      assert.notInclude(f.calls, "abandon");
+      f.state.authority = false;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* f.service
+            .compactThread(f.threadId, undefined, request.requestId)
+            .pipe(Effect.exit),
+        ),
+      );
+      assert.equal(f.calls.filter((call) => call === "replacement:start").length, 2);
+    }).pipe(Effect.scoped),
+);
 
 const customCompactionDriver = ProviderDriverKind.make("custom-compaction-provider");
 const nativeCompactionInstanceId = ProviderInstanceId.make("native-compaction");
