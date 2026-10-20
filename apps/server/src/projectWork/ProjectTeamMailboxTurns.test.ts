@@ -345,6 +345,16 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
       accountingReceipts,
     };
     yield* operations.persistTerminal(op, terminal);
+    if (op.operation.operationKind === "compact" && outcome === "success") {
+      const rows = yield* sql<{
+        resourceHash: string;
+      }>`SELECT json_extract(intent_json,'$.resourceHash') AS resourceHash
+        FROM project_team_pi_operation WHERE operation_id=${op.operation.operationId}`;
+      const resourceHash = rows[0]?.resourceHash;
+      if (typeof resourceHash !== "string")
+        return yield* Effect.die("Missing frozen compact resource identity");
+      yield* operations.publication(op, terminal, { resourceHash, check: () => {} });
+    }
     return terminal;
   });
   yield* complete(init, native);

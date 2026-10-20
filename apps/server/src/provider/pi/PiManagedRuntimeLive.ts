@@ -2675,9 +2675,35 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           assertCurrent: assertFreshnessOwner,
                         });
                       }
-                      const current = yield* operations.publication(durable, terminal);
-                      yield* verifySource(sourceFence);
-                      yield* finalWorkspaceFence(paths, workspace.fence);
+                      // Complete every asynchronous check before releasing compact ownership.
+                      if (request.kind === "compact") {
+                        yield* verifySource(sourceFence);
+                        yield* finalWorkspaceFence(paths, workspace.fence);
+                      }
+                      const current = yield* operations.publication(
+                        durable,
+                        terminal,
+                        request.kind === "compact"
+                          ? {
+                              resourceHash,
+                              check: (authority) => {
+                                if (
+                                  contextFor(authority) !== authorityContext ||
+                                  cancellation.signal.aborted ||
+                                  active.get(request.threadId)?.prepared.operation.operationId !==
+                                    operation.operationId
+                                )
+                                  throw deny("Pi compact publication owner changed", "conflict");
+                                sourceFence();
+                                workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                              },
+                            }
+                          : undefined,
+                      );
+                      if (request.kind !== "compact") {
+                        yield* verifySource(sourceFence);
+                        yield* finalWorkspaceFence(paths, workspace.fence);
+                      }
                       // No asynchronous work separates these owner checks from publication.
                       if (
                         cancellation.signal.aborted ||

@@ -1865,6 +1865,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     const authorize = Effect.fn("ProjectTeamPiOperations.authorize")(function* (
       captured: PiDurableOperation,
       settled = false,
+      publishingCompact = false,
     ) {
       const authority = yield* current(
         {
@@ -1890,6 +1891,10 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       if (
         (settled ? row.status !== "settled" : row.status === "settled") ||
         row.status === "quarantine" ||
+        (!settled &&
+          !publishingCompact &&
+          row.operation_kind === "compact" &&
+          row.terminal_json !== null) ||
         row.worker_id !== captured.workerId ||
         row.binding_id !== binding.recordId ||
         row.generation !== binding.generation ||
@@ -3426,8 +3431,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       captured: PiDurableOperation,
       native: PiNativeReference,
       settled = false,
+      publishingCompact = false,
     ) {
-      const authority = yield* authorize(captured, settled);
+      const authority = yield* authorize(captured, settled, publishingCompact);
       const row = yield* getRow(captured.operation.operationId);
       if (
         authority.binding.status !== "running" ||
@@ -3441,21 +3447,103 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       yield* clockCheck(row.deadline_at_ms);
       return authority;
     });
-    // Terminal persistence releases the durable writer fence. Publication must still belong
-    // to this exact completed operation and its current native session.
+    // A successful compact retains its writer fence until the first caller's final
+    // publication transaction. A crash in this gap remains unfinished for reconciliation.
     const publication = Effect.fn("ProjectTeamPiOperations.publication")(function* (
       captured: PiDurableOperation,
       terminal: PiSessionTerminal,
+      compactPublication?: {
+        readonly resourceHash: string;
+        readonly check: (authority: ProjectTeamAuthority) => void;
+      },
     ) {
       yield* ownTransaction();
+      const publishingCompact = captured.operation.operationKind === "compact";
+      if (publishingCompact && !compactPublication)
+        return yield* deny("Compact publication requires its final caller fence");
       if (terminal.outcome !== "success" || !terminal.native)
         return yield* deny("Successful native Pi terminal required");
       const native = terminal.native;
-      const validate = Effect.gen(function* () {
-        const authority = yield* nativeAuthority(captured, native, true);
+      const validate = Effect.fn("ProjectTeamPiOperations.validatePublication")(function* (
+        settled: boolean,
+      ) {
+        const authority = yield* nativeAuthority(captured, native, settled, publishingCompact);
         const row = yield* getRow(captured.operation.operationId);
-        if (row.terminal_json !== encode(terminal))
+        if (
+          row.terminal_json !== encode(terminal) ||
+          row.operation_kind !== captured.operation.operationKind ||
+          row.operation_ordinal !== captured.ordinal
+        )
           return yield* deny("Pi terminal publication receipt changed");
+        if (publishingCompact) {
+          const intent = yield* decodeReplayIntent(row.intent_json);
+          const request = yield* decodeStoredRequest(intent.request);
+          if (
+            request.kind !== "compact" ||
+            request.requestId === undefined ||
+            !intent.compaction ||
+            intent.resourceHash !== compactPublication!.resourceHash ||
+            encode(intent.allocation) !== encode(captured.allocation) ||
+            row.request_hash !== requestDigest(request)
+          )
+            return yield* deny("Compact publication resource or request changed");
+          const callers = yield* callerRows(
+            {
+              providerInstanceId: authority.binding.providerInstanceId,
+              threadId: authority.binding.threadId,
+            },
+            { ...request, requestId: request.requestId },
+          );
+          const caller = callers[0];
+          const original = yield* readRetained(intent.compaction.dispatchId);
+          const cleanup = yield* sql`SELECT 1 FROM project_team_dispatch
+            WHERE dispatch_id=${original.fence.dispatchId} AND cleanup_claim_revision IS NOT NULL`;
+          const process = yield* sql<{
+            status: string;
+            allocation_json: string;
+            owner_json: string | null;
+            drain_json: string | null;
+          }>`
+            SELECT status,allocation_json,owner_json,drain_json FROM project_team_pi_process
+            WHERE operation_id=${row.operation_id} AND unit=${captured.allocation.unit} LIMIT 2`;
+          const owner = process[0]?.owner_json
+            ? yield* decodeMemoryProcessOwner(process[0].owner_json)
+            : undefined;
+          const drain = terminal.drain;
+          if (
+            !owner ||
+            !drain ||
+            owner.unit !== captured.allocation.unit ||
+            owner.nonce !== captured.allocation.nonce ||
+            owner.invocation !== drain.invocation ||
+            owner.pid !== drain.ownerPid ||
+            owner.cgroup !== drain.cgroup ||
+            owner.memoryBytes !== drain.memoryBytes ||
+            owner.swapBytes !== drain.swapBytes ||
+            owner.oomGroup !== drain.oomGroup ||
+            cleanup.length ||
+            callers.length !== 1 ||
+            !caller ||
+            caller.status !== "consumed" ||
+            caller.operation_id !== row.operation_id ||
+            caller.dispatch_id !== original.fence.dispatchId ||
+            caller.binding_id !== row.binding_id ||
+            caller.generation !== row.generation ||
+            caller.predecessor_operation_id !== intent.compaction.predecessorOperationId ||
+            caller.request_json !==
+              encode(callerRequest({ ...request, requestId: request.requestId })) ||
+            caller.authority_json !== callerAuthority(original, authority) ||
+            caller.claim_generation !== original.fence.claimGeneration ||
+            (caller.admission_revision !== original.fence.revision &&
+              caller.admission_revision + 1 !== original.fence.revision) ||
+            process.length !== 1 ||
+            process[0]?.status !== "drained" ||
+            process[0]?.allocation_json !== encode(captured.allocation) ||
+            process[0]?.drain_json !== encode(terminal.drain)
+          )
+            return yield* deny("Compact publication owner or drain changed");
+          yield* clockCheck(caller.deadline_at_ms);
+        }
         const latest = yield* sql<{
           ordinal: number;
         }>`SELECT MAX(operation_ordinal) AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${authority.binding.providerInstanceId} AND thread_id=${authority.binding.threadId}`;
@@ -3467,8 +3555,37 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         yield* clockCheck(captured.deadlineAtMs);
         return authority;
       });
-      yield* sql.withTransaction(validate);
-      return yield* validate;
+      if (!publishingCompact) {
+        yield* sql.withTransaction(validate(true));
+        return yield* validate(true);
+      }
+      // Keep commit and its wake in one interruption mask; the transaction body
+      // stays interruptible and rolls back if the caller is canceled before publication.
+      return yield* Effect.uninterruptibleMask((restore) =>
+        sql
+          .withTransaction(
+            restore(
+              Effect.gen(function* () {
+                yield* validate(false);
+                const changed = yield* sql`UPDATE project_team_pi_operation SET status='settled'
+          WHERE operation_id=${captured.operation.operationId} AND status='running'
+          AND terminal_json=${encode(terminal)} RETURNING operation_id`;
+                if (changed.length !== 1)
+                  return yield* deny("Compact publication already released", "conflict");
+                const current = yield* validate(true);
+                yield* Effect.try({
+                  try: () => compactPublication!.check(current),
+                  catch: (error) =>
+                    isRuntimeError(error)
+                      ? error
+                      : deny("Compact final caller fence changed", "conflict"),
+                });
+                return current;
+              }),
+            ),
+          )
+          .pipe(Effect.tap(() => notifyCompactCallerChange)),
+      );
     });
     const persistNative = Effect.fn("ProjectTeamPiOperations.persistNative")(function* (
       captured: PiDurableOperation,
@@ -3558,7 +3675,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       const disposition = yield* sql.withTransaction(
         Effect.gen(function* () {
           const row = yield* getRow(captured.operation.operationId);
-          if (row.status === "settled" || row.status === "quarantine")
+          if (row.status === "settled" || row.status === "quarantine" || row.terminal_json !== null)
             return yield* deny("Pi terminal already recorded", "conflict");
           if (terminal.outcome === "success") yield* authorize(captured);
           const process = yield* sql<{
@@ -3757,8 +3874,10 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           yield* sql`UPDATE project_team_pi_process SET status=${uncertain ? "quarantine" : "drained"},drain_json=${drain ? encode(drain) : null} WHERE operation_id=${row.operation_id}`;
           // Clock and authority are sampled after the final SQL write receipt while still in the transaction.
           yield* sql`UPDATE project_team_pi_operation SET terminal_json=${encode(terminal)} WHERE operation_id=${row.operation_id}`;
-          if (terminal.outcome === "success") yield* authorize(captured);
-          yield* sql`UPDATE project_team_pi_operation SET status=${uncertain ? "quarantine" : "settled"} WHERE operation_id=${row.operation_id}`;
+          if (terminal.outcome === "success") yield* authorize(captured, false, true);
+          const awaitingPublication =
+            row.operation_kind === "compact" && terminal.outcome === "success";
+          yield* sql`UPDATE project_team_pi_operation SET status=${uncertain ? "quarantine" : awaitingPublication ? "running" : "settled"} WHERE operation_id=${row.operation_id}`;
           if (terminal.outcome === "success") {
             yield* clockCheck(captured.deadlineAtMs);
             yield* current({

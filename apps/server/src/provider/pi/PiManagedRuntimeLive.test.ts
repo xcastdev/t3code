@@ -10031,6 +10031,14 @@ for (const compactProof of [
   "beforeStart",
   "afterAwait",
   "successorReplay",
+  "cleanupReturn",
+  "returnRevoked",
+  "returnExpired",
+  "returnWorkspace",
+  "returnSource",
+  "returnSourceAfterWrite",
+  "returnWorkspaceAfterWrite",
+  "returnCancel",
   "memoryAdmission",
   "memoryAccounting",
   "memorySharedRoot",
@@ -10233,6 +10241,72 @@ for (const compactProof of [
           let reconcileMemory:
             | ((id: string) => Effect.Effect<void, ProjectMemoryServiceError>)
             | undefined;
+          const returnEntered = yield* Deferred.make<void>();
+          const returnProof = compactProof?.startsWith("return") === true;
+          const selectedSkill = compactProof?.startsWith("returnSource")
+            ? yield* (yield* ManagedSkills.ManagedSkillRepository).createGlobal({
+                expectedRevision: 0,
+                content: {
+                  key: ManagedSkillKey.make("compact-return"),
+                  name: "Compact Return",
+                  body: "Selected original source.",
+                },
+              })
+            : undefined;
+          let finalFenceEntered = false;
+          if (compactProof?.endsWith("AfterWrite")) {
+            const originalOperations = PiOperations.makeProjectTeamPiOperations;
+            const publicationSpy = vi
+              .spyOn(PiOperations, "makeProjectTeamPiOperations")
+              .mockImplementation((options) =>
+                originalOperations(options).pipe(
+                  Effect.map((operations) => ({
+                    ...operations,
+                    publication: (...args: Parameters<typeof operations.publication>) => {
+                      const [captured, terminal, fence] = args;
+                      if (captured.operation.operationKind !== "compact" || !fence)
+                        return operations.publication(...args);
+                      return operations.publication(captured, terminal, {
+                        ...fence,
+                        check: (authority) => {
+                          // Actual physical mutation after the settlement write, before the last caller fence.
+                          finalFenceEntered = true;
+                          const fs = process.getBuiltinModule("fs");
+                          if (selectedSkill)
+                            fs.writeFileSync(
+                              selectedSkill.packagePath + "/SKILL.md",
+                              "Changed at final SQL fence",
+                            );
+                          else {
+                            fs.renameSync(
+                              authority.binding.worktree,
+                              authority.binding.worktree + "-replaced",
+                            );
+                            fs.mkdirSync(authority.binding.worktree);
+                          }
+                          fence.check(authority);
+                        },
+                      });
+                    },
+                  })),
+                ),
+              );
+            yield* Effect.addFinalizer(() => Effect.sync(() => publicationSpy.mockRestore()));
+          }
+          let returnBoundaryCause = "";
+          let returnCleanup: string | undefined;
+          const authorization = yield* Authorization.ProjectTeamAuthorization;
+          const returnAuthorization = Authorization.ProjectTeamAuthorization.of({
+            ...authorization,
+            discover: (...args) =>
+              authorization.discover(...args).pipe(
+                Effect.tapCause((cause) =>
+                  Effect.sync(() => {
+                    returnBoundaryCause = json(cause.reasons) + "\n" + Cause.pretty(cause);
+                  }),
+                ),
+              ),
+          });
           const f = yield* requiredTransferFixture(
             false,
             compactProof === "memorySharedRoot" || compactProof === "memoryCompanionSharedRoot",
@@ -10245,7 +10319,16 @@ for (const compactProof of [
                 : sharedQuery && !sharedDenied
                   ? "shared"
                   : "project",
+            undefined,
+            selectedSkill
+              ? {
+                  ...basicRuntimeProfile,
+                  roleSkillIds: [selectedSkill.manifest.id],
+                  skillIds: [selectedSkill.manifest.id],
+                }
+              : undefined,
           ).pipe(
+            Effect.provideService(Authorization.ProjectTeamAuthorization, returnAuthorization),
             Effect.provideService(ProjectMemoryPorts, {
               assertConfigured: () =>
                 memoryReady
@@ -10291,6 +10374,48 @@ for (const compactProof of [
               confirmation: "permanent-local-delete",
             });
           });
+          let runInstance = f.instance;
+          let returnSkillPlan:
+            | Effect.Success<ReturnType<typeof selectedRuntimeFixture>>["plan"]
+            | undefined;
+          if (selectedSkill) {
+            const materialization = yield* Materialization.SkillMaterializationService;
+            const desiredRevision = SkillCatalogRevision.make(1);
+            const materialized = yield* materialization.materialize({
+              sessionId: catalogueRequest(f.binding.worktree).runtime.sessionId,
+              providerInstanceId,
+              desiredRevision,
+              packages: [
+                { key: selectedSkill.manifest.key, sourcePath: selectedSkill.packagePath },
+              ],
+            });
+            returnSkillPlan = {
+              providerInstanceId,
+              desiredRevision,
+              applicationMode: "new_session_required",
+              skillKeys: [selectedSkill.manifest.key],
+              payload: {
+                kind: "pi-managed-skills",
+                root: materialized.root,
+                skills: [
+                  {
+                    key: selectedSkill.manifest.key,
+                    path: materialized.skillPaths.get(selectedSkill.manifest.key)! + "/SKILL.md",
+                  },
+                ],
+              },
+            };
+            const cache = yield* f.fs.makeTempDirectoryScoped();
+            yield* f.fs.chmod(cache, 0o700);
+            runInstance = yield* (yield* makePiManagedRuntimeLive({
+              ...f.options,
+              allocateSkillStage: makePiSkillStageLifetime(cache),
+            })).forInstance({
+              instanceId: providerInstanceId,
+              enabled: true,
+              configuration: {},
+            });
+          }
           const journal = yield* makeProjectTeamDispatchJournal({
             environmentId: "environment",
             maximumEnvironmentModelCalls: 4,
@@ -10398,6 +10523,7 @@ for (const compactProof of [
             | ProjectWorkRepository
             | Authorization.ProjectTeamAuthorization
             | ProjectWorkGateway
+            | ProjectWorkProjection
           >();
           const spy = vi.spyOn(SessionRuntime, "makePiSessionRuntime").mockImplementation((input) =>
             original(input).pipe(
@@ -13716,6 +13842,62 @@ for (const compactProof of [
                         },
                       };
                       yield* Effect.tryPromise(() => input.persistTerminal(terminal, signal));
+                      if (returnProof && input.operation.operationKind === "compact") {
+                        if (compactProof === "returnRevoked") {
+                          const authority = yield* authorization.issueCredential({
+                            providerInstanceId,
+                            threadId,
+                          });
+                          if (!authority) return yield* Effect.die("Missing return authority");
+                          yield* restoreHistoricalBinding({
+                            ...authority.binding,
+                            status: "revoked",
+                            revision: authority.binding.revision + 1,
+                          });
+                        }
+                        if (compactProof === "returnExpired")
+                          yield* TestClock.setTime(
+                            input.persistence.deadlineAtMs ??
+                              (yield* Effect.die("Missing compact deadline")),
+                          );
+                        if (compactProof === "returnWorkspace") {
+                          yield* f.fs.rename(f.binding.worktree, f.binding.worktree + "-replaced");
+                          yield* f.fs.makeDirectory(f.binding.worktree);
+                        }
+                        if (selectedSkill && compactProof === "returnSource")
+                          yield* f.fs.writeFileString(
+                            selectedSkill.packagePath + "/SKILL.md",
+                            "Changed after compact terminal",
+                          );
+                        if (compactProof === "returnCancel") {
+                          yield* Deferred.succeed(returnEntered, undefined);
+                          yield* Effect.promise(
+                            () =>
+                              new Promise<void>((resolve) => {
+                                if (signal.aborted) resolve();
+                                else
+                                  signal.addEventListener("abort", () => resolve(), { once: true });
+                              }),
+                          );
+                        }
+                      }
+                      if (
+                        compactProof === "cleanupReturn" &&
+                        input.operation.operationKind === "compact"
+                      ) {
+                        // Exact first-run boundary: terminal is committed but run has not returned.
+                        returnCleanup = (yield* journal.claimCleanup(snapshot.fence))._tag;
+                        if (returnCleanup === "Claimed")
+                          yield* journal.settleAfterJoined(snapshot.fence, {
+                            receiptId: "compact-return-joined",
+                            stage: "settled",
+                            evidence: {
+                              bindingId: f.binding.recordId,
+                              worker: "joined",
+                              transport: "drained",
+                            },
+                          });
+                      }
                       return terminal;
                     }).pipe(
                       Effect.tapCause((cause) =>
@@ -13752,8 +13934,13 @@ for (const compactProof of [
               },
             ]);
           }
-          const initialized = yield* f.instance.prepareOperation(
-            { threadId, kind: "initialize", operationId: f.request.initializeOperationId },
+          const initialized = yield* runInstance.prepareOperation(
+            {
+              threadId,
+              kind: "initialize",
+              operationId: f.request.initializeOperationId,
+              ...(returnSkillPlan ? { skillPlan: returnSkillPlan } : {}),
+            },
             () => Effect.void,
           );
           expect(spy.mock.calls).toHaveLength(1);
@@ -13788,12 +13975,13 @@ for (const compactProof of [
               },
             ]);
           }
-          const assigned = yield* f.instance.prepareOperation(
+          const assigned = yield* runInstance.prepareOperation(
             {
               threadId,
               kind: "prompt",
               operationId: f.request.assignmentOperationId,
               prompt: f.request.assignment,
+              ...(returnSkillPlan ? { skillPlan: returnSkillPlan } : {}),
             },
             () => Effect.void,
           );
@@ -13922,7 +14110,7 @@ for (const compactProof of [
                 failedRequest,
               );
               failedUsageOperationId = failedBoundary.operationId;
-              const failedPreparation = yield* f.instance
+              const failedPreparation = yield* runInstance
                 .prepareOperation(
                   {
                     ...failedRequest,
@@ -14370,7 +14558,9 @@ for (const compactProof of [
             threadId,
             kind: "compact" as const,
             requestId: MessageId.make("live-compact-original"),
+            ...(returnSkillPlan ? { skillPlan: returnSkillPlan } : {}),
           };
+          yield* operations.reserveCompaction({ providerInstanceId, threadId }, supplied);
           const boundary = yield* operations.readCompaction(
             { providerInstanceId, threadId },
             supplied,
@@ -14429,7 +14619,7 @@ for (const compactProof of [
                   enabled: true,
                   configuration: {},
                 })
-              : f.instance;
+              : runInstance;
           const compact = yield* compactInstance.prepareOperation(request, () => Effect.void);
           if (
             compactProof === "beforeAcquire" ||
@@ -14520,15 +14710,54 @@ for (const compactProof of [
             expect(f.transports).toBe(0);
             return;
           }
-          const compactResult = yield* compact.run.pipe(Effect.result);
+          const compactResult = yield* Effect.gen(function* () {
+            if (compactProof !== "returnCancel") return yield* compact.run.pipe(Effect.result);
+            const running = yield* compact.run.pipe(Effect.result, Effect.forkChild);
+            yield* Deferred.await(returnEntered);
+            yield* runInstance.requestStop(threadId);
+            return yield* Fiber.join(running);
+          });
+          if (returnProof) {
+            expect(finalFenceEntered).toBe(compactProof?.endsWith("AfterWrite"));
+            expect(compactResult._tag).toBe("Failure");
+            expect(
+              yield* f.sql`SELECT status,json_extract(terminal_json,'$.outcome') AS outcome FROM project_team_pi_operation WHERE operation_kind='compact'`,
+            ).toEqual([{ status: "running", outcome: "success" }]);
+            expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+              { status: "consumed" },
+            ]);
+            expect(yield* f.sql`SELECT cleanup_claim_revision FROM project_team_dispatch`).toEqual([
+              { cleanup_claim_revision: null },
+            ]);
+            const charges = yield* f.sql`SELECT * FROM project_team_model_request`;
+            const allocations = f.allocations;
+            const restarted = yield* (yield* makePiManagedRuntimeLive(f.options)).forInstance({
+              instanceId: providerInstanceId,
+              enabled: true,
+              configuration: {},
+            });
+            expect(
+              (yield* restarted.prepareOperation(request, () => Effect.void).pipe(Effect.result))
+                ._tag,
+            ).toBe("Failure");
+            expect(runs).toBe(3);
+            expect(f.allocations).toBe(allocations);
+            expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(charges);
+            expect(f.transports).toBe(0);
+            return;
+          }
           expect({
             result: compactResult,
             constructed,
             runEntries,
             runs,
             diagnostic,
+            returnBoundaryCause,
+            returnCleanup,
           }).toMatchObject({
             diagnostic: "",
+            returnBoundaryCause: "",
+            ...(compactProof === "cleanupReturn" ? { returnCleanup: "WaitingForCompact" } : {}),
             constructed: 3,
             runEntries: 3,
             runs: 3,
@@ -14545,7 +14774,7 @@ for (const compactProof of [
             yield* f.sql`SELECT operation_id,status,intent_json FROM project_team_pi_operation ORDER BY operation_ordinal`;
           const budget =
             yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`;
-          const replay = yield* f.instance.prepareOperation(request, () => Effect.void);
+          const replay = yield* runInstance.prepareOperation(request, () => Effect.void);
           expect(replay.replayHeadOperationId).toBe(terminal.operation.operationId);
           expect((yield* replay.run).terminal).toEqual(terminal);
           expect(runs).toBe(3);
@@ -14557,6 +14786,21 @@ for (const compactProof of [
             yield* f.sql`SELECT maximum_tokens,deadline_at_ms FROM project_team_model_budget WHERE project_id=${projectId}`,
           ).toEqual(budget);
           expect(f.transports).toBe(0);
+          if (compactProof === "cleanupReturn") {
+            expect((yield* journal.claimCleanup(snapshot.fence))._tag).toBe("Claimed");
+            yield* journal.settleAfterJoined(snapshot.fence, {
+              receiptId: "first-return-complete-joined",
+              stage: "settled",
+              evidence: { bindingId: f.binding.recordId, worker: "joined", transport: "drained" },
+            });
+            expect(
+              (yield* runInstance.prepareOperation(request, () => Effect.void).pipe(Effect.result))
+                ._tag,
+            ).toBe("Failure");
+            expect(runs).toBe(3);
+            expect(f.allocations).toBe(allocations);
+            return;
+          }
           if (compactProof === "successorReplay") {
             const nextContext = yield* f.reader.readRequired(snapshot);
             expectedContext = nextContext.text;
@@ -14569,11 +14813,12 @@ for (const compactProof of [
               ...supplied,
               requestId: MessageId.make("live-compact-successor"),
             };
+            yield* operations.reserveCompaction({ providerInstanceId, threadId }, nextSupplied);
             const nextBoundary = yield* operations.readCompaction(
               { providerInstanceId, threadId },
               nextSupplied,
             );
-            const next = yield* f.instance.prepareOperation(
+            const next = yield* runInstance.prepareOperation(
               { ...nextSupplied, operationId: nextBoundary.operationId },
               () => Effect.void,
             );
@@ -14660,6 +14905,13 @@ for (const compactProof of [
             enabled: true,
             configuration: {},
           });
+          yield* operations.reserveCompaction(
+            { providerInstanceId, threadId },
+            {
+              threadId,
+              requestId: MessageId.make("live-compact-context-race"),
+            },
+          );
           const race = yield* changedInstance
             .prepareOperation(
               { threadId, kind: "compact", requestId: MessageId.make("live-compact-context-race") },
@@ -14690,7 +14942,7 @@ for (const compactProof of [
             instructions: role.instructions + " changed",
           });
           expect(
-            (yield* f.instance
+            (yield* runInstance
               .prepareOperation(
                 { ...request, requestId: MessageId.make("live-compact-drift") },
                 () => Effect.void,
@@ -14709,7 +14961,7 @@ for (const compactProof of [
           compactProof === "memoryCompanionDelete" ||
           compactProof?.startsWith("memoryQueryShared") === true ||
           compactProof === "memoryCompanionSharedQuery",
-      ),
+      ).pipe(Effect.provide(selectedRuntimeLayer)),
   );
 
 for (const readonlyKind of [undefined, "planning", "investigation", "review"] as const)

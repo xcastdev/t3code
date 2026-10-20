@@ -271,6 +271,7 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
     ref: PiNativeReference,
     outcome: PiSessionTerminal["outcome"] = "success",
     accountingReceipts: PiSessionTerminal["accountingReceipts"] = [],
+    publishCompact = true,
   ) {
     if (!activated.has(op.operation.operationId)) yield* activate(op, ref);
     else yield* operations.persistNative(op, ref);
@@ -296,6 +297,11 @@ const fixtureWithAssignment = Effect.fn("mailboxTest.fixture")(function* (
       accountingReceipts,
     };
     yield* operations.persistTerminal(op, terminal);
+    if (op.operation.operationKind === "compact" && outcome === "success" && publishCompact)
+      yield* operations.publication(op, terminal, {
+        resourceHash: "a".repeat(64),
+        check: () => {},
+      });
     return terminal;
   });
   yield* complete(init, native);
@@ -1486,6 +1492,248 @@ for (const change of [
             charges: yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
             budgets: yield* f.sql`SELECT * FROM project_team_model_budget`,
           }).toEqual(before);
+        }),
+      ),
+  );
+
+const pendingPublicationFixture = Effect.fn("compactTest.pendingPublication")(function* () {
+  const f = yield* fixtureWithAssignment();
+  const request = compactRequest();
+  yield* f.operations.reserveCompaction(identity, request);
+  const snapshot = yield* observe(f);
+  const boundary = yield* f.operations.readCompaction(identity, { ...request, kind: "compact" });
+  const input = { ...request, kind: "compact" as const, operationId: boundary.operationId };
+  const compact = yield* f.operations.prepare(identity, input, hash(input), {
+    allocation: yield* f.allocation,
+    workerId: "publication-compact",
+    operationId: boundary.operationId,
+    resourceHash: "a".repeat(64),
+    compactContext: { provenanceSha256: "b".repeat(64), textSha256: "c".repeat(64) },
+  });
+  const accounting = yield* f.reserveInput(compact);
+  const terminal = yield* f.complete(
+    compact,
+    { ...native, leafId: "publication-head" },
+    "success",
+    [yield* accounting.settle],
+    false,
+  );
+  return { ...f, compact, terminal, snapshot, input };
+});
+
+for (const order of ["cleanup-first", "publication-first", "interrupted-postcommit"] as const)
+  it.effect(`compact first publication serializes ${order} and wakes Host only after commit`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* pendingPublicationFixture();
+        const before = yield* f.sql`SELECT * FROM project_team_model_request`;
+        const events = yield* PubSub.unbounded<typeof OrchestrationEvent.Type>();
+        const waiting = yield* Deferred.make<void>();
+        const observingSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            return statement.compile()[0].includes("SELECT operation_id,status,operation_kind")
+              ? statement.pipe(Effect.tap(() => Deferred.succeed(waiting, undefined)))
+              : statement;
+          },
+        });
+        const committed = yield* Deferred.make<void>();
+        const returnCommit = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() => Deferred.succeed(returnCommit, undefined));
+        const publicationSql = new Proxy(f.sql, {
+          get(target, property, receiver) {
+            if (property !== "withTransaction") return Reflect.get(target, property, receiver);
+            return <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.gen(function* () {
+                const nested = Option.isSome(
+                  yield* Effect.serviceOption(target.transactionService),
+                );
+                const result = yield* target.withTransaction(effect);
+                if (order === "interrupted-postcommit" && !nested) {
+                  yield* Deferred.succeed(committed, undefined);
+                  yield* Deferred.await(returnCommit);
+                }
+                return result;
+              });
+          },
+        });
+        const publishingOperations = yield* makeProjectTeamPiOperations({
+          environmentId: "environment",
+        }).pipe(Effect.provideService(SqlClient.SqlClient, publicationSql));
+        const publish = publishingOperations
+          .publication(f.compact, f.terminal, {
+            resourceHash: "a".repeat(64),
+            check: () => {},
+          })
+          .pipe(Effect.provideService(SqlClient.SqlClient, publicationSql));
+        if (order === "publication-first") yield* publish;
+        const host = yield* waitForProjectTeamRetainedCompaction({
+          environmentId: "environment",
+          snapshot: f.snapshot,
+          assertCurrent: f.journal.inspect(f.snapshot.fence.dispatchId).pipe(
+            Effect.asVoid,
+            Effect.provideService(SqlClient.SqlClient, f.sql),
+            Effect.mapError(
+              () => new ProjectTeamDispatchJournalError({ reason: "Current authority failed" }),
+            ),
+          ),
+          claimCleanup: f.journal.claimCleanup(f.snapshot.fence).pipe(
+            Effect.provideService(SqlClient.SqlClient, f.sql),
+            Effect.mapError(
+              () => new ProjectTeamDispatchJournalError({ reason: "Cleanup failed" }),
+            ),
+            Effect.tap((result) =>
+              result._tag === "WaitingForCompact"
+                ? Deferred.succeed(waiting, undefined)
+                : Effect.void,
+            ),
+          ),
+        }).pipe(
+          Effect.provide(
+            Layer.merge(
+              ProjectWorkEventBusLive,
+              Layer.mock(OrchestrationEngineService)({
+                subscribeDomainEvents: PubSub.subscribe(events).pipe(
+                  Effect.map(Stream.fromSubscription),
+                ),
+              }),
+            ),
+          ),
+          Effect.provideService(SqlClient.SqlClient, observingSql),
+          Effect.forkChild,
+        );
+        if (order !== "publication-first") {
+          yield* Deferred.await(waiting);
+          // Read status itself does not claim; this separate durable CAS must also refuse cleanup.
+          expect((yield* f.journal.claimCleanup(f.snapshot.fence))._tag).toBe("WaitingForCompact");
+          // Host does not call claimCleanup while its durable operation read is running.
+          if (order === "interrupted-postcommit") {
+            const publication = yield* publish.pipe(Effect.forkChild);
+            yield* Deferred.await(committed);
+            // The durable write has committed; interruption must not erase its queued wake.
+            yield* Effect.sync(() => publication.interruptUnsafe());
+            yield* Deferred.succeed(returnCommit, undefined);
+            expect((yield* Fiber.await(publication))._tag).toBe("Failure");
+          } else yield* publish;
+        }
+        yield* Fiber.join(host);
+        expect(
+          yield* f.sql`SELECT status FROM project_team_pi_operation WHERE operation_kind='compact'`,
+        ).toEqual([{ status: "settled" }]);
+        expect(yield* f.sql`SELECT status FROM project_team_compact_caller`).toEqual([
+          { status: "consumed" },
+        ]);
+        expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(before);
+        expect(
+          (yield* f.operations
+            .publication(f.compact, f.terminal, {
+              resourceHash: "a".repeat(64),
+              check: () => {},
+            })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      }),
+    ),
+  );
+
+for (const mode of [
+  "after-write",
+  "after-write-expired",
+  "owner",
+  "caller-fence",
+  "revoked",
+  "expired",
+  "resource",
+  "terminal",
+  "native",
+  "drain",
+  "caller",
+] as const)
+  it.effect(
+    `compact publication ${mode} failure retains durable ownership without relaunch or charge`,
+    () =>
+      scoped(
+        Effect.gen(function* () {
+          const f = yield* pendingPublicationFixture();
+          const counts =
+            yield* f.sql`SELECT operation_id FROM project_team_pi_operation ORDER BY operation_id`;
+          const charges = yield* f.sql`SELECT * FROM project_team_model_request`;
+          if (mode === "revoked")
+            yield* restoreHistoricalBinding({
+              ...f.compact.authority.binding,
+              status: "revoked",
+              revision: f.compact.authority.binding.revision + 1,
+            });
+          if (mode === "expired") yield* TestClock.setTime(f.compact.deadlineAtMs);
+          if (mode === "native")
+            yield* f.sql`UPDATE project_team_pi_operation
+        SET native_json=json_set(native_json,'$.leafId','foreign') WHERE operation_id=${f.compact.operation.operationId}`;
+          if (mode === "owner")
+            yield* f.sql`UPDATE project_team_pi_process
+            SET owner_json=json_set(owner_json,'$.pid',999) WHERE operation_id=${f.compact.operation.operationId}`;
+          if (mode === "drain")
+            yield* f.sql`UPDATE project_team_pi_process SET drain_json=NULL
+        WHERE operation_id=${f.compact.operation.operationId}`;
+          if (mode === "caller") yield* f.sql`DELETE FROM project_team_compact_caller`;
+          let wrote = false;
+          const failingSql = new Proxy(f.sql, {
+            apply(target, _receiver, args) {
+              const statement = target(args[0], ...args.slice(1));
+              if (
+                mode === "after-write-expired" &&
+                statement.compile()[0].includes("SET status='settled'")
+              )
+                return statement.pipe(Effect.tap(() => TestClock.setTime(f.compact.deadlineAtMs)));
+              return mode === "after-write" &&
+                statement.compile()[0].includes("SET status='settled'")
+                ? statement.pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        wrote = true;
+                      }),
+                    ),
+                    Effect.andThen(
+                      Effect.fail(
+                        new ProjectTeamDispatchJournalError({ reason: "After publication write" }),
+                      ),
+                    ),
+                  )
+                : statement;
+            },
+          });
+          const operations = yield* makeProjectTeamPiOperations({
+            environmentId: "environment",
+          }).pipe(Effect.provideService(SqlClient.SqlClient, failingSql));
+          const result = yield* operations
+            .publication(
+              f.compact,
+              mode === "terminal" ? { ...f.terminal, accountingReceipts: [] } : f.terminal,
+              {
+                resourceHash: (mode === "resource" ? "f" : "a").repeat(64),
+                check: () => {
+                  if (mode === "caller-fence") throw Error("Captured owner canceled");
+                },
+              },
+            )
+            .pipe(Effect.provideService(SqlClient.SqlClient, failingSql), Effect.result);
+          expect(result._tag).toBe("Failure");
+          expect(wrote).toBe(mode === "after-write");
+          expect(
+            yield* f.sql`SELECT status FROM project_team_pi_operation WHERE operation_kind='compact'`,
+          ).toEqual([{ status: "running" }]);
+          const restarted = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+          expect((yield* restarted.nativeFor(identity).pipe(Effect.result))._tag).toBe("Failure");
+          expect(
+            (yield* restarted.readCompaction(identity, f.input).pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* restarted.persistTerminal(f.compact, f.terminal).pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          expect((yield* restarted.authorize(f.compact).pipe(Effect.result))._tag).toBe("Failure");
+          expect(
+            yield* f.sql`SELECT operation_id FROM project_team_pi_operation ORDER BY operation_id`,
+          ).toEqual(counts);
+          expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(charges);
         }),
       ),
   );
