@@ -1,3 +1,34 @@
+diff --git a/android/CMakeLists.txt b/android/CMakeLists.txt
+index 005caaf255..fb5153f4bc 100644
+--- a/android/CMakeLists.txt
++++ b/android/CMakeLists.txt
+@@ -5,11 +5,12 @@ set(CMAKE_VERBOSE_MAKEFILE ON)
+
+ # Find prebuilt oniguruma library
+ find_library(LOG_LIB log)
+-find_library(ONIG_LIB onig
+-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/src/main/jniLibs/${ANDROID_ABI}
+-    NO_CMAKE_FIND_ROOT_PATH
+-    REQUIRED
+-)
++set(ONIG_LIB "${CMAKE_CURRENT_SOURCE_DIR}/src/main/jniLibs/${ANDROID_ABI}/libonig.so")
++if(NOT EXISTS "${ONIG_LIB}")
++    message(FATAL_ERROR "Missing bundled Oniguruma library for Android ABI: ${ANDROID_ABI}")
++endif()
++add_library(shiki-onig SHARED IMPORTED)
++set_target_properties(shiki-onig PROPERTIES IMPORTED_LOCATION "${ONIG_LIB}")
+
+ # Main library
+ add_library(react-native-shiki-engine SHARED
+@@ -65,7 +66,7 @@ find_package(ReactAndroid REQUIRED CONFIG)
+
+ # Link libraries
+ target_link_libraries(react-native-shiki-engine
+-    ${ONIG_LIB}
++    shiki-onig
+     ${LOG_LIB}
+     android
+     fbjni::fbjni
 diff --git a/android/build.gradle b/android/build.gradle
 index 767eb43..2dccdd0 100644
 --- a/android/build.gradle
