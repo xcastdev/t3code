@@ -1118,6 +1118,7 @@ export interface ProjectMemoryQueryConsumerOptions {
   readonly confirmModelTransportDrained: (
     id: string,
   ) => Effect.Effect<void, ProjectMemoryServiceError>;
+  readonly releaseModelTransportObservation?: (reservationId: string) => Effect.Effect<void>;
   readonly companion?: (
     owner: ProjectMemoryQueryOwner,
     configuration: ProjectMemoryProcessingConfiguration,
@@ -1389,6 +1390,9 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
                 }
               : {}),
           });
+          // Settlement commits audited drain proof before the local observation is forgotten.
+          if (drained)
+            yield* options.releaseModelTransportObservation?.(held.reservationId) ?? Effect.void;
           const vector = reported ? decoded.success[0] : undefined;
           const embedded = {
             version: 1,
@@ -1822,10 +1826,15 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
               chargedOutputTokens: model.reservation.maxOutputTokens,
             });
           }
-          const receipt = yield* accounting.confirmTransportDrained(
-            queryId,
-            model.row.reservation_id,
-          );
+          const alreadyDrained =
+            model.row.settlement_json !== null &&
+            (yield* decodeSettlementJson(model.row.settlement_json)).transportDrained;
+          // A prior durable confirmation survives local observation release and consumer restart.
+          const receipt = alreadyDrained
+            ? { accountingReceiptId: model.row.accounting_receipt_id }
+            : yield* accounting.confirmTransportDrained(queryId, model.row.reservation_id);
+          if (receipt.accountingReceiptId === null)
+            return yield* deny("Query drain accounting receipt is missing");
           if (original.embedded === null) {
             // An interrupted exchange cannot be upgraded into a reported vector.
             const embedded = {
@@ -1925,6 +1934,10 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
           }),
           verify,
         );
+        if (model !== undefined)
+          yield* (
+            options.releaseModelTransportObservation?.(model.row.reservation_id) ?? Effect.void
+          );
       },
       Effect.mapError((error) =>
         isServiceError(error) ? error : deny("Query drain remains retained"),

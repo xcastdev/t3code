@@ -1892,6 +1892,9 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
       readCredential: options.readCredential,
       exchange: options.exchange,
       confirmModelTransportDrained: options.confirmModelTransportDrained,
+      ...(options.releaseModelTransportObservation === undefined
+        ? {}
+        : { releaseModelTransportObservation: options.releaseModelTransportObservation }),
       ...(options.observeCompanionCleanup === undefined
         ? {}
         : { observeCompanionCleanup: options.observeCompanionCleanup }),

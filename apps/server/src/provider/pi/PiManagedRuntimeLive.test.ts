@@ -10083,6 +10083,7 @@ for (const compactProof of [
   "memoryQuery",
   "memoryQueryPipeline",
   "memoryQueryActiveDrain",
+  "memoryQueryDrainCapacity",
   "memoryQueryJoinedRecovery",
   "memoryQueryInterruptedRecovery",
   "memoryQueryShared",
@@ -10266,6 +10267,7 @@ for (const compactProof of [
               !sharedDeliveryDenied) ||
             compactProof === "memoryQueryPipeline" ||
             compactProof === "memoryQueryActiveDrain" ||
+            compactProof === "memoryQueryDrainCapacity" ||
             compactProof === "memoryCompanionQuery" ||
             queryMixed;
           const queryForward =
@@ -10276,6 +10278,10 @@ for (const compactProof of [
           let memoryPipelineFailure = "";
           let memoryPipelineError: ProjectMemoryServiceError | undefined;
           const memoryDrains = new Set<string>();
+          const releasedModelObservations: string[] = [];
+          const observeModelDrain = (id: string) => {
+            if (memoryDrains.size < 256) memoryDrains.add(id);
+          };
           const queryGuard = yield* Effect.gen(function* () {
             return yield* ProjectWorkContentGuard;
           }).pipe(Effect.provide(ProjectWorkContentGuardLive));
@@ -10306,6 +10312,10 @@ for (const compactProof of [
           let reconcileMemory:
             | ((id: string) => Effect.Effect<void, ProjectMemoryServiceError>)
             | undefined;
+          let confirmMemoryDrain:
+            | ProjectMemoryProcessingConsumerOptions["confirmModelTransportDrained"]
+            | undefined;
+          let restartMemoryConsumer: Effect.Effect<void, ProjectMemoryServiceError> | undefined;
           let recoverMemory: MemoryModelPorts.ProjectMemoryPorts["Service"]["recoverJoinedOperation"];
           const recoveryWakes: string[] = [];
           const queryCleanupQueued = yield* Deferred.make<string>();
@@ -11785,6 +11795,25 @@ for (const compactProof of [
                                   if (queryNoForward && activeQuery)
                                     yield* Deferred.succeed(queryCleanupQueued, id);
                                 }),
+                              releaseModelTransportObservation: (id) =>
+                                Effect.gen(function* () {
+                                  const rows = yield* f.sql<{
+                                    status: string;
+                                    capacity: string;
+                                    settlement: string;
+                                  }>`SELECT status,capacity_state AS capacity,settlement_json AS settlement
+                                    FROM project_team_model_request WHERE reservation_id=${id}`;
+                                  expect(rows).toHaveLength(1);
+                                  expect(rows[0]?.status).not.toBe("held");
+                                  expect(rows[0]?.capacity).toBe("released");
+                                  expect(
+                                    decodeRequiredJson(rows[0]?.settlement ?? "null"),
+                                  ).toMatchObject({
+                                    transportDrained: true,
+                                  });
+                                  releasedModelObservations.push(id);
+                                  drained.delete(id);
+                                }).pipe(Effect.orDie),
                               confirmModelTransportDrained: (id) =>
                                 drained.has(id)
                                   ? Effect.void
@@ -11860,7 +11889,12 @@ for (const compactProof of [
                                           }),
                                         );
                                     }
-                                    drained.add(id);
+                                    if (compactProof === "memoryQueryDrainCapacity") {
+                                      // Other retained observations leave exactly one production drain slot.
+                                      for (let i = 0; drained.size < 255; i++)
+                                        drained.add(`retained-drain-${i}`);
+                                    }
+                                    observeModelDrain(id);
                                     if (compactProof === "memoryQueryActiveDrain") {
                                       const entered = yield* Deferred.make<void>();
                                       const release = yield* Deferred.make<void>();
@@ -11906,6 +11940,7 @@ for (const compactProof of [
                                         );
                                       yield* Effect.gen(function* () {
                                         yield* Deferred.await(entered);
+                                        const releasedBefore = [...releasedModelObservations];
                                         const before =
                                           yield* f.sql`SELECT * FROM project_team_model_request WHERE reservation_id=${id}`;
                                         const queries = yield* f.sql<{
@@ -11923,6 +11958,8 @@ for (const compactProof of [
                                             queries[0].id,
                                           ).pipe(Effect.result))._tag,
                                         ).toBe("Failure");
+                                        expect(releasedModelObservations).toEqual(releasedBefore);
+                                        expect(drained.has(id)).toBe(true);
                                         expect(
                                           yield* f.sql`SELECT * FROM project_team_model_request WHERE reservation_id=${id}`,
                                         ).toEqual(before);
@@ -12920,6 +12957,7 @@ for (const compactProof of [
                                   }),
                               };
                             }
+                            confirmMemoryDrain = consumerOptions.confirmModelTransportDrained;
                             const consumer = yield* makeProjectMemoryProcessingConsumer(
                               consumerOptions,
                             ).pipe(Effect.provideService(ProjectWorkContentGuard, contentGuard));
@@ -12949,6 +12987,17 @@ for (const compactProof of [
                                       }),
                                     ),
                                   );
+                            const restart = makeProjectMemoryProcessingConsumer(
+                              consumerOptions,
+                            ).pipe(Effect.provideService(ProjectWorkContentGuard, contentGuard));
+                            const restartContext =
+                              yield* Effect.context<Effect.Services<typeof restart>>();
+                            restartMemoryConsumer = restart.pipe(
+                              Effect.provide(restartContext),
+                              Effect.map((restarted) => {
+                                reconcileMemory = restarted.reconcileTransportDrain;
+                              }),
+                            );
                             reconcileMemory = consumer.reconcileTransportDrain;
                             recoverMemory = consumer.recoverJoinedOperation;
                             consumeQuery =
@@ -13347,6 +13396,24 @@ for (const compactProof of [
                                 exchanges: memoryExchanges,
                                 backend: memoryBackendCalls,
                               };
+                              if (compactProof === "memoryQueryDrainCapacity") {
+                                const charges =
+                                  yield* f.sql`SELECT * FROM project_team_model_request`;
+                                expect(memoryDrains.size).toBe(255);
+                                // The production dropping Set must still accept the next local drain.
+                                observeModelDrain("later-confirmed-drain");
+                                if (confirmMemoryDrain === undefined)
+                                  return yield* Effect.die("Model drain confirmation missing");
+                                yield* confirmMemoryDrain("later-confirmed-drain");
+                                expect(memoryDrains.size).toBe(256);
+                                expect({
+                                  exchanges: memoryExchanges,
+                                  backend: memoryBackendCalls,
+                                }).toEqual(calls);
+                                expect(
+                                  yield* f.sql`SELECT * FROM project_team_model_request`,
+                                ).toEqual(charges);
+                              }
                               const context = yield* f.reader.readRequired(snapshot);
                               expect(context.observations.provenance.queryId).toEqual(
                                 expect.any(String),
@@ -13626,6 +13693,7 @@ for (const compactProof of [
                               ).toEqual(queryReceipt);
                               const cleanupId =
                                 compactProof === "memoryQueryModelUnknown" ? model.id : retained.id;
+                              const releasesBeforeRecovery = [...releasedModelObservations];
                               if (!startFailure) {
                                 expect(
                                   (yield* reconcileMemory(cleanupId).pipe(Effect.result))._tag,
@@ -13639,11 +13707,39 @@ for (const compactProof of [
                                 accounting_receipt_id AS receipt,capacity_state AS capacity,reservation_id AS id
                                 FROM project_team_model_request WHERE reservation_id=${model.id}`,
                               ).toEqual(modelRows);
+                              expect(releasedModelObservations).toEqual(releasesBeforeRecovery);
                               // This is an observed completion handshake, rather than cancellation or an abort request.
                               if (compactProof === "memoryQueryModelUnknown")
                                 memoryDrains.add(model.id);
                               else queryDrains.add(retained.id + ":search");
+                              if (compactProof === "memoryQueryModelUnknown") {
+                                const admission = yield* f.sql<{
+                                  ids: string;
+                                }>`SELECT event_ids_json AS ids
+                                  FROM project_work_command_receipts WHERE project_id=${projectId}
+                                  AND command_id=${queryRequest.commandId}`;
+                                if (admission[0] === undefined)
+                                  return yield* Effect.die("Query admission receipt missing");
+                                yield* f.sql`UPDATE project_work_command_receipts SET event_ids_json='[]'
+                                  WHERE project_id=${projectId} AND command_id=${queryRequest.commandId}`;
+                                expect(
+                                  (yield* reconcileMemory(cleanupId).pipe(Effect.result))._tag,
+                                ).toBe("Failure");
+                                expect(releasedModelObservations).toEqual(releasesBeforeRecovery);
+                                expect(memoryDrains.has(model.id)).toBe(true);
+                                expect(
+                                  yield* f.sql`SELECT capacity_state FROM project_team_model_request
+                                  WHERE reservation_id=${model.id}`,
+                                ).toEqual([{ capacity_state: "quarantine" }]);
+                                yield* f.sql`UPDATE project_work_command_receipts SET event_ids_json=${admission[0].ids}
+                                  WHERE project_id=${projectId} AND command_id=${queryRequest.commandId}`;
+                              }
+                              if (restartMemoryConsumer === undefined)
+                                return yield* Effect.die("Restarted memory consumer missing");
+                              yield* restartMemoryConsumer;
                               yield* reconcileMemory(cleanupId);
+                              expect(memoryDrains.has(model.id)).toBe(false);
+                              expect(releasedModelObservations).toContain(model.id);
                               expect(
                                 (yield* auditProjectMemoryOperationLedger(f.sql, {
                                   environmentId: f.binding.environmentId,
@@ -13706,7 +13802,11 @@ for (const compactProof of [
                                 yield* f.sql`SELECT * FROM project_work_command_receipts
                                 WHERE project_id=${projectId} AND command_id=${retained.id + ":result"}`;
                               expect(completion).toHaveLength(1);
-                              yield* reconcileMemory(cleanupId);
+                              const releasesAfterRecovery = [...releasedModelObservations];
+                              yield* restartMemoryConsumer;
+                              for (const wake of [cleanupId, retained.id, model.id])
+                                yield* reconcileMemory(wake);
+                              expect(releasedModelObservations).toEqual(releasesAfterRecovery);
                               expect(
                                 yield* f.sql`SELECT * FROM project_work_command_receipts
                                 WHERE project_id=${projectId} AND command_id=${queryRequest.commandId}`,
