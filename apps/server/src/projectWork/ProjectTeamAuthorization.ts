@@ -92,6 +92,34 @@ export const managedActorId = (
   credential: Pick<ProjectTeamCredential, "providerInstanceId" | "threadId">,
 ) => `agent:mcp:${credential.providerInstanceId}:${credential.threadId}`;
 const deny = (reason: string) => new ProjectTeamAuthorizationError({ reason });
+class ProjectTeamReportTransaction extends Context.Service<
+  ProjectTeamReportTransaction,
+  {
+    readonly sql: SqlClient.SqlClient;
+    readonly repository: ProjectWorkRepository["Service"];
+    readonly transaction: SqlClient.TransactionConnection.Service;
+  }
+>()("t3/projectWork/ProjectTeamAuthorization/ProjectTeamReportTransaction") {}
+
+/** Borrow only the transaction entered by the gateway's captured repository callback. */
+export const withProjectTeamReportTransaction = <A, E, R>(
+  sql: SqlClient.SqlClient,
+  repository: ProjectWorkRepository["Service"],
+  effect: Effect.Effect<A, E, R>,
+) =>
+  Effect.gen(function* () {
+    const transaction = yield* Effect.serviceOption(sql.transactionService);
+    if (Option.isNone(transaction))
+      return yield* deny("Assignment report requires its original transaction");
+    return yield* effect.pipe(
+      Effect.provideService(ProjectTeamReportTransaction, {
+        sql,
+        repository,
+        transaction: transaction.value,
+      }),
+    );
+  });
+
 export const assertHumanMemoryMutationInTransaction = Effect.fn(
   "ProjectTeamAuthorization.assertHumanMemoryMutationInTransaction",
 )(function* (sql: SqlClient.SqlClient, principal: ProjectTeamPrincipal, projectId: ProjectId) {
@@ -2282,14 +2310,10 @@ export const layer = Layer.effect(
           Option.isNone(transaction) ||
           Option.isNone(repository)
         )
-          return yield* deny("Review completion report requires its original transaction");
+          return yield* deny("Assignment report requires its original transaction");
         return repository.value;
       });
-      if (
-        intent.type === "project-team.assignment.report" &&
-        intent.outcome === "complete" &&
-        principal.managed !== undefined
-      )
+      if (intent.type === "project-team.assignment.report" && principal.managed !== undefined)
         yield* requireProposalTransaction;
       const authority = yield* resolve(principal);
       if (principal.actor.kind !== "human") {
@@ -2383,6 +2407,41 @@ export const layer = Layer.effect(
           committedAt: attribution.recordedAt,
         } satisfies ProjectWorkCommand;
       }
+      // Only managed reports can outlive unrelated project progress. The gateway
+      // retains the original public intent fingerprint; this envelope is compiled
+      // against the same transaction's current authority and exact task fences.
+      const managedReport =
+        authority !== undefined && intent.type === "project-team.assignment.report";
+      if (managedReport) {
+        const loan = yield* Effect.serviceOption(ProjectTeamReportTransaction);
+        const transaction = yield* Effect.serviceOption(sql.transactionService);
+        const repository = yield* Effect.serviceOption(ProjectWorkRepository);
+        if (
+          Option.isNone(loan) ||
+          Option.isNone(transaction) ||
+          Option.isNone(repository) ||
+          loan.value.sql !== sql ||
+          loan.value.repository !== repository.value ||
+          loan.value.transaction !== transaction.value
+        )
+          return yield* deny("Assignment report requires its captured repository transaction");
+        const assignments =
+          state.foundationRecords?.filter(
+            (record) => record.kind === "task-membership" && record.taskId === intent.taskId,
+          ) ?? [];
+        const assignment = assignments[0];
+        if (
+          assignments.length !== 1 ||
+          assignment?.kind !== "task-membership" ||
+          assignment.recordId !== intent.assignmentId ||
+          assignment.revision !== intent.expectedAssignmentRevision ||
+          assignment.status !== "active" ||
+          (assignment.controlState !== undefined && assignment.controlState !== "active")
+        )
+          return yield* deny("Report assignment changed");
+      }
+      const compiledIntent =
+        managedReport && !duplicate ? { ...intent, expectedRevision: state.revision } : intent;
       if (duplicate) {
         if (intent.type === "project-team.criterion.waiver") yield* requireProposalTransaction;
         const rows = yield* sql<{
@@ -2543,20 +2602,22 @@ export const layer = Layer.effect(
       } else {
         const task = state.tasks.find((entry) => entry.taskId === intent.taskId);
         if (
-          state.revision !== intent.expectedRevision ||
+          (managedReport
+            ? intent.expectedRevision > state.revision
+            : state.revision !== intent.expectedRevision) ||
           task?.revision !== intent.expectedTaskRevision
         )
           return yield* deny("Guided project or task revision changed");
       }
-      return {
+      const command = {
         type: "project-work.foundation.commit",
         commandId: intent.commandId,
         projectId: intent.projectId,
-        expectedRevision: intent.expectedRevision,
+        expectedRevision: compiledIntent.expectedRevision,
         attribution,
         records: [],
         guided: {
-          intent,
+          intent: compiledIntent,
           ...(integrationSources === undefined ? {} : { integrationSources }),
           ...(authority === undefined
             ? {}
@@ -2564,6 +2625,12 @@ export const layer = Layer.effect(
         },
         committedAt: attribution.recordedAt,
       } satisfies ProjectWorkCommand;
+      if (managedReport && !duplicate)
+        yield* Effect.try({
+          try: () => decideProjectWorkCommand(state, command),
+          catch: () => deny("Report task, scope or evidence changed"),
+        });
+      return command;
     });
     const guard = <A, E>(effect: Effect.Effect<A, E>) =>
       effect.pipe(

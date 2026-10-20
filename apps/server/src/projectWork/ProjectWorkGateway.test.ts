@@ -9,6 +9,8 @@ import {
   ProjectWorkWriteIntent,
   ProjectTeamMemoryRetractIntent,
   CommandId,
+  canonicalProjectWorkPayload,
+  ProjectWorkEvidenceId,
   EnvironmentId,
   ProjectId,
   ProjectWorkApprovalId,
@@ -3675,3 +3677,349 @@ it.effect(
       ),
     ),
 );
+
+const seedParallelReports = Effect.fn("gatewayTest.seedParallelReports")(function* () {
+  const f = yield* seedTeam("coordinator", "running", {
+    roleTools: ["project-work.report"],
+  });
+  const children = yield* Effect.forEach(["a", "b"], (name) =>
+    Effect.gen(function* () {
+      const binding = yield* createManagedAssignment({
+        taskId: ProjectWorkTaskId.make(`parallel-${name}`),
+        recordId: `parallel-binding-${name}`,
+        attemptId: `parallel-attempt-${name}`,
+        commandId: `parallel-claim-${name}`,
+        parentRunId: f.binding.recordId,
+        memberId: f.binding.memberId,
+        providerInstanceId: f.binding.providerInstanceId,
+        threadId: ThreadId.make(`parallel-thread-${name}`),
+        role: f.role,
+        configuration: f.binding.configuration,
+        sessionId: `parallel-native-${name}`,
+        status: name === "a" ? "running" : "reserved",
+      });
+      const managed = (yield* f.auth.issueCredential({
+        providerInstanceId: binding.providerInstanceId,
+        threadId: binding.threadId,
+      }))!.credential;
+      return {
+        binding,
+        principal: {
+          actor: { kind: "agent" as const, id: TeamAuthorization.managedActorId(managed) },
+          managed,
+        },
+      };
+    }),
+  );
+  const report = Effect.fn("gatewayTest.captureReport")(function* (
+    child: (typeof children)[number],
+  ) {
+    const state = (yield* f.auth.resolve(child.principal))!.state;
+    const task = state.tasks.find((t) => t.taskId === child.binding.taskId)!;
+    const assignment = state.foundationRecords!.find(
+      (r) => r.kind === "task-membership" && r.taskId === task.taskId,
+    )!;
+    return {
+      type: "project-team.assignment.report" as const,
+      commandId: CommandId.make(`parallel-report-${task.taskId}`),
+      projectId: task.projectId,
+      taskId: task.taskId,
+      expectedRevision: state.revision,
+      expectedTaskRevision: task.revision,
+      assignmentId: assignment.recordId,
+      expectedAssignmentRevision: assignment.revision,
+      specRevision: task.specRevision,
+      planRevision: 1,
+      outcome: "findings" as const,
+      summary: `Retained report for ${task.taskId}`,
+      evidenceIds: [],
+      outputArtifactIds: [],
+      outputs: [
+        {
+          criterionId: ProjectWorkCriterionId.make(`${child.binding.recordId}-criterion`),
+          kind: "observation" as const,
+          detail: `Actual output for ${task.taskId}`,
+        },
+      ],
+    };
+  });
+  const a = children[0]!;
+  const b = children[1]!;
+  const inputA = yield* report(a);
+  yield* f.change(decodeTeamFixture({ ...b.binding, revision: 1, status: "running" }));
+  const inputB = yield* report(b);
+  expect(inputB.expectedRevision).toBe(inputA.expectedRevision + 1);
+  const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+  const source = { kind: "mcp" as const, id: "parallel-reports" };
+  return { f, a, b, inputA, inputB, gateway, source };
+});
+
+it.effect(
+  "records parallel same-member child reports captured before sibling progress exactly once",
+  () =>
+    Effect.gen(function* () {
+      const { f, a, b, inputA, inputB, gateway, source } = yield* seedParallelReports();
+      const first = yield* gateway.write(inputA, a.principal.actor, source, a.principal);
+      const second = yield* gateway.write(inputB, b.principal.actor, source, b.principal);
+      expect(first.receipt.status).toBe("accepted");
+      expect(second.receipt.status).toBe("accepted");
+      const before = yield* f.repo.replay(inputA.projectId);
+      expect(yield* gateway.write(inputA, a.principal.actor, source, a.principal)).toEqual(first);
+      expect(yield* gateway.write(inputB, b.principal.actor, source, b.principal)).toEqual(second);
+      expect(yield* f.repo.replay(inputA.projectId)).toEqual(before);
+      for (const input of [inputA, inputB]) {
+        const comments = before.filter(
+          (event) =>
+            event.type === "project-work.comment.added" &&
+            event.comment.taskId === input.taskId &&
+            event.comment.body === input.summary,
+        );
+        expect(comments).toHaveLength(1);
+        const receipts =
+          yield* f.sql`SELECT payload_fingerprint AS fingerprint FROM project_work_command_receipts
+        WHERE project_id=${input.projectId} AND command_id=${input.commandId}`;
+        expect(receipts).toEqual([
+          {
+            fingerprint:
+              "project-team-intent:" +
+              NodeCrypto.createHash("sha256")
+                .update(
+                  canonicalProjectWorkPayload({
+                    intent: input,
+                    actor: {
+                      kind: a.principal.actor.kind,
+                      id: input === inputA ? a.principal.actor.id : b.principal.actor.id,
+                    },
+                    source,
+                    managed: input === inputA ? a.principal.managed : b.principal.managed,
+                  }),
+                )
+                .digest("hex"),
+          },
+        ]);
+      }
+      expect(
+        (yield* gateway
+          .write({ ...inputA, summary: "Changed request" }, a.principal.actor, source, a.principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* gateway
+          .write(
+            { ...inputA, expectedRevision: second.revision },
+            a.principal.actor,
+            source,
+            a.principal,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.repo.replay(inputA.projectId)).toEqual(before);
+    }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+it.effect(
+  "denies stale parallel report targets and evidence without writes in validation and compilation",
+  () =>
+    Effect.gen(function* () {
+      const { f, a, b, inputA, gateway, source } = yield* seedParallelReports();
+      for (const [id, owner, scopeHash] of [
+        ["foreign-report-evidence", b.binding.taskId, b.binding.scopeHash!],
+        ["stale-report-evidence", a.binding.taskId, "old-scope"],
+      ] as const) {
+        yield* f.repo.execute({
+          type: "project-work.evidence.add",
+          projectId: inputA.projectId,
+          commandId: CommandId.make(id),
+          addedAt: at,
+          evidence: {
+            evidenceId: ProjectWorkEvidenceId.make(id),
+            taskId: owner,
+            kind: "observation",
+            summary: "Actual retained evidence",
+            detail: "Actual detail",
+            recordedAt: at,
+            revision: 0,
+            scopeHash,
+            attribution: {
+              actor: { kind: "human", id: "owner" },
+              source: { kind: "web", id: "owner" },
+              recordedAt: at,
+            },
+          },
+        });
+      }
+      const before = yield* f.repo.replay(inputA.projectId);
+      const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts`;
+      const attribution = { actor: a.principal.actor, source, recordedAt: at };
+      const invalid = [
+        { taskId: b.binding.taskId },
+        { expectedTaskRevision: inputA.expectedTaskRevision + 1 },
+        { specRevision: 0 },
+        { planRevision: 0 },
+        { assignmentId: "foreign-assignment" },
+        { expectedAssignmentRevision: inputA.expectedAssignmentRevision + 1 },
+        { expectedRevision: 99999 },
+        { evidenceIds: ["missing-evidence"] },
+        { evidenceIds: ["foreign-report-evidence"] },
+        { evidenceIds: ["stale-report-evidence"] },
+        { outputArtifactIds: ["foreign-report-evidence"] },
+        {
+          outputs: [
+            {
+              ...inputA.outputs[0]!,
+              criterionId: ProjectWorkCriterionId.make("foreign-criterion"),
+            },
+          ],
+        },
+      ];
+      for (const [index, patch] of invalid.entries()) {
+        const input = {
+          ...inputA,
+          ...patch,
+          commandId: CommandId.make(`invalid-parallel-${index}`),
+        };
+        for (const mode of ["validate", "compile"] as const) {
+          expect(
+            (yield* f.sql
+              .withTransaction(
+                TeamAuthorization.withProjectTeamReportTransaction(
+                  f.sql,
+                  f.repo,
+                  f.auth.guided(a.principal, input, attribution, false, mode),
+                ),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        expect(
+          (yield* gateway.write(input, a.principal.actor, source, a.principal).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+      }
+      for (const mode of ["validate", "compile"] as const) {
+        const bare = f.auth.guided(a.principal, inputA, attribution, false, mode);
+        expect((yield* f.sql.withTransaction(bare).pipe(Effect.result))._tag).toBe("Failure");
+        const compile = TeamAuthorization.withProjectTeamReportTransaction(f.sql, f.repo, bare);
+        expect((yield* compile.pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(compile.pipe(Effect.provideService(SqlClient.SqlClient, { ...f.sql })))
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* f.sql
+            .withTransaction(
+              compile.pipe(
+                Effect.updateContext((context: Context.Context<never>) =>
+                  Context.omit(ProjectWorkRepository.ProjectWorkRepository)(context),
+                ),
+              ),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        for (const substitute of [
+          bare.pipe(
+            Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, { ...f.repo }),
+          ),
+          Effect.gen(function* () {
+            const transaction = yield* Effect.serviceOption(f.sql.transactionService);
+            if (transaction._tag === "None") return yield* Effect.die("Missing test transaction");
+            return yield* bare.pipe(
+              Effect.provideService(f.sql.transactionService, [
+                transaction.value[0],
+                transaction.value[1],
+              ]),
+            );
+          }),
+        ])
+          expect(
+            (yield* f.sql
+              .withTransaction(
+                TeamAuthorization.withProjectTeamReportTransaction(f.sql, f.repo, substitute),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        expect(yield* f.sql.withTransaction(compile)).toMatchObject({
+          expectedRevision: before.at(-1)!.revision,
+          guided: { intent: { ...inputA, expectedRevision: before.at(-1)!.revision } },
+        });
+      }
+      expect(yield* f.repo.replay(inputA.projectId)).toEqual(before);
+      expect(yield* f.sql`SELECT * FROM project_work_command_receipts`).toEqual(receipts);
+      // Human reports and unrelated managed writes keep the exact project guard.
+      expect(
+        (yield* gateway
+          .write(
+            { ...inputA, commandId: CommandId.make("human-stale-report") },
+            { kind: "human", id: "owner" },
+            source,
+          )
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* gateway
+          .write(inputA, a.principal.actor, source, {
+            ...a.principal,
+            managed: { ...a.principal.managed, generation: 1 },
+          })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(yield* f.repo.replay(inputA.projectId)).toEqual(before);
+      expect(yield* f.sql`SELECT * FROM project_work_command_receipts`).toEqual(receipts);
+    }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+for (const changed of ["assignment", "binding", "member", "scope", "task"] as const)
+  it.effect(`denies new and replayed parallel reports after current ${changed} changes`, () =>
+    Effect.gen(function* () {
+      const { f, a, inputA, gateway, source } = yield* seedParallelReports();
+      yield* gateway.write(inputA, a.principal.actor, source, a.principal);
+      if (changed === "member")
+        yield* f.change(
+          decodeTeamFixture({ ...f.member, status: "paused", revision: f.member.revision + 1 }),
+        );
+      else if (changed === "binding")
+        yield* f.change(
+          decodeTeamFixture({ ...a.binding, status: "stopping", revision: a.binding.revision + 1 }),
+        );
+      else if (changed === "task")
+        yield* gateway.write(
+          {
+            type: "project-team.task.control",
+            projectId: inputA.projectId,
+            taskId: inputA.taskId,
+            commandId: CommandId.make("pause-parallel-task"),
+            expectedRevision: (yield* f.auth.resolve(a.principal))!.state.revision,
+            expectedTaskRevision: inputA.expectedTaskRevision,
+            control: { action: "pause", reason: "Authority withdrawn" },
+          },
+          { kind: "human", id: "owner" },
+          { kind: "web", id: "owner" },
+        );
+      else {
+        const state = (yield* f.auth.resolve(a.principal))!.state;
+        const record = state.foundationRecords!.find((r) =>
+          changed === "assignment"
+            ? r.kind === "task-membership" && r.taskId === inputA.taskId
+            : r.kind === "gate" && r.recordId === a.binding.authorizationGateId,
+        )!;
+        yield* f.change(
+          decodeTeamFixture({
+            ...record,
+            revision: record.revision + 1,
+            ...(changed === "scope" ? { status: "invalidated" } : {}),
+          }),
+        );
+      }
+      const before = yield* f.repo.replay(inputA.projectId);
+      const receipts = yield* f.sql`SELECT * FROM project_work_command_receipts`;
+      for (const commandId of [inputA.commandId, CommandId.make("report-after-revocation")])
+        expect(
+          (yield* gateway
+            .write({ ...inputA, commandId }, a.principal.actor, source, a.principal)
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+      expect(yield* f.repo.replay(inputA.projectId)).toEqual(before);
+      expect(yield* f.sql`SELECT * FROM project_work_command_receipts`).toEqual(receipts);
+    }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+  );

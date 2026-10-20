@@ -1645,6 +1645,10 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         records: [],
         committedAt: now,
       };
+      const withReportTransaction = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        input.type === "project-team.assignment.report" && caller.managed !== undefined
+          ? ProjectTeamAuthorization.withProjectTeamReportTransaction(sql, repository, effect)
+          : effect;
       let retainedMemorySelection = false;
       const result = yield* executeAuthorized(
         envelope,
@@ -1659,14 +1663,18 @@ const makeProjectWorkGateway = Effect.gen(function* () {
               ),
             );
             return yield* isGuidedIntent(input)
-              ? teamAuthorization.value.guided(caller, input, attribution, false)
+              ? withReportTransaction(
+                  teamAuthorization.value.guided(caller, input, attribution, false),
+                )
               : teamAuthorization.value.intent(caller, input, attribution, false);
           }),
         ({ duplicate }) => {
           retainedMemorySelection = duplicate;
           return (
             isGuidedIntent(input)
-              ? teamAuthorization.value.guided(caller, input, attribution, duplicate, "validate")
+              ? withReportTransaction(
+                  teamAuthorization.value.guided(caller, input, attribution, duplicate, "validate"),
+                )
               : teamAuthorization.value.intent(caller, input, attribution, duplicate)
           ).pipe(Effect.asVoid);
         },
