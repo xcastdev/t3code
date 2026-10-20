@@ -10050,6 +10050,10 @@ for (const compactProof of [
   "returnCancel",
   "memoryAdmission",
   "memoryAccounting",
+  "memorySubscriptionPiFirst",
+  "memorySubscriptionMemoryFirst",
+  "memorySubscriptionUnknown",
+  "memorySubscriptionPiUnknown",
   "memorySharedRoot",
   "memoryPipeline",
   "memoryLiquidPipeline",
@@ -10106,61 +10110,67 @@ for (const compactProof of [
   "memoryQueryMixed",
 ] as const)
   it.effect(
-    (compactProof?.includes("Shared") && compactProof.includes("Query")) ||
-      compactProof?.startsWith("memoryQueryShared")
-      ? `shared semantic query preserves recipient accounting and exact owner authority: ${compactProof}`
-      : compactProof === undefined
-        ? "managed compact transfers current required context after durable association and replays without another execution"
-        : compactProof === "memoryAdmission"
-          ? "retains exact memory selection against the executing operation before processing and replays after terminal"
-          : compactProof === "memoryAccounting" || compactProof === "memoryLiquidAccounting"
-            ? `accounts memory and ordinary stages against the same executing operation and shared capacity: ${compactProof}`
-            : compactProof === "memorySharedRoot"
-              ? "reads shared root usage outside the charged child binding page without assigning parent charges"
-              : compactProof === "memoryPipeline"
-                ? "processes an exact admitted source through shared model accounting and the configured index consumer"
-                : compactProof === "memoryFailure"
-                  ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
-                  : compactProof === "memorySecret"
-                    ? "rejects a newly learned escaped source secret before memory extraction reservation"
-                    : compactProof === "memoryEmbeddingSecret"
-                      ? "rejects newly learned escaped embedding text before its memory reservation"
-                      : compactProof === "memoryCleanup"
-                        ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
-                        : compactProof === "memoryHumanRetraction"
-                          ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
-                          : compactProof === "memoryCleanupGuards"
-                            ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
-                            : compactProof === "memoryQuery"
-                              ? "admits an explicit semantic query through the executing task bridge before forward stages"
-                              : compactProof === "memoryQueryPipeline"
-                                ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
-                                : compactProof === "memoryQueryMixed"
-                                  ? "retains current semantic context when completed search also returns a genuinely superseded observation"
-                                  : compactProof === "memoryQueryGuards"
-                                    ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
-                                    : compactProof === "memoryQueryNoGrant"
-                                      ? "denies semantic query admission without the original frozen write intersection"
-                                      : compactProof === "memoryQueryNoAccess"
-                                        ? "denies semantic query admission for an original no-memory role"
-                                        : compactProof === "memoryQueryBudget"
-                                          ? "retains authenticated query failure when the original operation budget cannot fund embedding"
-                                          : compactProof === "memoryQuerySecret"
-                                            ? "rejects a newly learned escaped query credential before embedding reservation"
-                                            : compactProof === "memoryQueryModelUnknown"
-                                              ? "retains an unknown query embedding charge until authenticated drain without resend"
-                                              : compactProof === "memoryQuerySearchUnknown"
-                                                ? "settles an uncertain query search only after its exact authenticated late drain"
-                                                : compactProof === "successorReplay"
-                                                  ? "retained compact replay preserves the latest successful native head without another execution"
-                                                  : compactProof?.startsWith("memoryServer")
-                                                    ? `production memory model forwarding fences the final wait: ${compactProof}`
-                                                    : compactProof?.startsWith("memoryForward")
-                                                      ? `captured runtime denies ${compactProof} before transport without holding SQL`
-                                                      : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
+    compactProof?.startsWith("memorySubscription")
+      ? `settles memory and monitored Pi usage atomically: ${compactProof}`
+      : (compactProof?.includes("Shared") && compactProof.includes("Query")) ||
+          compactProof?.startsWith("memoryQueryShared")
+        ? `shared semantic query preserves recipient accounting and exact owner authority: ${compactProof}`
+        : compactProof === undefined
+          ? "managed compact transfers current required context after durable association and replays without another execution"
+          : compactProof === "memoryAdmission"
+            ? "retains exact memory selection against the executing operation before processing and replays after terminal"
+            : compactProof === "memoryAccounting" || compactProof === "memoryLiquidAccounting"
+              ? `accounts memory and ordinary stages against the same executing operation and shared capacity: ${compactProof}`
+              : compactProof === "memorySharedRoot"
+                ? "reads shared root usage outside the charged child binding page without assigning parent charges"
+                : compactProof === "memoryPipeline"
+                  ? "processes an exact admitted source through shared model accounting and the configured index consumer"
+                  : compactProof === "memoryFailure"
+                    ? "retains a committed memory selection and unknown charge until authenticated local drain without resend"
+                    : compactProof === "memorySecret"
+                      ? "rejects a newly learned escaped source secret before memory extraction reservation"
+                      : compactProof === "memoryEmbeddingSecret"
+                        ? "rejects newly learned escaped embedding text before its memory reservation"
+                        : compactProof === "memoryCleanup"
+                          ? "discovers exact superseded decision cleanup for the executing task without funding old indexing"
+                          : compactProof === "memoryHumanRetraction"
+                            ? "funds exact authenticated human memory retraction cleanup without model calls or artifact deletion"
+                            : compactProof === "memoryCleanupGuards"
+                              ? "rejects forged decision lineage and immutable cleanup job changes before admission or backend"
+                              : compactProof === "memoryQuery"
+                                ? "admits an explicit semantic query through the executing task bridge before forward stages"
+                                : compactProof === "memoryQueryPipeline"
+                                  ? "consumes an exact task-funded semantic query and serves audited completed context without new calls"
+                                  : compactProof === "memoryQueryMixed"
+                                    ? "retains current semantic context when completed search also returns a genuinely superseded observation"
+                                    : compactProof === "memoryQueryGuards"
+                                      ? "denies stale task scope and disabled or ownerless semantic query admission without partial effects"
+                                      : compactProof === "memoryQueryNoGrant"
+                                        ? "denies semantic query admission without the original frozen write intersection"
+                                        : compactProof === "memoryQueryNoAccess"
+                                          ? "denies semantic query admission for an original no-memory role"
+                                          : compactProof === "memoryQueryBudget"
+                                            ? "retains authenticated query failure when the original operation budget cannot fund embedding"
+                                            : compactProof === "memoryQuerySecret"
+                                              ? "rejects a newly learned escaped query credential before embedding reservation"
+                                              : compactProof === "memoryQueryModelUnknown"
+                                                ? "retains an unknown query embedding charge until authenticated drain without resend"
+                                                : compactProof === "memoryQuerySearchUnknown"
+                                                  ? "settles an uncertain query search only after its exact authenticated late drain"
+                                                  : compactProof === "successorReplay"
+                                                    ? "retained compact replay preserves the latest successful native head without another execution"
+                                                    : compactProof?.startsWith("memoryServer")
+                                                      ? `production memory model forwarding fences the final wait: ${compactProof}`
+                                                      : compactProof?.startsWith("memoryForward")
+                                                        ? `captured runtime denies ${compactProof} before transport without holding SQL`
+                                                        : `compact fences protected context at ${compactProof} while permitting accounting and clock drift`,
     () =>
       scoped(
         Effect.gen(function* () {
+          const subscriptionMemory = compactProof?.startsWith("memorySubscription") === true;
+          const memoryUnknown = compactProof === "memorySubscriptionUnknown";
+          const piUnknown = compactProof === "memorySubscriptionPiUnknown";
+          let subscriptionMemoryChecked = false;
           const liquidProof = compactProof?.startsWith("memoryLiquid") === true;
           const liquidDenied =
             compactProof === "memoryLiquidConfiguration" || compactProof === "memoryLiquidIdentity";
@@ -10192,6 +10202,7 @@ for (const compactProof of [
             compactProof === "memoryFailure" || compactProof === "memorySourceJoinedRecovery";
           const memoryProof = compactProof?.startsWith("memory") === true;
           const accountingProof =
+            subscriptionMemory ||
             compactProof === "memoryAccounting" ||
             compactProof === "memoryLiquidAccounting" ||
             compactProof === "memorySharedRoot";
@@ -10426,6 +10437,21 @@ for (const compactProof of [
               detail: "Captured original runtime was revoked while waiting",
             });
           });
+          const controlledMemoryPorts = ProjectMemoryPorts.of({
+            assertConfigured: () =>
+              memoryReady
+                ? Effect.void
+                : Effect.fail(
+                    new ProjectMemoryServiceError({
+                      reason: "Controlled processing is not configured",
+                    }),
+                  ),
+            consume: (principal, effectId) =>
+              consumeMemory === undefined ? Effect.void : consumeMemory(principal, effectId),
+            readConfiguration: () => Effect.succeed(memoryReady ? queryConfiguration : undefined),
+            consumeQuery: (principal, id) => consumeQuery?.(principal, id) ?? Effect.void,
+            readQueryCache: (principal) => readQueryCache?.(principal) ?? Effect.succeed(undefined),
+          });
           const f = yield* requiredTransferFixture(
             false,
             compactProof === "memorySharedRoot" || compactProof === "memoryCompanionSharedRoot",
@@ -10439,32 +10465,19 @@ for (const compactProof of [
                   ? "shared"
                   : "project",
             undefined,
-            selectedSkill
-              ? {
-                  ...basicRuntimeProfile,
-                  roleSkillIds: [selectedSkill.manifest.id],
-                  skillIds: [selectedSkill.manifest.id],
-                }
-              : undefined,
+            subscriptionMemory
+              ? { ...subscriptionRuntimeProfile, role: "implementer", maxInputTokens: 32_768 }
+              : selectedSkill
+                ? {
+                    ...basicRuntimeProfile,
+                    roleSkillIds: [selectedSkill.manifest.id],
+                    skillIds: [selectedSkill.manifest.id],
+                  }
+                : undefined,
             forwardProof || serverCurrent ? forwardRuntimeCheck : undefined,
           ).pipe(
             Effect.provideService(Authorization.ProjectTeamAuthorization, returnAuthorization),
-            Effect.provideService(ProjectMemoryPorts, {
-              assertConfigured: () =>
-                memoryReady
-                  ? Effect.void
-                  : Effect.fail(
-                      new ProjectMemoryServiceError({
-                        reason: "Controlled processing is not configured",
-                      }),
-                    ),
-              consume: (principal, effectId) =>
-                consumeMemory === undefined ? Effect.void : consumeMemory(principal, effectId),
-              readConfiguration: () => Effect.succeed(memoryReady ? queryConfiguration : undefined),
-              consumeQuery: (principal, id) => consumeQuery?.(principal, id) ?? Effect.void,
-              readQueryCache: (principal) =>
-                readQueryCache?.(principal) ?? Effect.succeed(undefined),
-            }),
+            Effect.provideService(ProjectMemoryPorts, controlledMemoryPorts),
             Effect.provideService(ProjectWorkContentGuard, queryGuard),
           );
           let memoryRequest: typeof ProjectTeamMemoryProcessIntent.Type | undefined;
@@ -10560,6 +10573,36 @@ for (const compactProof of [
                   ),
                 );
           let runInstance = f.instance;
+          if (subscriptionMemory) {
+            const deadline = f.snapshot.intent.limits.rootDeadlineAtMs;
+            const access = `header.${Buffer.from(
+              json({
+                exp: Math.ceil(deadline / 1000) + 60,
+                "https://api.openai.com/auth": { chatgpt_account_id: "memory-fixture-account" },
+              }),
+            ).toString("base64url")}.signature`;
+            yield* f.fs.writeFileString(
+              f.options.agentDirectory + "/auth.json",
+              json({
+                "openai-codex": {
+                  type: "oauth",
+                  access,
+                  expires: deadline + 60_000,
+                  accountId: "memory-fixture-account",
+                },
+              }),
+            );
+            runInstance = yield* (yield* makePiManagedRuntimeLive({
+              ...f.options,
+              subscriptionTest: {
+                selection: subscriptionSelection(f),
+                credentialSource: { directory: f.options.agentDirectory, format: "pi" },
+              },
+            }).pipe(
+              Effect.provideService(ProjectMemoryPorts, controlledMemoryPorts),
+              Effect.provideService(ProjectWorkContentGuard, queryGuard),
+            )).forInstance({ instanceId: providerInstanceId, enabled: true, configuration: {} });
+          }
           let returnSkillPlan:
             | Effect.Success<ReturnType<typeof selectedRuntimeFixture>>["plan"]
             | undefined;
@@ -10840,61 +10883,90 @@ for (const compactProof of [
                       const accountingReceipts: Array<
                         SessionRuntime.PiSessionTerminal["accountingReceipts"][number]
                       > = [];
+                      let settleSubscriptionPi: Effect.Effect<void, Cause.UnknownError> | undefined;
                       const failedUsage =
                         accountingProof && input.operation.operationId === failedUsageOperationId;
                       if (input.operation.operationKind !== "initialize") {
-                        const fields = {
-                          workerId: input.identity.workerId,
-                          generation: input.identity.generation,
-                          operationId: input.operation.operationId,
-                          requestId: 1,
-                          routeId: input.broker.routeId,
-                          provider: input.broker.provider,
-                          model: input.broker.model,
-                          maxInputTokens: input.broker.maxInputTokens,
-                          maxOutputTokens: input.broker.maxOutputTokens,
-                          callCount: 1 as const,
-                          deadlineAtMs: row.deadline_at_ms,
-                        };
-                        const reserved = yield* Effect.tryPromise(() =>
-                          input.broker.reserveRequest(fields, signal),
-                        );
-                        const bindRequestInput = input.broker.bindRequestInput;
-                        if (bindRequestInput)
-                          yield* Effect.tryPromise(() =>
-                            bindRequestInput(
-                              {
-                                reservationId: reserved.reservationId,
-                                encodedRequestSha256: "d".repeat(64),
-                              },
-                              signal,
-                            ),
+                        for (const requestId of subscriptionMemory ? [1, 2] : [1]) {
+                          const fields = {
+                            workerId: input.identity.workerId,
+                            generation: input.identity.generation,
+                            operationId: input.operation.operationId,
+                            requestId,
+                            routeId: input.broker.routeId,
+                            provider: input.broker.provider,
+                            model: input.broker.model,
+                            maxInputTokens: subscriptionMemory
+                              ? 29_832
+                              : input.broker.maxInputTokens,
+                            maxOutputTokens: input.broker.maxOutputTokens,
+                            callCount: 1 as const,
+                            ...(subscriptionMemory
+                              ? {
+                                  accountingMode: "openai-subscription-monitored" as const,
+                                  unknownMaximumTokens: 64_000 as const,
+                                }
+                              : {}),
+                            deadlineAtMs: row.deadline_at_ms,
+                          };
+                          const reserved = yield* Effect.tryPromise(() =>
+                            input.broker.reserveRequest(fields, signal),
                           );
-                        const usage = { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 };
-                        const settled = yield* Effect.tryPromise(() =>
-                          input.broker.settleRequest({
-                            ...fields,
-                            reservationId: reserved.reservationId,
-                            transportDrained: true,
-                            outcome: failedUsage ? "unknown" : "reported",
-                            chargedInputTokens: failedUsage ? fields.maxInputTokens : 10,
-                            chargedOutputTokens: failedUsage ? fields.maxOutputTokens : 2,
-                            ...(failedUsage
-                              ? {}
-                              : { reportedModel: input.broker.model, reportedUsage: usage }),
-                          }),
-                        );
-                        if (!failedUsage)
-                          accountingReceipts.push({
-                            requestId: 1,
-                            reservationId: reserved.reservationId,
-                            accountingReceiptId: settled.accountingReceiptId,
-                            routeId: fields.routeId,
-                            provider: fields.provider,
-                            model: fields.model,
-                            reportedModel: fields.model,
-                            usage,
+                          const bindRequestInput = input.broker.bindRequestInput;
+                          if (bindRequestInput)
+                            yield* Effect.tryPromise(() =>
+                              bindRequestInput(
+                                {
+                                  reservationId: reserved.reservationId,
+                                  encodedRequestSha256: "d".repeat(64),
+                                },
+                                signal,
+                              ),
+                            );
+                          const usage = subscriptionMemory
+                            ? {
+                                prompt_tokens: 29_832,
+                                completion_tokens: 2_048,
+                                total_tokens: 31_880,
+                              }
+                            : { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 };
+                          const unknownPi = failedUsage || (piUnknown && requestId === 2);
+                          const settlePi = Effect.gen(function* () {
+                            const settled = yield* Effect.tryPromise(() =>
+                              input.broker.settleRequest({
+                                ...fields,
+                                reservationId: reserved.reservationId,
+                                transportDrained: true,
+                                outcome: unknownPi ? "unknown" : "reported",
+                                chargedInputTokens: unknownPi
+                                  ? fields.maxInputTokens
+                                  : usage.prompt_tokens,
+                                chargedOutputTokens: unknownPi
+                                  ? subscriptionMemory
+                                    ? 64_000
+                                    : fields.maxOutputTokens
+                                  : usage.completion_tokens,
+                                ...(unknownPi
+                                  ? {}
+                                  : { reportedModel: input.broker.model, reportedUsage: usage }),
+                              }),
+                            );
+                            if (!unknownPi)
+                              accountingReceipts.push({
+                                requestId,
+                                reservationId: reserved.reservationId,
+                                accountingReceiptId: settled.accountingReceiptId,
+                                routeId: fields.routeId,
+                                provider: fields.provider,
+                                model: fields.model,
+                                reportedModel: fields.model,
+                                usage,
+                              });
                           });
+                          if (subscriptionMemory && requestId === 2)
+                            settleSubscriptionPi = settlePi;
+                          else yield* settlePi;
+                        }
                       }
                       if (
                         memoryProof &&
@@ -14101,407 +14173,556 @@ for (const compactProof of [
                                       }),
                                     ),
                             });
-                            expect(admitted.operation.operationMaximumTokens).toBe(1000);
-                            const stage = {
-                              phase: "extract" as const,
-                              routeId: "controlled-command-code",
-                              requestId: 1,
-                              maxInputTokens: 400,
-                              maxOutputTokens: 100,
-                              deadlineAtMs: row.deadline_at_ms,
-                            };
-                            // Twelve ordinary tokens already exist. A memory stage uses
-                            // their original operation, rather than a new budget identity.
-                            const memoryHeld = yield* ledger.reserve(admitted, stage);
-                            expect(memoryHeld.status).toBe("reserved");
-                            expect(yield* ledger.reserve(admitted, stage)).toMatchObject({
-                              status: "existing",
-                              reservationId: memoryHeld.reservationId,
-                            });
-                            const nativeFields = {
-                              workerId: input.identity.workerId,
-                              generation: input.identity.generation,
-                              operationId: input.operation.operationId,
-                              requestId: 2,
-                              routeId: input.broker.routeId,
-                              provider: input.broker.provider,
-                              model: input.broker.model,
-                              maxInputTokens: input.broker.maxInputTokens,
-                              maxOutputTokens: input.broker.maxOutputTokens,
-                              callCount: 1 as const,
-                              deadlineAtMs: row.deadline_at_ms,
-                            };
-                            const ordinaryHeld = yield* Effect.tryPromise(() =>
-                              input.broker.reserveRequest(nativeFields, signal),
-                            );
-                            const beforeDenied =
-                              yield* f.sql`SELECT * FROM project_team_model_request`;
-                            expect(
-                              (yield* ledger
-                                .reserve(admitted, {
-                                  ...stage,
-                                  phase: "embed",
-                                  routeId: "controlled-openrouter",
-                                  maxInputTokens: 1,
-                                  maxOutputTokens: 1,
-                                })
-                                .pipe(Effect.result))._tag,
-                            ).toBe("Failure");
-                            expect(
-                              (yield* ledger
-                                .reserve(admitted, {
-                                  ...stage,
-                                  requestId: 2,
-                                  maxInputTokens: 300,
-                                  maxOutputTokens: 100,
-                                })
-                                .pipe(Effect.result))._tag,
-                            ).toBe("Failure");
-                            expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual(
-                              beforeDenied,
-                            );
-                            const memorySettlement = {
-                              ...memoryHeld.reservation,
-                              reservationId: memoryHeld.reservationId,
-                              outcome: "reported" as const,
-                              chargedInputTokens: 100,
-                              chargedOutputTokens: 10,
-                              transportDrained: true,
-                              reportedModel: memoryHeld.reservation.model,
-                              reportedInputTokens: 100,
-                              reportedOutputTokens: 10,
-                            };
-                            drainedMemory.add(memoryHeld.reservationId);
-                            if (liquidProof) {
-                              expect(memoryHeld.reservation).toMatchObject({
-                                provider: "openrouter",
-                                model: "liquid/lfm-2.5-2.6b:free",
-                                routeId: stage.routeId,
+                            if (subscriptionMemory) {
+                              const held = yield* ledger.reserve(admitted, {
+                                phase: "extract",
+                                routeId: "controlled-command-code",
+                                requestId: 1,
+                                maxInputTokens: 230,
+                                maxOutputTokens: 10,
+                                deadlineAtMs: row.deadline_at_ms,
                               });
+                              const settlement = {
+                                ...held.reservation,
+                                reservationId: held.reservationId,
+                                outcome: memoryUnknown
+                                  ? ("unknown" as const)
+                                  : ("reported" as const),
+                                chargedInputTokens: 230,
+                                chargedOutputTokens: 10,
+                                transportDrained: !memoryUnknown,
+                                ...(memoryUnknown
+                                  ? {}
+                                  : {
+                                      reportedModel: held.reservation.model,
+                                      reportedInputTokens: 230,
+                                      reportedOutputTokens: 10,
+                                    }),
+                              };
+                              drainedMemory.add(held.reservationId);
+                              if (!settleSubscriptionPi)
+                                return yield* Effect.die("Actual Pi producer absent");
+                              const piFirst = compactProof === "memorySubscriptionPiFirst";
+                              if (piFirst) {
+                                yield* settleSubscriptionPi;
+                                const originalRows =
+                                  yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+                                const guards = yield* f.sql<{
+                                  sql: string;
+                                }>`SELECT sql FROM sqlite_master
+                                  WHERE type='trigger' AND name='project_team_pi_subscription_grant_immutable'`;
+                                if (!guards[0])
+                                  return yield* Effect.die("Original grant guard missing");
+                                // Inject damaged storage only in this disposable fixture; production
+                                // writes retain the original CHECKs and immutable-grant trigger.
+                                yield* f.sql`DROP TRIGGER project_team_pi_subscription_grant_immutable`;
+                                yield* f.sql`PRAGMA ignore_check_constraints=ON`;
+                                for (const [column, original, corrupt] of [
+                                  ["model", "gpt-6-luna", "foreign-model"],
+                                  ["route_id", "openai-subscription-luna", "foreign-route"],
+                                  ["maximum_tokens", 64_000, 63_999],
+                                  ["maximum_duration_ms", 300_000, 299_999],
+                                  [
+                                    "deadline_at_ms",
+                                    admitted.operation.rootDeadlineAtMs,
+                                    admitted.operation.rootDeadlineAtMs + 1,
+                                  ],
+                                  [
+                                    "environment_id",
+                                    admitted.operation.environmentId,
+                                    "foreign-environment",
+                                  ],
+                                  ["project_id", admitted.operation.projectId, "foreign-project"],
+                                  ["root_task_id", admitted.operation.rootTaskId, "foreign-root"],
+                                ] as const) {
+                                  yield* f.sql`UPDATE project_team_pi_subscription_grant SET ${f.sql(column)}=${corrupt}`;
+                                  const corruptGrant =
+                                    yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`;
+                                  expect(
+                                    (yield* ledger.settle(settlement).pipe(Effect.result))._tag,
+                                  ).toBe("Failure");
+                                  expect(
+                                    yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+                                  ).toEqual(originalRows);
+                                  expect(
+                                    yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`,
+                                  ).toEqual(corruptGrant);
+                                  yield* f.sql`UPDATE project_team_pi_subscription_grant SET ${f.sql(column)}=${original}`;
+                                }
+                                yield* f.sql`PRAGMA ignore_check_constraints=OFF`;
+                                yield* f.sql.unsafe(guards[0].sql);
+                                const originalGrant =
+                                  yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`;
+                                yield* f.sql`CREATE TEMP TRIGGER deny_memory_grant_stop BEFORE UPDATE ON project_team_pi_subscription_grant
+                                  BEGIN SELECT RAISE(ABORT,'controlled-grant-stop-failure'); END`;
+                                expect(
+                                  (yield* ledger.settle(settlement).pipe(Effect.result))._tag,
+                                ).toBe("Failure");
+                                expect(
+                                  yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+                                ).toEqual(originalRows);
+                                expect(
+                                  yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`,
+                                ).toEqual(originalGrant);
+                                yield* f.sql`DROP TRIGGER deny_memory_grant_stop`;
+                              }
+                              const settled = yield* ledger.settle(settlement);
+                              const beforeReplay =
+                                yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`;
+                              expect(yield* ledger.settle(settlement)).toEqual(settled);
+                              expect(
+                                yield* f.sql`SELECT * FROM project_team_pi_subscription_grant`,
+                              ).toEqual(beforeReplay);
+                              if (piFirst) {
+                                expect(yield* readRecordedUsage()).toMatchObject([
+                                  { availability: "available", root: { chargedTokens: 64_000 } },
+                                ]);
+                                expect(
+                                  (yield* f.reader.readRequired(snapshot)).required.remaining,
+                                ).toMatchObject({
+                                  rootRemainingTokens: 0,
+                                  policy: {
+                                    accountingMode: "openai-subscription-monitored",
+                                    stoppedReason: "threshold-reached",
+                                    observedChargedTokens: 64_000,
+                                  },
+                                });
+                              }
+                              subscriptionMemoryChecked = true;
+                              if (memoryUnknown)
+                                expect(
+                                  yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+                                FROM project_team_model_request WHERE reservation_id=${held.reservationId}`,
+                                ).toEqual([
+                                  {
+                                    status: "unknown",
+                                    capacity_state: "quarantine",
+                                    charged_input_tokens: 230,
+                                    charged_output_tokens: 10,
+                                  },
+                                ]);
+                              if (!piFirst) {
+                                expect(
+                                  (yield* f.reader.readRequired(snapshot)).required.remaining,
+                                ).toMatchObject({
+                                  rootRemainingTokens: 31_880,
+                                  policy: {
+                                    observedChargedTokens: 32_120,
+                                    nominalHeldTokens: 31_880,
+                                  },
+                                });
+                                expect(
+                                  yield* f.sql`SELECT status FROM project_team_model_request WHERE request_lane='pi' AND request_id=2`,
+                                ).toEqual([{ status: "held" }]);
+                                expect(
+                                  yield* f.sql`SELECT stop_reason FROM project_team_pi_subscription_grant`,
+                                ).toEqual([{ stop_reason: null }]);
+                                yield* settleSubscriptionPi;
+                              }
+                            } else {
+                              expect(admitted.operation.operationMaximumTokens).toBe(1000);
+                              const stage = {
+                                phase: "extract" as const,
+                                routeId: "controlled-command-code",
+                                requestId: 1,
+                                maxInputTokens: 400,
+                                maxOutputTokens: 100,
+                                deadlineAtMs: row.deadline_at_ms,
+                              };
+                              // Twelve ordinary tokens already exist. A memory stage uses
+                              // their original operation, rather than a new budget identity.
+                              const memoryHeld = yield* ledger.reserve(admitted, stage);
+                              expect(memoryHeld.status).toBe("reserved");
+                              expect(yield* ledger.reserve(admitted, stage)).toMatchObject({
+                                status: "existing",
+                                reservationId: memoryHeld.reservationId,
+                              });
+                              const nativeFields = {
+                                workerId: input.identity.workerId,
+                                generation: input.identity.generation,
+                                operationId: input.operation.operationId,
+                                requestId: 2,
+                                routeId: input.broker.routeId,
+                                provider: input.broker.provider,
+                                model: input.broker.model,
+                                maxInputTokens: input.broker.maxInputTokens,
+                                maxOutputTokens: input.broker.maxOutputTokens,
+                                callCount: 1 as const,
+                                deadlineAtMs: row.deadline_at_ms,
+                              };
+                              const ordinaryHeld = yield* Effect.tryPromise(() =>
+                                input.broker.reserveRequest(nativeFields, signal),
+                              );
+                              const beforeDenied =
+                                yield* f.sql`SELECT * FROM project_team_model_request`;
                               expect(
                                 (yield* ledger
-                                  .settle({ ...memorySettlement, provider: "command-code" })
+                                  .reserve(admitted, {
+                                    ...stage,
+                                    phase: "embed",
+                                    routeId: "controlled-openrouter",
+                                    maxInputTokens: 1,
+                                    maxOutputTokens: 1,
+                                  })
                                   .pipe(Effect.result))._tag,
                               ).toBe("Failure");
-                              for (const wrong of [
-                                "liquid/lfm-2.5-2.6b",
-                                "inclusionai/ling-3.1-flash:free",
-                              ])
+                              expect(
+                                (yield* ledger
+                                  .reserve(admitted, {
+                                    ...stage,
+                                    requestId: 2,
+                                    maxInputTokens: 300,
+                                    maxOutputTokens: 100,
+                                  })
+                                  .pipe(Effect.result))._tag,
+                              ).toBe("Failure");
+                              expect(
+                                yield* f.sql`SELECT * FROM project_team_model_request`,
+                              ).toEqual(beforeDenied);
+                              const memorySettlement = {
+                                ...memoryHeld.reservation,
+                                reservationId: memoryHeld.reservationId,
+                                outcome: "reported" as const,
+                                chargedInputTokens: 100,
+                                chargedOutputTokens: 10,
+                                transportDrained: true,
+                                reportedModel: memoryHeld.reservation.model,
+                                reportedInputTokens: 100,
+                                reportedOutputTokens: 10,
+                              };
+                              drainedMemory.add(memoryHeld.reservationId);
+                              if (liquidProof) {
+                                expect(memoryHeld.reservation).toMatchObject({
+                                  provider: "openrouter",
+                                  model: "liquid/lfm-2.5-2.6b:free",
+                                  routeId: stage.routeId,
+                                });
                                 expect(
                                   (yield* ledger
-                                    .settle({ ...memorySettlement, reportedModel: wrong })
+                                    .settle({ ...memorySettlement, provider: "command-code" })
                                     .pipe(Effect.result))._tag,
                                 ).toBe("Failure");
-                            }
-                            const settledMemory = yield* ledger.settle(memorySettlement);
-                            expect(yield* ledger.settle(memorySettlement)).toEqual(settledMemory);
-                            const usage = {
-                              prompt_tokens: 10,
-                              completion_tokens: 2,
-                              total_tokens: 12,
-                            };
-                            const nativeSettled = yield* Effect.tryPromise(() =>
-                              input.broker.settleRequest({
-                                ...nativeFields,
-                                reservationId: ordinaryHeld.reservationId,
-                                outcome: "reported",
-                                chargedInputTokens: 10,
-                                chargedOutputTokens: 2,
-                                reportedModel: nativeFields.model,
-                                reportedUsage: usage,
-                                transportDrained: true,
-                              }),
-                            );
-                            accountingReceipts.push({
-                              requestId: 2,
-                              reservationId: ordinaryHeld.reservationId,
-                              accountingReceiptId: nativeSettled.accountingReceiptId,
-                              routeId: nativeFields.routeId,
-                              provider: nativeFields.provider,
-                              model: nativeFields.model,
-                              reportedModel: nativeFields.model,
-                              usage,
-                            });
-                            const embedding = yield* ledger.reserve(admitted, {
-                              ...stage,
-                              phase: "embed",
-                              routeId: "controlled-openrouter",
-                              maxInputTokens: 40,
-                              maxOutputTokens: 1,
-                            });
-                            expect(embedding.reservation.operationId).toBe(
-                              input.operation.operationId,
-                            );
-                            expect(embedding.reservation.requestId).toBe(1);
-                            expect(embedding.reservation.scope).not.toBe(
-                              memoryHeld.reservation.scope,
-                            );
-                            const uncertain = yield* ledger.settle({
-                              ...embedding.reservation,
-                              reservationId: embedding.reservationId,
-                              outcome: "unknown",
-                              chargedInputTokens: 40,
-                              chargedOutputTokens: 1,
-                              transportDrained: false,
-                            });
-                            expect(
-                              yield* f.sql`SELECT status,capacity_state FROM project_team_model_request
-                            WHERE reservation_id=${embedding.reservationId}`,
-                            ).toEqual([{ status: "unknown", capacity_state: "quarantine" }]);
-                            expect(yield* readRecordedUsage()).toMatchObject([
-                              {
-                                availability: "available",
-                                root: {
-                                  maximumTokens: 1000,
-                                  chargedTokens: 175,
-                                  reservedTokens: 0,
-                                  unknownChargedTokens: 41,
-                                  remainingTokens: 825,
-                                  quarantinedCalls: 1,
-                                },
-                                attempt: {
-                                  maximumTokens: 1000,
-                                  chargedTokens: 175,
-                                  unknownChargedTokens: 41,
-                                },
-                                operation: {
-                                  operationId: input.operation.operationId,
-                                  chargedTokens: 175,
-                                },
-                              },
-                            ]);
-                            if (
-                              compactProof === "memoryAccounting" ||
-                              compactProof === "memoryLiquidAccounting"
-                            ) {
-                              const originalJobs =
-                                yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
-                              const originalModels =
-                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
-                              const paddedOwner = json({
-                                ...admitted,
-                                padding: "x".repeat(240000),
-                              });
-                              expect(Buffer.byteLength(paddedOwner, "utf8")).toBeLessThanOrEqual(
-                                262144,
+                                for (const wrong of [
+                                  "liquid/lfm-2.5-2.6b",
+                                  "inclusionai/ling-3.1-flash:free",
+                                ])
+                                  expect(
+                                    (yield* ledger
+                                      .settle({ ...memorySettlement, reportedModel: wrong })
+                                      .pipe(Effect.result))._tag,
+                                  ).toBe("Failure");
+                              }
+                              const settledMemory = yield* ledger.settle(memorySettlement);
+                              expect(yield* ledger.settle(memorySettlement)).toEqual(settledMemory);
+                              const usage = {
+                                prompt_tokens: 10,
+                                completion_tokens: 2,
+                                total_tokens: 12,
+                              };
+                              const nativeSettled = yield* Effect.tryPromise(() =>
+                                input.broker.settleRequest({
+                                  ...nativeFields,
+                                  reservationId: ordinaryHeld.reservationId,
+                                  outcome: "reported",
+                                  chargedInputTokens: 10,
+                                  chargedOutputTokens: 2,
+                                  reportedModel: nativeFields.model,
+                                  reportedUsage: usage,
+                                  transportDrained: true,
+                                }),
                               );
-                              // Legal SQL metadata clones are not admitted owners. Rollback
-                              // preserves the genuine job, and no immutable trigger is bypassed.
-                              const bounded = yield* f.sql
-                                .withTransaction(
-                                  Effect.gen(function* () {
-                                    for (let index = 0; index < 18; index++)
-                                      yield* f.sql`INSERT INTO project_team_memory_job
+                              accountingReceipts.push({
+                                requestId: 2,
+                                reservationId: ordinaryHeld.reservationId,
+                                accountingReceiptId: nativeSettled.accountingReceiptId,
+                                routeId: nativeFields.routeId,
+                                provider: nativeFields.provider,
+                                model: nativeFields.model,
+                                reportedModel: nativeFields.model,
+                                usage,
+                              });
+                              const embedding = yield* ledger.reserve(admitted, {
+                                ...stage,
+                                phase: "embed",
+                                routeId: "controlled-openrouter",
+                                maxInputTokens: 40,
+                                maxOutputTokens: 1,
+                              });
+                              expect(embedding.reservation.operationId).toBe(
+                                input.operation.operationId,
+                              );
+                              expect(embedding.reservation.requestId).toBe(1);
+                              expect(embedding.reservation.scope).not.toBe(
+                                memoryHeld.reservation.scope,
+                              );
+                              const uncertain = yield* ledger.settle({
+                                ...embedding.reservation,
+                                reservationId: embedding.reservationId,
+                                outcome: "unknown",
+                                chargedInputTokens: 40,
+                                chargedOutputTokens: 1,
+                                transportDrained: false,
+                              });
+                              expect(
+                                yield* f.sql`SELECT status,capacity_state FROM project_team_model_request
+                            WHERE reservation_id=${embedding.reservationId}`,
+                              ).toEqual([{ status: "unknown", capacity_state: "quarantine" }]);
+                              expect(yield* readRecordedUsage()).toMatchObject([
+                                {
+                                  availability: "available",
+                                  root: {
+                                    maximumTokens: 1000,
+                                    chargedTokens: 175,
+                                    reservedTokens: 0,
+                                    unknownChargedTokens: 41,
+                                    remainingTokens: 825,
+                                    quarantinedCalls: 1,
+                                  },
+                                  attempt: {
+                                    maximumTokens: 1000,
+                                    chargedTokens: 175,
+                                    unknownChargedTokens: 41,
+                                  },
+                                  operation: {
+                                    operationId: input.operation.operationId,
+                                    chargedTokens: 175,
+                                  },
+                                },
+                              ]);
+                              if (
+                                compactProof === "memoryAccounting" ||
+                                compactProof === "memoryLiquidAccounting"
+                              ) {
+                                const originalJobs =
+                                  yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`;
+                                const originalModels =
+                                  yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`;
+                                const paddedOwner = json({
+                                  ...admitted,
+                                  padding: "x".repeat(240000),
+                                });
+                                expect(Buffer.byteLength(paddedOwner, "utf8")).toBeLessThanOrEqual(
+                                  262144,
+                                );
+                                // Legal SQL metadata clones are not admitted owners. Rollback
+                                // preserves the genuine job, and no immutable trigger is bypassed.
+                                const bounded = yield* f.sql
+                                  .withTransaction(
+                                    Effect.gen(function* () {
+                                      for (let index = 0; index < 18; index++)
+                                        yield* f.sql`INSERT INTO project_team_memory_job
                                     (effect_id,environment_id,project_id,input_json,claim_generation,status,receipt_json,owner_json)
                                     SELECT ${`usage-bound-${index}`},environment_id,project_id,input_json,0,'pending',NULL,${paddedOwner}
                                     FROM project_team_memory_job WHERE effect_id=${selection.effectId}`;
-                                    expect(
-                                      yield* f.sql`SELECT COUNT(*) AS count FROM project_team_memory_job
+                                      expect(
+                                        yield* f.sql`SELECT COUNT(*) AS count FROM project_team_memory_job
                                   WHERE effect_id LIKE 'usage-bound-%'`,
-                                    ).toEqual([{ count: 18 }]);
-                                    expect(yield* readRecordedUsage()).toMatchObject([
-                                      {
-                                        availability: "unavailable",
-                                        reason: "read-bound",
-                                      },
-                                    ]);
-                                    return yield* Effect.fail(
-                                      "controlled-memory-metadata-rollback",
-                                    );
-                                  }),
-                                )
-                                .pipe(Effect.result);
-                              expect(bounded).toMatchObject({
-                                _tag: "Failure",
-                                failure: "controlled-memory-metadata-rollback",
+                                      ).toEqual([{ count: 18 }]);
+                                      expect(yield* readRecordedUsage()).toMatchObject([
+                                        {
+                                          availability: "unavailable",
+                                          reason: "read-bound",
+                                        },
+                                      ]);
+                                      return yield* Effect.fail(
+                                        "controlled-memory-metadata-rollback",
+                                      );
+                                    }),
+                                  )
+                                  .pipe(Effect.result);
+                                expect(bounded).toMatchObject({
+                                  _tag: "Failure",
+                                  failure: "controlled-memory-metadata-rollback",
+                                });
+                                expect(
+                                  yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`,
+                                ).toEqual(originalJobs);
+                                expect(
+                                  yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
+                                ).toEqual(originalModels);
+                                expect(yield* readRecordedUsage()).toMatchObject([
+                                  {
+                                    availability: "available",
+                                    root: {
+                                      chargedTokens: 175,
+                                      unknownChargedTokens: 41,
+                                      remainingTokens: 825,
+                                    },
+                                  },
+                                ]);
+                              }
+                              const awaitingDrain = yield* ledger.reserve(admitted, {
+                                ...stage,
+                                requestId: 3,
+                                maxInputTokens: 1,
+                                maxOutputTokens: 1,
                               });
-                              expect(
-                                yield* f.sql`SELECT * FROM project_team_memory_job ORDER BY effect_id`,
-                              ).toEqual(originalJobs);
-                              expect(
-                                yield* f.sql`SELECT * FROM project_team_model_request ORDER BY reservation_id`,
-                              ).toEqual(originalModels);
                               expect(yield* readRecordedUsage()).toMatchObject([
                                 {
                                   availability: "available",
                                   root: {
                                     chargedTokens: 175,
+                                    reservedTokens: 2,
+                                    remainingTokens: 823,
+                                    heldCalls: 1,
+                                    quarantinedCalls: 1,
                                     unknownChargedTokens: 41,
-                                    remainingTokens: 825,
                                   },
                                 },
                               ]);
-                            }
-                            const awaitingDrain = yield* ledger.reserve(admitted, {
-                              ...stage,
-                              requestId: 3,
-                              maxInputTokens: 1,
-                              maxOutputTokens: 1,
-                            });
-                            expect(yield* readRecordedUsage()).toMatchObject([
-                              {
-                                availability: "available",
-                                root: {
-                                  chargedTokens: 175,
-                                  reservedTokens: 2,
-                                  remainingTokens: 823,
-                                  heldCalls: 1,
-                                  quarantinedCalls: 1,
-                                  unknownChargedTokens: 41,
-                                },
-                              },
-                            ]);
-                            const afterDrainRequest = {
-                              ...stage,
-                              phase: "embed" as const,
-                              routeId: "controlled-openrouter",
-                              requestId: 2,
-                              maxInputTokens: 1,
-                              maxOutputTokens: 1,
-                            };
-                            expect(
-                              (yield* ledger
-                                .reserve(admitted, afterDrainRequest)
-                                .pipe(Effect.result))._tag,
-                            ).toBe("Failure");
-                            expect(
-                              (yield* ledger
-                                .confirmTransportDrained(
-                                  selection.effectId,
-                                  embedding.reservationId,
-                                )
-                                .pipe(Effect.result))._tag,
-                            ).toBe("Failure");
-                            drainedMemory.add(embedding.reservationId);
-                            expect(
-                              yield* ledger.confirmTransportDrained(
-                                selection.effectId,
-                                embedding.reservationId,
-                              ),
-                            ).toEqual(uncertain);
-                            expect(
-                              yield* ledger.confirmTransportDrained(
-                                selection.effectId,
-                                embedding.reservationId,
-                              ),
-                            ).toEqual(uncertain);
-                            expect(
-                              yield* f.sql`SELECT status,capacity_state FROM project_team_model_request
-                            WHERE reservation_id=${embedding.reservationId}`,
-                            ).toEqual([{ status: "unknown", capacity_state: "released" }]);
-                            const afterDrain = yield* ledger.reserve(admitted, afterDrainRequest);
-                            for (const held of [awaitingDrain, afterDrain]) {
-                              drainedMemory.add(held.reservationId);
-                              yield* ledger.settle({
-                                ...held.reservation,
-                                reservationId: held.reservationId,
-                                outcome: "reported",
-                                chargedInputTokens: 0,
-                                chargedOutputTokens: 0,
-                                reportedModel: held.reservation.model,
-                                reportedInputTokens: 0,
-                                reportedOutputTokens: 0,
-                                transportDrained: true,
-                              });
-                            }
-                            if (liquidProof) {
-                              // Auditing follows each saved triple across a route switch.
-                              extractionEndpoint =
-                                "https://api.commandcode.ai/provider/v1/chat/completions";
-                              const legacy = yield* ledger.reserve(admitted, {
+                              const afterDrainRequest = {
                                 ...stage,
-                                routeId: "legacy-history",
-                                requestId: 4,
+                                phase: "embed" as const,
+                                routeId: "controlled-openrouter",
+                                requestId: 2,
                                 maxInputTokens: 1,
                                 maxOutputTokens: 1,
-                              });
-                              expect(legacy.reservation).toMatchObject({
-                                provider: "command-code",
-                                model: "inclusionai/ling-3.1-flash:free",
-                              });
-                              drainedMemory.add(legacy.reservationId);
-                              yield* ledger.settle({
-                                ...legacy.reservation,
-                                reservationId: legacy.reservationId,
-                                outcome: "reported",
-                                chargedInputTokens: 0,
-                                chargedOutputTokens: 0,
-                                reportedModel: "inclusionai/ling-3.1-flash",
-                                reportedInputTokens: 0,
-                                reportedOutputTokens: 0,
-                                transportDrained: true,
-                              });
-                              extractionEndpoint = "https://openrouter.ai/api/v1/chat/completions";
-                              expect((yield* ledger.reserve(admitted, stage)).status).toBe(
-                                "existing",
+                              };
+                              expect(
+                                (yield* ledger
+                                  .reserve(admitted, afterDrainRequest)
+                                  .pipe(Effect.result))._tag,
+                              ).toBe("Failure");
+                              expect(
+                                (yield* ledger
+                                  .confirmTransportDrained(
+                                    selection.effectId,
+                                    embedding.reservationId,
+                                  )
+                                  .pipe(Effect.result))._tag,
+                              ).toBe("Failure");
+                              drainedMemory.add(embedding.reservationId);
+                              expect(
+                                yield* ledger.confirmTransportDrained(
+                                  selection.effectId,
+                                  embedding.reservationId,
+                                ),
+                              ).toEqual(uncertain);
+                              expect(
+                                yield* ledger.confirmTransportDrained(
+                                  selection.effectId,
+                                  embedding.reservationId,
+                                ),
+                              ).toEqual(uncertain);
+                              expect(
+                                yield* f.sql`SELECT status,capacity_state FROM project_team_model_request
+                            WHERE reservation_id=${embedding.reservationId}`,
+                              ).toEqual([{ status: "unknown", capacity_state: "released" }]);
+                              const afterDrain = yield* ledger.reserve(admitted, afterDrainRequest);
+                              for (const held of [awaitingDrain, afterDrain]) {
+                                drainedMemory.add(held.reservationId);
+                                yield* ledger.settle({
+                                  ...held.reservation,
+                                  reservationId: held.reservationId,
+                                  outcome: "reported",
+                                  chargedInputTokens: 0,
+                                  chargedOutputTokens: 0,
+                                  reportedModel: held.reservation.model,
+                                  reportedInputTokens: 0,
+                                  reportedOutputTokens: 0,
+                                  transportDrained: true,
+                                });
+                              }
+                              if (liquidProof) {
+                                // Auditing follows each saved triple across a route switch.
+                                extractionEndpoint =
+                                  "https://api.commandcode.ai/provider/v1/chat/completions";
+                                const legacy = yield* ledger.reserve(admitted, {
+                                  ...stage,
+                                  routeId: "legacy-history",
+                                  requestId: 4,
+                                  maxInputTokens: 1,
+                                  maxOutputTokens: 1,
+                                });
+                                expect(legacy.reservation).toMatchObject({
+                                  provider: "command-code",
+                                  model: "inclusionai/ling-3.1-flash:free",
+                                });
+                                drainedMemory.add(legacy.reservationId);
+                                yield* ledger.settle({
+                                  ...legacy.reservation,
+                                  reservationId: legacy.reservationId,
+                                  outcome: "reported",
+                                  chargedInputTokens: 0,
+                                  chargedOutputTokens: 0,
+                                  reportedModel: "inclusionai/ling-3.1-flash",
+                                  reportedInputTokens: 0,
+                                  reportedOutputTokens: 0,
+                                  transportDrained: true,
+                                });
+                                extractionEndpoint =
+                                  "https://openrouter.ai/api/v1/chat/completions";
+                                expect((yield* ledger.reserve(admitted, stage)).status).toBe(
+                                  "existing",
+                                );
+                                expect(yield* readRecordedUsage()).toMatchObject([
+                                  { availability: "available" },
+                                ]);
+                              }
+                              // This is a genuinely accepted broker alias. Its durable
+                              // terminal, rather than today's policy, proves it on replay.
+                              const aliasRequest = {
+                                ...nativeFields,
+                                requestId: 3,
+                                maxInputTokens: 1,
+                                maxOutputTokens: 1,
+                              };
+                              const aliasHeld = yield* Effect.tryPromise(() =>
+                                input.broker.reserveRequest(aliasRequest, signal),
                               );
-                              expect(yield* readRecordedUsage()).toMatchObject([
-                                { availability: "available" },
-                              ]);
-                            }
-                            // This is a genuinely accepted broker alias. Its durable
-                            // terminal, rather than today's policy, proves it on replay.
-                            const aliasRequest = {
-                              ...nativeFields,
-                              requestId: 3,
-                              maxInputTokens: 1,
-                              maxOutputTokens: 1,
-                            };
-                            const aliasHeld = yield* Effect.tryPromise(() =>
-                              input.broker.reserveRequest(aliasRequest, signal),
-                            );
-                            const reportedAlias = nativeFields.model.replace(/:free$/u, "");
-                            expect(reportedAlias).not.toBe(nativeFields.model);
-                            const aliasUsage = {
-                              prompt_tokens: 0,
-                              completion_tokens: 0,
-                              total_tokens: 0,
-                            };
-                            const aliasSettled = yield* Effect.tryPromise(() =>
-                              input.broker.settleRequest({
-                                ...aliasRequest,
+                              const reportedAlias = nativeFields.model.replace(/:free$/u, "");
+                              expect(reportedAlias).not.toBe(nativeFields.model);
+                              const aliasUsage = {
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                                total_tokens: 0,
+                              };
+                              const aliasSettled = yield* Effect.tryPromise(() =>
+                                input.broker.settleRequest({
+                                  ...aliasRequest,
+                                  reservationId: aliasHeld.reservationId,
+                                  outcome: "reported",
+                                  chargedInputTokens: 0,
+                                  chargedOutputTokens: 0,
+                                  reportedModel: reportedAlias,
+                                  reportedUsage: aliasUsage,
+                                  transportDrained: true,
+                                }),
+                              );
+                              accountingReceipts.push({
+                                requestId: 3,
                                 reservationId: aliasHeld.reservationId,
-                                outcome: "reported",
-                                chargedInputTokens: 0,
-                                chargedOutputTokens: 0,
+                                accountingReceiptId: aliasSettled.accountingReceiptId,
+                                routeId: aliasRequest.routeId,
+                                provider: aliasRequest.provider,
+                                model: aliasRequest.model,
                                 reportedModel: reportedAlias,
-                                reportedUsage: aliasUsage,
-                                transportDrained: true,
-                              }),
-                            );
-                            accountingReceipts.push({
-                              requestId: 3,
-                              reservationId: aliasHeld.reservationId,
-                              accountingReceiptId: aliasSettled.accountingReceiptId,
-                              routeId: aliasRequest.routeId,
-                              provider: aliasRequest.provider,
-                              model: aliasRequest.model,
-                              reportedModel: reportedAlias,
-                              usage: aliasUsage,
-                            });
-                            expect(yield* readRecordedUsage()).toMatchObject([
-                              {
-                                availability: "unavailable",
-                                reason: "ledger-invalid",
-                              },
-                            ]);
-                            const physical = yield* f.sql<{
-                              lane: string;
-                              operation: string;
-                              tokens: number;
-                            }>`SELECT
+                                usage: aliasUsage,
+                              });
+                              expect(yield* readRecordedUsage()).toMatchObject([
+                                {
+                                  availability: "unavailable",
+                                  reason: "ledger-invalid",
+                                },
+                              ]);
+                              const physical = yield* f.sql<{
+                                lane: string;
+                                operation: string;
+                                tokens: number;
+                              }>`SELECT
                             request_lane AS lane,operation_id AS operation,
                             SUM(charged_input_tokens+charged_output_tokens) AS tokens
                             FROM project_team_model_request WHERE operation_id=${input.operation.operationId}
                             GROUP BY request_lane,operation_id ORDER BY request_lane`;
-                            expect(physical).toEqual([
-                              {
-                                lane: "memory",
-                                operation: input.operation.operationId,
-                                tokens: 151,
-                              },
-                              { lane: "pi", operation: input.operation.operationId, tokens: 24 },
-                            ]);
+                              expect(physical).toEqual([
+                                {
+                                  lane: "memory",
+                                  operation: input.operation.operationId,
+                                  tokens: 151,
+                                },
+                                { lane: "pi", operation: input.operation.operationId, tokens: 24 },
+                              ]);
+                            }
                           }
                         }
                       }
@@ -14652,7 +14873,7 @@ for (const compactProof of [
           });
           yield* stage("session-bound");
           yield* stage("assignment-intent");
-          if (accountingProof) {
+          if (accountingProof && !subscriptionMemory) {
             expect(yield* f.sql`SELECT * FROM project_team_model_request`).toEqual([]);
             expect(yield* readRecordedUsage()).toMatchObject([
               {
@@ -14677,6 +14898,31 @@ for (const compactProof of [
             () => Effect.void,
           );
           const assignmentResult = yield* assigned.run.pipe(Effect.result);
+          if (subscriptionMemory) {
+            expect(diagnostic).toBe("");
+            expect(subscriptionMemoryChecked).toBe(true);
+            expect(
+              yield* f.sql`SELECT stop_reason,stopped_at_ms FROM project_team_pi_subscription_grant`,
+            ).toEqual([
+              {
+                stop_reason: piUnknown ? "unknown-usage" : "threshold-reached",
+                stopped_at_ms: expect.any(Number),
+              },
+            ]);
+            if (piUnknown)
+              expect(
+                yield* f.sql`SELECT status,capacity_state,charged_input_tokens,charged_output_tokens
+              FROM project_team_model_request WHERE request_lane='pi' AND request_id=2`,
+              ).toEqual([
+                {
+                  status: "unknown",
+                  capacity_state: "quarantine",
+                  charged_input_tokens: 29_832,
+                  charged_output_tokens: 64_000,
+                },
+              ]);
+            return;
+          }
           if (compactProof === "joinedNoMemory") {
             if (assignmentResult._tag !== "Success")
               return yield* Effect.die("No-memory prompt failed");

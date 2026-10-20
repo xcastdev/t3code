@@ -1026,6 +1026,42 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
               !same(yield* decodeReservation(row.reservation_json), reservation)
             )
               return yield* deny("Memory settlement has no identical reserved stage");
+            const operation = owner.operation;
+            const grants = yield* sql<{
+              model: string;
+              route_id: string;
+              maximum_tokens: number;
+              maximum_duration_ms: number;
+              deadline_at_ms: number;
+            }>`SELECT model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms
+              FROM project_team_pi_subscription_grant WHERE environment_id=${operation.environmentId}
+              AND project_id=${operation.projectId} AND root_task_id=${operation.rootTaskId} LIMIT 2`;
+            const grant = grants[0];
+            if (grants.length > 1) return yield* deny("Memory subscription grant is ambiguous");
+            if (grant !== undefined) {
+              const originals = yield* sql<{ model: string }>`SELECT
+                json_extract(intent_json,'$.binding.model') AS model FROM project_team_pi_operation
+                WHERE environment_id=${operation.environmentId} AND project_id=${operation.projectId}
+                AND operation_id=${operation.operationId} LIMIT 2`;
+              if (
+                originals.length !== 1 ||
+                originals[0]?.model !== grant.model ||
+                grant.model !== "gpt-6-luna" ||
+                grant.route_id !== "openai-subscription-luna" ||
+                grant.maximum_tokens !== 64_000 ||
+                grant.maximum_tokens !== operation.rootMaximumTokens ||
+                grant.maximum_duration_ms !== 300_000 ||
+                grant.deadline_at_ms !== operation.rootDeadlineAtMs
+              )
+                return yield* deny("Original memory subscription grant changed");
+            } else {
+              const monitored = yield* sql`SELECT 1 FROM project_team_model_request
+                WHERE environment_id=${operation.environmentId} AND project_id=${operation.projectId}
+                AND root_task_id=${operation.rootTaskId}
+                AND accounting_mode='openai-subscription-monitored' LIMIT 1`;
+              if (monitored.length > 0)
+                return yield* deny("Original memory subscription grant is missing");
+            }
             if (row.status !== "held") {
               if (
                 row.settlement_json === null ||
@@ -1044,6 +1080,24 @@ export const makeProjectMemoryModelAccounting = Effect.fn("makeProjectMemoryMode
         accounting_receipt_id=${accountingReceiptId},settlement_json=${canonicalProjectWorkPayload(settlement)}
         WHERE reservation_id=${reservationId} AND request_lane='memory' AND status='held'`;
             yield* auditProjectMemoryOperationLedger(sql, owner.operation);
+            if (grant !== undefined) {
+              const usage = yield* sql<{ tokens: number }>`SELECT
+                COALESCE(SUM(charged_input_tokens+charged_output_tokens),0) AS tokens
+                FROM project_team_model_request WHERE environment_id=${operation.environmentId}
+                AND project_id=${operation.projectId} AND root_task_id=${operation.rootTaskId}
+                AND status<>'held'`;
+              const tokens = usage[0]?.tokens;
+              if (tokens === undefined || !Number.isSafeInteger(tokens) || tokens < 0)
+                return yield* deny("Memory subscription root charge is invalid");
+              // Hard memory uncertainty retains its own nominal charge; only aggregate
+              // settled usage can stop the monitored Pi root here.
+              if (tokens >= grant.maximum_tokens)
+                yield* sql`UPDATE project_team_pi_subscription_grant
+                  SET stopped_at_ms=COALESCE(stopped_at_ms,${yield* Clock.currentTimeMillis}),
+                      stop_reason=COALESCE(stop_reason,'threshold-reached')
+                  WHERE environment_id=${operation.environmentId} AND project_id=${operation.projectId}
+                  AND root_task_id=${operation.rootTaskId}`;
+            }
             return { accountingReceiptId };
           }).pipe(Effect.provideService(ProjectWorkRepository, repository)),
         );
