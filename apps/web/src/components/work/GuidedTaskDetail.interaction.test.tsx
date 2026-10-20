@@ -2049,70 +2049,145 @@ describe("GuidedTaskDetail human interactions", () => {
       expect(host.querySelector('[aria-label="Linked assignment"]')).toBeNull();
     });
 
-    it("replaces root scope guidance with recorded provenance for an authorized child", async () => {
+    const linked = () => host.querySelector('[aria-label="Linked assignment"]');
+    function childMembership(extra: Record<string, unknown> = {}) {
       const [membership, ...rest] = records(current);
-      foundation = [
+      return [
         decodeRecord({
           ...membership,
           deliverableKind: "review",
           parentTaskId: "parent-task",
-          assignment: {
-            authorizationGateId: "child-grant",
-            outputDescriptions: ["Independent review findings"],
-          },
+          assignment: { authorizationGateId: "child-grant", outputDescriptions: ["Findings"] },
+          ...extra,
         }),
         ...rest,
-        decodeRecord({
-          ...fields,
-          recordId: "child-grant",
-          kind: "gate",
-          status: "approved",
-          taskId: current.task.taskId,
-          gate: "assignment",
-          specRevision: current.task.specRevision,
-          planRevision: 0,
-          contentHash: "child-scope",
-          evidenceIds: [],
-          attribution,
-          assignmentAuthorization: {
-            assignmentKind: "review",
-            parentTaskId: "parent-task",
-            parentSpecRevision: 1,
-            parentSpecificationGateId: "parent-spec-gate",
-            parentSpecificationHash: "parent-spec-hash",
-            parentScopeHash: "parent-scope-hash",
-          },
-        }),
       ];
-      await render();
-      expect(rail()).toBeNull();
-      expect(host.textContent).not.toContain("Next step:");
-      const linked = host.querySelector('[aria-label="Linked assignment"]');
-      expect(linked?.textContent).toContain("Review assignment");
-      expect(linked?.textContent).toContain("Linked to parent task parent-task.");
-      expect(linked?.textContent).toContain(
-        "Authorized by assignment gate child-grant · Recorded approved.",
-      );
-    });
+    }
+    const parentAuthorization = {
+      parentTaskId: "parent-task",
+      parentSpecRevision: 1,
+      parentSpecificationGateId: "parent-spec-gate",
+      parentSpecificationHash: "parent-spec-hash",
+      parentScopeHash: "parent-scope-hash",
+    };
+    // `undefined` patches remove a key so fixtures stay valid known records.
+    function childGate(extra: Record<string, unknown> = {}) {
+      const gate: Record<string, unknown> = {
+        ...fields,
+        recordId: "child-grant",
+        kind: "gate",
+        status: "approved",
+        taskId: current.task.taskId,
+        gate: "assignment",
+        specRevision: current.task.specRevision,
+        planRevision: 0,
+        contentHash: "child-scope",
+        evidenceIds: [],
+        attribution,
+        assignmentAuthorization: { assignmentKind: "review", ...parentAuthorization },
+        ...extra,
+      };
+      for (const key of Object.keys(gate)) if (gate[key] === undefined) delete gate[key];
+      return decodeRecord(gate);
+    }
 
-    it("does not invent an authorization gate missing from the snapshot", async () => {
-      const [membership, ...rest] = records(current);
+    it("keeps the root workflow for a root task whose execution recorded an assignment", async () => {
+      const [membership, ...rest] = records(current, "approved");
       foundation = [
         decodeRecord({
           ...membership,
-          parentTaskId: "parent-task",
-          assignment: { authorizationGateId: "absent-grant", outputDescriptions: ["Findings"] },
+          assignment: {
+            authorizationGateId: "execution-gate",
+            outputDescriptions: ["Reconnect fix"],
+          },
         }),
         ...rest,
+        executionGate(),
       ];
       await render();
+      expect(linked()).toBeNull();
+      expect(rail()?.textContent).toContain("Execution authorized");
+      expect(host.textContent).toContain("Next step: Execution authorized");
+    });
+
+    it.each([
+      [
+        "investigation",
+        {
+          gate: "investigation",
+          assignmentAuthorization: undefined,
+        },
+        "Investigation assignment",
+      ],
+      [
+        "implementation",
+        {
+          assignmentAuthorization: {
+            assignmentKind: "implementation",
+            ...parentAuthorization,
+            parentCriterionIds: ["criterion-1"],
+            parentPlan: {
+              recordId: "parent-plan",
+              planRevision: 1,
+              contentHash: "parent-plan-hash",
+              gateId: "parent-plan-gate",
+            },
+          },
+        },
+        "Implementation assignment",
+      ],
+      ["review", {}, "Review assignment"],
+    ] as const)(
+      "shows recorded provenance instead of the root rail for a valid %s child",
+      async (kind, gate, title) => {
+        foundation = [...childMembership(), childGate(gate)];
+        await render();
+        expect(rail()).toBeNull();
+        expect(host.textContent).not.toContain("Next step:");
+        expect(linked()?.textContent).toContain(title);
+        expect(linked()?.textContent).toContain("Linked to parent task parent-task.");
+        expect(linked()?.textContent).toContain(
+          `Recorded ${kind === "investigation" ? "investigation" : "assignment"} gate child-grant: approved.`,
+        );
+        expect(linked()?.textContent).not.toMatch(/authoriz/i);
+      },
+    );
+
+    it.each(["rejected", "invalidated"])(
+      "describes a %s child gate neutrally without claiming authorization",
+      async (status) => {
+        foundation = [...childMembership(), childGate({ status })];
+        await render();
+        expect(rail()).toBeNull();
+        expect(linked()?.textContent).toContain(`Recorded assignment gate child-grant: ${status}.`);
+        expect(linked()?.textContent).not.toMatch(/authoriz/i);
+      },
+    );
+
+    it.each([
+      ["missing", null],
+      ["another task's", { taskId: "other-task" }],
+      [
+        "a different parent's",
+        {
+          assignmentAuthorization: {
+            assignmentKind: "review",
+            ...parentAuthorization,
+            parentTaskId: "other-parent",
+          },
+        },
+      ],
+      ["an unexpected kind of", { gate: "execution", assignmentAuthorization: undefined }],
+    ] as const)("keeps provenance unknown for a %s gate", async (_case, patch) => {
+      foundation = [...childMembership(), ...(patch === null ? [] : [childGate(patch)])];
+      await render();
       expect(rail()).toBeNull();
-      const linked = host.querySelector('[aria-label="Linked assignment"]');
-      expect(linked?.textContent).toContain("Linked assignment");
-      expect(linked?.textContent).toContain(
-        "Authorization gate absent-grant is not in this snapshot.",
+      expect(linked()?.textContent).toContain("Linked assignment");
+      expect(linked()?.textContent).toContain(
+        "Gate child-grant is not recorded for this task and parent.",
       );
-      expect(linked?.textContent).not.toContain("Recorded approved");
+      expect(linked()?.textContent).not.toContain("Recorded assignment gate");
+      expect(linked()?.textContent).not.toMatch(/authoriz/i);
     });
 
     it.each(["reserved", "stopping", "quarantined", "revoked"])(

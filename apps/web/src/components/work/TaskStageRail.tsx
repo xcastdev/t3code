@@ -57,7 +57,7 @@ export function TaskStageRail({
   );
 }
 
-/** Replaces the stage rail for linked child tasks, naming the recorded authorization source. */
+/** Replaces the stage rail for linked child tasks with their recorded parent and gate. */
 export function LinkedTaskSummary({ provenance }: { readonly provenance: LinkedTaskProvenance }) {
   const kind = provenance.kind
     ? `${provenance.kind.charAt(0).toUpperCase()}${provenance.kind.slice(1)}`
@@ -70,18 +70,12 @@ export function LinkedTaskSummary({ provenance }: { readonly provenance: LinkedT
     >
       <p className="font-medium">{kind} assignment</p>
       <p className="break-all text-muted-foreground">
-        {provenance.parentTaskId
-          ? `Linked to parent task ${provenance.parentTaskId}.`
-          : "Parent task not recorded."}{" "}
+        Linked to parent task {provenance.parentTaskId}.{" "}
         {provenance.gateId === undefined
-          ? "No authorization gate is recorded for this assignment."
+          ? "No assignment gate is recorded for this task."
           : provenance.gateStatus === undefined
-            ? `Authorization gate ${provenance.gateId} is not in this snapshot.`
-            : `Authorized by ${provenance.gateKind} gate ${provenance.gateId} · Recorded ${provenance.gateStatus}.`}
-      </p>
-      <p className="text-xs text-muted-foreground">
-        This work was authorized when it was started from the parent task, not through this task's
-        own scope and plan approvals. The server rechecks that authorization before each action.
+            ? `Gate ${provenance.gateId} is not recorded for this task and parent.`
+            : `Recorded ${provenance.gateKind} gate ${provenance.gateId}: ${provenance.gateStatus}.`}
       </p>
     </div>
   );

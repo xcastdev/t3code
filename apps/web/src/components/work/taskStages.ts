@@ -105,7 +105,7 @@ export function taskStages(input: TaskStageInput): {
 }
 
 export interface LinkedTaskProvenance {
-  readonly parentTaskId: string | undefined;
+  readonly parentTaskId: string;
   readonly kind: string | undefined;
   readonly gateId: string | undefined;
   readonly gateKind: Gate["gate"] | undefined;
@@ -113,22 +113,30 @@ export interface LinkedTaskProvenance {
 }
 
 /**
- * Investigation, implementation and review children run under the authorization gate recorded
- * when they were started from their parent, so the root scope/plan/execution rail does not
- * describe them. Returns null for root
- * tasks. The gate is reported only when exactly one matching record is present; nothing is
- * inferred when it is missing.
+ * Investigation, implementation and review children carry a parent task, so the root
+ * scope/plan/execution rail does not describe them. A root task can also record an assignment
+ * (execution start does), so only parent lineage marks a child. The gate is reported only when
+ * exactly one record matches this child task, its parent and an expected child gate kind;
+ * otherwise provenance stays unknown.
  */
 export function linkedTaskProvenance(
   membership: Membership | undefined,
   gates: ReadonlyArray<Gate>,
 ): LinkedTaskProvenance | null {
-  if (!membership || (membership.parentTaskId === undefined && !membership.assignment)) return null;
+  if (membership?.parentTaskId === undefined) return null;
   const gateId = membership.assignment?.authorizationGateId;
-  const matches = gateId === undefined ? [] : gates.filter((gate) => gate.recordId === gateId);
+  const matches = gates.filter(
+    (gate) =>
+      gate.recordId === gateId &&
+      gate.taskId === membership.taskId &&
+      (gate.gate === "investigation"
+        ? gate.assignmentAuthorization === undefined
+        : gate.gate === "assignment" &&
+          gate.assignmentAuthorization?.parentTaskId === membership.parentTaskId),
+  );
   const gate = matches.length === 1 ? matches[0] : undefined;
   return {
-    parentTaskId: membership.parentTaskId ?? gate?.assignmentAuthorization?.parentTaskId,
+    parentTaskId: membership.parentTaskId,
     kind:
       gate?.assignmentAuthorization?.assignmentKind ??
       (gate?.gate === "investigation" ? "investigation" : undefined),

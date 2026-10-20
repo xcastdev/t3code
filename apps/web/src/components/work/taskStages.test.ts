@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { ProjectTeamRecord } from "@t3tools/contracts";
+import { ProjectTeamRecord, ProjectWorkTaskId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 import { linkedTaskProvenance, taskStages, type TaskStageInput } from "./taskStages";
@@ -139,6 +139,10 @@ describe("linkedTaskProvenance", () => {
   it("returns null for a root task so the stage rail applies", () => {
     expect(linkedTaskProvenance(membership(), [gate("grant")])).toBeNull();
     expect(linkedTaskProvenance(undefined, [])).toBeNull();
+    // Root execution start records an assignment without parent lineage.
+    expect(
+      linkedTaskProvenance(membership({ assignment: child.assignment }), [gate("grant")]),
+    ).toBeNull();
   });
 
   it("reports the single recorded authorization gate", () => {
@@ -151,8 +155,9 @@ describe("linkedTaskProvenance", () => {
     });
   });
 
-  it("leaves the gate unknown when it is missing or ambiguous", () => {
-    for (const gates of [[], [gate("grant"), gate("grant")]])
+  it("leaves the gate unknown when it is missing, ambiguous or belongs to another task", () => {
+    const foreign = { ...gate("grant"), taskId: ProjectWorkTaskId.make("other") };
+    for (const gates of [[], [gate("grant"), gate("grant")], [foreign]])
       expect(linkedTaskProvenance(membership(child), gates)).toMatchObject({
         gateId: "grant",
         gateKind: undefined,
