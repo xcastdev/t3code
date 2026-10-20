@@ -106,8 +106,10 @@ const makeFixture = (
   memoryAccess: "none" | "project" | "shared" = "none",
   messageAddresses = false,
   subscription = false,
+  brokerModel?: string,
 ) =>
   Effect.gen(function* () {
+    const model = brokerModel ?? (subscription ? "gpt-6-luna" : "test");
     const repository = yield* ProjectWorkRepository;
     const sql = yield* SqlClient.SqlClient;
     const fs = subscription ? yield* FileSystem.FileSystem : undefined;
@@ -239,7 +241,7 @@ const makeFixture = (
                       ? {
                           ...record,
                           memoryAccess,
-                          ...(subscription ? { model: "gpt-6-luna" } : {}),
+                          ...(subscription ? { model } : {}),
                         }
                       : record,
                   ),
@@ -265,7 +267,7 @@ const makeFixture = (
                           ...command.transition,
                           binding: {
                             ...command.transition.binding,
-                            model: "gpt-6-luna",
+                            model,
                             configuration: {
                               ...command.transition.binding.configuration,
                               maxTokens: 64_000,
@@ -465,7 +467,7 @@ const makeFixture = (
             modelCalls: 2,
             delegationDepth: 2,
             repairAllowance: 2,
-            model: subscription ? "gpt-6-luna" : "test",
+            model,
             tokenLimit: subscription ? 64_000 : 2000,
             durationLimitMs: subscription ? 300_000 : 2000,
           },
@@ -1863,7 +1865,12 @@ it.effect("retained context preserves nested producer decorations and distinct t
   ),
 );
 
-const makeBudgetFixture = (writableWorkers = 1, subscription = false, memory = false) =>
+const makeBudgetFixture = (
+  writableWorkers = 1,
+  subscription = false,
+  memory = false,
+  hardMemory = false,
+) =>
   Effect.gen(function* () {
     if (subscription) yield* TestClock.setTime(Date.parse(at) + 1);
     const f = yield* makeFixture(
@@ -1873,7 +1880,8 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false, memory = f
       false,
       memory ? "project" : "none",
       memory,
-      subscription,
+      subscription || hardMemory,
+      hardMemory ? "inclusionai/ling-3.1-flash:free" : undefined,
     );
     const claim = f.snapshot.intent.compiledClaim.transition;
     if (claim?.kind !== "claim") return yield* Effect.die("Fixture claim missing");
@@ -1887,7 +1895,8 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false, memory = f
       threadId: binding.threadId,
     };
     const principal = { actor: { kind: "agent" as const, id: managedActorId(managed) }, managed };
-    const piRuntime = subscription
+    const runtimeEnabled = subscription || hardMemory;
+    const piRuntime = runtimeEnabled
       ? yield* Effect.gen(function* () {
           const fs = yield* FileSystem.FileSystem;
           const nativeStateRoot = yield* fs.makeTempDirectoryScoped();
@@ -1953,9 +1962,13 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false, memory = f
       : undefined;
     const accounting = yield* Accounting.make({
       environmentId: "environment",
-      routeId: subscription ? "openai-subscription-luna" : "configured",
-      model: subscription ? "gpt-6-luna" : "test",
-      acceptedReportedModels: [subscription ? "gpt-6-luna" : "test"],
+      routeId: subscription
+        ? "openai-subscription-luna"
+        : hardMemory
+          ? "command-code-ling-free"
+          : "configured",
+      model: binding.model,
+      acceptedReportedModels: [binding.model],
       ...(subscription
         ? {
             subscriptionTest: {
@@ -1987,9 +2000,13 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false, memory = f
       generation: binding.generation,
       operationId: piRuntime?.operation.operation.operationId ?? "assignment",
       requestId,
-      routeId: subscription ? "openai-subscription-luna" : "configured",
+      routeId: subscription
+        ? "openai-subscription-luna"
+        : hardMemory
+          ? "command-code-ling-free"
+          : "configured",
       provider: subscription ? "openai-codex" : "command-code",
-      model: subscription ? "gpt-6-luna" : "test",
+      model: binding.model,
       maxInputTokens: subscription ? 16_384 : 100,
       maxOutputTokens: subscription ? 2_048 : 100,
       callCount: 1,
@@ -2019,7 +2036,7 @@ const makeBudgetFixture = (writableWorkers = 1, subscription = false, memory = f
           outcome === "reported" ? (subscription ? 64_000 : 20) : subscription ? 64_000 : 100,
         ...(outcome === "reported"
           ? {
-              reportedModel: subscription ? "gpt-6-luna" : "test",
+              reportedModel: binding.model,
               reportedUsage: subscription
                 ? { prompt_tokens: 16_384, completion_tokens: 64_000, total_tokens: 80_384 }
                 : { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
@@ -2780,6 +2797,86 @@ for (const scope of ["operation", "attempt", "root"] as const)
         });
       }).pipe(Effect.provide(contentGuardLayer)),
     ),
+  );
+
+for (const grantScope of [
+  "hard-root",
+  "monitored-root",
+  "foreign-environment",
+  "foreign-project",
+  "foreign-root",
+  "wrong-deadline",
+] as const)
+  it.effect(
+    `qualifies a memory-only ${grantScope} subscription grant against the original root`,
+    () =>
+      withRetainedGateway(
+        Effect.gen(function* () {
+          const hard = grantScope === "hard-root";
+          const base = yield* makeBudgetFixture(2, !hard, true, hard);
+          const f = yield* admitMemoryBudgetFixture(base);
+          const reported = yield* f.reserveMemory(1, 100);
+          yield* f.settleMemory(reported, "reported", 40);
+          yield* f.reserveMemory(2, 300);
+          expect(
+            yield* f.sql`SELECT reservation_id FROM project_team_model_request WHERE request_lane='pi'`,
+          ).toEqual([]);
+          if (hard) {
+            const before = yield* f.reader.readRequired(f.snapshot);
+            expect(before.required.remaining).toMatchObject({
+              rootUsedTokens: 340,
+              rootRemainingTokens: 63_660,
+            });
+            expect(before.required.remaining.policy).toBeUndefined();
+            const fresh = yield* makeProjectTeamContext({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+            });
+            expect((yield* fresh.readRequired(f.snapshot)).required.remaining).toEqual(
+              before.required.remaining,
+            );
+          }
+          const limits = f.snapshot.intent.limits;
+          yield* f.sql`INSERT INTO project_team_pi_subscription_grant
+        (environment_id,project_id,root_task_id,model,route_id,maximum_tokens,maximum_duration_ms,deadline_at_ms)
+        VALUES(${grantScope === "foreign-environment" ? "foreign" : "environment"},
+          ${grantScope === "foreign-project" ? "foreign" : projectId},
+          ${grantScope === "foreign-root" ? "foreign" : limits.rootTaskId},
+          'gpt-6-luna','openai-subscription-luna',64000,300000,
+          ${limits.rootDeadlineAtMs - (grantScope === "wrong-deadline" ? 1 : 0)})`;
+          if (grantScope === "monitored-root") {
+            const current = yield* f.reader.readRequired(f.snapshot);
+            expect(current.required.remaining).toMatchObject({
+              rootUsedTokens: 340,
+              rootRemainingTokens: 63_960,
+              policy: {
+                accountingMode: "openai-subscription-monitored",
+                observedChargedTokens: 40,
+                nominalHeldTokens: 300,
+              },
+            });
+            const fresh = yield* makeProjectTeamContext({
+              environmentId: "environment",
+              maximumEnvironmentModelCalls: 4,
+            });
+            expect((yield* fresh.readRequired(f.snapshot)).required.remaining).toEqual(
+              current.required.remaining,
+            );
+            // Descendant memory inherits this original root grant without needing a Pi row of its own.
+            const child = yield* childMemoryBudgetFixture(f, "memory-only-child", 1000);
+            yield* child.reserveMemory(1, 100);
+            const descendant = yield* child.reader.readRequired(child.snapshot);
+            expect(descendant.required.remaining).toMatchObject({
+              rootUsedTokens: 440,
+              rootRemainingTokens: 63_960,
+              policy: { observedChargedTokens: 40, nominalHeldTokens: 400 },
+            });
+            expect((yield* fresh.readRequired(child.snapshot)).required.remaining).toEqual(
+              descendant.required.remaining,
+            );
+          } else yield* denyCurrentAndFreshContext(f);
+        }).pipe(Effect.provide(contentGuardLayer)),
+      ),
   );
 
 const budgetFixture = makeBudgetFixture();

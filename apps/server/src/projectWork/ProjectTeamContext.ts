@@ -1060,10 +1060,22 @@ export const makeProjectTeamContext = Effect.fn("makeProjectTeamContext")(functi
       FROM project_team_pi_subscription_grant WHERE environment_id=${options.environmentId}
       AND project_id=${binding.projectId} AND root_task_id=${limits.rootTaskId} LIMIT 2`;
     const grant = monitoredGrant[0];
+    // Original claims are ordered by retained event sequence. The first top-level
+    // root claim anchors policy across descendants and later attempts, even with no Pi rows.
+    const originalRoot = originals.find(
+      ({ record }) =>
+        record.kind === "run-binding" &&
+        record.taskId === limits.rootTaskId &&
+        record.parentRunId === undefined,
+    )?.record;
+    const subscriptionRoot =
+      originalRoot?.kind === "run-binding" && originalRoot.model === "gpt-6-luna";
     if (
       monitoredGrant.length > 1 ||
+      (subscriptionRoot && rows.length > 0 && grant === undefined) ||
       (grant !== undefined &&
-        (grant.model !== "gpt-6-luna" ||
+        (!subscriptionRoot ||
+          grant.model !== "gpt-6-luna" ||
           grant.route_id !== "openai-subscription-luna" ||
           grant.maximum_tokens !== 64_000 ||
           grant.maximum_tokens !== limits.maximumTokens ||
