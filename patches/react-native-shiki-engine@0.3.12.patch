@@ -1,0 +1,11 @@
+diff --git a/android/build.gradle b/android/build.gradle
+index 767eb43..2dccdd0 100644
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -111,5 +111,5 @@ dependencies {
+   //noinspection GradleDynamicVersion
+   implementation "com.facebook.react:react-native:+"
+   implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
+-  implementation "com.facebook.fbjni:fbjni:+"
++  implementation "com.facebook.fbjni:fbjni:0.7.0"
+ }
