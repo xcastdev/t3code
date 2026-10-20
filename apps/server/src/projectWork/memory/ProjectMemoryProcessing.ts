@@ -1140,6 +1140,7 @@ export interface ProjectMemoryProcessingConsumerOptions {
   readonly exchange: (
     request: ProjectMemoryModelExchange,
     reservationId: string,
+    assertCurrent: Effect.Effect<void, ProjectMemoryServiceError>,
   ) => Effect.Effect<ProjectMemoryModelResponse, ProjectMemoryServiceError>;
   readonly confirmModelTransportDrained: (
     reservationId: string,
@@ -1455,6 +1456,15 @@ export const makeProjectMemoryProcessingConsumer = Effect.fn("makeProjectMemoryP
                           input: phase === "extract" ? source.content : (bodies ?? []),
                         },
                         reserved.reservationId,
+                        sql
+                          .withTransaction(modelFence)
+                          .pipe(
+                            Effect.mapError((error) =>
+                              isServiceError(error)
+                                ? error
+                                : deny("Final memory model fence denied"),
+                            ),
+                          ),
                       ),
                     ),
                   ),

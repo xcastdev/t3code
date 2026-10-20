@@ -1111,6 +1111,7 @@ export interface ProjectMemoryQueryConsumerOptions {
   readonly exchange: (
     request: ProjectMemoryModelExchange,
     id: string,
+    assertCurrent: Effect.Effect<void, ProjectMemoryServiceError>,
   ) => Effect.Effect<ProjectMemoryModelResponse, ProjectMemoryServiceError>;
   readonly confirmModelTransportDrained: (
     id: string,
@@ -1339,6 +1340,11 @@ export const makeProjectMemoryQueryConsumer = Effect.fn("makeProjectMemoryQueryC
               input: [owner.request.query],
             },
             held.reservationId,
+            check().pipe(
+              Effect.mapError((error) =>
+                isServiceError(error) ? error : deny("Final query model fence denied"),
+              ),
+            ),
           )
           .pipe(Effect.result);
         const drained =

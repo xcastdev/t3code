@@ -167,7 +167,10 @@ import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.
 import * as ProjectWorkExport from "./projectWork/ProjectWorkExport.ts";
 import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
 import { makeProjectMemoryCapture } from "./projectWork/memory/ProjectMemoryCapture.ts";
-import { makeProjectMemoryProcessingConsumer } from "./projectWork/memory/ProjectMemoryProcessing.ts";
+import {
+  makeProjectMemoryProcessingConsumer,
+  type ProjectMemoryProcessingConsumerOptions,
+} from "./projectWork/memory/ProjectMemoryProcessing.ts";
 import {
   ProjectMemoryPorts,
   decodeProjectMemoryProcessingConfiguration,
@@ -787,6 +790,28 @@ const ProjectWorkVerificationLive = ProjectWorkVerification.layer.pipe(
   Layer.provide(PersistenceLayerLive),
 );
 
+/** Final forwarding stays with the original bridge; callers supply the source-specific SQL fence. */
+export const makeProjectMemoryModelExchange =
+  (
+    assertAdmission: Effect.Effect<void, ProjectMemoryServiceError>,
+    observeDrain: (id: string) => void,
+  ): ProjectMemoryProcessingConsumerOptions["exchange"] =>
+  (request, id, assertCurrent) =>
+    assertAdmission.pipe(
+      Effect.andThen(
+        Effect.gen(function* () {
+          const operation = yield* Effect.serviceOption(ProjectMemoryOperation);
+          if (Option.isNone(operation))
+            return yield* new ProjectMemoryServiceError({
+              reason: "Memory transport requires its captured executing bridge",
+            });
+          yield* operation.value.assertForward;
+        }),
+      ),
+      Effect.andThen(assertCurrent),
+      Effect.andThen(exchangeProjectMemoryModel(request, () => observeDrain(id))),
+    );
+
 const ProjectMemoryProcessingLayerLive = Layer.effect(
   ProjectMemoryPorts,
   Effect.gen(function* () {
@@ -877,28 +902,13 @@ const ProjectMemoryProcessingLayerLive = Layer.effect(
             () => new ProjectMemoryServiceError({ reason: "Memory credential could not be read" }),
           ),
         ),
-      exchange: (request, id) =>
-        assertAdmission.pipe(
-          Effect.andThen(
-            Effect.gen(function* () {
-              const operation = yield* Effect.serviceOption(ProjectMemoryOperation);
-              if (Option.isNone(operation))
-                return yield* new ProjectMemoryServiceError({
-                  reason: "Memory transport requires its captured executing bridge",
-                });
-              yield* operation.value.assertForward;
-            }),
-          ),
-          Effect.andThen(
-            exchangeProjectMemoryModel(request, () => {
-              // Observed promise/stream cleanup is local drain, never abort intent.
-              if (drained.size < 256) {
-                drained.add(id);
-                Queue.offerUnsafe(drainObservations, id);
-              }
-            }),
-          ),
-        ),
+      exchange: makeProjectMemoryModelExchange(assertAdmission, (id) => {
+        // Observed promise/stream cleanup is local drain, never abort intent.
+        if (drained.size < 256) {
+          drained.add(id);
+          Queue.offerUnsafe(drainObservations, id);
+        }
+      }),
       confirmModelTransportDrained: (id) =>
         drained.has(id)
           ? Effect.void
