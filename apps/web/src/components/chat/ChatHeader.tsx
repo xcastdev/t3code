@@ -9,7 +9,8 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { ChevronDownIcon } from "lucide-react";
+import { BotIcon, ChevronDownIcon } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 import {
   memo,
   useEffect,
@@ -36,6 +37,7 @@ import {
 import { observeResize } from "~/lib/observeResize";
 import { cn } from "~/lib/utils";
 import { useClientSettings } from "../../hooks/useSettings";
+import { useAssistantThreadOwner } from "../assistants/useAssistantHome";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -77,6 +79,9 @@ export const ChatHeader = memo(function ChatHeader({
   onNewThreadInProject,
   onOpenProjectSettings,
 }: ChatHeaderProps) {
+  const assistantHome = useAssistantThreadOwner(
+    isServerThread ? { environmentId: activeThreadEnvironmentId, threadId: activeThreadId } : null,
+  );
   const activeProjectName = activeProject?.isScratch ? "No project" : activeProject?.title;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const interfaceFont = useClientSettings((settings) => settings.fontFamilySans);
@@ -277,7 +282,35 @@ export const ChatHeader = memo(function ChatHeader({
         ariaLabel="Thread breadcrumb"
         className="flex-1 overflow-clip [overflow-clip-margin:2px]"
       >
-        {activeProject ? (
+        {assistantHome ? (
+          <>
+            {/* An agent's home chat belongs to the agent, not to its backing workspace. */}
+            <WorkspaceBreadcrumbItem className="shrink">
+              <Link
+                to="/agents/$environmentId/$assistantId"
+                params={{
+                  environmentId: assistantHome.environmentId,
+                  assistantId: assistantHome.assistantId,
+                }}
+                search={{ section: "overview" }}
+                aria-label={
+                  assistantHome.kind === "canonical"
+                    ? `Open agent ${assistantHome.name}`
+                    : `Part of agent ${assistantHome.name}'s work. Open the agent`
+                }
+                className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              >
+                <BotIcon className="size-3.5 shrink-0" />
+                <WorkspaceBreadcrumbText className="max-w-40">
+                  {assistantHome.name}
+                </WorkspaceBreadcrumbText>
+              </Link>
+            </WorkspaceBreadcrumbItem>
+            <WorkspaceBreadcrumbSeparator>
+              <WorkspaceBreadcrumbText>/</WorkspaceBreadcrumbText>
+            </WorkspaceBreadcrumbSeparator>
+          </>
+        ) : activeProject ? (
           <>
             <WorkspaceBreadcrumbItem className="shrink">
               <Tooltip>

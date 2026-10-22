@@ -1,3 +1,4 @@
+export * from "./externalNotifications.ts";
 export * from "./baseSchemas.ts";
 export * from "./assistantCitations.ts";
 export * from "./composerContext.ts";
@@ -66,3 +67,26 @@ export * from "./rpc.ts";
 export * from "./worktreeSetup.ts";
 export * from "./secretRequest.ts";
 export * from "./clientRpcPermissions.ts";
+export * from "./projectWork.ts";
+export * from "./projectVerification.ts";
+export * from "./projectIssueIntake.ts";
+export * from "./projectTeamSupervision.ts";
+export * from "./projectMemory.ts";
+export * from "./projectTeams.ts";
+export * from "./projectMcp.ts";
+export * from "./mcpCatalog.ts";
+export * from "./skills.ts";
+export * from "./managedTextResources.ts";
+export * from "./memoryOwner.ts";
+export * from "./assistants.ts";
+export * from "./assistantUi.ts";
+export * from "./projectMcp.ts";
+export * from "./mcpCatalog.ts";
+
+export * from "./terminalToolkit.ts";
+export * from "./issueSearch.ts";
+
+export * from "./assistantMemory.ts";
+export * from "./assistantRoutines.ts";
+
+export * from "./threadHistory.ts";

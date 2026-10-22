@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
   MessageId,
   NodeId,
   ProjectId,
@@ -21,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as ServerSettings from "../serverSettings.ts";
 import { restartContinuationRun, continueRestartedRun } from "./RestartContinuation.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import { OrchestratorCommandRejectedError } from "./Orchestrator.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as EventSink from "./EventSink.ts";
@@ -1144,4 +1146,37 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
         [],
       );
     }),
+);
+
+it.effect("recovers delegated results when ownership admission refuses a restart wake", () =>
+  Effect.gen(function* () {
+    const base = makeProjection();
+    const projection = { ...base, runs: [{ ...base.runs[0]!, status: "cancelled" as const }] };
+    let recovered = false;
+    const rejection = new OrchestratorCommandRejectedError({
+      commandId: CommandId.make("command:restart-refused"),
+      commandType: "message.dispatch",
+      cause: "Run owner is revoked.",
+    });
+    const error = yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: () => Effect.succeed(projection),
+            dispatch: () => Effect.fail(rejection),
+            recoverDelegatedTask: (target, source) =>
+              Effect.sync(() => {
+                assert.equal(target, threadId);
+                assert.equal(source, runId);
+                recovered = true;
+              }),
+          }),
+        ),
+      ),
+      Effect.flip,
+    );
+    assert.equal(error, rejection);
+    assert.isTrue(recovered);
+  }),
 );

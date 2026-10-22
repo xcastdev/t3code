@@ -276,6 +276,17 @@ describe("detectComposerTrigger", () => {
     });
   });
 
+  it("detects only the explicit issue filter as an issue search", () => {
+    const text = "Fixes #iss:login";
+    expect(detectComposerTrigger(text, text.length)).toEqual({
+      kind: "issue",
+      query: "login",
+      rangeStart: "Fixes ".length,
+      rangeEnd: text.length,
+    });
+    expect(detectComposerTrigger("Fixes #issue", 12)).toMatchObject({ kind: "pull-request" });
+  });
+
   it("does not keep pull request completion active for headings or embedded hashes", () => {
     expect(detectComposerTrigger("# Heading", "# Heading".length)).toBeNull();
     expect(detectComposerTrigger("issue#123", "issue#123".length)).toBeNull();

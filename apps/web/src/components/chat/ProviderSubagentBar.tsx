@@ -15,6 +15,8 @@ export function ProviderSubagentBar(props: {
   readonly showInstanceBadge: boolean;
   readonly modelLabel: string;
   readonly effortLabel: string | null;
+  /** Retained work in the child's latest turn, from rows already loaded. */
+  readonly workLabel?: string | null;
   readonly status: ProviderSubagentStatus | null;
   readonly onOpenParent: (() => void) | null;
 }) {
@@ -63,6 +65,11 @@ export function ProviderSubagentBar(props: {
           <span className="shrink-0 text-muted-foreground">{props.effortLabel}</span>
         )}
       </span>
+      {props.workLabel ? (
+        <span className="min-w-0 truncate text-muted-foreground max-md:hidden">
+          {props.workLabel}
+        </span>
+      ) : null}
       <span
         ref={statusRef}
         aria-hidden

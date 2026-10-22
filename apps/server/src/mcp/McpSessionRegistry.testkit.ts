@@ -7,6 +7,9 @@ import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 export const layer = Layer.succeed(
   McpSessionRegistry.McpSessionRegistry,
   McpSessionRegistry.McpSessionRegistry.of({
+    bindNativeRuntime: () => Effect.void,
+    resolveNativeRuntime: () => Effect.succeed(undefined),
+    onRevoke: () => Effect.succeed(() => {}),
     issue: ({ threadId, providerInstanceId }) =>
       Effect.succeed({
         config: {

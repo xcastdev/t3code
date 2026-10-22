@@ -17,9 +17,11 @@ import {
 } from "@t3tools/client-runtime/connection";
 
 import {
+  attachedPrimaryIdentityError,
   canRetainCachedPlatformRegistrationAfterRefreshFailure,
   canReuseCachedPlatformRegistration,
   layer,
+  primaryCredentialPinFor,
   isRejectedBootstrapCredentialError,
   isRejectedSecondaryBootstrap,
   nextRejectedSecondaryBootstrap,
@@ -410,5 +412,92 @@ describe("primary topology cache", () => {
         cause: new Error("IPC unavailable"),
       }),
     ).toBe(cached);
+  });
+});
+
+describe("attached primary pinning", () => {
+  const attached = {
+    httpBaseUrl: "http://127.0.0.1:4773",
+    wsBaseUrl: "ws://127.0.0.1:4773",
+    environmentId: EnvironmentId.make("environment-attached"),
+    attachmentRevision: "revision-1",
+  };
+  const resolved = {
+    source: "desktop-attached" as const,
+    target: { httpBaseUrl: "http://127.0.0.1:4773/", wsBaseUrl: "ws://127.0.0.1:4773/" },
+    attached,
+  };
+
+  it("blocks instead of registering a different server at the attached address", () => {
+    expect(
+      attachedPrimaryIdentityError(resolved, EnvironmentId.make("environment-attached")),
+    ).toBeNull();
+    const error = attachedPrimaryIdentityError(resolved, EnvironmentId.make("environment-other"));
+    expect(error).toBeInstanceOf(ConnectionBlockedError);
+    expect(error?.reason).toBe("configuration");
+    expect(
+      attachedPrimaryIdentityError(
+        { source: "desktop-managed", target: resolved.target },
+        EnvironmentId.make("environment-other"),
+      ),
+    ).toBeNull();
+  });
+
+  it("pins a broker credential request to the exact registered destination", () => {
+    const environmentId = EnvironmentId.make("environment-attached");
+    const registeredA = {
+      environmentId,
+      httpBaseUrl: resolved.target.httpBaseUrl,
+      wsBaseUrl: resolved.target.wsBaseUrl,
+      attached,
+    };
+    const requestA = {
+      environmentId,
+      httpBaseUrl: registeredA.httpBaseUrl,
+      socketUrl: "ws://127.0.0.1:4773/ws?client=web&mode=direct",
+    };
+    expect(primaryCredentialPinFor(requestA, registeredA)).toEqual({
+      _tag: "Pinned",
+      attached,
+    });
+
+    // The registration moved to B while request A was still in flight.
+    const attachedB = {
+      ...attached,
+      httpBaseUrl: "http://127.0.0.1:4774",
+      wsBaseUrl: "ws://127.0.0.1:4774",
+      attachmentRevision: "revision-2",
+    };
+    const registeredB = {
+      environmentId,
+      httpBaseUrl: "http://127.0.0.1:4774/",
+      wsBaseUrl: "ws://127.0.0.1:4774/",
+      attached: attachedB,
+    };
+    const refusedA = primaryCredentialPinFor(requestA, registeredB);
+    expect(refusedA._tag).toBe("Refused");
+    if (refusedA._tag === "Refused") expect(refusedA.error.reason).toBe("configuration");
+    expect(
+      primaryCredentialPinFor(
+        {
+          environmentId,
+          httpBaseUrl: registeredB.httpBaseUrl,
+          socketUrl: "ws://127.0.0.1:4774/ws?client=web",
+        },
+        registeredB,
+      ),
+    ).toEqual({ _tag: "Pinned", attached: attachedB });
+
+    expect(
+      primaryCredentialPinFor(
+        { ...requestA, environmentId: EnvironmentId.make("environment-other") },
+        registeredA,
+      )._tag,
+    ).toBe("Refused");
+    expect(
+      primaryCredentialPinFor({ ...requestA, socketUrl: "ws://127.0.0.1:4773/other" }, registeredA)
+        ._tag,
+    ).toBe("Refused");
+    expect(primaryCredentialPinFor(requestA, undefined)._tag).toBe("Refused");
   });
 });

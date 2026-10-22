@@ -38,6 +38,19 @@ const runCommand = Effect.fn("runCommand")(function* (command: ChildProcess.Stan
     });
   }
 });
+const stageMemoryCompanion = Effect.fn("stageMemoryCompanion")(function* (
+  serverDir: string,
+  outDir: string,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const target = path.join(serverDir, outDir, "companion");
+  yield* fs.makeDirectory(target, { recursive: true });
+  yield* fs.copyFile(
+    path.join(serverDir, "src/projectWork/memory/companion/mem0_backend.py"),
+    path.join(target, "mem0_backend.py"),
+  );
+});
 
 const applyDevelopmentIconOverrides = Effect.fn("applyDevelopmentIconOverrides")(function* (
   repoRoot: string,
@@ -86,6 +99,7 @@ const buildCmd = Command.make(
       );
 
       const webDist = path.join(repoRoot, "apps/web/dist");
+      yield* stageMemoryCompanion(serverDir, "dist");
       const clientTarget = path.join(serverDir, "dist/client");
 
       if (yield* fs.exists(webDist)) {
@@ -139,6 +153,7 @@ const buildExeCmd = Command.make(
       // passes the bundler and `node dist/bin.mjs`, then throws inside the
       // binary, so read the emitted module graph rather than trusting config.
       const bundlePath = path.join(serverDir, "dist-exe/bin.mjs");
+      yield* stageMemoryCompanion(serverDir, "dist-exe");
       const specifiers = findEsmImportsOfExternalPackages(yield* fs.readFileString(bundlePath));
       if (specifiers.length > 0) {
         return yield* new ServerCliExecutableImportError({ bundlePath, specifiers });

@@ -883,7 +883,10 @@ export const make = Effect.gen(function* () {
 
   const waitingForBackend = Effect.gen(function* () {
     if (yield* Ref.get(backendReadyRef)) return false;
-    return (yield* desktopSettings.get).localEnvironmentEnabled;
+    const settings = yield* desktopSettings.get;
+    return (
+      settings.localEnvironmentEnabled && (settings.primaryBackend?.mode ?? "managed") === "managed"
+    );
   });
 
   const createMainIfBackendReady = Effect.gen(function* () {

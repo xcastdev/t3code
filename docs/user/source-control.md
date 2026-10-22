@@ -10,6 +10,15 @@ rebases, the files Git brought in are left out. A file stays in the list when th
 committed it, or fixed a conflict in it. Use the branch comparison to review everything that changed
 against your base branch. Restore still returns the complete saved workspace.
 
+## Stage and commit
+
+Open **Source control** in a thread's right panel. If the workspace contains nested Git
+repositories, choose the repository first; changes and commits are scoped to that repository. In
+**Changes**, stage or unstage files individually, or use **Stage all** and **Unstage all**. Enter a
+commit message and choose **Commit staged**. Only staged files go into that commit. Turn on **Push
+after commit** to push it too. If the push fails, the commit is kept and you can retry it with the
+branch's **Push** action.
+
 ## Connect an account
 
 Install Git and configure authentication on the machine running your T3 Code server. For a remote

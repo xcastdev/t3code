@@ -1,4 +1,5 @@
 import { Button } from "../ui/button";
+import type { RunWorkSummary } from "./runWorkSummary";
 import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import {
@@ -24,8 +25,11 @@ export function ContextWindowMeter(props: {
   onCompact?: (() => void) | undefined;
   compactDisabled?: boolean | undefined;
   compactDisabledReason?: string | null | undefined;
+  /** Retained work in the latest turn; partial when older rows aren't loaded. */
+  work?: RunWorkSummary | null;
 }) {
-  const { usage, modelDisplayName, onCompact, compactDisabled, compactDisabledReason } = props;
+  const { usage, modelDisplayName, onCompact, compactDisabled, compactDisabledReason, work } =
+    props;
   const usedPercentage = formatPercentage(usage.usedPercentage);
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
   const radius = 9.75;
@@ -142,6 +146,15 @@ export function ContextWindowMeter(props: {
               <span className="font-medium tabular-nums text-secondary-label">
                 {formatContextWindowCost(usage.cost)}
               </span>
+            </div>
+          ) : null}
+          {work ? (
+            <div className="flex flex-col gap-0.5 text-2xs leading-4">
+              <span className="text-secondary-label">
+                Latest turn{work.effort ? ` · ${work.effort}` : ""}
+              </span>
+              <span className="font-medium tabular-nums text-secondary-label">{work.label}</span>
+              <span className="text-secondary-label">{work.retentionLabel}</span>
             </div>
           ) : null}
           {usage.compactsAutomatically ? (

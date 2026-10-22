@@ -1,5 +1,10 @@
 import { findRecordedWorktreeSetup, mergeDirectPreviewAnnotation } from "./ChatView.logic";
 import { recallCheckoutIsRepo, rememberCheckoutIsRepo } from "./ChatView.logic";
+import {
+  resolveComposerInteractionMode,
+  resolveComposerSettingsSource,
+  shouldShowPlanFollowUpPrompt,
+} from "./ChatView.logic";
 import { ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import { deriveProviderInstanceEntries } from "../providerInstances";
 import {
@@ -1022,5 +1027,102 @@ describe("mergeDirectPreviewAnnotation", () => {
     });
     expect(result.images).toEqual([]);
     expect(result.previewAnnotations[0]?.screenshot).toBeNull();
+  });
+});
+
+describe("agent-configured composer settings", () => {
+  const grok = { instanceId: ProviderInstanceId.make("grok"), model: "grok-code-fast-1" };
+  const thread = {
+    modelSelection: grok,
+    runtimeMode: "full-access",
+    interactionMode: "plan",
+  } as const;
+  const staleDraft = {
+    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+    runtimeMode: "approval-required",
+    interactionMode: "default",
+  } as const;
+  const noDraft = { modelSelection: null, runtimeMode: null, interactionMode: null };
+
+  it("keeps an agent's saved Plan mode on a provider without a mode toggle", () => {
+    const provider = { showInteractionModeToggle: false };
+    expect(
+      resolveComposerInteractionMode({
+        planModeEnabled: false,
+        provider,
+        interactionMode: "plan",
+        agentInteractionMode: "plan",
+      }).interactionMode,
+    ).toBe("plan");
+    expect(
+      resolveComposerInteractionMode({
+        planModeEnabled: true,
+        provider,
+        interactionMode: "plan",
+        agentInteractionMode: "default",
+      }).interactionMode,
+    ).toBe("default");
+    expect(
+      resolveComposerInteractionMode({ planModeEnabled: true, provider, interactionMode: "plan" })
+        .interactionMode,
+    ).toBe("default");
+  });
+
+  it("uses an agent home's thread settings over stale draft overrides", () => {
+    expect(resolveComposerSettingsSource({ owner: "canonical", draft: staleDraft, thread })).toBe(
+      "thread",
+    );
+  });
+
+  it.each(["ordinary", "child", null] as const)("keeps %s draft overrides", (owner) => {
+    expect(resolveComposerSettingsSource({ owner, draft: staleDraft, thread })).toBe("composer");
+  });
+
+  it.each(["unknown", "offline"] as const)(
+    "while ownership is %s, waits only on an override that differs from the thread",
+    (owner) => {
+      expect(resolveComposerSettingsSource({ owner, draft: staleDraft, thread })).toBe("wait");
+      expect(
+        resolveComposerSettingsSource({
+          owner,
+          draft: { ...noDraft, interactionMode: "default" },
+          thread,
+        }),
+      ).toBe("wait");
+      expect(resolveComposerSettingsSource({ owner, draft: noDraft, thread })).toBe("composer");
+      expect(
+        resolveComposerSettingsSource({
+          owner,
+          draft: { modelSelection: grok, runtimeMode: "full-access", interactionMode: "plan" },
+          thread,
+        }),
+      ).toBe("composer");
+    },
+  );
+
+  it("leaves a local draft thread on its composer settings", () => {
+    expect(resolveComposerSettingsSource({ owner: null, draft: staleDraft, thread: null })).toBe(
+      "composer",
+    );
+  });
+
+  it("offers blank-to-implement only where the composer may switch out of Plan mode", () => {
+    const settledPlan = {
+      pendingUserInputCount: 0,
+      interactionMode: "plan",
+      latestTurnSettled: true,
+      hasActionableProposedPlan: true,
+      hasComposerAttachments: false,
+    } as const;
+    const offered = (owner: "canonical" | "ordinary" | "child" | null) =>
+      shouldShowPlanFollowUpPrompt({
+        ...settledPlan,
+        agentOwnsInteractionMode:
+          resolveComposerSettingsSource({ owner, draft: noDraft, thread }) === "thread",
+      });
+    expect(offered("canonical")).toBe(false);
+    expect(offered("ordinary")).toBe(true);
+    expect(offered("child")).toBe(true);
+    expect(offered(null)).toBe(true);
   });
 });

@@ -18,6 +18,7 @@ import { dispatchHardwareKeyboardCommand } from "../keyboard/hardwareKeyboardCom
 import { WorkspaceConnectionTitle } from "../home/WorkspaceConnectionTitle";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 import { PullRequestsScreen } from "../pull-requests/PullRequestsScreen";
+import { WorkTab } from "../work/WorkTab";
 import {
   WorkspaceTabsContext,
   WorkspaceTabsProvider,
@@ -31,6 +32,7 @@ import { useSidebarWorkspaceTabs, useSystemWorkspaceTabBar } from "./useSystemWo
 const TAB_TITLES = {
   threads: "Threads",
   pullRequests: "Pull requests",
+  work: "Work",
 };
 
 function WorkspaceRootTitle(props: {
@@ -120,14 +122,18 @@ function WorkspaceRootContent() {
             title="T3 Code"
             titleContent={renderHeaderTitle()}
             actions={[
-              {
-                accessibilityLabel:
-                  state.selectedTab === "threads" ? "Search threads" : "Search pull requests",
-                icon: "magnifyingglass",
-                onPress: () => {
-                  dispatchHardwareKeyboardCommand("focusSearch");
-                },
-              },
+              ...(state.selectedTab === "work"
+                ? []
+                : [
+                    {
+                      accessibilityLabel:
+                        state.selectedTab === "threads" ? "Search threads" : "Search pull requests",
+                      icon: "magnifyingglass" as const,
+                      onPress: () => {
+                        dispatchHardwareKeyboardCommand("focusSearch");
+                      },
+                    },
+                  ]),
               {
                 accessibilityLabel: "Settings",
                 icon: "gearshape",
@@ -142,7 +148,13 @@ function WorkspaceRootContent() {
         )}
         {sidebarPicker ? <WorkspaceSidebarTabs /> : null}
         <SafeAreaInsetsContext value={sidebarPicker ? { ...insets, top: 0 } : insets}>
-          {state.selectedTab === "threads" ? <HomeRouteScreen /> : <PullRequestsScreen />}
+          {state.selectedTab === "threads" ? (
+            <HomeRouteScreen />
+          ) : state.selectedTab === "work" ? (
+            <WorkTab />
+          ) : (
+            <PullRequestsScreen />
+          )}
         </SafeAreaInsetsContext>
         <WorkspaceToolbar
           sidebar={sidebarNavigation}

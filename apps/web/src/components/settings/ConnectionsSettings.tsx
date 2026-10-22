@@ -99,6 +99,7 @@ import {
   environmentTransportLabel,
   formatDesktopSshTarget,
 } from "./EnvironmentRow";
+import { DesktopPrimaryBackendSettings } from "./DesktopPrimaryBackendSettings";
 import { FoldedSettingsSection } from "./FoldedSettingsSection";
 import { LoadBalancingSettings } from "./LoadBalancingSettings";
 import { GitHubRoutingSettings } from "./GitHubRoutingSettings";
@@ -184,6 +185,7 @@ import {
   refreshDesktopNetworkAccessState,
 } from "~/state/desktopNetworkAccess";
 import { desktopSshHostsStateAtom, filterDiscoveredSshHosts } from "~/state/desktopSshHosts";
+import { desktopPrimaryBackendStateAtom } from "~/state/desktopPrimaryBackend";
 import { desktopWslStateAtom, refreshDesktopWslState } from "~/state/desktopWslState";
 import { useDesktopUpdateState } from "~/state/desktopUpdate";
 import {
@@ -2243,6 +2245,14 @@ export function ConnectionsSettings() {
   const canMaintain = useEnvironmentScope(primaryEnvironmentId, AuthEnvironmentMaintainScope);
   const canManageRelay = useEnvironmentScope(primaryEnvironmentId, AuthRelayWriteScope);
   const canManageLocalBackend = !isLocalEnvironmentDisabled() && canMaintain;
+  // Exposure and WSL reconfigure a server this app launches; an attached server is
+  // independently owned, so those controls never apply to it.
+  const desktopPrimaryBackend = useEnvironmentQuery(
+    desktopBridge ? desktopPrimaryBackendStateAtom : null,
+  );
+  const canManageBundledBackend =
+    canManageLocalBackend &&
+    (desktopBridge === undefined || desktopPrimaryBackend.data?.mode === "managed");
   const authAccessChanges = useEnvironmentQuery(
     canReadAccess && primaryEnvironmentId !== null
       ? authEnvironment.accessChanges({
@@ -2252,7 +2262,7 @@ export function ConnectionsSettings() {
       : null,
   );
   const desktopNetworkAccess = useEnvironmentQuery(
-    canManageLocalBackend && desktopBridge ? desktopNetworkAccessStateAtom : null,
+    canManageBundledBackend && desktopBridge ? desktopNetworkAccessStateAtom : null,
   );
   const isSshDiscoveryActive =
     desktopBridge !== undefined && addBackendDialogOpen && savedBackendMode === "ssh";
@@ -2266,7 +2276,7 @@ export function ConnectionsSettings() {
     if (isSshDiscoveryActive) refreshDesktopSshHosts();
   }, [isSshDiscoveryActive, refreshDesktopSshHosts]);
   const desktopWsl = useEnvironmentQuery(
-    canManageLocalBackend && desktopBridge ? desktopWslStateAtom : null,
+    canManageBundledBackend && desktopBridge ? desktopWslStateAtom : null,
   );
   const desktopWslState = desktopWsl.data;
   const desktopWslError = desktopWslMutationError ?? desktopWsl.error;
@@ -3211,7 +3221,7 @@ export function ConnectionsSettings() {
     if (!desktopWslState) {
       if (
         isWslSettingsRowVisible({ state: null, error: desktopWslError }) &&
-        canManageLocalBackend
+        canManageBundledBackend
       ) {
         return (
           <SettingsRow
@@ -3552,7 +3562,7 @@ export function ConnectionsSettings() {
                 }
               />
             ) : null}
-            {canManageLocalBackend && desktopBridge ? (
+            {canManageBundledBackend && desktopBridge ? (
               <>
                 {renderNetworkAccessRow()}
                 {renderEndpointRows("endpoint-rail")}
@@ -3562,7 +3572,20 @@ export function ConnectionsSettings() {
                   <CloudLinkRow canReadRelay={canReadRelay} canManageRelay={canManageRelay} />
                 ) : null}
               </>
-            ) : canManageLocalBackend ? (
+            ) : canManageLocalBackend &&
+              desktopBridge &&
+              desktopPrimaryBackend.data !== null &&
+              desktopPrimaryBackend.data.mode !== "managed" ? (
+              <>
+                <SettingsRow
+                  title={searchableSetting("network-access").title}
+                  description="This app is attached to a server it doesn't own. Change network access, Tailscale and WSL where that server runs."
+                />
+                {canReadRelay || canManageRelay ? (
+                  <CloudLinkRow canReadRelay={canReadRelay} canManageRelay={canManageRelay} />
+                ) : null}
+              </>
+            ) : canManageLocalBackend && !desktopBridge ? (
               <>
                 {renderDisabledNetworkAccessRow()}
                 {canReadRelay || canManageRelay ? (
@@ -3630,7 +3653,7 @@ export function ConnectionsSettings() {
             </FoldedSettingsSection>
           ) : null}
           <AlertDialog
-            open={pendingDesktopServerExposureMode !== null && canManageLocalBackend}
+            open={pendingDesktopServerExposureMode !== null && canManageBundledBackend}
             onOpenChange={(open) => {
               if (!open && !isUpdatingDesktopServerExposure)
                 setPendingDesktopServerExposureMode(null);
@@ -3660,7 +3683,7 @@ export function ConnectionsSettings() {
                   variant="default"
                   onClick={handleConfirmDesktopServerExposureChange}
                   disabled={
-                    !canManageLocalBackend ||
+                    !canManageBundledBackend ||
                     pendingDesktopServerExposureMode === null ||
                     isUpdatingDesktopServerExposure
                   }
@@ -3678,7 +3701,7 @@ export function ConnectionsSettings() {
             </AlertDialogPopup>
           </AlertDialog>
           <AlertDialog
-            open={isWslConfirmDialogOpen && canManageLocalBackend}
+            open={isWslConfirmDialogOpen && canManageBundledBackend}
             onOpenChange={(open) => {
               if (isUpdatingWslBackend) return;
               if (!open) setPendingWslChange(null);
@@ -3725,7 +3748,7 @@ export function ConnectionsSettings() {
                     <Button
                       variant="outline"
                       onClick={() => handleConfirmEnableWsl("wsl-only")}
-                      disabled={isUpdatingWslBackend || !canManageLocalBackend}
+                      disabled={isUpdatingWslBackend || !canManageBundledBackend}
                     >
                       {isUpdatingWslBackend ? (
                         <>
@@ -3739,7 +3762,7 @@ export function ConnectionsSettings() {
                     <Button
                       variant="default"
                       onClick={() => handleConfirmEnableWsl("both")}
-                      disabled={isUpdatingWslBackend || !canManageLocalBackend}
+                      disabled={isUpdatingWslBackend || !canManageBundledBackend}
                     >
                       {isUpdatingWslBackend ? (
                         <>
@@ -3760,7 +3783,7 @@ export function ConnectionsSettings() {
                         : "default"
                     }
                     onClick={handleConfirmWslChange}
-                    disabled={isUpdatingWslBackend || !canManageLocalBackend}
+                    disabled={isUpdatingWslBackend || !canManageBundledBackend}
                   >
                     {isUpdatingWslBackend ? (
                       <>
@@ -3786,7 +3809,7 @@ export function ConnectionsSettings() {
             </AlertDialogPopup>
           </AlertDialog>
           <AlertDialog
-            open={disableTailscaleServeDialogOpen && canManageLocalBackend}
+            open={disableTailscaleServeDialogOpen && canManageBundledBackend}
             onOpenChange={(open) => {
               if (isUpdatingTailscaleServe) return;
               setDisableTailscaleServeDialogOpen(open);
@@ -3809,7 +3832,7 @@ export function ConnectionsSettings() {
                 <Button
                   variant="destructive"
                   onClick={() => void handleConfirmTailscaleServeDisable()}
-                  disabled={isUpdatingTailscaleServe || !canManageLocalBackend}
+                  disabled={isUpdatingTailscaleServe || !canManageBundledBackend}
                 >
                   {isUpdatingTailscaleServe ? (
                     <>
@@ -3913,6 +3936,7 @@ export function ConnectionsSettings() {
 
   return (
     <SettingsPageContainer>
+      <DesktopPrimaryBackendSettings />
       {primarySettings}
       <SettingsSection
         {...searchableSetting("remote-environments")}

@@ -7,6 +7,7 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { ScreenContent } from "../../components/ui/ScreenContent";
 import { useAndroidControlSizing } from "../../components/ui/useAndroidControlSizing";
 import { HomeRouteScreen } from "../home/HomeRouteScreen";
+import { WorkTab } from "../work/WorkTab";
 import { PullRequestFilterMenuProvider } from "../pull-requests/PullRequestFilterMenuContext";
 import { PullRequestsScreen } from "../pull-requests/PullRequestsScreen";
 import { PullRequestToolbar } from "../pull-requests/PullRequestToolbar.android";
@@ -16,7 +17,7 @@ import { WorkspaceTabsContext, useWorkspaceTabs } from "./WorkspaceTabsContext";
 import { WorkspaceTabPanes } from "./WorkspaceTabPanes";
 import type { WorkspaceTab } from "./workspace-tabs-state";
 
-const TABS: readonly WorkspaceTab[] = ["threads", "pullRequests"];
+const TABS: readonly WorkspaceTab[] = ["threads", "pullRequests", "work"];
 
 export function WorkspaceRootScreen() {
   const { layout } = useAdaptiveWorkspaceLayout();
@@ -40,6 +41,12 @@ export function WorkspaceRootScreen() {
         renderTab={(tab) =>
           tab === "threads" ? (
             <HomeRouteScreen />
+          ) : tab === "work" ? (
+            <>
+              <NativeStackScreenOptions options={{ headerShown: false }} />
+              <AndroidScreenHeader title="Work" />
+              <WorkTab mode="detail" />
+            </>
           ) : (
             <>
               <NativeStackScreenOptions options={{ headerShown: false }} />
@@ -69,6 +76,11 @@ export function WorkspaceRootScreen() {
             renderTab={(tab) =>
               tab === "threads" ? (
                 <HomeRouteScreen />
+              ) : tab === "work" ? (
+                <>
+                  <AndroidScreenHeader title="Work" />
+                  <WorkTab />
+                </>
               ) : (
                 <PullRequestFilterMenuProvider>
                   <PullRequestToolbar />

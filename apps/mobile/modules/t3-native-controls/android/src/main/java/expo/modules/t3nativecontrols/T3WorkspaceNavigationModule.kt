@@ -63,7 +63,7 @@ import expo.modules.kotlin.modules.ModuleDefinition
 import expo.modules.kotlin.viewevent.EventDispatcher
 import expo.modules.kotlin.views.ExpoView
 
-private val TABS = listOf("threads", "pullRequests", "settings")
+private val TABS = listOf("threads", "pullRequests", "work", "settings")
 
 class T3WorkspaceNavigationModule : Module() {
   override fun definition() = ModuleDefinition {
@@ -357,6 +357,7 @@ class T3WorkspaceNavigationView(
   private fun tabTitle(tab: String) = when (tab) {
     "threads" -> "Chats"
     "pullRequests" -> "PRs"
+    "work" -> "Work"
     else -> "Settings"
   }
 
@@ -368,6 +369,7 @@ class T3WorkspaceNavigationView(
     when (tab) {
       "threads" -> R.drawable.t3_chats
       "pullRequests" -> R.drawable.t3_pull_requests
+      "work" -> R.drawable.t3_work
       else -> R.drawable.t3_settings
     }
   )

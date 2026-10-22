@@ -32,6 +32,7 @@ import {
   requestGuarded,
   RpcPermissionGuard,
   subscribe,
+  subscribeDynamic,
 } from "../rpc/client.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type * as RpcSession from "../rpc/session.ts";
@@ -104,6 +105,11 @@ interface EnvironmentQueryAtomOptions<Input, A, E, R> extends Omit<
 }
 
 interface EnvironmentSubscriptionAtomOptions<Input, A, E, R> {
+  readonly onValue?: (
+    target: { readonly environmentId: EnvironmentIdType; readonly input: Input },
+    value: A,
+    registry: AtomRegistry.AtomRegistry,
+  ) => Effect.Effect<void>;
   readonly sensitiveInput?: boolean;
   readonly label: string;
   readonly subscribe: (input: Input) => Stream.Stream<A, E, R>;
@@ -711,10 +717,13 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
   const family = Atom.family((key: string) => {
     const target = parseEnvironmentRpcKey<Input>(key);
     return runtime
-      .atom(
+      .atom((get) =>
         Stream.suspend(() =>
           followStreamInEnvironment(target.environmentId, options.subscribe(target.input)),
-        ).pipe(options.completeWhen ? Stream.takeUntil(options.completeWhen) : (stream) => stream),
+        ).pipe(
+          Stream.tap((value) => options.onValue?.(target, value, get.registry) ?? Effect.void),
+          options.completeWhen ? Stream.takeUntil(options.completeWhen) : (stream) => stream,
+        ),
       )
       .pipe(
         Atom.setIdleTTL(options.idleTtlMs ?? 5 * 60_000),
@@ -745,7 +754,12 @@ export function createEnvironmentCommand<R, ER, Input, A, E>(
     execute: (target, registry) =>
       runInEnvironment(
         target.environmentId,
-        options.execute(target.input, registry, target.environmentId),
+        options.execute(target.input, registry, target.environmentId).pipe(
+          Effect.provideService(RpcPermissionGuard, {
+            authorize: (environmentId, method, input) =>
+              createCommandPermissions(runtime, method).authorize(registry, environmentId, input),
+          }),
+        ),
       ),
   });
 }
@@ -807,6 +821,10 @@ export function createEnvironmentRpcSubscriptionAtomFamily<
     readonly tag: TTag;
     readonly idleTtlMs?: number;
     readonly completeWhen?: (value: B) => boolean;
+    readonly resumeInput?: (
+      input: EnvironmentRpcInput<TTag>,
+      value: EnvironmentRpcStreamValue<TTag>,
+    ) => EnvironmentRpcInput<TTag>;
     readonly transform?: (
       stream: Stream.Stream<
         EnvironmentRpcStreamValue<TTag>,
@@ -825,7 +843,19 @@ export function createEnvironmentRpcSubscriptionAtomFamily<
     ...(options.completeWhen === undefined ? {} : { completeWhen: options.completeWhen }),
     ...(options.idleTtlMs === undefined ? {} : { idleTtlMs: options.idleTtlMs }),
     subscribe: (input: EnvironmentRpcInput<TTag>) => {
-      const stream = subscribe(options.tag, input);
+      let resumeInput = input;
+      // Session replacement must resume at the last delivered cursor, not the mount cursor.
+      const nextInput = options.resumeInput;
+      const stream =
+        nextInput === undefined
+          ? subscribe(options.tag, input)
+          : subscribeDynamic(options.tag, () => Effect.succeed(resumeInput)).pipe(
+              Stream.tap((value) =>
+                Effect.sync(() => {
+                  resumeInput = nextInput(resumeInput, value);
+                }),
+              ),
+            );
       return options.transform === undefined
         ? (stream as Stream.Stream<
             B,

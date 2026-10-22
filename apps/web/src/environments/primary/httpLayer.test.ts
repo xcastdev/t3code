@@ -43,12 +43,15 @@ describe("primary environment HTTP layer", { concurrent: false }, () => {
       value: {
         location: { origin: "t3code://app" },
         desktopBridge: {
-          getLocalEnvironmentBootstrap: () => ({
-            label: "Local environment",
-            httpBaseUrl: "http://127.0.0.1:3773",
-            wsBaseUrl: "ws://127.0.0.1:3773",
-            bootstrapToken: "desktop-bootstrap-token",
-          }),
+          getLocalEnvironmentBootstraps: () => [
+            {
+              id: "primary",
+              label: "Local environment",
+              httpBaseUrl: "http://127.0.0.1:3773",
+              wsBaseUrl: "ws://127.0.0.1:3773",
+              bootstrapToken: "desktop-bootstrap-token",
+            },
+          ],
           getLocalEnvironmentBearerToken: vi.fn().mockResolvedValue("desktop-bearer-token"),
         } as unknown as DesktopBridge,
       },

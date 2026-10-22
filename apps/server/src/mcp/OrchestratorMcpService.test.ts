@@ -1,5 +1,16 @@
+import * as OrchestratorHandlers from "./toolkits/orchestrator/handlers.ts";
+import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
+import * as McpToolAccess from "./McpToolAccess.ts";
+import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
+import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as Stream from "effect/Stream";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
+import * as Option from "effect/Option";
+import * as RunAdmission from "../orchestration-v2/RunAdmission.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
@@ -13,6 +24,11 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RunId,
+  RunAttemptId,
+  ProviderThreadId,
+  ProviderSessionId,
+  SecretRef,
+  TurnItemId,
   ThreadId,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadProjection,
@@ -57,6 +73,7 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(RunAdmission.layerOrdinary),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -2308,3 +2325,490 @@ describe("OrchestratorMcpService provider resolution", () => {
     );
   });
 });
+
+it.effect.each(["owned", "archived", "revoked"] as const)(
+  "rejects %s agent batch and scheduled-task escapes before mutations",
+  (reason) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread:owned-origin");
+      const shell = liveThreadShell(threadId);
+      const checked: Array<RunAdmission.CheckInput> = [];
+      const upserted: Array<import("@t3tools/contracts").ScheduledTaskUpsertInput> = [];
+      const task: ScheduledTask = {
+        id: ScheduledTaskId.make("task:existing"),
+        title: "Existing",
+        prompt: "Work",
+        enabled: true,
+        schedule: { type: "interval", everyMs: 600_000 },
+        projectId: shell.projectId,
+        threadId: null,
+        workspaceStrategy: { type: "root" },
+        modelSelection: shell.modelSelection,
+        runtimeMode: shell.runtimeMode,
+        interactionMode: shell.interactionMode,
+        createdBy: "agent",
+        creationSource: "mcp",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        nextRunAt: null,
+        lastRunAt: null,
+        lastRunStatus: "never",
+        lastRunError: null,
+        runCount: 0,
+      };
+      const scope: McpInvocationScope = {
+        environmentId: EnvironmentId.make("environment:owner-escape"),
+        requestNamespace: "provider-session:owned",
+        thread: {
+          threadId,
+          providerSessionId: "provider-session:owned",
+          providerInstanceId: shell.providerInstanceId,
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 0,
+      };
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(RunAdmission.RunAdmission)({
+          check: (input) => {
+            checked.push(input);
+            return Effect.succeed({ _tag: "denied", reason });
+          },
+        }),
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+          dispatch: () => Effect.die("An owned escape must not create a thread."),
+        }),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({
+          list: () => Effect.succeed({ tasks: [task] }),
+          upsert: (input) => {
+            upserted.push(input);
+            return Effect.succeed({ task: { ...task, enabled: input.enabled } });
+          },
+        }),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        ServerSettings.layerTest(),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const batch = yield* service
+          .createThreads(scope, { threads: [{ prompt: "Escape" }] })
+          .pipe(Effect.flip);
+        assert.equal(batch.code, "capability_denied");
+        const scheduled = yield* service
+          .scheduleTask(scope, {
+            prompt: "Escape later",
+            projectId: ProjectId.make("project:other"),
+            bindToCurrentThread: false,
+            schedule: { type: "interval", everyMs: 600_000 },
+          })
+          .pipe(Effect.flip);
+        assert.equal(scheduled.code, "capability_denied");
+        const updated = yield* service
+          .updateScheduledTask(scope, {
+            scheduledTaskId: ScheduledTaskId.make("task:existing"),
+            enabled: true,
+          })
+          .pipe(Effect.flip);
+        assert.equal(updated.code, "capability_denied");
+        assert.equal(upserted.length, 0);
+        yield* service.updateScheduledTask(scope, { scheduledTaskId: task.id, enabled: false });
+        assert.equal(upserted.length, 1);
+        assert.equal(upserted[0]?.enabled, false);
+        assert.equal(checked.length, 3);
+        for (const input of checked) {
+          assert.equal(input.threadId, threadId);
+          assert.isUndefined(input.originSessionId);
+          assert.equal(input.operation, "escape");
+        }
+      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+    }),
+);
+
+it.effect.each([
+  "saved",
+  "saved-ref-missing",
+  "declined",
+  "cancelled",
+  "timed_out",
+  "record-error",
+  "ordinary-declined",
+  "active-declined",
+  "archived-toolkit",
+  "stopped-toolkit",
+  "ordinary-toolkit",
+  "ordinary-archived-toolkit",
+  "provider-mismatch-toolkit",
+  "session-race",
+] as const)(
+  "guards the %s secret-tool response for its exact execution and holds inactive outcomes",
+  (outcome) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread:secret-response");
+      const shell = liveThreadShell(threadId);
+      const runId = RunId.make("run:secret-response");
+      const runAttemptId = RunAttemptId.make("attempt:secret-response");
+      const rootNodeId = NodeId.make("node:secret-response");
+      const providerThreadId = ProviderThreadId.make("provider-thread:secret-response");
+      const providerSessionId = ProviderSessionId.make("native-session:secret-response");
+      const epoch = DateTime.makeUnsafe("2026-01-01T00:00:00.000Z");
+      const driver = ProviderDriverKind.make("codex");
+      const base = idleThreadProjection(shell);
+      let requestId: TurnItemId | undefined;
+      let returned = false;
+      let serviceInvoked = false;
+      let stopRequested = false;
+      const checkedOrigin = yield* Deferred.make<RunAdmission.CheckInput>();
+      const throughToolkit = outcome.endsWith("toolkit");
+      const checking = yield* Deferred.make<void>();
+      const releaseCheck = yield* Deferred.make<void>();
+      let currentNativeSession = providerSessionId;
+      const stopped =
+        yield* Deferred.make<
+          Parameters<ThreadManagementService.ThreadManagementService["Service"]["stopExactRun"]>[0]
+        >();
+      const recorded = yield* Deferred.make<void>();
+      const projection = (): OrchestrationV2ThreadProjection => ({
+        ...base,
+        thread: {
+          ...base.thread,
+          archivedAt:
+            outcome === "archived-toolkit" || outcome === "ordinary-archived-toolkit"
+              ? epoch
+              : null,
+        },
+        runs: [
+          {
+            id: runId,
+            threadId,
+            ordinal: 1,
+            providerInstanceId: shell.providerInstanceId,
+            modelSelection: shell.modelSelection,
+            providerThreadId,
+            userMessageId: MessageId.make("message:secret-response"),
+            rootNodeId,
+            activeAttemptId: runAttemptId,
+            status: outcome === "stopped-toolkit" ? "completed" : "running",
+            requestedAt: epoch,
+            startedAt: epoch,
+            completedAt: outcome === "stopped-toolkit" ? epoch : null,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        ],
+        providerThreads: [
+          {
+            id: providerThreadId,
+            driver,
+            providerInstanceId: shell.providerInstanceId,
+            providerSessionId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "active",
+            firstRunOrdinal: 1,
+            lastRunOrdinal: 1,
+            handoffIds: [],
+            forkedFrom: null,
+            pendingBackgroundTasks: [],
+            contextUsage: null,
+            nativeMetadata: null,
+            goal: null,
+            createdAt: epoch,
+            updatedAt: epoch,
+          },
+        ],
+        providerSessions: [
+          {
+            id: providerSessionId,
+            driver,
+            providerInstanceId: shell.providerInstanceId,
+            status: "running",
+            cwd: "/tmp/secret-response",
+            model: shell.modelSelection.model,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: epoch,
+            updatedAt: epoch,
+            lastError: null,
+          },
+        ],
+        turnItems:
+          requestId === undefined
+            ? []
+            : [
+                {
+                  id: requestId,
+                  threadId,
+                  runId,
+                  nodeId: rootNodeId,
+                  providerThreadId,
+                  providerTurnId: null,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: 0,
+                  status: "completed",
+                  title: null,
+                  startedAt: epoch,
+                  completedAt: epoch,
+                  updatedAt: epoch,
+                  type: "secret_request",
+                  label: "Token",
+                  reason: "Test",
+                  secretStatus:
+                    outcome === "timed_out"
+                      ? "pending"
+                      : outcome === "ordinary-declined" ||
+                          outcome === "active-declined" ||
+                          outcome === "ordinary-toolkit"
+                        ? "declined"
+                        : outcome === "declined" || outcome === "cancelled"
+                          ? outcome
+                          : "saved",
+                },
+              ],
+      });
+      const scope: McpInvocationScope = {
+        environmentId: EnvironmentId.make("environment:secret-response"),
+        requestNamespace: "registry:secret-response",
+        thread: {
+          threadId,
+          providerSessionId: "registry-session-not-native",
+          providerInstanceId:
+            outcome === "provider-mismatch-toolkit"
+              ? ProviderInstanceId.make("prior-provider")
+              : shell.providerInstanceId,
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 0,
+      };
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.succeed(McpInvocationContext.McpInvocationContext, scope),
+        Layer.mock(ThreadMetadataMcpService.ThreadMetadataMcpService)({}),
+        Layer.mock(RunAdmission.RunAdmission)({
+          check: (input) => {
+            if (outcome === "provider-mismatch-toolkit")
+              return Deferred.succeed(checkedOrigin, input).pipe(
+                Effect.as<RunAdmission.AdmissionResult>({
+                  _tag: "denied",
+                  reason: "origin-unavailable",
+                }),
+              );
+            assert.equal(input.runId, runId);
+            assert.equal(input.originSessionId, providerSessionId);
+            if (outcome !== "session-race")
+              assert.deepEqual(input.nativeTarget, {
+                runAttemptId,
+                providerThreadId,
+                providerSessionId,
+                nodeId: rootNodeId,
+              });
+            const decision = Effect.succeed<RunAdmission.AdmissionResult>(
+              outcome === "ordinary-declined" ||
+                outcome === "ordinary-toolkit" ||
+                outcome === "ordinary-archived-toolkit"
+                ? { _tag: "ordinary" }
+                : outcome === "active-declined" || outcome === "session-race"
+                  ? {
+                      _tag: "admitted",
+                      owner: {
+                        projectId: shell.projectId,
+                        bindingId: "binding",
+                        rootId: "root",
+                        generation: 1,
+                        fence: 0,
+                        threadId,
+                        runId,
+                        runAttemptId,
+                        expiresAt: "2099-01-01T00:00:00.000Z",
+                        configuration: {
+                          providerInstanceId: shell.providerInstanceId,
+                          model: shell.modelSelection.model,
+                          instructionsHash: "hash",
+                          toolIds: [],
+                          skillIds: [],
+                          runtimeVersion: "native",
+                          maxTokens: 100,
+                          maxDurationMs: 1000,
+                          paidFallback: false,
+                        },
+                      },
+                    }
+                  : { _tag: "denied", reason: "revoked" },
+            );
+            return outcome !== "session-race"
+              ? decision
+              : Deferred.succeed(checking, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseCheck)),
+                  Effect.andThen(
+                    Effect.suspend(() =>
+                      input.nativeTarget !== undefined &&
+                      input.nativeTarget.providerSessionId !== currentNativeSession
+                        ? Effect.succeed<RunAdmission.AdmissionResult>({
+                            _tag: "denied",
+                            reason: "native-target-stale",
+                          })
+                        : decision,
+                    ),
+                  ),
+                );
+          },
+        }),
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadShell: () =>
+            Effect.succeed({
+              ...shell,
+              archivedAt:
+                outcome === "archived-toolkit" || outcome === "ordinary-archived-toolkit"
+                  ? epoch
+                  : null,
+            }),
+          getThreadRecords: () => {
+            serviceInvoked = true;
+            return Effect.succeed(projection());
+          },
+          dispatch: (command) => {
+            if (command.type === "secret_request.record") requestId = command.turnItemId;
+            return outcome === "record-error"
+              ? Effect.fail(
+                  new Orchestrator.OrchestratorCommandRejectedError({
+                    commandId: command.commandId,
+                    commandType: command.type,
+                    cause: "Cannot record request",
+                  }),
+                )
+              : Deferred.succeed(recorded, undefined).pipe(
+                  Effect.as({ sequence: 1, storedEvents: [] }),
+                );
+          },
+          stopExactRun: (input) => {
+            stopRequested = true;
+            return Deferred.succeed(stopped, input).pipe(Effect.asVoid);
+          },
+        }),
+        Layer.mock(SecretRequests.SecretRequests)({
+          savedRef: (input) => {
+            assert.deepEqual(input.execution, {
+              runId,
+              runAttemptId,
+              nodeId: rootNodeId,
+              providerThreadId,
+              providerSessionId,
+            });
+            return Effect.succeed(
+              outcome === "saved-ref-missing"
+                ? Option.none()
+                : Option.some(SecretRef.make("secret-ref:withheld")),
+            );
+          },
+        }),
+        Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ProjectService.ProjectService)({}),
+        ServerSettings.layerTest(),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const params = {
+          label: "Token",
+          reason: "Test",
+          clientRequestId: "secret",
+          timeoutMs: 1_000,
+        };
+        const call = Effect.gen(function* () {
+          if (throughToolkit) {
+            const toolkit = yield* OrchestratorToolkit.pipe(
+              Effect.provide(McpToolAccess.HandlersLayer.layer(OrchestratorHandlers.layer)),
+            );
+            const result = yield* toolkit
+              .handle("request_secret", params)
+              .pipe(Stream.unwrap, Stream.runCollect);
+            if (outcome === "ordinary-toolkit")
+              assert.deepEqual(result.at(-1)?.result, { status: "declined" });
+            if (outcome === "ordinary-archived-toolkit")
+              expect(result.at(-1)?.result).toMatchObject({ code: "parent_not_active" });
+            return;
+          }
+          const result = yield* service.requestSecret(scope, params);
+          if (outcome === "ordinary-declined" || outcome === "active-declined")
+            assert.deepEqual(result, { status: "declined" });
+        });
+        const pending = yield* call.pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              returned = true;
+            }),
+          ),
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              returned = true;
+            }),
+          ),
+          Effect.forkChild,
+        );
+        if (outcome === "provider-mismatch-toolkit") {
+          const checked = yield* Deferred.await(checkedOrigin);
+          assert.isUndefined(checked.runId);
+          assert.isUndefined(checked.nativeTarget);
+          assert.isFalse(stopRequested);
+          assert.isFalse(returned);
+          yield* Fiber.interrupt(pending);
+          assert.isFalse(returned);
+          return;
+        }
+        if (outcome === "session-race") {
+          yield* Deferred.await(checking);
+          currentNativeSession = ProviderSessionId.make("replacement-same-attempt");
+          yield* Deferred.succeed(releaseCheck, undefined);
+        }
+        if (outcome === "timed_out") {
+          yield* Deferred.await(recorded);
+          yield* TestClock.adjust("1 second");
+        }
+        if (
+          outcome === "ordinary-declined" ||
+          outcome === "active-declined" ||
+          outcome === "ordinary-toolkit" ||
+          outcome === "ordinary-archived-toolkit"
+        ) {
+          yield* Fiber.join(pending);
+          assert.isTrue(returned);
+          return;
+        }
+        const observed = yield* Effect.raceFirst(
+          Deferred.await(stopped).pipe(Effect.map((stop) => ({ _tag: "stopped" as const, stop }))),
+          Fiber.join(pending).pipe(Effect.map(() => ({ _tag: "returned" as const }))),
+        );
+        assert.equal(observed._tag, "stopped");
+        if (observed._tag !== "stopped") return;
+        const stop = observed.stop;
+        assert.isTrue(serviceInvoked);
+        assert.deepEqual(
+          { ...stop, commandId: undefined },
+          {
+            commandId: undefined,
+            threadId,
+            runId,
+            runAttemptId,
+            rootNodeId,
+            providerThreadId,
+            providerSessionId,
+          },
+        );
+        assert.isFalse(returned);
+        yield* Fiber.interrupt(pending);
+        assert.isFalse(returned);
+      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provideMerge(dependencies))));
+    }),
+);

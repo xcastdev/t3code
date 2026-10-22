@@ -1,6 +1,8 @@
 import { useState } from "react";
 
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
+import { desktopPrimaryBackendStateAtom } from "../../state/desktopPrimaryBackend";
+import { useEnvironmentQuery } from "../../state/query";
 import {
   AlertDialog,
   AlertDialogClose,
@@ -21,6 +23,10 @@ import { searchableSetting } from "./settingsSearch";
 export function LocalEnvironmentSetting() {
   const setEnabled = window.desktopBridge?.setLocalEnvironmentEnabled;
   const [enabled] = useState(() => !isLocalEnvironmentDisabled());
+  const primaryBackend = useEnvironmentQuery(
+    window.desktopBridge ? desktopPrimaryBackendStateAtom : null,
+  );
+  const attached = primaryBackend.data !== null && primaryBackend.data.mode === "attached";
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,9 +75,11 @@ export function LocalEnvironmentSetting() {
               {enabled ? "Turn off local environment?" : "Turn on local environment?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {enabled
-                ? "T3 Code will restart without running a server on this computer. Any agents and terminals running here will stop, and other devices will no longer be able to connect to this computer. Your projects, history, and remote environments are unaffected."
-                : "T3 Code will restart and start running a server on this computer again."}
+              {enabled && attached
+                ? "T3 Code will restart without connecting to the attached server. That server keeps running with its agents and terminals; turn the local environment back on to reconnect. Your remote environments are unaffected."
+                : enabled
+                  ? "T3 Code will restart without running a server on this computer. Any agents and terminals running here will stop, and other devices will no longer be able to connect to this computer. Your projects, history, and remote environments are unaffected."
+                  : "T3 Code will restart and start running a server on this computer again."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           {error ? <p className="px-6 pb-4 text-sm text-destructive">{error}</p> : null}

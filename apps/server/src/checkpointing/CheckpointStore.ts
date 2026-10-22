@@ -1,7 +1,13 @@
-import { VcsUnsupportedOperationError, type CheckpointRef } from "@t3tools/contracts";
+import {
+  VcsProcessExitError,
+  VcsUnsupportedOperationError,
+  type CheckpointRef,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import type { CheckpointStoreError } from "./Errors.ts";
 import type { VcsCheckpointOps } from "../vcs/VcsDriver.ts";
@@ -45,7 +51,16 @@ export interface DeleteCheckpointRefsInput {
 export class CheckpointStore extends Context.Service<
   CheckpointStore,
   {
+    readonly matchesCheckpoint?: (
+      input: Omit<RestoreCheckpointInput, "fallbackToHead">,
+    ) => Effect.Effect<boolean, CheckpointStoreError>;
     readonly isGitRepository: (cwd: string) => Effect.Effect<boolean, CheckpointStoreError>;
+
+    readonly retainCheckpointRef?: (input: {
+      readonly cwd: string;
+      readonly checkpointRef: CheckpointRef;
+      readonly retainedRef: CheckpointRef;
+    }) => Effect.Effect<string, CheckpointStoreError>;
 
     readonly captureCheckpoint: (
       input: CaptureCheckpointInput,
@@ -80,6 +95,7 @@ export class CheckpointStore extends Context.Service<
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const vcsRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
+  const sqlClient = yield* Effect.serviceOption(SqlClient.SqlClient);
 
   const resolveCheckpoints = Effect.fn("CheckpointStore.resolveCheckpoints")(function* (
     operation: string,
@@ -143,11 +159,61 @@ export const make = Effect.gen(function* () {
       "CheckpointStore.deleteCheckpointRefs",
       input.cwd,
     );
-    return yield* checkpoints.deleteCheckpointRefs(input);
+    if (Option.isNone(sqlClient)) return yield* checkpoints.deleteCheckpointRefs(input);
+    const sql = sqlClient.value;
+    // Hold the writer transaction through deletion so preparation cannot insert a claim after the check.
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`UPDATE t3_workflow_v2_history_archives SET state=state WHERE 0`;
+          const checkpointRefs: CheckpointRef[] = [];
+          for (const ref of input.checkpointRefs) {
+            const claims =
+              yield* sql`SELECT 1 FROM t3_workflow_v2_history_archive_refs r JOIN t3_workflow_v2_history_archives a USING(archive_id) WHERE (r.source_ref=${ref} OR r.retained_ref=${ref}) AND a.state!='released' AND (r.source_ref=${ref} OR a.state!='releasing') LIMIT 1`;
+            if (!claims.length) checkpointRefs.push(ref);
+          }
+          yield* checkpoints.deleteCheckpointRefs({ ...input, checkpointRefs });
+        }),
+      )
+      .pipe(
+        Effect.mapError(
+          (_cause) =>
+            new VcsProcessExitError({
+              operation: "CheckpointStore.deleteCheckpointRefs",
+              command: "git update-ref -d",
+              cwd: input.cwd,
+              exitCode: 1,
+              detail: "Checkpoint retention check or deletion failed.",
+            }),
+        ),
+      );
   });
 
   return CheckpointStore.of({
     isGitRepository,
+    matchesCheckpoint: Effect.fn("CheckpointStore.matchesCheckpoint")(function* (input) {
+      const checkpoints = yield* resolveCheckpoints("CheckpointStore.matchesCheckpoint", input.cwd);
+      if (!checkpoints.matchesCheckpoint)
+        return yield* new VcsUnsupportedOperationError({
+          operation: "CheckpointStore.matchesCheckpoint",
+          kind: "git",
+          detail: "Authoritative checkpoint comparison is unavailable.",
+        });
+      return yield* checkpoints.matchesCheckpoint(input);
+    }),
+    retainCheckpointRef: Effect.fn("CheckpointStore.retainCheckpointRef")(function* (input) {
+      const checkpoints = yield* resolveCheckpoints(
+        "CheckpointStore.retainCheckpointRef",
+        input.cwd,
+      );
+      if (!checkpoints.retainCheckpointRef)
+        return yield* new VcsUnsupportedOperationError({
+          operation: "CheckpointStore.retainCheckpointRef",
+          kind: "git",
+          detail: "Exact checkpoint retention is unavailable.",
+        });
+      return yield* checkpoints.retainCheckpointRef(input);
+    }),
     captureCheckpoint,
     hasCheckpointRef,
     restoreCheckpoint,

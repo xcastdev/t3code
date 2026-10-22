@@ -1,3 +1,8 @@
+import {
+  freezeInstructionSnapshot,
+  instructionSnapshotText,
+  sameInstructionSnapshot,
+} from "@t3tools/provider-core/server/instructionSnapshot";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
@@ -332,6 +337,7 @@ function spawnClaudeProcessGroup(options: ClaudeSpawnOptions): ClaudeSpawnedProc
 }
 
 export const ClaudeProviderCapabilitiesV2 = {
+  instructionDelivery: { mode: "session", supportsSessionReplacement: true },
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
     supportsModelSwitchInSession: true,
@@ -475,6 +481,7 @@ export type ClaudeAgentSdkQueryOptions = Omit<
 } & ClaudeAgentSdkThreadIdentity;
 
 export interface ClaudeAgentSdkQueryOpenInput {
+  readonly onCatalogEndpointAcknowledged?: Effect.Effect<void>;
   readonly options: ClaudeAgentSdkQueryOptions;
   readonly threadId: ThreadId;
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
@@ -944,11 +951,17 @@ export const layerQueryRunner: Layer.Layer<
                   if (mcpServers !== undefined) {
                     // Error texts and the CLI's mcp_status response can echo the headers, so
                     // only server names are logged.
-                    const failed = yield* Effect.tryPromise(() =>
+                    const registration = yield* Effect.tryPromise(() =>
                       queryRuntime.setMcpServers(mcpServers),
                     ).pipe(
-                      Effect.map((result) => Object.keys(result.errors)),
-                      Effect.orElseSucceed(() => Object.keys(mcpServers)),
+                      Effect.orElseSucceed(
+                        (): { added: string[]; errors: Record<string, string> } => ({
+                          added: [],
+                          errors: Object.fromEntries(
+                            Object.keys(mcpServers).map((name) => [name, "unavailable"]),
+                          ),
+                        }),
+                      ),
                       Effect.timeoutOrElse({
                         duration: CLAUDE_MCP_REGISTRATION_TIMEOUT,
                         orElse: () =>
@@ -960,6 +973,14 @@ export const layerQueryRunner: Layer.Layer<
                           ),
                       }),
                     );
+                    if (
+                      mcpServers.t3_catalog !== undefined &&
+                      registration.added.includes("t3_catalog") &&
+                      registration.errors.t3_catalog === undefined
+                    ) {
+                      yield* input.onCatalogEndpointAcknowledged ?? Effect.void;
+                    }
+                    const failed = Object.keys(registration.errors);
                     if (failed.length > 0) {
                       yield* Effect.logWarning("orchestration-v2.claude-mcp-servers-unavailable", {
                         threadId: input.threadId,
@@ -1264,6 +1285,7 @@ export function makeClaudeQueryOptions(input: {
   readonly supportedDialogKinds?: ClaudeQueryOptions["supportedDialogKinds"];
   readonly allowDangerouslySkipPermissions?: boolean;
   readonly appendSystemPromptFileText?: string;
+  readonly instructionSnapshot?: ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"];
 }): ClaudeAgentSdkQueryOptions {
   const compiledSelection = compileClaudeModelSelection(input.modelSelection);
   const {
@@ -1359,6 +1381,9 @@ export function makeClaudeQueryOptions(input: {
         buildRuntimeInstructions({ harness: "Claude Code" }) +
           (input.mcpServers === undefined ? "" : T3_CODE_ORCHESTRATION_INSTRUCTIONS),
         ...launchAppendSystemPrompt,
+        ...(input.instructionSnapshot === undefined
+          ? []
+          : [instructionSnapshotText(input.instructionSnapshot)]),
       ].join("\n\n"),
     },
     ...(Object.keys(extraArgs).length === 0 ? {} : { extraArgs }),
@@ -1466,6 +1491,16 @@ export function claudeMcpQueryOverrides(input: {
   return {
     allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])),
     mcpServers: {
+      ...(session.catalogEndpoint === undefined
+        ? {}
+        : {
+            t3_catalog: {
+              type: "http" as const,
+              url: session.catalogEndpoint,
+              headers: { Authorization: session.authorizationHeader },
+              timeout: CLAUDE_T3_MCP_TOOL_TIMEOUT_MS,
+            },
+          }),
       "t3-code": {
         type: "http",
         url: session.endpoint,
@@ -3887,6 +3922,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: Effect.fn("ClaudeAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
+        const instructionSnapshot =
+          input.instructionSnapshot === undefined
+            ? undefined
+            : freezeInstructionSnapshot(input.instructionSnapshot);
+        const appliedInstructions = new Map<string, NonNullable<typeof instructionSnapshot>>();
         const sessionScope = yield* Effect.scope;
         const now = yield* DateTime.now;
         const session = providerSession({
@@ -9038,8 +9078,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           nativeThreadId: string,
         ) {
           const queryPolicy = yield* queryPolicyForTurn(turnInput);
+          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
           const mcpOverrides = claudeMcpQueryOverrides({
-            mcpSession: yield* mcpSessions.read(turnInput.threadId),
+            mcpSession,
             readOnlySandbox:
               sandboxPolicyKindForClaudeRuntimePolicy(turnInput.runtimePolicy) === "readOnly",
             ...(queryPolicy.allowedTools === undefined
@@ -9171,15 +9212,30 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             canUseTool,
             onUserDialog,
             supportedDialogKinds: ["resume_return"],
+            ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
             ...(appendSystemPromptFileText === undefined ? {} : { appendSystemPromptFileText }),
           });
+          const catalogInstallation =
+            mcpSession === undefined
+              ? undefined
+              : yield* mcpSessions.beginCatalogEndpointInstallation(mcpSession);
+          const invalidateCatalogInstallation = catalogInstallation?.invalidate ?? Effect.void;
           const querySession = yield* queryRunner
             .open({
               threadId: turnInput.threadId,
               providerSessionId: input.providerSessionId,
               options: queryOptions,
+              ...(catalogInstallation === undefined
+                ? {}
+                : { onCatalogEndpointAcknowledged: catalogInstallation.acknowledge }),
             })
             .pipe(
+              Effect.onError(() => invalidateCatalogInstallation),
+              Effect.map((session) => ({
+                ...session,
+                close: session.close.pipe(Effect.ensuring(invalidateCatalogInstallation)),
+                messages: session.messages.pipe(Stream.ensuring(invalidateCatalogInstallation)),
+              })),
               Effect.onError(() =>
                 closedExistingNativeThreadId === nativeThreadId
                   ? Effect.gen(function* () {
@@ -9284,6 +9340,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
         const startTurn = Effect.fn("ClaudeAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
+            if (!sameInstructionSnapshot(instructionSnapshot, turnInput.instructionSnapshot)) {
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: CLAUDE_PROVIDER,
+                detail: "Instruction changes require replacing the Claude provider session.",
+              });
+            }
             const startedAt = yield* DateTime.now;
             const nativeThreadId = yield* getNativeThreadId(turnInput.providerThread);
             const nativeTurnId = `turn:${turnInput.attemptId}`;
@@ -9452,6 +9514,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               yield* attachTurn;
               yield* startUserTurnForWakeReports(nativeThreadId);
               yield* querySession.query.offer(userMessage);
+              if (instructionSnapshot !== undefined) {
+                appliedInstructions.set(turnInput.providerThread.id, instructionSnapshot);
+                yield* turnInput.onInstructionsApplied?.(instructionSnapshot) ?? Effect.void;
+              }
               return;
             }
             // Transcript reads suspend replay. Hold live SDK frames until the whole
@@ -10014,6 +10080,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 ),
               ),
           ),
+          getAppliedInstructions: ({ providerThread }) =>
+            Effect.sync(() => appliedInstructions.get(providerThread.id)),
           startTurn,
           compactThread: (turnInput) =>
             startTurn({

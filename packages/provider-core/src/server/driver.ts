@@ -39,7 +39,21 @@ export interface ProviderDriverMetadata {
 export type ProviderWorkspaceSnapshot = ServerProvider &
   Pick<ServerProviderWorkspaceSnapshot, "slashCommandsPending" | "optionDescriptors">;
 
+export {
+  skillInstallTargets,
+  externalOpenCodeInstallTargets,
+  verifyExternalOpenCodeInstallTargets,
+} from "./skillInstallTargets.ts";
+export type { SkillInstallTarget, SkillInstallTargetId } from "./skillInstallTargets.ts";
+
 export interface ProviderInstance {
+  readonly nativeSkillContentAccess?: "local" | "external";
+  readonly resolveSkillInstallTargets?: (
+    projectRoot?: string,
+  ) => Effect.Effect<
+    ReadonlyArray<import("./skillInstallTargets.ts").SkillInstallTarget>,
+    ProviderDriverError
+  >;
   readonly instanceId: ProviderInstanceId;
   readonly driverKind: ProviderDriverKind;
   readonly continuationIdentity: ProviderContinuationIdentity;

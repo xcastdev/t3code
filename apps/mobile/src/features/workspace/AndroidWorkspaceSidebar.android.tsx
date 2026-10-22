@@ -6,6 +6,8 @@ import { PullRequestsScreen } from "../pull-requests/PullRequestsScreen";
 import { PullRequestToolbar } from "../pull-requests/PullRequestToolbar.android";
 import { WorkspaceTabsContext, useWorkspaceTabs } from "./WorkspaceTabsContext";
 import { WorkspaceTabPanes } from "./WorkspaceTabPanes";
+import { AndroidScreenHeader } from "../../components/ui/AndroidScreenHeader";
+import { WorkTab } from "../work/WorkTab";
 
 export function AndroidWorkspaceSidebar(props: {
   readonly children: ReactNode;
@@ -16,11 +18,18 @@ export function AndroidWorkspaceSidebar(props: {
   const context = useMemo(() => ({ ...workspace, bottomClearance: 16 }), [workspace]);
   return (
     <WorkspaceTabPanes
-      tabs={["threads", "pullRequests"]}
+      tabs={["threads", "pullRequests", "work"]}
       selected={workspace.state.selectedTab}
       renderTab={(tab) =>
         tab === "threads" ? (
           props.children
+        ) : tab === "work" ? (
+          <WorkspaceTabsContext value={context}>
+            <View className="flex-1 bg-header">
+              <AndroidScreenHeader title="Work" />
+              <WorkTab mode="list" />
+            </View>
+          </WorkspaceTabsContext>
         ) : (
           <WorkspaceTabsContext value={context}>
             <PullRequestFilterMenuProvider>

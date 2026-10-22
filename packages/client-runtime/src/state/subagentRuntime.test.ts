@@ -263,3 +263,20 @@ describe("resolveWorkflowOpening", () => {
     expect(isWorkflowScriptMessage({ role: "assistant", text: SCRIPT })).toBe(false);
   });
 });
+
+it("uses saved subagent model and effort without borrowing the coordinator's effort for members", () => {
+  const agents = projectedSubagentsToRuntime([
+    subagent({
+      model: "stale-label",
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: "saved-model",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      },
+      workflow: { phases: [], agents: [member({ model: "child-model" })] },
+    }),
+  ]);
+  expect(agents[0]).toMatchObject({ model: "saved-model", effort: "high", usage: null });
+  expect(agents[1]).toMatchObject({ model: "child-model", effort: null, usage: null });
+  expect(projectedSubagentsToRuntime([subagent()])[0]?.effort).toBeNull();
+});

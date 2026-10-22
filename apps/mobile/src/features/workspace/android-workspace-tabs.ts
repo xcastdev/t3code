@@ -2,7 +2,7 @@ import type { NavigationState } from "@react-navigation/native";
 import { androidWorkspaceNavigationState } from "../../lib/android-workspace-navigation";
 import type { WorkspaceTab } from "./workspace-tabs-state";
 
-/** Settings joins the two list tabs as a top-level Android destination. */
+/** Settings joins the workspace tabs as a top-level Android destination. */
 export type AndroidWorkspaceNavigationTab = WorkspaceTab | "settings";
 
 const WORKSPACE_ROUTES = new Set(["Home", "Thread", "PullRequest", "SettingsSheet"]);

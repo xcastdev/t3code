@@ -125,4 +125,54 @@ describe("environmentBootstrap", () => {
       "http://127.0.0.1:5733/.well-known/t3/environment",
     );
   });
+
+  function installAttachedDesktop(input: { readonly environmentId?: string }) {
+    vi.stubGlobal("window", {
+      location: new URL("http://127.0.0.1:5733/"),
+      history: { replaceState: vi.fn() },
+      desktopBridge: {
+        getLocalEnvironmentBootstraps: () => [
+          {
+            id: "primary",
+            label: "External",
+            httpBaseUrl: "http://127.0.0.1:4773",
+            wsBaseUrl: "ws://127.0.0.1:4773",
+            ownership: "attached",
+            ...(input.environmentId === undefined ? {} : { environmentId: input.environmentId }),
+            attachmentRevision: "revision-1",
+          },
+        ],
+        getLocalEnvironmentBearerToken: async () => "attached-bearer",
+      },
+    });
+  }
+
+  it("sends attached loopback requests straight to the attached server, not the dev proxy", async () => {
+    vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:5733");
+    installAttachedDesktop({ environmentId: "environment-local" });
+    await installDescriptorApi();
+
+    expect(resolvePrimaryEnvironmentHttpUrl("/.well-known/t3/environment")).toBe(
+      "http://127.0.0.1:4773/.well-known/t3/environment",
+    );
+    await expect(resolveInitialPrimaryEnvironmentDescriptor()).resolves.toEqual(BASE_ENVIRONMENT);
+  });
+
+  it("refuses a different server answering at the attached address without retrying", async () => {
+    installAttachedDesktop({ environmentId: "environment-expected" });
+    const testApi = await installDescriptorApi();
+
+    await expect(resolveInitialPrimaryEnvironmentDescriptor()).rejects.toThrow(
+      "A different T3 Code server is answering at the attached address",
+    );
+    expect(testApi.calls.descriptor).toBe(1);
+  });
+
+  it("fails closed when an attached bootstrap has no identity", () => {
+    installAttachedDesktop({});
+
+    expect(() => readPrimaryEnvironmentTarget()).toThrow(
+      "The attached T3 Code server is missing its identity",
+    );
+  });
 });

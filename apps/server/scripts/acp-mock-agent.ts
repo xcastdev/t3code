@@ -104,6 +104,8 @@ const initialGrokReasoningEffort =
   process.env.T3_ACP_INITIAL_GROK_REASONING_EFFORT?.trim() || undefined;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const supportsSessionLifecycle = process.env.T3_ACP_SESSION_LIFECYCLE === "1";
+const supportsStdioMcp = process.env.T3_ACP_MCP_STDIO === "1";
+const failCreateSession = process.env.T3_ACP_FAIL_CREATE_SESSION === "1";
 const supportsAcpMcp = process.env.T3_ACP_MCP_ACP === "1";
 const supportsV2Management = process.env.T3_ACP_V2_MANAGEMENT === "1";
 const omitSessionListHandler = process.env.T3_ACP_OMIT_SESSION_LIST_HANDLER === "1";
@@ -514,7 +516,14 @@ const program = Effect.gen(function* () {
           session: {
             ...(supportsSessionLifecycle ? { fork: {}, additionalDirectories: {} } : {}),
             ...(supportsV2Management ? { delete: {} } : {}),
-            ...(supportsAcpMcp ? { mcp: { acp: {} } } : {}),
+            ...(supportsAcpMcp || supportsStdioMcp
+              ? {
+                  mcp: {
+                    ...(supportsAcpMcp ? { acp: {} } : {}),
+                    ...(supportsStdioMcp ? { stdio: {} } : {}),
+                  },
+                }
+              : {}),
           },
           ...(supportsV2Management ? { providers: {} } : {}),
         },
@@ -575,6 +584,11 @@ const program = Effect.gen(function* () {
   yield* agent.handleCreateSession(() =>
     Effect.gen(function* () {
       yield* requireAuthentication();
+      if (failCreateSession) {
+        return yield* AcpError.AcpRequestError.internalError(
+          "Mock session/new MCP install failure",
+        );
+      }
       if (antigravityProfile) {
         yield* publishAntigravityCommands(sessionId);
       }

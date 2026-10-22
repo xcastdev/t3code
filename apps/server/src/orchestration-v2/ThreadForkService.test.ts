@@ -242,3 +242,35 @@ it.effect("rejects in-progress and rolled-back fork sources", () =>
     }
   }),
 );
+
+it.effect(
+  "archive forks retain rolled-back source identity and never request native continuation",
+  () =>
+    Effect.gen(function* () {
+      const sourceRun = makeSourceRun("rolled_back");
+      const service = yield* ThreadForkService.ThreadForkServiceV2;
+      const result = yield* service.plan({
+        archiveSource: { archiveId: "immutable-source" },
+        sourceProjection: makeSourceProjection(sourceRun),
+        sourceRun,
+        sourceProviderThread: undefined,
+        canonicalSourcePoint: { threadId: sourceThreadId, runId: sourceRunId },
+        transferId: ContextTransferId.make("archive-transfer"),
+        targetThreadId,
+        createdBy: "user",
+        creationSource: "web",
+        createdAt: forkCreatedAt,
+      });
+      assert.equal(sourceRun.status, "rolled_back");
+      assert.equal(result.targetThread.lineage.parentThreadId, sourceThreadId);
+      assert.deepEqual(result.targetThread.forkedFrom, {
+        type: "run",
+        threadId: sourceThreadId,
+        runId: sourceRunId,
+      });
+      assert.equal(result.transfer.status, "superseded");
+      assert.isNull(result.transfer.resolution);
+      assert.isUndefined(result.transfer.sourceTokenUsage);
+      assert.include(result.transfer.error ?? "", "native provider history is not restored");
+    }).pipe(Effect.provide(ThreadForkService.layer)),
+);

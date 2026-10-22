@@ -9,7 +9,7 @@ import {
   serializeAssistantCitation,
   withAssistantCitationComment,
 } from "@t3tools/shared/assistantCitations";
-import { isPathWord } from "@t3tools/shared/composerTrigger";
+import { COMPOSER_ISSUE_TOKEN, isPathWord } from "@t3tools/shared/composerTrigger";
 import {
   splitPromptIntoComposerSegments,
   type ComposerPromptSegment,
@@ -17,7 +17,7 @@ import {
 
 import { resolveShortcutCommand, type ShortcutEventLike } from "./keybindings";
 
-export type ComposerTriggerKind = "path" | "pull-request" | "slash-command" | "skill";
+export type ComposerTriggerKind = "path" | "pull-request" | "issue" | "slash-command" | "skill";
 export type ComposerSlashCommand = "model" | "plan" | "default";
 export type ComposerSubmissionIntent = "foreground" | "background" | "alternate";
 
@@ -287,6 +287,15 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
     return {
       kind: "slash-command",
       query: token.slice(1),
+      rangeStart: tokenStart,
+      rangeEnd: cursor,
+    };
+  }
+  const issueMatch = COMPOSER_ISSUE_TOKEN.exec(token);
+  if (issueMatch) {
+    return {
+      kind: "issue",
+      query: issueMatch[1] ?? "",
       rangeStart: tokenStart,
       rangeEnd: cursor,
     };

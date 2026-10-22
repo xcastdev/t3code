@@ -880,7 +880,336 @@ export const make = Effect.gen(function* () {
     return { title: subject.title, body: subject.body ?? null };
   });
 
+  const nativeRest = Effect.fn("GitHubSourceControlProvider.nativeRest")(function* (
+    input: GitHubRest.GitHubRestInput,
+  ) {
+    const response = yield* api.rest(input);
+    if (response.truncated || response.invalidUtf8)
+      return yield* failure("GitHub returned an incomplete publication response.");
+    return response;
+  });
+  const NativeRepository = Schema.Struct({ node_id: Schema.String, full_name: Schema.String });
+  const NativePull = Schema.Struct({
+    node_id: Schema.String,
+    number: Schema.Number,
+    html_url: Schema.String,
+    state: Schema.String,
+    body: Schema.NullOr(Schema.String),
+    merged_at: Schema.NullOr(Schema.String),
+    merge_commit_sha: Schema.NullOr(Schema.String),
+    base: Schema.Struct({ ref: Schema.String, sha: Schema.String, repo: NativeRepository }),
+    head: Schema.Struct({
+      ref: Schema.String,
+      sha: Schema.String,
+      repo: Schema.NullOr(NativeRepository),
+    }),
+  });
+  const nativeDecode =
+    <A>(schema: Schema.Codec<A, unknown>) =>
+    (body: string) =>
+      Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(body);
+  const nativeError = (operation: string, cwd: string) => (cause: unknown) =>
+    new SourceControlProviderError({
+      provider: SourceControlProviderKind.make("github"),
+      operation,
+      cwd,
+      detail: "Guarded publication failed.",
+      cause,
+    });
+  const withNativeAccount = Effect.fn("GitHubSourceControlProvider.withNativeAccount")(function* <
+    A,
+    E,
+    R,
+  >(
+    host: string,
+    account: SourceControlProvider.GuardedPublicationTarget["account"] | undefined,
+    effect: Effect.Effect<A, E, R>,
+  ) {
+    const credential = yield* api.credential(host);
+    if (account && account.credentialFingerprint !== credential.fingerprint)
+      return yield* failure("Publication credential changed.");
+    return yield* Effect.gen(function* () {
+      const response = yield* nativeRest({ host, operation: "publicationIdentity", path: "user" });
+      const identity = yield* nativeDecode(
+        Schema.Struct({ id: Schema.Number, login: Schema.String }),
+      )(response.body);
+      if (
+        account &&
+        (account.accountId !== String(identity.id) || account.viewer !== identity.login)
+      )
+        return yield* failure("Publication account changed.");
+      return {
+        value: yield* effect,
+        account: {
+          credentialFingerprint: credential.fingerprint,
+          accountId: String(identity.id),
+          viewer: identity.login,
+        },
+      };
+    }).pipe(
+      Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, {
+        host,
+        token: credential.token,
+        credentialFingerprint: credential.fingerprint,
+      }),
+    );
+  });
+  const nativePath = (target: SourceControlProvider.GuardedPublicationTarget) =>
+    `repos/${target.repository.nameWithOwner.split("/").map(encodeURIComponent).join("/")}`;
+  const nativeRecord = (
+    pull: typeof NativePull.Type,
+    target: SourceControlProvider.GuardedPublicationTarget,
+    marker: string,
+  ): SourceControlProvider.GuardedPublicationRecord => {
+    if (!pull.head.repo || !pull.body?.includes(`<!-- t3-publication:${marker} -->`))
+      throw new Error("Publication identity is incomplete.");
+    return {
+      nodeId: pull.node_id,
+      number: pull.number,
+      url: pull.html_url,
+      state: pull.merged_at ? "MERGED" : pull.state === "open" ? "OPEN" : "CLOSED",
+      marker,
+      target: {
+        ...target,
+        repository: { nodeId: pull.base.repo.node_id, nameWithOwner: pull.base.repo.full_name },
+        baseRef: pull.base.ref,
+        baseSha: pull.base.sha,
+        headRef: pull.head.ref,
+        headSha: pull.head.sha,
+        headRepositoryNodeId: pull.head.repo.node_id,
+      },
+      mergedAt: pull.merged_at,
+      mergedCommitSha: pull.merge_commit_sha,
+    };
+  };
+  const nativeRepositoryCurrent = Effect.fn("GitHubSourceControlProvider.nativeRepositoryCurrent")(
+    function* (
+      target: SourceControlProvider.GuardedPublicationTarget,
+      method?: "merge" | "squash" | "rebase",
+    ) {
+      const repository = yield* nativeDecode(
+        Schema.Struct({
+          node_id: Schema.String,
+          full_name: Schema.String,
+          permissions: Schema.optionalKey(
+            Schema.Struct({
+              push: Schema.optionalKey(Schema.Boolean),
+              maintain: Schema.optionalKey(Schema.Boolean),
+              admin: Schema.optionalKey(Schema.Boolean),
+            }),
+          ),
+          allow_merge_commit: Schema.optionalKey(Schema.Boolean),
+          allow_squash_merge: Schema.optionalKey(Schema.Boolean),
+          allow_rebase_merge: Schema.optionalKey(Schema.Boolean),
+        }),
+      )(
+        (yield* nativeRest({
+          host: target.host,
+          operation: "publicationRepositoryCurrent",
+          path: nativePath(target),
+        })).body,
+      );
+      if (
+        repository.node_id !== target.repository.nodeId ||
+        repository.full_name !== target.repository.nameWithOwner
+      )
+        return yield* failure("Publication repository identity changed.");
+      if (
+        method &&
+        (!repository.permissions ||
+          !(
+            repository.permissions.push ||
+            repository.permissions.maintain ||
+            repository.permissions.admin
+          ) ||
+          !(method === "merge"
+            ? repository.allow_merge_commit
+            : method === "squash"
+              ? repository.allow_squash_merge
+              : repository.allow_rebase_merge))
+      )
+        return yield* failure("Publication merge permission changed.");
+    },
+  );
+  const guardedPublication: SourceControlProvider.GuardedPublicationApi = {
+    capture: Effect.fn("GitHubSourceControlProvider.capturePublication")(
+      function* (input) {
+        const locator = yield* resolveRepository(input);
+        const host = locator.host;
+        const path = `repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.name)}`;
+        const captured = yield* withNativeAccount(
+          host,
+          undefined,
+          Effect.gen(function* () {
+            const repository = yield* nativeDecode(NativeRepository)(
+              (yield* nativeRest({ host, operation: "publicationRepository", path })).body,
+            );
+            const branch = Schema.Struct({ commit: Schema.Struct({ sha: Schema.String }) });
+            const base = yield* nativeDecode(branch)(
+              (yield* nativeRest({
+                host,
+                operation: "publicationBase",
+                path: `${path}/branches/${encodeURIComponent(input.baseRef)}`,
+              })).body,
+            );
+            const head = yield* nativeDecode(branch)(
+              (yield* nativeRest({
+                host,
+                operation: "publicationHead",
+                path: `${path}/branches/${encodeURIComponent(input.headRef)}`,
+              })).body,
+            );
+            return {
+              host,
+              repository: { nodeId: repository.node_id, nameWithOwner: repository.full_name },
+              baseRef: input.baseRef,
+              baseSha: base.commit.sha,
+              headRef: input.headRef,
+              headSha: head.commit.sha,
+              headRepositoryNodeId: repository.node_id,
+              headSelector: input.headRef,
+            };
+          }),
+        );
+        return { ...captured.value, account: captured.account };
+      },
+      (effect, input) => effect.pipe(Effect.mapError(nativeError("capturePublication", input.cwd))),
+    ),
+    read: Effect.fn("GitHubSourceControlProvider.readPublication")(
+      function* (input) {
+        const read = yield* withNativeAccount(
+          input.target.host,
+          input.target.account,
+          Effect.gen(function* () {
+            const path = nativePath(input.target);
+            const rows =
+              input.number === undefined
+                ? yield* nativeDecode(Schema.Array(NativePull))(
+                    (yield* nativeRest({
+                      host: input.target.host,
+                      operation: "reconcilePublication",
+                      path: `${path}/pulls?state=all&head=${encodeURIComponent(`${input.target.repository.nameWithOwner.split("/")[0]}:${input.target.headRef}`)}&per_page=100`,
+                    })).body,
+                  )
+                : [
+                    yield* nativeDecode(NativePull)(
+                      (yield* nativeRest({
+                        host: input.target.host,
+                        operation: "reconcilePublication",
+                        path: `${path}/pulls/${input.number}`,
+                      })).body,
+                    ),
+                  ];
+            // A full page cannot prove uniqueness without following pagination.
+            if (rows.length >= 100)
+              return yield* failure("Publication lookup exceeds its bounded page.");
+            const matches = rows.filter((pull) =>
+              pull.body?.includes(`<!-- t3-publication:${input.marker} -->`),
+            );
+            return yield* Effect.forEach(matches, (pull) =>
+              Effect.try({
+                try: () => nativeRecord(pull, input.target, input.marker),
+                catch: nativeError("decodePublication", input.cwd),
+              }),
+            );
+          }),
+        );
+        return read.value;
+      },
+      (effect, input) => effect.pipe(Effect.mapError(nativeError("readPublication", input.cwd))),
+    ),
+    create: Effect.fn("GitHubSourceControlProvider.createPublication")(
+      function* (input) {
+        const created = yield* withNativeAccount(
+          input.target.host,
+          input.target.account,
+          Effect.gen(function* () {
+            yield* nativeRepositoryCurrent(input.target);
+            if (input.beforeWrite) yield* input.beforeWrite;
+            const response = yield* nativeRest({
+              host: input.target.host,
+              operation: "createPublication",
+              method: "POST",
+              path: `${nativePath(input.target)}/pulls`,
+              body: {
+                title: input.title,
+                body: `${input.body}\n\n<!-- t3-publication:${input.marker} -->`,
+                head: input.target.headSelector,
+                base: input.target.baseRef,
+              },
+            });
+            const pull = yield* nativeDecode(NativePull)(response.body);
+            return yield* Effect.try({
+              try: () => nativeRecord(pull, input.target, input.marker),
+              catch: nativeError("decodePublication", input.cwd),
+            });
+          }),
+        );
+        return created.value;
+      },
+      (effect, input) => effect.pipe(Effect.mapError(nativeError("createPublication", input.cwd))),
+    ),
+    merge: Effect.fn("GitHubSourceControlProvider.mergePublication")(
+      function* (input) {
+        const merged = yield* withNativeAccount(
+          input.target.host,
+          input.target.account,
+          Effect.gen(function* () {
+            yield* nativeRepositoryCurrent(input.target, input.method);
+            const prior = yield* nativeDecode(NativePull)(
+              (yield* nativeRest({
+                host: input.target.host,
+                operation: "publicationMergeTarget",
+                path: `${nativePath(input.target)}/pulls/${input.number}`,
+              })).body,
+            );
+            if (
+              prior.base.repo.node_id !== input.target.repository.nodeId ||
+              prior.head.repo?.node_id !== input.target.headRepositoryNodeId ||
+              prior.base.ref !== input.target.baseRef ||
+              prior.base.sha !== input.target.baseSha ||
+              prior.head.sha !== input.target.headSha ||
+              prior.head.ref !== input.target.headRef ||
+              !prior.body?.includes(`<!-- t3-publication:${input.marker} -->`) ||
+              prior.merged_at !== null ||
+              prior.state !== "open"
+            )
+              return yield* failure("Publication merge target changed.");
+            if (input.beforeWrite) yield* input.beforeWrite;
+            // GitHub rejects this write if the PR head no longer equals the approved SHA.
+            const response = yield* nativeRest({
+              host: input.target.host,
+              operation: "mergePublication",
+              method: "PUT",
+              path: `${nativePath(input.target)}/pulls/${input.number}/merge`,
+              body: { sha: input.target.headSha, merge_method: input.method },
+            });
+            const result = yield* nativeDecode(
+              Schema.Struct({ merged: Schema.Boolean, sha: Schema.String }),
+            )(response.body);
+            if (!result.merged) return yield* failure("GitHub did not confirm the merge.");
+            const pull = yield* nativeDecode(NativePull)(
+              (yield* nativeRest({
+                host: input.target.host,
+                operation: "confirmMerge",
+                path: `${nativePath(input.target)}/pulls/${input.number}`,
+              })).body,
+            );
+            if (pull.merge_commit_sha !== result.sha || pull.merged_at === null)
+              return yield* failure("GitHub merge receipt changed.");
+            return yield* Effect.try({
+              try: () => nativeRecord(pull, input.target, input.marker),
+              catch: nativeError("decodePublication", input.cwd),
+            });
+          }),
+        );
+        return merged.value;
+      },
+      (effect, input) => effect.pipe(Effect.mapError(nativeError("mergePublication", input.cwd))),
+    ),
+  };
   return SourceControlProvider.SourceControlProvider.of({
+    guardedPublication,
     kind: SourceControlProviderKind.make("github"),
     // `gh pr list --head` filters on the head ref name alone and accepts anything, so an
     // `owner:branch` or `remote:branch` selector silently lists zero pull requests while

@@ -8,6 +8,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  EnvironmentId,
   CommandId,
   EventId,
   ProviderInstanceId,
@@ -27,6 +28,7 @@ import { Command } from "effect/cli";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import { cli } from "../binCli.ts";
 import * as ServerConfig from "../config.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -40,7 +42,18 @@ import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 
-const layerCliRuntime = Layer.mergeAll(NodeServices.layer, NetService.layer);
+const layerTestEnvironment = Layer.succeed(ServerEnvironment.ServerEnvironment, {
+  getEnvironmentId: Effect.succeed(EnvironmentId.make("env")),
+  getDescriptor: Effect.succeed({
+    environmentId: EnvironmentId.make("env"),
+    label: "Runtime test environment",
+    platform: { os: "linux" as const, arch: "x64" as const },
+    serverVersion: "0.0.0",
+    capabilities: { repositoryIdentity: false },
+  }),
+});
+
+const layerCliRuntime = Layer.mergeAll(NodeServices.layer, NetService.layer, layerTestEnvironment);
 const runCli = (args: ReadonlyArray<string>) =>
   Command.runWith(cli, { version: "0.0.0" })(args).pipe(Effect.provide(layerCliRuntime));
 
@@ -91,7 +104,7 @@ const readProjects = (baseDir: string) =>
       Layer.provideMerge(WorkspacePaths.layer),
       Layer.provideMerge(ServerSettings.layer.pipe(Layer.provide(ServerSecretStore.layer))),
       Layer.provideMerge(SqlitePersistence.layerConfig),
-      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Layer.merge(NodeServices.layer, layerTestEnvironment)),
       Layer.provide(ServerConfig.layer(config)),
       Layer.provide(Layer.succeed(References.MinimumLogLevel, config.logLevel)),
     );
@@ -142,7 +155,7 @@ const makeThreadPersistenceLayer = Effect.fn("ProjectCliTest.makeThreadPersisten
       EventStore.layer,
     ).pipe(
       Layer.provideMerge(SqlitePersistence.layerConfig),
-      Layer.provideMerge(NodeServices.layer),
+      Layer.provideMerge(Layer.merge(NodeServices.layer, layerTestEnvironment)),
       Layer.provide(ServerConfig.layer(config)),
       Layer.provide(Layer.succeed(References.MinimumLogLevel, config.logLevel)),
     );

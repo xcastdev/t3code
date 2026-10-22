@@ -18,6 +18,7 @@ import {
   CheckpointId,
   EnvironmentId,
   type ModelSelection,
+  type OrchestrationV2InstructionSnapshot,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -140,6 +141,7 @@ function makeMockRuntime(input: {
     | ((runtimeOrdinal: number) => Readonly<Record<string, string>>);
   readonly protocolEvents?: Queue.Queue<EffectAcpProtocol.AcpProtocolLogEvent>;
   readonly cancelBehavior?: AcpSessionRuntime.AcpSessionRuntimeOptions["cancelBehavior"];
+  readonly sessionLoadReplayIdleGap?: Duration.Input;
   readonly ownDescendantProcessGroups?: boolean;
   readonly ownDetachedProcessGroup?: boolean;
   readonly processGroupPlatform?: NodeJS.Platform;
@@ -177,6 +179,9 @@ function makeMockRuntime(input: {
       const context = yield* Layer.build(
         AcpSessionRuntime.layer({
           ...runtimeInput,
+          ...(input.sessionLoadReplayIdleGap === undefined
+            ? {}
+            : { sessionLoadReplayIdleGap: input.sessionLoadReplayIdleGap }),
           ...(input.cancelBehavior === undefined ? {} : { cancelBehavior: input.cancelBehavior }),
           ...(input.ownDetachedProcessGroup === undefined
             ? {}
@@ -303,6 +308,14 @@ const pollProtocolMethods = (events: Queue.Queue<EffectAcpProtocol.AcpProtocolLo
 
 const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
   environment: Readonly<Record<string, string>>,
+  harnessOptions: {
+    readonly withMcp?: boolean;
+    readonly catalogEndpoint?: string;
+    readonly initialNativeThreadId?: string;
+    readonly sessionLoadReplayIdleGap?: Duration.Input;
+    readonly afterSessionStarted?: Effect.Effect<void>;
+    readonly beforePromptAcknowledged?: Effect.Effect<void>;
+  } = {},
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
@@ -313,15 +326,25 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
   const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
   const instanceId = ProviderInstanceId.make("acp-test-instruction-compaction");
   const threadId = ThreadId.make("thread-acp-instruction-compaction");
-  yield* (yield* McpProviderSessions.McpProviderSessions).set({
-    environmentId: EnvironmentId.make("environment-acp-instruction-compaction"),
-    threadId,
-    providerSessionId: "mcp-session-acp-instruction-compaction",
-    providerInstanceId: instanceId,
-    endpoint: "http://127.0.0.1:43123/mcp",
-    authorizationHeader: "Bearer instruction-compaction-token",
-    browserToolsAvailable: true,
-  });
+  if (harnessOptions.withMcp !== false)
+    yield* (yield* McpProviderSessions.McpProviderSessions).set({
+      environmentId: EnvironmentId.make("environment-acp-instruction-compaction"),
+      threadId,
+      providerSessionId: "mcp-session-acp-instruction-compaction",
+      providerInstanceId: instanceId,
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer instruction-compaction-token",
+      browserToolsAvailable: true,
+      ...(harnessOptions.catalogEndpoint === undefined
+        ? {}
+        : {
+            catalogEndpoint: harnessOptions.catalogEndpoint,
+            catalogRevision: 7,
+            nativeRuntimeId: "native-acp-catalog-runtime",
+          }),
+    });
+  let runtimeStarts = 0;
+  let nativeStartup: AcpSessionRuntime.AcpSessionRuntimeStartResult | undefined;
   const adapter = yield* makeAcpAdapterV2({
     instanceId,
     flavor: {
@@ -333,12 +356,30 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
         mockAgentPath,
         protocolEvents,
         environment,
-        wrapRuntime: (runtime) => ({
-          ...runtime,
-          // Make compaction during prompt completion deterministic at the adapter boundary.
-          prompt: (payload, options) =>
-            runtime.prompt(payload, options).pipe(Effect.tap(() => runtime.drainEvents)),
-        }),
+        ...(harnessOptions.sessionLoadReplayIdleGap === undefined
+          ? {}
+          : { sessionLoadReplayIdleGap: harnessOptions.sessionLoadReplayIdleGap }),
+        wrapRuntime: (runtime) => {
+          runtimeStarts += 1;
+          return {
+            ...runtime,
+            start: () =>
+              runtime.start().pipe(
+                Effect.tap((started) =>
+                  Effect.sync(() => {
+                    nativeStartup = started;
+                  }),
+                ),
+                Effect.tap(() => harnessOptions.afterSessionStarted ?? Effect.void),
+              ),
+            // Make compaction during prompt completion deterministic at the adapter boundary.
+            prompt: (payload, options) =>
+              runtime.prompt(payload, options).pipe(
+                Effect.tap(() => runtime.drainEvents),
+                Effect.tap(() => harnessOptions.beforePromptAcknowledged ?? Effect.void),
+              ),
+          };
+        },
       }),
     },
     selfInvocation,
@@ -352,24 +393,40 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
   const runtime = yield* adapter.openSession({
     threadId,
     providerSessionId: ProviderSessionId.make("provider-session-acp-instruction-compaction"),
+    ...(harnessOptions.initialNativeThreadId === undefined
+      ? {}
+      : { initialNativeThreadId: harnessOptions.initialNativeThreadId }),
     modelSelection,
     runtimePolicy,
   });
   const providerThread = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
   const now = yield* DateTime.now;
   let ordinal = 0;
-  return Effect.fnUntraced(function* (messageText: string, expectedStatus = "completed") {
-    yield* runtime.startTurn(
-      makeTurnInput({
-        threadId,
-        providerThread,
-        instanceId,
-        runtimePolicy,
-        now,
-        ordinal: ++ordinal,
-        messageText,
-      }),
-    );
+  const receipts: OrchestrationV2InstructionSnapshot[] = [];
+  const runTurn = Effect.fnUntraced(function* (
+    messageText: string,
+    expectedStatus = "completed",
+    instructionSnapshot?: OrchestrationV2InstructionSnapshot,
+    attachments: ProviderAdapter.ProviderAdapterV2TurnInput["message"]["attachments"] = [],
+  ) {
+    const turnInput = makeTurnInput({
+      threadId,
+      providerThread,
+      instanceId,
+      runtimePolicy,
+      now,
+      ordinal: ++ordinal,
+      messageText,
+    });
+    yield* runtime.startTurn({
+      ...turnInput,
+      message: { ...turnInput.message, attachments },
+      ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
+      onInstructionsApplied: (snapshot) =>
+        Effect.sync(() => {
+          receipts.push(snapshot);
+        }),
+    });
     const terminal = yield* runtime.events.pipe(
       Stream.filter((event) => event.type === "turn.terminal"),
       Stream.runHead,
@@ -381,6 +438,17 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
         return rawProtocolPromptTextBlocks(event);
       }
     }
+  });
+  return Object.assign(runTurn, {
+    receipts,
+    protocolEvents,
+    threadId,
+    runtime,
+    providerThread,
+    capabilities: runtime.providerSession.capabilities,
+    runtimeStarts: () => runtimeStarts,
+    nativeStartup: () => nativeStartup,
+    applied: () => runtime.getAppliedInstructions!({ providerThread }),
   });
 });
 
@@ -395,7 +463,245 @@ function assertReinjectedInstructions(
   assert.include(text, `<user_request>\n${request}\n</user_request>`);
 }
 
+const decodeCatalogNativeServers = Schema.decodeUnknownEffect(
+  Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      env: Schema.optional(
+        Schema.Array(Schema.Struct({ name: Schema.String, value: Schema.String })),
+      ),
+    }),
+  ),
+);
+
+const decodeCatalogNativeServerNames = Schema.decodeUnknownEffect(
+  Schema.Array(Schema.Struct({ name: Schema.String })),
+);
+
+const decodeForkCatalogNativeServers = Schema.decodeUnknownEffect(
+  Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      env: Schema.Array(Schema.Struct({ name: Schema.String, value: Schema.String })),
+    }),
+  ),
+);
+
 describe("AcpAdapterV2", () => {
+  it.live.each([false, true])(
+    "installs the catalog beside built-in MCP with native ACP MCP %s",
+    (nativeAcpMcp) =>
+      Effect.gen(function* () {
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const runTurn = yield* makeInstructionCompactionHarness(
+          { T3_ACP_MCP_STDIO: "1", ...(nativeAcpMcp ? { T3_ACP_MCP_ACP: "1" } : {}) },
+          { catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/acp" },
+        );
+        const request = Option.getOrThrow(
+          yield* Stream.fromQueue(runTurn.protocolEvents).pipe(
+            Stream.filter(
+              (event) =>
+                event.direction === "outgoing" && rawProtocolMethod(event) === "session/new",
+            ),
+            Stream.runHead,
+          ),
+        );
+        const servers = yield* decodeCatalogNativeServers(
+          rawProtocolRequestParam(request, "mcpServers"),
+        );
+        assert.lengthOf(servers, 2);
+        assert.deepEqual(
+          servers.map((server) => server.name),
+          ["t3-code", "t3_catalog"],
+        );
+        const catalog = servers[1];
+        assert.deepEqual(catalog?.env, [
+          { name: "ELECTRON_RUN_AS_NODE", value: "1" },
+          { name: "T3_ACP_MCP_ENDPOINT", value: "http://127.0.0.1:43123/mcp/catalog/acp" },
+          { name: "T3_ACP_MCP_AUTHORIZATION", value: "Bearer instruction-compaction-token" },
+        ]);
+        const config = yield* mcpSessions.read(runTurn.threadId);
+        assert.strictEqual(yield* mcpSessions.readCatalogEndpointReceipt(runTurn.threadId), config);
+        assert.isTrue(runTurn.capabilities.tools.supportsMcpTools);
+        yield* runTurn("Report what you can do.");
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live.each([false, true])(
+    "omits unsupported catalog stdio without breaking ACP chat with native ACP MCP %s",
+    (nativeAcpMcp) =>
+      Effect.gen(function* () {
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const runTurn = yield* makeInstructionCompactionHarness(
+          nativeAcpMcp ? { T3_ACP_MCP_ACP: "1" } : {},
+          { catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/acp" },
+        );
+        const request = Option.getOrThrow(
+          yield* Stream.fromQueue(runTurn.protocolEvents).pipe(
+            Stream.filter(
+              (event) =>
+                event.direction === "outgoing" && rawProtocolMethod(event) === "session/new",
+            ),
+            Stream.runHead,
+          ),
+        );
+        const servers = yield* decodeCatalogNativeServerNames(
+          rawProtocolRequestParam(request, "mcpServers"),
+        );
+        assert.deepEqual(
+          servers.map((server) => server.name),
+          ["t3-code"],
+        );
+        assert.equal(yield* mcpSessions.readCatalogEndpointReceipt(runTurn.threadId), undefined);
+        yield* runTurn("Report what you can do.");
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live.each([false, true])(
+    "acknowledges the captured ACP fork and load catalog configs with load failure %s",
+    (failLoad) =>
+      Effect.gen(function* () {
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const runTurn = yield* makeInstructionCompactionHarness(
+          {
+            T3_ACP_MCP_STDIO: "1",
+            ...(failLoad ? { T3_ACP_FAIL_LOAD_SESSION: "1" } : {}),
+          },
+          { catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/source" },
+        );
+        const sourceConfig = (yield* mcpSessions.read(runTurn.threadId))!;
+        const targetConfig = {
+          ...sourceConfig,
+          threadId: ThreadId.make("thread-acp-catalog-fork"),
+          providerSessionId: "mcp-acp-catalog-fork",
+          catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/target",
+          authorizationHeader: "Bearer catalog-fork-token",
+        };
+        yield* mcpSessions.set(targetConfig);
+        yield* runTurn.runtime.forkThread({
+          sourceProviderThread: runTurn.providerThread,
+          targetThreadId: targetConfig.threadId,
+        });
+        assert.strictEqual(
+          yield* mcpSessions.readCatalogEndpointReceipt(targetConfig.threadId),
+          targetConfig,
+        );
+        const request = Option.getOrThrow(
+          yield* Stream.fromQueue(runTurn.protocolEvents).pipe(
+            Stream.filter(
+              (event) =>
+                event.direction === "outgoing" && rawProtocolMethod(event) === "session/fork",
+            ),
+            Stream.runHead,
+          ),
+        );
+        const servers = yield* decodeForkCatalogNativeServers(
+          rawProtocolRequestParam(request, "mcpServers"),
+        );
+        assert.deepEqual(
+          servers.map((server) => server.name),
+          ["t3-code", "t3_catalog"],
+        );
+        for (const server of servers) {
+          assert.deepInclude(server.env, {
+            name: "T3_ACP_MCP_AUTHORIZATION",
+            value: targetConfig.authorizationHeader,
+          });
+        }
+        assert.deepInclude(servers[1]!.env, {
+          name: "T3_ACP_MCP_ENDPOINT",
+          value: targetConfig.catalogEndpoint,
+        });
+        const replacementConfig = { ...sourceConfig, nativeRuntimeId: "rebound-source-runtime" };
+        yield* mcpSessions.set(replacementConfig);
+        const loaded = yield* runTurn.runtime
+          .readThreadSnapshot({ providerThread: runTurn.providerThread })
+          .pipe(Effect.exit);
+        assert.equal(Exit.isFailure(loaded), failLoad);
+        assert.strictEqual(
+          yield* mcpSessions.readCatalogEndpointReceipt(runTurn.threadId),
+          failLoad ? undefined : replacementConfig,
+        );
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live("keeps replay-idle ACP load chat usable without acknowledging catalog installation", () =>
+    Effect.gen(function* () {
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      const runTurn = yield* makeInstructionCompactionHarness(
+        {
+          T3_ACP_MCP_STDIO: "1",
+          T3_ACP_HANG_LOAD_SESSION_AFTER_REPLAY: "1",
+          T3_ACP_LOAD_SESSION_DELAY_MS: "60000",
+        },
+        {
+          catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/acp",
+          initialNativeThreadId: "existing-catalog-session",
+          sessionLoadReplayIdleGap: "1 millis",
+        },
+      );
+      assert.equal(
+        runTurn.nativeStartup()?.sessionSetupResult._meta?.t3SessionLoadReady,
+        "replay_idle",
+      );
+      assert.equal(yield* mcpSessions.readCatalogEndpointReceipt(runTurn.threadId), undefined);
+      yield* runTurn("Continue after replay.");
+      assert.equal(yield* mcpSessions.readCatalogEndpointReceipt(runTurn.threadId), undefined);
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live("does not acknowledge a catalog config replaced during native ACP startup", () =>
+    Effect.gen(function* () {
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      const threadId = ThreadId.make("thread-acp-instruction-compaction");
+      const runTurn = yield* makeInstructionCompactionHarness(
+        { T3_ACP_MCP_STDIO: "1" },
+        {
+          catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/acp",
+          afterSessionStarted: Effect.gen(function* () {
+            assert.equal(yield* mcpSessions.readCatalogEndpointReceipt(threadId), undefined);
+            const config = (yield* mcpSessions.read(threadId))!;
+            yield* mcpSessions.set({ ...config, nativeRuntimeId: "replacement-native-runtime" });
+          }),
+        },
+      );
+      assert.equal(yield* mcpSessions.readCatalogEndpointReceipt(threadId), undefined);
+      yield* runTurn("Continue ordinary chat.");
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live("does not acknowledge a catalog when the native ACP install fails", () =>
+    Effect.gen(function* () {
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      const threadId = ThreadId.make("thread-acp-instruction-compaction");
+      const started = yield* makeInstructionCompactionHarness(
+        { T3_ACP_MCP_STDIO: "1", T3_ACP_FAIL_CREATE_SESSION: "1" },
+        { catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/acp" },
+      ).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(started));
+      assert.equal(yield* mcpSessions.readCatalogEndpointReceipt(threadId), undefined);
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live("keeps ordinary ACP chat without catalog or authenticated MCP configuration", () =>
+    Effect.gen(function* () {
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      const runTurn = yield* makeInstructionCompactionHarness({}, { withMcp: false });
+      assert.equal(yield* mcpSessions.readCatalogEndpointReceipt(runTurn.threadId), undefined);
+      const request = Option.getOrThrow(
+        yield* Stream.fromQueue(runTurn.protocolEvents).pipe(
+          Stream.filter(
+            (event) => event.direction === "outgoing" && rawProtocolMethod(event) === "session/new",
+          ),
+          Stream.runHead,
+        ),
+      );
+      assert.deepEqual(rawProtocolRequestParam(request, "mcpServers"), []);
+      assert.isFalse(runTurn.capabilities.tools.supportsMcpTools);
+      yield* runTurn("Report a proposal.");
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   // Factory Droid 0.243.0 sends an optional text companion for every AskUser choice.
   const droidChoice = {
     type: "string",
@@ -860,6 +1166,151 @@ describe("AcpAdapterV2", () => {
         "Build should restore the native mode that T3 temporarily replaced for Plan",
       );
     }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live("holds the ACP instruction receipt until native acknowledgment", () =>
+    Effect.gen(function* () {
+      const promptReturned = yield* Deferred.make<void>();
+      const acknowledge = yield* Deferred.make<void>();
+      const runTurn = yield* makeInstructionCompactionHarness(
+        {},
+        {
+          beforePromptAcknowledged: Deferred.succeed(promptReturned, undefined).pipe(
+            Effect.andThen(Deferred.await(acknowledge)),
+          ),
+        },
+      );
+      const toolIds = ["selected-tool"];
+      const instructions = {
+        configurationHash: "config-ack",
+        resourceRevision: "resources-ack",
+        memoryEpoch: 0,
+        roleInstructions: "Review carefully.",
+        toolIds,
+        skillIds: [],
+      };
+      const turn = yield* runTurn("Inspect the diff.", "completed", instructions).pipe(
+        Effect.forkChild,
+      );
+      yield* Deferred.await(promptReturned);
+      assert.equal(yield* runTurn.applied(), undefined);
+      assert.deepEqual(runTurn.receipts, []);
+      const overlapping = yield* runTurn(
+        "Wait for the active turn.",
+        "completed",
+        instructions,
+      ).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(overlapping));
+      toolIds.push("not-injected");
+      yield* Deferred.succeed(acknowledge, undefined);
+      const blocks = yield* Fiber.join(turn);
+      assert.include(
+        blocks.map((block) => block.text),
+        "Review carefully.",
+      );
+      assert.deepEqual((yield* runTurn.applied())?.toolIds, ["selected-tool"]);
+      assert.deepEqual(runTurn.receipts[0]?.toolIds, ["selected-tool"]);
+      assert.notInclude(
+        blocks.map((block) => block.text).join("\n"),
+        "authenticated T3 tool bridge is unavailable",
+      );
+      assert.equal(runTurn.capabilities.tools.supportsMcpTools, true);
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live("clears the ACP instruction receipt before failed next-turn preparation", () =>
+    Effect.gen(function* () {
+      const runTurn = yield* makeInstructionCompactionHarness({});
+      const snapshot: OrchestrationV2InstructionSnapshot = {
+        configurationHash: "same-config",
+        resourceRevision: "same-resources",
+        memoryEpoch: 0,
+        roleInstructions: "Review carefully.",
+        toolIds: [],
+        skillIds: [],
+      };
+      yield* runTurn("Review the diff.", "completed", snapshot);
+      assert.deepEqual(yield* runTurn.applied(), snapshot);
+      const failed = yield* runTurn("Check the image.", "completed", snapshot, [
+        {
+          type: "image",
+          id: "unsupported-image",
+          name: "image.png",
+          mimeType: "image/png",
+          sizeBytes: 1,
+        },
+      ]).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(failed));
+      assert.equal(yield* runTurn.applied(), undefined);
+      assert.deepEqual(runTurn.receipts, [snapshot]);
+      yield* runTurn("Continue without the image.", "completed", snapshot);
+      assert.deepEqual(yield* runTurn.applied(), snapshot);
+      assert.deepEqual(runTurn.receipts, [snapshot, snapshot]);
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.live(
+    "delivers each managed ACP revision and acknowledges only successful native prompts",
+    () =>
+      Effect.gen(function* () {
+        const runTurn = yield* makeInstructionCompactionHarness(
+          { T3_ACP_FAIL_PROMPT_ORDINAL: "3" },
+          { withMcp: false },
+        );
+        const first: OrchestrationV2InstructionSnapshot = {
+          configurationHash: "config-1",
+          resourceRevision: "resources-1",
+          memoryEpoch: 0,
+          roleInstructions: "Review the changes and report concrete evidence.",
+          toolIds: [],
+          skillIds: [],
+        };
+        const second = {
+          ...first,
+          configurationHash: "config-2",
+          resourceRevision: "resources-2",
+          roleInstructions: "Implement the approved fix and report evidence.",
+        };
+        assert.equal(yield* runTurn.applied(), undefined);
+        assert.equal(runTurn.capabilities.tools.supportsMcpTools, false);
+        assert.deepEqual(runTurn.capabilities.instructionDelivery, {
+          mode: "turn",
+          supportsSessionReplacement: true,
+        });
+        assert.equal(runTurn.capabilities.context.acceptsSystemContext, false);
+        const firstBlocks = yield* runTurn("Inspect the diff.", "completed", first);
+        assert.include(
+          firstBlocks.map((block) => block.text),
+          first.roleInstructions,
+        );
+        assert.include(
+          firstBlocks.map((block) => block.text).join("\n"),
+          "proposals requiring human confirmation",
+        );
+        assert.deepEqual(yield* runTurn.applied(), first);
+        const secondBlocks = yield* runTurn("Apply the fix.", "completed", second);
+        assert.include(
+          secondBlocks.map((block) => block.text),
+          second.roleInstructions,
+        );
+        assert.notInclude(
+          secondBlocks.map((block) => block.text),
+          first.roleInstructions,
+        );
+        assert.deepEqual(yield* runTurn.applied(), second);
+        assert.equal(runTurn.runtimeStarts(), 1);
+        yield* runTurn("Try this failed prompt.", "failed", first);
+        assert.equal(yield* runTurn.applied(), undefined);
+        assert.deepEqual(yield* runTurn("  /repro-skill", "completed", second), [
+          { type: "text", text: "  /repro-skill" },
+        ]);
+        assert.equal(yield* runTurn.applied(), undefined);
+        yield* runTurn("Resume ordinary chat.");
+        assert.equal(yield* runTurn.applied(), undefined);
+        assert.deepEqual(runTurn.receipts, [first, second]);
+        assert.isTrue(Object.isFrozen(runTurn.receipts[0]));
+        assert.isTrue(Object.isFrozen(runTurn.receipts[0]?.toolIds));
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
   it.live(

@@ -74,7 +74,11 @@ import { VideoPreviewModal, type VideoPreviewSource } from "../../components/Vid
 import { GlassSurface } from "../../components/ui/GlassSurface";
 import { ComposerEditor, type ComposerEditorHandle } from "../../components/ComposerEditor";
 import { fileRoutePathSegments } from "../files/filePath";
-import { ComposerActionButton, ComposerToolbarRow } from "../../components/ComposerToolbar";
+import {
+  ComposerActionButton,
+  ComposerInlineControl,
+  ComposerToolbarRow,
+} from "../../components/ComposerToolbar";
 import { ComposerModelControl } from "../../components/ComposerModelControl";
 import {
   composerStripAttachments,
@@ -96,10 +100,13 @@ import {
   resolveComposerSendPresentation,
   type ComposerSendPresentation,
 } from "./composerSendPresentation";
+import { useAgentThreadLink } from "../assistants/useAgentThreadLink";
+import { useAgentThreadOwner } from "../assistants/useAgentThreadOwner";
+import { composerOwnerAcceptsDraftSettings } from "../../state/composer-turn-settings";
 import { ComposerCommandPopover } from "./ComposerCommandPopover";
 import { ComposerPopoverAnchor } from "./ComposerPopoverAnchor";
 import { ComposerQueuedEditAttachments } from "./ComposerQueuedEdit";
-import { useComposerCommandMenu } from "./use-composer-command-menu";
+import { isComposerMenuVisible, useComposerCommandMenu } from "./use-composer-command-menu";
 import {
   ComposerDictationCancelAction,
   ComposerDictationDraftContent,
@@ -459,6 +466,32 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     return report !== null;
   };
 
+  // A canonical agent home always runs with its agent's saved model, access and mode; the server
+  // rejects conflicting draft settings. Its controls open the agent's Configuration instead.
+  // Until the owner is confirmed, settings stay read-only so no override can precede that answer.
+  const agentOwner = useAgentThreadOwner(props.environmentId, props.selectedThread.id);
+  const agentLink = useAgentThreadLink(props.environmentId, props.selectedThread.id);
+  const canonicalAgent = agentLink?.kind === "canonical" ? agentLink : null;
+  const configureAgentInstead = (setting: string) => {
+    if (canonicalAgent === null) {
+      if (composerOwnerAcceptsDraftSettings(agentOwner.kind)) return false;
+      Dialog.alert(
+        "Checking this chat's settings",
+        agentOwner.kind === "offline"
+          ? `Reconnect to change this chat's ${setting}. An agent may own it.`
+          : `T3 Code is still confirming whether an agent owns this chat's ${setting}. Try again in a moment.`,
+      );
+      return true;
+    }
+    Dialog.confirm({
+      title: `Configure ${canonicalAgent.name}`,
+      message: `This chat always uses ${canonicalAgent.name}'s saved settings. Change its ${setting} in the agent's configuration.`,
+      confirmText: "Configure",
+      onConfirm: canonicalAgent.open,
+    });
+    return true;
+  };
+
   const composerMenu = useComposerCommandMenu({
     draftMessage: draftMessage,
     ownerKey: composerDraftKey,
@@ -469,6 +502,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     pullRequestProjectId: props.serverConfig?.environment.capabilities.pullRequests
       ? (project?.id ?? null)
       : null,
+    resourceProjectId: project?.id ?? null,
     pullRequestRepository: project?.repositoryIdentity?.displayName ?? null,
     threadPullRequests: props.selectedThread.pullRequests,
     selectedProviderStatus,
@@ -478,7 +512,9 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     onUpdateInteractionMode:
       selectedProviderStatus?.showInteractionModeToggle === false
         ? undefined
-        : props.onUpdateInteractionMode,
+        : (mode) => {
+            if (!configureAgentInstead("mode")) props.onUpdateInteractionMode(mode);
+          },
     offersUsageLimits: usageLimitsOffered,
     onUsageLimits:
       usageLimitsOffered && draftAttachments.length === 0 ? openUsageLimits : undefined,
@@ -656,11 +692,14 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
     prompt: draftMessage,
     onPromptChange: (text) => setComposerDraftText(composerDraftKey, text),
     reportedModelSelection: props.reportedModelSelection,
-    onSelectModel: (option) =>
-      props.onUpdateModelSelection(withRememberedModelOptions(option.selection)),
+    onSelectModel: (option) => {
+      if (!configureAgentInstead("model"))
+        props.onUpdateModelSelection(withRememberedModelOptions(option.selection));
+    },
     restoreSelection: withRememberedModelOptions,
     optionDescriptors: providerOptionDescriptors,
     onUpdateOptionSelections: (options) => {
+      if (configureAgentInstead("model options")) return;
       rememberModelOptions(
         currentModelSelection.instanceId,
         currentModelSelection.model,
@@ -669,9 +708,16 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
       props.onUpdateModelSelection({ ...currentModelSelection, options });
     },
     runtimeMode: currentRuntimeMode,
-    onUpdateRuntimeMode: props.onUpdateRuntimeMode,
+    onUpdateRuntimeMode: (mode) => {
+      if (!configureAgentInstead("access")) props.onUpdateRuntimeMode(mode);
+    },
   } satisfies ExistingThreadSettingsRouteSession;
   const openSettings = () => {
+    if (canonicalAgent !== null) {
+      canonicalAgent.open();
+      return;
+    }
+    if (configureAgentInstead("settings")) return;
     settingsRoutePresentation.present(settingsRouteSession);
     settingsSheetPresentation.open();
   };
@@ -760,7 +806,19 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
 
   // The row and the card's toolbar share this picker. It shrinks to the provider
   // icon in the row once the draft has text, so the draft keeps the width.
-  const modelControl = (
+  const modelControl = canonicalAgent ? (
+    <View className="min-w-0 shrink">
+      <ComposerInlineControl
+        icon="person.crop.circle"
+        label={`Configure ${canonicalAgent.name}`}
+        accessibilityHint="Model, access and mode for this chat are set on the agent."
+        emphasized
+        iconOnly={!usesCard && draftMessage.length > 0}
+        maxWidth="100%"
+        onPress={canonicalAgent.open}
+      />
+    </View>
+  ) : (
     <View className="min-w-0 shrink">
       <ComposerModelControl
         modelOption={currentModelOption}
@@ -802,15 +860,14 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
         style={{ maxWidth: props.contentMaxWidth }}
         onLayout={(event) => measureRow("surfaceWidth", event.nativeEvent.layout.width)}
       >
-        {!isSubmissionLocked &&
-        composerMenu.trigger &&
-        (composerMenu.items.length > 0 || composerMenu.trigger.kind === "pull-request") ? (
+        {!isSubmissionLocked && composerMenu.trigger && isComposerMenuVisible(composerMenu) ? (
           <ComposerPopoverAnchor>
             <ComposerCommandPopover
               items={composerMenu.items}
               triggerKind={composerMenu.trigger.kind}
               isLoading={composerMenu.isLoading}
               error={composerMenu.error}
+              onRetry={composerMenu.onRetry}
               onSelect={composerMenu.onSelect}
             />
           </ComposerPopoverAnchor>
@@ -839,7 +896,11 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
         ) : null}
         {modelUnavailable ? (
           <Button
-            label="Model unavailable. Open model settings."
+            label={
+              canonicalAgent
+                ? `Model unavailable. Configure ${canonicalAgent.name}.`
+                : "Model unavailable. Open model settings."
+            }
             tone="text"
             onPress={openSettings}
           />

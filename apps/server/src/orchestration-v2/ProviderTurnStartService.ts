@@ -1,3 +1,9 @@
+import { selectHandoffsForMemoryEpoch } from "./ContextHandoffEpoch.ts";
+import {
+  freezeInstructionSnapshot,
+  sameInstructionSnapshot,
+} from "@t3tools/provider-core/server/instructionSnapshot";
+import * as InstructionDelivery from "./InstructionDelivery.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
@@ -22,7 +28,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
-import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Exit from "effect/Exit";
 
 import * as ServerConfig from "../config.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
@@ -53,6 +59,7 @@ import {
 } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
+import * as RunAdmission from "./RunAdmission.ts";
 import {
   isRestartNoteContinuation,
   pendingRestartCancelledBackgroundWork,
@@ -113,6 +120,7 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | RunExecutionService.RunExecutionServiceV2
   | RuntimePolicy.RuntimePolicyV2
+  | RunAdmission.RunAdmission
 > = Layer.effect(
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
@@ -121,8 +129,6 @@ export const layer: Layer.Layer<
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const serverConfig = yield* ServerConfig.ServerConfig;
-    const serverSettings = yield* ServerSettings.ServerSettingsService;
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
@@ -130,6 +136,10 @@ export const layer: Layer.Layer<
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
+    const runAdmission = yield* RunAdmission.RunAdmission;
+    const instructionDelivery = yield* Effect.serviceOption(
+      InstructionDelivery.InstructionDelivery,
+    );
     const isManagedWorktreePath = yield* makeIsManagedWorktreePath;
 
     // These callbacks outlive startup while a run drains background work. Build
@@ -243,6 +253,66 @@ export const layer: Layer.Layer<
       if (run.status !== "starting") {
         return;
       }
+      let admittedOwner: RunAdmission.AdmittedOwner | undefined;
+      const checkAdmission = Effect.fn("ProviderTurnStartService.checkAdmission")(function* () {
+        yield* runAdmission.validatePhysical?.(input.threadId) ?? Effect.void;
+        const admission = yield* runAdmission.check({
+          threadId: input.threadId,
+          runId,
+          operation: "start",
+          now: DateTime.formatIso(yield* DateTime.now),
+        });
+        if (
+          admission._tag === "denied" ||
+          admission._tag === "expired" ||
+          (admittedOwner !== undefined &&
+            (admission._tag !== "admitted" ||
+              admission.owner.bindingId !== admittedOwner.bindingId ||
+              admission.owner.generation !== admittedOwner.generation ||
+              admission.owner.fence !== admittedOwner.fence ||
+              admission.owner.expiresAt !== admittedOwner.expiresAt ||
+              !sameInstructionSnapshot(
+                admission.owner.configuration.instructionSnapshot,
+                admittedOwner.configuration.instructionSnapshot,
+              )))
+        ) {
+          return yield* new ProviderTurnStartError({ runId, cause: admission._tag });
+        }
+        if (
+          admission._tag === "admitted" &&
+          (admission.owner.configuration.providerInstanceId !== run.providerInstanceId ||
+            admission.owner.configuration.providerInstanceId !== run.modelSelection.instanceId ||
+            admission.owner.configuration.model !== run.modelSelection.model ||
+            !modelSelectionsEqual(
+              { ...run.modelSelection, options: admission.owner.configuration.options ?? [] },
+              run.modelSelection,
+            ) ||
+            admission.owner.runId !== run.id ||
+            admission.owner.runAttemptId !== run.activeAttemptId)
+        ) {
+          return yield* new ProviderTurnStartError({
+            runId,
+            cause: "Admitted provider route does not match the run.",
+          });
+        }
+        if (admission._tag === "admitted") admittedOwner = admission.owner;
+        return admission;
+      });
+      const initialAdmission = yield* checkAdmission();
+      const instructionSnapshot =
+        initialAdmission._tag === "admitted" &&
+        initialAdmission.owner.configuration.instructionSnapshot !== undefined
+          ? freezeInstructionSnapshot(initialAdmission.owner.configuration.instructionSnapshot)
+          : undefined;
+      if (
+        initialAdmission._tag === "admitted" &&
+        (instructionSnapshot === undefined || Option.isNone(instructionDelivery))
+      ) {
+        return yield* new ProviderTurnStartError({
+          runId,
+          cause: "Admitted instruction revision is unavailable.",
+        });
+      }
       const rootNode = projection.nodes.find((candidate) => candidate.id === run.rootNodeId);
       const attempt = projection.attempts.find((candidate) => candidate.id === run.activeAttemptId);
       const providerThread = projection.providerThreads.find(
@@ -259,26 +329,34 @@ export const layer: Layer.Layer<
           .filter((transfer) => transfer.type === "subagent_result")
           .map((transfer) => transfer.id),
       );
-      const handoffs = projection.contextHandoffs.filter(
-        (handoff) =>
-          (handoff.transferId == null || !subagentResultTransfers.has(handoff.transferId)) &&
-          handoff.status === "ready" &&
-          (handoff.targetRunId === run.id ||
-            (handoff.toProviderThreadId === run.providerThreadId &&
-              projection.runs.some(
-                (source) =>
-                  source.id === handoff.targetRunId &&
-                  (source.status === "failed" ||
-                    source.status === "interrupted" ||
-                    (source.status === "completed" &&
-                      handoff.delivery === undefined &&
-                      projection.messages.some(
-                        (message) =>
-                          message.id === source.userMessageId &&
-                          message.attachments.length === 0 &&
-                          message.text.trim().toLowerCase() === "/compact",
-                      ))),
-              ))),
+      const handoffs = selectHandoffsForMemoryEpoch(
+        projection.contextHandoffs.filter(
+          (handoff) =>
+            (handoff.transferId == null || !subagentResultTransfers.has(handoff.transferId)) &&
+            handoff.status === "ready" &&
+            (handoff.targetRunId === run.id ||
+              (handoff.toProviderThreadId === run.providerThreadId &&
+                projection.runs.some(
+                  (source) =>
+                    source.id === handoff.targetRunId &&
+                    (source.status === "failed" ||
+                      source.status === "interrupted" ||
+                      (source.status === "completed" &&
+                        handoff.delivery === undefined &&
+                        projection.messages.some(
+                          (message) =>
+                            message.id === source.userMessageId &&
+                            message.attachments.length === 0 &&
+                            message.text.trim().toLowerCase() === "/compact",
+                        ))),
+                ))),
+        ),
+        initialAdmission._tag === "admitted" && initialAdmission.owner.ownerKind === "assistant"
+          ? instructionSnapshot?.memoryEpoch
+          : undefined,
+        initialAdmission._tag === "admitted" && initialAdmission.owner.ownerKind === "assistant"
+          ? instructionSnapshot?.memoryContextHash
+          : undefined,
       );
       const nativeForkTransfer = projection.contextTransfers.find(
         (transfer) =>
@@ -537,6 +615,7 @@ export const layer: Layer.Layer<
         thread: projection.thread,
         modelSelection: run.modelSelection,
       });
+      yield* checkAdmission();
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const existingSessionProjection = projection.providerSessions.find(
         (candidate) => candidate.id === providerSessionId,
@@ -545,6 +624,7 @@ export const layer: Layer.Layer<
         providerSessions.open({
           threadId: projection.thread.id,
           providerSessionId,
+          ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
           modelSelection: run.modelSelection,
           runtimePolicy: resolvedRuntimePolicy,
           ...(existingSessionProjection === undefined
@@ -602,6 +682,7 @@ export const layer: Layer.Layer<
         return;
       }
       const session = sessionResult.success;
+      yield* checkAdmission();
       if (!(yield* isCurrentAttemptInStatus("starting"))) return;
       const loadFromProvider = Effect.fn("ProviderTurnStartService.loadFromProvider")(function* (
         load: Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapter.ProviderAdapterV2Error>,
@@ -669,6 +750,7 @@ export const layer: Layer.Layer<
               runtimePolicy: resolvedRuntimePolicy,
               providerSessionId,
               existingProviderThread: providerThread,
+              ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
             }),
           );
         }
@@ -679,7 +761,7 @@ export const layer: Layer.Layer<
             handoff.delivery?.status === "pending",
         );
         const resumed = yield* Effect.result(
-          uncertainDelivery
+          uncertainDelivery || session.instructionRevisionReplaced === true
             ? Effect.fail(
                 new ProviderAdapter.ProviderAdapterTurnStartError({
                   driver: session.driver,
@@ -718,6 +800,7 @@ export const layer: Layer.Layer<
             // session instead of retrying the resume that just failed, while
             // still adopting this row's identity.
             existingProviderThread: { ...providerThread, nativeThreadRef: null },
+            ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
           }),
         );
         if (replacement === undefined) return undefined;
@@ -1094,6 +1177,180 @@ export const layer: Layer.Layer<
                 !coveredItemIds.has(item.id) &&
                 historicalMessage(item) !== null,
             );
+      const guardNativeStart = (
+        nativeStart: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"],
+      ): ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"] =>
+        Effect.fn("ProviderTurnStartService.guardNativeStart")(
+          function* (turnInput) {
+            const currentAdmission = yield* checkAdmission();
+            if (currentAdmission._tag === "ordinary") return yield* nativeStart(turnInput);
+            if (instructionSnapshot === undefined || Option.isNone(instructionDelivery))
+              return yield* new ProviderTurnStartError({
+                runId,
+                cause: "Admitted instruction revision is unavailable.",
+              });
+            if (
+              session.providerSession.capabilities.instructionDelivery?.mode === undefined ||
+              session.providerSession.capabilities.instructionDelivery.mode === "unsupported"
+            ) {
+              return yield* new ProviderTurnStartError({
+                runId,
+                cause: "Provider instruction delivery is unsupported.",
+              });
+            }
+            const target: InstructionDelivery.InstructionTarget = {
+              threadId: input.threadId,
+              runId,
+              runAttemptId: attempt.id,
+              providerThreadId: turnInput.providerThread.id,
+              providerSessionId: session.providerSessionId,
+              runOrdinal: run.ordinal,
+              ...(session.providerSession.instructionRuntimeId === undefined
+                ? {}
+                : { runtimeId: session.providerSession.instructionRuntimeId }),
+              snapshot: instructionSnapshot,
+            };
+            yield* instructionDelivery.value.prepare(target);
+            const instructedInput = {
+              ...turnInput,
+              instructionSnapshot,
+              onInstructionsApplied: (applied: typeof instructionSnapshot) =>
+                instructionDelivery.value.recordApplied(target, applied).pipe(
+                  Effect.catchCause(() =>
+                    Effect.logWarning("Provider instruction receipt persistence failed", {
+                      runId,
+                    }),
+                  ),
+                ),
+            };
+            if (!(yield* isCurrentAttemptInStatus("running"))) {
+              return yield* new ProviderTurnStartError({
+                runId,
+                cause: "Run is no longer current.",
+              });
+            }
+            yield* checkAdmission();
+            const reconcile = Effect.fn("ProviderTurnStartService.reconcileNative")(function* (
+              accepted: boolean,
+              uncertain: boolean,
+            ) {
+              return yield* runAdmission.reconcileNative({
+                threadId: input.threadId,
+                runId,
+                runAttemptId: attempt.id,
+                now: DateTime.formatIso(yield* DateTime.now),
+                accepted,
+                uncertain,
+              });
+            });
+            const nativeState = Effect.suspend(() =>
+              projectionStore.getRuntimeRecoveryProjection(input.threadId),
+            ).pipe(
+              Effect.map((current) => {
+                const turn = latestProviderTurnForAttempt(current.providerTurns, attempt.id);
+                return {
+                  turn,
+                  terminal:
+                    turn !== undefined &&
+                    turn.providerThreadId === providerThread.id &&
+                    turn.nativeTurnRef != null &&
+                    turn.completedAt != null &&
+                    turn.status !== "pending" &&
+                    turn.status !== "running",
+                };
+              }),
+            );
+            const stopObservedNative = Effect.gen(function* () {
+              const { turn, terminal } = yield* nativeState;
+              if (turn !== undefined && !terminal) {
+                yield* session.interruptTurn({
+                  providerThread: turnInput.providerThread,
+                  providerTurnId: turn.id,
+                  requestRuntimeRestart: true,
+                });
+              }
+            });
+            yield* Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                const pending = yield* reconcile(false, true);
+                if (
+                  pending._tag !== "admitted" ||
+                  admittedOwner === undefined ||
+                  pending.owner.runId !== run.id ||
+                  pending.owner.runAttemptId !== attempt.id ||
+                  pending.owner.bindingId !== admittedOwner.bindingId ||
+                  pending.owner.generation !== admittedOwner.generation ||
+                  pending.owner.fence !== admittedOwner.fence
+                ) {
+                  // No native invocation occurred, so this attempt has definitive non-acceptance.
+                  yield* reconcile(false, false);
+                  return yield* new ProviderTurnStartError({
+                    runId,
+                    cause: "Admission ended before native invocation.",
+                  });
+                }
+                let invoked = false;
+                yield* restore(
+                  Effect.suspend(() => {
+                    invoked = true;
+                    return nativeStart(instructedInput);
+                  }),
+                ).pipe(
+                  Effect.onExit((exit) =>
+                    Exit.isFailure(exit)
+                      ? reconcile(
+                          false,
+                          invoked && !refusedBeforePrompt(Cause.squash(exit.cause)),
+                        ).pipe(
+                          Effect.andThen(
+                            !invoked || refusedBeforePrompt(Cause.squash(exit.cause))
+                              ? Effect.void
+                              : stopObservedNative,
+                          ),
+                          Effect.catchCause(() => Effect.void),
+                        )
+                      : nativeState.pipe(
+                          Effect.flatMap(({ terminal }) =>
+                            terminal ? Effect.void : reconcile(true, true).pipe(Effect.asVoid),
+                          ),
+                        ),
+                  ),
+                );
+              }),
+            );
+            if ((yield* nativeState).terminal) return;
+            const current = yield* isCurrentAttemptInStatus("running");
+            const verified = yield* Effect.result(checkAdmission());
+            const accepted =
+              verified._tag === "Failure" ? undefined : yield* reconcile(true, !current);
+            if (accepted?._tag !== "admitted" || !current) {
+              // An interrupt receipt cannot prove that an accepted native turn stopped.
+              yield* reconcile(true, true);
+              yield* stopObservedNative;
+              return yield* new ProviderTurnStartError({
+                runId,
+                cause: "Admission ended during native start.",
+              });
+            }
+          },
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: input.threadId,
+                providerThreadId: providerThread.id,
+                runId,
+                cause,
+              }),
+          ),
+        );
+      const guardedSession = {
+        ...session,
+        startTurn: guardNativeStart(session.startTurn),
+        ...(session.compactThread === undefined
+          ? {}
+          : { compactThread: guardNativeStart(session.compactThread) }),
+      };
       const startWithHandoffs = Effect.fn("ProviderTurnStartService.startWithHandoffs")(
         function* (turnInput: Parameters<typeof session.startTurn>[0], compact = false) {
           const retryHandoff =
@@ -1165,7 +1422,7 @@ export const layer: Layer.Layer<
             }),
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
-          const start = compact ? session.compactThread! : session.startTurn;
+          const start = compact ? guardedSession.compactThread! : guardedSession.startTurn;
           const context = [delivery.context, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
@@ -1219,8 +1476,9 @@ export const layer: Layer.Layer<
         missedItems.length === 0 &&
         restartNote === "" &&
         !noteContinuation
-          ? session
-          : makeDeliverySession(session, startWithHandoffs);
+          ? guardedSession
+          : makeDeliverySession(guardedSession, startWithHandoffs);
+      yield* checkAdmission();
       return runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,

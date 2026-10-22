@@ -1,6 +1,15 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  EventId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  SkillCatalogRevision,
+  type SkillCatalogChanged,
+  ManagedTextResourceCatalogRevision,
+  type ManagedTextResourceChanged,
+  type ManagedTextResourceCatalogListInput,
   type PreviewEvent,
   type TerminalAttachInput,
   type TerminalAttachStreamEvent,
@@ -33,6 +42,8 @@ import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
 import type * as RpcSession from "../rpc/session.ts";
+import { makeManagedTextResourceInvalidationSignals } from "./managedTextResources.ts";
+import { createSkillsEnvironmentAtoms, makeSkillInvalidationSignals } from "./skills.ts";
 import { createPreviewEnvironmentAtoms } from "./preview.ts";
 import type { QueryPersistence } from "./queryPersistence.ts";
 import { createTerminalEnvironmentAtoms } from "./terminal.ts";
@@ -1168,3 +1179,210 @@ describe("persisted environment queries", () => {
     ),
   );
 });
+
+it.effect("catalog subscriptions refresh a mounted query and dispose the stream", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const changes = yield* Queue.unbounded<ManagedTextResourceChanged>();
+      const initial = yield* Deferred.make<void>();
+      const refreshed = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const signals = makeManagedTextResourceInvalidationSignals();
+      const target = { environmentId: QUERY_ENVIRONMENT.environmentId, input: {} };
+      let reads = 0;
+      const harness = yield* makeEnvironmentQueryHarness(
+        Effect.sync(() => ++reads),
+        {
+          refreshTrigger: signals.refresh(target),
+        },
+      );
+      const family = createEnvironmentSubscriptionAtomFamily(harness.runtime, {
+        label: "test.catalog-changes",
+        subscribe: (_input: ManagedTextResourceCatalogListInput) =>
+          Stream.fromQueue(changes).pipe(Stream.ensuring(Deferred.succeed(closed, undefined))),
+        onValue: (destination, change, registry) =>
+          Effect.sync(() => signals.publish(destination, change, registry)),
+        idleTtlMs: 0,
+      });
+      const registry = AtomRegistry.make();
+      const unmountQuery = registry.subscribe(
+        harness.atom,
+        (result) => {
+          if (!AsyncResult.isSuccess(result)) return;
+          if (result.value === 1) Deferred.doneUnsafe(initial, Exit.void);
+          if (result.value === 2) Deferred.doneUnsafe(refreshed, Exit.void);
+        },
+        { immediate: true },
+      );
+      const unmountChanges = registry.mount(family(target));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountQuery();
+          unmountChanges();
+          registry.dispose();
+        }),
+      );
+      yield* Deferred.await(initial);
+      yield* Queue.offer(changes, {
+        scope: "environment",
+        scopeId: target.environmentId,
+        catalogRevision: ManagedTextResourceCatalogRevision.make(2),
+        changedKeys: [],
+      });
+      yield* Deferred.await(refreshed);
+      expect(reads).toBe(2);
+      unmountChanges();
+      registry.dispose();
+      yield* Deferred.await(closed);
+    }),
+  ),
+);
+
+it.effect("refreshes mounted skill application revisions after global and project changes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const changes = yield* Queue.unbounded<SkillCatalogChanged>();
+      const initial = yield* Deferred.make<void>();
+      const globalRefreshed = yield* Deferred.make<void>();
+      const projectRefreshed = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const providerInstanceId = ProviderInstanceId.make("codex");
+      const threadId = ThreadId.make("thread-a");
+      let reads = 0;
+      const harness = yield* makeEnvironmentQueryHarness(Effect.void, {
+        rpcSession: {
+          ...QUERY_RPC_SESSION,
+          client: {
+            [WS_METHODS.skillsApplicationGet]: () =>
+              Effect.sync(() => ({
+                providerInstanceId,
+                threadId,
+                desiredRevision: SkillCatalogRevision.make(++reads),
+                appliedRevision: SkillCatalogRevision.make(1),
+                status: reads === 1 ? "applied" : "pending_restart",
+                outcomes: [],
+              })),
+            [WS_METHODS.skillsCatalogSubscribe]: () =>
+              Stream.fromQueue(changes).pipe(Stream.ensuring(Deferred.succeed(closed, undefined))),
+          },
+        } as unknown as RpcSession.RpcSession,
+      });
+      const atoms = createSkillsEnvironmentAtoms(harness.runtime);
+      const target = {
+        environmentId: QUERY_ENVIRONMENT.environmentId,
+        input: { providerInstanceId, threadId },
+      };
+      const application = atoms.application(target);
+      const registry = AtomRegistry.make();
+      const stopApplication = registry.subscribe(
+        application,
+        (result) => {
+          if (!AsyncResult.isSuccess(result)) return;
+          if (result.value.desiredRevision === 1) Deferred.doneUnsafe(initial, Exit.void);
+          if (result.value.desiredRevision === 2) Deferred.doneUnsafe(globalRefreshed, Exit.void);
+          if (result.value.desiredRevision === 3) Deferred.doneUnsafe(projectRefreshed, Exit.void);
+        },
+        { immediate: true },
+      );
+      const stopChanges = registry.mount(atoms.changes(target));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          stopApplication();
+          stopChanges();
+          registry.dispose();
+        }),
+      );
+      yield* Deferred.await(initial);
+      yield* Queue.offer(changes, {
+        scope: "global",
+        scopeId: target.environmentId,
+        catalogRevision: SkillCatalogRevision.make(2),
+        changedKeys: [],
+      });
+      yield* Deferred.await(globalRefreshed);
+      yield* Queue.offer(changes, {
+        scope: "project",
+        scopeId: ProjectId.make("project-a"),
+        catalogRevision: SkillCatalogRevision.make(3),
+        changedKeys: [],
+      });
+      yield* Deferred.await(projectRefreshed);
+      const current = registry.get(application);
+      expect(AsyncResult.isSuccess(current) && current.value.status).toBe("pending_restart");
+      expect(AsyncResult.isSuccess(current) && current.value.appliedRevision).toBe(1);
+      expect(reads).toBe(3);
+      registry.dispose();
+      yield* Deferred.await(closed);
+    }),
+  ),
+);
+
+it.effect("coalesced destination notices refresh every mounted skill query dependency", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const signals = makeSkillInvalidationSignals();
+      const threadId = ThreadId.make("thread-a");
+      const providerInstanceId = ProviderInstanceId.make("codex");
+      const target = {
+        environmentId: QUERY_ENVIRONMENT.environmentId,
+        input: { threadId, providerInstanceId },
+      };
+      const tags = [
+        WS_METHODS.skillsCatalogList,
+        WS_METHODS.skillsApplicationGet,
+        WS_METHODS.skillsContentGet,
+        WS_METHODS.skillsHistoryList,
+        WS_METHODS.skillsDeploymentList,
+        WS_METHODS.skillsNativeContentGet,
+      ];
+      const registry = AtomRegistry.make();
+      const reads = tags.map(() => 0);
+      const milestones = yield* Effect.forEach(tags, () =>
+        Effect.forEach([1, 2, 3, 4], () => Deferred.make<void>()),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+      for (const [index, tag] of tags.entries()) {
+        const harness = yield* makeEnvironmentQueryHarness(
+          Effect.sync(() => ++reads[index]!),
+          {
+            refreshTrigger: signals.refresh(tag, {
+              ...target,
+              input:
+                tag === WS_METHODS.skillsHistoryList || tag === WS_METHODS.skillsNativeContentGet
+                  ? {}
+                  : target.input,
+            }),
+          },
+        );
+        const stop = registry.subscribe(
+          harness.atom,
+          (result) => {
+            if (!AsyncResult.isSuccess(result)) return;
+            const milestone = milestones[index]?.[result.value - 1];
+            if (milestone) Deferred.doneUnsafe(milestone, Exit.void);
+          },
+          { immediate: true },
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(stop));
+      }
+      yield* Effect.forEach(milestones, (steps) => Deferred.await(steps[0]!), { discard: true });
+      for (const [index, eventId] of ["initial", "ack-1", "ack-2"].entries()) {
+        signals.publish(
+          target,
+          {
+            scope: "session",
+            scopeId: threadId,
+            catalogRevision: SkillCatalogRevision.make(7),
+            changedKeys: [],
+            eventId: EventId.make(eventId),
+          },
+          registry,
+        );
+        yield* Effect.forEach(milestones, (steps) => Deferred.await(steps[index + 1]!), {
+          discard: true,
+        });
+      }
+      expect(reads).toEqual(tags.map(() => 4));
+    }),
+  ),
+);

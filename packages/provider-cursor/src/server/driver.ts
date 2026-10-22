@@ -1,3 +1,4 @@
+import { skillInstallTargets } from "@t3tools/provider-core/server/driver";
 import {
   ProviderDriverKind,
   ProviderSetupError,
@@ -283,6 +284,14 @@ export const CursorDriver: ProviderDriver<
     return {
       instanceId,
       driverKind: DRIVER_KIND,
+      resolveSkillInstallTargets: (projectRoot?: string) =>
+        Effect.succeed(
+          skillInstallTargets({
+            driverKind: DRIVER_KIND,
+            environment: processEnv,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
+        ),
       continuationIdentity,
       displayName,
       accentColor,

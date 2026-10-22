@@ -1,5 +1,7 @@
 import { MessageId, ThreadId, OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as RunAdmission from "../../../orchestration-v2/RunAdmission.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
@@ -56,7 +58,22 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
     (input, { runtimeMode, interactionMode }) =>
       Effect.gen(function* () {
         const context = yield* readCaller();
-        const { caller } = context;
+        const { caller, scope } = context;
+        if (scope.thread !== undefined) {
+          const admission = yield* RunAdmission.RunAdmission;
+          const decision = yield* admission
+            .check({
+              threadId: scope.thread.threadId,
+              operation: "escape",
+              now: DateTime.formatIso(yield* DateTime.now),
+            })
+            .pipe(Effect.mapError(unavailable));
+          if (decision._tag !== "ordinary")
+            return yield* new OrchestratorMcpFailure({
+              code: "capability_denied",
+              message: "Owned runs must use permitted delegation to start another thread.",
+            });
+        }
         const commandId = yield* newCommandId();
         const threadId = ThreadId.make(commandId);
         const messageId = MessageId.make(commandId);

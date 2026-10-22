@@ -1,4 +1,9 @@
-import { type TerminalAttachStreamEvent, type TerminalEvent, WS_METHODS } from "@t3tools/contracts";
+import {
+  type TerminalAttachStreamEvent,
+  type TerminalEvent,
+  type ProjectTerminalAttachStreamEvent,
+  WS_METHODS,
+} from "@t3tools/contracts";
 import type * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -27,6 +32,7 @@ export function withTerminalOutputWindow(
             message._tag === "Request" &&
             (message.tag === WS_METHODS.terminalAttach ||
               message.tag === WS_METHODS.terminalObserve ||
+              message.tag === WS_METHODS.projectTerminalAttach ||
               message.tag === WS_METHODS.subscribeTerminalEvents)
           ) {
             const key = `${clientId}:${message.id}`;
@@ -82,7 +88,9 @@ type Subscribe<A, E> = (
   registerCleanup: (stop: () => void) => void,
 ) => Effect.Effect<() => void, E>;
 
-const queuedSize = (event: TerminalEvent | TerminalAttachStreamEvent) =>
+const queuedSize = (
+  event: TerminalEvent | TerminalAttachStreamEvent | ProjectTerminalAttachStreamEvent,
+) =>
   EVENT_OVERHEAD +
   (event.type === "output"
     ? Buffer.byteLength(event.data)
@@ -90,7 +98,10 @@ const queuedSize = (event: TerminalEvent | TerminalAttachStreamEvent) =>
       ? Buffer.byteLength(event.snapshot.history)
       : 0);
 
-export function terminalOutputStream<A extends TerminalEvent | TerminalAttachStreamEvent, E>(
+export function terminalOutputStream<
+  A extends TerminalEvent | TerminalAttachStreamEvent | ProjectTerminalAttachStreamEvent,
+  E,
+>(
   subscribe: Subscribe<A, E>,
   resync?: Subscribe<A, E>,
   maxQueued = MAX_QUEUED_OUTPUT,

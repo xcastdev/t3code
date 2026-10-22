@@ -182,3 +182,34 @@ it.effect("starts fresh without V1 and never imports over existing V2 state", ()
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
   );
 });
+
+it.effect("refuses an ahead V2 ledger before changing journal mode or applying migrations", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v2-ahead-"));
+  const dbPath = NodePath.join(directory, "statev2.sqlite");
+  return Effect.gen(function* () {
+    yield* Effect.gen(function* () {
+      yield* runMigrations({ toMigrationInclusive: 52 });
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`INSERT INTO effect_sql_migrations(migration_id,name) VALUES (999,'FutureUpstream')`;
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+    const before = NodeFS.readFileSync(dbPath);
+    const result = yield* Effect.result(
+      Effect.void.pipe(Effect.provide(SqlitePersistence.layerFromPath(dbPath))),
+    );
+    assert.equal(result._tag, "Failure");
+    assert.deepEqual(NodeFS.readFileSync(dbPath), before);
+    const db = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+    try {
+      assert.equal(db.prepare("PRAGMA journal_mode").get()?.journal_mode, "delete");
+      assert.equal(
+        db.prepare("SELECT count(*) AS count FROM effect_sql_migrations").get()?.count,
+        53,
+      );
+    } finally {
+      db.close();
+    }
+  }).pipe(
+    Effect.provide(NodeServices.layer),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});

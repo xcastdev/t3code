@@ -1205,4 +1205,43 @@ describe("rightPanelStore", () => {
     expect(surfaceIds()).toEqual(["browser:tab-a", "terminal:term-1", "diff", "browser:tab-b"]);
     expect(store.getUserActionRevision(refA)).toBe(revision);
   });
+
+  it("keeps source control a single reopenable tab that survives a reload", async () => {
+    const store = useRightPanelStore.getState();
+    store.openFile(refA, "src/app.ts");
+    store.open(refA, "source-control");
+    store.open(refA, "source-control");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.id,
+      ),
+    ).toEqual(["file:src/app.ts", "source-control"]);
+
+    await reloadRightPanelStore();
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe(
+      "source-control",
+    );
+
+    useRightPanelStore.getState().closeSurface(refA, "source-control");
+    const closed = useClosedViewStore.getState().entries[0]!;
+    await expect(
+      reopenClosedView(closed, {
+        workspaceAvailable: false,
+        openPreview: () => {
+          throw new Error("Source control must not create a browser session");
+        },
+      }),
+    ).resolves.toBe(false);
+    await expect(
+      reopenClosedView(closed, {
+        workspaceAvailable: true,
+        openPreview: () => {
+          throw new Error("Source control must not create a browser session");
+        },
+      }),
+    ).resolves.toBe(true);
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe(
+      "source-control",
+    );
+  });
 });

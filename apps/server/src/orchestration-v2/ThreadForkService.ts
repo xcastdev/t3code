@@ -52,6 +52,7 @@ export function forkableSourceRunStatusError(
 
 export interface ThreadForkServiceV2Shape {
   readonly plan: (input: {
+    readonly archiveSource?: { readonly archiveId: string };
     readonly sourceProjection: Pick<OrchestrationV2ThreadProjection, "thread">;
     readonly sourceRun: OrchestrationV2Run;
     readonly sourceProviderThread: OrchestrationV2ProviderThread | undefined;
@@ -75,13 +76,18 @@ export const layer: Layer.Layer<ThreadForkServiceV2> = Layer.succeed(
   ThreadForkServiceV2,
   ThreadForkServiceV2.of({
     plan: Effect.fn("ThreadForkService.plan")(function* (input) {
-      if (!isForkableSourceRunStatus(input.sourceRun.status)) {
+      if (
+        !isForkableSourceRunStatus(input.sourceRun.status) &&
+        !(input.archiveSource !== undefined && input.sourceRun.status === "rolled_back")
+      ) {
         return yield* new ThreadForkPlanError({
           sourceThreadId: input.sourceProjection.thread.id,
           targetThreadId: input.targetThreadId,
           cause: forkableSourceRunStatusError(input.sourceRun),
         });
       }
+      const sourceProviderThread =
+        input.archiveSource === undefined ? input.sourceProviderThread : undefined;
       const targetThread: OrchestrationV2AppThread = {
         ...input.sourceProjection.thread,
         // PR context follows the conversation; watching remains the source thread's responsibility.
@@ -124,18 +130,21 @@ export const layer: Layer.Layer<ThreadForkServiceV2> = Layer.succeed(
         // Only native forks retain this context; portable handoffs rebuild it.
         sourceTokenUsage:
           (input.sourceRun.status === "completed" || input.sourceRun.status === "waiting") &&
-          input.sourceProviderThread?.nativeThreadRef?.strength === "strong"
+          sourceProviderThread?.nativeThreadRef?.strength === "strong"
             ? input.sourceTokenUsage
             : undefined,
         targetProviderInstanceId: null,
         targetRunId: null,
-        status: "pending",
+        // Archive context is delivered explicitly; never resolve it against the mutable native source.
+        status: input.archiveSource === undefined ? "pending" : "superseded",
         resolution: null,
         createdBy: input.createdBy,
         error:
-          input.sourceProviderThread?.nativeThreadRef?.strength === "strong"
-            ? null
-            : "Source provider thread does not expose a strong native thread ref.",
+          input.archiveSource !== undefined
+            ? "Archive recovery provides conversation context; native provider history is not restored."
+            : sourceProviderThread?.nativeThreadRef?.strength === "strong"
+              ? null
+              : "Source provider thread does not expose a strong native thread ref.",
         createdAt: input.createdAt,
         updatedAt: input.createdAt,
         consumedAt: null,

@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./turnWorkCounts": {
+      "types": "./src/turnWorkCounts.ts",
+      "import": "./src/turnWorkCounts.ts"
+    },
     "./changedFileKind": {
       "types": "./src/changedFileKind.ts",
       "import": "./src/changedFileKind.ts"

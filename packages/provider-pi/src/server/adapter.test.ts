@@ -11,6 +11,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  type OrchestrationV2InstructionSnapshot,
   type ChatAttachment,
   type ModelSelection,
   type OrchestrationV2AppThread,
@@ -45,6 +46,11 @@ import {
   type PiAdapterV2Options,
 } from "./adapter.ts";
 import { makePiRpcConnection, type PiRpcRecord } from "./rpc.ts";
+import {
+  T3_PI_INSTRUCTIONS_ENV,
+  T3_PI_INSTRUCTIONS_APPLIED_PREFIX,
+  T3_PI_CATALOG_APPLIED_PREFIX,
+} from "./mcpExtensionSource.ts";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
 import { turnItemOutputText } from "../../../client-runtime/src/work-log/itemDetail.ts";
 
@@ -433,9 +439,11 @@ const openRuntime = Effect.fnUntraced(function* (
   providerSessionId = SESSION_ID,
   forkFake?: FakePi,
   continuationRequests?: PiAdapterV2Options["continuationRequests"],
+  instructionSnapshot?: OrchestrationV2InstructionSnapshot,
 ) {
   const adapter = yield* makeAdapter(fake, "", forkFake, continuationRequests);
   const runtime = yield* adapter.openSession({
+    ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
     threadId,
     providerSessionId,
     modelSelection: modelSelection(model),
@@ -493,10 +501,14 @@ const startTurn = Effect.fnUntraced(function* (
   runOrdinal = 1,
   threadId = THREAD_ID,
   continuation = false,
+  instructionSnapshot?: OrchestrationV2InstructionSnapshot,
+  onInstructionsApplied?: ProviderAdapter.ProviderAdapterV2TurnInput["onInstructionsApplied"],
 ) {
   const appThread = yield* makeAppThread(model, threadId);
   const runId = RunId.make(`run:${threadId}:${runOrdinal}`);
   yield* runtime.startTurn({
+    ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
+    ...(onInstructionsApplied === undefined ? {} : { onInstructionsApplied }),
     appThread,
     threadId,
     runId,
@@ -518,6 +530,278 @@ const startTurn = Effect.fnUntraced(function* (
 });
 
 describe("PiAdapterV2", () => {
+  it.effect(
+    "keeps role delivery session scoped and acknowledges only matching native injection",
+    () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const snapshot = {
+          configurationHash: "config",
+          resourceRevision: "resources",
+          memoryEpoch: 0,
+          roleInstructions: "Review this project",
+          toolIds: ["report"],
+          skillIds: [],
+        };
+        const { runtime, takeEvent } = yield* openRuntime(
+          fake,
+          "default",
+          THREAD_ID,
+          SESSION_ID,
+          undefined,
+          undefined,
+          snapshot,
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+          instructionSnapshot: snapshot,
+        });
+        assert.equal(runtime.providerSession.capabilities.instructionDelivery?.mode, "session");
+        assert.deepEqual(JSON.parse(fake.lastSpawn().env[T3_PI_INSTRUCTIONS_ENV]!), {
+          configurationHash: snapshot.configurationHash,
+          resourceRevision: snapshot.resourceRevision,
+          memoryEpoch: snapshot.memoryEpoch,
+          roleInstructions: snapshot.roleInstructions,
+        });
+        assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread }));
+        const applied = yield* Queue.unbounded<OrchestrationV2InstructionSnapshot>();
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "/review",
+          undefined,
+          1,
+          THREAD_ID,
+          false,
+          snapshot,
+          (receipt) => Queue.offer(applied, receipt).pipe(Effect.asVoid),
+        );
+        const prompt = yield* fake.takeRequest("prompt");
+        assert.equal(prompt["message"], "/review");
+        assert.isUndefined(prompt["max_tokens"]);
+        assert.isUndefined(prompt["maxTokens"]);
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "notify",
+          message: T3_PI_INSTRUCTIONS_APPLIED_PREFIX + "stale",
+        });
+        yield* fake.emit({ type: "extension_ui_request", method: "notify", message: "barrier" });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "barrier",
+        );
+        assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread }));
+        const nativeNotifications: string[] = [];
+        yield* Effect.promise(async () => {
+          const bridge = await loadMcpBridge({ instructionSnapshot: snapshot, withoutMcp: true });
+          const result = await bridge.handlers.get("before_agent_start")!(
+            { systemPrompt: "base" },
+            {
+              ui: { notify: (message) => nativeNotifications.push(message) },
+            },
+          );
+          assert.equal(result?.systemPrompt, "base\n\n" + snapshot.roleInstructions);
+        });
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "notify",
+          message: nativeNotifications[0],
+        });
+        const receipt = yield* Queue.take(applied);
+        assert.deepEqual(receipt, snapshot);
+        assert.isTrue(Object.isFrozen(receipt));
+        assert.isTrue(Object.isFrozen(receipt.toolIds));
+        yield* fake.emit({ type: "agent_start" });
+        yield* fake.emit({ type: "agent_settled" });
+        const completed = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "completed",
+        );
+        assert.isTrue(completed.type === "provider_turn.updated");
+        if (completed.type === "provider_turn.updated")
+          assert.isUndefined(completed.providerTurn.tokenUsage);
+        yield* takeEvent((event) => event.type === "turn.terminal");
+        const ordinaryThread = yield* runtime
+          .ensureThread({
+            threadId: ThreadId.make("ordinary"),
+            modelSelection: modelSelection("default"),
+            runtimePolicy,
+          })
+          .pipe(Effect.result);
+        assert.equal(ordinaryThread._tag, "Failure");
+        snapshot.toolIds.push("changed-after-launch");
+        assert.deepEqual((yield* runtime.getAppliedInstructions!({ providerThread }))?.toolIds, [
+          "report",
+        ]);
+        assert.isUndefined(
+          yield* runtime.getAppliedInstructions!({
+            providerThread: { ...providerThread, id: ProviderThreadId.make("other") },
+          }),
+        );
+        const changed = yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "next",
+          undefined,
+          2,
+          THREAD_ID,
+          false,
+          { ...snapshot, resourceRevision: "next" },
+        ).pipe(Effect.result);
+        assert.equal(changed._tag, "Failure");
+        assert.equal(
+          fake.allRequests().filter((request) => request["type"] === "prompt").length,
+          1,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([
+    "new_session",
+    "switch_session",
+    "rollback_fork",
+    "fork_thread",
+    "cancelled_new_session",
+  ] as const)("requires fresh injection after native lifecycle %s", (operation) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const forkFake = yield* makeFakePi;
+      const snapshot = {
+        configurationHash: "config",
+        resourceRevision: "resource",
+        memoryEpoch: 0,
+        roleInstructions: "Review role",
+        toolIds: [],
+        skillIds: [],
+      };
+      const { runtime, takeEvent } = yield* openRuntime(
+        fake,
+        "default",
+        THREAD_ID,
+        SESSION_ID,
+        forkFake,
+        undefined,
+        snapshot,
+      );
+      const first = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+        instructionSnapshot: snapshot,
+      });
+      yield* startTurn(
+        runtime,
+        first,
+        "default",
+        [],
+        "first",
+        undefined,
+        1,
+        THREAD_ID,
+        false,
+        snapshot,
+      );
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message:
+          T3_PI_INSTRUCTIONS_APPLIED_PREFIX +
+          JSON.stringify({
+            configurationHash: "config",
+            resourceRevision: "resource",
+            memoryEpoch: 0,
+          }),
+      });
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((e) => e.type === "turn.terminal");
+      assert.deepEqual(yield* runtime.getAppliedInstructions!({ providerThread: first }), snapshot);
+      if (operation === "cancelled_new_session") {
+        fake.vetoNextNewSession();
+        const rejected = yield* runtime
+          .ensureThread({
+            threadId: ThreadId.make("cancelled"),
+            modelSelection: modelSelection("default"),
+            runtimePolicy,
+            instructionSnapshot: snapshot,
+          })
+          .pipe(Effect.result);
+        assert.equal(rejected._tag, "Failure");
+        assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread: first }));
+      }
+      if (operation === "fork_thread") {
+        forkFake.queueState({ sessionFile: "/fake/forked.jsonl" });
+        fake.queueState({ sessionFile: "/fake/forked.jsonl" });
+      }
+      const second =
+        operation === "new_session" || operation === "cancelled_new_session"
+          ? yield* runtime.ensureThread({
+              threadId: ThreadId.make("second"),
+              modelSelection: modelSelection("default"),
+              runtimePolicy,
+              instructionSnapshot: snapshot,
+            })
+          : operation === "fork_thread"
+            ? yield* runtime.forkThread({
+                sourceProviderThread: first,
+                targetThreadId: ThreadId.make("fork-target"),
+              })
+            : operation === "switch_session"
+              ? yield* runtime.resumeThread({ providerThread: first })
+              : (yield* runtime.rollbackThread({
+                  providerThread: first,
+                  target: {
+                    type: "thread_start",
+                    checkpointId: CheckpointId.make("empty"),
+                    appRunOrdinal: 0,
+                  },
+                  providerThreadTurns: uncapturedTurns(first.id),
+                })).providerThread;
+      if (operation === "new_session")
+        assert.notEqual(second.nativeThreadRef?.nativeId, first.nativeThreadRef?.nativeId);
+      assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread: second }));
+      yield* startTurn(
+        runtime,
+        second,
+        "default",
+        [],
+        "/native-command",
+        undefined,
+        2,
+        second.appThreadId ?? THREAD_ID,
+        false,
+        snapshot,
+      );
+      assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread: second }));
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message:
+          T3_PI_INSTRUCTIONS_APPLIED_PREFIX +
+          JSON.stringify({
+            configurationHash: "config",
+            resourceRevision: "resource",
+            memoryEpoch: 0,
+          }),
+      });
+      yield* fake.emit({ type: "agent_start" });
+      yield* fake.emit({ type: "agent_settled" });
+      yield* takeEvent((e) => e.type === "turn.terminal");
+      assert.deepEqual(
+        yield* runtime.getAppliedInstructions!({ providerThread: second }),
+        snapshot,
+      );
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect.each([false, true])(
     "completes a resumed user turn before native wake events arrive, Pi streaming=%s",
     (streaming) =>
@@ -1404,6 +1688,100 @@ describe("PiAdapterV2", () => {
         }
       }
       assert.equal(itemIds.size, 4);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("acknowledges only native catalog success for the exact captured runtime config", () =>
+    Effect.gen(function* () {
+      const sessions = yield* McpProviderSessions.McpProviderSessions;
+      const config = {
+        environmentId: EnvironmentId.make("environment-pi-catalog"),
+        threadId: THREAD_ID,
+        providerSessionId: "credential-pi",
+        providerInstanceId: PI_INSTANCE_ID,
+        endpoint: "http://fixture.invalid/mcp",
+        authorizationHeader: "Bearer secret",
+        catalogEndpoint: "http://fixture.invalid/mcp/catalog/credential-pi",
+        nativeRuntimeId: "native-pi",
+        catalogRevision: 1,
+        browserToolsAvailable: true,
+      };
+      yield* sessions.set(config);
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread);
+      yield* fake.takeRequest("prompt");
+      const barrier = Effect.gen(function* () {
+        yield* fake.emit({
+          type: "extension_ui_request",
+          method: "notify",
+          message: "catalog barrier",
+        });
+        yield* takeEvent(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "system_notice" &&
+            event.turnItem.message === "catalog barrier",
+        );
+      });
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(THREAD_ID));
+      const catalogConfig = fake.lastSpawn().env.T3_MCP_CATALOG_CONFIG!;
+      const nativeNotifications: string[] = [];
+      yield* Effect.promise(async () => {
+        const failed = await loadMcpBridge({ catalogConfig, catalogFailure: true });
+        await failed.handlers.get("session_start")!(
+          { systemPrompt: "" },
+          { ui: { notify: (message) => nativeNotifications.push(message) } },
+        );
+      });
+      for (const message of nativeNotifications)
+        yield* fake.emit({ type: "extension_ui_request", method: "notify", message });
+      yield* barrier;
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(THREAD_ID));
+      nativeNotifications.length = 0;
+      yield* Effect.promise(async () => {
+        const bridge = await loadMcpBridge({ catalogConfig });
+        await bridge.handlers.get("session_start")!(
+          { systemPrompt: "" },
+          { ui: { notify: (message) => nativeNotifications.push(message) } },
+        );
+      });
+      yield* fake.emit({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "text_end",
+          contentIndex: 0,
+          content: nativeNotifications[0],
+        },
+      });
+      yield* barrier;
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(THREAD_ID));
+      yield* fake.emit({
+        type: "extension_ui_request",
+        method: "notify",
+        message: T3_PI_CATALOG_APPLIED_PREFIX + "stale",
+      });
+      yield* barrier;
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(THREAD_ID));
+      for (const message of nativeNotifications)
+        yield* fake.emit({ type: "extension_ui_request", method: "notify", message });
+      yield* barrier;
+      assert.deepEqual(yield* sessions.readCatalogEndpointReceipt(THREAD_ID), config);
+      yield* sessions.set({ ...config, catalogRevision: 2 });
+      for (const message of nativeNotifications)
+        yield* fake.emit({ type: "extension_ui_request", method: "notify", message });
+      yield* barrier;
+      assert.deepEqual(yield* sessions.readCatalogEndpointReceipt(THREAD_ID), config);
+      yield* sessions.set({ ...config, nativeRuntimeId: "replacement" });
+      for (const message of nativeNotifications)
+        yield* fake.emit({ type: "extension_ui_request", method: "notify", message });
+      yield* barrier;
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(THREAD_ID));
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 

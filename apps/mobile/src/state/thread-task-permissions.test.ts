@@ -10,6 +10,8 @@ import {
   TurnItemId,
   type ModelSelection,
   type OrchestrationV2ThreadProjection,
+  type ProviderInteractionMode,
+  type RuntimeMode,
   type ServerConfig,
 } from "@t3tools/contracts";
 import {
@@ -28,7 +30,10 @@ const state = vi.hoisted(() => ({
     text: "Keep my draft",
     attachments: [] as DraftComposerImageAttachment[],
     modelSelection: undefined as ModelSelection | undefined,
+    runtimeMode: undefined as RuntimeMode | undefined,
+    interactionMode: undefined as ProviderInteractionMode | undefined,
   },
+  ownerKind: "ordinary" as "offline" | "unknown" | "ordinary" | "canonical" | "child",
   serverConfig: null as ServerConfig | null,
   projection: null as OrchestrationV2ThreadProjection | null,
   pendingRequests: { approvals: [], userInputs: [] } as PendingThreadRequests,
@@ -170,6 +175,9 @@ vi.mock("../lib/commandMetadata", () => ({
 }));
 vi.mock("../lib/copyTextWithHaptic", () => ({ copyTextWithHaptic: vi.fn() }));
 vi.mock("./use-remote-environment-registry", () => ({ setPendingConnectionError: vi.fn() }));
+vi.mock("../features/assistants/useAgentThreadOwner", () => ({
+  useAgentThreadOwner: () => ({ kind: state.ownerKind }),
+}));
 
 import { useThreadComposerState } from "./use-thread-composer-state";
 import { useSelectedThreadRequests } from "./use-selected-thread-requests";
@@ -177,10 +185,22 @@ import { useSelectedThreadRequests } from "./use-selected-thread-requests";
 beforeEach(() => {
   state.grantedEnvironments = new Set(["primary"]);
   state.connectionState = "connected";
-  state.draft = { text: "Keep my draft", attachments: [], modelSelection: undefined };
+  state.draft = {
+    text: "Keep my draft",
+    attachments: [],
+    modelSelection: undefined,
+    runtimeMode: undefined,
+    interactionMode: undefined,
+  };
+  state.ownerKind = "ordinary";
+  state.thread.modelSelection = { instanceId: "codex", model: "gpt-5.4" };
+  state.thread.interactionMode = "default";
   state.projection = null;
   state.serverConfig = {
-    providers: [{ instanceId: "codex", driver: "codex", enabled: true }],
+    providers: [
+      { instanceId: "codex", driver: "codex", enabled: true },
+      { instanceId: "grok", driver: "grok", enabled: true, showInteractionModeToggle: false },
+    ],
     environment: { capabilities: {} },
   } as unknown as ServerConfig;
   state.pendingRequests = {
@@ -386,5 +406,160 @@ describe("mobile handoff preview and submission", () => {
       }),
     );
     expect(state.clearDraft).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mobile agent-owned composer settings", () => {
+  function stageConflictingOverrides() {
+    state.grantedEnvironments.add("secondary");
+    state.draft.modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "old-model",
+    };
+    state.draft.runtimeMode = "approval-required";
+    state.draft.interactionMode = "plan";
+  }
+
+  it("sends a canonical home with its current synchronized settings, not persisted overrides", async () => {
+    stageConflictingOverrides();
+    state.ownerKind = "canonical";
+    const composer = useThreadComposerState();
+    expect(composer.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.4" });
+    expect(composer.runtimeMode).toBe("full-access");
+    expect(composer.interactionMode).toBe("default");
+    expect(await composer.onSendMessage()).toBe("message");
+    expect(state.enqueue).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        text: "Keep my draft",
+        modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+      }),
+    );
+
+    // The agent's configuration changed on the server while the composer stayed mounted.
+    state.thread.modelSelection = { instanceId: "codex", model: "gpt-5.5" };
+    const remounted = useThreadComposerState();
+    expect(remounted.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.5" });
+    expect(await remounted.onSendMessage()).toBe("message");
+    expect(state.enqueue).toHaveBeenLastCalledWith(
+      expect.objectContaining({ modelSelection: { instanceId: "codex", model: "gpt-5.5" } }),
+    );
+  });
+
+  it("shows and queues a canonical home's saved Plan mode on a provider without a mode toggle", async () => {
+    state.grantedEnvironments.add("secondary");
+    state.ownerKind = "canonical";
+    state.thread.modelSelection = { instanceId: "grok", model: "grok-code-fast-1" };
+    state.thread.interactionMode = "plan";
+    const composer = useThreadComposerState();
+    expect(composer.interactionMode).toBe("plan");
+    expect(await composer.onSendMessage()).toBe("message");
+    expect(state.enqueue).toHaveBeenLastCalledWith(
+      expect.objectContaining({ interactionMode: "plan", settingsSource: "agent" }),
+    );
+
+    // The agent's configuration moved back to Default on the server.
+    state.thread.interactionMode = "default";
+    const updated = useThreadComposerState();
+    expect(updated.interactionMode).toBe("default");
+    expect(await updated.onSendMessage()).toBe("message");
+    expect(state.enqueue).toHaveBeenLastCalledWith(
+      expect.objectContaining({ interactionMode: "default", settingsSource: "agent" }),
+    );
+  });
+
+  it.each(["ordinary", "child"] as const)(
+    "still normalizes a %s Plan override for a provider without a mode toggle",
+    async (kind) => {
+      state.grantedEnvironments.add("secondary");
+      state.ownerKind = kind;
+      state.thread.modelSelection = { instanceId: "grok", model: "grok-code-fast-1" };
+      state.draft.interactionMode = "plan";
+      const composer = useThreadComposerState();
+      expect(composer.interactionMode).toBe("default");
+      expect(await composer.onSendMessage()).toBe("message");
+      expect(state.enqueue).toHaveBeenLastCalledWith(
+        expect.not.objectContaining({ settingsSource: "agent" }),
+      );
+      expect(state.enqueue).toHaveBeenLastCalledWith(
+        expect.objectContaining({ interactionMode: "default" }),
+      );
+    },
+  );
+
+  it("keeps a canonical home's settings out of local drafts", () => {
+    state.ownerKind = "canonical";
+    const composer = useThreadComposerState();
+    composer.onUpdateModelSelection({ instanceId: ProviderInstanceId.make("codex"), model: "x" });
+    composer.onUpdateRuntimeMode("approval-required");
+    composer.onUpdateInteractionMode("plan");
+    expect(state.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it.each(["unknown", "offline"] as const)(
+    "while ownership is %s, writes no overrides and holds a conflicting send with its content",
+    async (kind) => {
+      stageConflictingOverrides();
+      state.ownerKind = kind;
+      const composer = useThreadComposerState();
+      composer.onUpdateModelSelection({ instanceId: ProviderInstanceId.make("codex"), model: "x" });
+      composer.onUpdateRuntimeMode("full-access");
+      composer.onUpdateInteractionMode("default");
+      expect(state.updateSettings).not.toHaveBeenCalled();
+      expect(await composer.onSendMessage()).toBeNull();
+      expect(state.enqueue).not.toHaveBeenCalled();
+      expect(state.clearDraft).not.toHaveBeenCalled();
+
+      state.draft.modelSelection = undefined;
+      state.draft.runtimeMode = undefined;
+      state.draft.interactionMode = undefined;
+      expect(await useThreadComposerState().onSendMessage()).toBe("message");
+      expect(state.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ modelSelection: { instanceId: "codex", model: "gpt-5.4" } }),
+      );
+    },
+  );
+
+  it.each(["unknown", "offline"] as const)(
+    "while ownership is %s, holds a saved Plan mode the provider would normalize away",
+    async (kind) => {
+      state.grantedEnvironments.add("secondary");
+      state.ownerKind = kind;
+      state.thread.modelSelection = { instanceId: "grok", model: "grok-code-fast-1" };
+      state.thread.interactionMode = "plan";
+      expect(await useThreadComposerState().onSendMessage()).toBeNull();
+      expect(state.enqueue).not.toHaveBeenCalled();
+      expect(state.clearDraft).not.toHaveBeenCalled();
+      expect(state.draft.text).toBe("Keep my draft");
+
+      state.ownerKind = "canonical";
+      expect(await useThreadComposerState().onSendMessage()).toBe("message");
+      expect(state.enqueue).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          text: "Keep my draft",
+          interactionMode: "plan",
+          settingsSource: "agent",
+        }),
+      );
+    },
+  );
+
+  it.each(["ordinary", "child"] as const)("keeps %s draft overrides", async (kind) => {
+    stageConflictingOverrides();
+    state.ownerKind = kind;
+    const composer = useThreadComposerState();
+    composer.onUpdateRuntimeMode("full-access");
+    expect(state.updateSettings).toHaveBeenCalledWith("secondary:thread", {
+      runtimeMode: "full-access",
+    });
+    expect(await composer.onSendMessage()).toBe("message");
+    expect(state.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelSelection: { instanceId: "codex", model: "old-model" },
+        runtimeMode: "approval-required",
+        interactionMode: "plan",
+      }),
+    );
   });
 });

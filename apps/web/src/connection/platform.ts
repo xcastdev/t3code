@@ -26,6 +26,7 @@ import { EnvironmentRpcRequestObserver } from "@t3tools/client-runtime/rpc";
 import {
   AuthStandardClientScopes,
   type DesktopBridge,
+  type DesktopAttachedBackendTarget,
   type DesktopEnvironmentBootstrap,
   type DesktopSshEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
@@ -43,10 +44,14 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/http";
 
 import { APP_VERSION } from "../branding";
-import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
+import {
+  DesktopAttachedCredentialTargetMismatchError,
+  readDesktopPrimaryBearerToken,
+} from "../environments/primary/desktopAuth";
 import * as PrimaryEnvironmentHttpLayer from "../environments/primary/httpLayer";
 import {
   readPrimaryEnvironmentTarget,
+  verifyDesktopPrimaryAttachment,
   type PrimaryEnvironmentTarget,
 } from "../environments/primary/target";
 import { clearComposerDraftsEnvironment } from "../composerDraftStore";
@@ -354,15 +359,43 @@ const layerCapabilities = Layer.effectContext(
     const identity = ClientCapabilities.RelayDeviceIdentity.of({
       deviceId: Effect.succeedNone,
     });
+    const readPinnedPrimaryBearer = (pinned: PrimaryCredentialPin) =>
+      pinned._tag === "Refused"
+        ? Effect.fail(pinned.error)
+        : Effect.tryPromise({
+            try: () => readDesktopPrimaryBearerToken(pinned.attached ?? "managed"),
+            catch: (cause) =>
+              cause instanceof DesktopAttachedCredentialTargetMismatchError
+                ? new ConnectionBlockedError({ reason: "configuration", detail: cause.message })
+                : new ConnectionTransientError({
+                    reason: "remote-unavailable",
+                    detail: `Could not load the desktop primary credential: ${String(cause)}`,
+                  }),
+          }).pipe(Effect.map(Option.fromNullishOr));
     const primaryAuth = ClientCapabilities.PrimaryEnvironmentAuth.of({
-      bearerToken: Effect.tryPromise({
-        try: readDesktopPrimaryBearerToken,
-        catch: (cause) =>
-          new ConnectionTransientError({
-            reason: "remote-unavailable",
-            detail: `Could not load the desktop primary credential: ${String(cause)}`,
-          }),
-      }).pipe(Effect.map(Option.fromNullishOr)),
+      // Only the bundled server is reachable without a target; an attachment needs the
+      // broker's exact destination.
+      bearerToken: Effect.suspend(() =>
+        window.desktopBridge === undefined
+          ? Effect.succeedNone
+          : readPinnedPrimaryBearer(
+              registeredPrimary?.attached === undefined
+                ? { _tag: "Pinned", attached: undefined }
+                : {
+                    _tag: "Refused",
+                    error: new ConnectionBlockedError({
+                      reason: "configuration",
+                      detail: "The attached T3 Code server needs a pinned connection target.",
+                    }),
+                  },
+            ),
+      ),
+      bearerTokenForTarget: (requested) =>
+        Effect.suspend(() =>
+          window.desktopBridge === undefined
+            ? Effect.succeedNone
+            : readPinnedPrimaryBearer(primaryCredentialPinFor(requested, registeredPrimary)),
+        ),
     });
     const ssh = ClientCapabilities.SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(
@@ -414,6 +447,76 @@ const layerCapabilities = Layer.effectContext(
   }),
 );
 
+/** The primary connection as registered, with the attachment captured when it was read. */
+export interface RegisteredPrimaryTarget {
+  readonly environmentId: EnvironmentId;
+  readonly httpBaseUrl: string;
+  readonly wsBaseUrl: string;
+  readonly attached: DesktopAttachedBackendTarget | undefined;
+}
+
+let registeredPrimary: RegisteredPrimaryTarget | undefined;
+
+/**
+ * A different server answering at the attached endpoint is a configuration failure the
+ * user recovers from Settings, never a reason to connect to whatever is listening.
+ */
+export function attachedPrimaryIdentityError(
+  resolved: PrimaryEnvironmentTarget,
+  environmentId: EnvironmentId,
+): ConnectionBlockedError | null {
+  if (resolved.attached === undefined || resolved.attached.environmentId === environmentId) {
+    return null;
+  }
+  return new ConnectionBlockedError({
+    reason: "configuration",
+    detail:
+      "A different T3 Code server is answering at the attached address. Open Settings → Connections to refresh the attachment or switch back to the bundled server.",
+  });
+}
+
+export type PrimaryCredentialPin =
+  | { readonly _tag: "Pinned"; readonly attached: DesktopAttachedBackendTarget | undefined }
+  | { readonly _tag: "Refused"; readonly error: ConnectionBlockedError };
+
+function socketEndpoint(rawUrl: string): string | null {
+  try {
+    const url = new URL(rawUrl);
+    if (url.pathname === "" || url.pathname === "/") url.pathname = "/ws";
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Binds a broker's credential request to the registration it was built from. A request
+ * for any other environment, HTTP origin or socket endpoint is refused before the main
+ * process is asked, so a token for a newer attachment never goes to an older target.
+ */
+export function primaryCredentialPinFor(
+  requested: ClientCapabilities.PrimaryEnvironmentCredentialTarget,
+  registered: RegisteredPrimaryTarget | undefined,
+): PrimaryCredentialPin {
+  const requestedSocket = socketEndpoint(requested.socketUrl);
+  if (
+    registered !== undefined &&
+    requested.environmentId === registered.environmentId &&
+    requested.httpBaseUrl === registered.httpBaseUrl &&
+    requestedSocket !== null &&
+    requestedSocket === socketEndpoint(registered.wsBaseUrl)
+  ) {
+    return { _tag: "Pinned", attached: registered.attached };
+  }
+  return {
+    _tag: "Refused",
+    error: new ConnectionBlockedError({
+      reason: "configuration",
+      detail: "The primary T3 Code server changed. Reload the window to connect to it.",
+    }),
+  };
+}
+
 const loadPrimaryConnectionRegistration = Effect.fn(
   "web.connectionPlatform.loadPrimaryConnectionRegistration",
 )(function* (resolved: PrimaryEnvironmentTarget) {
@@ -423,6 +526,14 @@ const loadPrimaryConnectionRegistration = Effect.fn(
     Effect.provide(PrimaryEnvironmentHttpLayer.layer),
     Effect.mapError(mapRemoteEnvironmentError),
   );
+  const attachedIdentityError = attachedPrimaryIdentityError(resolved, descriptor.environmentId);
+  if (attachedIdentityError !== null) return yield* attachedIdentityError;
+  registeredPrimary = {
+    environmentId: descriptor.environmentId,
+    httpBaseUrl: resolved.target.httpBaseUrl,
+    wsBaseUrl: resolved.target.wsBaseUrl,
+    attached: resolved.attached,
+  };
   return new PrimaryConnectionRegistration({
     target: new PrimaryConnectionTarget({
       environmentId: descriptor.environmentId,
@@ -643,6 +754,9 @@ const layerPlatformConnectionSource = Layer.effect(
       const next = new Map<string, CachedPlatformRegistration>();
       const registrations: Array<PlatformConnectionRegistration> = [];
 
+      // Settles an unusable attachment first, so the topology read refuses it rather
+      // than falling back to the page origin.
+      yield* Effect.promise(() => verifyDesktopPrimaryAttachment().catch(() => undefined));
       const primaryTopologyRead = readPrimaryEnvironmentTargetResult();
       const retainedPrimary = primaryRegistrationToRetainAfterTopologyRead(
         previous,
@@ -659,7 +773,12 @@ const layerPlatformConnectionSource = Layer.effect(
         });
       } else if (primaryTopologyRead.target !== null) {
         const primaryTarget = primaryTopologyRead.target;
-        const signature = `primary|${primaryTarget.target.httpBaseUrl}|${primaryTarget.target.wsBaseUrl}`;
+        const attached = primaryTarget.attached;
+        const signature = `primary|${primaryTarget.target.httpBaseUrl}|${primaryTarget.target.wsBaseUrl}${
+          attached === undefined
+            ? ""
+            : `|attached|${attached.environmentId}|${attached.attachmentRevision}`
+        }`;
         const cached = previous.get(PRIMARY_LOCAL_ENVIRONMENT_ID);
         if (
           cached !== undefined &&

@@ -60,6 +60,38 @@ const setup = Effect.gen(function* () {
 });
 
 describe("command permissions", () => {
+  it.effect("requires the destination settings grant for catalog changes and OAuth", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        registry.set(
+          sessions(env),
+          AsyncResult.success({
+            ...grant(false),
+            scopes: [AuthSettingsWriteScope],
+            permissions: [AuthSettingsWriteScope],
+          }),
+        );
+        registry.set(sessions(other), AsyncResult.success(grant(true)));
+        for (const method of [
+          WS_METHODS.mcpCatalogWrite,
+          WS_METHODS.mcpCatalogSecretPrepare,
+          WS_METHODS.mcpCatalogSessionReset,
+          WS_METHODS.mcpCatalogOAuthBegin,
+          WS_METHODS.mcpCatalogOAuthContinue,
+          WS_METHODS.mcpCatalogOAuthDisconnect,
+        ]) {
+          const catalog = createCommandPermissions(runtime, method);
+          expect(registry.get(catalog.permissionAtom(env))).toBe(true);
+          yield* catalog.authorize(registry, env);
+          expect(registry.get(catalog.permissionAtom(other))).toBe(false);
+          expect(yield* catalog.authorize(registry, other).pipe(Effect.flip)).toMatchObject({
+            requiredPermission: AuthSettingsWriteScope,
+          });
+        }
+      }),
+    ),
+  );
   it.effect("requires the destination preview grant to close a browser tab", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -251,6 +283,27 @@ it.effect(
     ),
 );
 
+it.effect("delivery availability requires both source control and orchestration grants", () =>
+  Effect.gen(function* () {
+    const registry = yield* setup;
+    const command = createCommandPermissions(runtime, WS_METHODS.projectWorkDelivery);
+    for (const scopes of [
+      [AuthSourceControlWriteScope],
+      [AuthOrchestrationOperateScope],
+      [AuthSourceControlWriteScope, AuthOrchestrationOperateScope],
+    ] as const) {
+      registry.set(
+        sessions(env),
+        AsyncResult.success({ ...grant(false), scopes, permissions: scopes }),
+      );
+      const allowed = scopes.length === 2;
+      expect(registry.get(command.permissionAtom(env))).toBe(allowed);
+      const result = yield* command.authorize(registry, env).pipe(Effect.result);
+      expect(result._tag).toBe(allowed ? "Success" : "Failure");
+    }
+  }).pipe(Effect.scoped),
+);
+
 it.effect.each(["commit", "push", "commit_push", "create_pr", "commit_push_pr"] as const)(
   "%s needs thread read permission only when generating a PR from a thread",
   (action) =>
@@ -345,4 +398,30 @@ it.effect("rejects protected unary and streamed RPCs outside a guarded command",
     expect(streamed._tag).toBe("EnvironmentAuthorizationError");
     expect(writes).toBe(0);
   }),
+);
+
+it.effect("assistant memory mutation availability uses the current destination operate grant", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* setup;
+      const memory = createCommandPermissions(runtime, WS_METHODS.assistantsMemoryWrite);
+      registry.set(
+        sessions(env),
+        AsyncResult.success({
+          ...grant(true),
+          scopes: [AuthOrchestrationReadScope],
+          permissions: [AuthOrchestrationReadScope],
+        }),
+      );
+      expect(registry.get(memory.permissionAtom(env))).toBe(false);
+      expect((yield* memory.authorize(registry, env).pipe(Effect.flip))._tag).toBe(
+        "EnvironmentAuthorizationError",
+      );
+      registry.set(sessions(env), AsyncResult.success(grant(true)));
+      expect(registry.get(memory.permissionAtom(env))).toBe(true);
+      yield* memory.authorize(registry, env);
+      registry.set(sessions(other), AsyncResult.success(grant(false)));
+      expect(registry.get(memory.permissionAtom(other))).toBe(false);
+    }),
+  ),
 );

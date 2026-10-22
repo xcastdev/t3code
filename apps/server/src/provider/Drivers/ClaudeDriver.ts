@@ -1,3 +1,4 @@
+import { resolveClaudeSkillInstallTargets } from "./ClaudeSkillInstallTargets.ts";
 import { ClaudeSettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Duration from "effect/Duration";
@@ -387,6 +388,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     return {
       instanceId,
       driverKind: DRIVER_KIND,
+      resolveSkillInstallTargets: (projectRoot?: string) =>
+        resolveClaudeSkillInstallTargets(effectiveConfig, processEnv, projectRoot).pipe(
+          Effect.provideService(Path.Path, path),
+        ),
       continuationIdentity: {
         ...fallbackContinuationIdentity,
         continuationKey: continuationGroupKey,

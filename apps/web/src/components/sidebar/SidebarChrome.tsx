@@ -1,8 +1,15 @@
-import { ArrowLeftIcon, ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  BotIcon,
+  ChartNoAxesColumnIcon,
+  ListTodoIcon,
+  SettingsIcon,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { memo } from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 
+import { useProjectWorkTarget } from "../../hooks/useProjectWorkTarget";
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { usePullRequestsSupported } from "../../state/environments";
@@ -164,6 +171,7 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
     select: (location) => isSidebarUtilityPage(location.pathname),
   });
   const pullRequestsSupported = usePullRequestsSupported();
+  const workTarget = useProjectWorkTarget();
   const closeMobileSidebar = () => {
     if (isMobile) {
       setOpenMobile(false);
@@ -176,9 +184,22 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
       search: readPullRequestListPreferences(),
     });
   };
+  const handleWorkClick = () => {
+    if (workTarget === null) return;
+    closeMobileSidebar();
+    void navigate({
+      to: "/work/$environmentId/$projectId",
+      params: { environmentId: workTarget.environmentId, projectId: workTarget.projectId },
+      search: { section: "overview" },
+    });
+  };
   const handleSettingsClick = () => {
     closeMobileSidebar();
     void navigate({ to: "/settings" });
+  };
+  const handleAgentsClick = () => {
+    closeMobileSidebar();
+    void navigate({ to: "/agents" });
   };
 
   const handleUsageClick = () => {
@@ -216,6 +237,14 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
               onClick={handlePullRequestsClick}
             />
           ) : null}
+          {workTarget ? (
+            <SidebarUtilityItem
+              icon={<ListTodoIcon />}
+              label={`Work · ${workTarget.title}`}
+              onClick={handleWorkClick}
+            />
+          ) : null}
+          <SidebarUtilityItem icon={<BotIcon />} label="Agents" onClick={handleAgentsClick} />
           <SidebarUtilityItem
             icon={<ChartNoAxesColumnIcon />}
             label="Usage"

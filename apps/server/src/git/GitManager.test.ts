@@ -360,6 +360,7 @@ function createTextGeneration(
         title: "Update workflow",
       }),
     generateReviewGuide: () => Effect.succeed({ stops: [] }),
+    extractMemoryFacts: () => Effect.succeed({ facts: [] }),
     ...overrides,
   };
 
@@ -409,6 +410,7 @@ function createTextGeneration(
         ),
       ),
     generateReviewGuide: (input) => implementation.generateReviewGuide(input),
+    extractMemoryFacts: (input) => implementation.extractMemoryFacts(input),
   };
 }
 

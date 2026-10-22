@@ -39,6 +39,10 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
+import {
+  freezeInstructionSnapshot,
+  sameInstructionSnapshot,
+} from "@t3tools/provider-core/server/instructionSnapshot";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { mcpToolPresentation } from "@t3tools/provider-core/server/mcpToolPresentation";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -71,7 +75,12 @@ import {
   materializePiT3McpExtension,
   resolvePiLaunchArgs,
 } from "./mcpInjection.ts";
-import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
+import {
+  T3_PI_INSTRUCTIONS_APPLIED_PREFIX,
+  T3_PI_CATALOG_APPLIED_PREFIX,
+  T3_MCP_CATALOG_CONFIG_ENV,
+  PI_FILE_CHANGE_TOOLS,
+} from "./mcpExtensionSource.ts";
 
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
@@ -92,7 +101,18 @@ const PI_UNSOLICITED_ACTIVITY_ERROR =
 const SETTLE_PROBE_MAX_ATTEMPTS = 3;
 const SETTLE_PROBE_RETRY_DELAY = Duration.millis(100);
 
+const encodeInstructionMarker = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      configurationHash: Schema.String,
+      resourceRevision: Schema.String,
+      memoryEpoch: Schema.Number,
+    }),
+  ),
+);
+
 const PiProviderCapabilitiesV2 = {
+  instructionDelivery: { mode: "session", supportsSessionReplacement: true },
   runtimePolicy: { enforcement: "client-boundary" },
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
@@ -443,6 +463,26 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
       input: ProviderAdapter.ProviderAdapterV2OpenSessionInput,
     ) {
       const scope = yield* Effect.scope;
+      const instructionSnapshot =
+        input.instructionSnapshot === undefined
+          ? undefined
+          : freezeInstructionSnapshot(input.instructionSnapshot);
+      let appliedInstructions:
+        | {
+            readonly snapshot: NonNullable<typeof instructionSnapshot>;
+            readonly providerThreadId: OrchestrationV2ProviderThread["id"];
+            readonly nativeThreadId: string | undefined;
+          }
+        | undefined;
+      const instructionMarker =
+        instructionSnapshot === undefined
+          ? undefined
+          : T3_PI_INSTRUCTIONS_APPLIED_PREFIX +
+            encodeInstructionMarker({
+              configurationHash: instructionSnapshot.configurationHash,
+              resourceRevision: instructionSnapshot.resourceRevision,
+              memoryEpoch: instructionSnapshot.memoryEpoch,
+            });
       const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
       const mcpSession = yield* mcpSessions.read(input.threadId);
       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
@@ -473,7 +513,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         mcpSession,
         extensionPath,
         runtimeMode: input.runtimePolicy.runtimeMode,
+        ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
       });
+      const catalogMarker =
+        launch.env[T3_MCP_CATALOG_CONFIG_ENV] === undefined
+          ? undefined
+          : T3_PI_CATALOG_APPLIED_PREFIX + launch.env[T3_MCP_CATALOG_CONFIG_ENV];
       const scopedLaunch = yield* agentScope.wrap({
         command: options.settings.binaryPath || "pi",
         args: launch.args,
@@ -641,8 +686,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         return null;
       };
 
-      const lifecycleRequest = (record: PiRpcRecord) =>
-        request(record, PI_SESSION_TIMEOUT_MS).pipe(
+      const lifecycleRequest = Effect.fn("PiAdapter.lifecycleRequest")(function* (
+        record: PiRpcRecord,
+      ) {
+        // A cancelled or failed hook can still change the native prompt owner.
+        appliedInstructions = undefined;
+        return yield* request(record, PI_SESSION_TIMEOUT_MS).pipe(
           // A local timeout does not cancel Pi's lifecycle hook. Retire the
           // process before fallback can race its eventual switch/new-session.
           Effect.tapError((error) =>
@@ -658,6 +707,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }),
           Effect.onInterrupt(() => connection.terminate),
         );
+      });
 
       const tokenUsageFromStats = (
         stats: unknown,
@@ -1226,6 +1276,29 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           const state = threadState;
           const turn = state?.activeTurn ?? null;
           const message = recordString(event, "message") ?? "";
+          if (message.startsWith(T3_PI_CATALOG_APPLIED_PREFIX)) {
+            if (message === catalogMarker && mcpSession !== undefined && !closed) {
+              yield* mcpSessions.acknowledgeCatalogEndpoint(mcpSession);
+            }
+            return;
+          }
+          if (message.startsWith(T3_PI_INSTRUCTIONS_APPLIED_PREFIX)) {
+            if (
+              turn !== null &&
+              message === instructionMarker &&
+              sameInstructionSnapshot(turn.turnInput.instructionSnapshot, instructionSnapshot)
+            ) {
+              if (instructionSnapshot !== undefined && state !== null) {
+                appliedInstructions = {
+                  snapshot: instructionSnapshot,
+                  providerThreadId: state.providerThread.id,
+                  nativeThreadId: state.providerThread.nativeThreadRef?.nativeId ?? undefined,
+                };
+                yield* turn.turnInput.onInstructionsApplied?.(instructionSnapshot) ?? Effect.void;
+              }
+            }
+            return;
+          }
           if (turn === null || message.length === 0) return;
           const emittedAt = yield* DateTime.now;
           const nativeItemId = `notify:${turn.providerTurn.id}:${turn.nextItemOrdinal}`;
@@ -1641,12 +1714,24 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           threadState?.activeTurn === null &&
           pendingWake !== null &&
           !interactiveUiRequest &&
+          !(
+            event["type"] === "extension_ui_request" &&
+            recordString(event, "message")?.startsWith(T3_PI_CATALOG_APPLIED_PREFIX)
+          ) &&
           !String(event["type"]).startsWith("t3.") &&
           event["type"] !== "response"
         ) {
           pendingWake.events.push(event);
           if (event["type"] === "agent_start") yield* updateProviderSession("running", null);
           if (event["type"] === "agent_settled") yield* updateProviderSession("ready", null);
+          return;
+        }
+        if (
+          event["type"] === "extension_ui_request" &&
+          event["method"] === "notify" &&
+          recordString(event, "message")?.startsWith(T3_PI_CATALOG_APPLIED_PREFIX)
+        ) {
+          yield* handleExtensionUiRequest(event);
           return;
         }
         const state = threadState;
@@ -2362,6 +2447,19 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           return sessionEntity;
         },
         events: Stream.fromQueue(events),
+        getAppliedInstructions: ({ providerThread }) =>
+          Effect.sync(() =>
+            !closed &&
+            !stopRequested &&
+            threadState?.providerThread.id === providerThread.id &&
+            appliedInstructions?.providerThreadId === providerThread.id &&
+            appliedInstructions.nativeThreadId ===
+              (providerThread.nativeThreadRef?.nativeId ?? undefined) &&
+            appliedInstructions.nativeThreadId ===
+              (threadState.providerThread.nativeThreadRef?.nativeId ?? undefined)
+              ? appliedInstructions.snapshot
+              : undefined,
+          ),
         hasPendingBackgroundWork: Effect.sync(() => pendingWake !== null),
         hasPendingBackgroundWorkForThread: (providerThread) =>
           Effect.sync(
@@ -2377,17 +2475,25 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               : selection.model;
           return slug === undefined ? undefined : modelContextWindows.get(slug);
         },
-        ensureThread: (threadInput) =>
-          registerThread(threadInput).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapter.ProviderAdapterEnsureThreadError({
-                  driver: PI_PROVIDER,
-                  threadId: threadInput.threadId,
-                  cause,
-                }),
+        ensureThread: Effect.fn("PiAdapter.ensureThread")(
+          function* (threadInput) {
+            if (!sameInstructionSnapshot(threadInput.instructionSnapshot, instructionSnapshot)) {
+              return yield* protocolError("Pi instruction revisions require session replacement");
+            }
+            return yield* registerThread(threadInput);
+          },
+          (effect, threadInput) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterEnsureThreadError({
+                    driver: PI_PROVIDER,
+                    threadId: threadInput.threadId,
+                    cause,
+                  }),
+              ),
             ),
-          ),
+        ),
         resumeThread: (threadInput) =>
           registerThread({
             threadId:
@@ -2413,6 +2519,9 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           }),
         startTurn: Effect.fn("PiAdapter.startTurn")(
           function* (turnInput) {
+            if (!sameInstructionSnapshot(turnInput.instructionSnapshot, instructionSnapshot)) {
+              return yield* protocolError("Pi instruction revisions require session replacement");
+            }
             if (rollbackBarrier !== null)
               return yield* protocolError("Cannot start a Pi turn during rollback");
             const state = threadState;

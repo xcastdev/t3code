@@ -326,7 +326,10 @@ export class GitVcsDriver extends Context.Service<
     readonly pushCurrentBranch: (
       cwd: string,
       fallbackBranch: string | null,
-      options?: { readonly remoteName?: string | null },
+      options?: {
+        readonly remoteName?: string | null;
+        readonly reviewed?: { readonly branchRef: string; readonly commitSha: string };
+      },
     ) => Effect.Effect<GitPushResult, GitCommandError>;
     readonly readRangeContext: (
       cwd: string,
@@ -1165,6 +1168,75 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         });
       }).pipe(Effect.ensuring(cleanupTempIndex));
     }),
+
+    matchesCheckpoint: Effect.fn("GitVcsDriver.checkpoints.matchesCheckpoint")(function* (input) {
+      const operation = "GitVcsDriver.checkpoints.matchesCheckpoint";
+      const commit = yield* resolveCheckpointCommit(input.cwd, input.checkpointRef);
+      if (commit === null) return false;
+      for (const cached of [false, true]) {
+        const diff = yield* execute({
+          operation,
+          cwd: input.cwd,
+          args: [
+            "diff",
+            "--quiet",
+            "--exit-code",
+            ...(cached ? ["--cached"] : []),
+            commit,
+            "--",
+            ".",
+          ],
+          allowNonZeroExit: true,
+        });
+        if (diff.exitCode !== 0) return false;
+      }
+      const untracked = yield* execute({
+        operation,
+        cwd: input.cwd,
+        args: ["ls-files", "--others", "--exclude-standard", "--directory", "-z", "--", "."],
+        maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
+      });
+      return !untracked.stdoutTruncated && untracked.stdout.length === 0;
+    }),
+
+    retainCheckpointRef: Effect.fn("GitVcsDriver.checkpoints.retainCheckpointRef")(
+      function* (input) {
+        const operation = "GitVcsDriver.checkpoints.retainCheckpointRef";
+        const retained = yield* resolveCheckpointCommit(input.cwd, input.retainedRef);
+        const source = yield* resolveCheckpointCommit(input.cwd, input.checkpointRef);
+        if (retained !== null && (source === null || retained === source)) return retained;
+        if (source === null || retained !== null)
+          return yield* new VcsProcessExitError({
+            operation,
+            command: "git update-ref",
+            cwd: input.cwd,
+            exitCode: 1,
+            detail: "Checkpoint retention identity is unavailable or conflicts.",
+          });
+        yield* execute({
+          operation,
+          cwd: input.cwd,
+          args: [
+            "-c",
+            "core.fsync=reference",
+            "update-ref",
+            input.retainedRef,
+            source,
+            "0000000000000000000000000000000000000000",
+          ],
+        });
+        const confirmed = yield* resolveCheckpointCommit(input.cwd, input.retainedRef);
+        if (confirmed !== source)
+          return yield* new VcsProcessExitError({
+            operation,
+            command: "git update-ref",
+            cwd: input.cwd,
+            exitCode: 1,
+            detail: "Checkpoint retention could not be confirmed.",
+          });
+        return source;
+      },
+    ),
 
     hasCheckpointRef: (input) =>
       resolveCheckpointCommit(input.cwd, input.checkpointRef).pipe(

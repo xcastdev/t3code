@@ -28,6 +28,7 @@ import {
 } from "@t3tools/provider-core/server/adapterDriver";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 
 const driver = ProviderDriverKind.make("codex");
 const personalId = ProviderInstanceId.make("codex_personal");
@@ -87,6 +88,57 @@ it.effect("routes two configured instances of the same driver independently", ()
     assert.strictEqual(yield* registry.get(workId), workAdapter);
     assert.deepEqual(yield* registry.list(), [personalId, workId]);
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "reads instruction and tool support from the selected instance rather than its driver",
+  () =>
+    Effect.gen(function* () {
+      const unsupported = {
+        ...CodexProviderCapabilitiesV2,
+        instructionDelivery: { mode: "unsupported" as const, supportsSessionReplacement: false },
+        tools: { ...CodexProviderCapabilitiesV2.tools, supportsMcpTools: false },
+      };
+      const configured = [
+        makeInstance(personalId, {
+          ...personalAdapter,
+          getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+        }),
+        makeInstance(workId, {
+          ...workAdapter,
+          getCapabilities: () => Effect.succeed(unsupported),
+        }),
+      ];
+      const registry = yield* Effect.service(
+        ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+      ).pipe(
+        Effect.provide(
+          ProviderAdapterRegistry.layerFromProviderInstanceRegistry.pipe(
+            Layer.provide(
+              Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+                getInstance: (id) =>
+                  Effect.succeed(configured.find((entry) => entry.instanceId === id)),
+                listInstances: Effect.succeed(configured),
+              }),
+            ),
+          ),
+        ),
+      );
+      const personal = yield* registry.getMetadata!(personalId);
+      const work = yield* registry.getMetadata!(workId);
+      assert.deepEqual(personal.capabilities.instructionDelivery, {
+        mode: "session",
+        supportsSessionReplacement: true,
+      });
+      assert.deepEqual(work.capabilities.instructionDelivery, {
+        mode: "unsupported",
+        supportsSessionReplacement: false,
+      });
+      assert.isTrue(personal.capabilities.tools.supportsMcpTools);
+      assert.isFalse(work.capabilities.tools.supportsMcpTools);
+      assert.equal(personal.driver, work.driver);
+      assert.deepEqual(yield* registry.list(), [personalId, workId]);
+    }),
 );
 
 const lifecycleDriver = ProviderDriverKind.make("lifecycle-test");

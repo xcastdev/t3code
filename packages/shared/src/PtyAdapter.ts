@@ -18,6 +18,21 @@ export class PtySpawnError extends Schema.TaggedError<PtySpawnError>()("PtySpawn
   }
 }
 
+export class PtyDrainError extends Schema.TaggedError<PtyDrainError>()("PtyDrainError", {
+  reason: Schema.Literals([
+    "unsupported",
+    "ownership-changed",
+    "inspection-failed",
+    "signal-failed",
+    "deadline",
+  ]),
+  cause: Schema.optional(Schema.Defect()),
+}) {
+  override get message(): string {
+    return `Could not prove owned terminal processes drained (${this.reason})`;
+  }
+}
+
 export interface PtyExitEvent {
   exitCode: number;
   signal: number | null;
@@ -28,6 +43,9 @@ export interface PtyProcess {
   write(data: string): void;
   resize(cols: number, rows: number): void;
   kill(signal?: string): void;
+  /** Captured spawn ownership, including ordinary foreground/background jobs. */
+  readonly signalOwned?: (signal: "SIGTERM" | "SIGKILL") => Effect.Effect<void, PtyDrainError>;
+  readonly awaitOwnedExit?: Effect.Effect<void, PtyDrainError>;
   onData(callback: (data: string) => void): () => void;
   onExit(callback: (event: PtyExitEvent) => void): () => void;
 }

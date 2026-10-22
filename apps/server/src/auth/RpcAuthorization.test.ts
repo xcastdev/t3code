@@ -1,4 +1,8 @@
 import {
+  CLIENT_GUARDED_RPC_SCOPES,
+  EnvironmentId,
+  AssistantId,
+  clientRpcRequiredScopes,
   AuthEnvironmentMaintainScope,
   AuthDiagnosticsReadScope,
   AuthFilesystemReadScope,
@@ -6,6 +10,7 @@ import {
   AuthSettingsWriteScope,
   DEFAULT_SERVER_SETTINGS,
   ProviderInstanceId,
+  ProjectId,
   ThreadId,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -15,7 +20,7 @@ import {
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -29,6 +34,21 @@ import {
 import * as RpcAuthorization from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it("keeps source-control inspection readable and index mutations guarded", () => {
+    for (const method of [
+      WS_METHODS.gitDiscoverRepositories,
+      WS_METHODS.gitIndexStatus,
+      WS_METHODS.gitHistory,
+      WS_METHODS.gitHistoryDiff,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+    for (const method of [WS_METHODS.gitMutateIndex, WS_METHODS.gitCommitStaged]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthSourceControlWriteScope);
+      expect(clientRpcRequiredScopes(method, undefined)).toEqual([AuthSourceControlWriteScope]);
+    }
+  });
+
   it("declares exactly one scope for every RPC in the server group", () => {
     expect(new Set(Object.keys(RPC_REQUIRED_SCOPES))).toEqual(new Set(WsRpcGroup.requests.keys()));
   });
@@ -128,6 +148,40 @@ describe("RPC scope middleware", () => {
     }).pipe(Effect.scoped),
   );
 });
+
+it.effect("denies catalog changes to an orchestration operator before running the handler", () =>
+  Effect.gen(function* () {
+    const method = WS_METHODS.mcpCatalogWrite;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+      ),
+    );
+    let handled = false;
+    const client = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          group.toLayerHandler(method, () =>
+            Effect.sync(() => {
+              handled = true;
+              return { revision: 1, definitions: [], overrides: [] };
+            }),
+          ),
+          RpcAuthorization.layer([AuthOrchestrationReadScope, AuthOrchestrationOperateScope]),
+        ),
+      ),
+    );
+    expect(
+      yield* client[method]({
+        scope: "project",
+        scopeId: "project",
+        expectedRevision: 0,
+        operation: { type: "reset" },
+      }).pipe(Effect.flip),
+    ).toMatchObject({ requiredPermission: AuthSettingsWriteScope });
+    expect(handled).toBe(false);
+  }).pipe(Effect.scoped),
+);
 
 describe("settings mutation authorization", () => {
   const group = WsRpcGroup.omit(
@@ -369,5 +423,166 @@ it.effect("denies manual cleanup before the handler without settings permission"
       requiredPermission: AuthSettingsWriteScope,
     });
     expect(handled).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+it("guards human Work mutations while keeping reads and subscriptions passive", () => {
+  expect(clientRpcRequiredScopes(WS_METHODS.projectWorkDelivery, {})).toEqual([
+    AuthSourceControlWriteScope,
+    AuthOrchestrationOperateScope,
+  ]);
+  expect(clientRpcRequiredScopes(WS_METHODS.projectWorkIssue, {})).toEqual([
+    AuthOrchestrationOperateScope,
+  ]);
+  assert.strictEqual(
+    CLIENT_GUARDED_RPC_SCOPES[WS_METHODS.projectWorkWrite],
+    AuthOrchestrationOperateScope,
+  );
+  expect(clientRpcRequiredScopes(WS_METHODS.projectWorkWrite, {})).toEqual([
+    AuthOrchestrationOperateScope,
+  ]);
+  expect(requiredScopeForRpcMethod(WS_METHODS.projectWorkRead)).toBe(AuthOrchestrationReadScope);
+  expect(requiredScopeForRpcMethod(WS_METHODS.projectWorkSubscribe)).toBe(
+    AuthOrchestrationReadScope,
+  );
+});
+
+it.effect("delivery middleware requires source control write before invoking its service", () =>
+  Effect.gen(function* () {
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (
+          tag,
+        ): tag is Exclude<
+          keyof typeof RPC_REQUIRED_SCOPES,
+          typeof WS_METHODS.projectWorkDelivery
+        > => tag !== WS_METHODS.projectWorkDelivery,
+      ),
+    );
+    for (const { scopes, missing } of [
+      { scopes: [AuthOrchestrationOperateScope], missing: AuthSourceControlWriteScope },
+      { scopes: [AuthSourceControlWriteScope], missing: AuthOrchestrationOperateScope },
+      { scopes: [AuthSourceControlWriteScope, AuthOrchestrationOperateScope], missing: undefined },
+    ] as const) {
+      const allowed = missing === undefined;
+      let handled = false;
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayerHandler(WS_METHODS.projectWorkDelivery, () =>
+              Effect.sync(() => {
+                handled = true;
+                return {
+                  operationId: "merge",
+                  kind: "merge" as const,
+                  stage: "confirmed" as const,
+                };
+              }),
+            ),
+            RpcAuthorization.layer(scopes),
+          ),
+        ),
+      );
+      const result = yield* client[WS_METHODS.projectWorkDelivery]({
+        operation: "merge",
+        input: { operationId: "merge", publicationOperationId: "publication", gateId: "gate" },
+      }).pipe(Effect.result);
+      expect(handled).toBe(allowed);
+      expect(result._tag).toBe(allowed ? "Success" : "Failure");
+      if (result._tag === "Failure")
+        expect(result.failure).toMatchObject({ requiredPermission: missing });
+    }
+  }).pipe(Effect.scoped),
+);
+
+it("keeps managed resource edits and shared shell input behind their destination grants", () => {
+  for (const method of [
+    WS_METHODS.skillsGlobalUpdate,
+    WS_METHODS.skillsDeploymentChange,
+    WS_METHODS.skillsSessionSetEnabled,
+    WS_METHODS.managedTextResourcesEnvironmentUpdate,
+    WS_METHODS.managedTextResourcesThreadSetEnabled,
+  ]) {
+    expect(requiredScopeForRpcMethod(method)).toBe(AuthSettingsWriteScope);
+  }
+  for (const method of [
+    WS_METHODS.projectTerminalAttach,
+    WS_METHODS.projectTerminalMetadata,
+    WS_METHODS.projectTerminalList,
+  ])
+    expect(requiredScopeForRpcMethod(method)).toBe(AuthTerminalReadScope);
+  for (const method of [
+    WS_METHODS.projectTerminalWrite,
+    WS_METHODS.projectTerminalResize,
+    WS_METHODS.projectTerminalKill,
+  ])
+    expect(requiredScopeForRpcMethod(method)).toBe(AuthTerminalOperateScope);
+});
+
+it.effect("rejects shared terminal stop from a passive reader before touching the process", () =>
+  Effect.gen(function* () {
+    const method = WS_METHODS.projectTerminalKill;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+      ),
+    );
+    let handled = false;
+    const client = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          group.toLayerHandler(method, (input) =>
+            Effect.sync(() => {
+              handled = true;
+              return { ...input, generation: "captured-generation", status: "requested" as const };
+            }),
+          ),
+          RpcAuthorization.layer([AuthTerminalReadScope]),
+        ),
+      ),
+    );
+    const error = yield* client[method]({
+      projectId: ProjectId.make("project"),
+      terminalId: "terminal",
+    }).pipe(Effect.flip);
+    expect(error).toMatchObject({ requiredPermission: AuthTerminalOperateScope });
+    expect(handled).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("keeps assistant memory inspection passive and mutations behind operate permission", () =>
+  Effect.gen(function* () {
+    const method = WS_METHODS.assistantsMemoryWrite;
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, typeof method> => tag !== method,
+      ),
+    );
+    let handled = false;
+    const client = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.merge(
+          group.toLayerHandler(method, (input) =>
+            Effect.sync(() => {
+              handled = true;
+              return { operation: input.operation };
+            }),
+          ),
+          RpcAuthorization.layer([AuthOrchestrationReadScope]),
+        ),
+      ),
+    );
+    const error = yield* client[method]({
+      environmentId: EnvironmentId.make("env"),
+      assistantId: AssistantId.make("assistant"),
+      operation: "configure",
+      expectedRevision: 0,
+      configuration: {},
+    }).pipe(Effect.flip);
+    expect(error).toMatchObject({ requiredPermission: AuthOrchestrationOperateScope });
+    expect(handled).toBe(false);
+    expect(requiredScopeForRpcMethod(WS_METHODS.assistantsMemoryRead)).toBe(
+      AuthOrchestrationReadScope,
+    );
   }).pipe(Effect.scoped),
 );

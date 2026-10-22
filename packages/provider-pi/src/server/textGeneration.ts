@@ -6,12 +6,14 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { TextGenerationError } from "@t3tools/contracts";
 import type { PiSettings } from "../settings.ts";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
 import { makePiRpcConnection, parsePiModelSlug } from "./rpc.ts";
 import { buildPiRpcLaunch, resolvePiLaunchArgs } from "./mcpInjection.ts";
 import * as TextGenerationOperations from "@t3tools/provider-core/server/textGenerationOperations";
 
 const PI_TIMEOUT_MS = 180_000;
+const PI_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 const isTextGenerationError = Schema.is(TextGenerationError);
 
@@ -24,6 +26,21 @@ export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function* 
   const runPiJson: TextGenerationOperations.Runner = Effect.fn("PiTextGeneration.runPiJson")(
     function* (request) {
       const { operation, cwd, prompt, modelSelection } = request;
+
+      const thinking =
+        operation === "extractMemoryFacts"
+          ? getModelSelectionStringOptionValue(modelSelection, "thinking")
+          : undefined;
+      if (
+        operation === "extractMemoryFacts" &&
+        modelSelection.options?.some((option) => option.id === "thinking") &&
+        (thinking === undefined || !PI_THINKING_LEVELS.has(thinking))
+      ) {
+        return yield* new TextGenerationError({
+          operation,
+          detail: "Pi memory extraction received an unsupported thinking selection.",
+        });
+      }
 
       const resolvedLaunchArgs = resolvePiLaunchArgs(piSettings.launchArgs);
       if (!resolvedLaunchArgs.ok) {
@@ -80,6 +97,9 @@ export const makePiTextGeneration = Effect.fn("makePiTextGeneration")(function* 
           );
       }
 
+      if (thinking !== undefined) {
+        yield* connection.request({ type: "set_thinking_level", level: thinking });
+      }
       yield* connection.request({ type: "prompt", message: prompt });
       yield* Effect.gen(function* () {
         while (true) {

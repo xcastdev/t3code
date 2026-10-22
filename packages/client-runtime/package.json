@@ -207,6 +207,10 @@
       "types": "./src/state/projects.ts",
       "default": "./src/state/projects.ts"
     },
+    "./state/project-work": {
+      "types": "./src/state/projectWork.ts",
+      "default": "./src/state/projectWork.ts"
+    },
     "./state/provider-instance-display": {
       "types": "./src/state/providerInstanceDisplay.ts",
       "default": "./src/state/providerInstanceDisplay.ts"
@@ -263,6 +267,10 @@
       "types": "./src/state/shell.ts",
       "default": "./src/state/shell.ts"
     },
+    "./state/source-control-workspace": {
+      "types": "./src/state/sourceControlWorkspace.ts",
+      "default": "./src/state/sourceControlWorkspace.ts"
+    },
     "./state/source-control": {
       "types": "./src/state/sourceControl.ts",
       "default": "./src/state/sourceControl.ts"
@@ -270,6 +278,26 @@
     "./state/terminal": {
       "types": "./src/state/terminal.ts",
       "default": "./src/state/terminal.ts"
+    },
+    "./state/thread-history": {
+      "types": "./src/state/threadHistory.ts",
+      "default": "./src/state/threadHistory.ts"
+    },
+    "./state/thread-history-presentation": {
+      "types": "./src/state/threadHistoryPresentation.ts",
+      "default": "./src/state/threadHistoryPresentation.ts"
+    },
+    "./state/thread-history-storage": {
+      "types": "./src/state/threadHistoryStorage.ts",
+      "default": "./src/state/threadHistoryStorage.ts"
+    },
+    "./assistant-presentation": {
+      "types": "./src/assistantPresentation.ts",
+      "default": "./src/assistantPresentation.ts"
+    },
+    "./external-notification-presentation": {
+      "types": "./src/externalNotificationPresentation.ts",
+      "default": "./src/externalNotificationPresentation.ts"
     },
     "./state/threads": {
       "types": "./src/state/threads.ts",
@@ -442,6 +470,62 @@
     "./model-traits": {
       "types": "./src/modelTraits.ts",
       "default": "./src/modelTraits.ts"
+    },
+    "./project-work": {
+      "types": "./src/projectWork.ts",
+      "default": "./src/projectWork.ts"
+    },
+    "./state/mcp-catalog": {
+      "types": "./src/state/mcpCatalog.ts",
+      "default": "./src/state/mcpCatalog.ts"
+    },
+    "./state/skills": {
+      "types": "./src/state/skills.ts",
+      "default": "./src/state/skills.ts"
+    },
+    "./state/managedTextResources": {
+      "types": "./src/state/managedTextResources.ts",
+      "default": "./src/state/managedTextResources.ts"
+    },
+    "./state/managedResources": {
+      "types": "./src/state/managedResources.ts",
+      "default": "./src/state/managedResources.ts"
+    },
+    "./skills": {
+      "types": "./src/skills/skillCatalog.ts",
+      "default": "./src/skills/skillCatalog.ts"
+    },
+    "./managedTextResources": {
+      "types": "./src/managedTextResources/managedTextResources.ts",
+      "default": "./src/managedTextResources/managedTextResources.ts"
+    },
+    "./state/project-terminals": {
+      "types": "./src/state/projectTerminals.ts",
+      "default": "./src/state/projectTerminals.ts"
+    },
+    "./composer-managed-resources": {
+      "types": "./src/composerManagedResources.ts",
+      "default": "./src/composerManagedResources.ts"
+    },
+    "./resource-actions": {
+      "types": "./src/resourceActions.ts",
+      "default": "./src/resourceActions.ts"
+    },
+    "./project-terminal-view": {
+      "types": "./src/projectTerminalView.ts",
+      "default": "./src/projectTerminalView.ts"
+    },
+    "./composerIssueItems": {
+      "types": "./src/composerIssueItems.ts",
+      "default": "./src/composerIssueItems.ts"
+    },
+    "./state/assistants": {
+      "types": "./src/state/assistants.ts",
+      "default": "./src/state/assistants.ts"
+    },
+    "./state/external-notifications": {
+      "types": "./src/state/externalNotificationCommands.ts",
+      "default": "./src/state/externalNotificationCommands.ts"
     }
   },
   "scripts": {

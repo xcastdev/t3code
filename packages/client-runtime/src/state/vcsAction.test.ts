@@ -540,12 +540,20 @@ describe("vcsActionState", () => {
           { actionId: successfulTransportActionId, cwd, action, threadId, projectId },
         ]);
 
+        const reviewedPush = { branchRef: "refs/heads/main", commitSha: "a".repeat(40) };
         const failedResult = yield* Effect.promise(() =>
           manager.runStackedAction(targetKey).run(registry, {
             actionId: failedActionId,
-            action,
+            action: "push",
+            reviewedPush,
           }),
         );
+        expect(rpcInputs[1]).toEqual({
+          actionId: failedTransportActionId,
+          cwd,
+          action: "push",
+          reviewedPush,
+        });
 
         expect(AsyncResult.isFailure(failedResult)).toBe(true);
         expect(registry.get(manager.stateAtom(targetKey))).toMatchObject({

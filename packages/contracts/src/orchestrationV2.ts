@@ -325,7 +325,37 @@ export const OrchestrationV2IdentityCapabilities = Schema.Struct({
 });
 export type OrchestrationV2IdentityCapabilities = typeof OrchestrationV2IdentityCapabilities.Type;
 
+export const OrchestrationV2InstructionSnapshot = Schema.Struct({
+  configurationHash: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  resourceRevision: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  memoryEpoch: NonNegativeInt,
+  memoryContextHash: Schema.optional(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u))),
+  roleInstructions: Schema.String.check(Schema.isMaxLength(32_000)),
+  toolIds: Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(256))).check(
+    Schema.isMaxLength(64),
+  ),
+  skillIds: Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(256))).check(
+    Schema.isMaxLength(64),
+  ),
+});
+export type OrchestrationV2InstructionSnapshot = typeof OrchestrationV2InstructionSnapshot.Type;
+
+export const OrchestrationV2EffectiveInstructions = Schema.Struct({
+  configurationHash: TrimmedNonEmptyString,
+  resourceRevision: TrimmedNonEmptyString,
+  memoryEpoch: NonNegativeInt,
+});
+export type OrchestrationV2EffectiveInstructions = typeof OrchestrationV2EffectiveInstructions.Type;
+
+export const OrchestrationV2InstructionDeliveryCapabilities = Schema.Struct({
+  mode: Schema.Literals(["session", "turn", "unsupported"]),
+  supportsSessionReplacement: Schema.Boolean,
+});
+export type OrchestrationV2InstructionDeliveryCapabilities =
+  typeof OrchestrationV2InstructionDeliveryCapabilities.Type;
+
 export const OrchestrationV2ProviderCapabilities = Schema.Struct({
+  instructionDelivery: Schema.optional(OrchestrationV2InstructionDeliveryCapabilities),
   sessions: OrchestrationV2SessionCapabilities,
   threads: OrchestrationV2ThreadCapabilities,
   turns: OrchestrationV2TurnCapabilities,
@@ -534,6 +564,7 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
 export const OrchestrationV2Run = Schema.Struct({
+  effectiveInstructions: Schema.optional(OrchestrationV2EffectiveInstructions),
   id: RunId,
   threadId: ThreadId,
   ordinal: PositiveInt,
@@ -754,6 +785,8 @@ export const OrchestrationV2CheckpointScope = Schema.Struct({
 export type OrchestrationV2CheckpointScope = typeof OrchestrationV2CheckpointScope.Type;
 
 export const OrchestrationV2ProviderSession = Schema.Struct({
+  instructionRuntimeId: Schema.optional(TrimmedNonEmptyString),
+  effectiveInstructions: Schema.optional(OrchestrationV2EffectiveInstructions),
   id: ProviderSessionId,
   driver: ProviderDriverKind,
   providerInstanceId: ProviderInstanceId,
@@ -945,6 +978,9 @@ export const OrchestrationV2ContextHandoff = Schema.Struct({
   status: Schema.Literals(["pending", "ready", "failed", "superseded"]),
   summaryMessageId: Schema.NullOr(MessageId),
   summaryText: Schema.String,
+  protectedHistoryOmissions: Schema.optional(Schema.Boolean),
+  memoryEpoch: Schema.optional(NonNegativeInt),
+  memoryContextHash: Schema.optional(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u))),
   history: Schema.optional(
     Schema.Struct({
       messages: Schema.Array(OrchestrationV2HistoricalMessage),
@@ -2784,6 +2820,21 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
+    retainedOwner: Schema.optional(
+      Schema.NullOr(
+        Schema.Struct({
+          projectId: ProjectId,
+          threadId: ThreadId,
+          bindingId: Schema.String,
+          rootId: Schema.String,
+          generation: Schema.Number,
+          fence: Schema.Number,
+          expiresAt: Schema.NullOr(Schema.String),
+          runId: RunId,
+          runAttemptId: RunAttemptId,
+        }),
+      ),
+    ),
     notification: Schema.optional(OrchestrationV2Notification),
     ...OrchestrationV2CreationFields,
     scheduledTaskId: Schema.optional(ScheduledTaskId),
@@ -3008,6 +3059,24 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread.history.fork"),
+    ...OrchestrationV2CreationFields,
+    commandId: CommandId,
+    sourceThreadId: ThreadId,
+    targetThreadId: ThreadId,
+    archiveId: Schema.String,
+    title: Schema.optional(TrimmedNonEmptyString),
+    createdAt: Schema.optional(Schema.DateTimeUtc),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.notice.append"),
+    commandId: CommandId,
+    projectId: ProjectId,
+    threadId: ThreadId,
+    turnItemId: TurnItemId,
+    notification: OrchestrationV2Notification,
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request-watch.sync"),
     commandId: CommandId,

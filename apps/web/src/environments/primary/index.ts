@@ -23,6 +23,7 @@ export {
 export { usePrimarySessionState } from "./sessionState";
 
 export {
+  DesktopAttachmentUnavailableError,
   DesktopEnvironmentBootstrapIncompleteError,
   PrimaryEnvironmentProtocolUnsupportedError,
   PrimaryEnvironmentUrlInvalidError,

@@ -746,6 +746,11 @@ export const layer: Layer.Layer<
             if (input.writeIfProviderThreadOwner !== undefined) {
               const ownerResult = yield* eventSink
                 .writeIfProviderThreadOwner({
+                  providerEventOrigin: {
+                    threadId: input.threadId,
+                    providerSessionId: input.providerSessionId,
+                    ...(input.runId === undefined ? {} : { runId: input.runId }),
+                  },
                   guardPendingUserInputCancellations: true,
                   ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                   ...input.writeIfProviderThreadOwner,
@@ -757,6 +762,11 @@ export const layer: Layer.Layer<
             if (input.writeIfRunCurrent === undefined) {
               return yield* eventSink
                 .write({
+                  providerEventOrigin: {
+                    threadId: input.threadId,
+                    providerSessionId: input.providerSessionId,
+                    ...(input.runId === undefined ? {} : { runId: input.runId }),
+                  },
                   guardPendingUserInputCancellations: true,
                   ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                   events,
@@ -765,6 +775,11 @@ export const layer: Layer.Layer<
             }
             const result = yield* eventSink
               .writeIfRunCurrent({
+                providerEventOrigin: {
+                  threadId: input.threadId,
+                  providerSessionId: input.providerSessionId,
+                  ...(input.runId === undefined ? {} : { runId: input.runId }),
+                },
                 guardPendingUserInputCancellations: true,
                 ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
                 threadId: input.threadId,

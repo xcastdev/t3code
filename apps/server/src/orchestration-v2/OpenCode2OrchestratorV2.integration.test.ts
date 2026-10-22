@@ -298,6 +298,80 @@ const runScenario = (input: {
   });
 
 describe("OpenCode 2 through the orchestrator", () => {
+  it.effect.each([true, false])("external work termination when explicit Stop=%s", (explicitStop) =>
+    Effect.gen(function* () {
+      const name = `opencode2-external-explicit-stop-${explicitStop}`;
+      const cwd = yield* checkpointWorkspace(name);
+      const thread = threadCommands({ name, worktreePath: cwd });
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const runId = ids.derive.run({ threadId: thread.threadId, ordinal: 1 });
+      const stop: OrchestrationV2Command = {
+        type: "thread.stop",
+        commandId: thread.command("stop"),
+        threadId: thread.threadId,
+      };
+      const transcript = yield* OpenCode2OrchestratorReplayHarness.decodeTranscript({
+        provider: OPENCODE_PROVIDER,
+        protocol: OPENCODE2_HTTP_PROTOCOL,
+        version: "2.0.18",
+        scenario: name,
+        entries: [
+          ...createdSession(cwd, name),
+          ...instructionsWritten,
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          reply("session.prompt", {
+            data: {
+              id: "msg_running",
+              sessionID: SESSION,
+              time: { created: 1 },
+              type: "user",
+              payload: { text: "<prompt>" },
+              delivery: "steer",
+            },
+          }),
+          ...(explicitStop
+            ? [
+                out("session.interrupt", { sessionID: SESSION }),
+                reply("session.interrupt", { interrupted: true }),
+                out("session.list", { parentID: SESSION }),
+                reply("session.list", { data: [], cursor: {} }),
+                event("session.execution.interrupted", { sessionID: SESSION }),
+              ]
+            : []),
+        ],
+      });
+      const result = yield* runOrchestratorV2ProviderReplayScenario(
+        {
+          name,
+          transcript,
+          commands: [thread.create, thread.message("start"), ...(explicitStop ? [stop] : [])],
+          steps: [
+            { type: "dispatch", command: thread.create },
+            { type: "advance_clock", duration: "1 millis" },
+            { type: "dispatch", command: thread.message("start") },
+            { type: "await_run_steerable", threadId: thread.threadId, runId },
+            ...(explicitStop
+              ? [
+                  { type: "dispatch" as const, command: stop },
+                  { type: "await_thread_idle" as const, threadId: thread.threadId },
+                ]
+              : []),
+          ],
+        },
+        OpenCode2OrchestratorReplayHarness,
+      ).pipe(provideDeterministicTestRuntime);
+      const projection = result.projections.get(thread.threadId)!;
+      assert.deepEqual(
+        projection.runs.map((run) => run.status),
+        [explicitStop ? "interrupted" : "running"],
+      );
+      assert.equal(
+        projection.providerTurns.some((turn) => turn.status === "running"),
+        !explicitStop,
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.merge(NodeServices.layer, IdAllocator.layer))),
+  );
+
   it.effect.each(["message", "thread settings"] as const)(
     "switches the session's model before the next prompt when changed from the %s",
     (via) =>

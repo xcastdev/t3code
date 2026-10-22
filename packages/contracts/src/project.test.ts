@@ -144,6 +144,7 @@ effectIt.effect("project favicon paths accept only supported image files", () =>
 const decodeStoredIcon = Schema.decodeUnknownEffect(StoredProjectIcon);
 const decodeReceivedIcon = Schema.decodeUnknownEffect(ReceivedProjectIcon);
 const decodeProjectShell = Schema.decodeUnknownEffect(OrchestrationProjectShell);
+const encodeProjectShell = Schema.encodeEffect(OrchestrationProjectShell);
 
 effectIt.effect("reads monograms stored in the pre-v2 fallback shape", () =>
   Effect.gen(function* () {
@@ -176,4 +177,24 @@ effectIt.effect("an icon kind from a newer server shows the default icon", () =>
     const broken = yield* Effect.exit(decodeReceivedIcon({ kind: "emoji" }));
     assert.strictEqual(broken._tag, "Failure");
   }),
+);
+
+effectIt.effect(
+  "project shells accept older servers without ownership and retain an assistant owner",
+  () =>
+    Effect.gen(function* () {
+      const project = {
+        id: "project-ownership",
+        title: "Project",
+        workspaceRoot: "/tmp/project",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      assert.strictEqual((yield* decodeProjectShell(project)).assistantId, undefined);
+      const owned = yield* decodeProjectShell({ ...project, assistantId: "assistant-owner" });
+      assert.strictEqual(owned.assistantId, "assistant-owner");
+      assert.strictEqual((yield* encodeProjectShell(owned)).assistantId, "assistant-owner");
+    }),
 );

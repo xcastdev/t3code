@@ -22,6 +22,7 @@ import {
   THREAD_HISTORY_PAGE_POLICY,
 } from "./threadHistoryPaging.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
+import { threadShellFromProjection } from "./ProjectionStore.ts";
 
 const NOW = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
 const THREAD = ThreadId.make("thread-1");
@@ -176,6 +177,62 @@ function makeProjection(visibleTurnItems: OrchestrationV2ProjectedTurnItem[]) {
 }
 
 describe("threadHistoryPaging", () => {
+  it("keeps shell payloads independent of stored transcript size beyond the history page", () => {
+    const rows = Array.from({ length: THREAD_HISTORY_PAGE_POLICY.maxItems + 1 }, (_, index) =>
+      makeRow(index),
+    );
+    const messages = rows.map((row, index) => ({
+      id: MessageId.make(`message-${index}`),
+      threadId: THREAD,
+      runId: null,
+      nodeId: null,
+      role: "user" as const,
+      text: "Short prompt",
+      attachments: [],
+      streaming: false,
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      createdAt: NOW,
+      updatedAt: row.item.updatedAt,
+    }));
+    const short = {
+      ...makeProjection(rows),
+      runs: [],
+      attempts: [],
+      runtimeRequests: [],
+      messages,
+    };
+    const largeRows = rows.map((row) => ({
+      ...row,
+      item: {
+        ...row.item,
+        ...(row.item.type === "command_execution"
+          ? { output: "private-command-detail".repeat(8_192) }
+          : {}),
+      },
+    }));
+    const large = {
+      ...short,
+      messages: messages.map((message) => ({
+        ...message,
+        text: "private-memory-and-transcript".repeat(8_192),
+      })),
+      turnItems: largeRows.map((row) => row.item),
+      visibleTurnItems: largeRows,
+    };
+
+    const shell = threadShellFromProjection(large);
+    expect(shell).toEqual(threadShellFromProjection(short));
+    expect(shell.visibleItemCount).toBe(rows.length);
+    expect(JSON.stringify(shell)).not.toContain("private-command-detail");
+    expect(JSON.stringify(shell)).not.toContain("private-memory-and-transcript");
+    expect(shell.latestUserMessageAt).toEqual(NOW);
+    const bounded = buildBoundedThreadProjection({ projection: large, snapshotSequence: 1 });
+    expect(bounded.hasMoreHistory).toBe(true);
+    expect(bounded.projection.visibleTurnItems.length).toBeLessThan(rows.length);
+    expect(large.turnItems[0]).toHaveProperty("output", "private-command-detail".repeat(8_192));
+  });
+
   it("keeps background turns with user turns, with main's 150-turn fan-out ceiling", () => {
     const items = Array.from({ length: 161 }, (_, turn) => {
       const row = makeRow(turn * 2);

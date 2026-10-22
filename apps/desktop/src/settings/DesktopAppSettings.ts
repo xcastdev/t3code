@@ -1,4 +1,5 @@
 import {
+  EnvironmentId,
   DesktopServerExposureModeSchema,
   DesktopUpdateChannelSchema,
   type DesktopServerExposureMode,
@@ -25,7 +26,10 @@ import {
 import { resolveDefaultDesktopUpdateChannel } from "../updates/updateChannels.ts";
 import { isValidDistroName } from "../wsl/wslPathParsing.ts";
 
+import { parseDesktopAttachedBackendEndpoints } from "../backend/DesktopAttachedBackendEndpoints.ts";
+
 export interface DesktopSettings {
+  readonly primaryBackend?: DesktopPrimaryBackendPreference;
   readonly localEnvironmentEnabled: boolean;
   readonly linuxPasswordStore: LinuxPasswordStorePreference;
   readonly mainWindowBounds: DesktopWindowBounds | null;
@@ -41,6 +45,20 @@ export interface DesktopSettings {
   // chosen once at layer init.
   readonly wslOnly: boolean;
 }
+
+export type DesktopPrimaryBackendPreference =
+  | { readonly mode: "managed" }
+  | {
+      readonly mode: "attached";
+      readonly httpBaseUrl: string;
+      readonly wsBaseUrl: string;
+      readonly environmentId: EnvironmentId;
+      readonly attachmentRevision: string;
+      readonly label: string;
+      readonly encryptedBearerToken: string;
+      readonly bearerExpiresAt: string;
+    }
+  | { readonly mode: "invalid-attached"; readonly reason: string };
 
 export interface DesktopSettingsChange {
   readonly settings: DesktopSettings;
@@ -87,6 +105,7 @@ const DesktopWindowBoundsDocument = Schema.Struct({
 });
 
 const DesktopSettingsDocument = Schema.Struct({
+  primaryBackend: Schema.optionalKey(Schema.Unknown),
   localEnvironmentEnabled: Schema.optionalKey(Schema.Boolean),
   linuxPasswordStore: Schema.optionalKey(Schema.Unknown),
   mainWindowBounds: Schema.optionalKey(Schema.NullOr(DesktopWindowBoundsDocument)),
@@ -110,6 +129,59 @@ const decodeDesktopSettingsJson = Schema.decodeEffect(DesktopSettingsJson);
 const encodeDesktopSettingsJson = Schema.encodeEffect(DesktopSettingsJson);
 const decodeDesktopWindowBounds = Schema.decodeUnknownOption(DesktopWindowBoundsSchema);
 const desktopWindowBoundsEquivalence = Schema.toEquivalence(DesktopWindowBoundsSchema);
+
+const isEnvironmentId = Schema.is(EnvironmentId);
+
+const invalidPrimaryBackend = (reason: string): DesktopPrimaryBackendPreference => ({
+  mode: "invalid-attached",
+  reason,
+});
+
+export function normalizePrimaryBackendPreference(
+  value: unknown,
+  now: number,
+): DesktopPrimaryBackendPreference {
+  if (value === undefined) return { mode: "managed" };
+  if (typeof value !== "object" || value === null) {
+    return invalidPrimaryBackend("Stored attached backend settings are invalid.");
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.mode === "managed") return { mode: "managed" };
+  if (candidate.mode !== "attached") {
+    return invalidPrimaryBackend("Stored attached backend settings have an unknown mode.");
+  }
+  const fields = [
+    "httpBaseUrl",
+    "wsBaseUrl",
+    "label",
+    "encryptedBearerToken",
+    "attachmentRevision",
+    "bearerExpiresAt",
+  ] as const;
+  if (
+    !fields.every((field) => typeof candidate[field] === "string" && candidate[field].length > 0) ||
+    !isEnvironmentId(candidate.environmentId)
+  ) {
+    return invalidPrimaryBackend("Stored attached backend settings are incomplete.");
+  }
+  const endpoints = parseDesktopAttachedBackendEndpoints(
+    candidate.httpBaseUrl as string,
+    candidate.wsBaseUrl as string,
+  );
+  const expiresAt = Date.parse(candidate.bearerExpiresAt as string);
+  if (endpoints === null || !Number.isFinite(expiresAt) || expiresAt <= now) {
+    return invalidPrimaryBackend("Stored attached backend settings are invalid.");
+  }
+  return {
+    mode: "attached",
+    ...endpoints,
+    environmentId: candidate.environmentId,
+    attachmentRevision: candidate.attachmentRevision as string,
+    label: candidate.label as string,
+    encryptedBearerToken: candidate.encryptedBearerToken as string,
+    bearerExpiresAt: candidate.bearerExpiresAt as string,
+  };
+}
 
 const settingsChange = (settings: DesktopSettings, changed: boolean): DesktopSettingsChange => ({
   settings,
@@ -142,6 +214,9 @@ export class DesktopSettingsWriteError extends Schema.TaggedError<DesktopSetting
 export class DesktopAppSettings extends Context.Service<
   DesktopAppSettings,
   {
+    readonly setPrimaryBackendPreference?: (
+      preference: DesktopPrimaryBackendPreference,
+    ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
     readonly load: Effect.Effect<DesktopSettings>;
     readonly get: Effect.Effect<DesktopSettings>;
     readonly setLocalEnvironmentEnabled: (
@@ -216,6 +291,9 @@ function normalizeDesktopSettingsDocument(
     (parsed.wslBackendEnabled === undefined && parsed.wslMode === "wsl");
 
   return {
+    ...(parsed.primaryBackend === undefined
+      ? {}
+      : { primaryBackend: normalizePrimaryBackendPreference(parsed.primaryBackend, 0) }),
     localEnvironmentEnabled: parsed.localEnvironmentEnabled !== false,
     linuxPasswordStore: normalizeLinuxPasswordStorePreference(parsed.linuxPasswordStore),
     mainWindowBounds,
@@ -239,6 +317,8 @@ function toDesktopSettingsDocument(
   defaults: DesktopSettings,
 ): DesktopSettingsDocument {
   const document: Mutable<DesktopSettingsDocument> = {};
+  if (settings.primaryBackend?.mode !== "managed")
+    document.primaryBackend = settings.primaryBackend;
 
   if (settings.localEnvironmentEnabled !== defaults.localEnvironmentEnabled) {
     document.localEnvironmentEnabled = settings.localEnvironmentEnabled;
@@ -514,6 +594,8 @@ export const make = Effect.gen(function* () {
     });
 
   return DesktopAppSettings.of({
+    setPrimaryBackendPreference: (primaryBackend) =>
+      persist((settings) => ({ ...settings, primaryBackend })),
     get: SynchronizedRef.get(settingsRef),
     load: Effect.gen(function* () {
       const settings = yield* readSettings(
@@ -594,6 +676,8 @@ export const layerTest = (initialSettings: DesktopSettings = DEFAULT_DESKTOP_SET
         });
 
       return DesktopAppSettings.of({
+        setPrimaryBackendPreference: (primaryBackend) =>
+          update((settings) => ({ ...settings, primaryBackend })),
         get: SynchronizedRef.get(settingsRef),
         load: SynchronizedRef.get(settingsRef),
         setMainWindowBounds: (bounds, isMaximized) =>

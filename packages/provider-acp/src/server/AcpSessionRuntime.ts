@@ -2109,13 +2109,16 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
     activationOptions?: AcpSessionActivationOptions,
   ): ReadonlyArray<EffectAcpSchema.McpServer> => {
     const acpServers = activationOptions?.acpMcpServers ?? options.acpMcpServers ?? [];
-    if (
-      initializeResult.agentCapabilities?.mcpCapabilities?.acp === true &&
-      acpServers.length > 0
-    ) {
-      return acpServers;
-    }
-    return activationOptions?.mcpServers ?? options.mcpServers ?? [];
+    const servers =
+      initializeResult.agentCapabilities?.mcpCapabilities?.acp === true && acpServers.length > 0
+        ? acpServers
+        : (activationOptions?.mcpServers ?? options.mcpServers ?? []);
+    // Catalog installation must not break chat on v2 agents without stdio MCP.
+    // Preserve the built-in bridge's existing compatibility behavior.
+    return initializeResult.protocolVersion === 1 ||
+      initializeResult.agentCapabilities?.mcpCapabilities?.stdio === true
+      ? servers
+      : servers.filter((server) => server.name !== "t3_catalog");
   };
 
   const startOnce = Effect.gen(function* () {

@@ -196,6 +196,38 @@ function withFakeClaudeEnv<A, E, R>(
 }
 
 it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
+  it.effect("extracts memory facts with native auth outside the checkout", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({
+          structured_output: {
+            facts: [
+              {
+                key: "storage",
+                body: "SQLite is authoritative.",
+                quote: "SQLite is authoritative.",
+              },
+            ],
+          },
+        }),
+        cwdMustNotBe: process.cwd(),
+        argsMustContain: "--tools  --disable-slash-commands",
+        stdinMustContain: "untrusted data",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const result = yield* textGeneration.extractMemoryFacts({
+            cwd: process.cwd(),
+            sourceText: "SQLite is authoritative.",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+            },
+          });
+          expect(result.facts[0]?.key).toBe("storage");
+        }),
+    ),
+  );
   it.effect(
     "keeps canonical built-in capabilities when a custom model collides with its alias",
     () =>

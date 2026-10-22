@@ -38,6 +38,7 @@ import { runtime } from "../../lib/runtime";
 import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
 import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
 import { SettingsRow } from "./components/SettingsRow";
+import { ExternalNotificationsSection } from "./ExternalNotificationsSection";
 import { SettingsSection } from "./components/SettingsSection";
 import { SettingsSwitchRow } from "./components/SettingsSwitchRow";
 import { SettingsScreen } from "./components/SettingsScreen";
@@ -66,6 +67,8 @@ export function SettingsNotificationsRouteScreen() {
           <Text className="text-base text-foreground-muted">
             Notifications require T3 Connect in this app build.
           </Text>
+          {/* Server-side webhooks don't depend on T3 Connect. */}
+          <ExternalNotificationsSection />
         </ScrollView>
       </SettingsScreen>
     );
@@ -464,6 +467,7 @@ function ConfiguredSettingsNotificationsRouteScreen() {
             />
           ) : null}
         </SettingsSection>
+        <ExternalNotificationsSection />
       </ScrollView>
     </SettingsScreen>
   );

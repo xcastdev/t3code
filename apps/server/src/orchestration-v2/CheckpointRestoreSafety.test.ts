@@ -18,6 +18,7 @@ import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
+import * as ThreadHistoryArchive from "./ThreadHistoryArchiveService.ts";
 import { isCheckpointRestoreIsolated } from "./CheckpointRestoreSafety.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { CheckpointServiceV2 } from "./CheckpointService.ts";
@@ -92,6 +93,14 @@ it.effect.each([
       runsToRollback: [{ id: "later-run", ordinal: 1, status: "completed", rootNodeId: null }],
     } as unknown as ProjectionCheckpointRollbackContext;
     const layerTest = CheckpointRollbackService.layer.pipe(
+      Layer.provide(
+        Layer.mock(ThreadHistoryArchive.ThreadHistoryArchiveService)({
+          prepareIntent: () => Effect.void,
+          prepare: () => Effect.void,
+          beginExternal: () => Effect.void,
+          completeExternal: () => Effect.void,
+        }),
+      ),
       Layer.provide(
         Layer.mergeAll(
           NodeServices.layer,

@@ -3,7 +3,9 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as ThreadHistoryArchive from "./ThreadHistoryArchiveService.ts";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import { resolveAttachmentPathById } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
@@ -45,6 +47,8 @@ export const layer = Layer.effect(
     const fileSystem = yield* FileSystem.FileSystem;
     const config = yield* ServerConfig.ServerConfig;
     const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
+    const archives = yield* ThreadHistoryArchive.ThreadHistoryArchiveService;
+    const sql = yield* SqlClient.SqlClient;
     return {
       cleanupScheduledTasks: (threadId: ThreadId) =>
         scheduledTasks
@@ -74,22 +78,49 @@ export const layer = Layer.effect(
       cleanupAttachments: (attachmentIds: ReadonlyArray<string>) =>
         Effect.forEach(
           attachmentIds,
-          (attachmentId) => {
-            const path = resolveAttachmentPathById({
-              attachmentsDir: config.attachmentsDir,
-              attachmentId,
-            });
-            return path === null
-              ? Effect.void
-              : fileSystem
-                  .remove(path, { force: true })
-                  .pipe(
-                    Effect.mapError(
-                      (cause) =>
-                        new ResourceCleanupError({ operation: "attachment", attachmentId, cause }),
-                    ),
-                  );
-          },
+          Effect.fn("ResourceCleanup.cleanupAttachment")(function* (attachmentId: string) {
+            return yield* sql
+              .withTransaction(
+                Effect.gen(function* () {
+                  yield* sql`UPDATE t3_workflow_v2_history_archives SET state=state WHERE 0`;
+                  if (
+                    yield* archives.isAttachmentRetained(attachmentId).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ResourceCleanupError({
+                            operation: "attachment",
+                            attachmentId,
+                            cause,
+                          }),
+                      ),
+                    )
+                  )
+                    return;
+                  const path = resolveAttachmentPathById({
+                    attachmentsDir: config.attachmentsDir,
+                    attachmentId,
+                  });
+                  return yield* path === null
+                    ? Effect.void
+                    : fileSystem.remove(path, { force: true }).pipe(
+                        Effect.mapError(
+                          (cause) =>
+                            new ResourceCleanupError({
+                              operation: "attachment",
+                              attachmentId,
+                              cause,
+                            }),
+                        ),
+                      );
+                }),
+              )
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ResourceCleanupError({ operation: "attachment", attachmentId, cause }),
+                ),
+              );
+          }),
           { discard: true, concurrency: 4 },
         ),
     };

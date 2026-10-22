@@ -7,7 +7,11 @@ import { T3_CODE_ORCHESTRATION_INSTRUCTIONS } from "@t3tools/provider-core/serve
 export const PI_T3_MCP_EXTENSION_FILENAME = "pi-t3-mcp-extension.ts";
 
 export const T3_MCP_URL_ENV = "T3_MCP_URL";
+export const T3_MCP_CATALOG_CONFIG_ENV = "T3_MCP_CATALOG_CONFIG";
+export const T3_PI_CATALOG_APPLIED_PREFIX = "t3-code:catalog-applied:";
 export const T3_MCP_BEARER_ENV = "T3_MCP_BEARER_TOKEN";
+export const T3_PI_INSTRUCTIONS_ENV = "T3_PI_INSTRUCTIONS";
+export const T3_PI_INSTRUCTIONS_APPLIED_PREFIX = "t3-code:instructions-applied:";
 export const T3_PI_RUNTIME_MODE_ENV = "T3_PI_RUNTIME_MODE";
 export const T3_PI_MCP_EXTENSION_PATH_ENV = "T3_PI_MCP_EXTENSION_PATH";
 
@@ -24,7 +28,11 @@ import * as NodePath from "node:path";
 import { Type } from "typebox";
 
 const URL_ENV = ${JSON.stringify(T3_MCP_URL_ENV)};
+const CATALOG_CONFIG_ENV = ${JSON.stringify(T3_MCP_CATALOG_CONFIG_ENV)};
+const CATALOG_APPLIED_PREFIX = ${JSON.stringify(T3_PI_CATALOG_APPLIED_PREFIX)};
 const TOKEN_ENV = ${JSON.stringify(T3_MCP_BEARER_ENV)};
+const INSTRUCTIONS_ENV = ${JSON.stringify(T3_PI_INSTRUCTIONS_ENV)};
+const INSTRUCTIONS_APPLIED_PREFIX = ${JSON.stringify(T3_PI_INSTRUCTIONS_APPLIED_PREFIX)};
 const RUNTIME_MODE_ENV = ${JSON.stringify(T3_PI_RUNTIME_MODE_ENV)};
 const EXTENSION_PATH_ENV = ${JSON.stringify(T3_PI_MCP_EXTENSION_PATH_ENV)};
 const ORCHESTRATION_INSTRUCTIONS = ${JSON.stringify(T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim())};
@@ -158,7 +166,7 @@ function isMcpToolError(result: unknown): boolean {
   );
 }
 
-function createMcpClient(endpoint: string, token: string) {
+function createMcpClient(endpoint: string, token: string, strict = false) {
   let nextId = 1;
   let sessionId: string | undefined;
 
@@ -190,8 +198,16 @@ function createMcpClient(endpoint: string, token: string) {
     if (!response.ok) {
       throw new Error(\`MCP \${method} failed (\${response.status}): \${body.slice(0, 400)}\`);
     }
-    if (body.length === 0) return undefined;
+    if (body.length === 0) {
+      if (strict) throw new Error(\`MCP \${method} returned no JSON-RPC response.\`);
+      return undefined;
+    }
     const parsed = parseSseOrJson(body, response.headers.get("content-type") ?? "");
+    if (strict && (parsed === null || typeof parsed !== "object" ||
+      !("jsonrpc" in parsed) || parsed.jsonrpc !== "2.0" || parsed.id !== id ||
+      !("result" in parsed) || parsed.result === null || typeof parsed.result !== "object" || Array.isArray(parsed.result))) {
+      throw new Error(\`MCP \${method} returned an invalid JSON-RPC response.\`);
+    }
     if (parsed.error) {
       throw new Error(parsed.error.message ?? \`MCP \${method} returned an error\`);
     }
@@ -199,17 +215,20 @@ function createMcpClient(endpoint: string, token: string) {
   };
 
   const notify = async (method: string, params?: unknown, signal?: AbortSignal) => {
-    await fetch(endpoint, {
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: headers(),
       body: JSON.stringify({ jsonrpc: "2.0", method, params }),
       signal,
     });
+    if (strict && !response.ok) {
+      throw new Error(\`MCP \${method} failed (\${response.status}).\`);
+    }
   };
 
   return {
     async connect(signal?: AbortSignal) {
-      await request(
+      const initialized = await request(
         "initialize",
         {
           protocolVersion: PROTOCOL,
@@ -218,7 +237,15 @@ function createMcpClient(endpoint: string, token: string) {
         },
         signal,
       );
-      await notify("notifications/initialized", {}, signal).catch(() => undefined);
+      if (strict && (initialized === null || typeof initialized !== "object" || Array.isArray(initialized) ||
+        typeof initialized.protocolVersion !== "string" || initialized.protocolVersion.length === 0 ||
+        initialized.capabilities === null || typeof initialized.capabilities !== "object" || Array.isArray(initialized.capabilities) ||
+        initialized.serverInfo === null || typeof initialized.serverInfo !== "object" || Array.isArray(initialized.serverInfo) ||
+        typeof initialized.serverInfo.name !== "string" || typeof initialized.serverInfo.version !== "string")) {
+        throw new Error("MCP initialize returned an invalid result.");
+      }
+      const notification = notify("notifications/initialized", {}, signal);
+      await (strict ? notification : notification.catch(() => undefined));
     },
     async listTools(signal?: AbortSignal) {
       const tools: McpTool[] = [];
@@ -229,6 +256,12 @@ function createMcpClient(endpoint: string, token: string) {
           cursor === undefined ? {} : { cursor },
           signal,
         )) as { tools?: McpTool[]; nextCursor?: string } | undefined;
+        if (strict && (!Array.isArray(result?.tools) || result.tools.some((tool) =>
+          tool === null || typeof tool !== "object" || typeof tool.name !== "string" || tool.name.length === 0 ||
+          tool.inputSchema === null || typeof tool.inputSchema !== "object" || Array.isArray(tool.inputSchema)) ||
+          (result.nextCursor !== undefined && typeof result.nextCursor !== "string"))) {
+          throw new Error("MCP tools/list returned an invalid result.");
+        }
         tools.push(...(result?.tools ?? []));
         cursor = result?.nextCursor;
       } while (cursor);
@@ -333,6 +366,32 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
     }
   });
 
+  let reconcileBeforeAgentStart: (ctx: ExtensionContext) => void | Promise<void> = (_ctx) => {};
+  const managedInstructions = env(INSTRUCTIONS_ENV);
+  const snapshot = managedInstructions === undefined ? undefined : JSON.parse(managedInstructions);
+  // Keep leading slash commands native; role text belongs in the system prompt.
+  // This hook also runs when the optional MCP bridge is unavailable.
+  pi.on("before_agent_start", async (event, ctx) => {
+    await reconcileBeforeAgentStart(ctx);
+    const guidance = [
+      ...(env(URL_ENV) !== undefined && env(TOKEN_ENV) !== undefined ? [ORCHESTRATION_INSTRUCTIONS] : []),
+      ...(snapshot === undefined ? [] : [snapshot.roleInstructions]),
+    ].join("\\n\\n");
+    if (guidance.length === 0 && snapshot === undefined) return;
+    const sections = event.systemPromptOptions?.sections;
+    const result = sections && typeof sections === "object" && event.systemPromptOptions?.forceSystemPrompt === undefined
+      ? (sections.t3_code_orchestration = guidance, undefined)
+      : { systemPrompt: event.systemPrompt + "\\n\\n" + guidance };
+    if (snapshot !== undefined) {
+      ctx.ui.notify(INSTRUCTIONS_APPLIED_PREFIX + JSON.stringify({
+        configurationHash: snapshot.configurationHash,
+        resourceRevision: snapshot.resourceRevision,
+        memoryEpoch: snapshot.memoryEpoch,
+      }), "info");
+    }
+    return result;
+  });
+
   const endpoint = env(URL_ENV);
   const token = env(TOKEN_ENV);
   if (endpoint === undefined || token === undefined) {
@@ -435,29 +494,61 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
     if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
   };
 
+  const catalogConfigText = env(CATALOG_CONFIG_ENV);
+  const catalogConfig = catalogConfigText === undefined ? undefined : JSON.parse(catalogConfigText);
+  const catalogClient = catalogConfig === undefined ? undefined : createMcpClient(catalogConfig.catalogEndpoint, token, true);
+  let catalogConnected = false;
+  // Pi catalog discovery is session-scoped. Revision changes replace the
+  // runtime, so a cached connection must never acknowledge a newer config.
+  const reconcileCatalog = async (ctx: ExtensionContext) => {
+    if (catalogClient === undefined || catalogConnected) return;
+    try {
+      const signal = AbortSignal.timeout(10_000);
+      await catalogClient.connect(signal);
+      const tools = await catalogClient.listTools(signal);
+      for (const tool of tools) {
+        pi.registerTool({
+          name: "mcp__t3_catalog__" + tool.name,
+          label: tool.name,
+          description: tool.description ?? tool.name,
+          parameters: jsonSchemaToTypebox(tool.inputSchema),
+          ...(supportsExposure ? { outputSchema: mcpOutputSchema(tool), exposure: "direct" } : {}),
+          async execute(_toolCallId, params, callSignal) {
+            const result = await catalogClient.callTool(tool.name, (params ?? {}) as Record<string, unknown>, callSignal);
+            return {
+              content: mcpModelContent(result),
+              structuredContent: mcpScriptResult(result),
+              details: { server: "t3_catalog", tool: tool.name },
+              ...(isMcpToolError(result) ? { isError: true } : {}),
+            };
+          },
+        });
+      }
+      catalogConnected = true;
+      ctx.ui.notify(CATALOG_APPLIED_PREFIX + catalogConfigText, "info");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(\`t3_catalog MCP unavailable: \${message}\`, "warning");
+    }
+  };
+
+  reconcileBeforeAgentStart = async (ctx) => {
+    reconcileDiscovery(ctx);
+    await reconcileCatalog(ctx);
+  };
+
   // Tree navigation restores its saved loadout after session_start.
   pi.on("session_tree", (_event, ctx) => reconcileDiscovery(ctx));
   pi.on("model_select", (_event, ctx) => reconcileDiscovery(ctx));
   pi.on("session_start", async (_event, ctx) => {
     reconcileDiscovery(ctx);
+    await reconcileCatalog(ctx);
     try {
       await ensureStarted();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(\`t3-code MCP unavailable: \${message}\`, "warning");
     }
-  });
-
-  // Keep guidance in the system prompt so leading slash commands still expand.
-  pi.on("before_agent_start", (event, ctx) => {
-    reconcileDiscovery(ctx);
-    const sections = event.systemPromptOptions?.sections;
-    if (sections && typeof sections === "object" && event.systemPromptOptions?.forceSystemPrompt === undefined) {
-      // A full prompt override bypasses Pi's later section rendering.
-      sections.t3_code_orchestration = ORCHESTRATION_INSTRUCTIONS;
-      return undefined;
-    }
-    return { systemPrompt: event.systemPrompt + "\\n\\n" + ORCHESTRATION_INSTRUCTIONS };
   });
 }
 `;

@@ -176,6 +176,9 @@ function SettingsIndexSections() {
           />
         ) : null}
         <SettingsRow icon="folder" label="Organization" target="SettingsOrganization" />
+        <SettingsRow icon="checkmark.circle" label="Work" target="SettingsWork" />
+        <SettingsRow icon="person.crop.circle" label="Agents" target="SettingsAgents" />
+        <SettingsRow icon="sparkles" label="Skills and commands" target="SettingsResources" />
         <SettingsRow icon="text.bubble" label="Thread behavior" target="SettingsThreads" />
         <SettingsRow icon="arrow.turn.left.up" label="Follow-ups" target="SettingsFollowUp" />
         <SettingsRow icon="archivebox" label="Archived Threads" target="SettingsArchive" />

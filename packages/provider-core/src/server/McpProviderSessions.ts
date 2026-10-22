@@ -30,6 +30,25 @@ const hashHtml = (html: string) => NodeCrypto.createHash("sha256").update(html).
 export class McpProviderSessions extends Context.Service<
   McpProviderSessions,
   {
+    readonly beginCatalogEndpointInstallation: (config: McpProviderSessionConfig) => Effect.Effect<{
+      readonly acknowledge: Effect.Effect<void>;
+      readonly invalidate: Effect.Effect<void>;
+    }>;
+    readonly onCatalogEndpointAcknowledged: (
+      listener: (config: McpProviderSessionConfig) => Effect.Effect<void>,
+    ) => Effect.Effect<() => void>;
+    readonly acknowledgeCatalogEndpoint: (config: McpProviderSessionConfig) => Effect.Effect<void>;
+    readonly readCatalogEndpointReceipt: (
+      threadId: ThreadId,
+    ) => Effect.Effect<McpProviderSessionConfig | undefined>;
+    readonly replaceIfCurrent: (
+      expected: {
+        readonly threadId: ThreadId;
+        readonly providerSessionId: string;
+        readonly nativeRuntimeId?: string;
+      },
+      replacement?: McpProviderSessionConfig,
+    ) => Effect.Effect<boolean>;
     readonly set: (config: McpProviderSessionConfig) => Effect.Effect<void>;
     readonly read: (threadId: ThreadId) => Effect.Effect<McpProviderSessionConfig | undefined>;
     readonly clear: (threadId: ThreadId) => Effect.Effect<void>;
@@ -78,11 +97,119 @@ const matchingPageIndex = (
 };
 
 const make = Effect.gen(function* () {
+  const catalogInstallations = new Map<ThreadId, symbol>();
+  const catalogListeners = new Set<(config: McpProviderSessionConfig) => Effect.Effect<void>>();
+  const catalogReceipts = new Map<ThreadId, McpProviderSessionConfig>();
   const sessions = yield* Ref.make(new Map<ThreadId, McpProviderSessionConfig>());
   const htmlRenders = yield* Ref.make(new Map<ThreadId, ReadonlyArray<KeptHtmlRender>>());
+  const acknowledgeCatalogEndpoint = Effect.fn("McpProviderSessions.acknowledgeCatalogEndpoint")(
+    function* (config: McpProviderSessionConfig) {
+      const accepted = yield* Ref.modify(sessions, (current) => {
+        const actual = current.get(config.threadId);
+        const matches = Boolean(
+          config.catalogEndpoint &&
+          config.nativeRuntimeId &&
+          actual?.providerSessionId === config.providerSessionId &&
+          actual.nativeRuntimeId === config.nativeRuntimeId &&
+          actual.catalogEndpoint === config.catalogEndpoint &&
+          actual.catalogRevision === config.catalogRevision,
+        );
+        if (matches) catalogReceipts.set(config.threadId, config);
+        return [matches, current] as const;
+      });
+      if (accepted) for (const listener of catalogListeners) yield* listener(config);
+    },
+  );
   return McpProviderSessions.of({
+    beginCatalogEndpointInstallation: (config) =>
+      Effect.sync(() => {
+        const current = Ref.getUnsafe(sessions);
+        const actual = current.get(config.threadId);
+        if (
+          !actual ||
+          actual.providerSessionId !== config.providerSessionId ||
+          actual.nativeRuntimeId !== config.nativeRuntimeId ||
+          actual.catalogEndpoint !== config.catalogEndpoint ||
+          actual.catalogRevision !== config.catalogRevision
+        )
+          return { acknowledge: Effect.void, invalidate: Effect.void };
+        const generation = Symbol();
+        catalogInstallations.set(config.threadId, generation);
+        catalogReceipts.delete(config.threadId);
+        return {
+          acknowledge: Effect.suspend(() =>
+            catalogInstallations.get(config.threadId) === generation
+              ? acknowledgeCatalogEndpoint(config)
+              : Effect.void,
+          ),
+          invalidate: Effect.sync(() => {
+            if (catalogInstallations.get(config.threadId) === generation) {
+              catalogInstallations.delete(config.threadId);
+              catalogReceipts.delete(config.threadId);
+            }
+          }),
+        };
+      }),
+    onCatalogEndpointAcknowledged: (listener) =>
+      Effect.sync(() => {
+        catalogListeners.add(listener);
+        return () => {
+          catalogListeners.delete(listener);
+        };
+      }),
+    acknowledgeCatalogEndpoint,
+    replaceIfCurrent: (expected, replacement) =>
+      Ref.modify(sessions, (current) => {
+        const actual = current.get(expected.threadId);
+        if (
+          !actual ||
+          actual.providerSessionId !== expected.providerSessionId ||
+          (expected.nativeRuntimeId !== undefined &&
+            actual.nativeRuntimeId !== expected.nativeRuntimeId)
+        )
+          return [false, current] as const;
+        const next = new Map(current);
+        if (replacement) next.set(expected.threadId, replacement);
+        else next.delete(expected.threadId);
+        if (
+          !replacement ||
+          actual.providerSessionId !== replacement.providerSessionId ||
+          actual.nativeRuntimeId !== replacement.nativeRuntimeId ||
+          actual.catalogEndpoint !== replacement.catalogEndpoint
+        ) {
+          catalogReceipts.delete(expected.threadId);
+          catalogInstallations.delete(expected.threadId);
+        }
+        return [true, next] as const;
+      }).pipe(
+        Effect.tap((swapped) =>
+          swapped
+            ? Ref.update(htmlRenders, (current) => {
+                const actual = Ref.getUnsafe(sessions).get(expected.threadId);
+                if (
+                  actual?.providerSessionId !== replacement?.providerSessionId ||
+                  actual?.nativeRuntimeId !== replacement?.nativeRuntimeId
+                )
+                  return current;
+                const next = new Map(current);
+                next.delete(expected.threadId);
+                return next;
+              })
+            : Effect.void,
+        ),
+      ),
+    readCatalogEndpointReceipt: (threadId) => Effect.sync(() => catalogReceipts.get(threadId)),
     set: Effect.fn("McpProviderSessions.set")(function* (config) {
       const current = yield* Ref.get(sessions);
+      const previous = current.get(config.threadId);
+      if (
+        previous?.providerSessionId !== config.providerSessionId ||
+        previous?.nativeRuntimeId !== config.nativeRuntimeId ||
+        previous?.catalogEndpoint !== config.catalogEndpoint
+      ) {
+        catalogReceipts.delete(config.threadId);
+        catalogInstallations.delete(config.threadId);
+      }
       if (current.get(config.threadId)?.providerSessionId !== config.providerSessionId) {
         yield* Ref.update(htmlRenders, (kept) => {
           const next = new Map(kept);
@@ -94,17 +221,24 @@ const make = Effect.gen(function* () {
     }),
     read: (threadId) => Ref.get(sessions).pipe(Effect.map((current) => current.get(threadId))),
     clear: (threadId) =>
-      Ref.update(sessions, (current) => {
-        const next = new Map(current);
-        next.delete(threadId);
-        return next;
+      Effect.sync(() => {
+        catalogReceipts.delete(threadId);
+        catalogInstallations.delete(threadId);
       }).pipe(
         Effect.andThen(
-          Ref.update(htmlRenders, (current) => {
+          Ref.update(sessions, (current) => {
             const next = new Map(current);
             next.delete(threadId);
             return next;
-          }),
+          }).pipe(
+            Effect.andThen(
+              Ref.update(htmlRenders, (current) => {
+                const next = new Map(current);
+                next.delete(threadId);
+                return next;
+              }),
+            ),
+          ),
         ),
       ),
     recordHtmlRender: (threadId, input, reference) =>

@@ -6,6 +6,9 @@ export interface McpProviderSessionConfig {
   readonly providerSessionId: string;
   readonly providerInstanceId: ProviderInstanceId;
   readonly endpoint: string;
+  readonly catalogEndpoint?: string;
+  readonly catalogRevision?: number;
+  readonly nativeRuntimeId?: string;
   readonly authorizationHeader: string;
   /**
    * Adapters read it to keep developer instructions truthful: when the user

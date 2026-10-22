@@ -1,8 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { OpencodeClient, ToolPart } from "@opencode-ai/sdk/v2";
+import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2";
 import {
   CheckpointId,
+  EnvironmentId,
   NodeId,
   ProjectId,
   ProviderInstanceId,
@@ -13,6 +14,7 @@ import {
   RunId,
   MessageId,
   ThreadId,
+  type OrchestrationV2InstructionSnapshot,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
 } from "@t3tools/contracts";
@@ -144,6 +146,7 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
   suffix: string,
   nativeSessionId: string,
   client: object,
+  external = true,
 ) {
   const instanceId = ProviderInstanceId.make(`opencode-${suffix}`);
   const threadId = ThreadId.make(`thread-opencode-${suffix}`);
@@ -159,7 +162,8 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
     environment: {},
   }).pipe(
     Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, {
-      connectToOpenCodeServer: () => Effect.succeed({ url: "http://test.invalid", external: true }),
+      connectToOpenCodeServer: () =>
+        Effect.succeed({ url: "http://test.invalid", external, exitCode: null }),
       createOpenCodeSdkClient: () => client,
     } as unknown as OpenCodeRuntime.OpenCodeRuntime["Service"]),
     Effect.provideService(ProviderHost.ProviderHost, {
@@ -182,8 +186,10 @@ const makeOpenCodeRuntimeHarness = Effect.fn("makeOpenCodeRuntimeHarness")(funct
   const startTurn = (
     text = "hello",
     startProviderThread: OrchestrationV2ProviderThread = providerThread,
+    instructionSnapshot?: OrchestrationV2InstructionSnapshot,
   ) =>
     runtime.startTurn({
+      ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
       appThread: {
         id: threadId,
         projectId: ProjectId.make(`project-opencode-${suffix}`),
@@ -2307,5 +2313,443 @@ it.effect.each([false, true])(
     }).pipe(
       Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
       Effect.scoped,
+    ),
+);
+
+const managedInstructions: OrchestrationV2InstructionSnapshot = {
+  configurationHash: "config-1",
+  resourceRevision: "resources-1",
+  memoryEpoch: 0,
+  roleInstructions: "Investigate the assigned task and report evidence.",
+  toolIds: ["report"],
+  skillIds: [],
+};
+
+it.effect(
+  "external shutdown detaches active OpenCode 1 work without aborting roots or descendants",
+  () =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      yield* Effect.gen(function* () {
+        const events = asyncEventStream();
+        const harness = yield* makeOpenCodeRuntimeHarness("detach", "root", {
+          event: {
+            subscribe: async (_: unknown, options: { signal: AbortSignal }) => {
+              options.signal.addEventListener(
+                "abort",
+                () => {
+                  calls.push("unsubscribe");
+                  events.close();
+                },
+                { once: true },
+              );
+              return { stream: events.stream };
+            },
+          },
+          session: {
+            create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+            promptAsync: async () => ({ data: true }),
+            abort: async () => {
+              calls.push("abort");
+              return { data: true };
+            },
+            children: async () => {
+              calls.push("children");
+              return { data: [{ id: "child" }] };
+            },
+          },
+        });
+        assert.equal(harness.runtime.detachThreadPolicy, "detach");
+        yield* harness.startTurn();
+      }).pipe(Effect.scoped);
+      assert.deepEqual(calls, ["unsubscribe"]);
+    }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
+);
+
+it.effect.each([true, false])(
+  "OpenCode 1 explicit termination requires root and descendant confirmation, confirmed=%s",
+  (confirmed) =>
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const events = asyncEventStream();
+      const harness = yield* makeOpenCodeRuntimeHarness("termination", "root", {
+        event: { subscribe: async () => ({ stream: events.stream }) },
+        session: {
+          create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+          abort: async ({ sessionID }: { sessionID: string }) => {
+            calls.push(sessionID);
+            return { data: sessionID === "root" || confirmed };
+          },
+          children: async ({ sessionID }: { sessionID: string }) => ({
+            data: sessionID === "root" ? [{ id: "child" }] : [],
+          }),
+        },
+      });
+      if (confirmed) yield* harness.runtime.terminateSession!;
+      else
+        assert.equal(
+          (yield* harness.runtime.terminateSession!.pipe(Effect.flip))._tag,
+          "ProviderAdapterProtocolError",
+        );
+      assert.deepEqual(calls, ["root", "child"]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+    ),
+);
+
+it.effect.each([true, false])(
+  "OpenCode 1 receipts follow the actual system prompt acknowledgement, accepted=%s",
+  (accepted) =>
+    Effect.gen(function* () {
+      const events = asyncEventStream();
+      const systems: string[] = [];
+      const harness = yield* makeOpenCodeRuntimeHarness("instructions", "root", {
+        event: { subscribe: async () => ({ stream: events.stream }) },
+        session: {
+          create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+          promptAsync: async ({ system }: { system: string }) => {
+            systems.push(system);
+            if (!accepted) throw new Error("rejected");
+            return { data: true };
+          },
+        },
+      });
+      assert.isUndefined(
+        yield* harness.runtime.getAppliedInstructions!({ providerThread: harness.providerThread }),
+      );
+      const start = harness.startTurn("hello", harness.providerThread, managedInstructions);
+      if (accepted) yield* start;
+      else yield* start.pipe(Effect.flip);
+      assert.equal(systems.length, 1);
+      assert.include(systems[0]!, managedInstructions.roleInstructions);
+      assert.notInclude(systems[0]!, "delegate_task");
+      const receipt = yield* harness.runtime.getAppliedInstructions!({
+        providerThread: harness.providerThread,
+      });
+      assert.deepEqual(receipt, accepted ? managedInstructions : undefined);
+      if (receipt !== undefined) {
+        assert.isTrue(Object.isFrozen(receipt));
+        assert.isTrue(Object.isFrozen(receipt.toolIds));
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+    ),
+);
+
+it.effect("OpenCode 1 applies the next revision in the next native system prompt", () =>
+  Effect.gen(function* () {
+    const events = asyncEventStream();
+    const systems: string[] = [];
+    const harness = yield* makeOpenCodeRuntimeHarness("revision", "root", {
+      event: { subscribe: async () => ({ stream: events.stream }) },
+      session: {
+        create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+        promptAsync: async ({ system }: { system: string }) => {
+          systems.push(system);
+          return { data: true };
+        },
+      },
+    });
+    yield* harness.startTurn("first", harness.providerThread, managedInstructions);
+    yield* Effect.promise(() =>
+      events.push({
+        type: "session.error",
+        properties: {
+          sessionID: "root",
+          error: { name: "UnknownError", data: { message: "first failed" } },
+        },
+      }),
+    );
+    const next = {
+      ...managedInstructions,
+      configurationHash: "config-next",
+      resourceRevision: "resources-next",
+      roleInstructions: "Apply the new role instructions.",
+    };
+    yield* harness.startTurn("second", harness.providerThread, next);
+    assert.equal(systems.length, 2);
+    assert.include(systems[1]!, next.roleInstructions);
+    assert.notInclude(systems[1]!, managedInstructions.roleInstructions);
+    assert.deepEqual(
+      yield* harness.runtime.getAppliedInstructions!({ providerThread: harness.providerThread }),
+      next,
+    );
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
+);
+
+it.effect(
+  "OpenCode 1 rejected Stop retains the active turn and never submits a replacement prompt",
+  () =>
+    Effect.gen(function* () {
+      const events = asyncEventStream();
+      let prompts = 0;
+      const harness = yield* makeOpenCodeRuntimeHarness("uncertain-stop", "root", {
+        event: { subscribe: async () => ({ stream: events.stream }) },
+        session: {
+          create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+          promptAsync: async () => {
+            prompts++;
+            return { data: true };
+          },
+          abort: async () => ({ data: false }),
+          children: async () => ({ data: [] }),
+        },
+      });
+      yield* harness.startTurn("hello", harness.providerThread, managedInstructions);
+      const active = yield* harness.runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        ),
+        Stream.runHead,
+      );
+      if (active._tag !== "Some" || active.value.type !== "provider_turn.updated")
+        throw new Error("Missing active turn");
+      yield* harness.runtime
+        .interruptTurn({
+          providerThread: harness.providerThread,
+          providerTurnId: active.value.providerTurn.id,
+          requestRuntimeRestart: true,
+        })
+        .pipe(Effect.flip);
+      yield* harness
+        .startTurn("replacement", harness.providerThread, {
+          ...managedInstructions,
+          resourceRevision: "replacement",
+        })
+        .pipe(Effect.flip);
+      assert.equal(prompts, 1);
+      assert.deepEqual(
+        yield* harness.runtime.getAppliedInstructions!({ providerThread: harness.providerThread }),
+        managedInstructions,
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+    ),
+);
+
+it.effect("OpenCode 1 clears a previous receipt before a rejected same-revision turn", () =>
+  Effect.gen(function* () {
+    const events = asyncEventStream();
+    let promptCount = 0;
+    const test = yield* makeOpenCodeRuntimeHarness("stale-review", "root", {
+      event: { subscribe: async () => ({ stream: events.stream }) },
+      session: {
+        create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+        promptAsync: async () => {
+          if (++promptCount === 2) throw new Error("rejected");
+          return { data: true };
+        },
+      },
+    });
+    yield* test.startTurn("first", test.providerThread, managedInstructions);
+    yield* Effect.promise(() =>
+      events.push({
+        type: "session.error",
+        properties: {
+          sessionID: "root",
+          error: { name: "UnknownError", data: { message: "failed" } },
+        },
+      }),
+    );
+    yield* test.startTurn("second", test.providerThread, managedInstructions).pipe(Effect.flip);
+    assert.isUndefined(
+      yield* test.runtime.getAppliedInstructions!({ providerThread: test.providerThread }),
+    );
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
+);
+it.effect(
+  "OpenCode 1 ignores an older delayed prompt acknowledgement after a newer turn starts",
+  () =>
+    Effect.gen(function* () {
+      const events = asyncEventStream();
+      let promptCount = 0;
+      const entered = promiseGate<void>();
+      const release = promiseGate<void>();
+      const test = yield* makeOpenCodeRuntimeHarness("late-review", "root", {
+        event: { subscribe: async () => ({ stream: events.stream }) },
+        session: {
+          create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+          promptAsync: async () => {
+            if (++promptCount === 1) {
+              entered.resolve();
+              await release.promise;
+            }
+            return { data: true };
+          },
+        },
+      });
+      const first = yield* test
+        .startTurn("first", test.providerThread, managedInstructions)
+        .pipe(Effect.forkScoped);
+      yield* Effect.promise(() => entered.promise);
+      yield* Effect.promise(() =>
+        events.push({
+          type: "session.error",
+          properties: {
+            sessionID: "root",
+            error: { name: "UnknownError", data: { message: "failed" } },
+          },
+        }),
+      );
+      const next = {
+        ...managedInstructions,
+        resourceRevision: "newer",
+        roleInstructions: "Do task B",
+      };
+      yield* test.startTurn("second", test.providerThread, next);
+      release.resolve();
+      yield* Fiber.join(first);
+      assert.deepEqual(
+        yield* test.runtime.getAppliedInstructions!({ providerThread: test.providerThread }),
+        next,
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+    ),
+);
+
+it.effect("OpenCode 1 clears the previous receipt for unsupported managed compaction", () =>
+  Effect.gen(function* () {
+    const events = asyncEventStream();
+    let prompts = 0;
+    const test = yield* makeOpenCodeRuntimeHarness("no-injection", "root", {
+      event: { subscribe: async () => ({ stream: events.stream }) },
+      session: {
+        create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+        promptAsync: async () => {
+          prompts++;
+          return { data: true };
+        },
+      },
+    });
+    yield* test.startTurn("first", test.providerThread, managedInstructions);
+    yield* Effect.promise(() =>
+      events.push({
+        type: "session.error",
+        properties: {
+          sessionID: "root",
+          error: { name: "UnknownError", data: { message: "first failed" } },
+        },
+      }),
+    );
+    yield* test.startTurn("/compact", test.providerThread, managedInstructions).pipe(Effect.flip);
+    assert.isUndefined(
+      yield* test.runtime.getAppliedInstructions!({ providerThread: test.providerThread }),
+    );
+    assert.equal(prompts, 1);
+  }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer))),
+);
+
+it.effect.each(["connected", "failed", "rejected", "external", "replaced"] as const)(
+  "OpenCode 1 catalog delivery uses native MCP config acknowledgement: %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const sessions = yield* McpProviderSessions.McpProviderSessions;
+      const threadId = ThreadId.make("thread-opencode-catalog");
+      const config = {
+        environmentId: EnvironmentId.make("environment"),
+        threadId,
+        providerSessionId: "mcp-catalog",
+        providerInstanceId: ProviderInstanceId.make("opencode-catalog"),
+        nativeRuntimeId: "native-runtime-catalog",
+        endpoint: "http://t3.test/mcp",
+        catalogEndpoint: "http://t3.test/mcp/catalog/mcp-catalog",
+        authorizationHeader: "Bearer test-catalog-only",
+        browserToolsAvailable: false,
+      };
+      yield* sessions.set(config);
+      const writes: Array<unknown> = [];
+      const catalogEntered = promiseGate<void>();
+      const catalogRelease = promiseGate<void>();
+      const client = createOpencodeClient({
+        baseUrl: "http://opencode.test",
+        throwOnError: true,
+        fetch: async (request, init) => {
+          const body: unknown = await new Request(request, init).json();
+          writes.push(body);
+          const catalog = writes.length === 2;
+          if (catalog && mode === "replaced") {
+            catalogEntered.resolve();
+            await catalogRelease.promise;
+          }
+          return new Response(
+            JSON.stringify({
+              [catalog ? "t3_catalog" : "t3-code"]: {
+                status: catalog && mode === "failed" ? "failed" : "connected",
+                ...(catalog && mode === "failed" ? { error: "unavailable" } : {}),
+              },
+            }),
+            {
+              status: catalog && mode === "rejected" ? 500 : 200,
+              headers: { "content-type": "application/json" },
+            },
+          );
+        },
+      });
+      const events = asyncEventStream();
+      const systems: string[] = [];
+      const opening = yield* makeOpenCodeRuntimeHarness(
+        "catalog",
+        "root",
+        {
+          mcp: client.mcp,
+          event: { subscribe: async () => ({ stream: events.stream }) },
+          session: {
+            create: async () => ({ data: { id: "root", time: { created: 1, updated: 1 } } }),
+            promptAsync: async ({ system }: { system: string }) => {
+              systems.push(system);
+              return { data: true };
+            },
+          },
+        },
+        mode === "external",
+      ).pipe(Effect.forkChild);
+      if (mode === "replaced") {
+        yield* Effect.promise(() => catalogEntered.promise);
+        yield* sessions.set({ ...config, nativeRuntimeId: "replacement-runtime" });
+        catalogRelease.resolve();
+      }
+      const harness = yield* Fiber.join(opening);
+      assert.strictEqual(
+        yield* sessions.readCatalogEndpointReceipt(threadId),
+        mode === "connected" ? config : undefined,
+      );
+      assert.deepEqual(
+        writes,
+        mode === "external"
+          ? []
+          : [
+              {
+                name: "t3-code",
+                config: {
+                  type: "remote",
+                  url: config.endpoint,
+                  headers: { Authorization: config.authorizationHeader },
+                  oauth: false,
+                },
+              },
+              {
+                name: "t3_catalog",
+                config: {
+                  type: "remote",
+                  url: config.catalogEndpoint,
+                  headers: { Authorization: config.authorizationHeader },
+                  oauth: false,
+                },
+              },
+            ],
+      );
+      yield* harness.startTurn();
+      assert.equal(systems.length, 1);
+      assert.notInclude(systems[0]!, config.authorizationHeader);
+      assert.notInclude(systems[0]!, config.catalogEndpoint);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
     ),
 );

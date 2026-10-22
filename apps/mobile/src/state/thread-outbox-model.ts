@@ -57,6 +57,7 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   dispatchMode: Schema.optional(Schema.Literals(["auto", "queue", "steer", "restart"])),
   runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: Schema.optional(ProviderInteractionMode),
+  settingsSource: Schema.optional(Schema.Literals(["agent"])),
   creation: Schema.optional(QueuedThreadCreationSchema),
   createdAt: IsoDateTime,
 });
@@ -87,6 +88,12 @@ export interface QueuedThreadMessage {
   readonly runtimeMode?: RuntimeModeType;
   readonly interactionMode?: ProviderInteractionModeType;
   /**
+   * The settings were an agent's saved configuration rather than local choices. The server
+   * rejects any change to them, so delivery keeps the mode as captured instead of applying the
+   * provider's mode-toggle normalization. A local hint only: the server still decides.
+   */
+  readonly settingsSource?: "agent";
+  /**
    * Captured at enqueue time because the drain can fire long after the tap.
    */
   readonly dispatchMode?: ComposerDispatchMode;
@@ -112,10 +119,13 @@ export function resolveQueuedThreadSettings(
   return {
     modelSelection,
     runtimeMode: message.runtimeMode ?? thread.runtimeMode,
-    interactionMode: resolveProviderInteractionMode(
-      provider,
-      message.interactionMode ?? thread.interactionMode,
-    ),
+    interactionMode:
+      message.settingsSource === "agent"
+        ? (message.interactionMode ?? thread.interactionMode)
+        : resolveProviderInteractionMode(
+            provider,
+            message.interactionMode ?? thread.interactionMode,
+          ),
   };
 }
 

@@ -473,6 +473,27 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
+  it.effect("unpacks the memory companion for every desktop archive", () =>
+    Effect.gen(function* () {
+      for (const [platform, target] of [
+        ["mac", "dmg"],
+        ["linux", "AppImage"],
+        ["win", "nsis"],
+      ] as const) {
+        const config = yield* createBuildConfig(
+          platform,
+          target,
+          "0.0.33-pr.8182.1",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        assert.include(config.asarUnpack, "**/apps/server/dist/companion/mem0_backend.py");
+      }
+    }),
+  );
+
   it.effect("omits update feeds for pull request preview builds", () =>
     Effect.gen(function* () {
       const preview = yield* createBuildConfig(
@@ -666,8 +687,20 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         }
 
         const asarPath = path.join(tempDir, "server.asar");
+        const companionRelative = "apps/server/dist/companion/mem0_backend.py";
+        yield* fs.makeDirectory(path.dirname(path.join(sourceDir, companionRelative)), {
+          recursive: true,
+        });
+        yield* fs.writeFileString(
+          path.join(sourceDir, companionRelative),
+          "print('companion fixture')",
+        );
         yield* packWindowsServerAsar({ sourceDir, asarPath, arch: "x64" });
         const unpackedRoot = `${asarPath}.unpacked`;
+        assert.equal(
+          yield* fs.readFileString(path.join(unpackedRoot, companionRelative)),
+          "print('companion fixture')",
+        );
 
         assert.isTrue(
           yield* fs.exists(

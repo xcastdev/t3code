@@ -24,8 +24,10 @@ import {
   type ThreadId,
   type ThreadLinkedPullRequest,
   type RunId,
+  type RuntimeMode,
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
 import * as DateTime from "effect/DateTime";
 import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
@@ -578,10 +580,15 @@ export function resolveComposerProviderSelection(input: {
   };
 }
 
+/**
+ * The toggle's normalization applies to local choices. An agent's saved mode is sent as
+ * configured because the server rejects any change to it.
+ */
 export function resolveComposerInteractionMode(input: {
   planModeEnabled: boolean;
   provider: Pick<ServerProvider, "showInteractionModeToggle"> | null | undefined;
   interactionMode: ProviderInteractionMode;
+  agentInteractionMode?: ProviderInteractionMode | null;
 }): { enabled: boolean; interactionMode: ProviderInteractionMode } {
   const enabled =
     input.planModeEnabled &&
@@ -589,8 +596,41 @@ export function resolveComposerInteractionMode(input: {
     input.provider.showInteractionModeToggle !== false;
   return {
     enabled,
-    interactionMode: enabled ? input.interactionMode : "default",
+    interactionMode: input.agentInteractionMode ?? (enabled ? input.interactionMode : "default"),
   };
+}
+
+interface ThreadTurnSettings {
+  readonly modelSelection: ModelSelection;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: ProviderInteractionMode;
+}
+
+/**
+ * Where a server thread's next turn takes its settings. An agent's home uses the thread's
+ * settings, which the server keeps equal to the agent's configuration, so stale local overrides
+ * are ignored. While the owner is unresolved, an override that differs from the thread could be
+ * such a conflict, so the send waits instead of guessing.
+ */
+export function resolveComposerSettingsSource(input: {
+  readonly owner: "offline" | "unknown" | "ordinary" | "canonical" | "child" | null;
+  readonly draft: {
+    readonly modelSelection: ModelSelection | null;
+    readonly runtimeMode: RuntimeMode | null;
+    readonly interactionMode: ProviderInteractionMode | null;
+  };
+  readonly thread: ThreadTurnSettings | null;
+}): "thread" | "composer" | "wait" {
+  if (input.thread === null) return "composer";
+  if (input.owner === "canonical") return "thread";
+  if (input.owner !== "unknown" && input.owner !== "offline") return "composer";
+  const { draft, thread } = input;
+  const conflicts =
+    (draft.modelSelection !== null &&
+      !modelSelectionsEqual(draft.modelSelection, thread.modelSelection)) ||
+    (draft.runtimeMode !== null && draft.runtimeMode !== thread.runtimeMode) ||
+    (draft.interactionMode !== null && draft.interactionMode !== thread.interactionMode);
+  return conflicts ? "wait" : "composer";
 }
 
 export function getAntigravitySendBlockReason(
@@ -878,11 +918,14 @@ export function shouldShowBranchMismatchBanner(input: {
 export function shouldShowPlanFollowUpPrompt(input: {
   pendingUserInputCount: number;
   interactionMode: ProviderInteractionMode;
+  /** Implementing a plan switches the mode, which an agent's configuration owns. */
+  agentOwnsInteractionMode: boolean;
   latestTurnSettled: boolean;
   hasActionableProposedPlan: boolean;
   hasComposerAttachments: boolean;
 }): boolean {
   return (
+    !input.agentOwnsInteractionMode &&
     input.pendingUserInputCount === 0 &&
     input.interactionMode === "plan" &&
     input.latestTurnSettled &&

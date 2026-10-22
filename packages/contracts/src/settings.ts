@@ -1090,7 +1090,29 @@ export const StorageCleanupSettings = Schema.Struct({
 });
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
+export const ExternalNotificationDestination = Schema.Struct({
+  id: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  name: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  kind: Schema.Literal("home-assistant"),
+  enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  webhookUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+});
+export type ExternalNotificationDestination = typeof ExternalNotificationDestination.Type;
+export const ExternalNotificationSettings = Schema.Struct({
+  destinations: Schema.Array(ExternalNotificationDestination).check(
+    Schema.isMaxLength(16),
+    Schema.makeFilter(
+      (destinations) => new Set(destinations.map(({ id }) => id)).size === destinations.length,
+      { message: "Destination IDs must be unique." },
+    ),
+  ),
+});
+export type ExternalNotificationSettings = typeof ExternalNotificationSettings.Type;
+
 export const ServerSettings = Schema.Struct({
+  externalNotifications: ExternalNotificationSettings.pipe(
+    Schema.withDecodingDefault(Effect.succeed({ destinations: [] })),
+  ),
   // Null means no client has migrated this preference yet; an empty value is
   // authoritative so another device cannot resurrect cleared preferences.
   favorites: Schema.NullOr(ModelFavorites).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
@@ -1384,6 +1406,7 @@ const ModelSelectionPatch = Schema.Struct({
 });
 
 export const ServerSettingsPatch = Schema.Struct({
+  externalNotifications: Schema.optionalKey(ExternalNotificationSettings),
   setModelFavorites: Schema.optionalKey(
     Schema.Array(Schema.Struct({ ...ModelFavorite.fields, favorite: Schema.Boolean })),
   ),

@@ -1,8 +1,10 @@
+import * as RunAdmission from "../../../orchestration-v2/RunAdmission.ts";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
+  ThreadId,
   type Project as ProjectRecord,
 } from "@t3tools/contracts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -26,8 +28,11 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as ProjectHandlers from "./handlers.ts";
 import { ProjectToolkit } from "./tools.ts";
+import { liveThreadShell } from "../../McpToolAccess.testkit.ts";
 
 const clientLaunchHarness = (input: {
+  readonly origin?: McpInvocationContext.McpThreadCaller;
+  readonly admissionCheck?: RunAdmission.RunAdmission["Service"]["check"];
   readonly runtimeModeCeiling: "approval-required" | "auto-accept-edits" | "auto" | "full-access";
   readonly launched: Array<ThreadLaunch.ThreadLaunchInput>;
   readonly workspaceRoot?: string;
@@ -39,12 +44,15 @@ const clientLaunchHarness = (input: {
     model: "claude-opus",
   };
   const layerDependencies = Layer.mergeAll(
+    Layer.mock(RunAdmission.RunAdmission)({
+      check: input.admissionCheck ?? (() => Effect.succeed({ _tag: "ordinary" })),
+    }),
     ServerSettings.layerTest(),
     NodeCrypto.layer,
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
       environmentId: EnvironmentId.make("environment"),
       requestNamespace: "client:session-1",
-      thread: undefined,
+      thread: input.origin,
       client: {
         sessionId: "session-1",
         label: "Claude Code",
@@ -53,7 +61,9 @@ const clientLaunchHarness = (input: {
       issuedAt: 0,
       capabilities: new Set(["orchestration" as const]),
     }),
-    Layer.mock(ThreadManagement.ThreadManagementService)({}),
+    Layer.mock(ThreadManagement.ThreadManagementService)({
+      getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+    }),
     Layer.mock(ThreadLaunch.ThreadLaunchService)({
       checkWorktreeBase: input.checkWorktreeBase ?? (() => Effect.void),
       launch: (launch) => {
@@ -230,5 +240,37 @@ it.effect("a launch into a new worktree creates nothing when its base ref has no
 
     expect((yield* launchFrom("main")).at(-1)?.result).toMatchObject({ projectId });
     expect(launched).toHaveLength(1);
+  }),
+);
+
+it.effect("an owned agent cannot launch a top-level thread even without a message", () =>
+  Effect.gen(function* () {
+    const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+    const threadId = ThreadId.make("thread:owned-origin");
+    const checked: Array<RunAdmission.CheckInput> = [];
+    const { dependencies } = clientLaunchHarness({
+      launched,
+      runtimeModeCeiling: "full-access",
+      origin: {
+        threadId,
+        providerSessionId: "session:owned",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      },
+      admissionCheck: (input) => {
+        checked.push(input);
+        return Effect.succeed({ _tag: "denied", reason: "owned" });
+      },
+    });
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    const result = yield* toolkit
+      .handle("t3_thread_launch", { title: "Escape", scratch: true })
+      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+    expect(result.at(-1)?.result).toMatchObject({ code: "capability_denied" });
+    expect(launched).toHaveLength(0);
+    expect(checked).toMatchObject([{ threadId, operation: "escape" }]);
   }),
 );

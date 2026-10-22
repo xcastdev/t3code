@@ -90,6 +90,45 @@ describe("connection routes", () => {
 });
 
 describe("learned routes", () => {
+  it("keeps coincident learned tunnel addresses scoped to their owning environment", () => {
+    const environments = [ENVIRONMENT_ID, EnvironmentId.make("environment-2")];
+    const reported = [{ httpBaseUrl: "https://tunnel.example.com/" }];
+    const learnedRoutes = environments.map((environmentId) => {
+      const relay = {
+        target: new RelayConnectionTarget({ environmentId, label: "Desk" }),
+        profile: Option.none(),
+      };
+      const routes = mergeLearnedRoutes({
+        entry: { ...relay, enabled: true },
+        activeRoute: relay,
+        reported,
+        allowInsecure: false,
+      });
+      expect(routes).not.toBeNull();
+      const route = routes![0]!;
+      expect(route.target.environmentId).toBe(environmentId);
+      expect(Option.getOrThrow(route.profile)).toMatchObject({
+        environmentId,
+        httpBaseUrl: "https://tunnel.example.com/",
+        wsBaseUrl: "wss://tunnel.example.com/",
+        authorization: "t3-connect",
+      });
+      expect(routesAfterRemoving(routes!, "relay")).toEqual([]);
+      expect(
+        mergeLearnedRoutes({
+          entry: entryWithRoutes({ ...relay, enabled: true }, routes!),
+          activeRoute: relay,
+          reported,
+          allowInsecure: false,
+        }),
+      ).toBeNull();
+      return route;
+    });
+    expect(connectionRouteId(learnedRoutes[0]!.target)).not.toBe(
+      connectionRouteId(learnedRoutes[1]!.target),
+    );
+  });
+
   const relayOnly: ConnectionCatalogEntry = {
     target: RELAY.target,
     profile: RELAY.profile,

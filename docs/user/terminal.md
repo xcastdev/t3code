@@ -17,6 +17,14 @@ then copy. Cmd+A on macOS and Ctrl+Shift+A elsewhere select the same output.
 Ctrl+A still moves to the beginning of shell input on Windows and Linux.
 Jump to latest in the context menu returns to the current output.
 
+## Project terminals
+
+Agents can start terminals that belong to the project rather than a thread, such as a dev
+server. Open them with **Open project terminals** in the command palette, or from a project's
+overview on mobile. Watching one never starts or stops it. Turn on **Allow typing** to send
+keystrokes, use **Fit to this window** to resize it for everyone watching, and **Stop** to end
+the process. Leaving the page leaves the process running.
+
 ## fish
 
 T3 Code starts fish with `no-query-term`, avoiding startup waits for terminal

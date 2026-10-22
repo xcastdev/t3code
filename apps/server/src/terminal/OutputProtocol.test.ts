@@ -1,6 +1,9 @@
 import { assert, describe, it } from "@effect/vitest";
 import {
   type TerminalAttachStreamEvent,
+  type ProjectTerminalAttachStreamEvent,
+  ProjectId,
+  ThreadId,
   TerminalAttachStreamEvent as TerminalAttachStreamEventSchema,
   TerminalEvent as TerminalEventSchema,
   WS_METHODS,
@@ -20,6 +23,8 @@ describe("terminal output window", () => {
   it.effect.each([
     { tag: WS_METHODS.terminalAttach, size: 1, limit: 8 },
     { tag: WS_METHODS.terminalObserve, size: 1, limit: 8 },
+    { tag: WS_METHODS.projectTerminalAttach, size: 1, limit: 8 },
+    { tag: WS_METHODS.projectTerminalAttach, size: 64 * 1024, limit: 1 },
     { tag: WS_METHODS.subscribeTerminalEvents, size: 1, limit: 8 },
     { tag: WS_METHODS.terminalAttach, size: 64 * 1024, limit: 1 },
     { tag: WS_METHODS.terminalObserve, size: 64 * 1024, limit: 1 },
@@ -359,3 +364,69 @@ describe("terminal output stream", () => {
     }).pipe(Effect.scoped),
   );
 });
+
+it.effect(
+  "a stalled project reader releases its bounded listener and resumes from the owned snapshot",
+  () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("shared-project");
+      const handle = { projectId, terminalId: "shared-terminal" };
+      const listeners = new Set<(event: ProjectTerminalAttachStreamEvent) => Effect.Effect<void>>();
+      let stopped = false;
+      const snapshot: ProjectTerminalAttachStreamEvent = {
+        type: "snapshot",
+        snapshot: {
+          terminal: {
+            ...handle,
+            generation: "generation",
+            creatingThreadId: ThreadId.make("creator"),
+            label: "Shared",
+            status: "running",
+            cols: 120,
+            rows: 30,
+            exitCode: null,
+            exitSignal: null,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+          history: "current owned history",
+          cols: 120,
+          rows: 30,
+          sequence: 10,
+        },
+      };
+      const subscribe = (
+        listener: (event: ProjectTerminalAttachStreamEvent) => Effect.Effect<void>,
+        registerCleanup: (stop: () => void) => void,
+      ) =>
+        Effect.gen(function* () {
+          listeners.add(listener);
+          const stop = () => {
+            listeners.delete(listener);
+          };
+          registerCleanup(stop);
+          yield* listener(snapshot);
+          return stop;
+        });
+      const stalled = yield* Stream.toPull(terminalOutputStream(subscribe, subscribe, 1024));
+      const healthy = yield* Stream.toPull(terminalOutputStream(subscribe, subscribe, 1024));
+      yield* stalled;
+      yield* healthy;
+      for (let sequence = 11; sequence < 15; sequence++) {
+        const event: ProjectTerminalAttachStreamEvent = {
+          type: "output",
+          handle,
+          sequence,
+          data: "x".repeat(600),
+        };
+        yield* Effect.forEach(listeners, (listener) => listener(event), { discard: true });
+        assert.deepEqual(yield* healthy, [event]);
+      }
+      assert.equal(listeners.size, 1);
+      yield* Effect.sync(() => {
+        stopped = true;
+      });
+      assert.isTrue(stopped);
+      assert.deepEqual(yield* stalled, [snapshot]);
+      assert.equal(listeners.size, 2);
+    }).pipe(Effect.scoped),
+);

@@ -75,7 +75,7 @@ import { threadContextsOutsideEnvironment } from "@t3tools/shared/composerContex
 import { COMPOSER_LAYOUT_TRANSITION, ComposerSurface } from "./ThreadComposer";
 import { ComposerCommandPopover } from "./ComposerCommandPopover";
 import { ComposerPopoverAnchor } from "./ComposerPopoverAnchor";
-import { useComposerCommandMenu } from "./use-composer-command-menu";
+import { isComposerMenuVisible, useComposerCommandMenu } from "./use-composer-command-menu";
 import {
   ComposerDictationCancelAction,
   ComposerDictationPrimaryAction,
@@ -482,6 +482,7 @@ export function NewTaskDraftScreen(props: {
     pullRequestProjectId: selectedEnvironmentServerConfig?.environment.capabilities.pullRequests
       ? (selectedProject?.id ?? null)
       : null,
+    resourceProjectId: selectedProject?.id ?? null,
     pullRequestRepository: selectedProject?.repositoryIdentity?.displayName ?? null,
     projectCwd: composerWorkspaceCwd,
     selectedProviderStatus: flow.selectedProviderStatus,
@@ -1599,6 +1600,7 @@ export function NewTaskDraftScreen(props: {
       triggerKind={composerMenu.trigger.kind}
       isLoading={composerMenu.isLoading}
       error={composerMenu.error}
+      onRetry={composerMenu.onRetry}
       onSelect={composerMenu.onSelect}
     />
   ) : null;
@@ -1609,9 +1611,7 @@ export function NewTaskDraftScreen(props: {
       }
       style={{ paddingBottom: controlsBottomPadding }}
     >
-      {!voiceInput.isBusy &&
-      composerMenu.trigger &&
-      (composerMenu.items.length > 0 || composerMenu.trigger.kind === "pull-request") ? (
+      {!voiceInput.isBusy && composerMenu.trigger && isComposerMenuVisible(composerMenu) ? (
         Platform.OS === "ios" ? (
           <View>
             <ComposerPopoverAnchor>

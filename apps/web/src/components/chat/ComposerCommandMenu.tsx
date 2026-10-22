@@ -5,18 +5,23 @@ import {
   type ProviderSkillSourceKind,
 } from "@t3tools/client-runtime/providerSkills";
 import {
+  type IssueSearchEntry,
+  type ManagedTextResourceSummary,
   type ProjectEntry,
   type ProviderDriverKind,
   type PullRequestContextMetadata,
+  type SkillManagedCatalogSummary,
   type ScopedThreadRef,
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import {
   BlocksIcon,
+  CircleDotIcon,
   FolderIcon,
   MessagesSquareIcon,
   PackageIcon,
+  ScrollTextIcon,
   SettingsIcon,
   UserRoundIcon,
   type LucideIcon,
@@ -75,6 +80,31 @@ export type ComposerCommandItem =
       id: string;
       type: "thread";
       thread: ScopedThreadRef;
+      label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "issue";
+      issue: IssueSearchEntry;
+      label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "managed-text";
+      entry: ManagedTextResourceSummary & {
+        readonly id: NonNullable<ManagedTextResourceSummary["id"]>;
+      };
+      collidesWithNative: boolean;
+      label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "managed-skill";
+      entry: SkillManagedCatalogSummary;
+      collidesWithNative: boolean;
       label: string;
       description: string;
     };
@@ -144,7 +174,9 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
                   ? "Searching workspace skills..."
                   : props.triggerKind === "pull-request"
                     ? "Finding pull request..."
-                    : "Searching workspace files..."
+                    : props.triggerKind === "issue"
+                      ? "Searching issues..."
+                      : "Searching workspace files..."
                 : (props.emptyStateText ??
                   (props.triggerKind === "skill"
                     ? "No skills found. Try / to browse provider commands."
@@ -202,6 +234,19 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
       {props.item.type === "thread" ? (
         <MessagesSquareIcon aria-hidden="true" className="size-4 shrink-0 text-secondary-label" />
       ) : null}
+      {props.item.type === "issue" ? (
+        <CircleDotIcon
+          role="img"
+          aria-label={props.item.issue.state === "open" ? "Open issue" : "Closed issue"}
+          className={cn(
+            "size-4 shrink-0",
+            props.item.issue.state === "open" ? "text-success" : "text-secondary-label",
+          )}
+        />
+      ) : null}
+      {props.item.type === "managed-text" ? (
+        <ScrollTextIcon aria-hidden="true" className="size-4 shrink-0 text-secondary-label" />
+      ) : null}
       {pullRequestPresentation ? (
         <pullRequestPresentation.Icon
           role="img"
@@ -223,6 +268,18 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
         <span className="min-w-0 flex-1 truncate text-left text-secondary-label text-xs">
           {props.item.description}
         </span>
+        {props.item.type === "managed-text" || props.item.type === "managed-skill" ? (
+          <ManagedSourceBadge
+            label={
+              props.item.type === "managed-skill"
+                ? "Managed skill"
+                : props.item.entry.kind === "command"
+                  ? "Managed command"
+                  : "Snippet"
+            }
+            collides={props.item.collidesWithNative}
+          />
+        ) : null}
         {skillSourceKind ? (
           <SkillSourceBadge
             kind={skillSourceKind}
@@ -242,6 +299,7 @@ export function composerSuggestionOptionId(listId: string, itemId: string): stri
 const LISTBOX_LABEL_BY_TRIGGER: Record<ComposerTriggerKind, string> = {
   path: "Files and folders",
   "pull-request": "Pull requests",
+  issue: "Issues",
   "slash-command": "Commands",
   skill: "Skills",
 };
@@ -271,6 +329,16 @@ function SkillSourceBadge(props: { kind: ProviderSkillSourceKind; showSkillSuffi
       <Icon aria-hidden="true" className="text-current" />
       {SKILL_SOURCE_LABEL_BY_KIND[props.kind]}
       {props.showSkillSuffix ? " Skill" : null}
+    </Badge>
+  );
+}
+
+/** Names the source so a managed item is never mistaken for the provider's same-named one. */
+function ManagedSourceBadge(props: { label: string; collides: boolean }) {
+  return (
+    <Badge className="ms-auto" variant={props.collides ? "warning" : "secondary"}>
+      {props.label}
+      {props.collides ? " · same name as provider" : null}
     </Badge>
   );
 }

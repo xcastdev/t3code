@@ -32,6 +32,13 @@ connection. Pull request diffs and provider settings keep working after the
 previous credential expires. A failed renewal affects that request; it does not
 disconnect an otherwise healthy conversation.
 
+## Attach a running server in Desktop
+
+In Desktop, open **Settings → Connections** and choose **Attach a running server** to use a T3
+Code server already running on this computer. Paste an owner pairing link from that server; the
+app restarts to connect. If you switch back with **Use bundled server**, the attached server keeps
+running with its agents and terminals. You can attach it again with a new pairing link.
+
 ## Pair over a LAN or private network
 
 Use direct pairing when the other device can reach the host's network address.

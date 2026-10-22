@@ -1,3 +1,4 @@
+import * as RunAdmission from "../orchestration-v2/RunAdmission.ts";
 import {
   EnvironmentId,
   NodeId,
@@ -30,6 +31,7 @@ import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(RunAdmission.layerOrdinary),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );

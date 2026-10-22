@@ -1,3 +1,5 @@
+import { archivedForkSource } from "./ThreadHistoryArchiveCommitGuard.ts";
+import { projectTerminalNoticeItem } from "../terminal/ProjectTerminalNotice.ts";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -277,7 +279,13 @@ function canReplayCommandReceipt(receiptThreadId: ThreadId, commandThreadId: Thr
   return receiptThreadId === commandThreadId;
 }
 
+export class OrchestratorOwnerDeadlineBusyError extends Schema.TaggedError<OrchestratorOwnerDeadlineBusyError>()(
+  "OrchestratorOwnerDeadlineBusyError",
+  { threadId: ThreadId, commandId: CommandId },
+) {}
+
 export const OrchestratorV2Error = Schema.Union([
+  OrchestratorOwnerDeadlineBusyError,
   OrchestratorDispatchError,
   OrchestratorThreadAlreadyExistsError,
   OrchestratorCommandRejectedError,
@@ -297,6 +305,16 @@ export interface OrchestratorV2DispatchResult {
 }
 
 export interface OrchestratorV2Shape {
+  readonly stopExactRun: (
+    input: import("./EventSink.ts").ExactRunStopTarget & {
+      readonly threadId: ThreadId;
+      readonly commandId: CommandId;
+    },
+  ) => Effect.Effect<void, OrchestratorV2Error>;
+  readonly stopOwnedRun: (input: {
+    readonly control: import("./RunAdmission.ts").OwnerDeadlineControl;
+    readonly commandId: CommandId;
+  }) => Effect.Effect<void, OrchestratorV2Error>;
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   readonly recoverDelegatedTasks: Effect.Effect<void>;
   readonly recoverDelegatedTask: (threadId: ThreadId, sourceRunId: RunId) => Effect.Effect<void>;
@@ -495,9 +513,11 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "delegated_task.completion-delivery.dispose":
     case "thread.created.record":
       return command.parentThreadId;
+    case "thread.notice.append":
     case "secret_request.record":
       return command.threadId;
     case "thread.fork":
+    case "thread.history.fork":
     case "thread.merge_back":
       return command.targetThreadId;
   }
@@ -1505,6 +1525,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       const commandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
+      const promotionReceipt = yield* commandReceipts.getByCommandId(commandId);
+      if (Option.isSome(promotionReceipt)) {
+        if (promotionReceipt.value.status === "rejected") {
+          return yield* new OrchestratorCommandPreviouslyRejectedError({
+            commandId,
+            commandType: "system:queued-run.promote",
+            detail: promotionReceipt.value.error ?? "Run ownership admission rejected.",
+          });
+        }
+        return;
+      }
       const now = yield* DateTime.now;
       const targetAdapter = yield* providerAdapters.get(queuedRun.providerInstanceId).pipe(
         Effect.mapError(
@@ -1923,137 +1954,144 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           session.status !== "stopped" &&
           session.status !== "error",
       );
-      yield* writeSystemEvents(
-        [
-          ...(selectionChanged
-            ? [
-                {
-                  type:
-                    queuedRun.providerInstanceId === projection.thread.providerInstanceId
-                      ? ("thread.model-selection-updated" as const)
-                      : ("thread.provider-switched" as const),
-                  threadId,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: {
-                    ...projection.thread,
+      const promoted = yield* eventSink.commitCommand({
+        commandId,
+        threadId,
+        commandType: "system:queued-run.promote",
+        acceptedAt: now,
+        events: yield* Effect.forEach(
+          [
+            ...(selectionChanged
+              ? [
+                  {
+                    type:
+                      queuedRun.providerInstanceId === projection.thread.providerInstanceId
+                        ? ("thread.model-selection-updated" as const)
+                        : ("thread.provider-switched" as const),
+                    threadId,
                     providerInstanceId: queuedRun.providerInstanceId,
-                    modelSelection: queuedRun.modelSelection,
-                    updatedAt: now,
-                  },
-                },
-              ]
-            : []),
-          ...(handoff === null || transferId === null || latestHandoffRun === undefined
-            ? []
-            : [
-                {
-                  type: "context-transfer.created" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: {
-                    id: transferId,
-                    type: "provider_handoff" as const,
-                    sourceThreadId: threadId,
-                    targetThreadId: threadId,
-                    sourcePoint: contextSourcePointForRun(projection, latestHandoffRun),
-                    basePoint:
-                      needsFullContext || targetLastCompletedRun === undefined
-                        ? null
-                        : contextSourcePointForRun(projection, targetLastCompletedRun),
-                    sourceProviderInstanceId: latestHandoffRun.providerInstanceId,
-                    targetProviderInstanceId: queuedRun.providerInstanceId,
-                    targetRunId: queuedRun.id,
-                    status: "consumed" as const,
-                    resolution: {
-                      strategy: needsFullContext
-                        ? ("portable_context" as const)
-                        : ("delta_context" as const),
-                      contextHandoffId: handoff.id,
+                    occurredAt: now,
+                    payload: {
+                      ...projection.thread,
+                      providerInstanceId: queuedRun.providerInstanceId,
+                      modelSelection: queuedRun.modelSelection,
+                      updatedAt: now,
                     },
-                    createdBy: queuedMessage.createdBy,
-                    error: null,
-                    createdAt: now,
-                    updatedAt: now,
-                    consumedAt: now,
                   },
-                },
-                {
-                  type: "context-handoff.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: handoff,
-                },
-              ]),
-          ...(legacyImportRecoveryHandoff === null
-            ? []
-            : [
-                {
-                  type: "context-handoff.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: legacyImportRecoveryHandoff,
-                },
-              ]),
-          ...(handoffTurnItem === null
-            ? []
-            : [
-                {
-                  type: "turn-item.updated" as const,
-                  threadId,
-                  runId: queuedRun.id,
-                  nodeId: rootNodeId,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: handoffTurnItem,
-                },
-              ]),
-          ...sessionsToDetach.map((session) => ({
-            type: "provider-session.detached" as const,
-            threadId,
-            driver: session.driver,
-            providerInstanceId: session.providerInstanceId,
-            occurredAt: now,
-            payload: {
-              providerSessionId: session.id,
-              detachedAt: now,
-              reason: "Provider or model selection changed.",
+                ]
+              : []),
+            ...(handoff === null || transferId === null || latestHandoffRun === undefined
+              ? []
+              : [
+                  {
+                    type: "context-transfer.created" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: {
+                      id: transferId,
+                      type: "provider_handoff" as const,
+                      sourceThreadId: threadId,
+                      targetThreadId: threadId,
+                      sourcePoint: contextSourcePointForRun(projection, latestHandoffRun),
+                      basePoint:
+                        needsFullContext || targetLastCompletedRun === undefined
+                          ? null
+                          : contextSourcePointForRun(projection, targetLastCompletedRun),
+                      sourceProviderInstanceId: latestHandoffRun.providerInstanceId,
+                      targetProviderInstanceId: queuedRun.providerInstanceId,
+                      targetRunId: queuedRun.id,
+                      status: "consumed" as const,
+                      resolution: {
+                        strategy: needsFullContext
+                          ? ("portable_context" as const)
+                          : ("delta_context" as const),
+                        contextHandoffId: handoff.id,
+                      },
+                      createdBy: queuedMessage.createdBy,
+                      error: null,
+                      createdAt: now,
+                      updatedAt: now,
+                      consumedAt: now,
+                    },
+                  },
+                  {
+                    type: "context-handoff.updated" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: handoff,
+                  },
+                ]),
+            ...(legacyImportRecoveryHandoff === null
+              ? []
+              : [
+                  {
+                    type: "context-handoff.updated" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: legacyImportRecoveryHandoff,
+                  },
+                ]),
+            ...(handoffTurnItem === null
+              ? []
+              : [
+                  {
+                    type: "turn-item.updated" as const,
+                    threadId,
+                    runId: queuedRun.id,
+                    nodeId: rootNodeId,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    occurredAt: now,
+                    payload: handoffTurnItem,
+                  },
+                ]),
+            ...sessionsToDetach.map((session) => ({
+              type: "provider-session.detached" as const,
+              threadId,
+              driver: session.driver,
+              providerInstanceId: session.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                providerSessionId: session.id,
+                detachedAt: now,
+                reason: "Provider or model selection changed.",
+              },
+            })),
+            ...executionIdentityEvents,
+            {
+              type: "provider-thread.updated",
+              threadId,
+              providerInstanceId: queuedRun.providerInstanceId,
+              occurredAt: now,
+              payload: providerThread,
             },
-          })),
-          ...executionIdentityEvents,
-          {
-            type: "provider-thread.updated",
-            threadId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: providerThread,
-          },
-          {
-            type: "turn-item.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
-          },
-          {
-            type: "run.updated",
-            threadId,
-            runId: queuedRun.id,
-            nodeId: rootNodeId,
-            providerInstanceId: queuedRun.providerInstanceId,
-            occurredAt: now,
-            payload: startingRun,
-          },
-        ],
-        [
+            {
+              type: "turn-item.updated",
+              threadId,
+              runId: queuedRun.id,
+              nodeId: rootNodeId,
+              providerInstanceId: queuedRun.providerInstanceId,
+              occurredAt: now,
+              payload: notificationTurnItem(userTurnItem, queuedMessage, projection.subagents),
+            },
+            {
+              type: "run.updated",
+              threadId,
+              runId: queuedRun.id,
+              nodeId: rootNodeId,
+              providerInstanceId: queuedRun.providerInstanceId,
+              occurredAt: now,
+              payload: startingRun,
+            },
+          ] satisfies ReadonlyArray<Omit<OrchestrationV2DomainEvent, "id">>,
+          (event) => makeSystemEvent(event),
+        ),
+        effects: [
           ...sessionsToDetach.map((session) => ({
             id: `effect:${commandId}:provider-session.detach:${session.id}`,
             commandId,
@@ -2071,7 +2109,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             request: { type: "provider-turn.start", runId: queuedRun.id },
           },
         ],
-      );
+      });
+      if (promoted.receipt.status === "rejected") {
+        return yield* new OrchestratorCommandPreviouslyRejectedError({
+          commandId,
+          commandType: "system:queued-run.promote",
+          detail: promoted.receipt.error ?? "Run ownership admission rejected.",
+        });
+      }
     },
     (effect, threadId, _options?) =>
       effect.pipe(Effect.catch((cause) => failQueuedRunStart(threadId, cause))),
@@ -3898,6 +3943,93 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: transfer,
     });
   });
+
+  const dispatchArchivedThreadFork = Effect.fn("orchestrationV2.dispatch.archivedThreadFork")(
+    function* (
+      command: Extract<OrchestrationV2ServerCommand, { readonly type: "thread.history.fork" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const archived = yield* archivedForkSource(command).pipe(mapDispatchError(command));
+      const existing = yield* projectionStore.getThread(command.targetThreadId).pipe(
+        Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(null) }),
+        Effect.mapError(
+          (cause) => new OrchestratorProjectionError({ threadId: command.targetThreadId, cause }),
+        ),
+      );
+      if (existing !== null)
+        return yield* new OrchestratorThreadAlreadyExistsError({
+          commandId: command.commandId,
+          threadId: command.targetThreadId,
+        });
+
+      const source = yield* projectionStore
+        .getThread(command.sourceThreadId)
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.sourceThreadId, cause }),
+          ),
+        );
+      if (
+        archived.thread.id !== source.id ||
+        archived.thread.projectId !== source.projectId ||
+        archived.run.threadId !== source.id ||
+        command.targetThreadId === source.id
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "Archive fork source does not match the current thread.",
+        });
+      yield* refuseAboveDispatchModeLimit(command, source.id, source);
+      const now = command.createdAt ?? (yield* DateTime.now);
+      const transferId = yield* mapDispatchError(command)(
+        idAllocator.allocate.contextTransfer({
+          sourceThreadId: source.id,
+          targetThreadId: command.targetThreadId,
+          type: "fork",
+        }),
+      );
+      const { targetThread, transfer } = yield* threadForkService
+        .plan({
+          archiveSource: { archiveId: command.archiveId },
+          sourceProjection: {
+            thread: {
+              ...archived.thread,
+              projectId: source.projectId,
+              modelSelection: source.modelSelection,
+              providerInstanceId: source.providerInstanceId,
+              worktreePath: source.worktreePath,
+              branch: source.branch,
+            },
+          },
+          sourceRun: archived.run,
+          sourceProviderThread: undefined,
+          canonicalSourcePoint: { threadId: source.id, runId: archived.run.id },
+          transferId,
+          targetThreadId: command.targetThreadId,
+          ...(command.title === undefined ? {} : { title: command.title }),
+          createdBy: command.createdBy,
+          creationSource: command.creationSource,
+          createdAt: now,
+        })
+        .pipe(mapDispatchError(command));
+      const emitEvent = emit(events, command);
+      yield* emitEvent({
+        type: "thread.created",
+        threadId: command.targetThreadId,
+        providerInstanceId: targetThread.providerInstanceId,
+        occurredAt: now,
+        payload: targetThread,
+      });
+      yield* emitEvent({
+        type: "context-transfer.created",
+        threadId: command.targetThreadId,
+        providerInstanceId: archived.run.providerInstanceId,
+        occurredAt: now,
+        payload: transfer,
+      });
+    },
+  );
 
   const dispatchThreadMergeBack = Effect.fn("orchestrationV2.dispatch.threadMergeBack")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "thread.merge_back" }>,
@@ -11445,6 +11577,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.background-work.settle":
         yield* dispatchBackgroundWorkSettle(command, events, effects);
         break;
+      case "thread.history.fork":
+        yield* dispatchArchivedThreadFork(command, events);
+        break;
       case "thread.fork":
         yield* dispatchThreadFork(command, events);
         break;
@@ -11464,6 +11599,46 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.created.record":
         yield* dispatchCreatedThreadRecord(command, events);
         break;
+      case "thread.notice.append": {
+        const projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+        const project = yield* projects.get(command.projectId).pipe(mapDispatchError(command));
+        if (Option.isNone(project)) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: "The completion project no longer exists.",
+          });
+        }
+        const now = yield* DateTime.now;
+        const item = yield* Effect.try({
+          try: () =>
+            projectTerminalNoticeItem({
+              command,
+              thread: projection.thread,
+              existingItemIds: new Set(projection.turnItems.map((item) => item.id)),
+              ordinal: 0,
+              now,
+            }),
+          catch: (cause) =>
+            new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        });
+        if (item !== null) {
+          yield* emit(
+            events,
+            command,
+          )({
+            type: "turn-item.updated",
+            threadId: command.threadId,
+            occurredAt: now,
+            payload: { ...item, ordinal: yield* nextTurnItemOrdinal(projection) },
+          });
+        }
+        break;
+      }
       case "secret_request.record":
         yield* dispatchSecretRequestRecord(command, events);
         break;
@@ -11479,6 +11654,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
     command: OrchestrationV2ServerCommand,
+    ownerDeadline?: import("./RunAdmission.ts").OwnerDeadlineControl,
+    exactRunStop?: import("./EventSink.ts").ExactRunStopTarget,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     yield* Effect.annotateCurrentSpan({
       "orchestration_v2.command_id": command.commandId,
@@ -11636,6 +11813,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         threadId: commandThreadId(command),
         commandType: command.type,
         acceptedAt,
+        ...(command.type === "message.dispatch" && command.retainedOwner !== undefined
+          ? { retainedOwner: command.retainedOwner }
+          : {}),
+        ...(ownerDeadline === undefined ? {} : { ownerDeadline }),
+        ...(exactRunStop === undefined ? {} : { exactRunStop }),
         events: plan.events,
         effects: plan.effects,
         ...(plan.cancelUnsettledEffects === undefined
@@ -11675,6 +11857,113 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       storedEvents: committed.storedEvents,
     } satisfies OrchestratorV2DispatchResult;
   });
+
+  const stopExactRun: OrchestratorV2Shape["stopExactRun"] = Effect.fn("Orchestrator.stopExactRun")(
+    function* (input) {
+      yield* threadDispatch.withLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const projection = yield* projectionStore.getThreadRecords(
+            input.threadId,
+            ["runs", "providerThreads"],
+            { runIds: [input.runId] },
+          );
+          const run = projection.runs.find((candidate) => candidate.id === input.runId);
+          const providerThread = projection.providerThreads.find(
+            (candidate) => candidate.id === input.providerThreadId,
+          );
+          if (
+            run?.activeAttemptId !== input.runAttemptId ||
+            run.rootNodeId !== input.rootNodeId ||
+            run.providerThreadId !== input.providerThreadId ||
+            providerThread?.providerSessionId !== input.providerSessionId ||
+            providerThread.ownerNodeId !== input.rootNodeId ||
+            !["preparing", "starting", "running", "waiting"].includes(run.status)
+          )
+            return;
+          yield* dispatchWithReceiptEffect(
+            {
+              type: "run.interrupt",
+              commandId: input.commandId,
+              threadId: input.threadId,
+              runId: input.runId,
+              reason: "Owned native continuation is inactive.",
+            },
+            undefined,
+            input,
+          ).pipe(
+            Effect.catchTags({ OrchestratorCommandPreviouslyRejectedError: () => Effect.void }),
+          );
+        }),
+      );
+    },
+    (effect, input) =>
+      effect.pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestratorDispatchError({
+              commandId: input.commandId,
+              commandType: "owned-continuation.stop",
+              cause,
+            }),
+        ),
+      ),
+  );
+
+  const stopOwnedRun: OrchestratorV2Shape["stopOwnedRun"] = Effect.fn("Orchestrator.stopOwnedRun")(
+    function* ({ control, commandId }) {
+      const stopped = yield* threadDispatch.tryWithLock(
+        control.targetThreadId,
+        Effect.gen(function* () {
+          const projection = yield* projectionStore.getThreadRecords(control.targetThreadId, [
+            "runs",
+          ]);
+          const run = projection.runs.find((candidate) => candidate.id === control.targetRunId);
+          if (
+            run === undefined ||
+            !["queued", "preparing", "starting", "running", "waiting"].includes(run.status)
+          )
+            return;
+          yield* dispatchWithReceiptEffect(
+            run.status === "queued"
+              ? {
+                  type: "queued-run.cancel",
+                  commandId,
+                  threadId: control.targetThreadId,
+                  runId: run.id,
+                }
+              : {
+                  type: "run.interrupt",
+                  commandId,
+                  threadId: control.targetThreadId,
+                  runId: run.id,
+                  reason: "Run owner deadline expired.",
+                },
+            control,
+          ).pipe(
+            Effect.catchTags({ OrchestratorCommandPreviouslyRejectedError: () => Effect.void }),
+          );
+        }),
+      );
+      if (Option.isNone(stopped))
+        return yield* new OrchestratorOwnerDeadlineBusyError({
+          threadId: control.targetThreadId,
+          commandId,
+        });
+    },
+    (effect, input) =>
+      effect.pipe(
+        Effect.mapError((cause) =>
+          cause._tag === "OrchestratorOwnerDeadlineBusyError"
+            ? cause
+            : new OrchestratorDispatchError({
+                commandId: input.commandId,
+                commandType: "owner-deadline.stop",
+                cause,
+              }),
+        ),
+      ),
+  );
 
   // dispatchWithReceiptEffect owns the dispatch span; this wrapper selects the thread locks.
   const dispatchWithReceipt = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
@@ -11922,6 +12211,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     new OrchestratorProjectionError({ threadId: ThreadId.make("thread:shell"), cause });
 
   return OrchestratorV2.of({
+    stopExactRun,
+    stopOwnedRun,
     resumeQueuedRuns,
     recoverDelegatedTasks,
     recoverDelegatedTask,
@@ -12088,6 +12379,22 @@ export const layer: Layer.Layer<
 const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
   OrchestratorV2,
   OrchestratorV2.of({
+    stopExactRun: (input) =>
+      Effect.fail(
+        new OrchestratorDispatchError({
+          commandId: input.commandId,
+          commandType: "owned-continuation.stop",
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
+    stopOwnedRun: (input) =>
+      Effect.fail(
+        new OrchestratorDispatchError({
+          commandId: input.commandId,
+          commandType: "owner-deadline.stop",
+          cause: "Orchestration V2 live runtime is not configured.",
+        }),
+      ),
     resumeQueuedRuns: Effect.fail(
       new OrchestratorDispatchError({
         commandId: CommandId.make("command:system:resume-queued-runs"),

@@ -6,7 +6,11 @@ import * as NodeModule from "node:module";
 import * as NodeVM from "node:vm";
 import { assert, describe, it } from "@effect/vitest";
 
-import { PI_T3_MCP_EXTENSION_SOURCE } from "./mcpExtensionSource.ts";
+import {
+  T3_PI_INSTRUCTIONS_APPLIED_PREFIX,
+  T3_PI_CATALOG_APPLIED_PREFIX,
+  PI_T3_MCP_EXTENSION_SOURCE,
+} from "./mcpExtensionSource.ts";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
 
 type RequestHook = (
@@ -47,6 +51,52 @@ async function loadHooks(commands: ReadonlyArray<SkillCommand> = []) {
 }
 
 describe("Pi orchestration prompt section", () => {
+  it.each([false, true])(
+    "injects the immutable managed role through native sections without requiring MCP, missing=%s",
+    async (withoutMcp) => {
+      const snapshot = {
+        configurationHash: "config-1",
+        resourceRevision: "resources-2",
+        memoryEpoch: 0,
+        roleInstructions:
+          "You review the selected project.\nUse the report fallback when tools are unavailable.",
+        toolIds: ["report"],
+        skillIds: ["review"],
+      };
+      const bridge = await loadMcpBridge({ instructionSnapshot: snapshot, withoutMcp });
+      const hook = bridge.handlers.get("before_agent_start")!;
+      const notifications: string[] = [];
+      const context = { ui: { notify: (message: string) => notifications.push(message) } };
+      const sections: Record<string, string> = {};
+      const result = await hook(
+        { systemPrompt: "base", systemPromptOptions: { sections } },
+        context,
+      );
+      assert.isUndefined(result);
+      assert.include(sections.t3_code_orchestration!, snapshot.roleInstructions);
+      assert.equal(
+        sections.t3_code_orchestration!.includes("orchestrator_capabilities"),
+        !withoutMcp,
+      );
+      assert.deepEqual(notifications, [
+        T3_PI_INSTRUCTIONS_APPLIED_PREFIX +
+          JSON.stringify({
+            configurationHash: "config-1",
+            resourceRevision: "resources-2",
+            memoryEpoch: 0,
+          }),
+      ]);
+      const forced = await hook(
+        {
+          systemPrompt: "forced",
+          systemPromptOptions: { forceSystemPrompt: "forced", sections: {} },
+        },
+        context,
+      );
+      assert.include(forced!.systemPrompt, snapshot.roleInstructions);
+    },
+  );
+
   it.each([
     {
       name: "on Pi builds without prompt sections",
@@ -492,5 +542,163 @@ describe("Pi skill references", () => {
     } finally {
       await NodeFSP.rm(directory, { recursive: true });
     }
+  });
+});
+
+describe("Pi catalog endpoint delivery", () => {
+  const catalogConfig = JSON.stringify({
+    threadId: "thread",
+    providerSessionId: "credential",
+    nativeRuntimeId: "runtime",
+    catalogEndpoint: "http://fixture.invalid/mcp/catalog/credential",
+  });
+
+  it("connects the separate catalog with the builtin bearer and acknowledges after discovery", async () => {
+    const bridge = await loadMcpBridge({ catalogConfig });
+    const notifications: string[] = [];
+    assert.isFalse(bridge.tools.some((tool) => tool.name === "mcp__t3_catalog__project_lookup"));
+    await bridge.handlers.get("session_start")!(
+      { systemPrompt: "" },
+      { ui: { notify: (message) => notifications.push(message) } },
+    );
+    assert.isTrue(bridge.tools.some((tool) => tool.name === "mcp__t3_catalog__project_lookup"));
+    assert.isTrue(bridge.tools.some((tool) => tool.name === "mcp__t3-code__delegate_task"));
+    assert.deepEqual(notifications, [T3_PI_CATALOG_APPLIED_PREFIX + catalogConfig]);
+    assert.isTrue(
+      bridge.transports.some(
+        (transport) =>
+          transport.url.endsWith("/catalog/credential") &&
+          transport.authorization === "Bearer fixture-token",
+      ),
+    );
+  });
+
+  it.each([{ catalogFailure: true }, { withoutMcp: true }])(
+    "does not acknowledge an unavailable catalog %s",
+    async (options) => {
+      const bridge = await loadMcpBridge({ catalogConfig, ...options });
+      const notifications: string[] = [];
+      await bridge.handlers.get("session_start")!(
+        { systemPrompt: "" },
+        { ui: { notify: (message) => notifications.push(message) } },
+      );
+      assert.isFalse(
+        notifications.some((message) => message.startsWith(T3_PI_CATALOG_APPLIED_PREFIX)),
+      );
+      assert.isFalse(bridge.tools.some((tool) => tool.name.startsWith("mcp__t3_catalog__")));
+    },
+  );
+
+  it("retries a failed catalog install before the next turn", async () => {
+    const options = { catalogConfig, catalogFailure: true };
+    const bridge = await loadMcpBridge(options);
+    const notifications: string[] = [];
+    const ctx = { ui: { notify: (message: string) => notifications.push(message) } };
+    await bridge.handlers.get("session_start")!({ systemPrompt: "" }, ctx);
+    assert.isFalse(
+      notifications.some((message) => message.startsWith(T3_PI_CATALOG_APPLIED_PREFIX)),
+    );
+    options.catalogFailure = false;
+    await bridge.handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx);
+    assert.equal(notifications.at(-1), T3_PI_CATALOG_APPLIED_PREFIX + catalogConfig);
+    assert.isTrue(bridge.tools.some((tool) => tool.name === "mcp__t3_catalog__project_lookup"));
+  });
+
+  it.each([
+    {
+      method: "initialize",
+      response: () => new Response(null, { status: 204 }),
+      name: "empty initialize",
+    },
+    {
+      method: "initialize",
+      response: (id: number) => Response.json({ jsonrpc: "2.0", id, result: {} }),
+      name: "malformed initialize result",
+    },
+    {
+      method: "tools/list",
+      response: () => new Response(null, { status: 204 }),
+      name: "empty discovery",
+    },
+    {
+      method: "tools/list",
+      response: (id: number) => Response.json({ jsonrpc: "2.0", id, result: {} }),
+      name: "missing tools array",
+    },
+    {
+      method: "tools/list",
+      response: (id: number) => Response.json({ jsonrpc: "2.0", id, result: { tools: [null] } }),
+      name: "malformed tool",
+    },
+    {
+      method: "tools/list",
+      response: () => Response.json({ result: { tools: [] } }),
+      name: "missing JSON-RPC identity",
+    },
+    {
+      method: "tools/list",
+      response: (id: number) =>
+        Response.json({ jsonrpc: "2.0", id: id + 1, result: { tools: [] } }),
+      name: "wrong JSON-RPC identity",
+    },
+    {
+      method: "notifications/initialized",
+      response: () => new Response("unavailable", { status: 503 }),
+      name: "failed initialized notification",
+    },
+    {
+      method: "notifications/initialized",
+      response: (): Response => {
+        throw new Error("disconnected");
+      },
+      name: "disconnected initialized notification",
+    },
+  ])("does not acknowledge $name and retries setup", async ({ method, response }) => {
+    let failing = true;
+    const bridge = await loadMcpBridge({
+      catalogConfig,
+      catalogResponse: (request) =>
+        failing && request.method === method ? response(request.id) : undefined,
+    });
+    const notifications: string[] = [];
+    const ctx = { ui: { notify: (message: string) => notifications.push(message) } };
+    await bridge.handlers.get("session_start")!({ systemPrompt: "" }, ctx);
+    assert.isFalse(
+      notifications.some((message) => message.startsWith(T3_PI_CATALOG_APPLIED_PREFIX)),
+    );
+    assert.isFalse(bridge.tools.some((tool) => tool.name.startsWith("mcp__t3_catalog__")));
+    failing = false;
+    await bridge.handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx);
+    assert.equal(notifications.at(-1), T3_PI_CATALOG_APPLIED_PREFIX + catalogConfig);
+    assert.isTrue(bridge.tools.some((tool) => tool.name === "mcp__t3_catalog__project_lookup"));
+  });
+
+  it("acknowledges a valid empty catalog", async () => {
+    const bridge = await loadMcpBridge({
+      catalogConfig,
+      catalogResponse: (request) =>
+        request.method === "tools/list"
+          ? Response.json({ jsonrpc: "2.0", id: request.id, result: { tools: [] } })
+          : undefined,
+    });
+    const notifications: string[] = [];
+    await bridge.handlers.get("session_start")!(
+      { systemPrompt: "" },
+      { ui: { notify: (message) => notifications.push(message) } },
+    );
+    assert.deepEqual(notifications, [T3_PI_CATALOG_APPLIED_PREFIX + catalogConfig]);
+    assert.isFalse(bridge.tools.some((tool) => tool.name.startsWith("mcp__t3_catalog__")));
+  });
+
+  it("caches successful catalog discovery for the native session", async () => {
+    const bridge = await loadMcpBridge({ catalogConfig, modern: true });
+    const notifications: string[] = [];
+    const ctx = { ui: { notify: (message: string) => notifications.push(message) } };
+    await bridge.handlers.get("session_start")!({ systemPrompt: "" }, ctx);
+    const requestCount = bridge.requests.length;
+    await bridge.handlers.get("before_agent_start")!({ systemPrompt: "base" }, ctx);
+    assert.equal(bridge.requests.length, requestCount);
+    assert.deepEqual(notifications, [T3_PI_CATALOG_APPLIED_PREFIX + catalogConfig]);
+    assert.isTrue(bridge.tools.some((tool) => tool.name === "mcp__t3_catalog__project_lookup"));
   });
 });

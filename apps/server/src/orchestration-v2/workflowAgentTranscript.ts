@@ -50,15 +50,33 @@ export const WorkflowAgentTranscriptReadObserver = Context.Reference<
  * harness bookkeeping (hook output, skill listings, injected context), and a
  * line without a uuid cannot be projected idempotently.
  */
-function parseWorkflowAgentTranscriptLines(contents: string): ReadonlyArray<unknown> {
-  return contents.split("\n").flatMap((line) => {
+function parseWorkflowAgentTranscriptLines(contents: string) {
+  let omittedLines = 0;
+  const ids = new Set<string>();
+  const lines = contents.split("\n").flatMap((line) => {
     if (line.trim().length === 0) return [];
     const entry = Option.getOrUndefined(decodeJsonLine(line));
+    if (entry === undefined) {
+      omittedLines += 1;
+      return [];
+    }
     const type = text(field(entry, "type"));
     if (type !== "assistant" && type !== "user") return [];
-    if (field(entry, "isMeta") === true || text(field(entry, "uuid")) === undefined) return [];
+    if (field(entry, "isMeta") === true) return [];
+    const uuid = text(field(entry, "uuid"));
+    const content = field(field(entry, "message"), "content");
+    // Match the Claude projector: assistant blocks are arrays; user content
+    // may also be a string. A skipped malformed conversation is partial.
+    const validContent = Array.isArray(content) || (type === "user" && typeof content === "string");
+    if (uuid === undefined || uuid.trim().length === 0 || !validContent) {
+      omittedLines += 1;
+      return [];
+    }
+    if (ids.has(uuid)) return [];
+    ids.add(uuid);
     return [entry];
   });
+  return { lines, omittedLines };
 }
 
 /** Reads the complete lines written since `cursor`, and the cursor after them. */
@@ -82,7 +100,16 @@ export const readWorkflowAgentTranscript = Effect.fn("orchestration.readWorkflow
       fromOffset: input.cursor,
       ...(input.configDir === undefined ? {} : { configDir: input.configDir }),
     });
-    const lines = parseWorkflowAgentTranscriptLines(file.contents);
+    const { lines, omittedLines } = parseWorkflowAgentTranscriptLines(file.contents);
+    const skippedBytes = file.endOffset - file.startOffset > Buffer.byteLength(file.contents);
+    const reset = input.cursor.offset > 0 && file.startOffset === 0;
+    const partial =
+      file.truncated ||
+      file.incompleteLine ||
+      omittedLines > 0 ||
+      skippedBytes ||
+      file.startOffset > 0 ||
+      reset;
     yield* (yield* WorkflowAgentTranscriptReadObserver)({
       agentId: input.agentId,
       startOffset: file.startOffset,
@@ -94,6 +121,28 @@ export const readWorkflowAgentTranscript = Effect.fn("orchestration.readWorkflow
       cursor: { offset: file.endOffset, identity: file.identity },
       // More complete lines may follow past the per-read cap.
       truncated: file.truncated,
+      fidelity: partial ? ("partial" as const) : ("complete" as const),
+      omittedLines,
+      incompleteLine: file.incompleteLine,
+      skippedBytes,
+      reset,
     };
   },
 );
+
+/** Missing provider files do not erase an already retained child conversation. */
+export const readWorkflowAgentTranscriptPage = Effect.fn(
+  "orchestration.readWorkflowAgentTranscriptPage",
+)(function* (input: Parameters<typeof readWorkflowAgentTranscript>[0]) {
+  return yield* readWorkflowAgentTranscript(input).pipe(
+    Effect.map((page) => ({ availability: "available" as const, ...page })),
+    Effect.catchTags({
+      OrchestrationWorkflowFileError: (error) =>
+        error.reason === "not-found" ||
+        error.reason === "root-unavailable" ||
+        error.reason === "read-failed"
+          ? Effect.succeed({ availability: "unavailable" as const, reason: error.reason })
+          : Effect.fail(error),
+    }),
+  );
+});

@@ -2,7 +2,11 @@ import { assert, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as Effect from "effect/Effect";
 
-import { ResolvedKeybindingsConfig } from "./keybindings.ts";
+import {
+  KeybindingCommand,
+  STATIC_KEYBINDING_COMMANDS,
+  ResolvedKeybindingsConfig,
+} from "./keybindings.ts";
 
 const decode = <S extends Schema.Top>(
   schema: S,
@@ -47,6 +51,31 @@ it.effect("drops malformed resolved rule entries", () =>
     assert.deepEqual(
       parsed.map((rule) => rule.command),
       ["terminal.toggle"],
+    );
+  }),
+);
+
+it.effect("accepts the Source Control command in configured and resolved keybindings", () =>
+  Effect.gen(function* () {
+    assert.equal(STATIC_KEYBINDING_COMMANDS.includes("sourceControl.open"), true);
+    assert.equal(yield* decode(KeybindingCommand, "sourceControl.open"), "sourceControl.open");
+    const parsed = yield* decode(ResolvedKeybindingsConfig, [
+      { command: "sourceControl.open", shortcut },
+    ]);
+    assert.deepEqual(
+      parsed.map((rule) => rule.command),
+      ["sourceControl.open"],
+    );
+  }),
+);
+
+it.effect("retains Agents commands across configured and resolved keybinding decoding", () =>
+  Effect.gen(function* () {
+    assert.equal(yield* decode(KeybindingCommand, "agents.open"), "agents.open");
+    const parsed = yield* decode(ResolvedKeybindingsConfig, [{ command: "agents.open", shortcut }]);
+    assert.deepEqual(
+      parsed.map((rule) => rule.command),
+      ["agents.open"],
     );
   }),
 );

@@ -100,10 +100,68 @@ export function repositoryPathFromRemoteUrl(url: string | null): string | null {
   return path.length > 0 ? path : null;
 }
 
+export interface GuardedPublicationTarget {
+  readonly host: string;
+  readonly repository: { readonly nodeId: string; readonly nameWithOwner: string };
+  readonly account: {
+    readonly credentialFingerprint: string;
+    readonly accountId: string;
+    readonly viewer: string;
+  };
+  readonly baseRef: string;
+  readonly baseSha: string;
+  readonly headRef: string;
+  readonly headSha: string;
+  readonly headRepositoryNodeId: string;
+  readonly headSelector: string;
+}
+export interface GuardedPublicationRecord {
+  readonly nodeId: string;
+  readonly number: number;
+  readonly url: string;
+  readonly state: "OPEN" | "CLOSED" | "MERGED";
+  readonly marker: string;
+  readonly target: GuardedPublicationTarget;
+  readonly mergedAt: string | null;
+  readonly mergedCommitSha: string | null;
+}
+export interface GuardedPublicationApi {
+  readonly capture: (input: {
+    readonly cwd: string;
+    readonly context?: SourceControlProviderContext;
+    readonly baseRef: string;
+    readonly headRef: string;
+  }) => Effect.Effect<GuardedPublicationTarget, SourceControlProviderError>;
+  readonly read: (input: {
+    readonly cwd: string;
+    readonly target: GuardedPublicationTarget;
+    readonly marker: string;
+    readonly number?: number;
+  }) => Effect.Effect<ReadonlyArray<GuardedPublicationRecord>, SourceControlProviderError>;
+  readonly create: (input: {
+    readonly cwd: string;
+    readonly target: GuardedPublicationTarget;
+    readonly marker: string;
+    readonly title: string;
+    readonly body: string;
+    readonly beforeWrite?: Effect.Effect<void, SourceControlProviderError>;
+  }) => Effect.Effect<GuardedPublicationRecord, SourceControlProviderError>;
+  /** The host must condition the merge on target.headSha atomically. */
+  readonly merge: (input: {
+    readonly cwd: string;
+    readonly target: GuardedPublicationTarget;
+    readonly number: number;
+    readonly marker: string;
+    readonly method: "merge" | "squash" | "rebase";
+    readonly beforeWrite?: Effect.Effect<void, SourceControlProviderError>;
+  }) => Effect.Effect<GuardedPublicationRecord, SourceControlProviderError>;
+}
+
 export class SourceControlProvider extends Context.Service<
   SourceControlProvider,
   {
     readonly kind: SourceControlProviderKind;
+    readonly guardedPublication?: GuardedPublicationApi;
     /**
      * The caller checks the owner against what comes back, so a host that cannot search
      * `owner:branch` can drop those selectors without losing anything.

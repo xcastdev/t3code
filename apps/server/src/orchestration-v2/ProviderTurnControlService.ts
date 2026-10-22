@@ -9,7 +9,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
-import type * as DateTime from "effect/DateTime";
+import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -18,6 +18,7 @@ import * as Schema from "effect/Schema";
 
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as RunAdmission from "./RunAdmission.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
@@ -84,12 +85,15 @@ export class ProviderTurnControlServiceV2 extends Context.Service<
 export const layer: Layer.Layer<
   ProviderTurnControlServiceV2,
   never,
-  ProjectionStore.ProjectionStoreV2 | ProviderSessionManager.ProviderSessionManagerV2
+  | ProjectionStore.ProjectionStoreV2
+  | ProviderSessionManager.ProviderSessionManagerV2
+  | RunAdmission.RunAdmission
 > = Layer.effect(
   ProviderTurnControlServiceV2,
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const admission = yield* RunAdmission.RunAdmission;
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
       readonly threadId: ThreadId;
@@ -351,6 +355,50 @@ export const layer: Layer.Layer<
               operation: "steer",
               providerTurnId: input.providerTurnId,
               cause: "The persisted steering message or target run is missing.",
+            });
+          }
+          const permitted = yield* admission.check({
+            threadId: input.threadId,
+            runId: run.id,
+            operation: "continue",
+            now: DateTime.formatIso(yield* DateTime.now),
+          });
+          let ownedTargetValid = true;
+          if (permitted._tag === "admitted") {
+            const current = yield* projections.getProviderControlContext(input.threadId, input);
+            const verified =
+              loaded.providerTurn.runAttemptId == null
+                ? undefined
+                : yield* admission.check({
+                    threadId: input.threadId,
+                    runId: run.id,
+                    operation: "continue",
+                    nativeTarget: {
+                      runAttemptId: loaded.providerTurn.runAttemptId,
+                      providerThreadId: loaded.providerThread.id,
+                      providerSessionId: input.providerSessionId,
+                      providerTurnId: loaded.providerTurn.id,
+                    },
+                    now: DateTime.formatIso(yield* DateTime.now),
+                  });
+            ownedTargetValid =
+              verified?._tag === "admitted" &&
+              verified.owner.bindingId === permitted.owner.bindingId &&
+              verified.owner.generation === permitted.owner.generation &&
+              verified.owner.fence === permitted.owner.fence &&
+              verified.owner.runId === run.id &&
+              verified.owner.runAttemptId !== undefined &&
+              verified.owner.runAttemptId === loaded.providerTurn.runAttemptId &&
+              verified.owner.runAttemptId === current.providerTurn?.runAttemptId &&
+              current.providerTurn.providerThreadId === input.providerThreadId &&
+              current.providerThread?.providerSessionId === input.providerSessionId;
+          }
+          if (permitted._tag === "denied" || permitted._tag === "expired" || !ownedTargetValid) {
+            return yield* new ProviderTurnControlError({
+              threadId: input.threadId,
+              operation: "steer",
+              providerTurnId: input.providerTurnId,
+              cause: "Run ownership no longer permits steering.",
             });
           }
           yield* loaded.session.value

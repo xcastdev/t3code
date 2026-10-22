@@ -14,6 +14,16 @@ vi.mock("../../state/use-composer-drafts", () => ({
   setComposerDraftContext: vi.fn(),
 }));
 vi.mock("../../lib/uuid", () => ({ uuidv4: () => "context-id" }));
+// The hook's managed-resource and dialog wiring loads Expo; these tests cover pure helpers only.
+vi.mock("../../components/ui/Dialog", () => ({ alert: vi.fn(), confirm: vi.fn() }));
+vi.mock("../../state/query", () => ({ useEnvironmentQuery: vi.fn() }));
+vi.mock("../../state/resources", () => ({
+  issueSearchEnvironment: {},
+  managedTextEnvironment: {},
+  resourceCatalogInput: vi.fn(),
+  skillsEnvironment: {},
+  useComposerResourceSubscriptions: vi.fn(),
+}));
 vi.mock("../../state/server", () => ({
   serverEnvironment: { refreshProviders: Symbol("refreshProviders") },
 }));
@@ -23,6 +33,7 @@ vi.mock("../../state/use-atom-command", () => ({
 
 import {
   buildComposerSlashCommandItems,
+  isComposerMenuVisible,
   resolveComposerCommandSelection,
 } from "./use-composer-command-menu";
 
@@ -89,5 +100,21 @@ describe("mobile slash commands", () => {
         allowInteractionMode: false,
       }),
     ).toEqual({ text: "/plan ", cursor: 6, interactionMode: null });
+  });
+});
+
+describe("isComposerMenuVisible", () => {
+  it("shows a failed managed or issue lookup even when nothing matches", () => {
+    for (const kind of ["slash-command", "skill", "issue"]) {
+      const trigger = { kind };
+      expect(isComposerMenuVisible({ trigger, items: [], error: null })).toBe(false);
+      expect(
+        isComposerMenuVisible({ trigger, items: [], error: "Managed skills couldn't be loaded." }),
+      ).toBe(true);
+    }
+    expect(
+      isComposerMenuVisible({ trigger: { kind: "pull-request" }, items: [], error: null }),
+    ).toBe(true);
+    expect(isComposerMenuVisible({ trigger: null, items: [], error: "failed" })).toBe(false);
   });
 });

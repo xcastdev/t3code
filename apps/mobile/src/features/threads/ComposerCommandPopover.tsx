@@ -3,8 +3,11 @@ import {
   type ProviderSkillSourceKind,
 } from "@t3tools/client-runtime/providerSkills";
 import type {
+  IssueSearchEntry,
+  ManagedTextResourceSummary,
   PullRequestContextMetadata,
   ScopedThreadRef,
+  SkillManagedCatalogSummary,
   ServerProviderSkill,
   ServerProviderSlashCommand,
 } from "@t3tools/contracts";
@@ -60,6 +63,31 @@ export type ComposerCommandItem =
       readonly skill: ServerProviderSkill;
       readonly label: string;
       readonly description: string;
+    }
+  | {
+      readonly id: string;
+      readonly type: "issue";
+      readonly issue: IssueSearchEntry;
+      readonly label: string;
+      readonly description: string;
+    }
+  | {
+      readonly id: string;
+      readonly type: "managed-text";
+      readonly entry: ManagedTextResourceSummary & {
+        readonly id: NonNullable<ManagedTextResourceSummary["id"]>;
+      };
+      readonly collidesWithNative: boolean;
+      readonly label: string;
+      readonly description: string;
+    }
+  | {
+      readonly id: string;
+      readonly type: "managed-skill";
+      readonly entry: SkillManagedCatalogSummary;
+      readonly collidesWithNative: boolean;
+      readonly label: string;
+      readonly description: string;
     };
 
 interface ComposerCommandPopoverProps {
@@ -67,6 +95,8 @@ interface ComposerCommandPopoverProps {
   readonly triggerKind: ComposerTriggerKind | null;
   readonly isLoading: boolean;
   readonly error?: string | null;
+  /** Re-runs a failed lookup; the draft is untouched. */
+  readonly onRetry?: (() => void) | null;
   readonly onSelect: (item: ComposerCommandItem) => void;
 }
 
@@ -110,6 +140,12 @@ function itemIcon(item: ComposerCommandItem): AppSymbolName | null {
       return null;
     case "thread":
       return "text.bubble";
+    case "issue":
+      return "circle.inset.filled";
+    case "managed-text":
+      return item.entry.kind === "command" ? "terminal" : "text.alignleft";
+    case "managed-skill":
+      return "sparkles";
   }
 }
 
@@ -117,6 +153,8 @@ function groupLabel(triggerKind: ComposerTriggerKind | null): string | null {
   switch (triggerKind) {
     case "pull-request":
       return "Pull requests";
+    case "issue":
+      return "Issues";
     case "slash-command":
       return "Commands";
     case "skill":
@@ -135,6 +173,8 @@ function emptyText(triggerKind: ComposerTriggerKind | null, isLoading: boolean):
   switch (triggerKind) {
     case "pull-request":
       return "No matching pull requests.";
+    case "issue":
+      return "Type after #issue: to search issues.";
     case "path":
       return "No matching files or folders.";
     case "skill":
@@ -190,6 +230,23 @@ const CommandRow = memo(function CommandRow(props: {
           {props.item.description}
         </Text>
       ) : null}
+      {props.item.type === "managed-text" || props.item.type === "managed-skill" ? (
+        <Text
+          className={
+            props.item.collidesWithNative
+              ? "shrink-0 text-2xs font-t3-medium text-warning"
+              : "shrink-0 text-2xs text-foreground-muted"
+          }
+          numberOfLines={1}
+        >
+          {props.item.type === "managed-skill"
+            ? "Managed"
+            : props.item.entry.kind === "command"
+              ? "Managed"
+              : "Snippet"}
+          {props.item.collidesWithNative ? " · same name as provider" : ""}
+        </Text>
+      ) : null}
     </Pressable>
   );
 });
@@ -206,6 +263,11 @@ export const ComposerCommandPopover = memo(function ComposerCommandPopover(
           <Text className="text-3xs font-t3-bold tracking-[0.8px] uppercase text-foreground-muted">
             {label}
           </Text>
+        </View>
+      ) : null}
+      {props.items.length > 0 && props.error ? (
+        <View className="px-3.5 pb-1">
+          <Text className="text-xs text-foreground-tertiary">{props.error}</Text>
         </View>
       ) : null}
       {props.items.length > 0 ? (
@@ -231,6 +293,16 @@ export const ComposerCommandPopover = memo(function ComposerCommandPopover(
           </Text>
         </View>
       )}
+      {props.error && props.onRetry ? (
+        <Pressable
+          accessibilityRole="button"
+          className="px-3.5 pb-2.5"
+          hitSlop={8}
+          onPress={props.onRetry}
+        >
+          <Text className="text-xs font-t3-medium text-primary">Try again</Text>
+        </Pressable>
+      ) : null}
     </PopoverSurface>
   );
 });

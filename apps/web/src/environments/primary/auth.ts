@@ -20,6 +20,7 @@ import {
 } from "../../pairingUrl";
 
 import { PrimaryEnvironmentHttpClient } from "./httpClient";
+import { verifyDesktopPrimaryAttachment } from "./target";
 import { runPrimaryHttp } from "../../lib/runtime";
 
 const PrimaryEnvironmentRequestOperation = Schema.Literals([
@@ -427,6 +428,7 @@ export async function revokeOtherServerClientSessions(): Promise<number> {
 }
 
 export async function resolveInitialServerAuthGateState(): Promise<ServerAuthGateState> {
+  await verifyDesktopPrimaryAttachment();
   // An explicit pairing link replaces this browser's grant, even when the
   // current cookie or a cached gate already authenticates it. Keep that intent
   // after stripping the token, which causes the router to load this gate again.

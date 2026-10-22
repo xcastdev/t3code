@@ -1,4 +1,4 @@
-import { SourceControlProviderKind } from "@t3tools/contracts";
+import { SourceControlProviderKind, SourceControlProviderError } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -1051,3 +1051,135 @@ it.effect.each([
     );
   },
 );
+
+describe("guarded publication", () => {
+  const target = {
+    host: "github.com",
+    repository: { nodeId: "repo-id", nameWithOwner: "acme/web" },
+    account: { credentialFingerprint: "fingerprint", accountId: "1", viewer: "alice" },
+    baseRef: "main",
+    baseSha: "b".repeat(40),
+    headRef: "feature",
+    headSha: "c".repeat(40),
+    headRepositoryNodeId: "repo-id",
+    headSelector: "feature",
+  };
+  const marker = "stable_operation_marker";
+  const pull = {
+    node_id: "pull-id",
+    number: 7,
+    html_url: "https://github.com/acme/web/pull/7",
+    state: "closed",
+    body: `<!-- t3-publication:${marker} -->`,
+    merged_at: "2026-01-02T00:00:00Z",
+    merge_commit_sha: "d".repeat(40),
+    base: { ref: "main", sha: target.baseSha, repo: { node_id: "repo-id", full_name: "acme/web" } },
+    head: {
+      ref: "feature",
+      sha: target.headSha,
+      repo: { node_id: "repo-id", full_name: "acme/web" },
+    },
+  };
+  it.effect("sends the approved head as GitHub's atomic merge precondition", () => {
+    const writes: GitHubRest.GitHubRestInput[] = [];
+    return Effect.gen(function* () {
+      const provider = yield* makeProvider({
+        credential: () =>
+          Effect.succeed({ token: Redacted.make("private-token"), fingerprint: "fingerprint" }),
+        rest: (input) => {
+          if (input.path === "user") return Effect.succeed(restResponse({ id: 1, login: "alice" }));
+          if (input.path === "repos/acme/web")
+            return Effect.succeed(
+              restResponse({
+                node_id: "repo-id",
+                full_name: "acme/web",
+                permissions: { push: true },
+                allow_squash_merge: true,
+              }),
+            );
+          if (input.operation === "publicationMergeTarget")
+            return Effect.succeed(
+              restResponse({ ...pull, state: "open", merged_at: null, merge_commit_sha: null }),
+            );
+          if (input.method === "PUT") {
+            writes.push(input);
+            return Effect.succeed(restResponse({ merged: true, sha: pull.merge_commit_sha }));
+          }
+          return Effect.succeed(restResponse(pull));
+        },
+      });
+      assert(provider.guardedPublication);
+      const receipt = yield* provider.guardedPublication.merge({
+        cwd: "/repo",
+        target,
+        marker,
+        number: 7,
+        method: "squash",
+      });
+      assert.deepEqual(
+        writes.map((write) => write.body),
+        [{ sha: target.headSha, merge_method: "squash" }],
+      );
+      assert.equal(receipt.target.headSha, target.headSha);
+      assert.equal(receipt.nodeId, "pull-id");
+    });
+  });
+  it.effect("an account change refuses publication before the native write", () => {
+    const requests: GitHubRest.GitHubRestInput[] = [];
+    return Effect.gen(function* () {
+      const provider = yield* makeProvider({
+        credential: () =>
+          Effect.succeed({ token: Redacted.make("private-token"), fingerprint: "changed" }),
+        rest: (input) => {
+          requests.push(input);
+          return Effect.succeed(restResponse({ id: 2, login: "other" }));
+        },
+      });
+      assert(provider.guardedPublication);
+      const result = yield* provider.guardedPublication
+        .create({ cwd: "/repo", target, marker, title: "Title", body: "Body" })
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      assert.equal(requests.length, 0);
+    });
+  });
+  it.effect("rechecks retained human authority after native account inspection", () => {
+    const writes: GitHubRest.GitHubRestInput[] = [];
+    return Effect.gen(function* () {
+      const provider = yield* makeProvider({
+        credential: () =>
+          Effect.succeed({ token: Redacted.make("private-token"), fingerprint: "fingerprint" }),
+        rest: (input) => {
+          if (input.method === "POST") writes.push(input);
+          return Effect.succeed(
+            restResponse(
+              input.path === "user"
+                ? { id: 1, login: "alice" }
+                : { node_id: "repo-id", full_name: "acme/web" },
+            ),
+          );
+        },
+      });
+      assert(provider.guardedPublication);
+      const result = yield* provider.guardedPublication
+        .create({
+          cwd: "/repo",
+          target,
+          marker,
+          title: "Title",
+          body: "Body",
+          beforeWrite: Effect.fail(
+            new SourceControlProviderError({
+              provider: SourceControlProviderKind.make("github"),
+              operation: "createPublication",
+              cwd: "/repo",
+              detail: "Human session was revoked.",
+            }),
+          ),
+        })
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      assert.equal(writes.length, 0);
+    });
+  });
+});

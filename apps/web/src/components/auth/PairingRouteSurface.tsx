@@ -11,6 +11,7 @@ import {
   submitServerAuthCredential,
 } from "../../environments/primary";
 import { readHostedPairingRequest } from "../../hostedPairing";
+import { DesktopPrimaryBackendRecovery } from "../settings/DesktopPrimaryBackendSettings";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { StandalonePage, StandalonePageHeader } from "../ui/standalone-page";
@@ -134,6 +135,8 @@ export function PairingRouteSurface({
       <div className="mt-6 rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
         {describeSupportedMethods(auth.bootstrapMethods)}
       </div>
+
+      <DesktopPrimaryBackendRecovery />
     </StandalonePage>
   );
 }

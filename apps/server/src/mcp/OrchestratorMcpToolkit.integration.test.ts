@@ -1,3 +1,4 @@
+import * as RunAdmission from "../orchestration-v2/RunAdmission.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -157,6 +158,7 @@ const layerMemorySecretStore = Layer.sync(ServerSecretStore.ServerSecretStore, (
 const layerUnusedScheduledTaskStub = Layer.succeed(
   ScheduledTaskService.ScheduledTaskService,
   ScheduledTaskService.ScheduledTaskService.of({
+    get: () => Effect.die("ScheduledTaskService.get is unused in this test"),
     list: () => Effect.succeed({ tasks: [] }),
     subscribeList: () => Stream.succeed({ tasks: [] }),
     upsert: () => Effect.die("ScheduledTaskService.upsert is unused in this test"),
@@ -210,6 +212,7 @@ describe("orchestrator MCP toolkit", () => {
           }),
         ]);
         const layerTest = layerOrchestratorToolkit.pipe(
+          Layer.provide(RunAdmission.layerOrdinary),
           Layer.provideMerge(McpServer.McpServer.layer),
           Layer.provideMerge(layerOrchestration),
           Layer.provide(
@@ -223,6 +226,7 @@ describe("orchestrator MCP toolkit", () => {
           Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
           Layer.provideMerge(
             SecretRequests.layer.pipe(
+              Layer.provide(RunAdmission.layerOrdinary),
               Layer.provide(layerMemorySecretStore),
               Layer.provide(layerOrchestration),
             ),

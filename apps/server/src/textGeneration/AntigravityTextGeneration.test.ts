@@ -278,6 +278,24 @@ const makeFixture = Effect.fn("makeAntigravityTextGenerationFixture")(function* 
 });
 
 it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
+  it.effect("extracts facts through the selected native Antigravity model", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture({
+        outputs: [
+          '{"facts":[{"key":"storage","body":"SQLite is authoritative.","quote":"SQLite is authoritative."}]}',
+        ],
+      });
+      const result = yield* fixture.textGeneration.extractMemoryFacts({
+        cwd: fixture.projectDirectory,
+        sourceText: "SQLite is authoritative.",
+        modelSelection,
+      });
+      expect(result.facts[0]?.key).toBe("storage");
+      expect(fixture.state.selectedModels).toEqual([modelSelection.model]);
+      expect(fixture.state.workspaces).not.toContain(fixture.projectDirectory);
+      yield* fixture.assertCleaned;
+    }).pipe(Effect.scoped),
+  );
   it.effect(
     "generates all helper types in empty workspaces and removes only owned session files",
     () =>

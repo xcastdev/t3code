@@ -39,16 +39,21 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
     if (pending.length === 0 || (input.deferInline && input.inject === undefined))
       return { context: "", delivered: Effect.void, unsent: Effect.void };
     const budget = typeof input.budget === "number" ? input.budget : yield* input.budget;
-    let coverage = pending
-      .map(
-        (handoff) =>
-          `Context handoff (${handoff.strategy === "fork_delta_summary" ? "merge_back / fork_delta_summary" : handoff.strategy}):\n${
-            handoff.history?.coverage ??
-            `From thread ${handoff.threadId}, runs ${handoff.coveredRunOrdinals.from}-${handoff.coveredRunOrdinals.to}. Recover history with t3_thread_read, view=activity; paginate with afterPosition, and use itemId/textOffset for long items.`
-          }`,
-      )
-      .join("\n");
-    if (historyCost([], coverage) > Math.min(4_000, budget / 2)) {
+    const protectedHistory = pending.some((handoff) => handoff.protectedHistoryOmissions === true);
+    const protectedCoverage =
+      "Context handoff. Memory source policy omits protected history. Do not restore excluded personal information from retained history.";
+    let coverage = protectedHistory
+      ? protectedCoverage
+      : pending
+          .map(
+            (handoff) =>
+              `Context handoff (${handoff.strategy === "fork_delta_summary" ? "merge_back / fork_delta_summary" : handoff.strategy}):\n${
+                handoff.history?.coverage ??
+                `From thread ${handoff.threadId}, runs ${handoff.coveredRunOrdinals.from}-${handoff.coveredRunOrdinals.to}. Recover history with t3_thread_read, view=activity; paginate with afterPosition, and use itemId/textOffset for long items.`
+              }`,
+          )
+          .join("\n");
+    if (!protectedHistory && historyCost([], coverage) > Math.min(4_000, budget / 2)) {
       const strategies = Array.from(new Set(pending.map((handoff) => handoff.strategy)));
       coverage = `Context handoff (${strategies.join(", ")}). ${pending.length} handoff records; detailed coverage references omitted. Recover history with t3_thread_read({threadId:"${input.providerThread.appThreadId ?? pending[0]!.threadId}",view:"activity",limit:20,maxCharsPerItem:4000}); paginate with afterPosition=nextPosition. Follow fork/handoff source references in activity. For long items use itemId and textOffset=nextTextOffset until null.`;
     }
@@ -60,7 +65,7 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
         seen.add(message.itemId);
         return true;
       });
-    const oldContext = pending
+    const oldContext = (protectedHistory ? [] : pending)
       .filter((handoff) => handoff.history === undefined)
       .map((handoff) => handoff.summaryText)
       .join("\n\n");

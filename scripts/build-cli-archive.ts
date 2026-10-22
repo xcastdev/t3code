@@ -471,6 +471,11 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
     `Run \`node apps/server/scripts/cli.ts build-exe --target ${targetKey}\` first.`,
   );
   yield* requireInput(path.join(webClient, "index.html"), "Run `vp run --filter t3 build` first.");
+  const memoryCompanion = path.join(serverDir, "dist-exe/companion");
+  yield* requireInput(
+    path.join(memoryCompanion, "mem0_backend.py"),
+    "Run the server build-exe step first.",
+  );
   yield* requireInput(
     resourceMonitorDir,
     "Build the resource monitor or pass --resource-monitor-dir.",
@@ -485,6 +490,7 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
   yield* stageWebClient(webClient, path.join(contentDir, "client"));
   yield* fs.copy(resourceMonitorDir, path.join(contentDir, "resource-monitor"));
+  yield* fs.copy(memoryCompanion, path.join(contentDir, "companion"));
   yield* stageRuntimeExternals({
     repoRoot,
     stageDir: contentDir,

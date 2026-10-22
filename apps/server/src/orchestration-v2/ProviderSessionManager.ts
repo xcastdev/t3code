@@ -1,3 +1,5 @@
+import { instructionDeliveryDecision } from "./InstructionDelivery.ts";
+import { freezeInstructionSnapshot } from "@t3tools/provider-core/server/instructionSnapshot";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -12,6 +14,7 @@ import {
   ProviderSessionId,
   ThreadId,
   type ProviderThreadId,
+  type OrchestrationV2InstructionSnapshot,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -45,6 +48,7 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import { McpCatalogApplicationService } from "../mcp/McpCatalogApplicationService.ts";
 import * as EventSink from "./EventSink.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -145,6 +149,7 @@ export type ProviderSessionManagerV2Error = typeof ProviderSessionManagerV2Error
 export interface ProviderSessionManagerV2Shape {
   readonly shutdown: Effect.Effect<void>;
   readonly open: (input: {
+    readonly instructionSnapshot?: OrchestrationV2InstructionSnapshot;
     readonly threadId: ThreadId;
     readonly providerSessionId: ProviderSessionId;
     readonly modelSelection: ModelSelection;
@@ -188,6 +193,7 @@ export class ProviderSessionManagerV2 extends Context.Service<
 >()("t3/orchestration-v2/ProviderSessionManager/ProviderSessionManagerV2") {}
 
 interface LiveSessionEntry {
+  readonly instructionSnapshot?: OrchestrationV2InstructionSnapshot;
   readonly attachedThreadIds: ReadonlySet<ThreadId>;
   readonly loadedProviderThreadKeyByThread: ReadonlyMap<ThreadId, string>;
   /**
@@ -315,6 +321,7 @@ export const layerWithOptions = (
       const fileSystem = yield* FileSystem.FileSystem;
       const mcpSessionRegistry = yield* McpSessionRegistry.McpSessionRegistry;
       const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      const mcpCatalogApplications = yield* Effect.serviceOption(McpCatalogApplicationService);
       /**
        * When present, an unreadable settings file withholds browser access
        * rather than granting it — an explicit "off" silently becoming "on"
@@ -435,6 +442,7 @@ export const layerWithOptions = (
       const prepareMcpSession = (
         threadId: ThreadId,
         providerInstanceId: ProviderInstanceId,
+        freshNativeRuntime = false,
       ): Effect.Effect<PreparedMcpCredential> =>
         options.configureMcp === false
           ? mcpSessions
@@ -457,7 +465,7 @@ export const layerWithOptions = (
                 if (browserToolsAvailable) capabilities.add("preview");
                 if (deviceToolsAvailable) capabilities.add("device");
                 const existing = yield* mcpSessions.read(threadId);
-                if (existing !== undefined) {
+                if (existing !== undefined && !freshNativeRuntime) {
                   // Reserve before the async resolve so a release cannot
                   // revoke the credential between validation and reservation.
                   reserveMcpCredential(threadId, existing.providerSessionId);
@@ -484,7 +492,7 @@ export const layerWithOptions = (
                   }
                   dropMcpCredentialReservation(threadId, existing.providerSessionId);
                 }
-                yield* mcpSessionRegistry.revokeThread(threadId);
+                if (!freshNativeRuntime) yield* mcpSessionRegistry.revokeThread(threadId);
                 const credential = yield* mcpSessionRegistry.issue({
                   threadId,
                   providerInstanceId,
@@ -498,18 +506,19 @@ export const layerWithOptions = (
             );
       const clearMcpSession = (threadId: ThreadId, mcpCredentialId?: string) =>
         mcpCredentialId === undefined
-          ? mcpSessionRegistry
-              .revokeThread(threadId)
-              .pipe(Effect.tap(() => mcpSessions.clear(threadId)))
-          : mcpSessionRegistry.revokeProviderSession(mcpCredentialId).pipe(
-              Effect.tap(() =>
-                Effect.gen(function* () {
-                  if ((yield* mcpSessions.read(threadId))?.providerSessionId === mcpCredentialId) {
-                    yield* mcpSessions.clear(threadId);
-                  }
-                }),
-              ),
-            );
+          ? mcpPrepareLock.withLock(
+              threadId,
+              mcpSessionRegistry
+                .revokeThread(threadId)
+                .pipe(Effect.tap(() => mcpSessions.clear(threadId))),
+            )
+          : mcpSessionRegistry
+              .revokeProviderSession(mcpCredentialId)
+              .pipe(
+                Effect.tap(() =>
+                  mcpSessions.replaceIfCurrent({ threadId, providerSessionId: mcpCredentialId }),
+                ),
+              );
 
       const publishToSubscribers = (
         subscribers: Ref.Ref<
@@ -581,6 +590,7 @@ export const layerWithOptions = (
         readonly threadIds: Iterable<ThreadId>;
         readonly type: "provider-session.attached" | "provider-session.updated";
         readonly payload: OrchestrationV2ProviderSession;
+        readonly advanceRuntime?: true;
       }) {
         const now = yield* DateTime.now;
         const events = yield* Effect.forEach(input.threadIds, (threadId) =>
@@ -600,7 +610,21 @@ export const layerWithOptions = (
           }),
         );
         if (events.length > 0) {
-          yield* eventSink.write({ events });
+          yield* eventSink.write({
+            events,
+            ...(input.advanceRuntime === true
+              ? { advanceProviderSessionRuntime: input.runtime.providerSessionId }
+              : {}),
+            ...(input.advanceRuntime === true ||
+            input.runtime.providerSession.instructionRuntimeId === undefined
+              ? {}
+              : {
+                  expectedProviderSessionRuntime: {
+                    providerSessionId: input.runtime.providerSessionId,
+                    runtimeId: input.runtime.providerSession.instructionRuntimeId,
+                  },
+                }),
+          });
         }
       });
 
@@ -1375,12 +1399,23 @@ export const layerWithOptions = (
             if (attached !== undefined) {
               const prepared = yield* prepareMcpSession(input.threadId, input.providerInstanceId);
               preparedForCleanup = prepared;
+              if (
+                prepared.mcpCredentialId !== undefined &&
+                attached.providerSession.instructionRuntimeId !== undefined
+              ) {
+                yield* mcpSessionRegistry.bindNativeRuntime({
+                  providerSessionId: prepared.mcpCredentialId,
+                  threadId: input.threadId,
+                  providerInstanceId: input.providerInstanceId,
+                  runtimeId: attached.providerSession.instructionRuntimeId,
+                });
+              }
               if (prepared.mcpCredentialId !== undefined) {
                 const mcpCredentialId = prepared.mcpCredentialId;
                 yield* Ref.update(sessions, (current) => {
                   const key = sessionKey(input.providerSessionId);
                   const entry = current.get(key);
-                  if (entry === undefined) return current;
+                  if (entry?.runtime !== attached) return current;
                   const mcpCredentialIdByThread = new Map(entry.mcpCredentialIdByThread);
                   mcpCredentialIdByThread.set(input.threadId, mcpCredentialId);
                   const updated = new Map(current);
@@ -1389,6 +1424,11 @@ export const layerWithOptions = (
                 });
               }
               const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
+              if (entry?.runtime !== attached)
+                return yield* new ProviderSessionActivityError({
+                  providerSessionId: input.providerSessionId,
+                  cause: "Provider runtime changed during attachment.",
+                });
               if (entry !== undefined) {
                 yield* withActivityError(
                   input.providerSessionId,
@@ -1399,6 +1439,14 @@ export const layerWithOptions = (
                     payload: entry.runtime.providerSession,
                   }),
                 );
+                if (
+                  (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId))?.runtime !==
+                  attached
+                )
+                  return yield* new ProviderSessionActivityError({
+                    providerSessionId: input.providerSessionId,
+                    cause: "Provider runtime changed during attachment.",
+                  });
               }
             }
           }).pipe(
@@ -1732,6 +1780,9 @@ export const layerWithOptions = (
           });
         return {
           ...runtime,
+          get instructionRevisionReplaced() {
+            return runtime.instructionRevisionReplaced;
+          },
           subscribeEvents,
           events: Stream.unwrap(
             subscribeEvents.pipe(Effect.map((subscription) => subscription.events)),
@@ -2098,6 +2149,28 @@ export const layerWithOptions = (
         ),
       );
 
+      const terminateAndRelease = Effect.fn("ProviderSessionManager.terminateAndRelease")(
+        function* (input: {
+          readonly providerSessionId: ProviderSessionId;
+          readonly detail?: string;
+        }) {
+          const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
+          if (entry?.runtime.terminateSession !== undefined) yield* entry.runtime.terminateSession;
+          yield* releaseEntry({ ...input, reason: "manual_shutdown" });
+        },
+        (effect, input) =>
+          sessionOpen.withLock(input.providerSessionId, effect).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSessionReleaseError({
+                  providerSessionId: input.providerSessionId,
+                  reason: "manual_shutdown",
+                  cause,
+                }),
+            ),
+          ),
+      );
+
       return ProviderSessionManagerV2.of({
         shutdown,
         open: (input) =>
@@ -2118,7 +2191,71 @@ export const layerWithOptions = (
                 }
               }
               const key = sessionKey(input.providerSessionId);
-              const existing = (yield* Ref.get(sessions)).get(key);
+              let existing = (yield* Ref.get(sessions)).get(key);
+              let instructionRevisionReplaced = false;
+              if (existing !== undefined) {
+                const catalogNeedsRestart = Option.isSome(mcpCatalogApplications)
+                  ? yield* projectionStore.getThread(input.threadId).pipe(
+                      Effect.flatMap((thread) =>
+                        mcpCatalogApplications.value.requiresRestart({
+                          threadId: input.threadId,
+                          projectId: thread.projectId,
+                          providerInstanceId: input.modelSelection.instanceId,
+                        }),
+                      ),
+                      Effect.catch(() => Effect.succeed(false)),
+                    )
+                  : false;
+                const instructionDecision = instructionDeliveryDecision({
+                  capabilities: existing.runtime.providerSession.capabilities,
+                  previousSnapshot: existing.instructionSnapshot,
+                  requestedSnapshot: input.instructionSnapshot,
+                  sessionHasOtherThreads: [...existing.attachedThreadIds].some(
+                    (threadId) => threadId !== input.threadId,
+                  ),
+                });
+                const ownsOtherThreads = [...existing.attachedThreadIds].some(
+                  (threadId) => threadId !== input.threadId,
+                );
+                const decision =
+                  instructionDecision === "blocked" ||
+                  (catalogNeedsRestart &&
+                    (ownsOtherThreads ||
+                      existing.runtime.providerSession.capabilities.instructionDelivery
+                        ?.supportsSessionReplacement === false))
+                    ? "blocked"
+                    : catalogNeedsRestart
+                      ? "replace"
+                      : instructionDecision;
+                if (decision === "blocked")
+                  return yield* new ProviderSessionOpenError({
+                    instanceId: input.modelSelection.instanceId,
+                    providerSessionId: input.providerSessionId,
+                    cause: catalogNeedsRestart
+                      ? "MCP catalog revision requires an isolated provider session replacement."
+                      : "Instruction revision requires unsupported session replacement.",
+                  });
+                if (decision === "replace") {
+                  if (existing.runtime.terminateSession !== undefined)
+                    yield* existing.runtime.terminateSession.pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new ProviderSessionOpenError({
+                            instanceId: input.modelSelection.instanceId,
+                            providerSessionId: input.providerSessionId,
+                            cause,
+                          }),
+                      ),
+                    );
+                  yield* releaseEntry({
+                    providerSessionId: input.providerSessionId,
+                    reason: "manual_shutdown",
+                    detail: "Instruction revision changed.",
+                  });
+                  existing = undefined;
+                  instructionRevisionReplaced = true;
+                }
+              }
               if (existing !== undefined) {
                 const attached = existing.attachedThreadIds.has(input.threadId);
                 if (!attached && !existing.supportsMultipleProviderThreads) {
@@ -2148,9 +2285,57 @@ export const layerWithOptions = (
                     }),
                 ),
               );
+              const capabilities = yield* adapter.getCapabilities().pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderSessionOpenError({
+                      instanceId: input.modelSelection.instanceId,
+                      providerSessionId: input.providerSessionId,
+                      cause,
+                    }),
+                ),
+              );
+              if (
+                capabilities.instructionDelivery?.mode === "session" &&
+                !instructionRevisionReplaced &&
+                input.initialNativeThreadId !== undefined
+              ) {
+                const previous = input.resumeFromSession?.effectiveInstructions;
+                const requested = input.instructionSnapshot;
+                const sameRevision =
+                  previous === undefined
+                    ? requested === undefined
+                    : requested !== undefined &&
+                      previous.configurationHash === requested.configurationHash &&
+                      previous.resourceRevision === requested.resourceRevision &&
+                      previous.memoryEpoch === requested.memoryEpoch;
+                if (!sameRevision) {
+                  if (!capabilities.instructionDelivery.supportsSessionReplacement)
+                    return yield* new ProviderSessionOpenError({
+                      instanceId: input.modelSelection.instanceId,
+                      providerSessionId: input.providerSessionId,
+                      cause: "Instruction revision requires unsupported session replacement.",
+                    });
+                  instructionRevisionReplaced = true;
+                }
+              }
+              const instructionRuntimeId = String(
+                yield* idAllocator.allocate.event({ threadId: input.threadId }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderSessionOpenError({
+                        instanceId: input.modelSelection.instanceId,
+                        providerSessionId: input.providerSessionId,
+                        cause,
+                      }),
+                  ),
+                ),
+              );
+              const previousMcpConfig = yield* mcpSessions.read(input.threadId);
               const prepared = yield* prepareMcpSession(
                 input.threadId,
                 input.modelSelection.instanceId,
+                Option.isSome(mcpCatalogApplications),
               );
               const mcpCredentialId = prepared.mcpCredentialId;
               let reservationDropped = mcpCredentialId === undefined;
@@ -2160,18 +2345,46 @@ export const layerWithOptions = (
                   dropMcpCredentialReservation(input.threadId, mcpCredentialId);
                 }
               });
+              const mcpConfig = yield* mcpSessions.read(input.threadId);
+              if (mcpConfig !== undefined && mcpConfig.providerSessionId === mcpCredentialId)
+                yield* mcpSessions.replaceIfCurrent(
+                  {
+                    threadId: input.threadId,
+                    providerSessionId: mcpConfig.providerSessionId,
+                    ...(mcpConfig.nativeRuntimeId === undefined
+                      ? {}
+                      : { nativeRuntimeId: mcpConfig.nativeRuntimeId }),
+                  },
+                  { ...mcpConfig, nativeRuntimeId: instructionRuntimeId },
+                );
+              if (Option.isSome(mcpCatalogApplications)) {
+                const thread = yield* projectionStore.getThread(input.threadId).pipe(Effect.orDie);
+                yield* mcpCatalogApplications.value
+                  .prepareNativeRuntime({
+                    threadId: input.threadId,
+                    projectId: thread.projectId,
+                    providerInstanceId: input.modelSelection.instanceId,
+                    runtimeId: instructionRuntimeId,
+                  })
+                  .pipe(Effect.catch(() => Effect.void));
+              }
               const sessionScope = yield* Scope.fork(sessionScopes);
               yield* agentScope.clear(input.threadId);
-              const runtime = yield* adapter
+              const adapterRuntime = yield* adapter
                 .openSession({
                   threadId: input.threadId,
                   providerSessionId: input.providerSessionId,
                   modelSelection: input.modelSelection,
                   runtimePolicy: input.runtimePolicy,
-                  ...(input.resumeFromSession === undefined
+                  ...(input.instructionSnapshot === undefined
+                    ? {}
+                    : {
+                        instructionSnapshot: freezeInstructionSnapshot(input.instructionSnapshot),
+                      }),
+                  ...(input.resumeFromSession === undefined || instructionRevisionReplaced
                     ? {}
                     : { resumeFromSession: input.resumeFromSession }),
-                  ...(input.initialNativeThreadId === undefined
+                  ...(input.initialNativeThreadId === undefined || instructionRevisionReplaced
                     ? {}
                     : { initialNativeThreadId: input.initialNativeThreadId }),
                   ...(input.initialProviderItemIdentityVersion === undefined
@@ -2183,6 +2396,22 @@ export const layerWithOptions = (
                 })
                 .pipe(
                   Effect.provideService(Scope.Scope, sessionScope),
+                  Effect.tap(() =>
+                    Option.isSome(mcpCatalogApplications)
+                      ? Effect.gen(function* () {
+                          const current = yield* mcpSessions.read(input.threadId);
+                          if (
+                            current?.providerSessionId !== mcpCredentialId ||
+                            current?.nativeRuntimeId !== instructionRuntimeId
+                          )
+                            return yield* new ProviderSessionOpenError({
+                              instanceId: input.modelSelection.instanceId,
+                              providerSessionId: input.providerSessionId,
+                              cause: "The provider MCP identity was superseded during startup.",
+                            });
+                        })
+                      : Effect.void,
+                  ),
                   // The session cleanup runs first, and the close is
                   // time-boxed: this runs under the session's open lock, so an
                   // adapter finalizer that never finishes must not hold the
@@ -2190,8 +2419,19 @@ export const layerWithOptions = (
                   Effect.onError(() =>
                     dropReservation.pipe(
                       Effect.andThen(
-                        prepared.issued
-                          ? clearMcpSession(input.threadId, mcpCredentialId)
+                        prepared.issued && mcpCredentialId !== undefined
+                          ? mcpSessionRegistry.revokeProviderSession(mcpCredentialId).pipe(
+                              Effect.andThen(
+                                mcpSessions.replaceIfCurrent(
+                                  {
+                                    threadId: input.threadId,
+                                    providerSessionId: mcpCredentialId,
+                                    nativeRuntimeId: instructionRuntimeId,
+                                  },
+                                  previousMcpConfig,
+                                ),
+                              ),
+                            )
                           : Effect.void,
                       ),
                       Effect.ensuring(
@@ -2215,12 +2455,60 @@ export const layerWithOptions = (
                     attributes: { provider: adapter.driver, operation: "open" },
                   }),
                 );
+              let instructionReplacementPending = instructionRevisionReplaced;
+              const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+                ...adapterRuntime,
+                get instructionRevisionReplaced() {
+                  return instructionReplacementPending ? true : undefined;
+                },
+                startTurn: (turnInput) =>
+                  adapterRuntime.startTurn(turnInput).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        instructionReplacementPending = false;
+                      }),
+                    ),
+                  ),
+                ...(adapterRuntime.compactThread === undefined
+                  ? {}
+                  : {
+                      compactThread: (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+                        adapterRuntime.compactThread!(turnInput).pipe(
+                          Effect.tap(() =>
+                            Effect.sync(() => {
+                              instructionReplacementPending = false;
+                            }),
+                          ),
+                        ),
+                    }),
+                providerSession: {
+                  ...adapterRuntime.providerSession,
+                  instructionRuntimeId,
+                },
+              };
               const eventSubscribers = yield* Ref.make<
                 ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
               >(new Map());
+              if (mcpCredentialId !== undefined) {
+                yield* mcpSessionRegistry.bindNativeRuntime({
+                  providerSessionId: mcpCredentialId,
+                  threadId: input.threadId,
+                  providerInstanceId: input.modelSelection.instanceId,
+                  runtimeId: instructionRuntimeId,
+                });
+              }
+              if (previousMcpConfig && previousMcpConfig.providerSessionId !== mcpCredentialId)
+                yield* mcpSessionRegistry.revokeProviderSession(
+                  previousMcpConfig.providerSessionId,
+                );
+              if (Option.isSome(mcpCatalogApplications))
+                yield* mcpCatalogApplications.value.drain().pipe(Effect.ignore);
               const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
               const now = yield* Clock.currentTimeMillis;
               const entry: LiveSessionEntry = {
+                ...(input.instructionSnapshot === undefined
+                  ? {}
+                  : { instructionSnapshot: freezeInstructionSnapshot(input.instructionSnapshot) }),
                 attachedThreadIds: new Set([input.threadId]),
                 loadedProviderThreadKeyByThread: new Map(),
                 mcpCredentialIdByThread:
@@ -2254,6 +2542,7 @@ export const layerWithOptions = (
                   runtime,
                   threadIds: [input.threadId],
                   type: "provider-session.attached",
+                  advanceRuntime: true,
                   payload: runtime.providerSession,
                 }),
               ).pipe(
@@ -2304,16 +2593,21 @@ export const layerWithOptions = (
               ),
             ),
         ),
-        close: (providerSessionId) =>
-          releaseEntry({ providerSessionId, reason: "manual_shutdown" }).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderSessionCloseError({
-                  providerSessionId,
-                  cause,
-                }),
+        close: Effect.fn("ProviderSessionManager.close")(
+          function* (providerSessionId) {
+            yield* terminateAndRelease({ providerSessionId });
+          },
+          (effect, providerSessionId) =>
+            effect.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderSessionCloseError({
+                    providerSessionId,
+                    cause,
+                  }),
+              ),
             ),
-          ),
+        ),
         closeInstance: Effect.fn("ProviderSessionManager.closeInstance")(
           function* (instanceId) {
             const active = [...(yield* Ref.get(sessions)).values()].filter(
@@ -2322,9 +2616,8 @@ export const layerWithOptions = (
             const outcomes = yield* Effect.forEach(
               active,
               (entry) =>
-                releaseEntry({
+                terminateAndRelease({
                   providerSessionId: entry.runtime.providerSessionId,
-                  reason: "manual_shutdown",
                   detail: `Provider instance ${instanceId} logged out.`,
                 }).pipe(Effect.exit),
               { concurrency: "unbounded" },
@@ -2347,13 +2640,17 @@ export const layerWithOptions = (
               ),
             ),
         ),
-        release: releaseEntry,
+        release: (input) =>
+          input.reason === "manual_shutdown" ? terminateAndRelease(input) : releaseEntry(input),
         detach: Effect.fn("ProviderSessionManager.detach")(
           function* (input) {
             const key = sessionKey(input.providerSessionId);
             const currentEntry = (yield* Ref.get(sessions)).get(key);
             let detachedProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread> = [];
-            if (currentEntry?.supportsMultipleProviderThreads === true) {
+            if (
+              currentEntry?.supportsMultipleProviderThreads === true &&
+              currentEntry.runtime.detachThreadPolicy !== "detach"
+            ) {
               const projection = yield* Effect.option(
                 projectionStore.getThreadRecords(input.threadId, [
                   "providerThreads",

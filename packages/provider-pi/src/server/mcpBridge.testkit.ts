@@ -41,6 +41,14 @@ type AgentStartHook = (
 
 export async function loadMcpBridge(
   options: {
+    readonly instructionSnapshot?: import("@t3tools/contracts").OrchestrationV2InstructionSnapshot;
+    readonly withoutMcp?: boolean;
+    readonly catalogConfig?: string;
+    readonly catalogFailure?: boolean;
+    readonly catalogResponse?: (request: {
+      readonly id: number;
+      readonly method: string;
+    }) => Response | undefined;
     readonly modern?: boolean;
     readonly result?: unknown;
     readonly toolSearchAvailable?: boolean;
@@ -87,7 +95,12 @@ export async function loadMcpBridge(
   await NodeVM.runInNewContext(`${source}\nt3McpExtension(pi)`, {
     process: {
       env: {
-        T3_MCP_URL: "http://fixture.invalid/mcp",
+        T3_MCP_CATALOG_CONFIG: options.catalogConfig,
+        T3_MCP_URL: options.withoutMcp ? undefined : "http://fixture.invalid/mcp",
+        T3_PI_INSTRUCTIONS:
+          options.instructionSnapshot === undefined
+            ? undefined
+            : JSON.stringify(options.instructionSnapshot),
         T3_MCP_BEARER_TOKEN: "fixture-token",
         T3_PI_MCP_EXTENSION_PATH: "/fixture/pi-t3-extension.ts",
         T3_PI_RUNTIME_MODE: options.runtimeMode,
@@ -95,7 +108,14 @@ export async function loadMcpBridge(
     },
     AbortSignal,
     NodePath,
-    Type: { Unsafe: (schema: unknown) => schema },
+    Type: {
+      Unsafe: (schema: unknown) => schema,
+      Object: (properties: unknown, options: unknown) => ({
+        type: "object",
+        properties,
+        ...Object(options),
+      }),
+    },
     fetch: async (
       url: string,
       transport: { body: string; headers: Record<string, string>; signal?: AbortSignal },
@@ -112,12 +132,26 @@ export async function loadMcpBridge(
         params?: unknown;
       };
       requests.push(request);
+      if (url.includes("/catalog/") && options.catalogFailure)
+        return new Response("unavailable", { status: 503 });
+      if (url.includes("/catalog/")) {
+        const response = options.catalogResponse?.(request);
+        if (response !== undefined) return response;
+      }
       const result =
-        request.method === "tools/list"
-          ? { tools: catalog }
-          : request.method === "tools/call"
-            ? (options.result ?? { content: [{ type: "text", text: "browser snapshot" }] })
-            : {};
+        url.includes("/catalog/") && request.method === "tools/list"
+          ? { tools: [{ name: "project_lookup", inputSchema: { type: "object" } }] }
+          : url.includes("/catalog/") && request.method === "initialize"
+            ? {
+                protocolVersion: "2025-06-18",
+                capabilities: {},
+                serverInfo: { name: "fixture", version: "1" },
+              }
+            : request.method === "tools/list"
+              ? { tools: catalog }
+              : request.method === "tools/call"
+                ? (options.result ?? { content: [{ type: "text", text: "browser snapshot" }] })
+                : {};
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
         headers: { "content-type": "application/json" },
       });

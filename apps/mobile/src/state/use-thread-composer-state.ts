@@ -114,6 +114,11 @@ import { enqueueThreadOutboxMessage } from "./thread-outbox";
 import { dispatchingQueuedMessageIdAtom, useThreadOutboxMessages } from "./use-thread-outbox";
 import { threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
+import { useAgentThreadOwner } from "../features/assistants/useAgentThreadOwner";
+import {
+  composerOwnerAcceptsDraftSettings,
+  resolveComposerTurnSettings,
+} from "./composer-turn-settings";
 
 const EMPTY_QUEUE_WORKFLOW_ATOM = Atom.make<null>(null).pipe(
   Atom.withLabel("mobile-thread-queue-workflow:empty"),
@@ -305,9 +310,18 @@ export function useThreadComposerState() {
         ? selectedThreadKey
         : queuedEditDraftKey(selectedThreadKey, queuedRunEdit.runId);
   const selectedDraft = useComposerDraftSettings(selectedThreadKey);
+  // Same exact owner read as the thread header, so this adds no subscription.
+  const agentOwner = useAgentThreadOwner(
+    selectedThreadShell?.environmentId ?? null,
+    selectedThreadShell?.id ?? null,
+  );
+  const draftSettingsIgnored = agentOwner.kind === "canonical";
   const selectedThreadQueueCount = selectedThreadQueuedMessages.length;
   const selectedThread = selectedThreadShell;
-  const modelSelection = selectedDraft.modelSelection ?? selectedThread?.modelSelection ?? null;
+  const modelSelection =
+    (draftSettingsIgnored ? undefined : selectedDraft.modelSelection) ??
+    selectedThread?.modelSelection ??
+    null;
   const serverConfig = selectedEnvironmentRuntime?.serverConfig;
   const pendingHandoff = resolvePendingHandoff(
     selectedThreadProjection?.projection,
@@ -316,15 +330,21 @@ export function useThreadComposerState() {
       : modelSelection,
     serverConfig?.providers ?? [],
   );
-  const runtimeMode = selectedDraft.runtimeMode ?? selectedThread?.runtimeMode ?? null;
+  const runtimeMode =
+    (draftSettingsIgnored ? undefined : selectedDraft.runtimeMode) ??
+    selectedThread?.runtimeMode ??
+    null;
   const selectedProvider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
     (provider) => provider.instanceId === modelSelection?.instanceId,
   );
+  // An agent's saved mode is shown as configured; the toggle normalization is for local choices.
   const interactionMode = selectedThread
-    ? resolveProviderInteractionMode(
-        selectedProvider,
-        selectedDraft.interactionMode ?? selectedThread.interactionMode,
-      )
+    ? draftSettingsIgnored
+      ? selectedThread.interactionMode
+      : resolveProviderInteractionMode(
+          selectedProvider,
+          selectedDraft.interactionMode ?? selectedThread.interactionMode,
+        )
     : null;
   const canSwitchThreadProvider = threadAllowsProviderSwitch({
     thread: selectedThreadShell,
@@ -588,7 +608,22 @@ export function useThreadComposerState() {
       return null;
     }
 
-    const modelSelection = draft.modelSelection ?? thread.modelSelection;
+    const turnSettings = resolveComposerTurnSettings({
+      ownerKind: agentOwner.kind,
+      draft,
+      thread,
+      providers: selectedEnvironmentRuntime?.serverConfig?.providers ?? [],
+    });
+    if (turnSettings === null) {
+      Dialog.alert(
+        "Checking this chat's settings",
+        agentOwner.kind === "offline"
+          ? "Reconnect so T3 Code can confirm whether an agent owns this chat's model and mode, then send again. Your message is kept."
+          : "T3 Code is still confirming whether an agent owns this chat's model and mode. Send again in a moment. Your message is kept.",
+      );
+      return null;
+    }
+    const { modelSelection } = turnSettings;
     const serverConfig = selectedEnvironmentRuntime?.serverConfig;
     if (
       selectedEnvironmentRuntime?.connectionState === "connected" &&
@@ -678,11 +713,9 @@ export function useThreadComposerState() {
       attachments,
       context: draft.context,
       modelSelection,
-      runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-      interactionMode: resolveProviderInteractionMode(
-        provider,
-        draft.interactionMode ?? thread.interactionMode,
-      ),
+      runtimeMode: turnSettings.runtimeMode,
+      interactionMode: turnSettings.interactionMode,
+      ...(agentOwner.kind === "canonical" ? { settingsSource: "agent" as const } : {}),
       ...(followUpDispatchMode === null ? {} : { dispatchMode: followUpDispatchMode }),
       createdAt: metadata.createdAt,
     });
@@ -943,7 +976,7 @@ export function useThreadComposerState() {
   };
 
   const onUpdateModelSelection = (value: ModelSelection) => {
-    if (!selectedThreadKey) {
+    if (!selectedThreadKey || !composerOwnerAcceptsDraftSettings(agentOwner.kind)) {
       return;
     }
     const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
@@ -958,14 +991,14 @@ export function useThreadComposerState() {
   };
 
   const onUpdateRuntimeMode = (value: RuntimeMode) => {
-    if (!selectedThreadKey) {
+    if (!selectedThreadKey || !composerOwnerAcceptsDraftSettings(agentOwner.kind)) {
       return;
     }
     updateComposerDraftSettings(selectedThreadKey, { runtimeMode: value });
   };
 
   const onUpdateInteractionMode = (value: ProviderInteractionMode) => {
-    if (!selectedThreadKey) {
+    if (!selectedThreadKey || !composerOwnerAcceptsDraftSettings(agentOwner.kind)) {
       return;
     }
     const modelSelection =

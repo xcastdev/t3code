@@ -1,3 +1,5 @@
+import * as Fiber from "effect/Fiber";
+import * as RunAdmission from "./RunAdmission.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
@@ -172,7 +174,10 @@ function makeHarness(options: HarnessOptions = {}) {
   const layerExternalServices = Layer.mergeAll(
     WorktreeSetupTracker.layer,
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
-    Layer.mock(TerminalManager.TerminalManager)({ close: closeTerminal }),
+    Layer.mock(TerminalManager.TerminalManager)({
+      close: closeTerminal,
+      closeAndDrain: closeTerminal,
+    }),
     Layer.succeed(ProjectService.ProjectService, {
       create: () => Effect.die("unused"),
       bootstrap: () => Effect.die("unused"),
@@ -205,7 +210,17 @@ function makeHarness(options: HarnessOptions = {}) {
       ...options.git,
     }),
     Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
-      runForThread: runSetup,
+      runForThread: (input) =>
+        runSetup(input).pipe(
+          Effect.tap((result) =>
+            result.status === "started" && input.onTerminalAllocated
+              ? input.onTerminalAllocated(result.terminalId, {
+                  threadId: input.threadId,
+                  terminalId: result.terminalId,
+                })
+              : Effect.void,
+          ),
+        ),
     }),
     Layer.mock(TextGeneration.TextGeneration)({
       generateThreadTitle,
@@ -223,6 +238,7 @@ function makeHarness(options: HarnessOptions = {}) {
   const layerLaunch = ThreadLaunch.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        RunAdmission.layerOrdinary,
         layerExternalServices,
         layerThreadManagement,
         layerReceipts,
@@ -1755,6 +1771,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
     };
     const failed = yield* ThreadMessageIntake.launchThread(input).pipe(
       Effect.provideService(ThreadLaunch.ThreadLaunchService, {
+        ...launches,
         launch: (request) =>
           launches.launch(request).pipe(
             Effect.andThen(
@@ -2056,7 +2073,17 @@ it.effect.each([0, 1])("releases an async setup before its completion with exit 
       const running = yield* threads.getThreadProjection(launched.threadId);
       assert.equal(running.runs[0]?.status, "starting");
       assert.equal((yield* tracker.get(launched.threadId))?.phase, "running");
+      const finished = yield* launches.preparationChanges.pipe(
+        Stream.filter((threadId) => threadId === launched.threadId),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true }),
+      );
       yield* Deferred.succeed(completion, { exitCode, durationMs: 1 });
+      yield* Fiber.join(finished);
+      assert.isFalse(yield* launches.preparationActive(launched.threadId));
+      assert.isUndefined(harness.runSetup.mock.calls[0]?.[0].onTerminalAllocated);
+      assert.isUndefined(harness.runSetup.mock.calls[0]?.[0].retainTerminalForDrain);
+      assert.equal(harness.closeTerminal.mock.calls.length, 0);
       yield* tracker.stream(launched.threadId).pipe(
         Stream.filter((snapshot) => snapshot?.phase === "done"),
         Stream.runHead,

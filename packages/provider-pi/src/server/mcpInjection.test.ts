@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 
 import {
+  T3_PI_INSTRUCTIONS_ENV,
   T3_MCP_BEARER_ENV,
   T3_MCP_URL_ENV,
   T3_PI_RUNTIME_MODE_ENV,
@@ -22,6 +23,36 @@ const mcpSession = {
 };
 
 describe("pi T3 MCP injection", () => {
+  it("uses only the current managed snapshot and strips inherited instructions", () => {
+    const instructionSnapshot = {
+      configurationHash: "current",
+      resourceRevision: "resources",
+      memoryEpoch: 0,
+      roleInstructions: "Current role",
+      toolIds: [],
+      skillIds: [],
+    };
+    const input = {
+      launchArgs: [],
+      environment: { [T3_PI_INSTRUCTIONS_ENV]: "stale" },
+      mcpSession: undefined,
+      extensionPath: "/current/extension.ts",
+    };
+    const launch = buildPiRpcLaunch({ ...input, instructionSnapshot });
+    assert.deepEqual(JSON.parse(launch.env[T3_PI_INSTRUCTIONS_ENV]!), {
+      configurationHash: "current",
+      resourceRevision: "resources",
+      memoryEpoch: 0,
+      roleInstructions: "Current role",
+    });
+    assert.isUndefined(buildPiRpcLaunch(input).env[T3_PI_INSTRUCTIONS_ENV]);
+    assert.isUndefined(
+      buildPiRpcLaunch({ ...input, instructionSnapshot, disableExtensions: true }).env[
+        T3_PI_INSTRUCTIONS_ENV
+      ],
+    );
+  });
+
   it("always adds the permission bridge and configures MCP when available", () => {
     const resolvedArgs = resolvePiLaunchArgs(
       "--extension=/home/user/.pi/agent/extensions/demo.ts --session-dir=/tmp/pi-sessions --provider=anthropic --model=claude-sonnet --tools='' --name=-review --extension-flag=kept",
@@ -135,4 +166,30 @@ describe("pi T3 MCP injection", () => {
     assert.isTrue(resolvePiLaunchArgs("--provider openrouter --model=deepseek/v4").ok);
     assert.isTrue(resolvePiLaunchArgs("--model deepseek/v4").ok);
   });
+});
+
+it("binds catalog injection to the current native runtime and strips inherited catalog credentials", () => {
+  const launch = buildPiRpcLaunch({
+    launchArgs: [],
+    environment: { T3_MCP_CATALOG_CONFIG: "inherited" },
+    extensionPath: "/extension.ts",
+    mcpSession: {
+      ...mcpSession,
+      catalogEndpoint: "http://host/mcp/catalog/current",
+      nativeRuntimeId: "native-current",
+    },
+  });
+  assert.deepEqual(JSON.parse(launch.env.T3_MCP_CATALOG_CONFIG!), {
+    threadId,
+    providerSessionId: mcpSession.providerSessionId,
+    nativeRuntimeId: "native-current",
+    catalogEndpoint: "http://host/mcp/catalog/current",
+  });
+  const ordinary = buildPiRpcLaunch({
+    launchArgs: [],
+    environment: launch.env,
+    extensionPath: "/extension.ts",
+    mcpSession: undefined,
+  });
+  assert.isUndefined(ordinary.env.T3_MCP_CATALOG_CONFIG);
 });

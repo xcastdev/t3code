@@ -28,7 +28,21 @@ export interface McpIssuedCredential {
   readonly config: McpProviderSession.McpProviderSessionConfig;
 }
 
+export interface McpNativeRuntimeBinding {
+  readonly providerSessionId: string;
+  readonly threadId: ThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly runtimeId: string;
+}
+
 export interface McpSessionRegistryShape {
+  readonly bindNativeRuntime: (identity: McpNativeRuntimeBinding) => Effect.Effect<void>;
+  readonly resolveNativeRuntime: (
+    providerSessionId: string,
+  ) => Effect.Effect<McpNativeRuntimeBinding | undefined>;
+  readonly onRevoke: (
+    listener: (providerSessionId: string) => Effect.Effect<void>,
+  ) => Effect.Effect<() => void>;
   readonly issue: (request: McpCredentialRequest) => Effect.Effect<McpIssuedCredential>;
   readonly resolve: (
     rawToken: string,
@@ -84,6 +98,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const environmentId = yield* environment.getEnvironmentId;
   const httpServer = yield* HttpServer.HttpServer;
   const state = yield* SynchronizedRef.make<RegistryState>({ records: new Map() });
+  const pendingBindings = new Map<string, symbol>();
+  const nativeRuntimes = new Map<string, McpNativeRuntimeBinding>();
+  const revokeListeners = new Set<(providerSessionId: string) => Effect.Effect<void>>();
   const currentTimeMillis = options.now ? Effect.sync(options.now) : Clock.currentTimeMillis;
   const livenessWindowMs = options.livenessWindowMs ?? DEFAULT_LIVENESS_WINDOW_MS;
   const endpoint = NetAddress.isInetAddress(httpServer.address)
@@ -115,6 +132,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           "orchestration",
           "worktree",
           "pull-requests",
+          "terminal",
           ...(request.capabilities ?? (browserToolsAvailable ? (["preview"] as const) : [])),
         ]),
         issuedAt,
@@ -131,6 +149,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           providerSessionId,
           providerInstanceId: scope.thread.providerInstanceId,
           endpoint,
+          catalogEndpoint: `${endpoint}/catalog/${providerSessionId}`,
           authorizationHeader: `Bearer ${rawToken}`,
           browserToolsAvailable: scope.capabilities.has("preview"),
           capabilities: scope.capabilities,
@@ -171,12 +190,68 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     },
   );
 
-  const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
-    SynchronizedRef.update(state, ({ records }) => ({
-      records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
-    }));
+  const revokeWhere = Effect.fn("McpSessionRegistry.revokeWhere")(function* (
+    predicate: (record: CredentialRecord) => boolean,
+  ) {
+    const revoked = yield* SynchronizedRef.modify(state, ({ records }) => {
+      const identities = [...records.values()]
+        .filter(predicate)
+        .map((record) => record.scope.thread.providerSessionId);
+      return [
+        identities,
+        { records: new Map([...records].filter(([, record]) => !predicate(record))) },
+      ] as const;
+    });
+    for (const identity of revoked) {
+      nativeRuntimes.delete(identity);
+      pendingBindings.delete(identity);
+    }
+    for (const identity of revoked)
+      for (const listener of revokeListeners) yield* listener(identity);
+  });
 
   return McpSessionRegistry.of({
+    bindNativeRuntime: Effect.fn("McpSessionRegistry.bindNativeRuntime")(function* (binding) {
+      const records = (yield* SynchronizedRef.get(state)).records;
+      const record = [...records.values()].find(
+        (candidate) => candidate.scope.thread.providerSessionId === binding.providerSessionId,
+      );
+      if (
+        !record ||
+        record.scope.thread.threadId !== binding.threadId ||
+        record.scope.thread.providerInstanceId !== binding.providerInstanceId
+      )
+        return;
+      const attempt = Symbol();
+      pendingBindings.set(binding.providerSessionId, attempt);
+      try {
+        const previous = nativeRuntimes.get(binding.providerSessionId);
+        if (previous && previous.runtimeId !== binding.runtimeId) {
+          nativeRuntimes.delete(binding.providerSessionId);
+          for (const listener of revokeListeners) yield* listener(binding.providerSessionId);
+        }
+        const current = (yield* SynchronizedRef.get(state)).records;
+        if (
+          pendingBindings.get(binding.providerSessionId) !== attempt ||
+          ![...current.values()].some(
+            (candidate) => candidate.scope.thread.providerSessionId === binding.providerSessionId,
+          )
+        )
+          return;
+        nativeRuntimes.set(binding.providerSessionId, binding);
+      } finally {
+        if (pendingBindings.get(binding.providerSessionId) === attempt)
+          pendingBindings.delete(binding.providerSessionId);
+      }
+    }),
+    resolveNativeRuntime: (identity) => Effect.sync(() => nativeRuntimes.get(identity)),
+    onRevoke: (listener) =>
+      Effect.sync(() => {
+        revokeListeners.add(listener);
+        return () => {
+          revokeListeners.delete(listener);
+        };
+      }),
     issue,
     resolve,
     touch,
@@ -188,7 +263,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     revokeThread: Effect.fn("McpSessionRegistry.revokeThread")(function* (threadId) {
       yield* revokeWhere((record) => record.scope.thread.threadId === threadId);
     }),
-    revokeAll: SynchronizedRef.set(state, { records: new Map() }),
+    revokeAll: revokeWhere(() => true),
   });
 });
 

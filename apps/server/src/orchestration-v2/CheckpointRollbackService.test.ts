@@ -37,6 +37,7 @@ import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
 import { resolveCodexRollbackTurnCount } from "./Adapters/CodexAdapterV2.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
+import * as ThreadHistoryArchive from "./ThreadHistoryArchiveService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -53,6 +54,12 @@ const layerCheckpointRollbackService = CheckpointRollbackService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       NodeServices.layer,
+      Layer.mock(ThreadHistoryArchive.ThreadHistoryArchiveService)({
+        prepareIntent: () => Effect.void,
+        prepare: () => Effect.void,
+        beginExternal: () => Effect.void,
+        completeExternal: () => Effect.void,
+      }),
       Layer.mock(ServerConfig.ServerConfig)({ worktreesDir: "/synthetic-worktrees" } as never),
       ServerSettings.layerTest(),
       Layer.mock(GitWorkflow.GitWorkflowService)({}),
@@ -221,6 +228,14 @@ it.effect.each([
       providerTurns: [],
     } as unknown as ProjectionStore.ProjectionCheckpointRollbackContext;
     const testLayer = CheckpointRollbackService.layer.pipe(
+      Layer.provide(
+        Layer.mock(ThreadHistoryArchive.ThreadHistoryArchiveService)({
+          prepareIntent: () => Effect.void,
+          prepare: () => Effect.void,
+          beginExternal: () => Effect.void,
+          completeExternal: () => Effect.void,
+        }),
+      ),
       Layer.provide(
         Layer.mergeAll(
           ThreadCommandExecutor.layer,

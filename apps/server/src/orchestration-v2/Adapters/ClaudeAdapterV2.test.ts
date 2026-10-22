@@ -1678,15 +1678,25 @@ describe("ClaudeAdapterV2 native fork", () => {
   );
 });
 
-function makeFakeClaudeCli(answerSetServers = true) {
+function makeFakeClaudeCli(
+  answerSetServers = true,
+  registration?: {
+    readonly added: string[];
+    readonly removed: string[];
+    readonly errors: Record<string, string>;
+  },
+) {
   const spawns: Array<SpawnOptions> = [];
   const controlRequests: Array<object> = [];
   const stdins: Array<NodeStream.PassThrough> = [];
+  const outputs: Array<NodeStream.PassThrough> = [];
+  const exits: Array<() => void> = [];
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
     const stdin = new NodeStream.PassThrough();
     const stdout = new NodeStream.PassThrough();
     stdins.push(stdin);
+    outputs.push(stdout);
     const child = Object.assign(new NodeEvents.EventEmitter(), {
       stdin,
       stdout,
@@ -1697,6 +1707,10 @@ function makeFakeClaudeCli(answerSetServers = true) {
         child.emit("exit", null, "SIGTERM");
         return true;
       },
+    });
+    exits.push(() => {
+      stdout.end();
+      child.emit("exit", 0, null);
     });
     let pending = "";
     stdin.on("data", (chunk: Buffer) => {
@@ -1711,7 +1725,7 @@ function makeFakeClaudeCli(answerSetServers = true) {
         const response = {
           subtype: "success",
           request_id: frame.request_id,
-          response: setServers ? { added: [], removed: [], errors: {} } : {},
+          response: setServers ? (registration ?? { added: [], removed: [], errors: {} }) : {},
         };
         stdout.write(`${JSON.stringify({ type: "control_response", response })}\n`);
       }
@@ -1724,7 +1738,7 @@ function makeFakeClaudeCli(answerSetServers = true) {
   };
   // The SDK closes the CLI by ending its stdin.
   const closed = () => stdins.length > 0 && stdins.every((stdin) => stdin.writableEnded);
-  return { spawn, spawns, controlRequests, closed };
+  return { spawn, spawns, controlRequests, closed, outputs, exits };
 }
 
 describe("ClaudeAdapterV2 MCP credential channel", () => {
@@ -1733,10 +1747,14 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
     url: "http://127.0.0.1:43123/mcp",
     headers: { Authorization: "Bearer dummy-mcp-credential" },
   };
-  const openWith = (cli: ReturnType<typeof makeFakeClaudeCli>) =>
+  const openWith = (
+    cli: ReturnType<typeof makeFakeClaudeCli>,
+    catalog?: { readonly onAcknowledged: Effect.Effect<void> },
+  ) =>
     Effect.gen(function* () {
       const runner = yield* ClaudeAdapterV2.ClaudeAgentSdkQueryRunner;
       return yield* runner.open({
+        ...(catalog === undefined ? {} : { onCatalogEndpointAcknowledged: catalog.onAcknowledged }),
         threadId: ThreadId.make("thread-claude-mcp-channel"),
         providerSessionId: ProviderSessionId.make("provider-session-claude-mcp-channel"),
         options: {
@@ -1746,7 +1764,12 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
             resume: false,
             cwd: null,
             environment: { PATH: "/usr/bin" },
-            mcpServers: { "t3-code": t3McpServer },
+            mcpServers: {
+              "t3-code": t3McpServer,
+              ...(catalog === undefined
+                ? {}
+                : { t3_catalog: { ...t3McpServer, url: `${t3McpServer.url}/catalog/claude` } }),
+            },
           }),
           pathToClaudeCodeExecutable: "/opt/claude/cli.js",
           spawnClaudeCodeProcess: cli.spawn,
@@ -1760,6 +1783,56 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
       ),
       Effect.provide(NodeServices.layer),
     );
+
+  it.effect.each(["accepted", "error", "missing", "stale"] as const)(
+    "acknowledges only an explicitly installed current catalog endpoint (%s)",
+    (delivery) =>
+      Effect.gen(function* () {
+        const sessions = yield* McpProviderSessions.McpProviderSessions;
+        const config = {
+          environmentId: EnvironmentId.make("environment-claude-catalog"),
+          threadId: ThreadId.make("thread-claude-mcp-channel"),
+          providerSessionId: "mcp-claude-catalog",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          nativeRuntimeId: "native-claude-runtime",
+          endpoint: t3McpServer.url,
+          catalogEndpoint: `${t3McpServer.url}/catalog/claude`,
+          authorizationHeader: t3McpServer.headers.Authorization,
+          browserToolsAvailable: false,
+        };
+        yield* sessions.set(config);
+        const cli = makeFakeClaudeCli(true, {
+          added: delivery === "missing" ? [] : ["t3_catalog"],
+          removed: [],
+          errors: delivery === "error" ? { t3_catalog: "secret failure header" } : {},
+        });
+        let acknowledgements = 0;
+        const session = yield* openWith(cli, {
+          onAcknowledged: Effect.gen(function* () {
+            acknowledgements++;
+            assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(config.threadId));
+            if (delivery === "stale") {
+              yield* sessions.set({ ...config, nativeRuntimeId: "replacement-runtime" });
+            }
+            yield* sessions.acknowledgeCatalogEndpoint(config);
+          }),
+        });
+        yield* session.close;
+        assert.equal(acknowledgements, delivery === "accepted" || delivery === "stale" ? 1 : 0);
+        assert.deepEqual(
+          yield* sessions.readCatalogEndpointReceipt(config.threadId),
+          delivery === "accepted" ? config : undefined,
+        );
+        assert.deepInclude(cli.controlRequests, {
+          subtype: "mcp_set_servers",
+          servers: {
+            "t3-code": t3McpServer,
+            t3_catalog: { ...t3McpServer, url: config.catalogEndpoint },
+          },
+        });
+        assert.notInclude(JSON.stringify(cli.spawns), "dummy-mcp-credential");
+      }).pipe(Effect.provide(McpProviderSessions.layer)),
+  );
 
   it.effect("sends MCP servers over stdin, not argv or the environment", () =>
     Effect.gen(function* () {
@@ -2072,6 +2145,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
+    readonly instructionSnapshot?: ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"];
+    readonly offerFailure?: boolean;
     readonly close?: (sdkMessages: Queue.Queue<SDKMessage>) => Effect.Effect<void>;
     readonly interrupt?: Effect.Effect<void>;
     readonly setPermissionMode?: ClaudeAdapterV2.ClaudeAgentSdkQuerySession["setPermissionMode"];
@@ -2086,6 +2161,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly nativeSessionId?: string;
     readonly settings?: ClaudeSettings;
     readonly freshQueueOnReopen?: boolean;
+    readonly nativeQueryOpen?: ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerShape["open"];
     readonly forkSession?: ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerShape["forkSession"];
     readonly allocateSessionId?: Effect.Effect<string>;
   }) =>
@@ -2137,6 +2213,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "plan.updated" }>
         >();
       let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
+      let openedQuery: ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput | undefined;
       const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
         instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
         settings: options?.settings ?? DEFAULT_CLAUDE_SETTINGS,
@@ -2162,6 +2239,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           open: (input) =>
             Effect.gen(function* () {
               openedOptions = input.options;
+              openedQuery = input;
+              if (options?.nativeQueryOpen !== undefined)
+                return yield* options.nativeQueryOpen(input);
               const processMessages =
                 options?.freshQueueOnReopen === true && processQueues.length > 0
                   ? yield* Queue.unbounded<SDKMessage>()
@@ -2208,9 +2288,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               return {
                 messages,
                 offer: (message) =>
-                  Effect.sync(() => {
-                    offeredMessages.push(message);
-                  }).pipe(Effect.andThen(changes.notify)),
+                  options?.offerFailure === true
+                    ? Effect.fail(
+                        new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                          method: "offer",
+                          cause: new Error("Rejected prompt"),
+                        }),
+                      )
+                    : Effect.sync(() => {
+                        offeredMessages.push(message);
+                      }).pipe(Effect.andThen(changes.notify)),
                 setModel: (model) =>
                   Effect.sync(() => {
                     liveSelectionChanges.push({ model });
@@ -2240,6 +2327,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         providerSessionId: ProviderSessionId.make("provider-session-claude-wake"),
         modelSelection: CLAUDE_TEST_MODEL_SELECTION,
         runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+        ...(options?.instructionSnapshot === undefined
+          ? {}
+          : { instructionSnapshot: options.instructionSnapshot }),
       });
       const providerThread = yield* runtime.ensureThread({
         threadId,
@@ -2307,6 +2397,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         runtimeRequestReceipts,
         planReceipts,
         getOpenedOptions: () => openedOptions,
+        getOpenedQuery: () => openedQuery,
         terminalEvents,
         hasPendingBackgroundWork,
         until: changes.until,
@@ -2316,6 +2407,231 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect("invalidates MCP catalog receipts across native query replacement and exit", () =>
+    Effect.gen(function* () {
+      const registration: { added: string[]; removed: string[]; errors: Record<string, string> } = {
+        added: ["t3_catalog"],
+        removed: [],
+        errors: {},
+      };
+      const cli = makeFakeClaudeCli(true, registration);
+      const harness = yield* makeWakeHarnessWithOptions({
+        nativeQueryOpen: (input) =>
+          Effect.gen(function* () {
+            const runner = yield* ClaudeAdapterV2.ClaudeAgentSdkQueryRunner;
+            return yield* runner.open({
+              ...input,
+              options: {
+                ...input.options,
+                pathToClaudeCodeExecutable: "/opt/claude/cli.js",
+                spawnClaudeCodeProcess: cli.spawn,
+              },
+            });
+          }).pipe(
+            Effect.provide(ClaudeAdapterV2.layerQueryRunner),
+            Effect.provideService(
+              ProviderEventLoggers.ProviderEventLoggers,
+              ProviderEventLoggers.NoOpProviderEventLoggers,
+            ),
+            Effect.provide(NodeServices.layer),
+          ),
+      });
+      const sessions = yield* McpProviderSessions.McpProviderSessions;
+      const config = {
+        environmentId: EnvironmentId.make("environment-claude-replacement-catalog"),
+        threadId: harness.threadId,
+        providerSessionId: "mcp-claude-replacement-catalog",
+        providerInstanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+        nativeRuntimeId: "same-outer-native-runtime",
+        endpoint: "http://127.0.0.1:43123/mcp",
+        catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/replacement",
+        authorizationHeader: "Bearer replacement-secret",
+        browserToolsAvailable: false,
+      };
+      yield* sessions.set(config);
+      const now = yield* DateTime.now;
+      const start = (ordinal: number) =>
+        harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make(`attempt-catalog-replacement-${ordinal}`),
+            providerTurnOrdinal: ordinal,
+            text: "Read the project",
+            attachments: [],
+            runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: ordinal === 2 ? "approval-required" : "full-access",
+              interactionMode: "default",
+              cwd: `/workspace-${ordinal}`,
+            }),
+          }),
+        );
+      const finish = (ordinal: number) =>
+        Effect.sync(() => {
+          cli.outputs[ordinal - 1]!.write(
+            `${JSON.stringify(makeResultFrame({ uuid: `catalog-result-${ordinal}`, result: "Done." }))}\n`,
+          );
+        }).pipe(Effect.andThen(Queue.take(harness.terminalReceipts)));
+      yield* start(1);
+      assert.strictEqual(yield* sessions.readCatalogEndpointReceipt(config.threadId), config);
+      const oldAcknowledgement = harness.getOpenedQuery()!.onCatalogEndpointAcknowledged!;
+      yield* finish(1);
+      registration.added = [];
+      registration.errors = { t3_catalog: "registration rejected" };
+      yield* start(2);
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(config.threadId));
+      yield* oldAcknowledgement;
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(config.threadId));
+      yield* finish(2);
+      registration.added = ["t3_catalog"];
+      registration.errors = {};
+      yield* start(3);
+      assert.strictEqual(yield* sessions.readCatalogEndpointReceipt(config.threadId), config);
+      yield* Effect.sync(() => cli.exits[2]!());
+      yield* Queue.take(harness.terminalReceipts);
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(config.threadId));
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("captures the exact MCP catalog config for the native acknowledgement callback", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      const sessions = yield* McpProviderSessions.McpProviderSessions;
+      const config = {
+        environmentId: EnvironmentId.make("environment-claude-captured-catalog"),
+        threadId: harness.threadId,
+        providerSessionId: "mcp-claude-captured-catalog",
+        providerInstanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+        nativeRuntimeId: "native-claude-captured-runtime",
+        endpoint: "http://127.0.0.1:43123/mcp",
+        catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/captured",
+        authorizationHeader: "Bearer captured-secret",
+        browserToolsAvailable: false,
+      };
+      yield* sessions.set(config);
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-captured-catalog"),
+          text: "Read the project",
+          attachments: [],
+        }),
+      );
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(config.threadId));
+      const opened = harness.getOpenedQuery();
+      assert.equal(opened?.options.mcpServers?.t3_catalog?.type, "http");
+      assert.deepEqual(opened?.options.mcpServers?.t3_catalog, {
+        type: "http",
+        url: config.catalogEndpoint,
+        headers: { Authorization: config.authorizationHeader },
+        timeout: ClaudeAdapterV2.CLAUDE_T3_MCP_TOOL_TIMEOUT_MS,
+      });
+      assert.isDefined(opened?.onCatalogEndpointAcknowledged);
+      yield* opened!.onCatalogEndpointAcknowledged!;
+      assert.strictEqual(yield* sessions.readCatalogEndpointReceipt(config.threadId), config);
+      yield* sessions.set({ ...config, nativeRuntimeId: "replacement-runtime" });
+      yield* opened!.onCatalogEndpointAcknowledged!;
+      assert.isUndefined(yield* sessions.readCatalogEndpointReceipt(config.threadId));
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each([false, true])(
+    "delivers session role instructions without MCP and records only successful starts (failure=%s)",
+    (offerFailure) =>
+      Effect.gen(function* () {
+        const instructionSnapshot = {
+          configurationHash: "claude-role-v1",
+          resourceRevision: "resources-v1",
+          memoryEpoch: 0,
+          roleInstructions:
+            "Review only the assigned parser. Report findings before proposing edits.",
+          toolIds: ["report"],
+          skillIds: ["parser-review"],
+        };
+        const harness = yield* makeWakeHarnessWithOptions({ instructionSnapshot, offerFailure });
+        const readApplied = () =>
+          harness.runtime.getAppliedInstructions!({ providerThread: harness.providerThread });
+        assert.isUndefined(yield* readApplied());
+        const receipts: Array<ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"]> =
+          [];
+        const turn = {
+          ...makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("managed-attempt"),
+            text: "Review parser",
+            attachments: [],
+          }),
+          instructionSnapshot,
+          onInstructionsApplied: (
+            snapshot: NonNullable<
+              ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"]
+            >,
+          ) =>
+            Effect.sync(() => {
+              receipts.push(snapshot);
+            }),
+        };
+        const result = yield* harness.runtime.startTurn(turn).pipe(Effect.result);
+        assert.equal(result._tag, offerFailure ? "Failure" : "Success");
+        const options = harness.getOpenedOptions();
+        assert.isUndefined(options?.mcpServers);
+        assert.isDefined(options);
+        assert.isObject(options!.systemPrompt);
+        assert.include(
+          (options!.systemPrompt as { append: string }).append,
+          instructionSnapshot.roleInstructions,
+        );
+        assert.notProperty(options, "maxTurns");
+        const applied = yield* readApplied();
+        assert.deepEqual(applied, offerFailure ? undefined : instructionSnapshot);
+        assert.deepEqual(receipts, offerFailure ? [] : [instructionSnapshot]);
+        if (applied !== undefined) {
+          assert.isTrue(Object.isFrozen(applied));
+          assert.isTrue(Object.isFrozen(applied.skillIds));
+        }
+        const changed = yield* harness.runtime
+          .startTurn({
+            ...turn,
+            instructionSnapshot: {
+              ...instructionSnapshot,
+              configurationHash: "claude-role-v2",
+              roleInstructions: "Changed role",
+            },
+          })
+          .pipe(Effect.result);
+        assert.equal(changed._tag, "Failure");
+        yield* harness.offerAndWait(
+          makeResultFrame({ uuid: "stale-managed-result", result: "Old turn finished" }),
+        );
+        assert.deepEqual(yield* readApplied(), applied);
+        assert.deepEqual(receipts, offerFailure ? [] : [instructionSnapshot]);
+        assert.deepEqual(ClaudeAdapterV2.ClaudeProviderCapabilitiesV2.instructionDelivery, {
+          mode: "session",
+          supportsSessionReplacement: true,
+        });
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
 
   describe("Claude settings restrictions", () => {
     it.effect("resolves cached managed policy from the configured home through the real SDK", () =>

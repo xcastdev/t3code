@@ -1,3 +1,8 @@
+import {
+  freezeInstructionSnapshot,
+  instructionSnapshotText,
+  sameInstructionSnapshot,
+} from "@t3tools/provider-core/server/instructionSnapshot";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
@@ -235,6 +240,7 @@ const CODEX_CLIENT_CAPABILITIES = {
 } as const;
 
 export const CodexProviderCapabilitiesV2 = {
+  instructionDelivery: { mode: "session", supportsSessionReplacement: true },
   sessions: {
     supportsMultipleProviderThreadsPerSession: true,
     supportsModelSwitchInSession: true,
@@ -727,6 +733,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     /** ChatGPT token sharing does not accept service tiers. */
     readonly omitServiceTier?: boolean;
     readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
+    readonly instructionSnapshot?: ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"];
   }) {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
@@ -747,9 +754,16 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
         ? undefined
         : getCodexServiceTierOptionValue(input.modelSelection);
     const developerInstructions =
-      input.hasT3Mcp !== true
+      input.instructionSnapshot === undefined && input.hasT3Mcp !== true
         ? undefined
-        : buildCodexDeveloperInstructions(input.runtimePolicy.interactionMode);
+        : [
+            ...(input.hasT3Mcp === true
+              ? [buildCodexDeveloperInstructions(input.runtimePolicy.interactionMode)]
+              : []),
+            ...(input.instructionSnapshot === undefined
+              ? []
+              : [instructionSnapshotText(input.instructionSnapshot)]),
+          ].join("\n\n");
     // An app's context is text an MCP server wrote, so it goes in as untrusted
     // context: Codex renders it as quoted user-side input, never as developer
     // instructions.
@@ -1348,6 +1362,15 @@ function codexThreadRuntimeParams(input: {
         ? {}
         : {
             // Override only T3's server so launch-argument MCP servers survive.
+            ...(mcpSession.catalogEndpoint === undefined
+              ? {}
+              : {
+                  "mcp_servers.t3_catalog": {
+                    url: mcpSession.catalogEndpoint,
+                    tool_timeout_sec: CODEX_T3_MCP_TOOL_TIMEOUT_SEC,
+                    http_headers: { Authorization: mcpSession.authorizationHeader },
+                  },
+                }),
             "mcp_servers.t3-code": {
               url: mcpSession.endpoint,
               tool_timeout_sec: CODEX_T3_MCP_TOOL_TIMEOUT_SEC,
@@ -1720,6 +1743,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
     planSelectionTransition: () => Effect.succeed(turnScopedSelectionTransition()),
     openSession: Effect.fn("CodexAdapterV2.openSession")(
       function* (input) {
+        const instructionSnapshot =
+          input.instructionSnapshot === undefined
+            ? undefined
+            : freezeInstructionSnapshot(input.instructionSnapshot);
+        const appliedInstructions = new Map<string, NonNullable<typeof instructionSnapshot>>();
         const scope = yield* Scope.Scope;
         const resolvedRuntime =
           adapterOptions.resolveRuntime === undefined
@@ -6332,6 +6360,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
               ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
+              ...(instructionSnapshot === undefined ? {} : { instructionSnapshot }),
             });
             yield* Ref.update(pendingRootTurns, (current) => {
               const updated = new Map(current);
@@ -6346,6 +6375,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return next;
             });
             const started = yield* client.request("turn/start", turnStartParams);
+            if (instructionSnapshot !== undefined) {
+              appliedInstructions.set(turnInput.providerThread.id, instructionSnapshot);
+              yield* turnInput.onInstructionsApplied?.(instructionSnapshot) ?? Effect.void;
+            }
             yield* registerRootTurn({
               turnInput,
               nativeTurnId: started.turn.id,
@@ -6607,14 +6640,22 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ensureInitialized.pipe(
               Effect.andThen(mcpSessions.read(threadInput.threadId)),
               Effect.flatMap((mcpSession) =>
-                client.request(
-                  "thread/start",
-                  codexThreadRuntimeParams({
-                    mcpSession,
-                    modelSelection: threadInput.modelSelection,
-                    runtimePolicy: threadInput.runtimePolicy,
-                  }),
-                ),
+                client
+                  .request(
+                    "thread/start",
+                    codexThreadRuntimeParams({
+                      mcpSession,
+                      modelSelection: threadInput.modelSelection,
+                      runtimePolicy: threadInput.runtimePolicy,
+                    }),
+                  )
+                  .pipe(
+                    Effect.tap(() =>
+                      mcpSession === undefined
+                        ? Effect.void
+                        : mcpSessions.acknowledgeCatalogEndpoint(mcpSession),
+                    ),
+                  ),
               ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
@@ -6639,13 +6680,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (threadInput) {
               const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
               // excludeTurns is not in the generated request schema yet.
+              const mcpSession = yield* readMcpSession(
+                threadInput.threadId ?? threadInput.providerThread.appThreadId,
+              );
               const resume = client.raw.request("thread/resume", {
                 threadId: nativeThreadId,
                 excludeTurns: true,
                 ...codexThreadRuntimeParams({
-                  mcpSession: yield* readMcpSession(
-                    threadInput.threadId ?? threadInput.providerThread.appThreadId,
-                  ),
+                  mcpSession,
                   ...(threadInput.modelSelection === undefined
                     ? {}
                     : { modelSelection: threadInput.modelSelection }),
@@ -6674,6 +6716,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   ),
                 ),
                 Effect.flatMap(decodeCodexResumeMetadata),
+                Effect.tap(() =>
+                  mcpSession === undefined
+                    ? Effect.void
+                    : mcpSessions.acknowledgeCatalogEndpoint(mcpSession),
+                ),
               );
               return {
                 ...threadInput.providerThread,
@@ -6762,7 +6809,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }),
             ),
           ),
+          getAppliedInstructions: ({ providerThread }) =>
+            Effect.sync(() => appliedInstructions.get(providerThread.id)),
           startTurn: (turnInput) => {
+            if (!sameInstructionSnapshot(instructionSnapshot, turnInput.instructionSnapshot)) {
+              return toProtocolError(
+                "Instruction changes require replacing the Codex provider session.",
+              );
+            }
             const goalCommand =
               turnInput.message.attachments.length === 0 &&
               turnInput.restartContinuationOfRunId === undefined
@@ -7379,15 +7433,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               // process. After a restart or idle release, load it the same way
               // the next turn would before reverting.
               if (!loaded) {
+                const mcpSession = yield* readMcpSession(threadInput.providerThread.appThreadId);
                 yield* client.raw.request("thread/resume", {
                   threadId,
                   excludeTurns: true,
                   ...codexThreadRuntimeParams({
-                    mcpSession: yield* readMcpSession(threadInput.providerThread.appThreadId),
+                    mcpSession,
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
                   }),
                 });
+                if (mcpSession !== undefined) {
+                  yield* mcpSessions.acknowledgeCatalogEndpoint(mcpSession);
+                }
               }
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(revertCodexThread(client, threadId, numTurns)),

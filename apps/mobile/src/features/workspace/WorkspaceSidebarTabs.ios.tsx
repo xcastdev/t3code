@@ -14,6 +14,7 @@ export function WorkspaceSidebarTabs() {
         options={[
           { value: "threads", label: "Threads" },
           { value: "pullRequests", label: "Pull requests" },
+          { value: "work", label: "Work" },
         ]}
         selected={workspace.state.selectedTab}
         onSelect={(tab: WorkspaceTab) => selectTab(tab)}

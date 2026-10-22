@@ -16,6 +16,8 @@ type ChildProcessCommand = {
   readonly args: ReadonlyArray<string>;
   readonly options: {
     readonly shell?: boolean | string;
+    readonly env?: NodeJS.ProcessEnv;
+    readonly extendEnv?: boolean;
   };
 };
 
@@ -76,6 +78,26 @@ const runWith =
     );
 
 describe("runProcess", () => {
+  it.effect("keeps an explicitly clean invocation independent of host credentials", () => {
+    const spawner = makeSpawner((command) =>
+      Effect.sync(() => {
+        expect(command.options.extendEnv).toBe(false);
+        expect(command.options.env).toEqual({ PATH: "", LANG: "C" });
+        return makeHandle({ stdout: "clean" });
+      }),
+    );
+    return runWith(spawner)({
+      command: "/usr/bin/node",
+      args: [],
+      env: { PATH: "", LANG: "C" },
+      extendEnv: false,
+    }).pipe(
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.provideService(HostProcess.Environment, { SECRET: "host-only" }),
+      Effect.map((result) => expect(result.stdout).toBe("clean")),
+    );
+  });
+
   it.effect("resolves and escapes Windows command shims before spawning", () => {
     const spawner = makeSpawner((command) =>
       Effect.sync(() => {

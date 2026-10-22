@@ -9,6 +9,13 @@ import {
   SecretRef,
   SecretRequestError,
   type ProjectId,
+  type AuthSessionId,
+  type McpCatalogSecretPrepareInput,
+  type RunId,
+  type RunAttemptId,
+  type NodeId,
+  type ProviderThreadId,
+  type ProviderSessionId,
   type SecretRequestAnswerInput,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -16,11 +23,14 @@ import {
 import * as NodeCrypto from "node:crypto";
 
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
+import * as RunAdmission from "../orchestration-v2/RunAdmission.ts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -43,11 +53,33 @@ const refFor = (salt: string, threadId: ThreadId, turnItemId: string) =>
       .slice(0, 32)}`,
   );
 
+const CatalogBinding = Schema.Struct({
+  authSessionId: Schema.String,
+  scope: Schema.Literals(["global", "project", "session"]),
+  scopeId: Schema.String,
+  expectedRevision: Schema.Number,
+  logicalServerId: Schema.String,
+});
+export type CatalogSecretBinding = typeof CatalogBinding.Type;
+const CATALOG_REF_TTL_MS = 5 * 60 * 1000;
 const StoredSecret = Schema.fromJsonString(
-  Schema.Struct({ projectId: Schema.String, value: Schema.String, savedAt: Schema.Number }),
+  Schema.Struct({
+    projectId: Schema.optional(Schema.String),
+    catalogBinding: Schema.optional(CatalogBinding),
+    value: Schema.String,
+    savedAt: Schema.Number,
+  }),
 );
 const encodeStored = Schema.encodeEffect(StoredSecret);
 const decodeStored = Schema.decodeUnknownOption(StoredSecret);
+
+export interface SecretRequestExecution {
+  readonly runId: RunId;
+  readonly runAttemptId: RunAttemptId;
+  readonly nodeId: NodeId;
+  readonly providerThreadId: ProviderThreadId;
+  readonly providerSessionId: ProviderSessionId;
+}
 
 export class SecretRequests extends Context.Service<
   SecretRequests,
@@ -56,16 +88,22 @@ export class SecretRequests extends Context.Service<
     readonly savedRef: (input: {
       readonly threadId: ThreadId;
       readonly turnItemId: string;
+      readonly execution?: SecretRequestExecution;
     }) => Effect.Effect<Option.Option<SecretRef>>;
+    readonly prepareCatalog: (
+      input: McpCatalogSecretPrepareInput & { readonly authSessionId: AuthSessionId },
+    ) => Effect.Effect<SecretRef, SecretRequestError>;
     readonly consume: (input: {
       readonly ref: SecretRef;
-      readonly projectId: ProjectId;
+      readonly projectId?: ProjectId;
+      readonly catalogBinding?: CatalogSecretBinding;
     }) => Effect.Effect<string, SecretRequestError>;
   }
 >()("t3/secrets/SecretRequests") {}
 
 const make = Effect.gen(function* () {
   const store = yield* ServerSecretStore.ServerSecretStore;
+  const admission = yield* RunAdmission.RunAdmission;
   const fileSystem = yield* FileSystem.FileSystem;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
 
@@ -166,7 +204,72 @@ const make = Effect.gen(function* () {
     function* (input) {
       const ref = refFor(salt, input.threadId, input.turnItemId);
       const stored = yield* store.get(storeName(ref)).pipe(Effect.orElseSucceed(Option.none));
-      return Option.map(stored, () => ref);
+      if (Option.isNone(stored)) return Option.none();
+      const execution = input.execution;
+      if (execution !== undefined) {
+        const records = yield* threadManagement
+          .getThreadRecords(
+            input.threadId,
+            ["runs", "turnItems", "providerThreads", "providerSessions"],
+            { turnItemTypes: ["secret_request"], messageRoles: [] },
+          )
+          .pipe(Effect.option);
+        if (Option.isNone(records)) return Option.none();
+        const item = records.value.turnItems.find((item) => item.id === input.turnItemId);
+        const run = records.value.runs.find((run) => run.id === execution.runId);
+        const providerThread = records.value.providerThreads.find(
+          (thread) => thread.id === execution.providerThreadId,
+        );
+        const session = records.value.providerSessions.find(
+          (session) => session.id === execution.providerSessionId,
+        );
+        if (
+          item?.type !== "secret_request" ||
+          item.secretStatus !== "saved" ||
+          item.runId !== execution.runId ||
+          item.nodeId !== execution.nodeId ||
+          run === undefined ||
+          ThreadManagementService.isTerminalRunStatus(run.status) ||
+          run.rootNodeId !== execution.nodeId ||
+          run.activeAttemptId !== execution.runAttemptId ||
+          run.providerThreadId !== execution.providerThreadId ||
+          providerThread?.providerSessionId !== execution.providerSessionId ||
+          session === undefined ||
+          session.status === "stopped" ||
+          session.status === "error"
+        )
+          return Option.none();
+      }
+      // The final authority read follows all storage reads. An old request cannot
+      // borrow a replacement run or attempt's admission to release its ref.
+      const decision = yield* admission
+        .check({
+          threadId: input.threadId,
+          ...(execution === undefined
+            ? {}
+            : {
+                runId: execution.runId,
+                originSessionId: execution.providerSessionId,
+                nativeTarget: {
+                  runAttemptId: execution.runAttemptId,
+                  providerThreadId: execution.providerThreadId,
+                  providerSessionId: execution.providerSessionId,
+                  nodeId: execution.nodeId,
+                },
+              }),
+          operation: "continue",
+          now: DateTime.formatIso(yield* DateTime.now),
+        })
+        .pipe(Effect.orElseSucceed(() => ({ _tag: "denied" }) as const));
+      if (decision._tag === "denied" || decision._tag === "expired") return Option.none();
+      if (
+        decision._tag === "admitted" &&
+        (execution === undefined ||
+          decision.owner.runId !== execution.runId ||
+          decision.owner.runAttemptId !== execution.runAttemptId)
+      )
+        return Option.none();
+      return Option.some(ref);
     },
   );
 
@@ -193,9 +296,31 @@ const make = Effect.gen(function* () {
       Effect.withSpan("SecretRequests.consume"),
     );
 
+  const prepareCatalog: SecretRequests["Service"]["prepareCatalog"] = Effect.fn(
+    "SecretRequests.prepareCatalog",
+  )(function* (input) {
+    const ref = SecretRef.make(`${SECRET_REF_PREFIX}${NodeCrypto.randomBytes(16).toString("hex")}`);
+    const encoded = yield* encodeStored({
+      catalogBinding: {
+        authSessionId: input.authSessionId,
+        scope: input.scope,
+        scopeId: input.scopeId,
+        expectedRevision: input.expectedRevision,
+        logicalServerId: input.logicalServerId,
+      },
+      value: Redacted.value(input.secret),
+      savedAt: yield* Clock.currentTimeMillis,
+    }).pipe(Effect.orDie);
+    yield* store
+      .create(storeName(ref), new TextEncoder().encode(encoded))
+      .pipe(Effect.mapError((cause) => new SecretRequestError({ reason: "store_failed", cause })));
+    return ref;
+  });
+
   const consumeRef = Effect.fn("SecretRequests.consumeRef")(function* (input: {
     readonly ref: SecretRef;
-    readonly projectId: ProjectId;
+    readonly projectId?: ProjectId;
+    readonly catalogBinding?: CatalogSecretBinding;
   }) {
     if (!REF_PATTERN.test(input.ref))
       return yield* new SecretRequestError({ reason: "invalid_ref" });
@@ -205,10 +330,25 @@ const make = Effect.gen(function* () {
     const decoded = Option.flatMap(stored, (bytes) =>
       decodeStored(new TextDecoder().decode(bytes)),
     );
-    if (Option.isNone(decoded) || decoded.value.projectId !== input.projectId) {
+    if (Option.isNone(decoded)) return yield* new SecretRequestError({ reason: "ref_unavailable" });
+    const binding = decoded.value.catalogBinding;
+    const expected = input.catalogBinding;
+    const matches =
+      binding === undefined
+        ? input.projectId !== undefined && decoded.value.projectId === input.projectId
+        : expected !== undefined &&
+          binding.authSessionId === expected.authSessionId &&
+          binding.scope === expected.scope &&
+          binding.scopeId === expected.scopeId &&
+          binding.expectedRevision === expected.expectedRevision &&
+          binding.logicalServerId === expected.logicalServerId;
+    if (!matches) {
       return yield* new SecretRequestError({ reason: "ref_unavailable" });
     }
-    if ((yield* Clock.currentTimeMillis) - decoded.value.savedAt > SECRET_REF_TTL_MS) {
+    if (
+      (yield* Clock.currentTimeMillis) - decoded.value.savedAt >
+      (binding === undefined ? SECRET_REF_TTL_MS : CATALOG_REF_TTL_MS)
+    ) {
       yield* removeLogged(storeName(input.ref));
       return yield* new SecretRequestError({ reason: "ref_expired" });
     }
@@ -233,7 +373,12 @@ const make = Effect.gen(function* () {
       const decoded = Option.flatMap(stored, (bytes) =>
         decodeStored(new TextDecoder().decode(bytes)),
       );
-      if (Option.isSome(decoded) && now - decoded.value.savedAt <= SECRET_REF_TTL_MS) continue;
+      if (
+        Option.isSome(decoded) &&
+        now - decoded.value.savedAt <=
+          (decoded.value.catalogBinding === undefined ? SECRET_REF_TTL_MS : CATALOG_REF_TTL_MS)
+      )
+        continue;
       if (yield* removeLogged(name)) removed += 1;
     }
     yield* Effect.annotateCurrentSpan({ "secret_request.expired_removed": removed });
@@ -248,7 +393,7 @@ const make = Effect.gen(function* () {
     Effect.forkScoped,
   );
 
-  return SecretRequests.of({ answer, savedRef, consume });
+  return SecretRequests.of({ answer, savedRef, consume, prepareCatalog });
 });
 
 export const layer = Layer.effect(SecretRequests, make);

@@ -3,9 +3,12 @@ import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Migrator from "effect/sql/Migrator";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
+import { assertUpstreamUpgradeCompatibility } from "./UpstreamUpgradeCompatibility.ts";
 import { runMigrations } from "./Migrations.ts";
+import { runWorkflowFeatureMigrations } from "./WorkflowFeatureMigrations.ts";
 import { initializeV2Database } from "./initializeV2Database.ts";
 import * as ServerConfig from "../config.ts";
 
@@ -14,6 +17,12 @@ const WAL_SIZE_LIMIT_BYTES = 32 * 1024 * 1024;
 const layerSetup = Layer.effectDiscard(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    yield* assertUpstreamUpgradeCompatibility.pipe(
+      Effect.catchTags({
+        UpstreamUpgradeCompatibilityError: (cause) =>
+          new Migrator.MigrationError({ kind: "BadState", message: cause.message, cause }),
+      }),
+    );
     // CLI and server write from separate processes; wait rather than fail with SQLITE_BUSY.
     yield* sql`PRAGMA busy_timeout = 5000;`;
     yield* sql`PRAGMA foreign_keys = ON;`;
@@ -37,6 +46,12 @@ const layerSetup = Layer.effectDiscard(
     // largest size until the last connection closes.
     yield* sql.unsafe(`PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT_BYTES};`);
     yield* runMigrations();
+    yield* runWorkflowFeatureMigrations().pipe(
+      Effect.catchTags({
+        WorkflowFeatureCompatibilityError: (cause) =>
+          new Migrator.MigrationError({ kind: "BadState", message: cause.message, cause }),
+      }),
+    );
     // No planner statistics. Collecting them reads every page of the large
     // tables, and stats taken while a table was small make the planner scan it
     // once it grows. Without them SQLite assumes large tables and uses indexes;

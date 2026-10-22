@@ -1,3 +1,5 @@
+import { useNavigation } from "@react-navigation/native";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useMemo } from "react";
 import { AppBar } from "../../components/ui/AppBar";
 import { ScreenHeaderButton } from "../../components/ui/ScreenHeaderButton";
@@ -5,6 +7,7 @@ import type { AppBarAction } from "../../components/ui/AppBar.types";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 import type { ThreadInspectorMode } from "./thread-inspector-content-stack";
 import { useThreadHeaderOptions } from "./useThreadHeaderOptions";
+import { useAgentThreadLink } from "../assistants/useAgentThreadLink";
 import { useWorkspaceBackNavigation } from "../workspace/useAndroidWorkspaceNavigation";
 import { PullRequestGlyph } from "../pull-requests/pullRequestGlyphs";
 
@@ -20,10 +23,14 @@ export function ThreadHeader(
   },
 ) {
   const goBack = useWorkspaceBackNavigation("threads");
+  const navigation = useNavigation();
+  const environmentId = EnvironmentId.make(String(props.gitControls.environmentId));
+  const threadId = ThreadId.make(String(props.gitControls.threadId));
   const { layout, panes, toggleAuxiliaryPane, composerKeyboardActive } =
     useAdaptiveWorkspaceLayout();
   const { onOpenTerminal, onMergeBack } = props.gitControls;
   const native = useThreadHeaderOptions(props);
+  const agentLink = useAgentThreadLink(environmentId, threadId);
   const androidHeaderActions = useMemo<ReadonlyArray<AppBarAction>>(() => {
     const actions: AppBarAction[] = [];
     if (props.onReturnToThread) {
@@ -54,6 +61,18 @@ export function ThreadHeader(
       icon: "point.topleft.down.curvedto.point.bottomright.up",
       onPress: props.onOpenGitInspector,
     });
+    if (agentLink !== null) {
+      actions.push({
+        accessibilityLabel: agentLink.label,
+        icon: "person.crop.circle",
+        onPress: agentLink.open,
+      });
+    }
+    actions.push({
+      accessibilityLabel: "Thread history",
+      icon: "clock",
+      onPress: () => navigation.navigate("ThreadHistory", { environmentId, threadId }),
+    });
     if (onMergeBack) {
       actions.push({
         accessibilityLabel: "Merge back to source",
@@ -74,6 +93,10 @@ export function ThreadHeader(
     props.hasThreadCwd,
     props.hasWorkspaceRoot,
     props.gitControls.canOpenTerminal,
+    navigation,
+    environmentId,
+    threadId,
+    agentLink,
   ]);
 
   return (

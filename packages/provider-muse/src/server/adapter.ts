@@ -6,6 +6,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
+  type OrchestrationV2InstructionSnapshot,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderSession,
   type OrchestrationV2ProviderThread,
@@ -41,6 +42,10 @@ import * as Stream from "effect/Stream";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import {
+  freezeInstructionSnapshot,
+  instructionSnapshotText,
+} from "@t3tools/provider-core/server/instructionSnapshot";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import { museModelCapabilities, resolveMuseReasoningEffort } from "./modelCatalog.ts";
 import {
@@ -97,6 +102,7 @@ const isOpenSessionError = Schema.is(ProviderAdapter.ProviderAdapterOpenSessionE
 const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
 
 const MuseProviderCapabilitiesV2 = {
+  instructionDelivery: { mode: "turn", supportsSessionReplacement: false },
   runtimePolicy: { enforcement: "native" },
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
@@ -329,6 +335,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
       let relaunchable = false;
       let nativeSessionId: string | undefined;
       let thread: OrchestrationV2ProviderThread | undefined;
+      const appliedInstructions = new Map<string, OrchestrationV2InstructionSnapshot>();
       let active: ActiveTurn | undefined;
       let lastProviderTurn: OrchestrationV2ProviderTurn | undefined;
       // Meta's newest subscription windows, for when a turn stopped at a usage limit can resume.
@@ -1812,6 +1819,16 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                     url: mcpSession.endpoint,
                     headers: { Authorization: mcpSession.authorizationHeader },
                   },
+                  ...(mcpSession.catalogEndpoint
+                    ? {
+                        t3_catalog: {
+                          transport: "streamableHttp",
+                          mode: "optional",
+                          url: mcpSession.catalogEndpoint,
+                          headers: { Authorization: mcpSession.authorizationHeader },
+                        },
+                      }
+                    : {}),
                 },
               }
             : undefined;
@@ -1845,6 +1862,9 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
             yield* request("session/setApprovalMode", {
               mode: museApprovalMode(args.runtimePolicy.runtimeMode),
             });
+          if (mcpSession?.catalogEndpoint) {
+            yield* mcpSessions.acknowledgeCatalogEndpoint(mcpSession);
+          }
           const createdAt = yield* DateTime.now;
           thread = existing
             ? {
@@ -1950,9 +1970,13 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           return yield* protocolError("Muse does not support dedicated Plan mode");
         if (turnInput.runtimePolicy.runtimeMode !== input.runtimePolicy.runtimeMode)
           return yield* protocolError("Runtime policy changes require a fresh Muse host");
+        appliedInstructions.delete(turnInput.providerThread.id);
         const continuation =
           turnInput.message.createdBy === "agent" &&
           turnInput.message.creationSource === "provider";
+        const instructionSnapshot = turnInput.instructionSnapshot
+          ? freezeInstructionSnapshot(turnInput.instructionSnapshot)
+          : undefined;
         const adopted = continuation ? wake : undefined;
         const effort = continuation ? undefined : yield* selectionEffort(turnInput.modelSelection);
         const parts = compact || continuation ? [] : yield* prompt(turnInput.message);
@@ -2021,9 +2045,13 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           for (const [method, data] of held?.events ?? [])
             yield* handleNotification(method, data).pipe(Effect.catch(failHost));
         }).pipe(eventPermit.withPermits(1));
-        if (continuation) return;
+        if (continuation) {
+          appliedInstructions.delete(turnInput.providerThread.id);
+          return;
+        }
         yield* Effect.gen(function* () {
           if (compact) {
+            appliedInstructions.delete(turnInput.providerThread.id);
             const result = yield* request("session/compact", {}, true, nativeId).pipe(
               Effect.flatMap((value) => decode(MuseCompactResult, value)),
             );
@@ -2048,6 +2076,9 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                       reasoningEffort: effort,
                     }),
                   },
+                  ...(instructionSnapshot
+                    ? [{ type: "text", text: instructionSnapshotText(instructionSnapshot) }]
+                    : []),
                   ...parts,
                 ],
                 displayText: turnInput.message.text || "Image attachment",
@@ -2065,6 +2096,12 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                 failHost(new Error("Muse admitted an unowned turn")),
               );
               return yield* protocolError("Muse admitted the turn under an unexpected identity");
+            }
+            if (instructionSnapshot) {
+              appliedInstructions.set(turnInput.providerThread.id, instructionSnapshot);
+              yield* turnInput.onInstructionsApplied?.(instructionSnapshot) ?? Effect.void;
+            } else {
+              appliedInstructions.delete(turnInput.providerThread.id);
             }
           }
         }).pipe(
@@ -2125,6 +2162,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         };
       });
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+        getAppliedInstructions: ({ providerThread }) =>
+          Effect.sync(() => appliedInstructions.get(providerThread.id)),
         instanceId: options.instanceId,
         driver: MUSE_PROVIDER,
         providerSessionId: input.providerSessionId,

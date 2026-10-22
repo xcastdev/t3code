@@ -34,7 +34,10 @@ const state = vi.hoisted(() => ({
     session: null,
   },
   config: {
-    providers: [{ instanceId: "codex", driver: "codex" }],
+    providers: [
+      { instanceId: "codex", driver: "codex" },
+      { instanceId: "grok", driver: "grok", showInteractionModeToggle: false },
+    ],
     environment: { capabilities: {} },
   },
 }));
@@ -173,6 +176,7 @@ function runDrain() {
 beforeEach(() => {
   state.grantedEnvironments = new Set(["primary"]);
   state.draftText = "Keep this draft separate";
+  state.thread.interactionMode = "default";
   appAtomRegistry.set(state.manager.queuedMessagesByThreadKeyAtom, {});
   appAtomRegistry.set(dispatchingQueuedMessageIdAtom, null);
   for (const command of [
@@ -282,6 +286,37 @@ describe("queued PR checkout", () => {
 });
 afterEach(() => {
   state.cleanups.splice(0).forEach((cleanup) => cleanup());
+});
+
+describe("queued interaction mode", () => {
+  const grok = { instanceId: ProviderInstanceId.make("grok"), model: "grok-code-fast-1" };
+
+  it("delivers an agent's saved Plan mode unchanged on a provider without a mode toggle", async () => {
+    state.grantedEnvironments.add("secondary");
+    state.thread.interactionMode = "plan";
+    await state.manager.enqueue(
+      message({ modelSelection: grok, interactionMode: "plan", settingsSource: "agent" }),
+    );
+    await runDrain();
+    expect(state.interaction).not.toHaveBeenCalled();
+    expect(state.start).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ interactionMode: "plan" }) }),
+    );
+    expect(remaining()).toEqual([]);
+  });
+
+  it("still normalizes a local Plan choice for a provider without a mode toggle", async () => {
+    state.grantedEnvironments.add("secondary");
+    state.thread.interactionMode = "plan";
+    await state.manager.enqueue(message({ modelSelection: grok, interactionMode: "plan" }));
+    await runDrain();
+    expect(state.interaction).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ interactionMode: "default" }) }),
+    );
+    expect(state.start).toHaveBeenCalledWith(
+      expect.objectContaining({ input: expect.objectContaining({ interactionMode: "default" }) }),
+    );
+  });
 });
 
 describe("queued task operation access", () => {

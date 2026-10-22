@@ -8,6 +8,8 @@ import {
   type TerminalRestartInput,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
+  ThreadId,
   TerminalProviderInstanceNotFoundError,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -429,6 +431,24 @@ it.layer(
       assert.equal(second.threadId, "thread-1");
       assert.equal(third.threadId, "thread-1");
       expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    }),
+  );
+
+  it.effect("closing the creating thread leaves the project-owned process running", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter, baseDir } = yield* createManager();
+      yield* manager.open(openInput());
+      const projectId = ProjectId.make("project-independent-owner");
+      yield* manager.createProject({
+        projectId,
+        terminalId: "shared",
+        creatingThreadId: ThreadId.make("thread-1"),
+        cwd: baseDir,
+      });
+      yield* manager.close({ threadId: "thread-1" });
+      assert.equal(ptyAdapter.processes[0]?.killed, true);
+      assert.equal(ptyAdapter.processes[1]?.killed, false);
+      assert.equal((yield* manager.listProject(projectId))[0]?.status, "running");
     }),
   );
 

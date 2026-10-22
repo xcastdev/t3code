@@ -1,3 +1,11 @@
+import { AssistantRoutineToolkit } from "./toolkits/assistantRoutines/tools.ts";
+import * as AssistantRoutineHandlers from "./toolkits/assistantRoutines/handlers.ts";
+import { AssistantMemoryToolkit } from "./toolkits/assistantMemory/tools.ts";
+import * as AssistantMemoryHandlers from "./toolkits/assistantMemory/handlers.ts";
+import { TerminalToolkit } from "./toolkits/terminal/tools.ts";
+import * as TerminalHandlers from "./toolkits/terminal/handlers.ts";
+import { ProjectWorkToolkit } from "./toolkits/projectWork/tools.ts";
+import * as ProjectWorkHandlers from "./toolkits/projectWork/handlers.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -1013,6 +1021,8 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
+export const layerTerminalToolkit = toolkitRegistration(TerminalToolkit, TerminalHandlers.layer);
+
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
@@ -1069,7 +1079,11 @@ export const layer = Layer.mergeAll(
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,
+  layerTerminalToolkit,
   layerAttachmentToolkit,
+  toolkitRegistration(ProjectWorkToolkit, ProjectWorkHandlers.layer),
+  toolkitRegistration(AssistantMemoryToolkit, AssistantMemoryHandlers.layer),
+  toolkitRegistration(AssistantRoutineToolkit, AssistantRoutineHandlers.layer),
   layerProjectRegistration,
   layerEnvironmentToolkit,
   layerPreviewControlsRegistration,

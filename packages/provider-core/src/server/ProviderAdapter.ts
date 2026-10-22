@@ -6,6 +6,7 @@ import {
   ModelSelection,
   NodeId,
   OrchestrationV2AppThread,
+  OrchestrationV2InstructionSnapshot,
   OrchestrationV2ConversationMessage,
   OrchestrationV2ExecutionNode,
   OrchestrationV2ProviderSession,
@@ -403,6 +404,7 @@ export const ProviderAdapterV2Error = Schema.Union([
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
 export interface ProviderAdapterV2OpenSessionInput {
+  readonly instructionSnapshot?: OrchestrationV2InstructionSnapshot;
   readonly threadId: ThreadId;
   readonly providerSessionId: ProviderSessionId;
   readonly modelSelection: ModelSelection;
@@ -413,6 +415,7 @@ export interface ProviderAdapterV2OpenSessionInput {
 }
 
 export interface ProviderAdapterV2EnsureThreadInput {
+  readonly instructionSnapshot?: OrchestrationV2InstructionSnapshot;
   readonly threadId: ThreadId;
   readonly title?: string;
   readonly modelSelection: ModelSelection;
@@ -422,6 +425,10 @@ export interface ProviderAdapterV2EnsureThreadInput {
 }
 
 export interface ProviderAdapterV2TurnInput {
+  readonly onInstructionsApplied?: (
+    snapshot: OrchestrationV2InstructionSnapshot,
+  ) => Effect.Effect<void>;
+  readonly instructionSnapshot?: OrchestrationV2InstructionSnapshot;
   readonly appThread: OrchestrationV2AppThread;
   readonly threadId: ThreadId;
   readonly runId: RunId;
@@ -595,6 +602,12 @@ export interface ProviderAdapterV2SessionRuntime {
       readonly providerThread: OrchestrationV2ProviderThread;
     },
   ) => Effect.Effect<boolean, ProviderAdapterV2Error>;
+  readonly getAppliedInstructions?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<OrchestrationV2InstructionSnapshot | undefined, ProviderAdapterV2Error>;
+  readonly detachThreadPolicy?: "detach" | "interrupt";
+  readonly terminateSession?: Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly instructionRevisionReplaced?: true | undefined;
   readonly startTurn: (
     input: ProviderAdapterV2TurnInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;

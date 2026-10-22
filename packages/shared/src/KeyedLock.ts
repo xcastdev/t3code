@@ -1,9 +1,14 @@
 import * as Effect from "effect/Effect";
 import * as Ref from "effect/Ref";
+import type * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
 
 export interface KeyedLock<Key> {
   readonly withLock: <A, E, R>(key: Key, effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+  readonly tryWithLock: <A, E, R>(
+    key: Key,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<Option.Option<A>, E, R>;
   readonly activeKeys: Effect.Effect<ReadonlyArray<Key>>;
 }
 
@@ -49,6 +54,12 @@ export const make = Effect.fn("KeyedLock.make")(function* <Key>(): Effect.fn.Ret
       Effect.acquireUseRelease(
         acquire(key),
         (semaphore) => semaphore.withPermit(effect),
+        () => release(key),
+      ),
+    tryWithLock: (key, effect) =>
+      Effect.acquireUseRelease(
+        acquire(key),
+        (semaphore) => semaphore.withPermitsIfAvailable(1)(effect),
         () => release(key),
       ),
     activeKeys: Effect.map(Ref.get(locks), (current) => Array.from(current.keys())),

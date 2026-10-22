@@ -410,6 +410,32 @@ it.layer(layerOpenCodeTextGenerationTest)("OpenCodeTextGeneration", (it) => {
     ),
   );
 
+  it.effect("extracts facts through the configured native server", () =>
+    withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.promptResult = {
+          data: {
+            parts: [
+              {
+                type: "text",
+                text: '{"facts":[{"key":"storage","body":"SQLite is authoritative.","quote":"SQLite is authoritative."}]}',
+              },
+            ],
+          },
+        };
+        const result = yield* textGeneration.extractMemoryFacts({
+          cwd: process.cwd(),
+          sourceText: "SQLite is authoritative.",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        });
+        expect(result.facts[0]?.key).toBe("storage");
+        expect(runtimeMock.state.promptParts[0]).toEqual([
+          { type: "text", text: expect.stringContaining("untrusted data") },
+        ]);
+      }),
+    ),
+  );
+
   it.effect("parses JSON returned as plain text output", () =>
     withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
       Effect.gen(function* () {

@@ -1,3 +1,15 @@
+import * as SkillDeployment from "./skills/SkillDeploymentService.ts";
+import * as ResourceInstructionComposition from "./orchestration-v2/ResourceInstructionComposition.ts";
+import * as SkillCatalog from "./skills/SkillCatalogService.ts";
+import * as SkillRepository from "./skills/ManagedSkillRepository.ts";
+import * as SkillIndex from "./skills/SkillCatalogIndex.ts";
+import * as SkillWatch from "./skills/SkillWatchService.ts";
+import * as NativeSkills from "./skills/NativeSkillObservationService.ts";
+import * as TextCatalog from "./managedTextResources/ManagedTextResourceCatalogService.ts";
+import * as ResourceAuthority from "./ResourceMutationAuthority.ts";
+import * as IssueSearch from "./sourceControl/IssueSearchService.ts";
+import * as ProjectTerminals from "./terminal/ProjectTerminalService.ts";
+import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as Random from "effect/Random";
@@ -14,6 +26,7 @@ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentHttpApi, type RepositoryIdentity } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -65,6 +78,15 @@ import * as ProviderInstanceRegistryHydration from "./provider/ProviderInstanceR
 import * as ProjectSettingsOverrideSweep from "./provider/ProjectSettingsOverrideSweep.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+import * as McpCatalogService from "./mcp/McpCatalogService.ts";
+import * as McpCatalogApplicationService from "./mcp/McpCatalogApplicationService.ts";
+import * as McpCatalogClientService from "./mcp/McpCatalogClientService.ts";
+import * as McpCatalogGateway from "./mcp/McpCatalogGateway.ts";
+import * as McpCatalogGatewayHttpServer from "./mcp/McpCatalogGatewayHttpServer.ts";
+import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
+import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
+import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
+import * as ProjectMcpOAuthHttp from "./mcp/ProjectMcpOAuthHttp.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
@@ -193,7 +215,7 @@ import * as ServerActivation from "./serverActivation.ts";
 
 // MCP handoff thread IDs include escaped provenance and can exceed find-my-way's
 // 100-character default for one path segment.
-const HTTP_ROUTER_CONFIG = {
+export const HTTP_ROUTER_CONFIG = {
   maxParamLength: 512,
 } as const;
 
@@ -292,7 +314,7 @@ const layerRelayClient = Layer.unwrap(
   }),
 );
 
-const layerHttpServer = Layer.unwrap(
+export const layerApplicationHttpServer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     return NodeHttpServer.layer(
@@ -357,7 +379,11 @@ const layerPullRequestService = PullRequestService.layer.pipe(
 
 const layerGitManager = GitManager.layer.pipe(
   Layer.provide(Layer.merge(ProjectionStoreV2.layer, ProjectStore.layer)),
-  Layer.provideMerge(RuntimeLayer.layerProjectSetupScriptRunner),
+  Layer.provideMerge(
+    RuntimeLayer.layerProjectSetupScriptRunner.pipe(
+      Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+    ),
+  ),
   Layer.provideMerge(WorktreeSetupTracker.layer),
   Layer.provideMerge(GitVcsDriver.layer),
   Layer.provideMerge(layerSourceControlProviderRegistry),
@@ -495,7 +521,34 @@ const layerScheduledTaskWebhookOrigin = Layer.effect(
   }),
 );
 
+const layerMcpCatalogRuntime = McpCatalogApplicationService.layer.pipe(
+  Layer.provideMerge(
+    McpCatalogGateway.layer.pipe(Layer.provideMerge(ProjectMcpProxyRegistry.layer)),
+  ),
+  Layer.provideMerge(ProjectMcpOAuth.layer({ servers: [] })),
+  Layer.provideMerge(ProjectMcpSecretStore.layer),
+  Layer.provideMerge(McpCatalogService.layer),
+  Layer.tap((context) =>
+    Context.get(context, McpCatalogApplicationService.McpCatalogApplicationService).recover(),
+  ),
+);
+
+const layerSkillRepository = SkillRepository.layer;
+const layerSkillIndex = SkillIndex.layer.pipe(Layer.provide(layerSkillRepository));
+const layerSkillWatch = SkillWatch.layer.pipe(
+  Layer.provide(layerSkillIndex),
+  Layer.provide(layerSkillRepository),
+);
+const layerSkillCatalog = SkillCatalog.layer.pipe(
+  Layer.provide(NativeSkills.layer),
+  Layer.provide(layerSkillWatch),
+  Layer.provide(layerSkillIndex),
+  Layer.provide(layerSkillRepository),
+);
+
 const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
+  Layer.provideMerge(layerServerEnvironment),
+  Layer.provideMerge(layerMcpCatalogRuntime),
   Layer.provide(layerScheduledTaskWebhookOrigin),
   Layer.provide(ProviderEventIngestor.layerAnalytics),
   Layer.provide(layerCheckpointStore),
@@ -604,8 +657,13 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep),
 ).pipe(
   Layer.provideMerge(layerOrchestrationApplication),
+  Layer.provideMerge(
+    ResourceInstructionComposition.layer.pipe(Layer.provideMerge(layerSkillCatalog)),
+  ),
   Layer.provideMerge(RuntimeLayer.layerEventInfrastructure),
-  Layer.provideMerge(Layer.merge(ProjectStore.layer, ThreadSearch.layer)),
+  Layer.provideMerge(
+    Layer.mergeAll(ProjectStore.layer, ProjectionStoreV2.layer, ThreadSearch.layer),
+  ),
   Layer.provideMerge(layerServerSettings),
   Layer.provideMerge(layerSourceControlProviderRegistry),
   Layer.provideMerge(layerGit),
@@ -688,37 +746,54 @@ const layerCommandReadiness = HttpRouter.middleware(
   { global: true },
 );
 
+/** Client transports accept their services from the caller; startup owns no native work here. */
+export const makeClientApplicationRoutes = Layer.mergeAll;
+export const layerClientWebSocketRoutes = Ws.layer;
+
+export const serveClientApplication = HttpRouter.serve;
+
 const layerMakeRoutes = Layer.mergeAll(
-  Layer.mergeAll(
-    HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
-      Layer.provide(AuthHttp.layer),
-      Layer.provide(McpOAuthHttp.layer.pipe(Layer.provide(McpOAuth.layer))),
-      Layer.provide(CloudHttp.layer),
-      Layer.provide(OrchestrationHttp.layer),
-      Layer.provide(PullRequestHttp.layer),
-      Layer.provide(ProjectHttp.layer),
-      Layer.provide(ServerHttp.layerServerEnvironmentHttpApi),
-      Layer.provide(WebhookRoute.layer.pipe(Layer.provide(RelayDeliveryProof.layer))),
-      Layer.provide(AuthHttp.layerAuthenticatedAuth),
+  makeClientApplicationRoutes(
+    Layer.mergeAll(
+      HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
+        Layer.provide(AuthHttp.layer),
+        Layer.provide(McpOAuthHttp.layer.pipe(Layer.provide(McpOAuth.layer))),
+        Layer.provide(CloudHttp.layer),
+        Layer.provide(OrchestrationHttp.layer),
+        Layer.provide(PullRequestHttp.layer),
+        Layer.provide(ProjectHttp.layer),
+        Layer.provide(ServerHttp.layerServerEnvironmentHttpApi),
+        Layer.provide(WebhookRoute.layer.pipe(Layer.provide(RelayDeliveryProof.layer))),
+        Layer.provide(AuthHttp.layerAuthenticatedAuth),
+      ),
+      ServerHttp.layerOtlpTracesProxyRoute,
+      ServerHttp.layerAssetRoute,
+      ServerHttp.layerAttachmentUploadRoute,
+      DeviceHubProxy.layer,
+      ServerBrowserStream.routeLayer,
+      McpCatalogGatewayHttpServer.layer,
+      ProjectMcpOAuthHttp.layer,
     ),
-    ServerHttp.layerOtlpTracesProxyRoute,
-    ServerHttp.layerAssetRoute,
-    ServerHttp.layerAttachmentUploadRoute,
-    DeviceHubProxy.layer,
-    ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
-    Ws.layer,
+    layerClientWebSocketRoutes,
   ),
   McpHttpServer.layer.pipe(
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),
 ).pipe(
+  Layer.provide(McpCatalogClientService.layer),
+  Layer.provide(ProjectTerminals.ProjectTerminalServiceLive),
+  Layer.provide(IssueSearch.layer),
+  Layer.provide(ResourceAuthority.layer),
+  Layer.provide(TextCatalog.layer),
+  Layer.provide(SkillDeployment.layer),
   Layer.provide(
     PullRequestReviewGuideService.layer.pipe(Layer.provide(PullRequestReviewGuides.layer)),
   ),
   // Both transports consume the same service instance, so caches single-flight across clients
   // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
+  Layer.provide(ProjectWorkRuntime.executionLayer),
   Layer.provide(layerPullRequestService),
   Layer.provide(ServerBrowser.layer.pipe(Layer.provide(DesktopBrowserChannel.layer))),
   Layer.provide(PreviewBrowser.layer),
@@ -1031,7 +1106,7 @@ const layerMakeServer = Layer.unwrap(
       ).pipe(Effect.asVoid),
     }).pipe(Layer.provideMerge(layerRuntimeDependencies), Layer.provide(layerLauncher));
 
-    const layerRoutes = HttpRouter.serve(layerMakeRoutes.pipe(Layer.provide(layerLauncher)), {
+    const layerRoutes = serveClientApplication(layerMakeRoutes.pipe(Layer.provide(layerLauncher)), {
       disableLogger: !config.logWebSocketEvents,
       routerConfig: HTTP_ROUTER_CONFIG,
     }).pipe(
@@ -1057,7 +1132,7 @@ const layerMakeServer = Layer.unwrap(
       ),
       Layer.provide(layerActivation),
       Layer.provideMerge(RelayTracing.layerServerRelayBroker),
-      Layer.provideMerge(layerHttpServer),
+      Layer.provideMerge(layerApplicationHttpServer),
       Layer.provide(layerApplicationObservability),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(VcsProcess.layer),

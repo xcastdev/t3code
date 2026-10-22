@@ -186,6 +186,28 @@ function withFakeCodexEnv<A, E, R>(
 }
 
 it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
+  it.effect("extracts facts through the configured native Codex runtime", () =>
+    withFakeCodexEnv(
+      {
+        output:
+          '{"facts":[{"key":"storage","body":"SQLite is authoritative.","quote":"SQLite is authoritative."}]}',
+        requireReasoningEffort: "high",
+        stdinMustContain: "untrusted data",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const result = yield* textGeneration.extractMemoryFacts({
+            cwd: process.cwd(),
+            sourceText: "SQLite is authoritative.",
+            modelSelection: {
+              ...DEFAULT_TEST_MODEL_SELECTION,
+              options: [{ id: "reasoningEffort", value: "high" }],
+            },
+          });
+          expect(result.facts[0]?.key).toBe("storage");
+        }),
+    ),
+  );
   it.effect.each(["exec", "mcp list"] as const)(
     "kills a stalled %s CLI when its request is interrupted",
     (command) =>

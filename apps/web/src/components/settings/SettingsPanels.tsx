@@ -2080,6 +2080,13 @@ export function GeneralSettingsPanel() {
   const updateSettings = useUpdateScopedSettings();
   const navigate = useNavigate();
   const { scope, environment, connectedEnvironments, target } = useSettingsScope();
+  // Work belongs to one checkout; an all-projects or multi-checkout scope is ambiguous.
+  const workTarget =
+    scope.kind === "checkout"
+      ? scope.checkout
+      : scope.kind === "project" && scope.members.length === 1
+        ? scope.members[0]!
+        : null;
   const environmentId = environment?.environmentId ?? null;
   const isEnvironmentScope = scope.environmentIds.length === 1 && environmentId !== null;
   const hasServerTargets = connectedEnvironments.length > 0;
@@ -3052,6 +3059,40 @@ export function GeneralSettingsPanel() {
               spellCheck={false}
               aria-label="Add project base directory"
             />
+          }
+        />
+        <SettingsRow
+          {...searchableSetting("project-work")}
+          description={
+            workTarget
+              ? `Tasks, scope and plan approvals for ${workTarget.title}. Approving never starts work.`
+              : "Select one project checkout in the scope above to open its Work."
+          }
+          control={
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={workTarget === null}
+              onClick={() => {
+                if (workTarget === null) return;
+                void navigate({
+                  to: "/work/$environmentId/$projectId",
+                  params: { environmentId: workTarget.environmentId, projectId: workTarget.id },
+                  search: { section: "overview" },
+                });
+              }}
+            >
+              Open Work
+            </Button>
+          }
+        />
+        <SettingsRow
+          {...searchableSetting("agents")}
+          description="Named agents with their own chat, rules, model, tools, memory and routines on each environment."
+          control={
+            <Button size="xs" variant="outline" onClick={() => void navigate({ to: "/agents" })}>
+              Open Agents
+            </Button>
           }
         />
       </SettingsSection>

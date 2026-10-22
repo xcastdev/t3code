@@ -19,6 +19,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2PlanStep,
+  type OrchestrationV2InstructionSnapshot,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
   type OrchestrationV2ProviderSession,
@@ -55,6 +56,10 @@ import {
 } from "./skills.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { t3OrchestrationPromptForFirstRun } from "@t3tools/provider-core/server/orchestrationInstructions";
+import {
+  freezeInstructionSnapshot,
+  instructionSnapshotText,
+} from "@t3tools/provider-core/server/instructionSnapshot";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
@@ -83,6 +88,7 @@ export const CURSOR_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(CURSOR_DRIV
 const DEFAULT_CURSOR_SETTINGS = Schema.decodeSync(CursorSettings)({});
 
 export const CursorProviderCapabilitiesV2 = {
+  instructionDelivery: { mode: "turn", supportsSessionReplacement: false },
   sessions: {
     supportsMultipleProviderThreadsPerSession: false,
     supportsModelSwitchInSession: true,
@@ -221,6 +227,15 @@ export function cursorMcpServers(
         Authorization: session.authorizationHeader,
       },
     },
+    ...(session.catalogEndpoint
+      ? {
+          t3_catalog: {
+            type: "http" as const,
+            url: session.catalogEndpoint,
+            headers: { Authorization: session.authorizationHeader },
+          },
+        }
+      : {}),
   };
 }
 
@@ -876,6 +891,7 @@ interface ActiveCursorTurn {
 interface CursorLiveAgent {
   readonly nativeThreadId: string;
   readonly session: CursorAgentSdk.CursorAgentSdkSession;
+  readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
 }
 
 export interface CursorAdapterV2Options {
@@ -918,6 +934,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
         const liveAgent = yield* Ref.make<CursorLiveAgent | null>(null);
         const warnedUnsupportedSandbox = yield* Ref.make(false);
         const activeTurn = yield* Ref.make<ActiveCursorTurn | null>(null);
+        const appliedInstructions = new Map<string, OrchestrationV2InstructionSnapshot>();
         const planIds = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact["id"]>());
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
@@ -2133,13 +2150,14 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             yield* existing.session.close.pipe(Effect.ignore);
             yield* Ref.set(liveAgent, null);
           }
+          const mcpSession = yield* mcpSessions.read(openInput.threadId);
           const options = makeCursorAgentOptions({
             ...(apiKey === undefined ? {} : { apiKey }),
             modelSelection: openInput.modelSelection,
             runtimePolicy: openInput.runtimePolicy,
             platform,
             threadId: openInput.threadId,
-            mcpSession: yield* mcpSessions.read(openInput.threadId),
+            mcpSession,
           });
           if (
             platform === "win32" &&
@@ -2164,6 +2182,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
           const next = {
             nativeThreadId: sdkSession.agentId,
             session: sdkSession,
+            mcpSession,
           } satisfies CursorLiveAgent;
           yield* Ref.set(liveAgent, next);
           return next;
@@ -2239,7 +2258,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               detail: "Cursor turn requires non-empty text or attachments.",
             });
           }
-          const text = `${userText}\n\n${buildRuntimeInstructions({ harness: "Cursor", model: turnInput.modelSelection.model })}`;
+          const text = `${userText}\n\n${buildRuntimeInstructions({ harness: "Cursor", model: turnInput.modelSelection.model })}${turnInput.instructionSnapshot ? `\n\n${instructionSnapshotText(turnInput.instructionSnapshot)}` : ""}`;
           return images.length === 0
             ? text
             : ({
@@ -2258,6 +2277,11 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 reason: "previous_turn_active",
               });
             }
+            appliedInstructions.delete(turnInput.providerThread.id);
+            const instructionSnapshot = turnInput.instructionSnapshot
+              ? freezeInstructionSnapshot(turnInput.instructionSnapshot)
+              : undefined;
+            if (instructionSnapshot) turnInput = { ...turnInput, instructionSnapshot };
             const agentId = nativeThreadId(turnInput.providerThread);
             const agent = yield* openAgent({
               operation: "resume",
@@ -2288,6 +2312,23 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 },
               })
               .pipe(Effect.mapError(classifyCursorModelRejection(turnInput.modelSelection)));
+            // Cursor creates its MCP executor on send, after metadata-only create/resume.
+            if (agent.mcpSession?.catalogEndpoint) {
+              yield* mcpSessions.acknowledgeCatalogEndpoint(agent.mcpSession);
+            }
+            // Native compaction sends only /compress, so it cannot acknowledge instructions.
+            if (
+              instructionSnapshot &&
+              !(
+                turnInput.message.text.trim() === "/compress" &&
+                turnInput.message.attachments.length === 0
+              )
+            ) {
+              appliedInstructions.set(turnInput.providerThread.id, instructionSnapshot);
+              yield* turnInput.onInstructionsApplied?.(instructionSnapshot) ?? Effect.void;
+            } else {
+              appliedInstructions.delete(turnInput.providerThread.id);
+            }
             const startedAt = yield* DateTime.now;
             const completed = yield* Deferred.make<void, never>();
             const providerTurnId = idAllocator.derive.providerTurn({
@@ -2446,6 +2487,8 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
         yield* Effect.addFinalizer(() => closeSession());
 
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+          getAppliedInstructions: ({ providerThread }) =>
+            Effect.sync(() => appliedInstructions.get(providerThread.id)),
           instanceId: adapterOptions.instanceId,
           driver: CursorAgentSdk.CURSOR_PROVIDER,
           providerSessionId: input.providerSessionId,

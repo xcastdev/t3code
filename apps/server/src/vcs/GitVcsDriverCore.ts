@@ -2483,7 +2483,48 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const pushCurrentBranch: GitVcsDriver.GitVcsDriver["Service"]["pushCurrentBranch"] = Effect.fn(
     "pushCurrentBranch",
   )(function* (cwd, fallbackBranch, options) {
-    const details = yield* statusDetails(cwd);
+    const reviewed = options?.reviewed;
+    const reviewedBranch = reviewed?.branchRef.startsWith("refs/heads/")
+      ? reviewed.branchRef.slice("refs/heads/".length)
+      : null;
+    if (
+      reviewed &&
+      (!reviewedBranch || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(reviewed.commitSha))
+    ) {
+      return yield* new GitCommandError({
+        operation: "GitVcsDriver.pushCurrentBranch",
+        command: "git",
+        cwd,
+        detail: "Invalid reviewed branch or commit.",
+      });
+    }
+    const reviewedUpstreamRemote = reviewedBranch
+      ? yield* readConfigValue(cwd, `branch.${reviewedBranch}.remote`)
+      : null;
+    const reviewedUpstreamMerge = reviewedBranch
+      ? yield* readConfigValue(cwd, `branch.${reviewedBranch}.merge`)
+      : null;
+    const reviewedUpstream =
+      reviewedUpstreamRemote &&
+      reviewedUpstreamRemote !== "." &&
+      reviewedUpstreamMerge?.startsWith("refs/heads/")
+        ? {
+            remoteName: reviewedUpstreamRemote,
+            branchName: reviewedUpstreamMerge.slice("refs/heads/".length),
+            upstreamRef: `${reviewedUpstreamRemote}/${reviewedUpstreamMerge.slice("refs/heads/".length)}`,
+          }
+        : null;
+    // Reviewed pushes use explicit branch metadata, even if a raw HEAD edit bypasses the checkout lease.
+    const details = reviewed
+      ? {
+          ...NON_REPOSITORY_STATUS_DETAILS,
+          isRepo: true,
+          branch: reviewedBranch,
+          hasUpstream: reviewedUpstream !== null,
+          aheadCount: 1,
+          upstreamRef: reviewedUpstream?.upstreamRef ?? null,
+        }
+      : yield* statusDetails(cwd);
     const branch = details.branch ?? fallbackBranch;
     if (!branch) {
       return yield* new GitCommandError({
@@ -2496,14 +2537,92 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       });
     }
 
+    const pushToRemote = Effect.fn("GitVcsDriver.pushCurrentBranch.pushToRemote")(function* (
+      operation: string,
+      remoteName: string,
+      targetBranch: string,
+      setUpstream: boolean,
+    ) {
+      const targetRef = `refs/heads/${targetBranch}`;
+      if (!reviewed) {
+        return yield* runGit(
+          operation,
+          cwd,
+          ["push", ...(setUpstream ? ["-u"] : []), "--", remoteName, `HEAD:${targetRef}`],
+          { timeoutMs: null },
+        );
+      }
+      const currentCommit = (yield* runGitStdout(operation, cwd, [
+        "rev-parse",
+        "--verify",
+        `${reviewed.branchRef}^{commit}`,
+      ])).trim();
+      if (currentCommit !== reviewed.commitSha)
+        return yield* new GitCommandError({
+          operation,
+          command: "git",
+          cwd,
+          detail: "Reviewed branch changed before push. Refresh and try again.",
+        });
+      const trackingRef =
+        reviewedUpstream?.remoteName === remoteName && reviewedUpstream.branchName === targetBranch
+          ? (yield* runGitStdout(operation, cwd, [
+              "for-each-ref",
+              "--format=%(upstream)",
+              reviewed.branchRef,
+            ])).trim()
+          : `refs/remotes/${remoteName}/${targetBranch}`;
+      const trackingCommit = trackingRef
+        ? (yield* runGitStdout(
+            operation,
+            cwd,
+            ["rev-parse", "--verify", `${trackingRef}^{commit}`],
+            true,
+          )).trim()
+        : "";
+      if (trackingCommit) {
+        const fastForward = yield* executeGit(
+          operation,
+          cwd,
+          ["merge-base", "--is-ancestor", trackingCommit, reviewed.commitSha],
+          { allowNonZeroExit: true },
+        );
+        if (fastForward.exitCode !== 0)
+          return yield* new GitCommandError({
+            operation,
+            command: "git",
+            cwd,
+            detail: "Reviewed push is not a fast-forward. Refresh and reconcile the remote branch.",
+          });
+      }
+      // The ancestry check forbids history loss; the explicit lease also rejects a remote tip changed since observation.
+      yield* runGit(
+        operation,
+        cwd,
+        [
+          "push",
+          `--force-with-lease=${targetRef}:${trackingCommit}`,
+          "--",
+          remoteName,
+          `${reviewed.commitSha}:${targetRef}`,
+        ],
+        { timeoutMs: null },
+      );
+      if (setUpstream) {
+        // A SHA source cannot use git push -u to identify the local branch.
+        yield* runGit(operation, cwd, ["config", `branch.${branch}.remote`, remoteName]);
+        yield* runGit(operation, cwd, ["config", `branch.${branch}.merge`, targetRef]);
+      }
+    });
+
     const requestedRemoteName = options?.remoteName?.trim() || null;
     if (requestedRemoteName) {
       const publishBranch = yield* resolvePublishBranchName(cwd, branch);
-      yield* runGit(
+      yield* pushToRemote(
         "GitVcsDriver.pushCurrentBranch.pushWithRequestedRemote",
-        cwd,
-        ["push", "-u", "--", requestedRemoteName, `HEAD:refs/heads/${publishBranch}`],
-        { timeoutMs: null },
+        requestedRemoteName,
+        publishBranch,
+        true,
       );
       return {
         status: "pushed" as const,
@@ -2575,11 +2694,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         });
       }
       const publishBranch = yield* resolvePublishBranchName(cwd, branch);
-      yield* runGit(
+      yield* pushToRemote(
         "GitVcsDriver.pushCurrentBranch.pushWithUpstream",
-        cwd,
-        ["push", "-u", "--", publishRemoteName, `HEAD:refs/heads/${publishBranch}`],
-        { timeoutMs: null },
+        publishRemoteName,
+        publishBranch,
+        true,
       );
       return {
         status: "pushed" as const,
@@ -2589,9 +2708,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       };
     }
 
-    const currentUpstream = yield* resolveCurrentUpstream(cwd).pipe(
-      Effect.orElseSucceed(() => null),
-    );
+    const currentUpstream = reviewed
+      ? reviewedUpstream
+      : yield* resolveCurrentUpstream(cwd).pipe(Effect.orElseSucceed(() => null));
     if (currentUpstream) {
       // A branch tracking a differently named ref was cut from it, the way `git
       // checkout -b feature origin/dev` and our own worktree flow leave it.
@@ -2629,11 +2748,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             ]);
           }
         }
-        yield* runGit(
+        yield* pushToRemote(
           "GitVcsDriver.pushCurrentBranch.pushOwnBranch",
-          cwd,
-          ["push", "-u", "--", remoteName, `HEAD:refs/heads/${publishBranch}`],
-          { timeoutMs: null },
+          remoteName,
+          publishBranch,
+          true,
         );
         return {
           status: "pushed" as const,
@@ -2643,11 +2762,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         };
       }
 
-      yield* runGit(
+      yield* pushToRemote(
         "GitVcsDriver.pushCurrentBranch.pushUpstream",
-        cwd,
-        ["push", "--", currentUpstream.remoteName, `HEAD:refs/heads/${currentUpstream.branchName}`],
-        { timeoutMs: null },
+        currentUpstream.remoteName,
+        currentUpstream.branchName,
+        false,
       );
       return {
         status: "pushed" as const,
@@ -2657,6 +2776,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       };
     }
 
+    if (reviewed)
+      return yield* new GitCommandError({
+        operation: "GitVcsDriver.pushCurrentBranch",
+        command: "git",
+        cwd,
+        detail: "Cannot resolve the reviewed push destination. Refresh and try again.",
+      });
     yield* runGit("GitVcsDriver.pushCurrentBranch.push", cwd, ["push"], { timeoutMs: null });
     return {
       status: "pushed" as const,

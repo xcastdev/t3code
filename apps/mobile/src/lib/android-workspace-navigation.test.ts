@@ -315,4 +315,21 @@ describe("Android Settings tab", () => {
     expect(list.routes[0]?.key).toBe(previous.routes[0]?.key);
     expect(selectedTab(list, "pullRequests")).toBe("pullRequests");
   });
+
+  it("returns from Settings to the Work tab, not to Threads or the Settings root", () => {
+    const work = openTab(legacyHistory(), "work");
+    expect(names(work)).toEqual(["Home"]);
+    expect(selectedTab(work, "work")).toBe("work");
+    const settings = openTab(work, "settings");
+    expect(selectedTab(settings, "work")).toBe("settings");
+    // Home, with Work's in-pane history, stays mounted but blurred, so only Settings
+    // is focused to handle hardware Back.
+    expect(settings.routes[0]?.key).toBe(work.routes[0]?.key);
+    expect(settings.routes[settings.index]?.name).toBe("SettingsSheet");
+    // Closing Settings with Back keeps the previously selected Work destination.
+    expect(selectedTab(apply(settings, StackActions.pop()), "work")).toBe("work");
+    const back = openTab(settings, "work");
+    expect(names(back)).toEqual(["Home"]);
+    expect(selectedTab(back, "work")).toBe("work");
+  });
 });

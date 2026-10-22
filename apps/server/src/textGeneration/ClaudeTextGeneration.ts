@@ -189,7 +189,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
 
     const runClaudeCommand = Effect.fn("runClaudeJson.runClaudeCommand")(function* () {
       const workingDirectory =
-        operation === "generateThreadTitle"
+        operation === "generateThreadTitle" || operation === "extractMemoryFacts"
           ? yield* fileSystem
               .makeTempDirectoryScoped({ prefix: "t3code-claude-title-" })
               .pipe(
@@ -310,7 +310,10 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       ? output
       : output.findLast((message) => message.type === "result");
 
-    const decodeOutput = Schema.decodeEffect(outputSchemaJson);
+    const decodeOutput = Schema.decodeEffect(
+      outputSchemaJson,
+      operation === "extractMemoryFacts" ? { onExcessProperty: "error" } : undefined,
+    );
     return yield* decodeOutput(envelope?.structured_output).pipe(
       Effect.catchTags({
         SchemaError: (cause) =>

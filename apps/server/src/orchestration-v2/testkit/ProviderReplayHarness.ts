@@ -1,3 +1,7 @@
+import * as ThreadHistoryArchive from "../ThreadHistoryArchiveService.ts";
+import * as ProjectWorkRunAdmission from "../../projectWork/ProjectWorkRunAdmission.ts";
+import * as OwnerDeadlineControl from "../OwnerDeadlineControl.ts";
+import * as InstructionDelivery from "../InstructionDelivery.ts";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -276,7 +280,8 @@ export function layerWithRegistry<Error>(
   | EffectWorker.OrchestrationEffectWorkerV2
   | EventSink.EventSinkV2
   | ProviderSessionManager.ProviderSessionManagerV2
-  | CommandOutputRecorder.CommandOutputRecorder,
+  | CommandOutputRecorder.CommandOutputRecorder
+  | InstructionDelivery.InstructionDelivery,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
   const layerServerConfig = Layer.effect(
@@ -311,8 +316,9 @@ export function layerWithRegistry<Error>(
     EffectOutbox.layer,
     TurnItemPositionStore.layer,
   ).pipe(Layer.provide(layerDatabase));
-  const layerEventSinkProvided = EventSink.layerFromStores.pipe(
-    Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
+  const layerRunAdmission = ProjectWorkRunAdmission.layer.pipe(Layer.provide(layerDatabase));
+  const layerEventSinkProvided = EventSink.layerWithAdmission.pipe(
+    Layer.provide(Layer.mergeAll(layerStores, layerDatabase, layerRunAdmission)),
   );
   const layerCommandReceiptStoreProvided = CommandReceiptStore.layer.pipe(
     Layer.provide(layerDatabase),
@@ -389,10 +395,16 @@ export function layerWithRegistry<Error>(
       ),
     ),
   );
+  const layerInstructionDeliveryProvided = InstructionDelivery.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(layerDatabase, layerStores, layerEventSinkProvided, IdAllocator.layer),
+    ),
+  );
   const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerContextHandoffServiceProvided,
+        layerInstructionDeliveryProvided,
         layerEventSinkProvided,
         IdAllocator.layer,
         layerStores,
@@ -401,6 +413,7 @@ export function layerWithRegistry<Error>(
           tryHandlePromptCommand: () => Effect.succeed(false),
         }),
         layerRunExecutionServiceProvided,
+        layerRunAdmission,
         layerRuntime,
         layerServerConfig,
         layerServerSettings,
@@ -408,14 +421,22 @@ export function layerWithRegistry<Error>(
     ),
   );
   const layerProviderTurnControlServiceProvided = ProviderTurnControlService.layer.pipe(
-    Layer.provide(Layer.merge(layerStores, layerProviderSessionManagerProvided)),
+    Layer.provide(
+      Layer.mergeAll(layerStores, layerProviderSessionManagerProvided, layerRunAdmission),
+    ),
   );
   const layerRuntimeRequestServiceProvided = RuntimeRequestService.layer.pipe(
-    Layer.provide(Layer.merge(layerStores, layerProviderSessionManagerProvided)),
+    Layer.provide(
+      Layer.mergeAll(layerStores, layerProviderSessionManagerProvided, layerRunAdmission),
+    ),
+  );
+  const layerArchive = ThreadHistoryArchive.layer.pipe(
+    Layer.provide(Layer.mergeAll(layerDatabase, layerStores, layerCheckpointStore)),
   );
   const layerCheckpointRollbackServiceProvided = CheckpointRollbackService.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        layerArchive,
         layerCheckpointServiceProvided,
         layerEventSinkProvided,
         IdAllocator.layer,
@@ -472,6 +493,7 @@ export function layerWithRegistry<Error>(
         dispatch: orchestrator.dispatch,
         getThreadRecords: orchestrator.getThreadRecords,
         getThreadProjection: orchestrator.getThreadProjection,
+        stopExactRun: orchestrator.stopExactRun,
         recoverDelegatedTask: orchestrator.recoverDelegatedTask,
         delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
       });
@@ -484,14 +506,37 @@ export function layerWithRegistry<Error>(
             Layer.mergeAll(
               layerContinuationRequests,
               layerThreadManagementProvided,
+              layerRunAdmission,
               IdAllocator.layer,
             ),
           ),
         )
       : Layer.empty;
+  const layerOwnerDeadlineStop = Layer.effect(
+    OwnerDeadlineControl.OwnerDeadlineStop,
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      return OwnerDeadlineControl.OwnerDeadlineStop.of({
+        stop: (input) =>
+          orchestrator.stopOwnedRun(input).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OwnerDeadlineControl.OwnerDeadlineControlError({
+                  controlId: input.control.controlId,
+                  cause,
+                }),
+            ),
+          ),
+      });
+    }),
+  ).pipe(Layer.provide(layerOrchestratorProvided));
+  const layerOwnerDeadline = OwnerDeadlineControl.layer.pipe(
+    Layer.provide(Layer.merge(layerRunAdmission, layerOwnerDeadlineStop)),
+  );
   const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.provide(
       Layer.mergeAll(
+        layerOwnerDeadline,
         layerRunFinalizationServiceProvided,
         layerCheckpointRollbackServiceProvided,
         layerProviderSessionManagerProvided,
@@ -508,6 +553,7 @@ export function layerWithRegistry<Error>(
     Layer.provide(Layer.merge(layerStores, layerEffectExecutorProvided)),
   );
   const layerReplayRuntime = Layer.mergeAll(
+    layerInstructionDeliveryProvided,
     layerOrchestratorProvided,
     layerProviderSessionManagerProvided,
     layerEffectWorkerProvided,

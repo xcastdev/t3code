@@ -110,6 +110,27 @@ const finish =
   };
 
 it.layer(NodeServices.layer)("Muse text generation", (it) => {
+  it.effect("extracts facts through the native Muse host with selected options", () =>
+    Effect.gen(function* () {
+      const test = fixture(
+        finish(
+          '{"facts":[{"key":"storage","body":"SQLite is authoritative.","quote":"SQLite is authoritative."}]}',
+        ),
+      );
+      const service = yield* test.make;
+      const result = yield* service.extractMemoryFacts({
+        cwd: titleInput.cwd,
+        sourceText: "SQLite is authoritative.",
+        modelSelection,
+      });
+      expect(result.facts[0]?.key).toBe("storage");
+      expect(test.host.connection.command).toHaveBeenCalledWith(
+        "turn/start",
+        expect.objectContaining({ reasoningEffort: "high" }),
+        expect.anything(),
+      );
+    }),
+  );
   it.effect("validates the final item once and closes an isolated restrictive host", () =>
     Effect.gen(function* () {
       const test = fixture(finish('{"title":"Fix login form"}'));

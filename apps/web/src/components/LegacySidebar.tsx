@@ -2158,6 +2158,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           { id: "copy-path", label: "Copy Path" },
           { id: "copy-thread-id", label: "Copy Thread ID" },
           { id: "project-settings", label: "Project settings" },
+          { id: "thread-resources", label: "Skills, commands and MCP" },
           {
             id: "delete",
             label: "Delete",
@@ -2174,6 +2175,20 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         void router.navigate({
           to: "/projects/$projectKey",
           params: { projectKey: project.projectKey },
+        });
+        return;
+      }
+
+      if (clicked === "thread-resources") {
+        if (isMobile) setOpenMobile(false);
+        void router.navigate({
+          to: "/settings/resources",
+          search: {
+            project: project.projectKey,
+            machine: thread.environmentId,
+            ...(threadProject ? { checkout: threadProject.physicalProjectKey } : {}),
+            thread: thread.id,
+          },
         });
         return;
       }

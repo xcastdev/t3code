@@ -45,12 +45,40 @@ import {
   resolveProviderSkillsForCwd,
   resolveProviderSlashCommandsForCwd,
 } from "@t3tools/client-runtime/providerSkills";
-import { useEffect, useRef, useState } from "react";
+import { RegistryContext } from "@effect/atom-react";
+import { composerIssueItems } from "@t3tools/client-runtime/composerIssueItems";
+import {
+  composerTriggerTokenEnd,
+  createComposerInsertionGuard,
+  managedCommandArgumentRange,
+  managedSkillMenuItems,
+  managedTextMenuItems,
+  resolveManagedSkillInsertion,
+} from "@t3tools/client-runtime/composer-managed-resources";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { ComposerEditorSelection } from "../../components/ComposerEditor";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { useComposerPathSearch, useComposerPullRequestSearch } from "../../state/queries";
+import {
+  useComposerPathSearch,
+  useComposerPullRequestSearch,
+  useDebouncedValue,
+} from "../../state/queries";
+import { useEnvironmentQuery } from "../../state/query";
+import {
+  issueSearchEnvironment,
+  managedTextEnvironment,
+  resourceCatalogInput,
+  skillsEnvironment,
+  useComposerResourceSubscriptions,
+} from "../../state/resources";
+import { resolveManagedTextResourceInsertion } from "../managedTextResources/managedTextResourceInsertion";
 import type { ComposerCommandItem } from "./ComposerCommandPopover";
 import { matchesSlashSkillQuery } from "./composerSlashSkillSearch";
 
@@ -58,6 +86,19 @@ const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
 
 function composerSelectionAtEnd(draftMessage: string): ComposerEditorSelection {
   return { start: draftMessage.length, end: draftMessage.length };
+}
+
+/**
+ * Whether the composer shows its menu. A failed catalog or issue lookup is
+ * shown even with no rows, so the failure and its retry are never swallowed.
+ */
+export function isComposerMenuVisible(menu: {
+  readonly trigger: { readonly kind: string } | null;
+  readonly items: ReadonlyArray<unknown>;
+  readonly error: string | null;
+}): boolean {
+  if (menu.trigger === null) return false;
+  return menu.items.length > 0 || menu.trigger.kind === "pull-request" || menu.error !== null;
 }
 
 export function buildComposerSlashCommandItems(input: {
@@ -175,6 +216,7 @@ export function useComposerCommandMenu({
   currentThreadId = null,
   projectCwd,
   pullRequestProjectId = null,
+  resourceProjectId = null,
   pullRequestRepository = null,
   threadPullRequests,
   selectedProviderStatus,
@@ -193,6 +235,8 @@ export function useComposerCommandMenu({
   readonly currentThreadId?: ThreadId | null;
   readonly projectCwd: string | null;
   readonly pullRequestProjectId?: ProjectId | null;
+  /** The draft's project, which scopes managed commands, snippets and skills. */
+  readonly resourceProjectId?: ProjectId | null;
   readonly pullRequestRepository?: string | null;
   readonly threadPullRequests?: ReadonlyArray<ThreadPullRequestLink>;
   readonly selectedProviderStatus: ServerProvider | null;
@@ -351,8 +395,139 @@ export function useComposerCommandMenu({
     query: trigger?.kind === "pull-request" ? trigger.query : null,
   });
 
+  const registry = useContext(RegistryContext);
+  const resourceTarget =
+    environmentId === null
+      ? null
+      : {
+          environmentId,
+          ...(resourceProjectId === null ? {} : { projectId: resourceProjectId }),
+          ...(currentThreadId === null ? {} : { threadId: currentThreadId }),
+        };
+  const resourceInput = resourceTarget === null ? {} : resourceCatalogInput(resourceTarget);
+  // A managed insertion resumes after a fetch; it compares against these, not its own render.
+  const insertionProviderId: string | null = selectedProviderInstanceId ?? null;
+  const latestRef = useRef({
+    draftMessage,
+    resourceTarget,
+    ownerKey,
+    selection,
+    providerInstanceId: insertionProviderId,
+  });
+  useLayoutEffect(() => {
+    latestRef.current = {
+      draftMessage,
+      resourceTarget,
+      ownerKey,
+      selection,
+      providerInstanceId: insertionProviderId,
+    };
+  });
+  // Bumped when a pending managed insertion must not land: another selection,
+  // a caret move, a closed menu, another provider, another draft owner, or unmount.
+  const [insertionGuard] = useState(createComposerInsertionGuard);
+  const readInsertion = () => {
+    const latest = latestRef.current;
+    if (latest.resourceTarget === null || latest.selection.start !== latest.selection.end)
+      return null;
+    return {
+      ownerKey: latest.ownerKey ?? "",
+      target: latest.resourceTarget,
+      providerInstanceId: latest.providerInstanceId,
+      draft: latest.draftMessage,
+      cursor: latest.selection.end,
+      selection: { start: latest.selection.start, end: latest.selection.end },
+    };
+  };
+  const insertionContextRef = useRef("");
+  const insertionContext = JSON.stringify([
+    ownerKey,
+    selection.start,
+    selection.end,
+    trigger !== null,
+    insertionProviderId,
+  ]);
+  useLayoutEffect(() => {
+    if (insertionContextRef.current === insertionContext) return;
+    insertionContextRef.current = insertionContext;
+    insertionGuard.cancel();
+  }, [insertionContext, insertionGuard]);
+  useEffect(
+    () => () => {
+      insertionGuard.cancel();
+    },
+    [insertionGuard],
+  );
+  // Open menus follow catalog edits made elsewhere instead of offering a stale list.
+  useComposerResourceSubscriptions(
+    resourceTarget !== null && (trigger?.kind === "slash-command" || trigger?.kind === "skill")
+      ? {
+          target: resourceTarget,
+          kind: trigger.kind === "skill" ? "skills" : "text",
+          ...(trigger.kind === "skill" && selectedProviderStatus
+            ? { providerInstanceId: selectedProviderStatus.instanceId }
+            : {}),
+        }
+      : null,
+  );
+  const managedTextCatalog = useEnvironmentQuery(
+    environmentId !== null && trigger?.kind === "slash-command"
+      ? managedTextEnvironment.catalog({ environmentId, input: resourceInput })
+      : null,
+  );
+  const managedSkillCatalog = useEnvironmentQuery(
+    environmentId !== null && trigger?.kind === "skill"
+      ? skillsEnvironment.catalog({
+          environmentId,
+          input: {
+            ...resourceInput,
+            ...(selectedProviderStatus
+              ? { providerInstanceId: selectedProviderStatus.instanceId }
+              : {}),
+          },
+        })
+      : null,
+  );
+  const issueQuery = trigger?.kind === "issue" ? trigger.query : null;
+  const debouncedIssueQuery = useDebouncedValue(issueQuery, 180);
+  const issueSearch = useEnvironmentQuery(
+    environmentId !== null &&
+      pullRequestProjectId !== null &&
+      debouncedIssueQuery !== null &&
+      debouncedIssueQuery === issueQuery
+      ? issueSearchEnvironment.search({
+          environmentId,
+          input: { projectId: pullRequestProjectId, query: debouncedIssueQuery },
+        })
+      : null,
+  );
+  const managedSkillItems = managedSkillMenuItems({
+    entries: managedSkillCatalog.data?.entries ?? [],
+    query: trigger?.kind === "skill" ? trigger.query.replace(/^\p{Sc}+/u, "") : "",
+    nativeSkillNames: skills.map((skill) => skill.name),
+  }).map((item): ComposerCommandItem => ({
+    id: item.id,
+    type: "managed-skill",
+    entry: item.entry,
+    collidesWithNative: item.collidesWithNative,
+    label: item.entry.name,
+    description: `Adds its ${item.entry.scope} instructions to the message`,
+  }));
+
   const items = ((): ComposerCommandItem[] => {
     if (!trigger) return [];
+
+    if (trigger.kind === "issue") {
+      return issueSearch.data === null || debouncedIssueQuery !== issueQuery
+        ? []
+        : composerIssueItems(issueSearch.data).map((item) => ({
+            id: item.id,
+            type: "issue",
+            issue: item.issue,
+            label: `#${item.issue.number}`,
+            description: item.issue.title,
+          }));
+    }
 
     if (trigger.kind === "pull-request") {
       return pullRequestSearch.entries.map((entry) => ({
@@ -407,7 +582,23 @@ export function useComposerCommandMenu({
           description: skill.shortDescription ?? skill.description ?? "",
         }));
 
-      return [...commandItems, ...skillItems];
+      const managedItems = managedTextMenuItems({
+        entries: managedTextCatalog.data?.entries ?? [],
+        query: trigger.query,
+        nativeCommandNames: (selectedProviderStatus
+          ? resolveProviderSlashCommandsForCwd(selectedProviderStatus, projectCwd)
+          : []
+        ).map((command) => command.name),
+      }).map((item): ComposerCommandItem => ({
+        id: item.id,
+        type: "managed-text",
+        entry: item.entry,
+        collidesWithNative: item.collidesWithNative,
+        label: `/${item.entry.key}`,
+        description: item.entry.name ?? (item.entry.kind === "command" ? "Command" : "Snippet"),
+      }));
+
+      return [...commandItems, ...skillItems, ...managedItems];
     }
 
     if (trigger.kind === "skill") {
@@ -417,13 +608,16 @@ export function useComposerCommandMenu({
       });
 
       if (!normalizedQuery) {
-        return enabledSkills.slice(0, 20).map((skill) => ({
-          id: `skill:${skill.name}`,
-          type: "skill" as const,
-          skill,
-          label: skill.displayName ?? skill.name,
-          description: skill.shortDescription ?? skill.description ?? "",
-        }));
+        return [
+          ...enabledSkills.slice(0, 20).map((skill) => ({
+            id: `skill:${skill.name}`,
+            type: "skill" as const,
+            skill,
+            label: skill.displayName ?? skill.name,
+            description: skill.shortDescription ?? skill.description ?? "",
+          })),
+          ...managedSkillItems,
+        ];
       }
 
       const ranked: Array<{
@@ -484,13 +678,16 @@ export function useComposerCommandMenu({
         }
       }
 
-      return ranked.map(({ item: skill }) => ({
-        id: `skill:${skill.name}`,
-        type: "skill" as const,
-        skill,
-        label: skill.displayName ?? skill.name,
-        description: skill.shortDescription ?? skill.description ?? "",
-      }));
+      return [
+        ...ranked.map(({ item: skill }) => ({
+          id: `skill:${skill.name}`,
+          type: "skill" as const,
+          skill,
+          label: skill.displayName ?? skill.name,
+          description: skill.shortDescription ?? skill.description ?? "",
+        })),
+        ...managedSkillItems,
+      ];
     }
 
     if (trigger.kind === "path") {
@@ -521,8 +718,172 @@ export function useComposerCommandMenu({
     return [];
   })();
 
+  const onSelectRef = useRef<(item: ComposerCommandItem) => void>(() => undefined);
+  const reportInsertionFailure = (
+    label: string,
+    item: ComposerCommandItem,
+    result: Parameters<typeof isAtomCommandInterrupted>[0] & { readonly _tag: "Failure" },
+  ) => {
+    if (isAtomCommandInterrupted(result)) return;
+    const error = squashAtomCommandFailure(result);
+    Dialog.confirm({
+      title: `Couldn't insert ${label}`,
+      message: `${
+        error instanceof Error && error.message.trim().length > 0
+          ? error.message
+          : "It couldn't be read from this environment."
+      } Your draft is unchanged.`,
+      confirmText: "Try again",
+      onConfirm: () => onSelectRef.current(item),
+    });
+  };
+
+  /**
+   * Expands a managed command or snippet at selection time. After the content
+   * fetch the catalog is reread and everything is compared again, so nothing
+   * lands in another draft or after the user moved on.
+   */
+  const insertManagedText = async (
+    item: Extract<ComposerCommandItem, { type: "managed-text" }>,
+    selectedTrigger: ComposerTrigger,
+  ) => {
+    const pending = insertionGuard.begin(readInsertion);
+    if (pending === null) return;
+    const { selected } = pending;
+    const expectedDraft = selected.draft;
+    const range =
+      item.entry.kind === "command"
+        ? managedCommandArgumentRange(expectedDraft, selected.cursor)
+        : { argument: "", rangeEnd: composerTriggerTokenEnd(expectedDraft, selected.cursor) };
+    const scope = resourceCatalogInput(selected.target);
+    const content = await executeAtomQuery(
+      registry,
+      managedTextEnvironment.content({
+        environmentId: selected.target.environmentId,
+        input: {
+          kind: item.entry.kind,
+          id: item.entry.id,
+          expectedRevision: item.entry.revision,
+          ...scope,
+        },
+      }),
+      { reportFailure: false },
+    );
+    const catalog =
+      content._tag === "Success"
+        ? await executeAtomQuery(
+            registry,
+            managedTextEnvironment.catalog({
+              environmentId: selected.target.environmentId,
+              input: scope,
+            }),
+            { refresh: true, reportFailure: false },
+          )
+        : content;
+    if (!pending.isCurrent()) return;
+    if (content._tag !== "Success")
+      return reportInsertionFailure(`/${item.entry.key}`, item, content);
+    if (catalog._tag !== "Success")
+      return reportInsertionFailure(`/${item.entry.key}`, item, catalog);
+    const result = resolveManagedTextResourceInsertion({
+      selectedTarget: selected.target,
+      currentTarget: selected.target,
+      selected: item.entry,
+      content: content.value,
+      currentEntries: catalog.value.entries,
+      draft: selected.draft,
+      expectedDraft,
+      rangeStart: selectedTrigger.rangeStart,
+      rangeEnd: range.rangeEnd,
+      argument: range.argument,
+    });
+    if (result.status === "inserted") {
+      onChangeDraftMessage(result.text);
+      setSelection({ start: result.cursor, end: result.cursor });
+    } else if (result.status === "stale-resource") {
+      Dialog.alert(`/${item.entry.key} changed`, "Choose it again to use the current version.");
+    }
+  };
+
+  /**
+   * Inserts the verified body of a managed skill as ordinary draft text. A
+   * provider skill with the same key keeps its own `$key` row.
+   */
+  const insertManagedSkill = async (
+    item: Extract<ComposerCommandItem, { type: "managed-skill" }>,
+    selectedTrigger: ComposerTrigger,
+  ) => {
+    const pending = insertionGuard.begin(readInsertion);
+    if (pending === null) return;
+    const { selected } = pending;
+    const scope = resourceCatalogInput(selected.target);
+    const providerInstanceId = selectedProviderStatus?.instanceId;
+    const content = await executeAtomQuery(
+      registry,
+      skillsEnvironment.content({
+        environmentId: selected.target.environmentId,
+        input: { skillId: item.entry.id, ...scope },
+      }),
+      { refresh: true, reportFailure: false },
+    );
+    const catalog =
+      content._tag === "Success"
+        ? await executeAtomQuery(
+            registry,
+            skillsEnvironment.catalog({
+              environmentId: selected.target.environmentId,
+              input: {
+                ...scope,
+                ...(providerInstanceId === undefined ? {} : { providerInstanceId }),
+              },
+            }),
+            { refresh: true, reportFailure: false },
+          )
+        : content;
+    if (!pending.isCurrent()) return;
+    if (content._tag !== "Success") return reportInsertionFailure(item.entry.name, item, content);
+    if (catalog._tag !== "Success") return reportInsertionFailure(item.entry.name, item, catalog);
+    const result = resolveManagedSkillInsertion({
+      selected: item.entry,
+      content: content.value,
+      currentEntries: catalog.value.entries,
+      draft: selected.draft,
+      rangeStart: selectedTrigger.rangeStart,
+      rangeEnd: composerTriggerTokenEnd(selected.draft, selected.cursor),
+    });
+    if (result.status === "inserted") {
+      onChangeDraftMessage(result.text);
+      setSelection({ start: result.cursor, end: result.cursor });
+    } else if (result.status === "stale-resource") {
+      Dialog.alert(
+        `${item.entry.name} changed`,
+        "It was edited, turned off or replaced while loading. Choose it again to use the current version.",
+      );
+    }
+  };
+
   const onSelect = (item: ComposerCommandItem) => {
     if (!trigger) return;
+    if (item.type === "issue") {
+      if (trigger.kind !== "issue" || !items.some((candidate) => candidate.id === item.id)) return;
+      const result = replaceTextRange(
+        draftMessage,
+        trigger.rangeStart,
+        trigger.rangeEnd,
+        `${item.issue.url} `,
+      );
+      onChangeDraftMessage(result.text);
+      setSelection({ start: result.cursor, end: result.cursor });
+      return;
+    }
+    if (item.type === "managed-skill") {
+      if (trigger.kind === "skill") void insertManagedSkill(item, trigger);
+      return;
+    }
+    if (item.type === "managed-text") {
+      if (trigger.kind === "slash-command") void insertManagedText(item, trigger);
+      return;
+    }
     if (item.type === "thread") {
       if (!ownerKey || trigger.kind !== "path") return;
       const shell = threadShells.find(
@@ -613,6 +974,10 @@ export function useComposerCommandMenu({
     }
   };
 
+  useLayoutEffect(() => {
+    onSelectRef.current = onSelect;
+  });
+
   return {
     selection,
     onSelectionChange,
@@ -620,13 +985,33 @@ export function useComposerCommandMenu({
     items,
     skills,
     isLoading:
-      trigger?.kind === "pull-request" ? pullRequestSearch.isPending : pathSearch.isPending,
-    error:
       trigger?.kind === "pull-request"
-        ? pullRequestProjectId === null || pullRequestRepository === null
-          ? "Pull requests are unavailable for this project."
-          : pullRequestSearch.error
-        : null,
+        ? pullRequestSearch.isPending
+        : trigger?.kind === "issue"
+          ? issueSearch.isPending || debouncedIssueQuery !== issueQuery
+          : pathSearch.isPending,
+    error:
+      trigger?.kind === "issue"
+        ? pullRequestProjectId === null
+          ? "Issues are unavailable for this project."
+          : issueSearch.error
+        : trigger?.kind === "pull-request"
+          ? pullRequestProjectId === null || pullRequestRepository === null
+            ? "Pull requests are unavailable for this project."
+            : pullRequestSearch.error
+          : trigger?.kind === "slash-command" && managedTextCatalog.error !== null
+            ? `Managed commands and snippets couldn't be loaded. ${managedTextCatalog.error}`
+            : trigger?.kind === "skill" && managedSkillCatalog.error !== null
+              ? `Managed skills couldn't be loaded. ${managedSkillCatalog.error}`
+              : null,
+    onRetry:
+      trigger?.kind === "issue" && issueSearch.error !== null
+        ? issueSearch.refresh
+        : trigger?.kind === "slash-command" && managedTextCatalog.error !== null
+          ? managedTextCatalog.refresh
+          : trigger?.kind === "skill" && managedSkillCatalog.error !== null
+            ? managedSkillCatalog.refresh
+            : null,
     onSelect,
   };
 }

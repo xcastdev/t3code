@@ -1,5 +1,38 @@
+import * as ExternalNotificationGateway from "./notifications/ExternalNotificationGateway.ts";
+import * as ThreadHistoryService from "./orchestration-v2/ThreadHistoryService.ts";
+import { ThreadHistoryRpcError } from "@t3tools/contracts";
+import { AssistantRoutineGateway } from "./assistants/AssistantRoutineGateway.ts";
+import { AssistantActivity } from "./assistants/AssistantActivity.ts";
+import { AssistantRosterStream } from "./assistants/AssistantRosterStream.ts";
+import { AssistantMemoryRpcError } from "@t3tools/contracts";
+import { AssistantMemoryGateway } from "./assistants/AssistantMemoryGateway.ts";
+import { ProjectMemoryError } from "./projectWork/memory/ProjectMemoryRepository.ts";
+import { AssistantError } from "./assistants/AssistantRepository.ts";
+import * as AssistantRuntime from "./assistants/AssistantRuntime.ts";
+import { AssistantRpcError } from "@t3tools/contracts";
+import * as ProjectionStoreV2 from "./orchestration-v2/ProjectionStore.ts";
+import * as SkillCatalog from "./skills/SkillCatalogService.ts";
+import * as SkillRpcScope from "./skills/SkillRpcScope.ts";
+import * as SkillDeployment from "./skills/SkillDeploymentService.ts";
+import { makeSkillDeploymentRpc } from "./skills/SkillDeploymentRpc.ts";
+import { SkillMutationCommitAuthority } from "./skills/SkillMutationCommitAuthority.ts";
+import { ManagedSkillRepositoryError } from "./skills/ManagedSkillRepository.ts";
+import * as TextCatalog from "./managedTextResources/ManagedTextResourceCatalogService.ts";
+import * as TextRpcScope from "./managedTextResources/ManagedTextResourceRpc.ts";
+import * as ResourceAuthority from "./ResourceMutationAuthority.ts";
+import * as IssueSearch from "./sourceControl/IssueSearchService.ts";
+import {
+  SkillRpcError,
+  ManagedTextResourceRpcError,
+  SkillCatalogRevision,
+  type ProjectTerminalAttachStreamEvent,
+  type ProjectTerminalMetadataStreamEvent,
+  TerminalToolError,
+} from "@t3tools/contracts";
+import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
+import * as Cause from "effect/Cause";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
 
 import * as DateTime from "effect/DateTime";
@@ -27,6 +60,7 @@ import {
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   AuthOrchestrationOperateScope,
+  AuthTerminalOperateScope,
   type AuthEnvironmentScope,
   type ScheduledTaskListResult,
   AuthSessionId,
@@ -112,6 +146,8 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
 import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
+import * as McpCatalogClientService from "./mcp/McpCatalogClientService.ts";
+import { RPC_REQUIRED_SCOPES } from "./auth/RpcAuthorization.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
@@ -234,6 +270,7 @@ import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewG
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
 import { pullRequestSyncKey } from "./pullRequest/pullRequestSyncKey.ts";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlError from "effect/sql/SqlError";
 import * as PullRequestSyncReactor from "./orchestration-v2/PullRequestSyncReactor.ts";
 import * as SourceControlDiscovery from "./sourceControl/SourceControlDiscovery.ts";
 import * as OtlpEndpointCheck from "./observability/OtlpEndpointCheck.ts";
@@ -255,6 +292,30 @@ import {
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
 import * as AgentSessionImporter from "./project/AgentSessionImporter.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
+
+const isResourceMutationAuthorityError = Schema.is(
+  ResourceAuthority.ResourceMutationAuthorityError,
+);
+const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
+export const projectTerminalMetadataListener =
+  (
+    queue: Queue.Queue<ProjectTerminalMetadataStreamEvent, TerminalToolError | Cause.Done>,
+    projectId: ProjectId,
+  ) =>
+  (event: ProjectTerminalMetadataStreamEvent) =>
+    Effect.sync(() => {
+      if (!Queue.offerUnsafe(queue, event))
+        Queue.failCauseUnsafe(
+          queue,
+          Cause.fail(
+            new TerminalToolError({
+              operation: "list",
+              reason: "unavailable",
+              projectId,
+            }),
+          ),
+        );
+    });
 
 const CONFIG_DISCOVERY_TIMEOUT = Duration.seconds(5);
 const isProviderUploadFeedbackError = Schema.is(ProviderUploadFeedbackError);
@@ -320,7 +381,10 @@ export const withLateEditorConfig = <E, R>(
         editorConfig.availableEditors.join() !== config.availableEditors.join() ||
         editorConfig.shellRevealInFileManagerKind !== config.shellRevealInFileManagerKind,
     ),
-    Stream.map((editorConfig) => ({ type: "editorsResolved" as const, editorConfig })),
+    Stream.map((editorConfig) => ({
+      type: "editorsResolved" as const,
+      editorConfig,
+    })),
   );
 
   return Stream.merge(liveUpdates, lateEditorConfig).pipe(
@@ -544,6 +608,110 @@ const PROVIDER_STATUS_DEBOUNCE_MS = 200;
 
 // Middleware added later wraps middleware added earlier, so instrumentation wraps authorization.
 const ServerWsRpcGroup = WsRpcGroup.middleware(RpcInstrumentation);
+const resourceRpcMethods = [
+  WS_METHODS.skillsCatalogList,
+  WS_METHODS.skillsCatalogSubscribe,
+  WS_METHODS.skillsContentGet,
+  WS_METHODS.skillsHistoryList,
+  WS_METHODS.skillsNativeContentGet,
+  WS_METHODS.skillsApplicationGet,
+  WS_METHODS.skillsDeploymentList,
+  WS_METHODS.skillsDeploymentChange,
+  WS_METHODS.skillsGlobalCreate,
+  WS_METHODS.skillsGlobalUpdate,
+  WS_METHODS.skillsGlobalDelete,
+  WS_METHODS.skillsGlobalRename,
+  WS_METHODS.skillsGlobalRollback,
+  WS_METHODS.skillsProjectSetOverride,
+  WS_METHODS.skillsProjectSetDisabled,
+  WS_METHODS.skillsProjectDeleteState,
+  WS_METHODS.skillsProjectRename,
+  WS_METHODS.skillsSessionSetEnabled,
+  WS_METHODS.skillsSessionReset,
+  WS_METHODS.skillsNativeImport,
+  WS_METHODS.managedTextResourcesCatalogList,
+  WS_METHODS.managedTextResourcesCatalogSubscribe,
+  WS_METHODS.managedTextResourcesContentGet,
+  WS_METHODS.managedTextResourcesEnvironmentCreate,
+  WS_METHODS.managedTextResourcesEnvironmentUpdate,
+  WS_METHODS.managedTextResourcesEnvironmentDelete,
+  WS_METHODS.managedTextResourcesEnvironmentSetEnabled,
+  WS_METHODS.managedTextResourcesProjectSetOverride,
+  WS_METHODS.managedTextResourcesProjectSetDisabled,
+  WS_METHODS.managedTextResourcesProjectDeleteState,
+  WS_METHODS.managedTextResourcesThreadSetEnabled,
+  WS_METHODS.managedTextResourcesThreadReset,
+  WS_METHODS.projectTerminalAttach,
+  WS_METHODS.projectTerminalMetadata,
+  WS_METHODS.projectTerminalList,
+  WS_METHODS.projectTerminalWrite,
+  WS_METHODS.projectTerminalResize,
+  WS_METHODS.projectTerminalKill,
+  WS_METHODS.issuesSearch,
+] as const;
+const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...resourceRpcMethods,
+  WS_METHODS.mcpCatalogSessionSubscribeForThread,
+  WS_METHODS.mcpCatalogSessionForThread,
+  WS_METHODS.mcpCatalogOAuthStatus,
+  WS_METHODS.mcpCatalogSecretPrepare,
+  WS_METHODS.mcpCatalogRead,
+  WS_METHODS.mcpCatalogWrite,
+  WS_METHODS.mcpCatalogSessionGet,
+  WS_METHODS.mcpCatalogSessionReset,
+  WS_METHODS.mcpCatalogOAuthBegin,
+  WS_METHODS.mcpCatalogOAuthContinue,
+  WS_METHODS.mcpCatalogOAuthDisconnect,
+  WS_METHODS.projectWorkIssue,
+  WS_METHODS.projectWorkDelivery,
+  WS_METHODS.assistantsRoutineRead,
+  WS_METHODS.assistantsRoutineWrite,
+  WS_METHODS.assistantsMemoryRead,
+  WS_METHODS.assistantsMemoryWrite,
+  WS_METHODS.assistantsCreate,
+  WS_METHODS.assistantsGet,
+  WS_METHODS.assistantsResolveThread,
+  WS_METHODS.assistantsActivity,
+  WS_METHODS.assistantsSubscribeRoster,
+  WS_METHODS.threadHistoryList,
+  WS_METHODS.threadHistoryDetail,
+  WS_METHODS.threadHistoryRecover,
+  WS_METHODS.threadHistoryRestoreFiles,
+  WS_METHODS.threadHistoryFileRestoreStatus,
+  WS_METHODS.threadHistoryRelease,
+  WS_METHODS.threadHistoryReconcile,
+  WS_METHODS.assistantsList,
+  WS_METHODS.assistantsUpdateConfiguration,
+  WS_METHODS.assistantsLifecycle,
+  WS_METHODS.projectWorkRead,
+  WS_METHODS.projectWorkWrite,
+  WS_METHODS.projectWorkSubscribe,
+);
+const catalogRpcMethods = [
+  WS_METHODS.mcpCatalogSessionSubscribeForThread,
+  WS_METHODS.mcpCatalogSessionForThread,
+  WS_METHODS.mcpCatalogOAuthStatus,
+  WS_METHODS.mcpCatalogSecretPrepare,
+  WS_METHODS.mcpCatalogRead,
+  WS_METHODS.mcpCatalogWrite,
+  WS_METHODS.mcpCatalogSessionGet,
+  WS_METHODS.mcpCatalogSessionReset,
+  WS_METHODS.mcpCatalogOAuthBegin,
+  WS_METHODS.mcpCatalogOAuthContinue,
+  WS_METHODS.mcpCatalogOAuthDisconnect,
+] as const;
+const CatalogServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...[...ServerWsRpcGroup.requests.keys()].filter(
+    (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof catalogRpcMethods)[number]> =>
+      !(catalogRpcMethods as ReadonlyArray<string>).includes(tag),
+  ),
+);
+const ResourceServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...[...ServerWsRpcGroup.requests.keys()].filter(
+    (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof resourceRpcMethods)[number]> =>
+      !(resourceRpcMethods as ReadonlyArray<string>).includes(tag),
+  ),
+);
 // Replaying each intervening event costs a shell refetch; past this gap a
 // single O(active-threads) snapshot is cheaper and bounded.
 const SHELL_RESUME_MAX_GAP = 1_000;
@@ -563,7 +731,10 @@ function toAuthAccessStreamEvent(
         version: 1,
         revision,
         type: "pairingLinkUpserted",
-        payload: { ...change.pairingLink, ...authScopeResponse(change.pairingLink.scopes) },
+        payload: {
+          ...change.pairingLink,
+          ...authScopeResponse(change.pairingLink.scopes),
+        },
       };
     case "pairingLinkRemoved":
       return {
@@ -984,14 +1155,19 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       const base = buildActiveShellSnapshot(
         yield* loadShellSnapshotParts({
           sql,
-          readThreads: threadManagement.readShellSnapshot({ location: "active" }),
+          readThreads: threadManagement.readShellSnapshot({
+            location: "active",
+          }),
           listProjects: projects.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
         }),
       );
       const enriched = yield* enrichProjectShells(base.projects);
       return {
-        snapshot: { ...base, projects: enriched.projects } as OrchestrationV2ShellSnapshot,
+        snapshot: {
+          ...base,
+          projects: enriched.projects,
+        } as OrchestrationV2ShellSnapshot,
         resolvedRepositoryIdentityRoots: enriched.resolvedRepositoryIdentityRoots,
       };
     });
@@ -1069,7 +1245,12 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
           const snapshotSequence = yield* applicationEvents.latestApplicationSequence;
           const changedProjects = (yield* projects.listShells()).flatMap((project) =>
             identities.has(project.workspaceRoot)
-              ? [{ ...project, repositoryIdentity: identities.get(project.workspaceRoot) ?? null }]
+              ? [
+                  {
+                    ...project,
+                    repositoryIdentity: identities.get(project.workspaceRoot) ?? null,
+                  },
+                ]
               : [],
           );
           return shellStreamItemFromEnrichmentRefresh({
@@ -1180,14 +1361,501 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   },
 );
 
-export const layerWsRpc = (
+const layerResourceWsRpc = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
+  ResourceServerWsRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const currentSessionId = currentSession.sessionId;
+      const projectService = yield* ProjectService.ProjectService;
+      const terminalManager = yield* TerminalManager.TerminalManager;
+      const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+      const projectionStore = yield* ProjectionStoreV2.ProjectionStoreV2;
+      const skillCatalog = yield* SkillCatalog.SkillCatalogService;
+      const textCatalog = yield* TextCatalog.ManagedTextResourceCatalogService;
+      const resourceAuthority = yield* ResourceAuthority.ResourceMutationAuthority;
+      const issueSearch = yield* IssueSearch.IssueSearchService;
+      const skillDeploymentRpc = yield* makeSkillDeploymentRpc;
+      const resourceProjection = {
+        getThreadShellById: (threadId: ThreadId) =>
+          projectionStore.getThreadShell(threadId).pipe(
+            Effect.map((thread) =>
+              thread === null || thread.deletedAt !== null
+                ? Option.none()
+                : Option.some({
+                    ...thread,
+                    session: { providerInstanceId: thread.providerInstanceId },
+                  }),
+            ),
+            Effect.mapError(
+              () =>
+                new SkillRpcError({
+                  code: "scope_mismatch",
+                  message: "The thread is unavailable.",
+                }),
+            ),
+          ),
+        getProjectShellById: (projectId: ProjectId) =>
+          projectService.getShell(projectId).pipe(
+            Effect.mapError(
+              () =>
+                new SkillRpcError({
+                  code: "scope_mismatch",
+                  message: "The project is unavailable.",
+                }),
+            ),
+          ),
+      };
+      const resolveSkillScope = (input: SkillRpcScope.SkillScopeInput) =>
+        SkillRpcScope.resolveAuthoritativeSkillScope(resourceProjection, input).pipe(
+          Effect.mapError(
+            () =>
+              new SkillRpcError({
+                code: "scope_mismatch",
+                message: "The resource scope is unavailable.",
+              }),
+          ),
+        );
+      const resolveTextScope = Effect.fn("ws.resolveTextScope")(function* (
+        input: TextRpcScope.ManagedTextResourceScopeInput & {
+          readonly environmentId?: string;
+        },
+      ) {
+        const environmentId = yield* serverEnvironment.getEnvironmentId;
+        if (input.environmentId !== undefined && input.environmentId !== environmentId)
+          return yield* new ManagedTextResourceRpcError({
+            code: "invalid-override",
+            message: "The resource environment does not match.",
+          });
+        const scope = yield* TextRpcScope.resolveAuthoritativeManagedTextResourceScope(
+          resourceProjection,
+          input,
+        ).pipe(
+          Effect.mapError(
+            () =>
+              new ManagedTextResourceRpcError({
+                code: "invalid-override",
+                message: "The resource scope is unavailable.",
+              }),
+          ),
+        );
+        return { ...scope, environmentId };
+      });
+      const authorityScope = (scope: {
+        readonly projectId?: ProjectId;
+        readonly threadId?: ThreadId;
+        readonly projectRoot?: string;
+        readonly providerInstanceId?: ProviderInstanceId;
+      }) => ({
+        sessionId: currentSessionId,
+        ...(scope.projectId === undefined ? {} : { projectId: scope.projectId }),
+        ...(scope.threadId === undefined ? {} : { threadId: scope.threadId }),
+        ...(scope.providerInstanceId === undefined
+          ? {}
+          : { providerInstanceId: scope.providerInstanceId }),
+        ...(scope.projectRoot === undefined ? {} : { workspaceRoot: scope.projectRoot }),
+      });
+      const withSkillWrite = <A, E, R>(
+        scope: SkillRpcScope.ResolvedSkillScope,
+        effect: Effect.Effect<A, E, R>,
+      ) => {
+        const failure = (cause: unknown) =>
+          new ManagedSkillRepositoryError({
+            code: "mutation_failed",
+            detail: "Resource authorization failed.",
+            cause,
+          });
+        return effect.pipe(
+          Effect.provideService(SkillMutationCommitAuthority, {
+            commit: (action) =>
+              resourceAuthority
+                .commit(authorityScope(scope), action)
+                .pipe(Effect.mapError(failure)),
+            transaction: (action) =>
+              resourceAuthority
+                .transact(authorityScope(scope), action)
+                .pipe(
+                  Effect.mapError((cause) =>
+                    isResourceMutationAuthorityError(cause) ||
+                    isEnvironmentAuthorizationError(cause) ||
+                    SqlError.isSqlError(cause)
+                      ? failure(cause)
+                      : cause,
+                  ),
+                ),
+          }),
+        );
+      };
+      const terminalAuthority = (projectId: ProjectId, operation: TerminalToolError["operation"]) =>
+        resourceAuthority
+          .transact(
+            {
+              sessionId: currentSessionId,
+              projectId,
+              requiredScope: AuthTerminalOperateScope,
+            },
+            Effect.void,
+          )
+          .pipe(
+            Effect.mapError(
+              () =>
+                new TerminalToolError({
+                  operation,
+                  reason: "unavailable",
+                  projectId,
+                }),
+            ),
+          );
+      const requireTerminalProject = (projectId: ProjectId) =>
+        projectService.getById(projectId).pipe(
+          Effect.flatMap((project) =>
+            Option.isSome(project) && project.value.deletedAt === null
+              ? Effect.void
+              : Effect.fail(
+                  new TerminalToolError({
+                    operation: "list",
+                    reason: "unavailable",
+                    projectId,
+                  }),
+                ),
+          ),
+          Effect.mapError((cause) =>
+            cause._tag === "TerminalToolError"
+              ? cause
+              : new TerminalToolError({
+                  operation: "list",
+                  reason: "unavailable",
+                  projectId,
+                }),
+          ),
+        );
+      const textCommit =
+        (scope: TextRpcScope.ResolvedManagedTextResourceScope) => (action: () => void) =>
+          resourceAuthority.commit(authorityScope(scope), action).pipe(
+            Effect.mapError(
+              () =>
+                new ManagedTextResourceRpcError({
+                  code: "invalid-override",
+                  message: "Resource authorization failed.",
+                }),
+            ),
+          );
+      return ResourceServerWsRpcGroup.of({
+        [WS_METHODS.skillsDeploymentList]: (input) =>
+          resolveSkillScope(input).pipe(
+            Effect.flatMap((scope) => skillDeploymentRpc.list(input, scope.projectRoot)),
+          ),
+        [WS_METHODS.skillsDeploymentChange]: (input) =>
+          resolveSkillScope(input).pipe(
+            Effect.flatMap((scope) =>
+              withSkillWrite(scope, skillDeploymentRpc.change(input, scope.projectRoot)),
+            ),
+          ),
+        [WS_METHODS.projectTerminalList]: (input) =>
+          requireTerminalProject(input.projectId).pipe(
+            Effect.andThen(terminalManager.listProjectDockSummaries(input)),
+          ),
+        [WS_METHODS.projectTerminalAttach]: (input) =>
+          terminalOutputStream<ProjectTerminalAttachStreamEvent, TerminalToolError>(
+            (listener, registerCleanup) =>
+              requireTerminalProject(input.projectId).pipe(
+                Effect.andThen(
+                  terminalManager.attachProjectStream(input, listener, registerCleanup),
+                ),
+              ),
+            (listener, registerCleanup) =>
+              requireTerminalProject(input.projectId).pipe(
+                Effect.andThen(
+                  terminalManager.attachProjectStream(input, listener, registerCleanup),
+                ),
+              ),
+          ),
+        [WS_METHODS.projectTerminalMetadata]: (projectId) =>
+          Stream.callback<ProjectTerminalMetadataStreamEvent, TerminalToolError>(
+            (queue) =>
+              requireTerminalProject(projectId).pipe(
+                Effect.andThen(
+                  Effect.acquireRelease(
+                    terminalManager.subscribeProjectMetadata(
+                      projectId,
+                      projectTerminalMetadataListener(queue, projectId),
+                    ),
+                    (unsubscribe) => Effect.sync(unsubscribe),
+                  ),
+                ),
+              ),
+            { bufferSize: 16, strategy: "suspend" },
+          ),
+        [WS_METHODS.projectTerminalWrite]: (input) =>
+          terminalManager.writeProject(input, terminalAuthority(input.projectId, "write")),
+        [WS_METHODS.projectTerminalResize]: (input) =>
+          terminalManager.resizeProject(input, terminalAuthority(input.projectId, "resize")),
+        [WS_METHODS.projectTerminalKill]: (input) =>
+          terminalManager.killProjectTerminal(input, terminalAuthority(input.projectId, "kill")),
+
+        [WS_METHODS.issuesSearch]: (input) => issueSearch.search(input),
+        [WS_METHODS.skillsCatalogList]: (input) =>
+          resolveSkillScope(input).pipe(Effect.flatMap(skillCatalog.list)),
+        [WS_METHODS.skillsCatalogSubscribe]: (input) =>
+          Stream.unwrap(resolveSkillScope(input).pipe(Effect.map(skillCatalog.subscribe))),
+        [WS_METHODS.skillsContentGet]: (input) =>
+          resolveSkillScope(input).pipe(
+            Effect.flatMap((scope) => skillCatalog.content(input.skillId, scope.projectRoot)),
+          ),
+        [WS_METHODS.skillsHistoryList]: (input) => skillCatalog.history(input.skillId),
+        [WS_METHODS.skillsNativeContentGet]: (input) => skillCatalog.nativeContent(input),
+        [WS_METHODS.skillsApplicationGet]: (input) =>
+          resolveSkillScope(input).pipe(
+            Effect.flatMap((scope) => {
+              if (
+                scope.threadId === undefined ||
+                scope.providerInstanceId === undefined ||
+                scope.projectRoot === undefined
+              )
+                return Effect.fail(
+                  new SkillRpcError({
+                    code: "application_not_found",
+                    message: "No managed skill application exists for this scope.",
+                  }),
+                );
+              return skillCatalog.currentRevision.pipe(
+                Effect.flatMap((revision) =>
+                  skillCatalog.describeSession({
+                    ...scope,
+                    threadId: scope.threadId!,
+                    providerInstanceId: scope.providerInstanceId!,
+                    cwd: scope.projectRoot!,
+                    desiredRevision: revision,
+                    appliedRevision: SkillCatalogRevision.make(0),
+                  }),
+                ),
+              );
+            }),
+          ),
+        [WS_METHODS.skillsGlobalCreate]: (input) =>
+          withSkillWrite({}, skillCatalog.createGlobal(input)),
+        [WS_METHODS.skillsGlobalUpdate]: (input) =>
+          withSkillWrite({}, skillCatalog.updateGlobal(input)),
+        [WS_METHODS.skillsGlobalDelete]: (input) =>
+          withSkillWrite({}, skillCatalog.deleteGlobal(input)),
+        [WS_METHODS.skillsGlobalRename]: (input) =>
+          withSkillWrite({}, skillCatalog.renameGlobal(input)),
+        [WS_METHODS.skillsGlobalRollback]: (input) =>
+          withSkillWrite({}, skillCatalog.rollbackGlobal(input)),
+        [WS_METHODS.skillsNativeImport]: (input) =>
+          withSkillWrite({}, skillCatalog.importNative(input)),
+        [WS_METHODS.skillsProjectSetOverride]: (input) =>
+          resolveSkillScope({ projectId: input.projectId }).pipe(
+            Effect.flatMap((scope) =>
+              scope.projectRoot === undefined
+                ? Effect.fail(
+                    new SkillRpcError({
+                      code: "workspace_unavailable",
+                      message: "The project workspace is unavailable.",
+                    }),
+                  )
+                : withSkillWrite(
+                    scope,
+                    skillCatalog.setProjectOverride({
+                      ...input,
+                      projectRoot: scope.projectRoot,
+                    }),
+                  ),
+            ),
+          ),
+        [WS_METHODS.skillsProjectSetDisabled]: (input) =>
+          resolveSkillScope({ projectId: input.projectId }).pipe(
+            Effect.flatMap((scope) =>
+              scope.projectRoot === undefined
+                ? Effect.fail(
+                    new SkillRpcError({
+                      code: "workspace_unavailable",
+                      message: "The project workspace is unavailable.",
+                    }),
+                  )
+                : withSkillWrite(
+                    scope,
+                    skillCatalog.setProjectDisabled({
+                      ...input,
+                      projectRoot: scope.projectRoot,
+                    }),
+                  ),
+            ),
+          ),
+        [WS_METHODS.skillsProjectDeleteState]: (input) =>
+          resolveSkillScope({ projectId: input.projectId }).pipe(
+            Effect.flatMap((scope) =>
+              scope.projectRoot === undefined
+                ? Effect.fail(
+                    new SkillRpcError({
+                      code: "workspace_unavailable",
+                      message: "The project workspace is unavailable.",
+                    }),
+                  )
+                : withSkillWrite(
+                    scope,
+                    skillCatalog.deleteProjectState({
+                      ...input,
+                      projectRoot: scope.projectRoot,
+                    }),
+                  ),
+            ),
+          ),
+        [WS_METHODS.skillsProjectRename]: (input) =>
+          resolveSkillScope({ projectId: input.projectId }).pipe(
+            Effect.flatMap((scope) =>
+              scope.projectRoot === undefined
+                ? Effect.fail(
+                    new SkillRpcError({
+                      code: "workspace_unavailable",
+                      message: "The project workspace is unavailable.",
+                    }),
+                  )
+                : withSkillWrite(
+                    scope,
+                    skillCatalog.renameProject({
+                      ...input,
+                      projectRoot: scope.projectRoot,
+                    }),
+                  ),
+            ),
+          ),
+        [WS_METHODS.skillsSessionSetEnabled]: (input) =>
+          resolveSkillScope(input).pipe(
+            Effect.flatMap((scope) => withSkillWrite(scope, skillCatalog.setSessionEnabled(input))),
+          ),
+        [WS_METHODS.skillsSessionReset]: (input) =>
+          resolveSkillScope(input).pipe(
+            Effect.flatMap((scope) => withSkillWrite(scope, skillCatalog.resetSession(input))),
+          ),
+        [WS_METHODS.managedTextResourcesCatalogList]: (input) =>
+          resolveTextScope(input).pipe(Effect.flatMap(textCatalog.list)),
+        [WS_METHODS.managedTextResourcesCatalogSubscribe]: (input) =>
+          Stream.unwrap(resolveTextScope(input).pipe(Effect.map(textCatalog.subscribe))),
+        [WS_METHODS.managedTextResourcesContentGet]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) => textCatalog.content({ ...input, ...scope })),
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentCreate]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              textCatalog.createEnvironment({
+                ...input,
+                commit: textCommit(scope),
+              }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentUpdate]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              textCatalog.updateEnvironment({
+                ...input,
+                commit: textCommit(scope),
+              }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentDelete]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              textCatalog.deleteEnvironment({
+                ...input,
+                commit: textCommit(scope),
+              }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentSetEnabled]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              textCatalog.setEnvironmentEnabled({
+                ...input,
+                commit: textCommit(scope),
+              }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesProjectSetOverride]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              scope.projectRoot === undefined
+                ? Effect.fail(
+                    new ManagedTextResourceRpcError({
+                      code: "invalid-override",
+                      message: "The project workspace is unavailable.",
+                    }),
+                  )
+                : textCatalog.setProjectOverride({
+                    ...input,
+                    ...scope,
+                    projectRoot: scope.projectRoot,
+                    commit: textCommit(scope),
+                  }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesProjectSetDisabled]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              scope.projectRoot === undefined
+                ? Effect.fail(
+                    new ManagedTextResourceRpcError({
+                      code: "invalid-override",
+                      message: "The project workspace is unavailable.",
+                    }),
+                  )
+                : textCatalog.setProjectDisabled({
+                    ...input,
+                    ...scope,
+                    projectRoot: scope.projectRoot,
+                    commit: textCommit(scope),
+                  }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesProjectDeleteState]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              scope.projectRoot === undefined
+                ? Effect.fail(
+                    new ManagedTextResourceRpcError({
+                      code: "invalid-override",
+                      message: "The project workspace is unavailable.",
+                    }),
+                  )
+                : textCatalog.deleteProjectState({
+                    ...input,
+                    ...scope,
+                    projectRoot: scope.projectRoot,
+                    commit: textCommit(scope),
+                  }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesThreadSetEnabled]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              textCatalog.setThreadEnabled({
+                ...input,
+                ...scope,
+                commit: textCommit(scope),
+              }),
+            ),
+          ),
+        [WS_METHODS.managedTextResourcesThreadReset]: (input) =>
+          resolveTextScope(input).pipe(
+            Effect.flatMap((scope) =>
+              textCatalog.resetThread({
+                ...input,
+                ...scope,
+                commit: textCommit(scope),
+              }),
+            ),
+          ),
+      });
+    }),
+  );
+
+const layerCoreWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientOrigin: OrchestrationClientOrigin,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   serverBrowser: ServerBrowser.ServerBrowser["Service"],
 ) =>
-  ServerWsRpcGroup.toLayer(
+  CoreServerWsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
@@ -1284,6 +1952,7 @@ export const layerWsRpc = (
       const storageCleanup = yield* StorageCleanup.StorageCleanup;
       const databaseStorage = yield* DatabaseStorage.DatabaseStorage;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const externalNotifications = yield* ExternalNotificationGateway.ExternalNotificationGateway;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -1735,7 +2404,9 @@ export const layerWsRpc = (
       const getOrchestrationV2ArchivedShellSnapshot = Effect.gen(function* () {
         const { threads, projects, snapshotSequence } = yield* loadShellSnapshotParts({
           sql,
-          readThreads: threadManagement.readShellSnapshot({ location: "archive" }),
+          readThreads: threadManagement.readShellSnapshot({
+            location: "archive",
+          }),
           listProjects: projectStore.listShells(),
           latestSequence: applicationEvents.latestApplicationSequence,
         });
@@ -1772,13 +2443,14 @@ export const layerWsRpc = (
               Effect.forEach(
                 coalesceStoredThreadEvents(Array.from(events)),
                 (stored) =>
-                  threadManagement
-                    .getThreadShell(stored.event.threadId)
-                    .pipe(
-                      Effect.map((shell) =>
-                        archivedShellStreamItemFromThreadShell({ stored, shell }),
-                      ),
+                  threadManagement.getThreadShell(stored.event.threadId).pipe(
+                    Effect.map((shell) =>
+                      archivedShellStreamItemFromThreadShell({
+                        stored,
+                        shell,
+                      }),
                     ),
+                  ),
                 { concurrency: 8 },
               ),
             ),
@@ -1803,7 +2475,7 @@ export const layerWsRpc = (
         return result;
       });
 
-      const handlers = ServerWsRpcGroup.of({
+      const handlers = CoreServerWsRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,
@@ -1907,7 +2579,9 @@ export const layerWsRpc = (
         [ORCHESTRATION_V2_WS_METHODS.getArchivedShellSnapshot]: (_input) =>
           getOrchestrationV2ArchivedShellSnapshot,
         [ORCHESTRATION_V2_WS_METHODS.getThreadProjection]: (input) =>
-          Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+          Effect.annotateCurrentSpan({
+            "orchestration_v2.thread_id": input.threadId,
+          }).pipe(
             Effect.andThen(
               // Pre-pagination clients still call this compatibility endpoint.
               // Keep stale clients from materializing an unbounded transcript.
@@ -2032,15 +2706,15 @@ export const layerWsRpc = (
           Stream.unwrap(subscribeOrchestrationV2Shell(input)),
         [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
           Stream.unwrap(
-            Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-              Effect.andThen(subscribeOrchestrationV2Thread(input)),
-            ),
+            Effect.annotateCurrentSpan({
+              "orchestration_v2.thread_id": input.threadId,
+            }).pipe(Effect.andThen(subscribeOrchestrationV2Thread(input))),
           ),
         [ORCHESTRATION_V2_WS_METHODS.subscribeCommandOutput]: (input) =>
           Stream.unwrap(
-            Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-              Effect.as(commandOutputHub.subscribe(input)),
-            ),
+            Effect.annotateCurrentSpan({
+              "orchestration_v2.thread_id": input.threadId,
+            }).pipe(Effect.as(commandOutputHub.subscribe(input))),
           ),
         [WS_METHODS.scheduledTasksList]: (_input) =>
           scheduledTasks.list().pipe(Effect.map(withVisibleWebhookUrls)),
@@ -2064,9 +2738,9 @@ export const layerWsRpc = (
             Effect.andThen(scheduledTasks.rotateWebhookToken(input)),
           ),
         [WS_METHODS.secretsAnswerRequest]: (input) =>
-          Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
-            Effect.andThen(secretRequests.answer(input)),
-          ),
+          Effect.annotateCurrentSpan({
+            "orchestration_v2.thread_id": input.threadId,
+          }).pipe(Effect.andThen(secretRequests.answer(input))),
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.listWebhookDeliveries(input)),
@@ -2082,7 +2756,9 @@ export const layerWsRpc = (
             .search(input)
             .pipe(Effect.mapError(AcpRegistrySupport.toAcpRegistryOperationError)),
         [WS_METHODS.serverPrepareAcpRegistryAgent]: (input) =>
-          Effect.annotateCurrentSpan({ "acp_registry.agent_id": input.agentId }).pipe(
+          Effect.annotateCurrentSpan({
+            "acp_registry.agent_id": input.agentId,
+          }).pipe(
             Effect.andThen(
               acpRegistryCatalog
                 .prepare(input)
@@ -2090,7 +2766,9 @@ export const layerWsRpc = (
             ),
           ),
         [WS_METHODS.serverUninstallAcpRegistryManagedBinary]: (input) =>
-          Effect.annotateCurrentSpan({ "acp_registry.agent_id": input.agentId }).pipe(
+          Effect.annotateCurrentSpan({
+            "acp_registry.agent_id": input.agentId,
+          }).pipe(
             Effect.andThen(
               acpRegistryCatalog
                 .uninstallManagedBinary(input)
@@ -2098,7 +2776,9 @@ export const layerWsRpc = (
             ),
           ),
         [WS_METHODS.serverAcceptAcpRegistryUrlAuth]: (input) =>
-          Effect.annotateCurrentSpan({ "provider.instance_id": input.instanceId }).pipe(
+          Effect.annotateCurrentSpan({
+            "provider.instance_id": input.instanceId,
+          }).pipe(
             Effect.andThen(
               acpRegistryRuntimeCoordinator
                 .acceptUrlAuthentication(input)
@@ -2136,7 +2816,9 @@ export const layerWsRpc = (
             "project.id": input.projectId,
           }).pipe(Effect.andThen(disableAcpRegistryProvider(input))),
         [WS_METHODS.serverLogoutAcpRegistry]: (input) =>
-          Effect.annotateCurrentSpan({ "provider.instance_id": input.instanceId }).pipe(
+          Effect.annotateCurrentSpan({
+            "provider.instance_id": input.instanceId,
+          }).pipe(
             Effect.andThen(
               Effect.gen(function* () {
                 const { instance, manager } = yield* acpSessionManager(input.instanceId);
@@ -2382,6 +3064,8 @@ export const layerWsRpc = (
         [WS_METHODS.serverGetDatabaseStorage]: () => databaseStorage.status,
         [WS_METHODS.serverGetSettings]: (_input) =>
           serverSettings.getSettings.pipe(Effect.map(ServerSettings.redactServerSettingsForClient)),
+        [WS_METHODS.serverTestExternalNotification]: (input) =>
+          externalNotifications.test(input, currentSessionId),
         [WS_METHODS.serverUpdateSettings]:
           /* Request instrumentation already owns the span; keep this helper in that context. */
           Effect.fnUntraced(function* ({ patch, providerInstanceMutation }) {
@@ -2390,7 +3074,10 @@ export const layerWsRpc = (
                   Effect.provide(deviceHostContext),
                 )
               : undefined;
-            const nextPatch = { ...patch, ...(deviceHosts ? { deviceHosts } : {}) };
+            const nextPatch = {
+              ...patch,
+              ...(deviceHosts ? { deviceHosts } : {}),
+            };
             const settings = yield* providerInstanceMutation === undefined
               ? serverSettings.updateSettings(nextPatch)
               : serverSettings.updateProviderInstance(providerInstanceMutation, nextPatch);
@@ -2588,17 +3275,23 @@ export const layerWsRpc = (
         [WS_METHODS.projectsEnsureScratch]: () =>
           managedFolders.ensureScratchProject.pipe(
             Effect.mapError(
-              (cause) => new OrchestrationDispatchCommandError({ message: cause.message, cause }),
+              (cause) =>
+                new OrchestrationDispatchCommandError({
+                  message: cause.message,
+                  cause,
+                }),
             ),
           ),
         [WS_METHODS.projectsCreateNew]: (input) =>
-          managedFolders
-            .createNamedProject(input)
-            .pipe(
-              Effect.mapError(
-                (cause) => new OrchestrationDispatchCommandError({ message: cause.message, cause }),
-              ),
+          managedFolders.createNamedProject(input).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationDispatchCommandError({
+                  message: cause.message,
+                  cause,
+                }),
             ),
+          ),
         [WS_METHODS.projectCloneCancel]: (input) =>
           projectCloneTracker.cancel(input.projectId).pipe(Effect.map((applied) => ({ applied }))),
         [WS_METHODS.projectCloneRetry]: (input) =>
@@ -2757,7 +3450,9 @@ export const layerWsRpc = (
                   ? { projectFaviconPath: project.value.faviconPath }
                   : {}),
                 ...(clone !== null && clone.destinationPath === project.value.workspaceRoot
-                  ? { projectCheckout: clone.phase === "done" ? "cloned" : "pending" }
+                  ? {
+                      projectCheckout: clone.phase === "done" ? "cloned" : "pending",
+                    }
                   : {}),
               });
             }
@@ -2808,6 +3503,14 @@ export const layerWsRpc = (
                 refreshGitStatus(input.cwd).pipe(Effect.ignore({ log: true }), Effect.as(result)),
             }),
           ),
+        [WS_METHODS.gitDiscoverRepositories]: (input) => gitWorkflow.discoverRepositories(input),
+        [WS_METHODS.gitIndexStatus]: (input) => gitWorkflow.indexStatus(input),
+        [WS_METHODS.gitMutateIndex]: (input) =>
+          gitWorkflow.mutateIndex(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+        [WS_METHODS.gitCommitStaged]: (input) =>
+          gitWorkflow.commitStaged(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+        [WS_METHODS.gitHistory]: (input) => gitWorkflow.history(input),
+        [WS_METHODS.gitHistoryDiff]: (input) => gitWorkflow.historyDiff(input),
         [WS_METHODS.gitRunStackedAction]: (input) =>
           Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
             gitWorkflow
@@ -3124,6 +3827,278 @@ export const layerWsRpc = (
     }),
   );
 
+const isAssistantError = Schema.is(AssistantError);
+const isMemoryError = Schema.is(ProjectMemoryError);
+export const layerWsRpc = (
+  currentSession: EnvironmentAuth.AuthenticatedSession,
+  clientOrigin: OrchestrationClientOrigin,
+  clientAnalyticsProps: Readonly<Record<string, unknown>>,
+  previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  serverBrowser: ServerBrowser.ServerBrowser["Service"],
+  projectWork: ProjectWorkGateway.ProjectWorkGateway["Service"],
+  mcpOAuthRedirectOrigin?: string,
+) => {
+  const principal: ProjectWorkGateway.ProjectWorkPrincipal = {
+    actor: { kind: "human", id: currentSession.subject },
+    source: {
+      kind:
+        clientOrigin.surface === "desktop"
+          ? "desktop"
+          : clientOrigin.surface === "mobile"
+            ? "mobile"
+            : "web",
+      id: currentSession.sessionId,
+    },
+  };
+  return Layer.mergeAll(
+    layerResourceWsRpc(currentSession),
+    CatalogServerWsRpcGroup.toLayer(
+      Effect.gen(function* () {
+        const mcpCatalog = yield* McpCatalogClientService.McpCatalogClientService;
+        const currentSessionId = currentSession.sessionId;
+        return CatalogServerWsRpcGroup.of({
+          [WS_METHODS.mcpCatalogSessionSubscribeForThread]: (input) =>
+            mcpCatalog.sessionSubscribeForThread(input, currentSessionId),
+          [WS_METHODS.mcpCatalogSessionForThread]: (input) =>
+            mcpCatalog.sessionForThread(input, currentSessionId),
+          [WS_METHODS.mcpCatalogOAuthStatus]: (input) =>
+            mcpCatalog.oauthStatus(input, currentSessionId),
+          [WS_METHODS.mcpCatalogSecretPrepare]: (input) =>
+            mcpCatalog.secretPrepare(input, currentSessionId),
+          [WS_METHODS.mcpCatalogRead]: (input) => mcpCatalog.read(input, currentSessionId),
+          [WS_METHODS.mcpCatalogWrite]: (input) => mcpCatalog.write(input, currentSessionId),
+          [WS_METHODS.mcpCatalogSessionGet]: (input) =>
+            mcpCatalog.sessionGet(input, currentSessionId),
+          [WS_METHODS.mcpCatalogSessionReset]: (input) =>
+            mcpCatalog.sessionReset(input, currentSessionId),
+          [WS_METHODS.mcpCatalogOAuthBegin]: (input) =>
+            mcpCatalog.oauthBegin(input, currentSessionId, mcpOAuthRedirectOrigin),
+          [WS_METHODS.mcpCatalogOAuthContinue]: (input) =>
+            mcpCatalog.oauthContinue(input, currentSessionId),
+          [WS_METHODS.mcpCatalogOAuthDisconnect]: (input) =>
+            mcpCatalog.oauthDisconnect(input, currentSessionId),
+        });
+      }),
+    ),
+    layerCoreWsRpc(
+      currentSession,
+      clientOrigin,
+      clientAnalyticsProps,
+      previewAutomationBroker,
+      serverBrowser,
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsRoutineRead, (input) =>
+      Effect.gen(function* () {
+        return yield* (yield* AssistantRoutineGateway).read(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsRoutineWrite, (input) =>
+      Effect.gen(function* () {
+        return yield* (yield* AssistantRoutineGateway).write(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsMemoryRead, (input) =>
+      Effect.gen(function* () {
+        const memory = yield* AssistantMemoryGateway;
+        return yield* memory.read(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantMemoryRpcError({
+              reason: isMemoryError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsMemoryWrite, (input) =>
+      Effect.gen(function* () {
+        const memory = yield* AssistantMemoryGateway;
+        return yield* memory.write(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantMemoryRpcError({
+              reason: isMemoryError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsActivity, (input) =>
+      Effect.gen(function* () {
+        const activity = yield* AssistantActivity;
+        return yield* activity.list(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsSubscribeRoster, (input) =>
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const stream = yield* AssistantRosterStream;
+          return stream.subscribe(input, currentSession.sessionId);
+        }),
+      ).pipe(
+        Stream.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsCreate, (input) =>
+      Effect.gen(function* () {
+        const runtime = yield* AssistantRuntime.AssistantRuntime;
+        return yield* runtime.create(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.threadHistoryList, (input) =>
+      ThreadHistoryService.ThreadHistoryService.pipe(
+        Effect.flatMap((history) => history.list(input)),
+        Effect.mapError((error) => new ThreadHistoryRpcError({ reason: error.reason })),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.threadHistoryDetail, (input) =>
+      ThreadHistoryService.ThreadHistoryService.pipe(
+        Effect.flatMap((history) => history.detail(input)),
+        Effect.mapError((error) => new ThreadHistoryRpcError({ reason: error.reason })),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.threadHistoryRecover, (input) =>
+      ThreadHistoryService.ThreadHistoryService.pipe(
+        Effect.flatMap((history) => history.recover(input)),
+        Effect.mapError((error) => new ThreadHistoryRpcError({ reason: error.reason })),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.threadHistoryRestoreFiles, (input) =>
+      ThreadHistoryService.ThreadHistoryService.pipe(
+        Effect.flatMap((history) => history.restoreFiles(input)),
+        Effect.mapError((error) => new ThreadHistoryRpcError({ reason: error.reason })),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.threadHistoryFileRestoreStatus, (input) =>
+      ThreadHistoryService.ThreadHistoryService.pipe(
+        Effect.flatMap((history) => history.fileRestoreStatus(input)),
+        Effect.mapError((error) => new ThreadHistoryRpcError({ reason: error.reason })),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.threadHistoryRelease, (input) =>
+      ThreadHistoryService.ThreadHistoryService.pipe(
+        Effect.flatMap((history) => history.release(input)),
+        Effect.mapError((error) => new ThreadHistoryRpcError({ reason: error.reason })),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.threadHistoryReconcile, (input) =>
+      ThreadHistoryService.ThreadHistoryService.pipe(
+        Effect.flatMap((history) => history.reconcile(input)),
+        Effect.mapError((error) => new ThreadHistoryRpcError({ reason: error.reason })),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsResolveThread, (input) =>
+      AssistantRuntime.AssistantRuntime.pipe(
+        Effect.flatMap((runtime) => runtime.resolveThread(input, currentSession.sessionId)),
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsGet, (input) =>
+      Effect.gen(function* () {
+        const runtime = yield* AssistantRuntime.AssistantRuntime;
+        return yield* runtime.get(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsList, (input) =>
+      Effect.gen(function* () {
+        const activity = yield* AssistantActivity;
+        return yield* activity.roster(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsUpdateConfiguration, (input) =>
+      Effect.gen(function* () {
+        const runtime = yield* AssistantRuntime.AssistantRuntime;
+        return yield* runtime.updateConfiguration(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.assistantsLifecycle, (input) =>
+      Effect.gen(function* () {
+        const runtime = yield* AssistantRuntime.AssistantRuntime;
+        return yield* runtime.lifecycle(input, currentSession.sessionId);
+      }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new AssistantRpcError({
+              reason: isAssistantError(cause) ? cause.reason : "unavailable",
+            }),
+        ),
+      ),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.projectWorkIssue, (input) =>
+      projectWork.issue(input, principal),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.projectWorkDelivery, (input) =>
+      projectWork.delivery(input, principal),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.projectWorkRead, (input) => projectWork.read(input)),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.projectWorkWrite, (input) =>
+      projectWork.write(input, principal),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.projectWorkSubscribe, (input) =>
+      projectWork.subscribe(input),
+    ),
+  );
+};
+
 // RpcServer's default sends a socket-level Defect frame instead, and the client
 // ends every pending request on the socket with it.
 export const WS_RPC_SERVER_OPTIONS = {
@@ -3133,6 +4108,14 @@ export const WS_RPC_SERVER_OPTIONS = {
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
+    const projectWork = yield* ProjectWorkGateway.ProjectWorkGateway;
+    const skillCatalog = yield* SkillCatalog.SkillCatalogService;
+    const skillDeployment = yield* SkillDeployment.SkillDeploymentService;
+    const textCatalog = yield* TextCatalog.ManagedTextResourceCatalogService;
+    const resourceAuthority = yield* ResourceAuthority.ResourceMutationAuthority;
+    const issueSearch = yield* IssueSearch.IssueSearchService;
+    const projectionStore = yield* ProjectionStoreV2.ProjectionStoreV2;
+    const mcpCatalog = yield* McpCatalogClientService.McpCatalogClientService;
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
     const serverBrowser = yield* ServerBrowser.ServerBrowser;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
@@ -3210,12 +4193,27 @@ export const layer = Layer.unwrap(
               clientAnalyticsProps,
               previewAutomationBroker,
               serverBrowser,
+              projectWork,
+              Option.getOrUndefined(HttpServerRequest.toURL(request))?.origin,
             ).pipe(
+              Layer.provide(
+                Layer.succeed(McpCatalogClientService.McpCatalogClientService, mcpCatalog),
+              ),
               Layer.provideMerge(RpcSerialization.layerJson),
               // Request fibers run in the handlers' context, so this reporter sees
               // their defects, not the rest of the server's.
               Layer.provide(DefectReporter.layer),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+              Layer.provide(
+                Layer.mergeAll(
+                  Layer.succeed(SkillCatalog.SkillCatalogService, skillCatalog),
+                  Layer.succeed(SkillDeployment.SkillDeploymentService, skillDeployment),
+                  Layer.succeed(TextCatalog.ManagedTextResourceCatalogService, textCatalog),
+                  Layer.succeed(ResourceAuthority.ResourceMutationAuthority, resourceAuthority),
+                  Layer.succeed(IssueSearch.IssueSearchService, issueSearch),
+                  Layer.succeed(ProjectionStoreV2.ProjectionStoreV2, projectionStore),
+                ),
+              ),
               Layer.provide(AgentSessionScanner.layer),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),

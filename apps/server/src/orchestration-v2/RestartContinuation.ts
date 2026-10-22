@@ -319,15 +319,18 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         }),
       );
   },
-  // A delegated child this declined to continue still owes its parent a
-  // result. Once a continuation run exists this is a no-op; that run settles it.
-  (effect, input) =>
-    effect.pipe(
-      Effect.andThen(
-        Effect.gen(function* () {
-          const threads = yield* ThreadManagementService.ThreadManagementService;
-          yield* threads.recoverDelegatedTask(input.threadId, input.sourceRunId);
-        }),
+  // A permanent admission refusal still owes its parent a result. Other
+  // failures may retry the continuation before recovery is appropriate.
+  (effect, input) => {
+    const recover = Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      yield* threads.recoverDelegatedTask(input.threadId, input.sourceRunId);
+    });
+    return effect.pipe(
+      Effect.tapError((error) =>
+        error._tag === "OrchestratorCommandRejectedError" ? recover : Effect.void,
       ),
-    ),
+      Effect.andThen(recover),
+    );
+  },
 );

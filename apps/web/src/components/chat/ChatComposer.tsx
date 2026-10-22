@@ -67,10 +67,31 @@ import { folderDropTarget, resolveDroppedFolderPath } from "./folderDrop";
 import { splitTransferredFiles } from "./workspaceFileDrop";
 import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
 import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
+import { RegistryContext } from "@effect/atom-react";
+import { composerIssueItems } from "@t3tools/client-runtime/composerIssueItems";
+import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
+import {
+  composerTriggerTokenEnd,
+  createComposerInsertionGuard,
+  managedCommandArgumentRange,
+  managedSkillMenuItems,
+  managedTextMenuItems,
+  resolveManagedSkillInsertion,
+  resolveManagedTextResourceInsertion,
+  type ComposerInsertionSnapshot,
+} from "~/managedComposerResources";
+import {
+  issueSearchEnvironment,
+  managedTextEnvironment,
+  resourceCatalogInput,
+  skillsEnvironment,
+  useComposerResourceSubscriptions,
+} from "~/state/resources";
 import {
   memo,
   type ComponentProps,
   type ReactNode,
+  useContext,
   useEffect,
   useEffectEvent,
   useId,
@@ -288,6 +309,7 @@ import {
 import { useEnvironmentQuery } from "~/state/query";
 import { useComposerPathSearch, useDebouncedValue } from "~/state/queries";
 import { ProviderModelPicker } from "./ProviderModelPicker";
+import type { RunWorkSummary } from "./runWorkSummary";
 import { resolveModelPickerSelectedModel } from "./ModelPickerContent";
 import {
   type ComposerCommandItem,
@@ -1351,6 +1373,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   compact: boolean;
   canOperateThread: boolean;
   activeContextWindow: ContextWindowSnapshot | null;
+  latestRunWork?: RunWorkSummary | null;
   reserveContextWindowMeter: boolean;
   activeThreadModelDisplayName: string | null;
   isPreparingWorktree: boolean;
@@ -1393,6 +1416,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
       {props.activeContextWindow ? (
         <ContextWindowMeter
           usage={props.activeContextWindow}
+          work={props.latestRunWork ?? null}
           modelDisplayName={props.activeThreadModelDisplayName}
           onCompact={props.onCompactContext}
           compactDisabled={props.compactDisabled}
@@ -1579,6 +1603,7 @@ export interface ChatComposerProps {
   activeProjectId: ProjectId | null;
 
   activeContextWindow: ContextWindowSnapshot | null;
+  latestRunWork?: RunWorkSummary | null;
   compactThreadUnavailable: boolean;
   compactDisabled: boolean;
   compactDisabledReason: string | null;
@@ -1589,6 +1614,8 @@ export interface ChatComposerProps {
   terminalOpen: boolean;
   gitCwd: string | null;
   pullRequestProjectId: ProjectId | null;
+  /** The thread's project, for managed commands, snippets and skills. */
+  resourceProjectId: ProjectId | null;
   pullRequestRepository: string | null;
   threadPullRequests: ReadonlyArray<ThreadPullRequestLink> | undefined;
   restingControlsHost: HTMLDivElement | null;
@@ -1653,6 +1680,17 @@ export interface ChatComposerProps {
   handleInteractionModeChange: (mode: ProviderInteractionMode) => void;
 
   focusComposer: () => void;
+  /**
+   * Set in an agent's home chat. Its model and modes belong to the agent's
+   * revisioned configuration, so the stock selectors give way to a link there
+   * and sends carry the thread's settings instead of local draft choices.
+   */
+  agentConfiguration?: {
+    readonly name: string;
+    readonly onOpen: () => void;
+    readonly modelSelection: ModelSelection;
+    readonly interactionMode: ProviderInteractionMode;
+  } | null;
   scheduleComposerFocus: () => void;
   setThreadError: (threadId: ThreadId | null, error: string | null) => void;
   onExpandImage: (preview: ExpandedImagePreview) => void;
@@ -1796,6 +1834,7 @@ function useComposerProviderModel(
     readonly threadModelSelection: ModelSelection | null | undefined;
     readonly projectModelSelection: ModelSelection | null | undefined;
     readonly promptInjectionState: ReturnType<typeof getComposerPromptInjectionState>;
+    readonly ignoreDraftModel: boolean;
   },
 ) {
   const {
@@ -1809,8 +1848,10 @@ function useComposerProviderModel(
     candidateInstanceIds,
     lockedProvider,
     lockedInstanceId,
+    ignoreDraftModel,
   } = input;
-  const draftModelState = useComposerDraftModelState(threadRef);
+  const storedDraftModelState = useComposerDraftModelState(threadRef);
+  const draftModelState = ignoreDraftModel ? null : storedDraftModelState;
   const providerInstanceEntries: ReadonlyArray<ProviderInstanceEntry> = sortProviderInstanceEntries(
     applyProviderInstanceSettings(
       deriveProviderInstanceEntries(providerStatuses),
@@ -1947,6 +1988,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     reportedModelSelection,
     activeProjectId,
     activeContextWindow,
+    latestRunWork,
     compactThreadUnavailable,
     compactDisabled,
     compactDisabledReason,
@@ -1956,6 +1998,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     terminalOpen,
     gitCwd,
     pullRequestProjectId,
+    resourceProjectId,
     pullRequestRepository,
     threadPullRequests,
     restingControlsHost,
@@ -1992,6 +2035,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     handleRuntimeModeChange,
     handleInteractionModeChange,
     focusComposer,
+    agentConfiguration,
     scheduleComposerFocus,
     setThreadError,
     onExpandImage,
@@ -2317,8 +2361,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     threadModelSelection: activeThreadModelSelection,
     projectModelSelection: activeProjectDefaultModelSelection,
     promptInjectionState: getComposerPromptInjectionState(prompt),
+    ignoreDraftModel: agentConfiguration != null,
     candidateInstanceIds: [
-      composerDraft.activeProvider ?? null,
+      agentConfiguration ? null : (composerDraft.activeProvider ?? null),
       activeThread?.runtime?.providerInstanceId,
       activeThreadModelSelection?.instanceId,
       activeProjectDefaultModelSelection?.instanceId,
@@ -2383,12 +2428,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     planModeEnabled: settings.planModeEnabled,
     provider: selectedProviderStatus,
     interactionMode: requestedInteractionMode,
+    agentInteractionMode: agentConfiguration?.interactionMode ?? null,
   });
-  const selectedModelSelection: ModelSelection = createModelSelection(
-    selectedInstanceId,
-    selectedModel,
-    selectedModelOptionsForDispatch,
-  );
+  // An agent's home sends its thread's exact selection; the server rejects any other.
+  const selectedModelSelection: ModelSelection =
+    agentConfiguration?.modelSelection ??
+    createModelSelection(selectedInstanceId, selectedModel, selectedModelOptionsForDispatch);
   const selectedModelForPicker = selectedModel;
   const modelOptionsByInstance = new Map<ProviderInstanceId, ReadonlyArray<AppModelOption>>();
   for (const entry of providerInstanceEntries) {
@@ -2493,6 +2538,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerSelectLockRef = useRef(false);
   const composerMenuOpenRef = useRef(false);
   const composerMenuItemsRef = useRef<ComposerCommandItem[]>([]);
+  // The destination after an await; a resource fetched for another thread never lands here.
+  const resourceTargetRef = useRef<{
+    environmentId: EnvironmentId;
+    projectId?: ProjectId;
+    threadId?: ThreadId;
+  } | null>(null);
+  const composerOwnerKeyRef = useRef("");
+  const composerProviderInstanceIdRef = useRef<string | null>(null);
+  // Bumped whenever a pending managed insertion must not land anymore.
+  const [managedInsertion] = useState(createComposerInsertionGuard);
+  const managedInsertionContextRef = useRef("");
   const activeComposerMenuItemRef = useRef<ComposerCommandItem | null>(null);
   const composerBlurFrameRef = useRef<number | null>(null);
   const mobileComposerExpandFrameRef = useRef<number | null>(null);
@@ -2650,6 +2706,57 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ? []
       : composerPullRequestsFromLinks(threadPullRequests ?? [], pullRequestProjectId);
 
+  const registry = useContext(RegistryContext);
+  // Drafts have no server thread yet, so only their project scopes managed resources.
+  const resourceThreadId = routeKind === "server" ? activeThreadId : null;
+  const resourceTarget = {
+    environmentId,
+    ...(resourceProjectId === null ? {} : { projectId: resourceProjectId }),
+    ...(resourceThreadId === null ? {} : { threadId: resourceThreadId }),
+  };
+  const resourceCatalogScope = resourceCatalogInput(resourceTarget);
+  // Open menus follow catalog edits made elsewhere instead of offering a stale list.
+  useComposerResourceSubscriptions(
+    composerTriggerKind === "slash-command" || composerTriggerKind === "skill"
+      ? {
+          target: resourceTarget,
+          kind: composerTriggerKind === "skill" ? "skills" : "text",
+          ...(composerTriggerKind === "skill" && selectedProviderStatus
+            ? { providerInstanceId: selectedProviderStatus.instanceId }
+            : {}),
+        }
+      : null,
+  );
+  const managedTextCatalog = useEnvironmentQuery(
+    composerTriggerKind === "slash-command"
+      ? managedTextEnvironment.catalog({ environmentId, input: resourceCatalogScope })
+      : null,
+  );
+  const managedSkillCatalog = useEnvironmentQuery(
+    composerTriggerKind === "skill"
+      ? skillsEnvironment.catalog({
+          environmentId,
+          input: {
+            ...resourceCatalogScope,
+            ...(selectedProviderStatus
+              ? { providerInstanceId: selectedProviderStatus.instanceId }
+              : {}),
+          },
+        })
+      : null,
+  );
+  const issueTriggerQuery = composerTrigger?.kind === "issue" ? composerTrigger.query : null;
+  const debouncedIssueQuery = useDebouncedValue(issueTriggerQuery, 180);
+  const settledIssueQuery = issueTriggerQuery === debouncedIssueQuery ? issueTriggerQuery : null;
+  const issueLookup = useEnvironmentQuery(
+    settledIssueQuery === null || pullRequestProjectId === null
+      ? null
+      : issueSearchEnvironment.search({
+          environmentId,
+          input: { projectId: pullRequestProjectId, query: settledIssueQuery },
+        }),
+  );
+
   const composerMenuItems = ((): ComposerCommandItem[] => {
     if (!composerTrigger) return [];
     if (composerTrigger.kind === "path") {
@@ -2733,20 +2840,60 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems, ...skillItems],
         composerTrigger.rangeStart === 0,
       );
-      return searchSlashCommandItems(slashCommandItems, query);
+      const managedItems = managedTextMenuItems({
+        entries: managedTextCatalog.data?.entries ?? [],
+        query: composerTrigger.query,
+        nativeCommandNames: selectedProviderSlashCommands.map((command) => command.name),
+      }).map((item) => ({
+        id: item.id,
+        type: "managed-text" as const,
+        entry: item.entry,
+        collidesWithNative: item.collidesWithNative,
+        label: `/${item.entry.key}`,
+        description:
+          item.entry.name ??
+          (item.entry.kind === "command" ? "Expands into the draft" : "Inserts text"),
+      }));
+      return [...searchSlashCommandItems(slashCommandItems, query), ...managedItems];
+    }
+    if (composerTrigger.kind === "issue") {
+      return issueLookup.data === null || settledIssueQuery === null
+        ? []
+        : composerIssueItems(issueLookup.data).map((item) => ({
+            id: item.id,
+            type: "issue" as const,
+            issue: item.issue,
+            label: `#${item.issue.number}`,
+            description: item.issue.title,
+          }));
     }
     if (composerTrigger.kind === "skill") {
-      return searchProviderSkills(selectedProviderSkills, composerTrigger.query).map((skill) => ({
-        id: `skill:${selectedProvider}:${skill.name}`,
-        type: "skill" as const,
-        provider: selectedProvider,
-        skill,
-        label: formatProviderSkillDisplayName(skill),
-        description:
-          skill.shortDescription ??
-          skill.description ??
-          (skill.scope ? `${skill.scope} skill` : "Run provider skill"),
+      const managedSkills = managedSkillMenuItems({
+        entries: managedSkillCatalog.data?.entries ?? [],
+        query: composerTrigger.query,
+        nativeSkillNames: selectedProviderSkills.map((skill) => skill.name),
+      }).map((item) => ({
+        id: item.id,
+        type: "managed-skill" as const,
+        entry: item.entry,
+        collidesWithNative: item.collidesWithNative,
+        label: item.entry.name,
+        description: `Adds its ${item.entry.scope} instructions to the message`,
       }));
+      return [
+        ...searchProviderSkills(selectedProviderSkills, composerTrigger.query).map((skill) => ({
+          id: `skill:${selectedProvider}:${skill.name}`,
+          type: "skill" as const,
+          provider: selectedProvider,
+          skill,
+          label: formatProviderSkillDisplayName(skill),
+          description:
+            skill.shortDescription ??
+            skill.description ??
+            (skill.scope ? `${skill.scope} skill` : "Run provider skill"),
+        })),
+        ...managedSkills,
+      ];
     }
     if (
       composerTrigger.kind === "pull-request" &&
@@ -2823,7 +2970,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     composerMenuOpenRef.current = composerMenuOpen;
     composerMenuItemsRef.current = composerMenuItems;
     activeComposerMenuItemRef.current = activeComposerMenuItem;
+    resourceTargetRef.current = resourceTarget;
+    composerOwnerKeyRef.current = composerDraftTargetKey;
+    composerProviderInstanceIdRef.current = selectedProviderStatus?.instanceId ?? null;
+    // A caret move, a dismissed menu, another provider or another draft abandons a
+    // pending managed insertion. Selection-only changes may not rerender; the
+    // visible-selection callback and the resume check cover those.
+    const insertionContext = `${composerDraftTargetKey}\u0000${composerCursor}\u0000${composerMenuOpen}\u0000${composerProviderInstanceIdRef.current ?? ""}`;
+    if (managedInsertionContextRef.current !== insertionContext) {
+      managedInsertionContextRef.current = insertionContext;
+      managedInsertion.cancel();
+    }
   });
+  useEffect(
+    () => () => {
+      managedInsertion.cancel();
+    },
+    [managedInsertion],
+  );
 
   const nonPersistedComposerImageIdSet = new Set(nonPersistedComposerImageIds);
 
@@ -2847,6 +3011,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const isComposerMenuLoading =
     (composerTriggerKind === "path" && pathTriggerQuery.length > 0 && workspaceEntries.isPending) ||
+    (composerTriggerKind === "issue" &&
+      pullRequestProjectId !== null &&
+      (issueLookup.isPending || issueTriggerQuery !== debouncedIssueQuery)) ||
     (composerTriggerKind === "pull-request" &&
       pullRequestProjectId !== null &&
       pullRequestRepository !== null &&
@@ -2855,8 +3022,20 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         pullRequestTriggerNumber !== debouncedPullRequestNumber ||
         exactPullRequestLookup.isPending));
   const composerMenuEmptyState = (() => {
+    if (composerTriggerKind === "issue") {
+      if (pullRequestProjectId === null) return "Issues are not available for this project.";
+      if (issueLookup.error !== null) return "Issues could not be searched for this project.";
+      return issueTriggerQuery
+        ? `No issue matches ${issueTriggerQuery}.`
+        : "Type after #issue: to search this repository's issues.";
+    }
     if (composerTriggerKind === "skill") {
+      if (managedSkillCatalog.error !== null)
+        return `Managed skills couldn't be loaded. ${managedSkillCatalog.error}`;
       return "No skills found. Try / to browse provider commands.";
+    }
+    if (composerTriggerKind === "slash-command" && managedTextCatalog.error !== null) {
+      return `Managed commands couldn't be loaded. ${managedTextCatalog.error}`;
     }
     if (composerTriggerKind === "pull-request") {
       if (pullRequestProjectId === null || pullRequestRepository === null) {
@@ -3582,7 +3761,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     );
     setIsComposerScrollCollapsed(false);
   };
-  const expandComposerForEditorChangeStable = useStableCallback(expandComposerForEditorChange);
+  // Extending a selection keeps the caret, so it never reaches the insertion context.
+  const onComposerVisibleSelectionChange = useStableCallback(() => {
+    managedInsertion.cancel();
+    expandComposerForEditorChange();
+  });
 
   const retainedContextPayloads = useRetainedContextPayloads(composerDraftTargetKey);
 
@@ -3821,6 +4004,192 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     };
   };
 
+  // Also read after a managed insertion's await, so it reflects the editor
+  // then, including a selection change that caused no rerender.
+  const readManagedInsertion = (): Omit<ComposerInsertionSnapshot, "epoch"> | null => {
+    const target = resourceTargetRef.current;
+    if (target === null) return null;
+    const selection = composerEditorRef.current?.readSelectionRange();
+    const cursor = readComposerSnapshot().expandedCursor;
+    return {
+      ownerKey: composerOwnerKeyRef.current,
+      target,
+      providerInstanceId: composerProviderInstanceIdRef.current,
+      draft: promptRef.current,
+      cursor,
+      selection: selection ?? { start: cursor, end: cursor },
+    };
+  };
+
+  const reportManagedInsertionFailure = (label: string, error: unknown) =>
+    toastManager.add({
+      type: "error",
+      title: `Couldn't insert ${label}`,
+      description:
+        error instanceof Error && error.message.trim().length > 0
+          ? `${error.message} Your draft is unchanged; choose it again to retry.`
+          : "It couldn't be read from this environment. Your draft is unchanged; choose it again to retry.",
+    });
+
+  /**
+   * Expands a managed command or snippet into ordinary draft text at selection
+   * time. The catalog is reread after the content fetch, so a stale revision
+   * inserts nothing.
+   */
+  const insertManagedTextResource = async (
+    item: Extract<ComposerCommandItem, { type: "managed-text" }>,
+    trigger: ComposerTrigger,
+  ) => {
+    const pending = managedInsertion.begin(readManagedInsertion);
+    if (pending === null) return;
+    const { selected } = pending;
+    const expectedDraft = selected.draft;
+    const range =
+      item.entry.kind === "command"
+        ? managedCommandArgumentRange(expectedDraft, selected.cursor)
+        : { argument: "", rangeEnd: composerTriggerTokenEnd(expectedDraft, selected.cursor) };
+    const scope = resourceCatalogInput(selected.target);
+    const content = await executeAtomQuery(
+      registry,
+      managedTextEnvironment.content({
+        environmentId: selected.target.environmentId,
+        input: {
+          kind: item.entry.kind,
+          id: item.entry.id,
+          expectedRevision: item.entry.revision,
+          ...scope,
+        },
+      }),
+      { reportFailure: false },
+    );
+    const catalog =
+      content._tag === "Success"
+        ? await executeAtomQuery(
+            registry,
+            managedTextEnvironment.catalog({
+              environmentId: selected.target.environmentId,
+              input: scope,
+            }),
+            { refresh: true, reportFailure: false },
+          )
+        : null;
+    if (!pending.isCurrent()) return;
+    if (content._tag !== "Success" || catalog === null || catalog._tag !== "Success") {
+      reportManagedInsertionFailure(
+        `/${item.entry.key}`,
+        content._tag !== "Success"
+          ? squashAtomCommandFailure(content)
+          : catalog !== null && catalog._tag !== "Success"
+            ? squashAtomCommandFailure(catalog)
+            : null,
+      );
+      return;
+    }
+    const result = resolveManagedTextResourceInsertion({
+      selectedTarget: selected.target,
+      currentTarget: selected.target,
+      selected: item.entry,
+      content: content.value,
+      currentEntries: catalog.value.entries,
+      draft: promptRef.current,
+      expectedDraft,
+      rangeStart: trigger.rangeStart,
+      rangeEnd: range.rangeEnd,
+      argument: range.argument,
+    });
+    if (result.status === "inserted") {
+      if (
+        applyPromptReplacement(0, expectedDraft.length, result.text, {
+          expectedText: expectedDraft,
+          expandedCursorAfterReplace: result.cursor,
+        })
+      )
+        setComposerHighlightedItemId(null);
+      return;
+    }
+    if (result.status === "stale-resource")
+      toastManager.add({
+        type: "warning",
+        title: `/${item.entry.key} changed`,
+        description:
+          "It was edited or turned off while loading. Choose it again to use the current version.",
+      });
+  };
+
+  /**
+   * Inserts the verified body of a managed skill. A provider skill with the
+   * same key stays its own `$key` row, so choosing this one never triggers it.
+   */
+  const insertManagedSkill = async (
+    item: Extract<ComposerCommandItem, { type: "managed-skill" }>,
+    trigger: ComposerTrigger,
+    providerInstanceId: ProviderInstanceId | null,
+  ) => {
+    const pending = managedInsertion.begin(readManagedInsertion);
+    if (pending === null) return;
+    const { selected } = pending;
+    const scope = resourceCatalogInput(selected.target);
+    const content = await executeAtomQuery(
+      registry,
+      skillsEnvironment.content({
+        environmentId: selected.target.environmentId,
+        input: { skillId: item.entry.id, ...scope },
+      }),
+      { refresh: true, reportFailure: false },
+    );
+    const catalog =
+      content._tag === "Success"
+        ? await executeAtomQuery(
+            registry,
+            skillsEnvironment.catalog({
+              environmentId: selected.target.environmentId,
+              input: {
+                ...scope,
+                ...(providerInstanceId === null ? {} : { providerInstanceId }),
+              },
+            }),
+            { refresh: true, reportFailure: false },
+          )
+        : null;
+    if (!pending.isCurrent()) return;
+    if (content._tag !== "Success" || catalog === null || catalog._tag !== "Success") {
+      reportManagedInsertionFailure(
+        item.entry.name,
+        content._tag !== "Success"
+          ? squashAtomCommandFailure(content)
+          : catalog !== null && catalog._tag !== "Success"
+            ? squashAtomCommandFailure(catalog)
+            : null,
+      );
+      return;
+    }
+    const result = resolveManagedSkillInsertion({
+      selected: item.entry,
+      content: content.value,
+      currentEntries: catalog.value.entries,
+      draft: selected.draft,
+      rangeStart: trigger.rangeStart,
+      rangeEnd: composerTriggerTokenEnd(selected.draft, selected.cursor),
+    });
+    if (result.status === "inserted") {
+      if (
+        applyPromptReplacement(0, selected.draft.length, result.text, {
+          expectedText: selected.draft,
+          expandedCursorAfterReplace: result.cursor,
+        })
+      )
+        setComposerHighlightedItemId(null);
+      return;
+    }
+    if (result.status === "stale-resource")
+      toastManager.add({
+        type: "warning",
+        title: `${item.entry.name} changed`,
+        description:
+          "It was edited, turned off or replaced while loading. Choose it again to use the current version.",
+      });
+  };
+
   const { onUsageLimitsCommand } = props;
   const onSelectComposerItem = (item: ComposerCommandItem) => {
     if (composerSelectLockRef.current) return;
@@ -3934,6 +4303,35 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         });
         setComposerHighlightedItemId(null);
       }
+      return;
+    }
+    if (item.type === "issue") {
+      if (
+        trigger.kind !== "issue" ||
+        !composerMenuItemsRef.current.some((candidate) => candidate.id === item.id)
+      ) {
+        return;
+      }
+      const replacement = `${item.issue.url} `;
+      const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
+        snapshot.value,
+        trigger.rangeEnd,
+        replacement,
+      );
+      const applied = applyPromptReplacement(trigger.rangeStart, replacementRangeEnd, replacement, {
+        expectedText: snapshot.value.slice(trigger.rangeStart, replacementRangeEnd),
+      });
+      if (applied) setComposerHighlightedItemId(null);
+      return;
+    }
+    if (item.type === "managed-skill") {
+      if (trigger.kind !== "skill") return;
+      void insertManagedSkill(item, trigger, selectedProviderStatus?.instanceId ?? null);
+      return;
+    }
+    if (item.type === "managed-text") {
+      if (trigger.kind !== "slash-command") return;
+      void insertManagedTextResource(item, trigger);
       return;
     }
     if (item.type === "thread") {
@@ -4227,6 +4625,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       !isLiteralPendingAnswer && (composerMenuOpenRef.current || trigger !== null);
     if (key === "Escape") {
       if (!menuIsActive || event.isComposing || event.keyCode === 229) return false;
+      managedInsertion.cancel();
       dismissComposerTrigger(trigger);
       composerMenuOpenRef.current = false;
       return true;
@@ -5141,7 +5540,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const hiddenRestingBlockIds = restingBlockDefs
     .slice(restingBlockDefs.length - restingHiddenBlockCount)
     .map((def) => def.id);
-  const composerControls = showProviderUnavailable ? (
+  const composerControls = agentConfiguration ? (
+    <ComposerControl
+      type="button"
+      onClick={agentConfiguration.onOpen}
+      data-chat-agent-configuration="true"
+      className="shrink-0"
+    >
+      <BotIcon className="size-4" />
+      {`Configure ${agentConfiguration.name}`}
+    </ComposerControl>
+  ) : showProviderUnavailable ? (
     <ComposerControl
       type="button"
       disabled={!providerSetupInstanceId}
@@ -7177,7 +7586,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         "flex items-center overflow-hidden whitespace-nowrap leading-8",
                     )}
                     onChange={onPromptChangeStable}
-                    onVisibleSelectionChange={expandComposerForEditorChangeStable}
+                    onVisibleSelectionChange={onComposerVisibleSelectionChange}
                     onCommandKeyDown={onComposerCommandKeyStable}
                     onPageScrollKeyDown={onPageScrollKeyDown}
                     onPageScrollKeyUp={onPageScrollKeyUp}
@@ -7329,6 +7738,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       settings.contextWindowMeterEnabled ? activeContextWindow : null
                     }
                     reserveContextWindowMeter={reserveContextWindowMeter}
+                    latestRunWork={latestRunWork ?? null}
                     activeThreadModelDisplayName={activeThreadModelDisplayName}
                     pendingAction={pendingPrimaryAction}
                     isRunning={phase === "running"}

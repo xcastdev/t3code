@@ -1,3 +1,5 @@
+import * as Crypto from "effect/Crypto";
+import * as Hex from "effect/encoding/Hex";
 import {
   CheckpointId,
   CheckpointScopeId,
@@ -35,6 +37,9 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as ThreadHistoryArchive from "./ThreadHistoryArchiveService.ts";
+
+const encodeOperationIdentity = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 export const ROLLBACK_FAILED_MESSAGE =
   "The provider could not roll back this conversation. Try again; if it keeps failing, check the provider and server logs.";
@@ -47,6 +52,7 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
       "active-provider-changed",
       "provider-turn-unavailable",
       "unexpected-failure",
+      "history-reconciliation-required",
       "shared-workspace",
     ]),
     threadId: ThreadId,
@@ -65,6 +71,8 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
         return `Provider turn for rollback target ${this.checkpointId} is unavailable on provider thread ${this.providerThreadId}.`;
       case "shared-workspace":
         return SHARED_WORKSPACE_RESTORE_MESSAGE;
+      case "history-reconciliation-required":
+        return "A previous history operation may have changed the provider or files. Reconcile its retained archive before retrying.";
       case "unexpected-failure":
         return ROLLBACK_FAILED_MESSAGE;
     }
@@ -74,6 +82,7 @@ export class CheckpointRollbackExecutionError extends Schema.TaggedError<Checkpo
 const isCheckpointRollbackExecutionError = Schema.is(CheckpointRollbackExecutionError);
 const isVcsProcessExitError = Schema.is(VcsProcessExitError);
 const isCheckpointRestoreError = Schema.is(CheckpointRestoreError);
+const isHistoryArchiveError = Schema.is(ThreadHistoryArchive.HistoryArchiveError);
 
 /**
  * The message clients see when a rollback fails. Only a held Git index lock
@@ -81,6 +90,7 @@ const isCheckpointRestoreError = Schema.is(CheckpointRestoreError);
  * output, so they fall back to the generic message.
  */
 export function rollbackFailureClientMessage(error: CheckpointRollbackExecutionError): string {
+  if (error.reason === "history-reconciliation-required") return error.message;
   const restoreCause = isCheckpointRestoreError(error.cause) ? error.cause.cause : undefined;
   return isVcsProcessExitError(restoreCause) && restoreCause.detail === GIT_INDEX_LOCKED_DETAIL
     ? GIT_INDEX_LOCKED_DETAIL
@@ -106,6 +116,8 @@ export const layer: Layer.Layer<
   CheckpointRollbackServiceV2,
   never,
   | CheckpointServiceV2
+  | Crypto.Crypto
+  | ThreadHistoryArchive.ThreadHistoryArchiveService
   | GitWorkflowService.GitWorkflowService
   | EventSinkV2
   | IdAllocator.IdAllocatorV2
@@ -122,6 +134,8 @@ export const layer: Layer.Layer<
   CheckpointRollbackServiceV2,
   Effect.gen(function* () {
     const checkpoints = yield* CheckpointServiceV2;
+    const crypto = yield* Crypto.Crypto;
+    const archives = yield* ThreadHistoryArchive.ThreadHistoryArchiveService;
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const eventSink = yield* EventSinkV2;
     const ids = yield* IdAllocator.IdAllocatorV2;
@@ -199,6 +213,32 @@ export const layer: Layer.Layer<
               };
             });
 
+      // Retrying the same projected rollback must find an interrupted operation, not replay native side effects.
+      const operationIdentity = yield* encodeOperationIdentity([
+        input.threadId,
+        input.checkpointId,
+        providerThread,
+        runsToRollback.map((run) => run.id),
+      ]);
+      const archiveId = Hex.encode(
+        yield* crypto
+          .digest("SHA-256", new TextEncoder().encode(operationIdentity))
+          .pipe(Effect.orDie),
+      );
+      const archive = { threadId: input.threadId, archiveId };
+      const preparation = {
+        ...archive,
+        reason: "rollback",
+        operation: {
+          type: "rollback" as const,
+          checkpointId: input.checkpointId,
+          scopeId: input.scopeId,
+          providerThreadId: input.providerThreadId,
+          restoreFiles: input.restoreFiles !== false,
+        },
+      };
+      yield* archives.prepareIntent(preparation);
+
       const { worktreePath, branch } = context.thread;
       // Recreated only where the server would have made it, as turn start does.
       if (
@@ -234,6 +274,9 @@ export const layer: Layer.Layer<
           checkpointId: input.checkpointId,
         });
       }
+
+      yield* archives.prepare(preparation);
+      yield* archives.beginExternal(archive);
 
       const modelSelection = context.thread.modelSelection;
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({
@@ -350,6 +393,7 @@ export const layer: Layer.Layer<
             }
           }
           yield* eventSink.write({ events });
+          yield* archives.completeExternal(archive);
         }),
       );
     });
@@ -370,7 +414,10 @@ export const layer: Layer.Layer<
               isCheckpointRollbackExecutionError(cause)
                 ? cause
                 : new CheckpointRollbackExecutionError({
-                    reason: "unexpected-failure",
+                    reason:
+                      isHistoryArchiveError(cause) && cause.reason === "reconciliation-required"
+                        ? "history-reconciliation-required"
+                        : "unexpected-failure",
                     threadId: input.threadId,
                     providerThreadId: input.providerThreadId,
                     checkpointId: input.checkpointId,

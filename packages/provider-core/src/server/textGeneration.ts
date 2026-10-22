@@ -2,6 +2,7 @@ import type {
   BranchNamingOptions,
   ChatAttachment,
   ModelSelection,
+  MemoryExtractionResult,
   PullRequestReviewGuide,
   TextGenerationError,
 } from "@t3tools/contracts";
@@ -94,7 +95,17 @@ export type ReviewGuideGenerationResult = Omit<
   "headSha" | "generatedAt" | "modelSelection"
 >;
 
+export interface MemoryExtractionInput {
+  readonly cwd: string;
+  readonly sourceText: string;
+  readonly modelSelection: ModelSelection;
+}
+
 export interface ProviderTextGeneration {
+  readonly extractMemoryFacts: (
+    input: MemoryExtractionInput,
+  ) => Effect.Effect<MemoryExtractionResult, TextGenerationError>;
+
   readonly generateCommitMessage: (
     input: CommitMessageGenerationInput,
   ) => Effect.Effect<CommitMessageGenerationResult, TextGenerationError>;

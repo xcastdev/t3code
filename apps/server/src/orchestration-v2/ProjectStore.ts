@@ -1,5 +1,6 @@
 import {
   type ApplicationProjectEvent,
+  AssistantId,
   IsoDateTime,
   ModelSelection,
   type OrchestrationProjectShell,
@@ -15,6 +16,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlSchema from "effect/sql/SqlSchema";
+
+import * as Environment from "../environment/ServerEnvironment.ts";
 
 export class ProjectStoreV2Error extends Schema.TaggedError<ProjectStoreV2Error>()(
   "ProjectStoreV2Error",
@@ -52,9 +55,12 @@ const ProjectDbRow = Schema.Struct({
   scripts: Schema.fromJsonString(Schema.Array(ProjectScript)),
 });
 
-function toShell(row: ProjectRow): OrchestrationProjectShell {
+function toShell(
+  row: ProjectRow & { readonly assistantId: AssistantId | null },
+): OrchestrationProjectShell {
   return {
     id: row.projectId,
+    ...(row.assistantId === null ? {} : { assistantId: row.assistantId }),
     title: row.title,
     workspaceRoot: row.workspaceRoot,
     repositoryIdentity: null,
@@ -99,6 +105,40 @@ export class ProjectStoreV2 extends Context.Service<
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const encodeRow = Schema.encodeEffect(ProjectDbRow);
+  // Standalone projection tools have no environment identity and cannot assert ownership.
+  const environment = yield* Effect.serviceOption(Environment.ServerEnvironment);
+  const environmentId = Option.isSome(environment)
+    ? yield* environment.value.getEnvironmentId
+    : null;
+
+  const selectShellRows = SqlSchema.findAll({
+    Request: Schema.Struct({ projectIds: Schema.optional(Schema.Array(ProjectId)) }),
+    Result: Schema.Struct({ ...ProjectDbRow.fields, assistantId: Schema.NullOr(AssistantId) }),
+    execute: (request) => sql`
+      SELECT
+        p.project_id AS "projectId",
+        a.assistant_id AS "assistantId",
+        p.title,
+        p.workspace_root AS "workspaceRoot",
+        p.default_model_selection_json AS "defaultModelSelection",
+        p.default_thread_env_mode AS "defaultThreadEnvMode",
+        p.auto_pull AS "autoPull",
+        p.favicon_path AS "faviconPath",
+        p.project_icon_json AS "projectIcon",
+        p.scripts_json AS "scripts",
+        p.created_at AS "createdAt",
+        p.updated_at AS "updatedAt",
+        p.deleted_at AS "deletedAt"
+      FROM projection_projects p
+      LEFT JOIN t3_workflow_v2_assistants a
+        ON a.environment_id = ${environmentId} AND a.project_id = p.project_id
+      WHERE ${sql.and([
+        sql`p.deleted_at IS NULL`,
+        ...(request.projectIds === undefined ? [] : [sql.in("p.project_id", request.projectIds)]),
+      ])}
+      ORDER BY p.created_at ASC, p.project_id ASC
+    `,
+  });
 
   const selectRows = SqlSchema.findAll({
     Request: Schema.Struct({
@@ -263,10 +303,15 @@ export const make = Effect.gen(function* () {
     get,
     list,
     findActiveByWorkspaceRoot,
-    getShell: (projectId) => get(projectId).pipe(Effect.map(Option.map(toShell))),
+    getShell: (projectId) =>
+      selectShellRows({ projectIds: [projectId] }).pipe(
+        Effect.map((rows) => Option.fromUndefinedOr(rows[0]).pipe(Option.map(toShell))),
+        mapError("getShell"),
+      ),
     listShells: (options) =>
-      list(options?.projectIds === undefined ? undefined : { projectIds: options.projectIds }).pipe(
+      selectShellRows(options ?? {}).pipe(
         Effect.map((rows) => rows.map(toShell)),
+        mapError("listShells"),
       ),
   });
 });

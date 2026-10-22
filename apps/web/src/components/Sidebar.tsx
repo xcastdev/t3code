@@ -11,6 +11,7 @@ import {
 } from "./chat/threadContextDrag";
 import { discardComposerDraft } from "../lib/discardComposerDraft";
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
+import { requestThreadHistory } from "./thread-history/ThreadHistoryDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { useAtomValue } from "@effect/atom-react";
@@ -4298,6 +4299,24 @@ export default function Sidebar() {
                 projectId: thread.projectId,
               });
             return;
+          case "thread-resources": {
+            if (!threadProjectGroup) return;
+            const checkout = threadProjectGroup.memberProjects.find(
+              (member) =>
+                member.environmentId === thread.environmentId && member.id === thread.projectId,
+            );
+            if (isMobile) setOpenMobile(false);
+            void router.navigate({
+              to: "/settings/resources",
+              search: {
+                project: threadProjectGroup.projectKey,
+                machine: thread.environmentId,
+                ...(checkout ? { checkout: checkout.physicalProjectKey } : {}),
+                thread: thread.id,
+              },
+            });
+            return;
+          }
           case "new-thread-on-branch": {
             const result = await settlePromise(() =>
               handleNewThreadRef.current(scopeProjectRef(thread.environmentId, thread.projectId), {
@@ -4375,6 +4394,10 @@ export default function Sidebar() {
           }
           case "mark-unread":
             markThreadUnread(threadRef);
+            return;
+          case "history":
+            if (isMobile) setOpenMobile(false);
+            requestThreadHistory(threadRef);
             return;
           case "copy-path":
             if (!threadWorkspacePath) {

@@ -377,7 +377,10 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         ),
       );
 
-      const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(outputSchemaJson));
+      const decodeOutput = Schema.decodeEffect(
+        Schema.fromJsonString(outputSchemaJson),
+        operation === "extractMemoryFacts" ? { onExcessProperty: "error" } : undefined,
+      );
 
       return yield* fileSystem.readFileString(outputPath).pipe(
         Effect.mapError(

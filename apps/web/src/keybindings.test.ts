@@ -882,3 +882,31 @@ describe("Usage shortcuts", () => {
     );
   });
 });
+
+describe("source control shortcut", () => {
+  it("opens source control by default outside the terminal, including Mac option keys", () => {
+    assert.strictEqual(
+      resolveShortcutCommand(
+        event({ key: "g", ctrlKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "Win32" },
+      ),
+      "sourceControl.open",
+    );
+    assert.strictEqual(
+      resolveShortcutCommand(
+        event({ key: "©", code: "KeyG", metaKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "MacIntel" },
+      ),
+      "sourceControl.open",
+    );
+    assert.isNull(
+      resolveShortcutCommand(
+        event({ key: "g", ctrlKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "Win32", context: { terminalFocus: true } },
+      ),
+    );
+  });
+});

@@ -370,9 +370,111 @@ const approval = (turnId: string) => ({
 });
 
 describe("MuseAdapterV2", () => {
+  it.effect("acknowledges only current managed instructions admitted by turn/start", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const harness = yield* makeHarness(fake);
+      const { runtime, providerThread } = harness;
+      const first = {
+        configurationHash: "config-1",
+        resourceRevision: "resources-1",
+        memoryEpoch: 0,
+        roleInstructions: "Review migrations.",
+        toolIds: ["unavailable-tool"],
+        skillIds: [],
+      };
+      for (const [index, instructionSnapshot] of [
+        first,
+        {
+          ...first,
+          configurationHash: "config-2",
+          resourceRevision: "resources-2",
+          memoryEpoch: 1,
+          roleInstructions: "Review the revised schema.",
+        },
+        undefined,
+      ].entries()) {
+        yield* runtime.startTurn({
+          ...(yield* turnInput(providerThread, index + 1)),
+          ...(instructionSnapshot ? { instructionSnapshot } : {}),
+        });
+        const call = yield* fake.takeCall("turn/start");
+        assert.deepEqual(
+          yield* runtime.getAppliedInstructions!({ providerThread }),
+          instructionSnapshot,
+        );
+        const encoded = JSON.stringify(call.params);
+        if (instructionSnapshot) assert.include(encoded, instructionSnapshot.roleInstructions);
+        else assert.notInclude(encoded, first.roleInstructions);
+        assert.notProperty(call.params, "maxTokens");
+        yield* fake.emit("turn/completed", { turnId: call.commandId, terminal: "completed" });
+        yield* harness.takeEvent("turn.terminal");
+        // A stale native event cannot manufacture a receipt for the next revision.
+        yield* fake.emit("turn/completed", { turnId: "stale-turn", terminal: "completed" });
+        assert.deepEqual(
+          yield* runtime.getAppliedInstructions!({ providerThread }),
+          instructionSnapshot,
+        );
+      }
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("does not acknowledge instruction text before the native start reply", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const harness = yield* makeHarness(fake);
+      const reply = pendingPromise<Record<string, unknown>>();
+
+      const instructionSnapshot = {
+        configurationHash: "pending",
+        resourceRevision: "pending-resources",
+        memoryEpoch: 0,
+        roleInstructions: "Pending role.",
+        toolIds: [],
+        skillIds: [],
+      };
+      yield* harness.runtime.startTurn({
+        ...(yield* turnInput(harness.providerThread)),
+        instructionSnapshot,
+      });
+      const predecessor = yield* fake.takeCall("turn/start");
+      assert.deepEqual(
+        yield* harness.runtime.getAppliedInstructions!({ providerThread: harness.providerThread }),
+        instructionSnapshot,
+      );
+      yield* fake.emit("turn/completed", { turnId: predecessor.commandId, terminal: "completed" });
+      yield* harness.takeEvent("turn.terminal");
+      fake.queueResponse("turn/start", reply.promise);
+      const receipts: Array<unknown> = [];
+      const starting = yield* harness.runtime
+        .startTurn({
+          ...(yield* turnInput(harness.providerThread, 2)),
+          instructionSnapshot,
+          onInstructionsApplied: (snapshot) =>
+            Effect.sync(() => {
+              receipts.push(snapshot);
+            }),
+        })
+        .pipe(Effect.exit, Effect.forkScoped);
+      const call = yield* fake.takeCall("turn/start");
+      assert.include(JSON.stringify(call.params), instructionSnapshot.roleInstructions);
+      assert.isUndefined(
+        yield* harness.runtime.getAppliedInstructions!({ providerThread: harness.providerThread }),
+      );
+      reply.resolve({ turnId: "wrong-turn" });
+      const result = yield* Fiber.join(starting);
+      assert.isTrue(result._tag === "Failure");
+      assert.deepEqual(receipts, []);
+      assert.isUndefined(
+        yield* harness.runtime.getAppliedInstructions!({ providerThread: harness.providerThread }),
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("connects the thread's MCP credential on native start and resume", () =>
     Effect.gen(function* () {
-      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+      const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+      const config = {
         environmentId: EnvironmentId.make("test-environment"),
         threadId: THREAD_ID,
         providerSessionId: "test-session",
@@ -380,11 +482,17 @@ describe("MuseAdapterV2", () => {
         endpoint: "http://127.0.0.1:43210/mcp",
         authorizationHeader: "Bearer thread-scoped-test-token",
         browserToolsAvailable: true,
-      });
+        nativeRuntimeId: "muse-native-runtime",
+        catalogRevision: 1,
+        catalogEndpoint: "http://127.0.0.1:43210/mcp/catalog/test-session",
+      };
       for (const nativeId of [undefined, "saved-native-session"]) {
+        yield* mcpSessions.clear(THREAD_ID);
+        yield* mcpSessions.set(config);
         const fake = yield* makeFakeMuse();
         fake.host.initializeResult.grantedCapabilities.push("sessionMcp");
         yield* makeHarness(fake, INSTANCE_ID, nativeId);
+        assert.strictEqual(yield* mcpSessions.readCatalogEndpointReceipt(THREAD_ID), config);
         const call = yield* fake.takeCall(nativeId ? "session/resume" : "session/start");
         assert.deepStrictEqual(call.params.config, {
           mcpServers: {
@@ -394,10 +502,79 @@ describe("MuseAdapterV2", () => {
               url: "http://127.0.0.1:43210/mcp",
               headers: { Authorization: "Bearer thread-scoped-test-token" },
             },
+            t3_catalog: {
+              transport: "streamableHttp",
+              mode: "optional",
+              url: config.catalogEndpoint,
+              headers: { Authorization: config.authorizationHeader },
+            },
           },
         });
       }
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect.each(["failure", "stale", "stale-revision", "wrong-session"] as const)(
+    "does not acknowledge unconfirmed catalog configuration: %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const config = {
+          environmentId: EnvironmentId.make("test-environment"),
+          threadId: THREAD_ID,
+          providerSessionId: "catalog-credential",
+          providerInstanceId: INSTANCE_ID,
+          endpoint: "http://127.0.0.1:43210/mcp",
+          catalogEndpoint: "http://127.0.0.1:43210/mcp/catalog/catalog-credential",
+          nativeRuntimeId: "native-runtime",
+          catalogRevision: 1,
+          authorizationHeader: "Bearer synthetic-catalog-token",
+          browserToolsAvailable: false,
+        };
+        yield* mcpSessions.set(config);
+        const fake = yield* makeFakeMuse();
+        fake.host.initializeResult.grantedCapabilities.push("sessionMcp");
+        const reply = pendingPromise<Record<string, unknown>>();
+        fake.queueResponse("session/start", reply.promise);
+        const opening = yield* makeHarness(fake).pipe(Effect.exit, Effect.forkScoped);
+        const call = yield* fake.takeCall("session/start");
+        assert.deepStrictEqual(call.params.config, {
+          mcpServers: {
+            "t3-code": {
+              transport: "streamableHttp",
+              mode: "optional",
+              url: config.endpoint,
+              headers: { Authorization: config.authorizationHeader },
+            },
+            t3_catalog: {
+              transport: "streamableHttp",
+              mode: "optional",
+              url: config.catalogEndpoint,
+              headers: { Authorization: config.authorizationHeader },
+            },
+          },
+        });
+        assert.isUndefined(yield* mcpSessions.readCatalogEndpointReceipt(THREAD_ID));
+        if (outcome === "stale")
+          yield* mcpSessions.set({ ...config, nativeRuntimeId: "replacement-runtime" });
+        if (outcome === "stale-revision") yield* mcpSessions.set({ ...config, catalogRevision: 2 });
+        if (outcome === "failure") reply.reject(new Error("native config rejected"));
+        else
+          reply.resolve({
+            session: {
+              sessionId: outcome === "wrong-session" ? "wrong-session" : call.params.sessionId,
+              modelId: MODEL,
+              activeTurnId: null,
+            },
+            history: { items: [] },
+          });
+        const result = yield* Fiber.join(opening);
+        assert.strictEqual(
+          result._tag,
+          outcome === "stale" || outcome === "stale-revision" ? "Success" : "Failure",
+        );
+        assert.isUndefined(yield* mcpSessions.readCatalogEndpointReceipt(THREAD_ID));
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
   it.effect("selects the runtime mode's permission profile on native start and resume", () =>
@@ -436,11 +613,18 @@ describe("MuseAdapterV2", () => {
         endpoint: "http://127.0.0.1:43210/mcp",
         authorizationHeader: "Bearer thread-scoped-test-token",
         browserToolsAvailable: false,
+        catalogEndpoint: "http://127.0.0.1:43210/mcp/catalog/test-session",
+        nativeRuntimeId: "unsupported-runtime",
       });
       const fake = yield* makeFakeMuse();
       const outcome = yield* makeHarness(fake).pipe(Effect.result);
       assert.strictEqual(outcome._tag, "Failure");
       assert.isFalse(fake.calls.some((call) => call.method === "session/start"));
+      assert.isUndefined(
+        yield* (yield* McpProviderSessions.McpProviderSessions).readCatalogEndpointReceipt(
+          THREAD_ID,
+        ),
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

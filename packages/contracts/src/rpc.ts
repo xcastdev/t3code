@@ -1,3 +1,151 @@
+import { AssistantResolveThreadInput, AssistantResolveThreadResult } from "./assistantUi.ts";
+import {
+  ExternalNotificationTestInput,
+  ExternalNotificationTestResult,
+} from "./externalNotifications.ts";
+import {
+  ThreadHistoryArchiveIdentity,
+  ThreadHistoryDetailInput,
+  ThreadHistoryDetailResult,
+  ThreadHistoryFileRestoreStatusInput,
+  ThreadHistoryFileRestoreStatusResult,
+  ThreadHistoryListInput,
+  ThreadHistoryListResult,
+  ThreadHistoryReconcileInput,
+  ThreadHistoryReconcileResult,
+  ThreadHistoryRecoverInput,
+  ThreadHistoryRecoveryResult,
+  ThreadHistoryRestoreFilesInput,
+  ThreadHistoryRestoreFilesResult,
+  ThreadHistoryRpcError,
+} from "./threadHistory.ts";
+import {
+  AssistantRoutineReadInput,
+  AssistantRoutineReadResult,
+  AssistantRoutineWriteInput,
+  AssistantRoutineWriteResult,
+} from "./assistantRoutines.ts";
+import {
+  AssistantMemoryReadInput,
+  AssistantMemoryReadResult,
+  AssistantMemoryWriteInput,
+  AssistantMemoryWriteResult,
+  AssistantMemoryRpcError,
+} from "./assistantMemory.ts";
+import {
+  AssistantActivityListInput,
+  AssistantRunListResult,
+  AssistantCreateInput,
+  AssistantGetInput,
+  AssistantListInput,
+  AssistantListResult,
+  AssistantUpdateConfigurationInput,
+  AssistantLifecycleInput,
+  AssistantDetail,
+  AssistantRpcError,
+} from "./assistants.ts";
+import { IssueSearchInput, IssueSearchResult } from "./issueSearch.ts";
+import {
+  ProjectTerminalAttachStreamEvent,
+  ProjectTerminalDockListInput,
+  ProjectTerminalDockListResult,
+  ProjectTerminalHandle,
+  ProjectTerminalMetadataStreamEvent,
+  ProjectTerminalResizeInput,
+  ProjectTerminalWriteInput,
+  ProjectTerminalKillInput,
+  ProjectTerminalStopResult,
+  TerminalToolError,
+} from "./terminalToolkit.ts";
+import {
+  SkillApplicationGetInput,
+  SkillApplicationGetResult,
+  SkillCatalogChanged,
+  SkillCatalogListInput,
+  SkillCatalogListResult,
+  SkillContentGetInput,
+  SkillContentGetResult,
+  SkillDeploymentChangeInput,
+  SkillDeploymentChangeResult,
+  SkillDeploymentListInput,
+  SkillDeploymentListResult,
+  SkillGlobalCreateInput,
+  SkillGlobalCreateResult,
+  SkillGlobalDeleteInput,
+  SkillGlobalDeleteResult,
+  SkillGlobalRenameInput,
+  SkillGlobalRenameResult,
+  SkillGlobalRollbackInput,
+  SkillGlobalRollbackResult,
+  SkillGlobalUpdateInput,
+  SkillGlobalUpdateResult,
+  SkillHistoryListInput,
+  SkillHistoryListResult,
+  SkillNativeContentGetInput,
+  SkillNativeContentGetResult,
+  SkillNativeImportInput,
+  SkillNativeImportResult,
+  SkillProjectDeleteStateInput,
+  SkillProjectDeleteStateResult,
+  SkillProjectRenameInput,
+  SkillProjectRenameResult,
+  SkillProjectSetDisabledInput,
+  SkillProjectSetDisabledResult,
+  SkillProjectSetOverrideInput,
+  SkillProjectSetOverrideResult,
+  SkillRpcError,
+  SkillSessionResetInput,
+  SkillSessionResetResult,
+  SkillSessionSetEnabledInput,
+  SkillSessionSetEnabledResult,
+} from "./skills.ts";
+import {
+  ManagedTextResourceCatalogListInput,
+  ManagedTextResourceCatalogListResult,
+  ManagedTextResourceChanged,
+  ManagedTextResourceContentGetInput,
+  ManagedTextResourceContentGetResult,
+  ManagedTextResourceEnvironmentCreateInput,
+  ManagedTextResourceEnvironmentDeleteInput,
+  ManagedTextResourceEnvironmentSetEnabledInput,
+  ManagedTextResourceEnvironmentUpdateInput,
+  ManagedTextResourceMutationResult,
+  ManagedTextResourceProjectDeleteStateInput,
+  ManagedTextResourceProjectSetDisabledInput,
+  ManagedTextResourceProjectSetOverrideInput,
+  ManagedTextResourceRpcError,
+  ManagedTextResourceThreadResetInput,
+  ManagedTextResourceThreadSetEnabledInput,
+} from "./managedTextResources.ts";
+import {
+  McpCatalogSessionForThreadInput,
+  McpCatalogSessionForThreadResult,
+  McpCatalogOAuthTarget,
+  McpCatalogOAuthStatusResult,
+  McpCatalogSecretPrepareInput,
+  McpCatalogSecretPrepareResult,
+  McpCatalogReadInput,
+  McpCatalogReadResult,
+  McpCatalogWriteInput,
+  McpCatalogSessionRequest,
+  McpCatalogSessionMutationInput,
+  McpCatalogSnapshot,
+  McpCatalogMutationError,
+  McpCatalogOAuthBeginInput,
+  McpCatalogOAuthContinueInput,
+  McpCatalogOAuthDisconnectInput,
+} from "./mcpCatalog.ts";
+import { ProjectMcpOAuthBeginResult } from "./projectMcp.ts";
+import { ProjectIssueRequest } from "./projectIssueIntake.ts";
+import {
+  ProjectWorkReadIntent,
+  ProjectWorkWriteIntent,
+  ProjectWorkWriteResult,
+  ProjectWorkStreamInput,
+  ProjectWorkStreamItem,
+  ProjectWorkDeliveryRequest,
+  ProjectWorkDeliveryResult,
+} from "./projectWork.ts";
 import {
   OrchestrationV2SearchThreadError,
   OrchestrationV2SearchThreadInput,
@@ -118,6 +266,17 @@ import {
 } from "./worktreeSetup.ts";
 import {
   GitActionProgressEvent,
+  GitDiscoverRepositoriesInput,
+  GitDiscoverRepositoriesResult,
+  GitIndexStatusInput,
+  GitIndexStatusResult,
+  GitMutateIndexInput,
+  GitCommitStagedInput,
+  GitCommitStagedResult,
+  GitHistoryInput,
+  GitHistoryResult,
+  GitHistoryDiffInput,
+  GitHistoryDiffResult,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
   GitCommandError,
@@ -292,7 +451,6 @@ import {
   DeviceSession,
   DeviceShutdownInput,
 } from "./device.ts";
-import {} from "./previewAutomation.ts";
 import {
   ServerConfigStreamEvent,
   DesktopUpdateCommitInput,
@@ -377,7 +535,54 @@ import {
 import { VcsError } from "./vcs.ts";
 import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
 
+export class ProjectWorkRpcError extends Schema.TaggedError<ProjectWorkRpcError>()(
+  "ProjectWorkRpcError",
+  {
+    operation: Schema.Literals(["read", "write", "subscribe"]),
+    reason: Schema.Literals(["unavailable", "invalid-request", "forbidden", "rejected"]),
+  },
+) {
+  override get message(): string {
+    return `Project Work ${this.operation} failed (${this.reason}).`;
+  }
+}
+
 export const WS_METHODS = {
+  mcpCatalogSessionSubscribeForThread: "mcpCatalog.sessionSubscribeForThread",
+  mcpCatalogSessionForThread: "mcpCatalog.sessionForThread",
+  mcpCatalogOAuthStatus: "mcpCatalog.oauthStatus",
+  mcpCatalogSecretPrepare: "mcpCatalog.secretPrepare",
+  mcpCatalogRead: "mcpCatalog.read",
+  mcpCatalogWrite: "mcpCatalog.write",
+  mcpCatalogSessionGet: "mcpCatalog.sessionGet",
+  mcpCatalogSessionReset: "mcpCatalog.sessionReset",
+  mcpCatalogOAuthBegin: "mcpCatalog.oauthBegin",
+  mcpCatalogOAuthContinue: "mcpCatalog.oauthContinue",
+  mcpCatalogOAuthDisconnect: "mcpCatalog.oauthDisconnect",
+  projectWorkRead: "projectWork.read",
+  projectWorkWrite: "projectWork.write",
+  projectWorkIssue: "projectWork.issue",
+  projectWorkDelivery: "projectWork.delivery",
+  assistantsRoutineRead: "assistants.routines.read",
+  assistantsRoutineWrite: "assistants.routines.write",
+  assistantsActivity: "assistants.activity",
+  assistantsSubscribeRoster: "assistants.subscribeRoster",
+  assistantsMemoryRead: "assistants.memory.read",
+  assistantsMemoryWrite: "assistants.memory.write",
+  assistantsCreate: "assistants.create",
+  assistantsGet: "assistants.get",
+  assistantsResolveThread: "assistants.resolveThread",
+  threadHistoryList: "threadHistory.list",
+  threadHistoryDetail: "threadHistory.detail",
+  threadHistoryRecover: "threadHistory.recover",
+  threadHistoryRestoreFiles: "threadHistory.restoreFiles",
+  threadHistoryFileRestoreStatus: "threadHistory.fileRestoreStatus",
+  threadHistoryRelease: "threadHistory.release",
+  threadHistoryReconcile: "threadHistory.reconcile",
+  assistantsList: "assistants.list",
+  assistantsUpdateConfiguration: "assistants.updateConfiguration",
+  assistantsLifecycle: "assistants.lifecycle",
+  projectWorkSubscribe: "projectWork.subscribe",
   projectsList: "projects.list",
   projectsAdd: "projects.add",
   projectsRemove: "projects.remove",
@@ -433,6 +638,12 @@ export const WS_METHODS = {
   vcsSwitchRef: "vcs.switchRef",
   vcsInit: "vcs.init",
 
+  gitDiscoverRepositories: "git.discoverRepositories",
+  gitIndexStatus: "git.indexStatus",
+  gitMutateIndex: "git.mutateIndex",
+  gitCommitStaged: "git.commitStaged",
+  gitHistory: "git.history",
+  gitHistoryDiff: "git.historyDiff",
   gitRunStackedAction: "git.runStackedAction",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
@@ -440,6 +651,44 @@ export const WS_METHODS = {
   reviewGetDiffPreview: "review.getDiffPreview",
   reviewGetDiffFileContents: "review.getDiffFileContents",
 
+  skillsCatalogList: "skills.catalog.list",
+  skillsCatalogSubscribe: "skills.catalog.subscribe",
+  skillsContentGet: "skills.content.get",
+  skillsHistoryList: "skills.history.list",
+  skillsNativeContentGet: "skills.native.content.get",
+  skillsApplicationGet: "skills.application.get",
+  skillsDeploymentList: "skills.deployment.list",
+  skillsDeploymentChange: "skills.deployment.change",
+  skillsGlobalCreate: "skills.global.create",
+  skillsGlobalUpdate: "skills.global.update",
+  skillsGlobalDelete: "skills.global.delete",
+  skillsGlobalRename: "skills.global.rename",
+  skillsGlobalRollback: "skills.global.rollback",
+  skillsProjectSetOverride: "skills.project.setOverride",
+  skillsProjectSetDisabled: "skills.project.setDisabled",
+  skillsProjectDeleteState: "skills.project.deleteState",
+  skillsProjectRename: "skills.project.rename",
+  skillsSessionSetEnabled: "skills.session.setEnabled",
+  skillsSessionReset: "skills.session.reset",
+  skillsNativeImport: "skills.native.import",
+  managedTextResourcesCatalogList: "managedTextResources.catalog.list",
+  managedTextResourcesCatalogSubscribe: "managedTextResources.catalog.subscribe",
+  managedTextResourcesContentGet: "managedTextResources.content.get",
+  managedTextResourcesEnvironmentCreate: "managedTextResources.environment.create",
+  managedTextResourcesEnvironmentUpdate: "managedTextResources.environment.update",
+  managedTextResourcesEnvironmentDelete: "managedTextResources.environment.delete",
+  managedTextResourcesEnvironmentSetEnabled: "managedTextResources.environment.setEnabled",
+  managedTextResourcesProjectSetOverride: "managedTextResources.project.setOverride",
+  managedTextResourcesProjectSetDisabled: "managedTextResources.project.setDisabled",
+  managedTextResourcesProjectDeleteState: "managedTextResources.project.deleteState",
+  managedTextResourcesThreadSetEnabled: "managedTextResources.thread.setEnabled",
+  managedTextResourcesThreadReset: "managedTextResources.thread.reset",
+  projectTerminalAttach: "projectTerminal.attach",
+  projectTerminalMetadata: "projectTerminal.metadata",
+  projectTerminalList: "projectTerminal.list",
+  projectTerminalWrite: "projectTerminal.write",
+  projectTerminalResize: "projectTerminal.resize",
+  projectTerminalKill: "projectTerminal.kill",
   terminalOpen: "terminal.open",
   terminalAttach: "terminal.attach",
   terminalObserve: "terminal.observe",
@@ -484,6 +733,7 @@ export const WS_METHODS = {
   serverGetDatabaseStorage: "server.getDatabaseStorage",
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
+  serverTestExternalNotification: "server.testExternalNotification",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverSearchAcpRegistry: "server.searchAcpRegistry",
   serverPrepareAcpRegistryAgent: "server.prepareAcpRegistryAgent",
@@ -524,6 +774,7 @@ export const WS_METHODS = {
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
 
+  issuesSearch: "issues.search",
   pullRequestsList: "pullRequests.list",
   pullRequestsListStats: "pullRequests.listStats",
   pullRequestsSummary: "pullRequests.summary",
@@ -761,6 +1012,12 @@ const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
 });
 
+const WsServerTestExternalNotificationRpc = Rpc.make(WS_METHODS.serverTestExternalNotification, {
+  payload: ExternalNotificationTestInput,
+  success: ExternalNotificationTestResult,
+  error: EnvironmentAuthorizationError,
+});
+
 const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSettings, {
   payload: Schema.Struct({
     patch: ServerSettingsPatch,
@@ -945,6 +1202,12 @@ const PullRequestRpcError = Schema.Union([
   PullRequestOperationError,
   EnvironmentAuthorizationError,
 ]);
+
+export const WsIssuesSearchRpc = Rpc.make(WS_METHODS.issuesSearch, {
+  payload: IssueSearchInput,
+  success: IssueSearchResult,
+  error: PullRequestRpcError,
+});
 
 const WsPullRequestsListRpc = Rpc.make(WS_METHODS.pullRequestsList, {
   payload: PullRequestListInput,
@@ -1376,6 +1639,42 @@ const WsWorktreeSetupCancelRpc = Rpc.make(WS_METHODS.worktreeSetupCancel, {
   error: EnvironmentAuthorizationError,
 });
 
+const WsGitDiscoverRepositoriesRpc = Rpc.make(WS_METHODS.gitDiscoverRepositories, {
+  payload: GitDiscoverRepositoriesInput,
+  success: GitDiscoverRepositoriesResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitIndexStatusRpc = Rpc.make(WS_METHODS.gitIndexStatus, {
+  payload: GitIndexStatusInput,
+  success: GitIndexStatusResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitMutateIndexRpc = Rpc.make(WS_METHODS.gitMutateIndex, {
+  payload: GitMutateIndexInput,
+  success: GitIndexStatusResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitCommitStagedRpc = Rpc.make(WS_METHODS.gitCommitStaged, {
+  payload: GitCommitStagedInput,
+  success: GitCommitStagedResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitHistoryRpc = Rpc.make(WS_METHODS.gitHistory, {
+  payload: GitHistoryInput,
+  success: GitHistoryResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitHistoryDiffRpc = Rpc.make(WS_METHODS.gitHistoryDiff, {
+  payload: GitHistoryDiffInput,
+  success: GitHistoryDiffResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
 const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
   payload: GitRunStackedActionInput,
   success: GitActionProgressEvent,
@@ -1405,7 +1704,10 @@ const WsVcsCreateWorktreeRpc = Rpc.make(WS_METHODS.vcsCreateWorktree, {
   // Clients cannot choose the folder: new worktrees go in the server's managed
   // worktrees folder. `path` stays a required null because older servers
   // require the key.
-  payload: Schema.Struct({ ...VcsCreateWorktreeInput.fields, path: Schema.Null }),
+  payload: Schema.Struct({
+    ...VcsCreateWorktreeInput.fields,
+    path: Schema.Null,
+  }),
   success: VcsCreateWorktreeResult,
   error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
 });
@@ -1784,6 +2086,191 @@ const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServerLifecyc
   stream: true,
 });
 
+const WsThreadHistoryListRpc = Rpc.make(WS_METHODS.threadHistoryList, {
+  payload: ThreadHistoryListInput,
+  success: ThreadHistoryListResult,
+  error: Schema.Union([ThreadHistoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsThreadHistoryDetailRpc = Rpc.make(WS_METHODS.threadHistoryDetail, {
+  payload: ThreadHistoryDetailInput,
+  success: ThreadHistoryDetailResult,
+  error: Schema.Union([ThreadHistoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsThreadHistoryRecoverRpc = Rpc.make(WS_METHODS.threadHistoryRecover, {
+  payload: ThreadHistoryRecoverInput,
+  success: ThreadHistoryRecoveryResult,
+  error: Schema.Union([ThreadHistoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsThreadHistoryRestoreFilesRpc = Rpc.make(WS_METHODS.threadHistoryRestoreFiles, {
+  payload: ThreadHistoryRestoreFilesInput,
+  success: ThreadHistoryRestoreFilesResult,
+  error: Schema.Union([ThreadHistoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsThreadHistoryFileRestoreStatusRpc = Rpc.make(WS_METHODS.threadHistoryFileRestoreStatus, {
+  payload: ThreadHistoryFileRestoreStatusInput,
+  success: ThreadHistoryFileRestoreStatusResult,
+  error: Schema.Union([ThreadHistoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsThreadHistoryReleaseRpc = Rpc.make(WS_METHODS.threadHistoryRelease, {
+  payload: ThreadHistoryArchiveIdentity,
+  success: Schema.Void,
+  error: Schema.Union([ThreadHistoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsThreadHistoryReconcileRpc = Rpc.make(WS_METHODS.threadHistoryReconcile, {
+  payload: ThreadHistoryReconcileInput,
+  success: ThreadHistoryReconcileResult,
+  error: Schema.Union([ThreadHistoryRpcError, EnvironmentAuthorizationError]),
+});
+
+const WsAssistantsMemoryReadRpc = Rpc.make(WS_METHODS.assistantsMemoryRead, {
+  payload: AssistantMemoryReadInput,
+  success: AssistantMemoryReadResult,
+  error: Schema.Union([AssistantMemoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsMemoryWriteRpc = Rpc.make(WS_METHODS.assistantsMemoryWrite, {
+  payload: AssistantMemoryWriteInput,
+  success: AssistantMemoryWriteResult,
+  error: Schema.Union([AssistantMemoryRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsRoutineReadRpc = Rpc.make(WS_METHODS.assistantsRoutineRead, {
+  payload: AssistantRoutineReadInput,
+  success: AssistantRoutineReadResult,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsRoutineWriteRpc = Rpc.make(WS_METHODS.assistantsRoutineWrite, {
+  payload: AssistantRoutineWriteInput,
+  success: AssistantRoutineWriteResult,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsActivityRpc = Rpc.make(WS_METHODS.assistantsActivity, {
+  payload: AssistantActivityListInput,
+  success: AssistantRunListResult,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsSubscribeRosterRpc = Rpc.make(WS_METHODS.assistantsSubscribeRoster, {
+  payload: AssistantListInput,
+  success: AssistantListResult,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+const WsAssistantsCreateRpc = Rpc.make(WS_METHODS.assistantsCreate, {
+  payload: AssistantCreateInput,
+  success: AssistantDetail,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsResolveThreadRpc = Rpc.make(WS_METHODS.assistantsResolveThread, {
+  payload: AssistantResolveThreadInput,
+  success: AssistantResolveThreadResult,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsGetRpc = Rpc.make(WS_METHODS.assistantsGet, {
+  payload: AssistantGetInput,
+  success: AssistantDetail,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsListRpc = Rpc.make(WS_METHODS.assistantsList, {
+  payload: AssistantListInput,
+  success: AssistantListResult,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsUpdateConfigurationRpc = Rpc.make(WS_METHODS.assistantsUpdateConfiguration, {
+  payload: AssistantUpdateConfigurationInput,
+  success: AssistantDetail,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsAssistantsLifecycleRpc = Rpc.make(WS_METHODS.assistantsLifecycle, {
+  payload: AssistantLifecycleInput,
+  success: AssistantDetail,
+  error: Schema.Union([AssistantRpcError, EnvironmentAuthorizationError]),
+});
+const WsProjectWorkIssueRpc = Rpc.make(WS_METHODS.projectWorkIssue, {
+  payload: ProjectIssueRequest,
+  success: Schema.Unknown,
+  error: Schema.Union([ProjectWorkRpcError, EnvironmentAuthorizationError]),
+});
+const WsProjectWorkDeliveryRpc = Rpc.make(WS_METHODS.projectWorkDelivery, {
+  payload: ProjectWorkDeliveryRequest,
+  success: ProjectWorkDeliveryResult,
+  error: Schema.Union([ProjectWorkRpcError, EnvironmentAuthorizationError]),
+});
+const catalogRpcError = Schema.Union([McpCatalogMutationError, EnvironmentAuthorizationError]);
+const WsMcpCatalogSessionSubscribeForThreadRpc = Rpc.make(
+  WS_METHODS.mcpCatalogSessionSubscribeForThread,
+  {
+    payload: McpCatalogSessionForThreadInput,
+    success: McpCatalogSessionForThreadResult,
+    error: catalogRpcError,
+    stream: true,
+  },
+);
+const WsMcpCatalogSessionForThreadRpc = Rpc.make(WS_METHODS.mcpCatalogSessionForThread, {
+  payload: McpCatalogSessionForThreadInput,
+  success: McpCatalogSessionForThreadResult,
+  error: catalogRpcError,
+});
+const WsMcpCatalogOAuthStatusRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthStatus, {
+  payload: McpCatalogOAuthTarget,
+  success: McpCatalogOAuthStatusResult,
+  error: catalogRpcError,
+});
+const WsMcpCatalogSecretPrepareRpc = Rpc.make(WS_METHODS.mcpCatalogSecretPrepare, {
+  payload: McpCatalogSecretPrepareInput,
+  success: McpCatalogSecretPrepareResult,
+  error: catalogRpcError,
+});
+const WsMcpCatalogReadRpc = Rpc.make(WS_METHODS.mcpCatalogRead, {
+  payload: McpCatalogReadInput,
+  success: McpCatalogReadResult,
+  error: catalogRpcError,
+});
+const WsMcpCatalogWriteRpc = Rpc.make(WS_METHODS.mcpCatalogWrite, {
+  payload: McpCatalogWriteInput,
+  success: McpCatalogReadResult,
+  error: catalogRpcError,
+});
+const WsMcpCatalogSessionGetRpc = Rpc.make(WS_METHODS.mcpCatalogSessionGet, {
+  payload: McpCatalogSessionRequest,
+  success: McpCatalogSnapshot,
+  error: catalogRpcError,
+});
+const WsMcpCatalogSessionResetRpc = Rpc.make(WS_METHODS.mcpCatalogSessionReset, {
+  payload: McpCatalogSessionMutationInput,
+  success: McpCatalogSnapshot,
+  error: catalogRpcError,
+});
+const WsMcpCatalogOAuthBeginRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthBegin, {
+  payload: McpCatalogOAuthBeginInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: catalogRpcError,
+});
+const WsMcpCatalogOAuthContinueRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthContinue, {
+  payload: McpCatalogOAuthContinueInput,
+  success: Schema.Void,
+  error: catalogRpcError,
+});
+const WsMcpCatalogOAuthDisconnectRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthDisconnect, {
+  payload: McpCatalogOAuthDisconnectInput,
+  success: Schema.Void,
+  error: catalogRpcError,
+});
+
+const WsProjectWorkReadRpc = Rpc.make(WS_METHODS.projectWorkRead, {
+  payload: ProjectWorkReadIntent,
+  success: Schema.Unknown,
+  error: Schema.Union([ProjectWorkRpcError, EnvironmentAuthorizationError]),
+});
+const WsProjectWorkWriteRpc = Rpc.make(WS_METHODS.projectWorkWrite, {
+  payload: ProjectWorkWriteIntent,
+  success: ProjectWorkWriteResult,
+  error: Schema.Union([ProjectWorkRpcError, EnvironmentAuthorizationError]),
+});
+const WsProjectWorkSubscribeRpc = Rpc.make(WS_METHODS.projectWorkSubscribe, {
+  payload: ProjectWorkStreamInput,
+  success: ProjectWorkStreamItem,
+  stream: true,
+  error: Schema.Union([ProjectWorkRpcError, EnvironmentAuthorizationError]),
+});
+
 const WsScheduledTasksListRpc = Rpc.make(WS_METHODS.scheduledTasksList, {
   payload: ScheduledTaskListInput,
   success: ScheduledTaskListResult,
@@ -1879,7 +2366,287 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
   { error: EnvironmentAuthorizationError },
 ) {}
 
+const skillRpcError = Schema.Union([SkillRpcError, EnvironmentAuthorizationError]);
+export const WsSkillsCatalogListRpc = Rpc.make(WS_METHODS.skillsCatalogList, {
+  payload: SkillCatalogListInput,
+  success: SkillCatalogListResult,
+  error: skillRpcError,
+});
+export const WsSkillsCatalogSubscribeRpc = Rpc.make(WS_METHODS.skillsCatalogSubscribe, {
+  payload: SkillCatalogListInput,
+  success: SkillCatalogChanged,
+  error: skillRpcError,
+  stream: true,
+});
+export const WsSkillsContentGetRpc = Rpc.make(WS_METHODS.skillsContentGet, {
+  payload: SkillContentGetInput,
+  success: SkillContentGetResult,
+  error: skillRpcError,
+});
+export const WsSkillsHistoryListRpc = Rpc.make(WS_METHODS.skillsHistoryList, {
+  payload: SkillHistoryListInput,
+  success: SkillHistoryListResult,
+  error: skillRpcError,
+});
+export const WsSkillsNativeContentGetRpc = Rpc.make(WS_METHODS.skillsNativeContentGet, {
+  payload: SkillNativeContentGetInput,
+  success: SkillNativeContentGetResult,
+  error: skillRpcError,
+});
+export const WsSkillsApplicationGetRpc = Rpc.make(WS_METHODS.skillsApplicationGet, {
+  payload: SkillApplicationGetInput,
+  success: SkillApplicationGetResult,
+  error: skillRpcError,
+});
+export const WsSkillsDeploymentListRpc = Rpc.make(WS_METHODS.skillsDeploymentList, {
+  payload: SkillDeploymentListInput,
+  success: SkillDeploymentListResult,
+  error: skillRpcError,
+});
+export const WsSkillsDeploymentChangeRpc = Rpc.make(WS_METHODS.skillsDeploymentChange, {
+  payload: SkillDeploymentChangeInput,
+  success: SkillDeploymentChangeResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalCreateRpc = Rpc.make(WS_METHODS.skillsGlobalCreate, {
+  payload: SkillGlobalCreateInput,
+  success: SkillGlobalCreateResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalUpdateRpc = Rpc.make(WS_METHODS.skillsGlobalUpdate, {
+  payload: SkillGlobalUpdateInput,
+  success: SkillGlobalUpdateResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalDeleteRpc = Rpc.make(WS_METHODS.skillsGlobalDelete, {
+  payload: SkillGlobalDeleteInput,
+  success: SkillGlobalDeleteResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalRenameRpc = Rpc.make(WS_METHODS.skillsGlobalRename, {
+  payload: SkillGlobalRenameInput,
+  success: SkillGlobalRenameResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalRollbackRpc = Rpc.make(WS_METHODS.skillsGlobalRollback, {
+  payload: SkillGlobalRollbackInput,
+  success: SkillGlobalRollbackResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectSetOverrideRpc = Rpc.make(WS_METHODS.skillsProjectSetOverride, {
+  payload: SkillProjectSetOverrideInput,
+  success: SkillProjectSetOverrideResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectSetDisabledRpc = Rpc.make(WS_METHODS.skillsProjectSetDisabled, {
+  payload: SkillProjectSetDisabledInput,
+  success: SkillProjectSetDisabledResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectDeleteStateRpc = Rpc.make(WS_METHODS.skillsProjectDeleteState, {
+  payload: SkillProjectDeleteStateInput,
+  success: SkillProjectDeleteStateResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectRenameRpc = Rpc.make(WS_METHODS.skillsProjectRename, {
+  payload: SkillProjectRenameInput,
+  success: SkillProjectRenameResult,
+  error: skillRpcError,
+});
+export const WsSkillsSessionSetEnabledRpc = Rpc.make(WS_METHODS.skillsSessionSetEnabled, {
+  payload: SkillSessionSetEnabledInput,
+  success: SkillSessionSetEnabledResult,
+  error: skillRpcError,
+});
+export const WsSkillsSessionResetRpc = Rpc.make(WS_METHODS.skillsSessionReset, {
+  payload: SkillSessionResetInput,
+  success: SkillSessionResetResult,
+  error: skillRpcError,
+});
+export const WsSkillsNativeImportRpc = Rpc.make(WS_METHODS.skillsNativeImport, {
+  payload: SkillNativeImportInput,
+  success: SkillNativeImportResult,
+  error: skillRpcError,
+});
+
+const managedTextResourceRpcError = Schema.Union([
+  ManagedTextResourceRpcError,
+  EnvironmentAuthorizationError,
+]);
+export const WsManagedTextResourcesCatalogListRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesCatalogList,
+  {
+    payload: ManagedTextResourceCatalogListInput,
+    success: ManagedTextResourceCatalogListResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesCatalogSubscribeRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesCatalogSubscribe,
+  {
+    payload: ManagedTextResourceCatalogListInput,
+    success: ManagedTextResourceChanged,
+    error: managedTextResourceRpcError,
+    stream: true,
+  },
+);
+export const WsManagedTextResourcesContentGetRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesContentGet,
+  {
+    payload: ManagedTextResourceContentGetInput,
+    success: ManagedTextResourceContentGetResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentCreateRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentCreate,
+  {
+    payload: ManagedTextResourceEnvironmentCreateInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentUpdateRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentUpdate,
+  {
+    payload: ManagedTextResourceEnvironmentUpdateInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentDeleteRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentDelete,
+  {
+    payload: ManagedTextResourceEnvironmentDeleteInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentSetEnabledRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentSetEnabled,
+  {
+    payload: ManagedTextResourceEnvironmentSetEnabledInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesProjectSetOverrideRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesProjectSetOverride,
+  {
+    payload: ManagedTextResourceProjectSetOverrideInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesProjectSetDisabledRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesProjectSetDisabled,
+  {
+    payload: ManagedTextResourceProjectSetDisabledInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesProjectDeleteStateRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesProjectDeleteState,
+  {
+    payload: ManagedTextResourceProjectDeleteStateInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesThreadSetEnabledRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesThreadSetEnabled,
+  {
+    payload: ManagedTextResourceThreadSetEnabledInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesThreadResetRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesThreadReset,
+  {
+    payload: ManagedTextResourceThreadResetInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+
+const projectTerminalRpcError = Schema.Union([TerminalToolError, EnvironmentAuthorizationError]);
+export const WsProjectTerminalAttachRpc = Rpc.make(WS_METHODS.projectTerminalAttach, {
+  payload: ProjectTerminalHandle,
+  success: ProjectTerminalAttachStreamEvent,
+  error: projectTerminalRpcError,
+  stream: true,
+});
+export const WsProjectTerminalMetadataRpc = Rpc.make(WS_METHODS.projectTerminalMetadata, {
+  payload: ProjectTerminalDockListInput.fields.projectId,
+  success: ProjectTerminalMetadataStreamEvent,
+  error: projectTerminalRpcError,
+  stream: true,
+});
+export const WsProjectTerminalListRpc = Rpc.make(WS_METHODS.projectTerminalList, {
+  payload: ProjectTerminalDockListInput,
+  success: ProjectTerminalDockListResult,
+  error: projectTerminalRpcError,
+});
+export const WsProjectTerminalWriteRpc = Rpc.make(WS_METHODS.projectTerminalWrite, {
+  payload: ProjectTerminalWriteInput,
+  success: Schema.Void,
+  error: projectTerminalRpcError,
+});
+export const WsProjectTerminalResizeRpc = Rpc.make(WS_METHODS.projectTerminalResize, {
+  payload: ProjectTerminalResizeInput,
+  success: Schema.Void,
+  error: projectTerminalRpcError,
+});
+export const WsProjectTerminalKillRpc = Rpc.make(WS_METHODS.projectTerminalKill, {
+  payload: ProjectTerminalKillInput,
+  success: ProjectTerminalStopResult,
+  error: projectTerminalRpcError,
+});
+
 export const WsRpcGroup = RpcGroup.make(
+  WsIssuesSearchRpc,
+  WsProjectTerminalAttachRpc,
+  WsProjectTerminalMetadataRpc,
+  WsProjectTerminalListRpc,
+  WsProjectTerminalWriteRpc,
+  WsProjectTerminalResizeRpc,
+  WsProjectTerminalKillRpc,
+
+  WsSkillsCatalogListRpc,
+  WsSkillsCatalogSubscribeRpc,
+  WsSkillsContentGetRpc,
+  WsSkillsHistoryListRpc,
+  WsSkillsNativeContentGetRpc,
+  WsSkillsApplicationGetRpc,
+  WsSkillsDeploymentListRpc,
+  WsSkillsDeploymentChangeRpc,
+  WsSkillsGlobalCreateRpc,
+  WsSkillsGlobalUpdateRpc,
+  WsSkillsGlobalDeleteRpc,
+  WsSkillsGlobalRenameRpc,
+  WsSkillsGlobalRollbackRpc,
+  WsSkillsProjectSetOverrideRpc,
+  WsSkillsProjectSetDisabledRpc,
+  WsSkillsProjectDeleteStateRpc,
+  WsSkillsProjectRenameRpc,
+  WsSkillsSessionSetEnabledRpc,
+  WsSkillsSessionResetRpc,
+  WsSkillsNativeImportRpc,
+  WsManagedTextResourcesCatalogListRpc,
+  WsManagedTextResourcesCatalogSubscribeRpc,
+  WsManagedTextResourcesContentGetRpc,
+  WsManagedTextResourcesEnvironmentCreateRpc,
+  WsManagedTextResourcesEnvironmentUpdateRpc,
+  WsManagedTextResourcesEnvironmentDeleteRpc,
+  WsManagedTextResourcesEnvironmentSetEnabledRpc,
+  WsManagedTextResourcesProjectSetOverrideRpc,
+  WsManagedTextResourcesProjectSetDisabledRpc,
+  WsManagedTextResourcesProjectDeleteStateRpc,
+  WsManagedTextResourcesThreadSetEnabledRpc,
+  WsManagedTextResourcesThreadResetRpc,
+
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -1909,6 +2676,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetDatabaseStorageRpc,
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,
+  WsServerTestExternalNotificationRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerSearchAcpRegistryRpc,
   WsServerPrepareAcpRegistryAgentRpc,
@@ -1931,6 +2699,41 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetUsageSummaryRpc,
   WsServerRefreshUsageRatesRpc,
   WsServerSignalProcessRpc,
+  WsThreadHistoryListRpc,
+  WsThreadHistoryDetailRpc,
+  WsThreadHistoryRecoverRpc,
+  WsThreadHistoryRestoreFilesRpc,
+  WsThreadHistoryFileRestoreStatusRpc,
+  WsThreadHistoryReleaseRpc,
+  WsThreadHistoryReconcileRpc,
+  WsAssistantsMemoryReadRpc,
+  WsAssistantsMemoryWriteRpc,
+  WsAssistantsRoutineReadRpc,
+  WsAssistantsRoutineWriteRpc,
+  WsAssistantsActivityRpc,
+  WsAssistantsSubscribeRosterRpc,
+  WsAssistantsCreateRpc,
+  WsAssistantsGetRpc,
+  WsAssistantsResolveThreadRpc,
+  WsAssistantsListRpc,
+  WsAssistantsUpdateConfigurationRpc,
+  WsAssistantsLifecycleRpc,
+  WsProjectWorkIssueRpc,
+  WsProjectWorkDeliveryRpc,
+  WsMcpCatalogSessionSubscribeForThreadRpc,
+  WsMcpCatalogSessionForThreadRpc,
+  WsMcpCatalogOAuthStatusRpc,
+  WsMcpCatalogSecretPrepareRpc,
+  WsMcpCatalogReadRpc,
+  WsMcpCatalogWriteRpc,
+  WsMcpCatalogSessionGetRpc,
+  WsMcpCatalogSessionResetRpc,
+  WsMcpCatalogOAuthBeginRpc,
+  WsMcpCatalogOAuthContinueRpc,
+  WsMcpCatalogOAuthDisconnectRpc,
+  WsProjectWorkReadRpc,
+  WsProjectWorkWriteRpc,
+  WsProjectWorkSubscribeRpc,
   WsScheduledTasksListRpc,
   WsScheduledTasksSubscribeRpc,
   WsScheduledTasksUpsertRpc,
@@ -2014,6 +2817,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorktreeSetupCancelRpc,
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
+  WsGitDiscoverRepositoriesRpc,
+  WsGitIndexStatusRpc,
+  WsGitMutateIndexRpc,
+  WsGitCommitStagedRpc,
+  WsGitHistoryRpc,
+  WsGitHistoryDiffRpc,
   WsGitRunStackedActionRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,

@@ -21,6 +21,7 @@ import {
 } from "./catalog.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import {
+  ConnectionBlockedError,
   ConnectionTransientError,
   PrimaryConnectionTarget,
   SshConnectionTarget,
@@ -60,6 +61,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeBearer"];
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly primaryBearerToken?: string;
+  readonly primaryBearerTokenForTarget?: ClientCapabilities.PrimaryEnvironmentAuth["Service"]["bearerTokenForTarget"];
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
   readonly descriptorProtocolVersion?: number | null | undefined;
 }) => {
@@ -151,6 +153,9 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
       ClientCapabilities.PrimaryEnvironmentAuth,
       ClientCapabilities.PrimaryEnvironmentAuth.of({
         bearerToken: Effect.succeed(Option.fromNullishOr(options?.primaryBearerToken)),
+        ...(options?.primaryBearerTokenForTarget === undefined
+          ? {}
+          : { bearerTokenForTarget: options.primaryBearerTokenForTarget }),
       }),
     ),
     Layer.succeed(
@@ -167,6 +172,64 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
 });
 
 describe("ConnectionResolver", () => {
+  it.effect(
+    "pins primary credentials to the requested socket when the registered endpoint changes",
+    () =>
+      Effect.gen(function* () {
+        const requestedTargets: ClientCapabilities.PrimaryEnvironmentCredentialTarget[] = [];
+        const credentialReads: string[] = [];
+        const targetA = new PrimaryConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "A",
+          httpBaseUrl: "https://a.example.test",
+          wsBaseUrl: "wss://a.example.test/nested/ws",
+        });
+        const targetB = new PrimaryConnectionTarget({
+          environmentId: ENVIRONMENT_ID,
+          label: "B",
+          httpBaseUrl: "https://b.example.test",
+          wsBaseUrl: "wss://b.example.test/ws",
+        });
+        const registeredTarget = yield* Ref.make(targetA);
+        const layerBroker = yield* makeDependencies({
+          primaryBearerToken: "must-not-fall-back",
+          primaryBearerTokenForTarget: (requested) =>
+            Effect.gen(function* () {
+              requestedTargets.push(requested);
+              const registered = yield* Ref.get(registeredTarget);
+              if (new URL(requested.socketUrl).host !== new URL(registered.wsBaseUrl).host) {
+                return yield* new ConnectionBlockedError({
+                  reason: "configuration",
+                  detail: "Attached credential target changed.",
+                });
+              }
+              credentialReads.push(requested.socketUrl);
+              return Option.none<string>();
+            }),
+          authorizeBearer: () =>
+            Effect.die("rejected target must not fall back to ordinary credentials"),
+        });
+        const broker = yield* ConnectionResolver.ConnectionResolver.pipe(
+          Effect.provide(layerBroker),
+        );
+        yield* Ref.set(registeredTarget, targetB);
+        const error = yield* broker.prepare(catalogEntry(targetA)).pipe(Effect.flip);
+        expect(error).toMatchObject({ reason: "configuration" });
+        expect(requestedTargets[0]).toEqual({
+          environmentId: ENVIRONMENT_ID,
+          httpBaseUrl: targetA.httpBaseUrl,
+          socketUrl:
+            "wss://a.example.test/nested/ws?clientSurface=web&clientDeviceType=desktop&connectionMethod=direct",
+        });
+        expect(credentialReads).toEqual([]);
+        const prepared = yield* broker.prepare(catalogEntry(targetB));
+        expect(requestedTargets[1]?.httpBaseUrl).toBe(targetB.httpBaseUrl);
+        expect(credentialReads).toHaveLength(1);
+        expect(prepared.socketUrl).toContain("wss://b.example.test/ws?");
+        expect(prepared.target).toBe(targetB);
+      }),
+  );
+
   it.effect("blocks an old host during discovery before opening orchestration RPC", () =>
     Effect.gen(function* () {
       const layerBroker = yield* makeDependencies({ descriptorProtocolVersion: null });
@@ -182,6 +245,39 @@ describe("ConnectionResolver", () => {
 
       expect(error).toMatchObject({ reason: "unsupported" });
       expect(error.message).toContain("Update T3 Code on Compatible environment");
+    }),
+  );
+
+  it.effect("keeps effect-only primary credential providers compatible", () =>
+    Effect.gen(function* () {
+      const authorized: string[] = [];
+      const layerBroker = yield* makeDependencies({
+        primaryBearerToken: "ordinary-primary-token",
+        authorizeBearer: (input) =>
+          Effect.sync(() => {
+            authorized.push(input.bearerToken);
+            return {
+              environmentId: input.expectedEnvironmentId,
+              label: "Ordinary primary",
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: `${input.wsBaseUrl}/ws?wsTicket=ordinary`,
+              httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            };
+          }),
+      });
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(layerBroker));
+      const target = new PrimaryConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Primary",
+        ...ENDPOINT,
+      });
+      const prepared = yield* broker.prepare(catalogEntry(target));
+      expect(authorized).toEqual(["ordinary-primary-token"]);
+      expect(prepared.httpAuthorization).toEqual({
+        _tag: "Bearer",
+        token: "ordinary-primary-token",
+      });
+      expect(prepared.target).toBe(target);
     }),
   );
 

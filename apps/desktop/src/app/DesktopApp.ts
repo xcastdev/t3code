@@ -18,6 +18,7 @@ import * as DesktopClerk from "./DesktopClerk.ts";
 import * as DesktopApplicationMenu from "../window/DesktopApplicationMenu.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 import * as PreviewPasskeys from "../preview/Passkeys.ts";
+import * as DesktopAttachedBackend from "../backend/DesktopAttachedBackend.ts";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopLegacyLocalStorage from "./DesktopLegacyLocalStorage.ts";
@@ -194,6 +195,12 @@ const bootstrap = Effect.gen(function* () {
     return;
   }
 
+  const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+  if ((yield* attached.getState).mode !== "managed") {
+    // Keep Settings available for recovery without acquiring ownership of an external server.
+    yield* desktopWindow.createMain;
+    return;
+  }
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
   const primaryBackend = yield* pool.primary;
   const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;

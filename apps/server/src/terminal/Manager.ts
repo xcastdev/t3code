@@ -1,3 +1,8 @@
+import {
+  makeProjectTerminalManager,
+  type ProjectTerminalManagerMethods,
+} from "./ProjectTerminalManager.ts";
+import { makeSqlPersistence, type ProjectTerminalPersistence } from "./ProjectTerminalStore.ts";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto digest is effectful; a sync hash keeps historyPath a plain function.
 import * as NodeCrypto from "node:crypto";
 
@@ -17,6 +22,7 @@ import {
   TerminalResizeError,
   TerminalSessionLookupError,
   TerminalWriteError,
+  type ProjectTerminalCreateInput,
   type TerminalAttachInput,
   type TerminalAttachStreamEvent,
   type TerminalClearInput,
@@ -158,12 +164,44 @@ class TerminalProcessSignalError extends Schema.TaggedError<TerminalProcessSigna
   }
 }
 
+export class TerminalDrainError extends Schema.TaggedError<TerminalDrainError>()(
+  "TerminalDrainError",
+  {
+    threadId: Schema.String,
+    terminalId: Schema.String,
+    reason: Schema.Literals([
+      "missing-proof",
+      "ownership-mismatch",
+      "signal-failed",
+      "owned-processes-uncertain",
+    ]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Could not prove terminal ${this.terminalId} drained (${this.reason})`;
+  }
+}
+
+export interface TerminalDrainHandle {
+  readonly threadId: string;
+  readonly terminalId: string;
+}
+
 export class TerminalManager extends Context.Service<
   TerminalManager,
-  {
+  ProjectTerminalManagerMethods & {
     readonly open: (
       input: TerminalOpenInput,
     ) => Effect.Effect<TerminalSessionSnapshot, TerminalError>;
+
+    readonly openCaptured: (input: TerminalOpenInput) => Effect.Effect<
+      {
+        snapshot: TerminalSessionSnapshot;
+        capture: TerminalDrainHandle;
+      },
+      TerminalError | TerminalDrainError
+    >;
 
     readonly attachStream: (
       input: TerminalAttachInput,
@@ -185,6 +223,12 @@ export class TerminalManager extends Context.Service<
 
     readonly write: (input: TerminalWriteInput) => Effect.Effect<void, TerminalError>;
 
+    readonly writeCaptured: (
+      input: TerminalWriteInput & {
+        readonly capture: TerminalDrainHandle;
+      },
+    ) => Effect.Effect<void, TerminalError | TerminalDrainError>;
+
     readonly resize: (input: TerminalResizeInput) => Effect.Effect<void, TerminalError>;
 
     readonly clear: (input: TerminalClearInput) => Effect.Effect<void, TerminalError>;
@@ -200,6 +244,18 @@ export class TerminalManager extends Context.Service<
      * When `terminalId` is omitted, closes all sessions for the thread.
      */
     readonly close: (input: TerminalCloseInput) => Effect.Effect<void, TerminalError>;
+
+    readonly captureDrain: (input: {
+      readonly threadId: string;
+      readonly terminalId: string;
+    }) => Effect.Effect<TerminalDrainHandle, TerminalDrainError>;
+
+    readonly closeAndDrain: (input: {
+      readonly threadId: string;
+      readonly terminalId: string;
+      readonly deleteHistory?: boolean;
+      readonly capture?: TerminalDrainHandle;
+    }) => Effect.Effect<void, TerminalError | TerminalDrainError>;
 
     readonly closeIdle: (input: {
       readonly threadId: string;
@@ -1394,6 +1450,7 @@ function normalizedRuntimeEnv(
 
 interface TerminalManagerOptions {
   logsDir: string;
+  projectPersistence?: ProjectTerminalPersistence;
   historyLineLimit?: number;
   historyByteLimit?: number;
   ptyAdapter: PtyAdapter.PtyAdapter["Service"];
@@ -1472,6 +1529,7 @@ export const resolveProviderInstanceTerminalEnvironment = Effect.fn(
 export const make = Effect.fn("TerminalManager.make")(function* () {
   const { terminalLogsDir, providerStatusCacheDir, baseDir } = yield* ServerConfig.ServerConfig;
   const ptyAdapter = yield* PtyAdapter.PtyAdapter;
+  const projectPersistence = yield* makeSqlPersistence();
   const portDiscovery = yield* PortScanner.PortDiscovery;
   const nativeTelemetry = yield* NativeTelemetryClient.NativeTelemetryClient;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -1488,6 +1546,7 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
   );
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,
+    projectPersistence,
     ptyAdapter,
     processTable: nativeTelemetry.processTable.pipe(
       Effect.mapError(
@@ -1510,6 +1569,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
 
+  const sessionProcesses = new WeakMap<TerminalSessionState, PtyAdapter.PtyProcess>();
   const logsDir = options.logsDir;
   const historyLineLimit = options.historyLineLimit ?? DEFAULT_HISTORY_LINE_LIMIT;
   const historyByteLimit = options.historyByteLimit ?? DEFAULT_HISTORY_BYTE_LIMIT;
@@ -1698,38 +1758,53 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     process: PtyAdapter.PtyProcess,
     threadId: string,
     terminalId: string,
+    drainProof?: Deferred.Deferred<void>,
   ) {
     // Subscribe before SIGTERM so an immediate exit is not missed. Released with
     // Effect.ensuring because a JS `finally` does not run when the fiber is interrupted.
-    const exited = Deferred.makeUnsafe<void>();
+    const exited = drainProof ?? Deferred.makeUnsafe<void>();
     const unsubscribeExit = process.onExit(() => {
       Deferred.doneUnsafe(exited, Effect.void);
     });
     yield* Effect.gen(function* () {
-      const terminated = yield* Effect.try({
-        try: () => process.kill("SIGTERM"),
-        catch: (cause) =>
-          new TerminalProcessSignalError({
-            cause,
-            signal: "SIGTERM",
-            terminalPid: process.pid,
-          }),
-      }).pipe(
+      const signalProcess = Effect.fn("terminal.signalProcess")(function* (
+        signal: "SIGTERM" | "SIGKILL",
+      ) {
+        if (drainProof) {
+          yield* (
+            process.signalOwned?.(signal) ??
+              Effect.fail(new PtyAdapter.PtyDrainError({ reason: "unsupported" }))
+          );
+          return;
+        }
+        yield* Effect.try({
+          try: () => process.kill(signal),
+          catch: (cause) =>
+            new TerminalProcessSignalError({ cause, signal, terminalPid: process.pid }),
+        });
+      });
+      const terminated = yield* signalProcess("SIGTERM").pipe(
         Effect.as(true),
         Effect.catch((error) =>
-          Effect.logWarning("failed to kill terminal process", {
-            threadId,
-            terminalId,
-            signal: "SIGTERM",
-            cause: error,
-          }).pipe(Effect.as(false)),
+          drainProof
+            ? Effect.fail(error)
+            : Effect.logWarning("failed to kill terminal process", {
+                threadId,
+                terminalId,
+                signal: "SIGTERM",
+                cause: error,
+              }).pipe(Effect.as(false)),
         ),
       );
       if (!terminated) {
         return;
       }
 
-      const exitedBeforeGrace = yield* Deferred.await(exited).pipe(
+      const exitProof = drainProof
+        ? (process.awaitOwnedExit ??
+          Effect.fail(new PtyAdapter.PtyDrainError({ reason: "unsupported" })))
+        : Deferred.await(exited);
+      const exitedBeforeGrace = yield* exitProof.pipe(
         Effect.as(true),
         Effect.timeoutOrElse({
           duration: processKillGraceMs,
@@ -1737,27 +1812,26 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         }),
       );
       if (exitedBeforeGrace) {
+        if (drainProof) yield* Deferred.await(exited);
         return;
       }
 
-      yield* Effect.try({
-        try: () => process.kill("SIGKILL"),
-        catch: (cause) =>
-          new TerminalProcessSignalError({
-            cause,
-            signal: "SIGKILL",
-            terminalPid: process.pid,
-          }),
-      }).pipe(
+      yield* signalProcess("SIGKILL").pipe(
         Effect.catch((error) =>
-          Effect.logWarning("failed to force-kill terminal process", {
-            threadId,
-            terminalId,
-            signal: "SIGKILL",
-            cause: error,
-          }),
+          drainProof
+            ? Effect.fail(error)
+            : Effect.logWarning("failed to force-kill terminal process", {
+                threadId,
+                terminalId,
+                signal: "SIGKILL",
+                cause: error,
+              }),
         ),
       );
+      if (drainProof) {
+        yield* exitProof;
+        yield* Deferred.await(exited);
+      }
     }).pipe(Effect.ensuring(Effect.sync(unsubscribeExit)));
   });
 
@@ -1777,6 +1851,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           return [undefined, { ...state, killFibers }] as const;
         }),
       ),
+      Effect.ignoreCause({ log: true }),
       Effect.forkIn(workerScope),
     );
 
@@ -2189,7 +2264,10 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
   });
 
-  const stopProcess = Effect.fn("terminal.stopProcess")(function* (session: TerminalSessionState) {
+  const stopProcess = Effect.fn("terminal.stopProcess")(function* (
+    session: TerminalSessionState,
+    skipKill = false,
+  ) {
     const process = session.process;
     if (!process) return;
 
@@ -2214,7 +2292,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       threadId: session.threadId,
       terminalId: session.terminalId,
     });
-    yield* startKillEscalation(process, session.threadId, session.terminalId);
+    if (!skipKill) yield* startKillEscalation(process, session.threadId, session.terminalId);
     yield* evictInactiveSessionsIfNeeded();
   });
 
@@ -2372,6 +2450,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             };
             yield* modifyManagerState((state) => {
               session.process = ptyProcess;
+              sessionProcesses.set(session, spawnResult.process);
               session.pid = processPid;
               session.status = "running";
               // onExit may replay an exit immediately; accept it before subscribing.
@@ -2457,13 +2536,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     threadId: string,
     terminalId: string,
     deleteHistoryOnClose: boolean,
+    skipKill = false,
   ) {
     const key = toSessionKey(threadId, terminalId);
     const session = yield* getSession(threadId, terminalId);
     const closedEventSequence = Option.isSome(session) ? session.value.eventSequence + 1 : 0;
 
     if (Option.isSome(session)) {
-      yield* stopProcess(session.value);
+      yield* stopProcess(session.value, skipKill);
       yield* unregisterTerminal({ threadId, terminalId });
       yield* persistHistory(threadId, terminalId, session.value.history);
     }
@@ -3323,6 +3403,193 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       }),
     );
 
+  const drainHandles = new WeakMap<
+    TerminalDrainHandle,
+    {
+      session: TerminalSessionState;
+      process: PtyAdapter.PtyProcess | null;
+      exited: Deferred.Deferred<void>;
+      unsubscribe: () => void;
+    }
+  >();
+
+  const captureDrainLocked = Effect.fn("terminal.captureDrainLocked")(function* (input: {
+    readonly threadId: string;
+    readonly terminalId: string;
+  }) {
+    const found = yield* getSession(input.threadId, input.terminalId);
+    if (
+      Option.isNone(found) ||
+      (!found.value.process && !(found.value.status === "exited" && found.value.exitCode !== null))
+    ) {
+      return yield* new TerminalDrainError({ ...input, reason: "missing-proof" });
+    }
+    const session = found.value;
+    const process = session.process;
+    const exited = Deferred.makeUnsafe<void>();
+    let unsubscribe = () => {};
+    if (process) {
+      unsubscribe = process.onExit(() => {
+        Deferred.doneUnsafe(exited, Effect.void);
+        unsubscribe();
+      });
+    }
+    // Only the native exit event sets exitCode on an exited session.
+    if (!process) Deferred.doneUnsafe(exited, Effect.void);
+    const handle: TerminalDrainHandle = { ...input };
+    drainHandles.set(handle, {
+      session,
+      process: process ?? sessionProcesses.get(session) ?? null,
+      exited,
+      unsubscribe,
+    });
+    return handle;
+  });
+
+  const captureDrain: TerminalManager["Service"]["captureDrain"] = (input) =>
+    withThreadLock(input.threadId, captureDrainLocked(input));
+
+  const openCaptured: TerminalManager["Service"]["openCaptured"] = Effect.fn(
+    "terminal.openCaptured",
+  )(function* (input) {
+    return yield* withThreadLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const resolved = yield* resolveLaunchInputEnvironment(input);
+        const snapshot = yield* openLocked(resolved);
+        const capture = yield* captureDrainLocked(input);
+        return { snapshot, capture };
+      }),
+    );
+  });
+
+  const writeCaptured: TerminalManager["Service"]["writeCaptured"] = Effect.fn(
+    "terminal.writeCaptured",
+  )(function* (input) {
+    return yield* withThreadLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const captured = drainHandles.get(input.capture);
+        const current = yield* getSession(input.threadId, input.terminalId);
+        if (
+          !captured ||
+          input.capture.threadId !== input.threadId ||
+          input.capture.terminalId !== input.terminalId ||
+          Option.isNone(current) ||
+          current.value !== captured.session ||
+          current.value.process !== captured.process ||
+          sessionProcesses.get(current.value) !== captured.process
+        ) {
+          return yield* new TerminalDrainError({
+            threadId: input.threadId,
+            terminalId: input.terminalId,
+            reason: "ownership-mismatch",
+          });
+        }
+        if (!captured.process || current.value.status !== "running") {
+          return yield* new TerminalDrainError({
+            threadId: input.threadId,
+            terminalId: input.terminalId,
+            reason: "missing-proof",
+          });
+        }
+        yield* write(input);
+      }),
+    );
+  });
+
+  const closeAndDrain: TerminalManager["Service"]["closeAndDrain"] = Effect.fn(
+    "terminal.closeAndDrain",
+  )(function* (input) {
+    const handle = input.capture ?? (yield* captureDrain(input));
+    const captured = drainHandles.get(handle);
+    if (!captured || handle.threadId !== input.threadId || handle.terminalId !== input.terminalId) {
+      return yield* new TerminalDrainError({
+        threadId: input.threadId,
+        terminalId: input.terminalId,
+        reason: "ownership-mismatch",
+      });
+    }
+    yield* Effect.gen(function* () {
+      yield* withThreadLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const current = yield* getSession(input.threadId, input.terminalId);
+          // Restart reuses the session object, so process identity is also required.
+          if (
+            Option.isSome(current) &&
+            current.value === captured.session &&
+            sessionProcesses.get(current.value) === captured.process
+          ) {
+            yield* closeSession(
+              input.threadId,
+              input.terminalId,
+              input.deleteHistory === true,
+              true,
+            );
+          }
+        }),
+      );
+      if (yield* Deferred.isDone(captured.exited)) {
+        yield* (
+          captured.process?.awaitOwnedExit ??
+          Effect.fail(new PtyAdapter.PtyDrainError({ reason: "unsupported" }))
+        ).pipe(
+          Effect.mapError(
+            (cause) =>
+              new TerminalDrainError({
+                threadId: input.threadId,
+                terminalId: input.terminalId,
+                reason: "owned-processes-uncertain",
+                cause,
+              }),
+          ),
+        );
+        return;
+      }
+      if (!captured.process) {
+        return yield* new TerminalDrainError({
+          threadId: input.threadId,
+          terminalId: input.terminalId,
+          reason: "missing-proof",
+        });
+      }
+      yield* clearKillFiber(captured.process);
+      if (!captured.process.signalOwned || !captured.process.awaitOwnedExit) {
+        yield* startKillEscalation(captured.process, input.threadId, input.terminalId);
+        return yield* new TerminalDrainError({
+          threadId: input.threadId,
+          terminalId: input.terminalId,
+          reason: "owned-processes-uncertain",
+          cause: new PtyAdapter.PtyDrainError({ reason: "unsupported" }),
+        });
+      }
+      yield* runKillEscalation(
+        captured.process,
+        input.threadId,
+        input.terminalId,
+        captured.exited,
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new TerminalDrainError({
+              threadId: input.threadId,
+              terminalId: input.terminalId,
+              reason:
+                cause._tag === "PtyDrainError" ? "owned-processes-uncertain" : "signal-failed",
+              cause,
+            }),
+        ),
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.gen(function* () {
+          if (yield* Deferred.isDone(captured.exited)) captured.unsubscribe();
+        }),
+      ),
+    );
+  });
+
   const closeIdle: TerminalManager["Service"]["closeIdle"] = (input) =>
     withThreadLock(
       input.threadId,
@@ -3363,16 +3630,45 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       ),
     );
 
+  const projectHome = yield* HostProcess.HomeDirectory;
+  const projectMethods = yield* makeProjectTerminalManager({
+    ptyAdapter: options.ptyAdapter,
+    ...(options.projectPersistence ? { persistence: options.projectPersistence } : {}),
+    shell: shellResolver,
+    environment: Effect.fn("terminal.projectEnvironment")(function* (
+      input: ProjectTerminalCreateInput,
+    ) {
+      const runtimeEnv =
+        input.providerInstanceId && options.resolveProviderInstanceEnvironment
+          ? yield* options.resolveProviderInstanceEnvironment(
+              input.providerInstanceId,
+              input.env ? { ...input.env } : undefined,
+            )
+          : input.env;
+      return createTerminalSpawnEnv(
+        baseEnv,
+        runtimeEnv ? { ...runtimeEnv } : undefined,
+        platform,
+        projectHome,
+      );
+    }),
+  });
+
   return TerminalManager.of({
+    ...projectMethods,
     open,
+    openCaptured,
     attachStream,
     observeStream,
     resyncStream,
     write,
+    writeCaptured,
     resize,
     clear,
     restart,
     close,
+    captureDrain,
+    closeAndDrain,
     closeIdle,
     subscribe,
     subscribeMetadata,

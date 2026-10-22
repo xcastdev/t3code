@@ -1,3 +1,4 @@
+import { skillInstallTargets } from "@t3tools/provider-core/server/driver";
 import { CodexSettings, ProviderDriverKind } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -348,6 +349,14 @@ export const CodexDriver: ProviderDriver<
     return {
       instanceId,
       driverKind: DRIVER_KIND,
+      resolveSkillInstallTargets: (projectRoot?: string) =>
+        Effect.succeed(
+          skillInstallTargets({
+            driverKind: DRIVER_KIND,
+            environment: processEnv,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
+        ),
       continuationIdentity,
       displayName,
       accentColor,

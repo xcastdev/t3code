@@ -12,13 +12,14 @@ import { cn } from "../../lib/cn";
 import { useEnvironmentServerConfig, useProject, useThreadShell } from "../../state/entities";
 import { subagentCardDetail } from "./subagent-card-presentation";
 import { SUBAGENT_TONE_TEXT_CLASS, SubagentStatusDot } from "./SubagentStatusDot";
-import { resolveSubagentRowPresentation } from "./threadAgentsPresentation";
+import { resolveSubagentRowPresentation, subagentEffortText } from "./threadAgentsPresentation";
 
 type SubagentRowSubagent = Pick<
   OrchestrationV2Subagent,
   | "threadId"
   | "childThreadId"
   | "model"
+  | "modelSelection"
   | "driver"
   | "providerInstanceId"
   | "title"
@@ -121,7 +122,7 @@ function SubagentMetadata(props: {
       />
       <Text className="min-w-0 shrink text-xs text-foreground-muted" numberOfLines={1}>
         {provider ? `${resolveProviderInstanceDisplayName(provider)} · ` : ""}
-        {modelLabel}
+        {modelLabel} · {subagentEffortText(subagent)}
       </Text>
       {workspace.map(({ label, value }) => (
         // The row reads this label in place of the icon. collapsable keeps the

@@ -1,3 +1,4 @@
+import { skillInstallTargets } from "@t3tools/provider-core/server/driver";
 import { ProviderDriverKind, TextGenerationError, type CodexSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -36,11 +37,12 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const host = yield* ProviderHost.ProviderHost;
+  const processEnv = yield* mergeProviderInstanceEnvironment(input.environment);
   const runtime = yield* makeCodexManagedRuntime({
     instanceId,
     enabled,
     config,
-    environment: yield* mergeProviderInstanceEnvironment(input.environment),
+    environment: processEnv,
   });
   const continuationIdentity = codexContinuationIdentity(runtime.homeLayout);
   const stamp = withInstanceIdentity({
@@ -259,6 +261,8 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
       ),
     );
   const textGeneration: ProviderInstance["textGeneration"] = {
+    extractMemoryFacts: (value) =>
+      protect("extractMemoryFacts", nativeGeneration.extractMemoryFacts(value)),
     generateCommitMessage: (value) =>
       protect("generateCommitMessage", nativeGeneration.generateCommitMessage(value)),
     generatePrContent: (value) =>
@@ -273,6 +277,14 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
   return {
     instanceId,
     driverKind: DRIVER,
+    resolveSkillInstallTargets: (projectRoot?: string) =>
+      Effect.succeed(
+        skillInstallTargets({
+          driverKind: DRIVER,
+          environment: processEnv,
+          ...(projectRoot ? { projectRoot } : {}),
+        }),
+      ),
     continuationIdentity,
     displayName,
     accentColor,

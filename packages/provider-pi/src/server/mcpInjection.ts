@@ -6,8 +6,10 @@ import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcp
 import {
   PI_T3_MCP_EXTENSION_FILENAME,
   PI_T3_MCP_EXTENSION_SOURCE,
+  T3_PI_INSTRUCTIONS_ENV,
   T3_MCP_BEARER_ENV,
   T3_MCP_URL_ENV,
+  T3_MCP_CATALOG_CONFIG_ENV,
   T3_PI_RUNTIME_MODE_ENV,
   T3_PI_MCP_EXTENSION_PATH_ENV,
 } from "./mcpExtensionSource.ts";
@@ -241,6 +243,7 @@ export const materializePiT3McpExtension = Effect.fn("materializePiT3McpExtensio
 });
 
 export function buildPiRpcLaunch(input: {
+  readonly instructionSnapshot?: import("@t3tools/contracts").OrchestrationV2InstructionSnapshot;
   readonly launchArgs: ReadonlyArray<string>;
   readonly environment: NodeJS.ProcessEnv;
   readonly mcpSession: McpProviderSessionConfig | undefined;
@@ -287,7 +290,9 @@ export function buildPiRpcLaunch(input: {
   const environment = { ...input.environment };
   // These values belong to the current T3 session. Never let a Pi child reuse
   // credentials inherited from the server or a parent provider process.
+  delete environment[T3_PI_INSTRUCTIONS_ENV];
   delete environment[T3_MCP_URL_ENV];
+  delete environment[T3_MCP_CATALOG_CONFIG_ENV];
   delete environment[T3_MCP_BEARER_ENV];
   delete environment[T3_PI_MCP_EXTENSION_PATH_ENV];
 
@@ -295,6 +300,16 @@ export function buildPiRpcLaunch(input: {
     args,
     env: {
       ...environment,
+      ...(hasT3Extension && input.instructionSnapshot !== undefined
+        ? {
+            [T3_PI_INSTRUCTIONS_ENV]: JSON.stringify({
+              configurationHash: input.instructionSnapshot.configurationHash,
+              resourceRevision: input.instructionSnapshot.resourceRevision,
+              memoryEpoch: input.instructionSnapshot.memoryEpoch,
+              roleInstructions: input.instructionSnapshot.roleInstructions,
+            }),
+          }
+        : {}),
       ...(hasT3Extension && input.extensionPath !== undefined
         ? { [T3_PI_MCP_EXTENSION_PATH_ENV]: input.extensionPath }
         : {}),
@@ -307,6 +322,18 @@ export function buildPiRpcLaunch(input: {
       ...(hasT3Mcp && input.mcpSession !== undefined
         ? {
             [T3_MCP_URL_ENV]: input.mcpSession.endpoint,
+            ...(input.mcpSession.catalogEndpoint !== undefined &&
+            input.mcpSession.nativeRuntimeId !== undefined
+              ? {
+                  [T3_MCP_CATALOG_CONFIG_ENV]: JSON.stringify({
+                    threadId: input.mcpSession.threadId,
+                    providerSessionId: input.mcpSession.providerSessionId,
+                    nativeRuntimeId: input.mcpSession.nativeRuntimeId,
+                    catalogEndpoint: input.mcpSession.catalogEndpoint,
+                    catalogRevision: input.mcpSession.catalogRevision,
+                  }),
+                }
+              : {}),
             [T3_MCP_BEARER_ENV]: bearerTokenFromAuthorizationHeader(
               input.mcpSession.authorizationHeader,
             ),

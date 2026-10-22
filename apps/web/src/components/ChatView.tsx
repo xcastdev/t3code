@@ -421,6 +421,8 @@ import {
 import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { MessagesTimeline, type MessagesTimelineHistoryControls } from "./chat/MessagesTimeline";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
+import { latestRunWork as deriveLatestRunWork } from "./chat/runWorkSummary";
+import { useAssistantThreadOwnership } from "./assistants/useAssistantHome";
 import { getTriggerDisplayModelName } from "./chat/providerIconUtils";
 import { resolveTimelineIsAtEnd } from "./chat/MessagesTimeline.logic";
 import {
@@ -517,6 +519,7 @@ import {
   reconcileMountedTerminalThreadIds,
   resolveComposerInteractionMode,
   resolveComposerProviderSelection,
+  resolveComposerSettingsSource,
   getAntigravitySendBlockReason,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
@@ -1533,6 +1536,24 @@ export default function ChatView(props: ChatViewProps) {
     : undefined;
   const isServerThread = serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
+  // An agent's home chat runs on the agent's revisioned configuration; its children stay ordinary.
+  const assistantOwnership = useAssistantThreadOwnership(
+    isServerThread ? { environmentId, threadId } : null,
+  );
+  const assistantOwner = assistantOwnership.owner;
+  const agentHome = assistantOwner?.kind === "canonical" ? assistantOwner : null;
+  const ownerSettingsPending =
+    assistantOwnership.kind === "unknown" || assistantOwnership.kind === "offline";
+  const composerSettingsSource = resolveComposerSettingsSource({
+    owner: assistantOwnership.kind,
+    draft: {
+      modelSelection: composerSelectedModelSelection,
+      runtimeMode: composerRuntimeMode,
+      interactionMode: composerInteractionMode,
+    },
+    thread: serverThread,
+  });
+  const agentSettings = composerSettingsSource === "thread" ? serverThread : null;
   const serverLatestRun =
     serverProjection === null ? null : deriveLatestThreadRun(serverProjection);
   const serverActivityRun =
@@ -1618,6 +1639,7 @@ export default function ChatView(props: ChatViewProps) {
   const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
     .settings.defaultRuntimeMode;
   const runtimeMode =
+    agentSettings?.runtimeMode ??
     composerRuntimeMode ??
     (isServerThread ? activeThread?.runtimeMode : undefined) ??
     defaultRuntimeMode;
@@ -2490,6 +2512,7 @@ export default function ChatView(props: ChatViewProps) {
     provider: activeProviderStatus,
     interactionMode:
       composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE,
+    agentInteractionMode: agentSettings?.interactionMode ?? null,
   });
   const conversationProviderStatus =
     providerStatuses.find((status) => status.instanceId === activeRuntime?.providerInstanceId) ??
@@ -2551,6 +2574,7 @@ export default function ChatView(props: ChatViewProps) {
   const showPlanFollowUpPrompt = shouldShowPlanFollowUpPrompt({
     pendingUserInputCount: pendingUserInputs.length,
     interactionMode,
+    agentOwnsInteractionMode: agentSettings !== null,
     latestTurnSettled: latestRunSettled,
     hasActionableProposedPlan: hasActionableProposedPlan(activeProposedPlan),
     hasComposerAttachments: composerHasAttachments,
@@ -2640,6 +2664,15 @@ export default function ChatView(props: ChatViewProps) {
     activeThreadLiveTokenUsage,
     activeProviderThread,
   );
+  // Counts come from the rows this view already holds; no extra reads per row.
+  const latestRunWork =
+    serverProjection === null
+      ? null
+      : deriveLatestRunWork({
+          runs: serverProjection.runs,
+          turnItems: serverProjection.turnItems,
+          hasMoreHistory: serverThreadHistory.hasMoreHistory,
+        });
   const pendingBackgroundTasks = (() => {
     if (serverProjection === null || serverProjection === undefined) {
       return [];
@@ -3719,7 +3752,36 @@ export default function ChatView(props: ChatViewProps) {
     settings,
   });
 
+  const openAgentConfiguration = () => {
+    if (agentHome === null) return;
+    void navigate({
+      to: "/agents/$environmentId/$assistantId",
+      params: { environmentId: agentHome.environmentId, assistantId: agentHome.assistantId },
+      search: { section: "configuration" },
+    });
+  };
+  const openAgentConfigurationStable = useStableCallback(openAgentConfiguration);
+  const reportAgentConfigured = () => {
+    toastManager.add({
+      type: "info",
+      title: "This chat uses its agent's configuration",
+      description: `Change the model and modes from Configure ${agentHome?.name ?? "agent"}.`,
+    });
+  };
+  // Until the owner is known, a local override could fight an agent's configuration.
+  const reportOwnerSettingsPending = () => {
+    toastManager.add({
+      type: "info",
+      title: "Checking this chat's settings",
+      description:
+        assistantOwnership.kind === "offline"
+          ? "Reconnect so T3 Code can confirm whether an agent owns this chat's model and mode, then try again. Your message is kept."
+          : "T3 Code is still confirming whether an agent owns this chat's model and mode. Try again in a moment. Your message is kept.",
+    });
+  };
   const handleRuntimeModeChange = (mode: RuntimeMode) => {
+    if (agentHome !== null) return reportAgentConfigured();
+    if (ownerSettingsPending) return reportOwnerSettingsPending();
     if (mode === runtimeMode) return;
     setComposerDraftRuntimeMode(composerDraftTarget, mode);
     if (isLocalDraftThread) {
@@ -3730,6 +3792,8 @@ export default function ChatView(props: ChatViewProps) {
   const handleRuntimeModeChangeStable = useStableCallback(handleRuntimeModeChange);
 
   const handleInteractionModeChange = (mode: ProviderInteractionMode) => {
+    if (agentHome !== null) return reportAgentConfigured();
+    if (ownerSettingsPending) return reportOwnerSettingsPending();
     if (mode === "plan" && !interactionModeEnabled) return;
     if (mode === interactionMode) return;
     setComposerDraftInteractionMode(composerDraftTarget, mode);
@@ -3792,6 +3856,14 @@ export default function ChatView(props: ChatViewProps) {
     useRightPanelStore.getState().open(activeThreadRef, "files");
   };
   const addFilesSurfaceStable = useStableCallback(addFilesSurface);
+  // Nested repositories can live under a workspace that is not itself a repository.
+  const sourceControlSurfaceAvailable =
+    isServerThread && activeProject !== null && activeWorkspaceRoot !== undefined;
+  const addSourceControlSurface = () => {
+    if (!activeThreadRef || !sourceControlSurfaceAvailable) return;
+    useRightPanelStore.getState().open(activeThreadRef, "source-control");
+  };
+  const addSourceControlSurfaceStable = useStableCallback(addSourceControlSurface);
   const supportsThreadPullRequests =
     serverConfig?.environment.capabilities.threadPullRequests === true;
   const visiblePullRequests = visibleThreadPullRequests(
@@ -5330,6 +5402,7 @@ export default function ChatView(props: ChatViewProps) {
     if (!activeThread || !clientSettingsHydrated || sendInFlightRef.current) return;
     const context = composerRef.current?.getSendContext();
     if (!context?.providerAvailable) return;
+    if (composerSettingsSource === "wait") return reportOwnerSettingsPending();
 
     const threadId = activeThread.id;
     const messageId = newMessageId();
@@ -5520,7 +5593,8 @@ export default function ChatView(props: ChatViewProps) {
       item.type === "user_message" &&
       (item.text.trim().toLowerCase() !== "/compact" || item.attachments.length > 0),
   );
-  const pendingHandoffSelection = composerSelectedModelSelection ?? activeThread?.modelSelection;
+  const pendingHandoffSelection =
+    agentSettings?.modelSelection ?? composerSelectedModelSelection ?? activeThread?.modelSelection;
   const pendingHandoffSelectionUsable = providerInstanceEntries.some(
     (entry) =>
       entry.instanceId === pendingHandoffSelection?.instanceId &&
@@ -5856,6 +5930,10 @@ export default function ChatView(props: ChatViewProps) {
         createNewTerminalStable();
       },
       "diff.toggle": () => onToggleDiffStable(),
+      "sourceControl.open": ({ event }) => {
+        if (!sourceControlSurfaceAvailable) return false;
+        if (!event.repeat) addSourceControlSurfaceStable();
+      },
       "modelPicker.toggle": ({ event }) => {
         if (!event.repeat) composerRef.current?.toggleModelPicker();
       },
@@ -6140,6 +6218,10 @@ export default function ChatView(props: ChatViewProps) {
     ) {
       return;
     }
+    if (resumableRunId !== null && composerSettingsSource === "wait") {
+      reportOwnerSettingsPending();
+      return;
+    }
     const threadId = activeThread.id;
     sendInFlightRef.current = true;
     setResumingThreadKeys((current) => new Set(current).add(routeThreadKey));
@@ -6297,6 +6379,10 @@ export default function ChatView(props: ChatViewProps) {
     }
     if (!sendCtx?.providerAvailable) {
       notifyDirectAnnotationAttached();
+      return;
+    }
+    if (composerSettingsSource === "wait") {
+      reportOwnerSettingsPending();
       return;
     }
     const multipleModelSelections = sendCtx.multipleModelSelections;
@@ -7713,6 +7799,8 @@ export default function ChatView(props: ChatViewProps) {
     options?: { focusComposer?: boolean },
   ) => {
     if (!activeThread) return;
+    if (agentHome !== null) return reportAgentConfigured();
+    if (ownerSettingsPending) return reportOwnerSettingsPending();
     const entry = providerStatuses.find((snapshot) => snapshot.instanceId === instanceId);
     const resolvedDriverKind = entry?.driver ?? null;
     if (
@@ -8418,6 +8506,11 @@ export default function ChatView(props: ChatViewProps) {
                                 )
                               }
                               modelLabel={providerSubagentModelLabel}
+                              workLabel={
+                                latestRunWork === null
+                                  ? null
+                                  : `${latestRunWork.label} · ${latestRunWork.retentionLabel}`
+                              }
                               effortLabel={providerSubagentEffortLabel}
                               status={providerSubagentStatus}
                               onOpenParent={
@@ -8540,6 +8633,7 @@ export default function ChatView(props: ChatViewProps) {
                               pullRequestProjectId={
                                 supportsPullRequests ? (activeProject?.id ?? null) : null
                               }
+                              resourceProjectId={activeProject?.id ?? null}
                               pullRequestRepository={
                                 supportsPullRequests ? activeProjectRepository : null
                               }
@@ -8588,6 +8682,17 @@ export default function ChatView(props: ChatViewProps) {
                               handleRuntimeModeChange={handleRuntimeModeChangeStable}
                               handleInteractionModeChange={handleInteractionModeChangeStable}
                               focusComposer={focusComposerStable}
+                              latestRunWork={latestRunWork}
+                              agentConfiguration={
+                                agentHome === null || agentSettings === null
+                                  ? null
+                                  : {
+                                      name: agentHome.name,
+                                      onOpen: openAgentConfigurationStable,
+                                      modelSelection: agentSettings.modelSelection,
+                                      interactionMode: agentSettings.interactionMode,
+                                    }
+                              }
                               scheduleComposerFocus={scheduleComposerFocusStable}
                               setThreadError={setThreadError}
                               onExpandImage={onExpandTimelineImageStable}
@@ -8830,6 +8935,9 @@ export default function ChatView(props: ChatViewProps) {
           onAddPullRequest={addPullRequestSurfaceStable}
           onAddPullRequests={addPullRequestsSurfaceStable}
           onAddDevice={addDeviceSurfaceStable}
+          {...(sourceControlSurfaceAvailable
+            ? { onAddSourceControl: addSourceControlSurfaceStable }
+            : {})}
           browserAvailable={canOperatePreview && browserAvailable}
           terminalAvailable={activeProject !== null && canOperateTerminal}
           diffAvailable={isServerThread && isGitRepo}
@@ -8885,6 +8993,9 @@ export default function ChatView(props: ChatViewProps) {
             onAddPullRequest={addPullRequestSurfaceStable}
             onAddPullRequests={addPullRequestsSurfaceStable}
             onAddDevice={addDeviceSurfaceStable}
+            {...(sourceControlSurfaceAvailable
+              ? { onAddSourceControl: addSourceControlSurfaceStable }
+              : {})}
             browserAvailable={canOperatePreview && browserAvailable}
             terminalAvailable={activeProject !== null && canOperateTerminal}
             diffAvailable={isServerThread && isGitRepo}

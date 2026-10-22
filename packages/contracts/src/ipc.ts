@@ -360,6 +360,9 @@ export interface DesktopEnvironmentBootstrap {
   httpBaseUrl: string | null;
   wsBaseUrl: string | null;
   bootstrapToken?: string;
+  ownership?: "managed" | "attached";
+  environmentId?: EnvironmentId;
+  attachmentRevision?: string;
 }
 
 export const DesktopEnvironmentBootstrapSchema = Schema.Struct({
@@ -369,7 +372,33 @@ export const DesktopEnvironmentBootstrapSchema = Schema.Struct({
   httpBaseUrl: Schema.NullOr(Schema.String),
   wsBaseUrl: Schema.NullOr(Schema.String),
   bootstrapToken: Schema.optionalKey(Schema.String),
+  ownership: Schema.optionalKey(Schema.Literals(["managed", "attached"])),
+  environmentId: Schema.optionalKey(EnvironmentId),
+  attachmentRevision: Schema.optionalKey(Schema.String),
 });
+
+export const DesktopAttachedBackendTargetSchema = Schema.Struct({
+  httpBaseUrl: Schema.String,
+  wsBaseUrl: Schema.String,
+  environmentId: EnvironmentId,
+  attachmentRevision: Schema.String,
+});
+export type DesktopAttachedBackendTarget = typeof DesktopAttachedBackendTargetSchema.Type;
+
+/** Redacted ownership state for the single desktop primary slot. */
+export const DesktopPrimaryBackendStateSchema = Schema.Union([
+  Schema.Struct({ mode: Schema.Literal("managed") }),
+  Schema.Struct({
+    mode: Schema.Literal("attached"),
+    httpBaseUrl: Schema.String,
+    environmentId: EnvironmentId,
+    attachmentRevision: Schema.String,
+    label: Schema.String,
+    bearerExpiresAt: Schema.String,
+  }),
+  Schema.Struct({ mode: Schema.Literal("invalid-attached"), reason: Schema.String }),
+]);
+export type DesktopPrimaryBackendState = typeof DesktopPrimaryBackendStateSchema.Type;
 
 export const DesktopSshEnvironmentTargetSchema = Schema.Struct({
   alias: Schema.String,
@@ -1046,10 +1075,14 @@ export interface DesktopBridge {
    * regardless of OS settings.
    */
   getSystemLocale?: () => string | null;
+  getPrimaryBackendState: () => Promise<DesktopPrimaryBackendState>;
+  attachPrimaryBackend: (pairingUrl: string) => Promise<DesktopPrimaryBackendState>;
+  refreshPrimaryBackendCredential: (credential: string) => Promise<void>;
+  useManagedPrimaryBackend: () => Promise<void>;
   getLocalEnvironmentBootstraps: () => readonly DesktopEnvironmentBootstrap[];
   getLocalEnvironmentEnabled?: () => boolean;
   setLocalEnvironmentEnabled?: (enabled: boolean) => Promise<void>;
-  getLocalEnvironmentBearerToken: () => Promise<string>;
+  getLocalEnvironmentBearerToken: (target?: DesktopAttachedBackendTarget) => Promise<string>;
   getClientSettings: () => Promise<ClientSettings | null>;
   setClientSettings: (settings: ClientSettings) => Promise<void>;
   getConnectionCatalog?: () => Promise<string | null>;

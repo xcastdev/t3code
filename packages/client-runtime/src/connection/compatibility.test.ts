@@ -20,6 +20,21 @@ const descriptor = (orchestrationProtocolVersion?: number): ExecutionEnvironment
 });
 
 describe("orchestration protocol compatibility", () => {
+  it.each([
+    "ws://127.0.0.1:3773/ws",
+    "wss://desk.example.com/ws",
+    "wss://relay.example.com/environments/desk/ws?connectionMethod=relay",
+    "wss://desk.tail1234.ts.net/ws?wsTicket=fixture-ticket",
+    "wss://tunnel.example.com/session/ws?connectionMethod=tunnel",
+  ])("keeps the selected transport origin and path for %s", (address) => {
+    const selected = new URL(address);
+    const announced = new URL(appendOrchestrationProtocol(address));
+    expect(announced.origin).toBe(selected.origin);
+    expect(announced.pathname).toBe(selected.pathname);
+    announced.searchParams.delete("orchestrationProtocol");
+    expect(announced.href).toBe(selected.href);
+  });
+
   it("accepts the current protocol and announces it without disturbing socket credentials", () => {
     expect(
       orchestrationProtocolCompatibilityError(descriptor(ORCHESTRATION_PROTOCOL_VERSION)),

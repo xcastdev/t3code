@@ -1,6 +1,7 @@
 import { groupBy } from "effect/Array";
 import * as DateTime from "effect/DateTime";
 import type {
+  ModelSelection,
   OrchestrationV2AppThread,
   OrchestrationV2Subagent,
   OrchestrationV2SubagentWorkflow,
@@ -107,6 +108,14 @@ export interface SubagentWorkflowGroup {
   readonly unphasedMembers: ReadonlyArray<RuntimeSubagent>;
 }
 
+function persistedEffort(selection: ModelSelection): string | null {
+  for (const id of ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort"]) {
+    const value = selection.options?.find((option) => option.id === id)?.value;
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
 function workflowUsage(source: {
   readonly totalTokens?: number | undefined;
   readonly toolCalls?: number | undefined;
@@ -150,6 +159,8 @@ function workflowMembersToRuntime(
       kind: "workflow_agent" as const,
       title: agent.label,
       model: agent.model ?? null,
+      // Workflow members have no persisted options; the coordinator's effort is not evidence.
+      effort: null,
       status,
       activationCount: agent.attempt ?? 1,
       usage: workflowUsage(agent),
@@ -178,6 +189,7 @@ export function projectedSubagentsToRuntime(
     readonly title: string | null;
     readonly prompt: string;
     readonly model: string | null;
+    readonly modelSelection?: ModelSelection | undefined;
     readonly status: OrchestrationV2Subagent["status"];
     readonly progress?: string | undefined;
     readonly childThreadId?: string | null | undefined;
@@ -201,8 +213,9 @@ export function projectedSubagentsToRuntime(
         subagent.title ??
         (subagent.prompt.length > 80 ? `${subagent.prompt.slice(0, 77)}...` : subagent.prompt),
       role: null,
-      model: subagent.model,
-      effort: null,
+      model: subagent.modelSelection?.model ?? subagent.model,
+      effort:
+        subagent.modelSelection === undefined ? null : persistedEffort(subagent.modelSelection),
       status: subagent.status,
       activationCount: 1,
       usage: workflow === undefined ? null : workflowUsage(workflow),

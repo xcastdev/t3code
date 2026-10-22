@@ -1,5 +1,7 @@
 import { CommandId, type OrchestrationV2ThreadProjection } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as RunAdmission from "./RunAdmission.ts";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 
@@ -53,6 +55,7 @@ function delegatedCompletionRetryKey(
 export const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const ids = yield* IdAllocator.IdAllocatorV2;
+    const admission = yield* RunAdmission.RunAdmission;
     const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const retryAttempts = yield* Ref.make(new Map<string, number>());
@@ -85,8 +88,34 @@ export const layer = Layer.effectDiscard(
                 : [request.delegatedCompletion.messageId],
           },
         );
-        if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
-          yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
+        const sourceRun =
+          request.delegatedCompletion === undefined
+            ? projection.runs
+                .filter(
+                  (run) =>
+                    run.providerThreadId === request.providerThreadId &&
+                    run.status !== "queued" &&
+                    run.status !== "preparing",
+                )
+                .toSorted((left, right) => right.ordinal - left.ordinal)[0]
+            : projection.runs.find(
+                (run) =>
+                  run.id === request.delegatedCompletion?.parentRunId &&
+                  run.providerThreadId === request.providerThreadId,
+              );
+        const ownership = yield* admission.check({
+          threadId: request.threadId,
+          ...(sourceRun === undefined ? {} : { runId: sourceRun.id }),
+          operation: "continue",
+          now: DateTime.formatIso(yield* DateTime.now),
+        });
+        if (
+          projection.thread.archivedAt !== null ||
+          projection.thread.deletedAt !== null ||
+          ownership._tag === "denied" ||
+          ownership._tag === "expired"
+        ) {
+          yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-inactive", {
             threadId: request.threadId,
             providerThreadId: request.providerThreadId,
           });

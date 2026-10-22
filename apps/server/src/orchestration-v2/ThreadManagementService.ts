@@ -94,6 +94,7 @@ function existingThreadIdsForCommand(
     case "thread.mark-unread":
       return [];
     case "thread.fork":
+    case "thread.history.fork":
       return [command.sourceThreadId];
     case "thread.merge_back":
       return command.sourceThreadId === command.targetThreadId
@@ -429,6 +430,8 @@ export interface ThreadManagementServiceShape {
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
   readonly getThreadEventSequence: Orchestrator.OrchestratorV2["Service"]["getThreadEventSequence"];
+  readonly stopOwnedRun: Orchestrator.OrchestratorV2["Service"]["stopOwnedRun"];
+  readonly stopExactRun: Orchestrator.OrchestratorV2["Service"]["stopExactRun"];
   readonly recoverDelegatedTask: Orchestrator.OrchestratorV2["Service"]["recoverDelegatedTask"];
   readonly delegatedTaskResultPending: Orchestrator.OrchestratorV2["Service"]["delegatedTaskResultPending"];
   readonly streamStoredEvents: Orchestrator.OrchestratorV2["Service"]["streamStoredEvents"];
@@ -1187,6 +1190,8 @@ const make = Effect.gen(function* () {
     stopDelegatedTasks,
     stopWorkflow,
     getThreadEventSequence: orchestrator.getThreadEventSequence,
+    stopOwnedRun: orchestrator.stopOwnedRun,
+    stopExactRun: orchestrator.stopExactRun,
     recoverDelegatedTask: orchestrator.recoverDelegatedTask,
     delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
     streamStoredEvents: orchestrator.streamStoredEvents,

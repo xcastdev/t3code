@@ -1,3 +1,18 @@
+import * as ExternalNotificationGateway from "./notifications/ExternalNotificationGateway.ts";
+import * as ThreadHistoryService from "./orchestration-v2/ThreadHistoryService.ts";
+import { AssistantActivity } from "./assistants/AssistantActivity.ts";
+import { AssistantRosterStream } from "./assistants/AssistantRosterStream.ts";
+import { AssistantRoutineGateway } from "./assistants/AssistantRoutineGateway.ts";
+import { AssistantMemoryGateway } from "./assistants/AssistantMemoryGateway.ts";
+import * as Cause from "effect/Cause";
+import * as SkillDeployment from "./skills/SkillDeploymentService.ts";
+import * as SkillCatalog from "./skills/SkillCatalogService.ts";
+import * as TextCatalog from "./managedTextResources/ManagedTextResourceCatalogService.ts";
+import * as ResourceAuthority from "./ResourceMutationAuthority.ts";
+import * as IssueSearch from "./sourceControl/IssueSearchService.ts";
+import * as NativeProjection from "./orchestration-v2/ProjectionStore.ts";
+import * as McpCatalogClientService from "./mcp/McpCatalogClientService.ts";
+import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -11,6 +26,8 @@ import {
   type OrchestrationProjectShell,
   type ServerConfig,
   type ServerConfigStreamEvent,
+  type ProjectTerminalMetadataStreamEvent,
+  TerminalToolError,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -69,6 +86,7 @@ import * as ReviewService from "./review/ReviewService.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import * as AssistantRuntime from "./assistants/AssistantRuntime.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
@@ -110,6 +128,7 @@ import {
   subscribeOrchestrationV2Shell,
   subscribeOrchestrationV2Thread,
   WS_RPC_SERVER_OPTIONS,
+  projectTerminalMetadataListener,
   withLateEditorConfig,
 } from "./ws.ts";
 
@@ -290,6 +309,17 @@ it.live.each(["thread", "shell"] as const)(
 
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
+  Layer.mock(AssistantRuntime.AssistantRuntime)({}),
+  Layer.mock(AssistantMemoryGateway)({}),
+  Layer.mock(AssistantActivity)({}),
+  Layer.mock(AssistantRosterStream)({}),
+  Layer.mock(AssistantRoutineGateway)({}),
+  Layer.mock(SkillCatalog.SkillCatalogService)({}),
+  Layer.mock(SkillDeployment.SkillDeploymentService)({}),
+  Layer.mock(TextCatalog.ManagedTextResourceCatalogService)({}),
+  Layer.mock(ResourceAuthority.ResourceMutationAuthority)({}),
+  Layer.mock(IssueSearch.IssueSearchService)({}),
+  Layer.mock(NativeProjection.ProjectionStoreV2)({}),
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
   Layer.mock(WorkspacePaths.WorkspacePaths)({}),
   Layer.mock(TraceDiagnostics.TraceDiagnostics)({}),
@@ -337,6 +367,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ReviewService.ReviewService)({}),
   Layer.mock(ScheduledTasks.ScheduledTaskService)({}),
   Layer.mock(SecretRequests.SecretRequests)({}),
+  Layer.mock(McpCatalogClientService.McpCatalogClientService)({}),
   Layer.mock(ServerLifecycleEvents.ServerLifecycleEvents)({}),
   Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
   Layer.mock(ServerSelfUpdate.ServerSelfUpdate)({}),
@@ -348,6 +379,8 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(TerminalManager.TerminalManager)({}),
   Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   Layer.mock(ThreadManagement.ThreadManagementService)({}),
+  Layer.mock(ThreadHistoryService.ThreadHistoryService)({}),
+  Layer.mock(ExternalNotificationGateway.ExternalNotificationGateway)({}),
   Layer.mock(ThreadSearch.ThreadSearch)({}),
   Layer.mock(UsageService.UsageService)({}),
   Layer.mock(VcsProvisioningService.VcsProvisioningService)({}),
@@ -466,6 +499,7 @@ it.effect(
             {},
             yield* PreviewAutomationBroker.PreviewAutomationBroker,
             yield* ServerBrowser.ServerBrowser,
+            yield* ProjectWorkGateway.ProjectWorkGateway,
           ).pipe(Layer.provide(configRpcServices)),
         ),
       );
@@ -528,6 +562,7 @@ it.effect(
           Layer.fresh(layerConfigSources),
           Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
           Layer.mock(ServerBrowser.ServerBrowser)({}),
+          Layer.mock(ProjectWorkGateway.ProjectWorkGateway)({}),
         ),
       ),
       Effect.scoped,
@@ -624,4 +659,38 @@ it.effect("thread resume across compacted history keeps message order and final 
       ),
     ),
   ),
+);
+
+it.effect("metadata overflow fails only the slow reader without blocking terminal cleanup", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("shared-project");
+    const slow = yield* Queue.bounded<
+      ProjectTerminalMetadataStreamEvent,
+      TerminalToolError | Cause.Done
+    >(2);
+    const healthy = yield* Queue.unbounded<
+      ProjectTerminalMetadataStreamEvent,
+      TerminalToolError | Cause.Done
+    >();
+    const slowListener = projectTerminalMetadataListener(slow, projectId);
+    const healthyListener = projectTerminalMetadataListener(healthy, projectId);
+    for (let index = 0; index < 4; index++) {
+      const event: ProjectTerminalMetadataStreamEvent = {
+        type: "remove",
+        projectId,
+        terminalId: `terminal-${index}`,
+      };
+      yield* slowListener(event);
+      yield* healthyListener(event);
+      assert.deepEqual(yield* Queue.take(healthy), event);
+    }
+    let cleaned = false;
+    yield* Effect.sync(() => {
+      cleaned = true;
+    });
+    assert.isTrue(cleaned);
+    const result = yield* Stream.fromQueue(slow).pipe(Stream.runCollect, Effect.flip);
+    assert.equal(result._tag, "TerminalToolError");
+    assert.equal(result.reason, "unavailable");
+  }),
 );

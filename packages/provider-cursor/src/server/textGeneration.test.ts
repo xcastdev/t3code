@@ -76,6 +76,32 @@ beforeEach(() => {
 });
 
 describe("CursorTextGeneration", () => {
+  it.effect("extracts facts using the current native Cursor browser credential", () =>
+    Effect.gen(function* () {
+      cursorSdkMock.prompt.mockResolvedValue({
+        id: "memory-extraction",
+        status: "finished",
+        result:
+          '{"facts":[{"key":"storage","body":"SQLite is authoritative.","quote":"SQLite is authoritative."}]}',
+      });
+      const generation = yield* makeCursorTextGeneration(
+        cursorSettings,
+        {},
+        Effect.succeed("private-native-key"),
+      );
+      const result = yield* generation.extractMemoryFacts({
+        cwd: process.cwd(),
+        sourceText: "SQLite is authoritative.",
+        modelSelection: createModelSelection(ProviderInstanceId.make("cursor-second"), "auto"),
+      });
+      expect(result.facts[0]?.key).toBe("storage");
+      expect(cursorSdkMock.create).toHaveBeenCalledWith(
+        expect.objectContaining({ apiKey: "private-native-key" }),
+      );
+      expect(cursorSdkMock.prompt.mock.calls[0]?.[0]).not.toContain("private-native-key");
+    }).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("resolves the browser credential for every request after an account change", () =>
     Effect.gen(function* () {
       let apiKey = "first-browser-key";

@@ -58,10 +58,20 @@ export class ClientPresentation extends Context.Service<
   }
 >()("@t3tools/client-runtime/platform/capabilities/ClientPresentation") {}
 
+export interface PrimaryEnvironmentCredentialTarget {
+  readonly environmentId: EnvironmentId;
+  readonly httpBaseUrl: string;
+  readonly socketUrl: string;
+}
+
 export class PrimaryEnvironmentAuth extends Context.Service<
   PrimaryEnvironmentAuth,
   {
     readonly bearerToken: Effect.Effect<Option.Option<string>, ConnectionAttemptError>;
+    /** Credentials are bound to this request, even if the primary endpoint changes meanwhile. */
+    readonly bearerTokenForTarget?: (
+      target: PrimaryEnvironmentCredentialTarget,
+    ) => Effect.Effect<Option.Option<string>, ConnectionAttemptError>;
   }
 >()("@t3tools/client-runtime/platform/capabilities/PrimaryEnvironmentAuth") {}
 

@@ -15,6 +15,8 @@ import {
 import { CursorSettings } from "../settings.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -40,6 +42,166 @@ import { ConfigurationError } from "./sdk.ts";
 const decodeCursorSettings = Schema.decodeEffect(CursorSettings);
 
 describe("CursorAdapterV2", () => {
+  it.effect.each(["success", "failure", "stale", "stale-revision"] as const)(
+    "acknowledges the captured catalog config only after native send: %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "cursor-catalog-" });
+        const instanceId = ProviderInstanceId.make("cursor");
+        const threadId = ThreadId.make("cursor-catalog-thread");
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const config = {
+          environmentId: EnvironmentId.make("cursor-catalog-environment"),
+          threadId,
+          providerSessionId: "cursor-catalog-credential",
+          providerInstanceId: instanceId,
+          nativeRuntimeId: "cursor-native-runtime",
+          catalogRevision: 1,
+          endpoint: "http://127.0.0.1:43123/mcp",
+          catalogEndpoint: "http://127.0.0.1:43123/mcp/catalog/cursor-catalog-credential",
+          authorizationHeader: "Bearer synthetic-catalog-token",
+          browserToolsAvailable: false,
+        };
+        yield* mcpSessions.set(config);
+        const nativeOpened = yield* Deferred.make<void>();
+        const completeOpen = yield* Deferred.make<void>();
+        const nativeSending = yield* Deferred.make<void>();
+        const completeSend = yield* Deferred.make<void>();
+        const adapter = yield* makeCursorAdapterV2({
+          instanceId,
+          settings: yield* decodeCursorSettings({}),
+          environment: { HOME: workspace },
+        }).pipe(
+          Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, {
+            assertComplete: Effect.void,
+            open: (input) =>
+              Effect.gen(function* () {
+                assert.deepStrictEqual(input.options.mcpServers, {
+                  "t3-code": {
+                    type: "http",
+                    url: config.endpoint,
+                    headers: { Authorization: config.authorizationHeader },
+                  },
+                  t3_catalog: {
+                    type: "http",
+                    url: config.catalogEndpoint,
+                    headers: { Authorization: config.authorizationHeader },
+                  },
+                });
+                yield* Deferred.succeed(nativeOpened, undefined);
+                yield* Deferred.await(completeOpen);
+                return {
+                  agentId: "native-catalog",
+                  listMessages: Effect.succeed([]),
+                  close: Effect.void,
+                  send: () =>
+                    Effect.gen(function* () {
+                      yield* Deferred.succeed(nativeSending, undefined);
+                      yield* Deferred.await(completeSend);
+                      if (outcome === "failure")
+                        return yield* Effect.fail(
+                          new CursorAgentSdk.CursorAgentSdkRunnerError({
+                            method: "run.start",
+                            cause: "native rejected config",
+                          }),
+                        );
+
+                      return {
+                        runId: "catalog-run",
+                        agentId: "native-catalog",
+                        wait: Effect.never,
+                        cancel: Effect.void,
+                      };
+                    }),
+                };
+              }),
+          }),
+          Effect.provide(TestProviderHost.layer({ cwd: workspace })),
+        );
+        const modelSelection = { instanceId, model: "composer-2.5" };
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("catalog-runtime"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const opening = yield* runtime
+          .ensureThread({ threadId, modelSelection, runtimePolicy })
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(nativeOpened);
+        assert.isUndefined(yield* mcpSessions.readCatalogEndpointReceipt(threadId));
+        yield* Deferred.succeed(completeOpen, undefined);
+        const providerThread = yield* Fiber.join(opening).pipe(Effect.flatMap((result) => result));
+        assert.isUndefined(yield* mcpSessions.readCatalogEndpointReceipt(threadId));
+        const now = yield* DateTime.now;
+        const starting = yield* runtime
+          .startTurn({
+            threadId,
+            providerThread,
+            modelSelection,
+            runtimePolicy,
+            runId: RunId.make("cursor-lifecycle-run"),
+            runOrdinal: 1,
+            providerTurnOrdinal: 1,
+            attemptId: RunAttemptId.make("cursor-lifecycle-attempt"),
+            rootNodeId: NodeId.make("cursor-lifecycle-root"),
+            appThread: {
+              id: threadId,
+              projectId: ProjectId.make("cursor-lifecycle-project"),
+              createdBy: "user",
+              creationSource: "web",
+              title: "Cursor lifecycle",
+              providerInstanceId: instanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: providerThread.id,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+            message: {
+              messageId: MessageId.make("cursor-lifecycle-message"),
+              createdBy: "user",
+              creationSource: "web",
+              text: "Review the code.",
+              attachments: [],
+            },
+          })
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(nativeSending);
+        assert.isUndefined(yield* mcpSessions.readCatalogEndpointReceipt(threadId));
+        if (outcome === "stale")
+          yield* mcpSessions.set({ ...config, nativeRuntimeId: "replacement-runtime" });
+        if (outcome === "stale-revision") yield* mcpSessions.set({ ...config, catalogRevision: 2 });
+        yield* Deferred.succeed(completeSend, undefined);
+        const result = yield* Fiber.join(starting);
+        assert.strictEqual(result._tag, outcome === "failure" ? "Failure" : "Success");
+        const receipt = yield* mcpSessions.readCatalogEndpointReceipt(threadId);
+        if (outcome === "success") assert.strictEqual(receipt, config);
+        else assert.isUndefined(receipt);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+  );
+
   it.effect.each([
     { status: "finished", model: undefined, lateModel: undefined },
     { status: "cancelled", model: "claude-opus-4-6", lateModel: undefined },
@@ -368,6 +530,9 @@ describe("CursorAdapterV2", () => {
       const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "cursor-v2-errors-" });
       const sentMessages: Array<string> = [];
       let sendCalls = 0;
+      let delaySend = false;
+      const enteredSend = yield* Deferred.make<void>();
+      const sendReply = yield* Deferred.make<void, CursorAgentSdk.CursorAgentSdkRunnerError>();
       const instanceId = ProviderInstanceId.make("cursor");
       const threadId = ThreadId.make("cursor-transport-error-thread");
       const modelSelection = { instanceId, model: "composer-2.5" };
@@ -410,7 +575,15 @@ describe("CursorAdapterV2", () => {
                     }),
                     cancel: Effect.void,
                   };
-                }),
+                }).pipe(
+                  Effect.tap(() =>
+                    delaySend
+                      ? Deferred.succeed(enteredSend, undefined).pipe(
+                          Effect.andThen(Deferred.await(sendReply)),
+                        )
+                      : Effect.void,
+                  ),
+                ),
             }),
         }),
         Effect.provide(TestProviderHost.layer({ cwd: workspace })),
@@ -450,7 +623,21 @@ describe("CursorAdapterV2", () => {
         lastVisitedAt: null,
         deletedAt: null,
       };
-      yield* runtime.startTurn({
+      const instructionSnapshot = {
+        configurationHash: "config-1",
+        resourceRevision: "resources-1",
+        memoryEpoch: 0,
+        roleInstructions: "Review every migration.",
+        toolIds: ["unavailable-tool"],
+        skillIds: [],
+      };
+      const receipts: Array<unknown> = [];
+      const managedTurn: ProviderAdapter.ProviderAdapterV2TurnInput = {
+        instructionSnapshot,
+        onInstructionsApplied: (snapshot) =>
+          Effect.sync(() => {
+            receipts.push(snapshot);
+          }),
         threadId,
         providerThread,
         modelSelection,
@@ -468,7 +655,13 @@ describe("CursorAdapterV2", () => {
           text: "continue",
           attachments: [],
         },
-      });
+      };
+      yield* runtime.startTurn(managedTurn);
+      assert.include(sentMessages[0]!, instructionSnapshot.roleInstructions);
+      assert.deepEqual(
+        yield* runtime.getAppliedInstructions!({ providerThread }),
+        instructionSnapshot,
+      );
       const first = yield* runtime.events.pipe(
         Stream.filter((event) => event.type === "turn.terminal"),
         Stream.runHead,
@@ -481,6 +674,7 @@ describe("CursorAdapterV2", () => {
 
       assert.isDefined(runtime.compactThread);
       yield* runtime.compactThread!({
+        instructionSnapshot,
         threadId,
         providerThread,
         modelSelection,
@@ -504,6 +698,59 @@ describe("CursorAdapterV2", () => {
         Stream.runHead,
       );
       assert.equal(sentMessages[1], "/compress");
+      assert.equal(receipts.length, 1);
+      assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread }));
+      const revised = {
+        ...instructionSnapshot,
+        configurationHash: "config-2",
+        resourceRevision: "resources-2",
+        memoryEpoch: 1,
+        roleInstructions: "Verify the revised migration.",
+      };
+      yield* runtime.startTurn({
+        ...managedTurn,
+        instructionSnapshot: revised,
+        runOrdinal: 3,
+        providerTurnOrdinal: 3,
+      });
+      assert.include(sentMessages[2]!, revised.roleInstructions);
+      assert.deepEqual(receipts, [instructionSnapshot, revised]);
+      assert.notInclude(sentMessages[2]!, instructionSnapshot.roleInstructions);
+      assert.deepEqual(yield* runtime.getAppliedInstructions!({ providerThread }), revised);
+      yield* runtime.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.runHead,
+      );
+      delaySend = true;
+      const pending = yield* runtime
+        .startTurn({
+          ...managedTurn,
+          instructionSnapshot: revised,
+          runOrdinal: 4,
+          providerTurnOrdinal: 4,
+        })
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(enteredSend);
+      assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread }));
+      yield* Deferred.fail(
+        sendReply,
+        new CursorAgentSdk.CursorAgentSdkRunnerError({
+          method: "send",
+          cause: new Error("Rejected native admission"),
+        }),
+      );
+      assert.equal((yield* Fiber.join(pending))._tag, "Failure");
+      assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread }));
+      assert.deepEqual(receipts, [instructionSnapshot, revised]);
+      delaySend = false;
+      const { instructionSnapshot: _managedSnapshot, ...ordinaryTurn } = managedTurn;
+      yield* runtime.startTurn({
+        ...ordinaryTurn,
+        runOrdinal: 5,
+        providerTurnOrdinal: 5,
+      });
+      assert.notInclude(sentMessages[4]!, revised.roleInstructions);
+      assert.isUndefined(yield* runtime.getAppliedInstructions!({ providerThread }));
     }).pipe(
       Effect.scoped,
       Effect.provide(

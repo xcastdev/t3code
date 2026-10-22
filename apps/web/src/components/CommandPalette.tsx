@@ -55,8 +55,12 @@ import {
 } from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import {
+  GitBranchIcon,
   ArrowLeftIcon,
+  BotIcon,
   ChartNoAxesColumnIcon,
+  ListTodoIcon,
+  TerminalSquareIcon,
   CheckIcon,
   ChevronRightIcon,
   CornerLeftUpIcon,
@@ -94,6 +98,10 @@ import { useAtomValue } from "@effect/atom-react";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstraps";
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
+import { useProjectWorkTarget } from "../hooks/useProjectWorkTarget";
+import { ProjectWorkShortcut } from "./work/ProjectWorkShortcut";
+import { AgentsShortcut } from "./assistants/AgentsShortcut";
+import { useAssistantThreadOwner } from "./assistants/useAssistantHome";
 import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import {
@@ -623,6 +631,16 @@ export function CommandPalette({ children }: { children: ReactNode }) {
 
   return (
     <ComposerHandleContext value={composerHandleRef}>
+      <ProjectWorkShortcut
+        paletteOpen={state.open}
+        terminalOpen={terminalOpen}
+        previewOpen={previewOpen}
+      />
+      <AgentsShortcut
+        paletteOpen={state.open}
+        terminalOpen={terminalOpen}
+        previewOpen={previewOpen}
+      />
       <CommandDialog
         open={state.open}
         onOpenChange={(open, eventDetails) => {
@@ -767,6 +785,10 @@ function OpenCommandPaletteDialog(props: {
   const availableSettingsSearchItems = useAvailableSettingsSearchItems();
   const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
     useHandleNewThread();
+  const projectWorkTarget = useProjectWorkTarget();
+  const activeAssistant = useAssistantThreadOwner(
+    activeThread ? { environmentId: activeThread.environmentId, threadId: activeThread.id } : null,
+  );
   const paletteRouteTarget = useThreadRouteTarget();
   const projects = useProjects();
   const referenceThreadRef =
@@ -1742,6 +1764,21 @@ function OpenCommandPaletteDialog(props: {
   }
 
   if (activeThread !== null) {
+    const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    actionItems.push({
+      kind: "action",
+      value: "action:open-source-control",
+      searchTerms: ["source control", "git", "stage", "unstage", "commit", "history", "graph"],
+      title: "Open source control",
+      icon: <GitBranchIcon className={ITEM_ICON_CLASS} />,
+      shortcutCommand: "sourceControl.open",
+      run: async () => {
+        useRightPanelStore.getState().open(threadRef, "source-control");
+      },
+    });
+  }
+
+  if (activeThread !== null) {
     const thread = activeThread;
     actionItems.push({
       kind: "action",
@@ -2017,6 +2054,96 @@ function OpenCommandPaletteDialog(props: {
     });
   }
 
+  if (projectWorkTarget) {
+    actionItems.push({
+      kind: "action",
+      value: "action:project-work",
+      searchTerms: ["work", "tasks", "approvals", "scope", "plan", "knowledge", "issues"],
+      title: "Open Work",
+      description: projectWorkTarget.title,
+      icon: <ListTodoIcon className={ITEM_ICON_CLASS} />,
+      shortcutCommand: "projectWork.open",
+      run: async () => {
+        await navigate({
+          to: "/work/$environmentId/$projectId",
+          params: {
+            environmentId: projectWorkTarget.environmentId,
+            projectId: projectWorkTarget.projectId,
+          },
+          search: { section: "overview" },
+        });
+      },
+    });
+    actionItems.push({
+      kind: "action",
+      value: "action:project-work-portfolio",
+      searchTerms: ["work", "portfolio", "all projects", "workers", "questions", "inbox"],
+      title: "Open Work across projects",
+      description: "Team Work in every connected environment",
+      icon: <ListTodoIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await navigate({
+          to: "/work/$environmentId/$projectId",
+          params: {
+            environmentId: projectWorkTarget.environmentId,
+            projectId: projectWorkTarget.projectId,
+          },
+          search: { section: "portfolio" },
+        });
+      },
+    });
+    actionItems.push({
+      kind: "action",
+      value: "action:project-terminals",
+      searchTerms: ["terminals", "processes", "dev server", "watcher", "pty", "project"],
+      title: "Open project terminals",
+      description: projectWorkTarget.title,
+      icon: <TerminalSquareIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await navigate({
+          to: "/terminals/$environmentId/$projectId",
+          params: {
+            environmentId: projectWorkTarget.environmentId,
+            projectId: projectWorkTarget.projectId,
+          },
+        });
+      },
+    });
+  }
+
+  if (activeAssistant !== null) {
+    actionItems.push({
+      kind: "action",
+      value: "action:agent-settings",
+      searchTerms: ["agent", "assistant", "memory", "routines", "rules", "configuration"],
+      title: "Open this agent",
+      description: activeAssistant.name,
+      icon: <BotIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await navigate({
+          to: "/agents/$environmentId/$assistantId",
+          params: {
+            environmentId: activeAssistant.environmentId,
+            assistantId: activeAssistant.assistantId,
+          },
+          search: { section: "overview" },
+        });
+      },
+    });
+  }
+
+  actionItems.push({
+    kind: "action",
+    value: "action:agents",
+    searchTerms: ["agents", "assistants", "personal", "memory", "routines"],
+    title: "Open agents",
+    icon: <BotIcon className={ITEM_ICON_CLASS} />,
+    shortcutCommand: "agents.open",
+    run: async () => {
+      await navigate({ to: "/agents" });
+    },
+  });
+
   actionItems.push({
     kind: "action",
     value: "action:usage",
@@ -2075,6 +2202,33 @@ function OpenCommandPaletteDialog(props: {
         });
       },
     });
+  }
+
+  if (contextualProjectGroup && activeThread) {
+    const checkout = contextualProjectGroup.memberProjects.find(
+      (member) =>
+        member.environmentId === activeThread.environmentId && member.id === activeThread.projectId,
+    );
+    if (checkout)
+      actionItems.push({
+        kind: "action",
+        value: "action:thread-resources",
+        searchTerms: ["skills", "commands", "snippets", "mcp", "servers", "thread", "resources"],
+        title: "Skills, commands and MCP for this thread",
+        description: activeThread.title,
+        icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
+        run: async () => {
+          await navigate({
+            to: "/settings/resources",
+            search: {
+              project: contextualProjectGroup.projectKey,
+              machine: activeThread.environmentId,
+              checkout: checkout.physicalProjectKey,
+              thread: activeThread.id,
+            },
+          });
+        },
+      });
   }
 
   const rootGroups = buildRootGroups({ actionItems, recentThreadItems });

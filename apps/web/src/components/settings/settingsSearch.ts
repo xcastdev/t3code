@@ -22,6 +22,7 @@ export type SettingsPath =
   | "/settings/snap-shot"
   | "/settings/providers"
   | "/settings/integrations"
+  | "/settings/resources"
   | "/settings/scheduled-tasks"
   | "/settings/source-control"
   | "/settings/storage"
@@ -80,6 +81,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/snap-shot": "SnapShots",
   "/settings/providers": "Providers",
   "/settings/integrations": "Integrations",
+  "/settings/resources": "Resources",
   "/settings/scheduled-tasks": "Scheduled Tasks",
   "/settings/source-control": "Source Control",
   "/settings/storage": "Storage",
@@ -493,6 +495,18 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["base directory folder browser path home"],
   },
   {
+    id: "project-work",
+    title: "Project Work",
+    to: "/settings/general",
+    searchTerms: ["work tasks approvals scope plan knowledge issues intake"],
+  },
+  {
+    id: "agents",
+    title: "Agents",
+    to: "/settings/general",
+    searchTerms: ["agents assistants personal memory routines rules personality chat"],
+  },
+  {
     id: "unpin-confirmation",
     title: "Unpin confirmation",
     to: "/settings/general",
@@ -777,6 +791,37 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["agent opens browser device simulator pop into view hide"],
   },
   {
+    id: "external-notifications",
+    title: "External notifications",
+    to: "/settings/integrations",
+    targetId: "notifications",
+    searchTerms: ["home assistant webhook notify push alert integration"],
+  },
+  {
+    id: "resource-inventory",
+    title: "Resource overview",
+    to: "/settings/resources",
+    searchTerms: ["inventory agent tools skills commands snippets mcp servers applied"],
+  },
+  {
+    id: "mcp-servers",
+    title: "MCP servers",
+    to: "/settings/resources",
+    searchTerms: ["model context protocol tools oauth headers secrets providers session override"],
+  },
+  {
+    id: "skills",
+    title: "Skills",
+    to: "/settings/resources",
+    searchTerms: ["managed skill $skill instructions import install history rollback provider"],
+  },
+  {
+    id: "commands-snippets",
+    title: "Commands and snippets",
+    to: "/settings/resources",
+    searchTerms: ["slash command snippet template $ARGUMENTS reusable prompt text"],
+  },
+  {
     id: "automatic-pull",
     title: "Automatically pull",
     to: "/settings/source-control",
@@ -909,6 +954,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     desktopOnly: true,
   },
   {
+    id: "primary-server",
+    title: "Primary server",
+    to: "/settings/connections",
+    searchTerms: [
+      "attach attached external bundled managed server pairing credential refresh detach own",
+    ],
+    desktopOnly: true,
+  },
+  {
     id: "network-access",
     title: "Network access",
     to: "/settings/connections",
@@ -1015,6 +1069,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/keybindings": null,
   "/settings/providers": null,
   "/settings/integrations": null,
+  "/settings/resources": null,
   "/settings/source-control": "environment-defaults",
   "/settings/storage": "project-defaults",
   "/settings/connections": "connections",

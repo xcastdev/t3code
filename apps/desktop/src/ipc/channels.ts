@@ -125,3 +125,9 @@ export const RECEIVE_PROVIDER_AUTH_CALLBACK_CHANNEL = "desktop:receive-provider-
 export const CANCEL_PROVIDER_AUTH_CALLBACK_CHANNEL = "desktop:cancel-provider-auth-callback";
 export const TAKE_LEGACY_LOCAL_STORAGE_CHANNEL = "desktop:take-legacy-local-storage";
 export const COMPLETE_LEGACY_LOCAL_STORAGE_CHANNEL = "desktop:complete-legacy-local-storage";
+
+export const GET_PRIMARY_BACKEND_STATE_CHANNEL = "desktop:get-primary-backend-state";
+export const ATTACH_PRIMARY_BACKEND_CHANNEL = "desktop:attach-primary-backend";
+export const REFRESH_PRIMARY_BACKEND_CREDENTIAL_CHANNEL =
+  "desktop:refresh-primary-backend-credential";
+export const USE_MANAGED_PRIMARY_BACKEND_CHANNEL = "desktop:use-managed-primary-backend";

@@ -1,3 +1,4 @@
+import { skillInstallTargets } from "@t3tools/provider-core/server/driver";
 import { ProviderDriverKind } from "@t3tools/contracts";
 import { GrokSettings } from "../settings.ts";
 import * as Crypto from "effect/Crypto";
@@ -245,6 +246,14 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv, Path.Path> 
     return {
       instanceId,
       driverKind: DRIVER_KIND,
+      resolveSkillInstallTargets: (projectRoot?: string) =>
+        Effect.succeed(
+          skillInstallTargets({
+            driverKind: DRIVER_KIND,
+            environment: processEnv,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
+        ),
       continuationIdentity,
       displayName,
       accentColor,

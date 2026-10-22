@@ -1,3 +1,10 @@
+import * as ThreadHistoryArchive from "./ThreadHistoryArchiveService.ts";
+import * as ThreadHistoryRecovery from "./ThreadHistoryRecoveryService.ts";
+import { seedOwnedThreadWork } from "./testkit/OwnedRunTestkit.ts";
+import {
+  appendAdmissionFoundationRecords,
+  readCurrentState,
+} from "../projectWork/ProjectWorkRepository.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import { limitRecoveryCommand } from "./UsageLimitRecoveryWorker.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -12,6 +19,7 @@ import {
   CommandId,
   ContextTransferId,
   EventId,
+  EnvironmentId,
   MessageId,
   NodeId,
   RuntimeRequestId,
@@ -28,6 +36,7 @@ import {
   ProviderThreadId,
   ProviderTurnId,
   RunId,
+  RunAttemptId,
   ScheduledTaskId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -46,6 +55,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as ServerConfig from "../config.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
@@ -86,8 +96,18 @@ import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
-const layerPlatformTest = Layer.merge(
+const layerPlatformTest = Layer.mergeAll(
   NodeServices.layer,
+  Layer.succeed(ServerEnvironment.ServerEnvironment, {
+    getEnvironmentId: Effect.succeed(EnvironmentId.make("env")),
+    getDescriptor: Effect.succeed({
+      environmentId: EnvironmentId.make("env"),
+      label: "Runtime test environment",
+      platform: { os: "linux" as const, arch: "x64" as const },
+      serverVersion: "0.0.0",
+      capabilities: { repositoryIdentity: false },
+    }),
+  }),
   Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
     resolveLink: () => Effect.die("unused title link"),
   }),
@@ -271,7 +291,11 @@ const moveProject = (projectId: ProjectId, workspaceRoot: string, updatedAt: str
   );
 
 const layerTest = Layer.mergeAll(
-  RuntimeLayer.layer,
+  RuntimeLayer.layer.pipe(
+    Layer.provide(
+      Layer.mock(TerminalManager.TerminalManager)({ closeProjectOwner: () => Effect.void }),
+    ),
+  ),
   RuntimeLayer.layerEventSink,
   ProjectStore.layer,
   ProjectionStore.layer,
@@ -290,18 +314,24 @@ const layerTest = Layer.mergeAll(
   Layer.provide(layerPlatformTest),
 );
 
-const layerLegacyImportTest = RuntimeLayer.layer.pipe(
-  Layer.provide(McpSessionRegistryTestkit.layer),
-  Layer.provide(McpProviderSessions.layer),
-  Layer.provideMerge(SqlitePersistence.layerMemory),
-  Layer.provide(layerCheckpointStoreTest),
-  Layer.provide(layerServerConfig),
-  Layer.provide(ServerSettings.layerTest()),
-  Layer.provide(layerTestProviderInstanceRegistry),
-  Layer.provide(layerGitWorkflowTest),
-  Layer.provide(layerProjectServiceTest),
-  Layer.provide(layerPlatformTest),
-);
+const layerLegacyImportTest = RuntimeLayer.layer
+  .pipe(
+    Layer.provide(
+      Layer.mock(TerminalManager.TerminalManager)({ closeProjectOwner: () => Effect.void }),
+    ),
+  )
+  .pipe(
+    Layer.provide(McpSessionRegistryTestkit.layer),
+    Layer.provide(McpProviderSessions.layer),
+    Layer.provideMerge(SqlitePersistence.layerMemory),
+    Layer.provide(layerCheckpointStoreTest),
+    Layer.provide(layerServerConfig),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerTestProviderInstanceRegistry),
+    Layer.provide(layerGitWorkflowTest),
+    Layer.provide(layerProjectServiceTest),
+    Layer.provide(layerPlatformTest),
+  );
 
 const layerScheduledTasksTest = ScheduledTaskService.layer.pipe(
   Layer.provide(
@@ -318,6 +348,7 @@ const layerScheduledTasksTest = ScheduledTaskService.layer.pipe(
   ),
 );
 const layerResourceCleanupTest = ResourceCleanupService.layer.pipe(
+  Layer.provide(RuntimeLayer.layerHistoryArchive),
   Layer.provideMerge(layerScheduledTasksTest),
   Layer.provide(
     Layer.mergeAll(
@@ -328,7 +359,13 @@ const layerResourceCleanupTest = ResourceCleanupService.layer.pipe(
 );
 
 const layerProjectDeletionTest = Layer.mergeAll(
-  RuntimeLayer.layer.pipe(Layer.provide(RuntimeLayer.layerProjectService)),
+  RuntimeLayer.layer
+    .pipe(
+      Layer.provide(
+        Layer.mock(TerminalManager.TerminalManager)({ closeProjectOwner: () => Effect.void }),
+      ),
+    )
+    .pipe(Layer.provide(RuntimeLayer.layerProjectService)),
   RuntimeLayer.layerProjectService,
   RuntimeLayer.layerEventSink,
   ThreadCommandExecutor.layer,
@@ -595,7 +632,13 @@ it.layer(layerProjectDeletionTest)("project deletion during thread commands", (i
 });
 
 const layerSharedApplicationDataPlaneTest = Layer.mergeAll(
-  RuntimeLayer.layer.pipe(Layer.provide(RuntimeLayer.layerProjectService)),
+  RuntimeLayer.layer
+    .pipe(
+      Layer.provide(
+        Layer.mock(TerminalManager.TerminalManager)({ closeProjectOwner: () => Effect.void }),
+      ),
+    )
+    .pipe(Layer.provide(RuntimeLayer.layerProjectService)),
   RuntimeLayer.layerProjectService,
   RuntimeLayer.layerEventSink,
   RuntimeLayer.layerEventInfrastructure,
@@ -6195,7 +6238,11 @@ const queueResumeDisabledInstanceProjectId = ProjectId.make(
 );
 
 const layerQueueResumeDisabledInstanceTest = Layer.mergeAll(
-  RuntimeLayer.layer,
+  RuntimeLayer.layer.pipe(
+    Layer.provide(
+      Layer.mock(TerminalManager.TerminalManager)({ closeProjectOwner: () => Effect.void }),
+    ),
+  ),
   RuntimeLayer.layerEventSink,
   ProjectStore.layer,
   ProjectionStore.layer,
@@ -6316,3 +6363,796 @@ it.layer(layerQueueResumeDisabledInstanceTest)(
     );
   },
 );
+
+it.layer(Layer.merge(layerTest, SqlitePersistence.layerMemory))("owned run admission", (it) => {
+  it.effect.each(["prepared-release", "queued-promotion"] as const)(
+    "rejects %s after the stored owner is paused",
+    (scenario) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const events = yield* EventSink.EventSinkV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const sql = yield* SqlClient.SqlClient;
+        const now = yield* DateTime.now;
+        const projectId = ProjectId.make(`owned:${scenario}:project`);
+        const threadId = ThreadId.make(`owned:${scenario}:thread`);
+        yield* seedProject({
+          projectId,
+          title: "Owned",
+          workspaceRoot: "/tmp/owned-admission",
+          defaultModelSelection: modelSelection,
+          createdAt: DateTime.formatIso(now),
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${threadId}:create`),
+          threadId,
+          projectId,
+          title: "Owned",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* seedOwnedThreadWork({
+          projectId,
+          threadId,
+          modelSelection,
+          now: DateTime.formatIso(now),
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${threadId}:prepared`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:prepared`),
+          text: "Prepare",
+          attachments: [],
+          dispatchMode: { type: "defer_start" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const prepared = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+        assert.equal(prepared.status, "preparing");
+        let targetRun = prepared;
+        if (scenario === "queued-promotion") {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`${threadId}:queued`),
+            threadId,
+            messageId: MessageId.make(`${threadId}:queued`),
+            text: "Queue",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "system",
+            creationSource: "server",
+          });
+          targetRun = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.status === "queued",
+          )!;
+          assert.isDefined(targetRun);
+        }
+        const state = yield* readCurrentState(sql, projectId);
+        const member = state.foundationRecords!.find((record) => record.kind === "member")!;
+        yield* sql.withTransaction(
+          appendAdmissionFoundationRecords(
+            sql,
+            projectId,
+            `${threadId}:pause-owner`,
+            [{ ...member, status: "paused", revision: member.revision + 1 }],
+            DateTime.formatIso(now),
+          ),
+        );
+        if (scenario === "prepared-release") {
+          const result = yield* Effect.result(
+            orchestrator.dispatch({
+              type: "prepared-run.release",
+              commandId: CommandId.make(`${threadId}:release`),
+              threadId,
+              runId: prepared.id,
+            }),
+          );
+          assert.equal(result._tag, "Failure");
+          const stillPrepared = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.id === prepared.id,
+          )!;
+          assert.equal(stillPrepared.status, "preparing");
+          assert.deepEqual(
+            yield* outbox.listByCommandId(CommandId.make(`${threadId}:release`)),
+            [],
+          );
+        } else {
+          yield* events.write({
+            events: [
+              {
+                id: EventId.make(`${threadId}:prepared-settled`),
+                type: "run.updated",
+                threadId,
+                runId: prepared.id,
+                occurredAt: now,
+                payload: { ...prepared, status: "cancelled", completedAt: now },
+              },
+            ],
+          });
+          yield* orchestrator.dispatch({
+            type: "queue.resume",
+            commandId: CommandId.make(`${threadId}:resume`),
+            threadId,
+          });
+          const promotionCommand = CommandId.make(`command:system:start-queued:${targetRun.id}`);
+          const receipt = yield* sql<{
+            status: string;
+          }>`SELECT status FROM orchestration_command_receipts WHERE command_id = ${promotionCommand}`;
+          assert.equal(receipt[0]?.status, "rejected");
+          assert.deepEqual(yield* outbox.listByCommandId(promotionCommand), []);
+          const after = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (run) => run.id === targetRun.id,
+          )!;
+          assert.equal(after.status, "failed");
+        }
+      }),
+  );
+  it.effect("rejects a promotion planned before expiry when its SQL commit runs after expiry", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const plannedAt = yield* DateTime.now;
+      const threadId = ThreadId.make("owned:late-commit:thread");
+      const projectId = ProjectId.make("owned:late-commit:project");
+      yield* seedProject({
+        projectId,
+        title: "Late admission",
+        workspaceRoot: "/tmp/late-admission",
+        defaultModelSelection: modelSelection,
+        createdAt: DateTime.formatIso(plannedAt),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId,
+        title: "Owned",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* seedOwnedThreadWork({
+        projectId,
+        threadId,
+        modelSelection,
+        now: DateTime.formatIso(plannedAt),
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${threadId}:prepare`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:prepare`),
+        text: "Prepare",
+        attachments: [],
+        dispatchMode: { type: "defer_start" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      yield* TestClock.adjust(11000);
+      const commandId = CommandId.make(`${threadId}:late-release`);
+      const result = yield* sink.commitCommand({
+        commandId,
+        threadId,
+        commandType: "prepared-run.release",
+        acceptedAt: plannedAt,
+        events: [
+          {
+            id: EventId.make(`${threadId}:starting`),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: plannedAt,
+            payload: { ...run, status: "starting" },
+          },
+        ],
+        effects: [
+          {
+            id: `${commandId}:start`,
+            commandId,
+            threadId,
+            request: { type: "provider-turn.start", runId: run.id },
+          },
+        ],
+      });
+      assert.equal(result.receipt.status, "rejected");
+      assert.deepEqual(result.receipt.acceptedAt, plannedAt);
+      assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
+      assert.equal(
+        (yield* orchestrator.getThreadProjection(threadId)).runs[0]?.status,
+        "preparing",
+      );
+    }),
+  );
+  it.effect("rejects steering an old native attempt after the same owned run restarted", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("owned:old-steer:thread");
+      const projectId = ProjectId.make("owned:old-steer:project");
+      yield* seedProject({
+        projectId,
+        title: "Old steer",
+        workspaceRoot: "/tmp/old-steer",
+        defaultModelSelection: modelSelection,
+        createdAt: DateTime.formatIso(now),
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId,
+        title: "Owned",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* seedOwnedThreadWork({
+        projectId,
+        threadId,
+        modelSelection,
+        now: DateTime.formatIso(now),
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`${threadId}:prepare`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:prepare`),
+        text: "Prepare",
+        attachments: [],
+        dispatchMode: { type: "defer_start" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+      const oldTurnId = ProviderTurnId.make(`${threadId}:old-native-turn`);
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:native-turn`),
+            threadId,
+            runId: run.id,
+            type: "provider-turn.updated",
+            occurredAt: now,
+            payload: {
+              id: oldTurnId,
+              providerThreadId: run.providerThreadId!,
+              nodeId: run.rootNodeId!,
+              runAttemptId: run.activeAttemptId,
+              nativeTurnRef: { driver, nativeId: "old-native-turn", strength: "strong" },
+              ordinal: 1,
+              status: "running",
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+        ],
+      });
+      const restart = yield* sink.commitCommand({
+        commandId: CommandId.make(`${threadId}:restart`),
+        threadId,
+        commandType: "message.dispatch",
+        acceptedAt: now,
+        events: [
+          {
+            id: EventId.make(`${threadId}:restart`),
+            threadId,
+            runId: run.id,
+            type: "run.updated",
+            occurredAt: now,
+            payload: {
+              ...run,
+              activeAttemptId: RunAttemptId.make(`${threadId}:successor-attempt`),
+              status: "starting",
+            },
+          },
+        ],
+        effects: [],
+      });
+      assert.equal(restart.receipt.status, "accepted");
+      const commandId = CommandId.make(`${threadId}:old-steer`);
+      const steered = yield* sink.commitCommand({
+        commandId,
+        threadId,
+        commandType: "message.dispatch",
+        acceptedAt: now,
+        events: [
+          {
+            id: EventId.make(`${threadId}:stale-message`),
+            threadId,
+            type: "thread.metadata-updated",
+            occurredAt: now,
+            payload: (yield* orchestrator.getThreadProjection(threadId)).thread,
+          },
+        ],
+        effects: [
+          {
+            id: `${commandId}:steer`,
+            commandId,
+            threadId,
+            request: {
+              type: "provider-turn.steer",
+              providerThreadId: run.providerThreadId!,
+              providerTurnId: oldTurnId,
+              providerSessionId: ProviderSessionId.make("session:old"),
+              messageId: MessageId.make(`${threadId}:stale-steer`),
+            },
+          },
+        ],
+      });
+      assert.equal(steered.receipt.status, "rejected");
+      assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
+    }),
+  );
+});
+
+it.layer(Layer.fresh(Layer.merge(layerTest, SqlitePersistence.layerMemory)))(
+  "owner deadline busy target",
+  (it) => {
+    it.effect(
+      "lets another root expire while the first target's ordinary thread lock is busy",
+      () =>
+        Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const lock = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+          const sql = yield* SqlClient.SqlClient;
+          const prepare = Effect.fn("OwnedAdmissionTest.prepare")(function* (name: string) {
+            const now = yield* DateTime.now;
+            const projectId = ProjectId.make(`owned:busy:${name}:project`);
+            const threadId = ThreadId.make(`owned:busy:${name}:thread`);
+            yield* seedProject({
+              projectId,
+              title: name,
+              workspaceRoot: `/tmp/owned-busy-${name}`,
+              defaultModelSelection: modelSelection,
+              createdAt: DateTime.formatIso(now),
+            });
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make(`${threadId}:create`),
+              threadId,
+              projectId,
+              title: name,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              createdBy: "user",
+              creationSource: "web",
+            });
+            yield* seedOwnedThreadWork({
+              projectId,
+              threadId,
+              modelSelection,
+              now: DateTime.formatIso(now),
+            });
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`${threadId}:prepare`),
+              threadId,
+              messageId: MessageId.make(`${threadId}:prepare`),
+              text: "Prepare",
+              attachments: [],
+              dispatchMode: { type: "defer_start" },
+              createdBy: "user",
+              creationSource: "web",
+            });
+            return { threadId, run: (yield* orchestrator.getThreadProjection(threadId)).runs[0]! };
+          });
+          const first = yield* prepare("a");
+          yield* TestClock.adjust(1);
+          const second = yield* prepare("b");
+          const controls = yield* sql<{
+            control_id: string;
+            thread_id: string;
+          }>`SELECT control_id,thread_id FROM t3_workflow_v2_run_admissions WHERE thread_id IN (${first.threadId},${second.threadId})`;
+          const firstControl = controls.find((control) => control.thread_id === first.threadId)!;
+          const secondControl = controls.find((control) => control.thread_id === second.threadId)!;
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const holder = yield* lock
+            .withLock(
+              first.threadId,
+              Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+            )
+            .pipe(Effect.forkScoped({ startImmediately: true }));
+          yield* Deferred.await(entered);
+          yield* TestClock.adjust(10000);
+          assert.isTrue(yield* worker.runControlOnce);
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(first.threadId)).runs[0]?.status,
+            "preparing",
+          );
+          assert.isTrue(yield* worker.runControlOnce);
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(second.threadId)).runs[0]?.status,
+            "interrupted",
+          );
+          const receiptFor = (controlId: string) =>
+            sql<{
+              status: string;
+            }>`SELECT status FROM orchestration_command_receipts WHERE command_id=${`${controlId}:stop`}`;
+          assert.equal((yield* receiptFor(secondControl.control_id))[0]?.status, "accepted");
+          assert.deepEqual(yield* receiptFor(firstControl.control_id), []);
+          // Six failed nonblocking claims exceed the normal effect attempt budget.
+          for (const backoff of [100, 200, 400, 800, 1600]) {
+            yield* TestClock.adjust(backoff);
+            assert.isTrue(yield* worker.runControlOnce);
+            assert.deepEqual(yield* receiptFor(firstControl.control_id), []);
+          }
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(holder);
+          yield* TestClock.adjust(3200);
+          assert.isTrue(yield* worker.runControlOnce);
+          assert.equal(
+            (yield* orchestrator.getThreadProjection(first.threadId)).runs[0]?.status,
+            "interrupted",
+          );
+          assert.equal((yield* receiptFor(firstControl.control_id))[0]?.status, "accepted");
+        }),
+    );
+  },
+);
+
+const layerArchiveRecoveryTest = ThreadHistoryRecovery.layer.pipe(
+  Layer.provideMerge(RuntimeLayer.layerHistoryArchive),
+  Layer.provideMerge(Layer.merge(ProjectionStore.layer, ProjectStore.layer)),
+  Layer.provideMerge(layerSharedApplicationDataPlaneTest),
+  Layer.provide(layerCheckpointStoreTest),
+  Layer.provide(layerPlatformTest),
+);
+
+const seedArchiveRecovery = Effect.fn("test.seedArchiveRecovery")(function* (name: string) {
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const sink = yield* EventSink.EventSinkV2;
+  const threadId = ThreadId.make(`archive-source:${name}`);
+  const projectId = ProjectId.make(`archive-project:${name}`);
+  const runId = RunId.make(`archive-run:${name}`);
+  const at = DateTime.makeUnsafe("2026-10-01T00:00:00.000Z");
+  yield* seedProject({
+    projectId,
+    title: "Archive recovery",
+    workspaceRoot: "/archive-recovery",
+    defaultModelSelection: modelSelection,
+    createdAt: DateTime.formatIso(at),
+  });
+  yield* orchestrator.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make(`archive-create:${name}`),
+    threadId,
+    projectId,
+    title: "Archive source",
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    createdBy: "user",
+    creationSource: "web",
+  });
+  const run: OrchestrationV2Run = {
+    id: runId,
+    threadId,
+    ordinal: 1,
+    providerInstanceId: modelSelection.instanceId,
+    modelSelection,
+    providerThreadId: null,
+    userMessageId: MessageId.make(`archive-message:${name}`),
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "completed",
+    queuePosition: null,
+    requestedAt: at,
+    startedAt: at,
+    completedAt: at,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  yield* sink.write({
+    events: [
+      {
+        id: EventId.make(`archive-run-created:${name}`),
+        type: "run.created",
+        threadId,
+        runId,
+        providerInstanceId: modelSelection.instanceId,
+        occurredAt: at,
+        payload: run,
+      },
+      {
+        id: EventId.make(`archive-message-created:${name}`),
+        type: "message.updated",
+        threadId,
+        runId,
+        providerInstanceId: modelSelection.instanceId,
+        occurredAt: at,
+        payload: {
+          id: run.userMessageId,
+          threadId,
+          runId,
+          nodeId: null,
+          role: "assistant",
+          text: "The retained answer before rollback.",
+          attachments: [],
+          streaming: false,
+          createdBy: "system",
+          creationSource: "server",
+          createdAt: at,
+          updatedAt: at,
+        },
+      },
+    ],
+  });
+  const archives = yield* ThreadHistoryArchive.ThreadHistoryArchiveService;
+  const archiveId = `recovery-${name}`;
+  yield* archives.prepare({ threadId, archiveId, reason: "rollback" });
+  yield* sink.write({
+    events: [
+      {
+        id: EventId.make(`archive-run-rolled-back:${name}`),
+        type: "run.updated",
+        threadId,
+        runId,
+        providerInstanceId: modelSelection.instanceId,
+        occurredAt: at,
+        payload: { ...run, status: "rolled_back" },
+      },
+      {
+        id: EventId.make(`archive-message-replaced:${name}`),
+        type: "message.updated",
+        threadId,
+        runId,
+        providerInstanceId: modelSelection.instanceId,
+        occurredAt: at,
+        payload: {
+          id: run.userMessageId,
+          threadId,
+          runId,
+          nodeId: null,
+          role: "assistant",
+          text: "The current timeline has moved on.",
+          attachments: [],
+          streaming: false,
+          createdBy: "system",
+          creationSource: "server",
+          createdAt: at,
+          updatedAt: at,
+        },
+      },
+    ],
+  });
+  return { threadId, projectId, run, archiveId, at };
+});
+
+it.layer(Layer.fresh(layerArchiveRecoveryTest))("immutable archive recovery", (it) => {
+  it.effect(
+    "repeated context restore and real V2 archive forks survive compaction with honest lineage",
+    () =>
+      Effect.gen(function* () {
+        const { threadId, archiveId, at } = yield* seedArchiveRecovery("repeat");
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const recovery = yield* ThreadHistoryRecovery.ThreadHistoryRecoveryService;
+        const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+        const sink = yield* EventSink.EventSinkV2;
+        yield* maintenance.compactEventStore;
+        assert.isTrue((yield* maintenance.rebuild).valid);
+        for (const suffix of ["one", "two"]) {
+          const targetThreadId = ThreadId.make(`archive-fork:${suffix}`);
+          const result = yield* recovery.recover({
+            threadId,
+            archiveId,
+            mode: "fork",
+            targetThreadId,
+            commandId: CommandId.make(`recover-fork:${suffix}`),
+            messageId: MessageId.make(`recover-fork-message:${suffix}`),
+            createdBy: "user",
+            creationSource: "web",
+          });
+          assert.equal(result.continuity, "context-only");
+          assert.isFalse(result.filesRestored);
+          const target = yield* orchestrator.getThreadProjection(targetThreadId);
+          assert.deepEqual(target.thread.lineage, {
+            parentThreadId: threadId,
+            relationshipToParent: "fork",
+            rootThreadId: threadId,
+          });
+          assert.equal(target.thread.forkedFrom?.type, "run");
+          assert.equal(target.contextTransfers[0]?.status, "superseded");
+          assert.isNull(target.contextTransfers[0]?.resolution);
+          assert.include(target.messages[0]?.text ?? "", "The retained answer before rollback.");
+          assert.notInclude(target.messages[0]?.text ?? "", "The current timeline has moved on.");
+          assert.equal(target.messages[0]?.createdBy, "system");
+          const restored = yield* recovery.recover({
+            threadId,
+            archiveId,
+            mode: "restore",
+            commandId: CommandId.make(`recover-home:${suffix}`),
+            messageId: MessageId.make(`recover-home-message:${suffix}`),
+            createdBy: "user",
+            creationSource: "web",
+          });
+          assert.equal(restored.threadId, threadId);
+          const current = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+          for (const run of current.runs.filter(
+            (run) => run.status !== "rolled_back" && run.status !== "completed",
+          ))
+            yield* sink.write({
+              events: [
+                {
+                  id: EventId.make(`settle-recovery:${run.id}`),
+                  type: "run.updated",
+                  threadId,
+                  runId: run.id,
+                  providerInstanceId: run.providerInstanceId,
+                  occurredAt: at,
+                  payload: { ...run, status: "completed", completedAt: at },
+                },
+              ],
+            });
+          yield* maintenance.compactEventStore;
+          assert.isTrue((yield* maintenance.rebuild).valid);
+        }
+      }),
+  );
+  it.effect(
+    "a release racing the actual V2 commit refuses the archive fork before creating its target",
+    () =>
+      Effect.gen(function* () {
+        const { threadId, archiveId } = yield* seedArchiveRecovery("release-race");
+        const recovery = yield* ThreadHistoryRecovery.ThreadHistoryRecoveryService;
+        const archives = yield* ThreadHistoryArchive.ThreadHistoryArchiveService;
+        const sink = yield* EventSink.EventSinkV2;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const reached = yield* Deferred.make<void>();
+        const resume = yield* Deferred.make<void>();
+        const original = sink.commitCommand;
+        const commandId = CommandId.make("recover-release-race");
+        using _spy = vi.spyOn(sink, "commitCommand").mockImplementation((input) =>
+          Effect.gen(function* () {
+            if (input.commandId === commandId) {
+              yield* Deferred.succeed(reached, undefined);
+              yield* Deferred.await(resume);
+            }
+            return yield* original(input);
+          }),
+        );
+        const targetThreadId = ThreadId.make("release-race-target");
+        const fiber = yield* recovery
+          .recover({
+            threadId,
+            archiveId,
+            mode: "fork",
+            targetThreadId,
+            commandId,
+            messageId: MessageId.make("release-race-message"),
+            createdBy: "user",
+            creationSource: "web",
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.raceFirst(
+          Deferred.await(reached),
+          Fiber.join(fiber).pipe(
+            Effect.andThen(Effect.die("Recovery did not reach its commit barrier.")),
+          ),
+        );
+        yield* archives.release({ threadId, archiveId });
+        yield* Deferred.succeed(resume, undefined);
+        assert.equal((yield* Fiber.join(fiber).pipe(Effect.flip)).reason, "execution");
+        assert.isNull(yield* orchestrator.getThreadShell(targetThreadId));
+      }),
+  );
+  it.effect(
+    "archive fork chooses the child own run before higher ordinal inherited runs and refuses an empty child",
+    () =>
+      Effect.gen(function* () {
+        const { threadId: parentId, run, at } = yield* seedArchiveRecovery("ancestor-run-selector");
+        const sink = yield* EventSink.EventSinkV2;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const archives = yield* ThreadHistoryArchive.ThreadHistoryArchiveService;
+        const recovery = yield* ThreadHistoryRecovery.ThreadHistoryRecoveryService;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("parent-high-ordinal"),
+              type: "run.updated",
+              threadId: parentId,
+              runId: run.id,
+              occurredAt: at,
+              payload: { ...run, ordinal: 9, status: "completed" },
+            },
+          ],
+        });
+        const childId = ThreadId.make("archive-own-run-child");
+        yield* orchestrator.dispatch({
+          type: "thread.fork",
+          commandId: CommandId.make("create-own-run-child"),
+          sourceThreadId: parentId,
+          targetThreadId: childId,
+          sourcePoint: { type: "run", runId: run.id },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const empty = { threadId: childId, archiveId: "child-without-own-run" };
+        yield* archives.prepare({ ...empty, reason: "rollback" });
+        assert.isFalse((yield* recovery.capabilities(empty)).fork);
+        assert.equal(
+          (yield* recovery
+            .recover({
+              ...empty,
+              mode: "fork",
+              targetThreadId: ThreadId.make("empty-child-target"),
+              commandId: CommandId.make("refuse-empty-child"),
+              messageId: MessageId.make("empty-child-message"),
+              createdBy: "user",
+              creationSource: "web",
+            })
+            .pipe(Effect.flip)).reason,
+          "unavailable",
+        );
+        assert.isNull(yield* orchestrator.getThreadShell(ThreadId.make("empty-child-target")));
+        const childRun = {
+          ...run,
+          id: RunId.make("child-own-run"),
+          threadId: childId,
+          ordinal: 1,
+          userMessageId: MessageId.make("child-own-message"),
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("create-child-own-run"),
+              type: "run.created",
+              threadId: childId,
+              runId: childRun.id,
+              occurredAt: at,
+              payload: childRun,
+            },
+          ],
+        });
+        const input = { threadId: childId, archiveId: "child-with-own-run" };
+        yield* archives.prepare({ ...input, reason: "rollback" });
+        assert.isTrue((yield* recovery.capabilities(input)).fork);
+        const targetThreadId = ThreadId.make("correct-child-archive-fork");
+        yield* recovery.recover({
+          ...input,
+          mode: "fork",
+          targetThreadId,
+          commandId: CommandId.make("recover-child-own-run"),
+          messageId: MessageId.make("child-context-seed"),
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const target = yield* orchestrator.getThreadProjection(targetThreadId);
+        assert.deepEqual(target.thread.forkedFrom, {
+          type: "run",
+          threadId: childId,
+          runId: childRun.id,
+        });
+        assert.deepEqual(target.thread.lineage, {
+          parentThreadId: childId,
+          relationshipToParent: "fork",
+          rootThreadId: parentId,
+        });
+      }),
+  );
+});

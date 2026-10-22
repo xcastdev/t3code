@@ -1039,7 +1039,9 @@ export const WINDOWS_SERVER_ASAR_RESOURCE = "server.asar";
 // asar redirect convention). Everything else stays packed.
 export const WINDOWS_NATIVE_ASAR_UNPACK_GLOB =
   "{**/*.node,**/*.dll,**/*.exe,**/*.so,**/*.so.*,**/*.dylib}";
+const MEMORY_COMPANION_ASAR_UNPACK_GLOB = "**/apps/server/dist/companion/mem0_backend.py";
 export const WINDOWS_SERVER_ASAR_UNPACK_GLOBS = [
+  MEMORY_COMPANION_ASAR_UNPACK_GLOB,
   "**/*.dll",
   "**/*.exe",
   "**/*.so",
@@ -2847,9 +2849,11 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     // Smart unpack extracts entire native packages, including JavaScript and
     // metadata. Windows keeps those files archived so native dependencies do
     // not inflate the loose-file count and slow NSIS installation.
-    ...(platform === "win"
-      ? { asar: { smartUnpack: false }, asarUnpack: [WINDOWS_NATIVE_ASAR_UNPACK_GLOB] }
-      : {}),
+    ...(platform === "win" ? { asar: { smartUnpack: false } } : {}),
+    asarUnpack: [
+      ...(platform === "win" ? [WINDOWS_NATIVE_ASAR_UNPACK_GLOB] : []),
+      MEMORY_COMPANION_ASAR_UNPACK_GLOB,
+    ],
     extraResources: [
       ...DESKTOP_EXTRA_RESOURCES,
       ...(platform === "linux" ? LINUX_CAPTURE_EXTRA_RESOURCES : []),

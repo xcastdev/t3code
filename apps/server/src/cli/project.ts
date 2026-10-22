@@ -1,3 +1,4 @@
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import {
   AuthStandardClientScopes,
   CommandId,
@@ -201,6 +202,7 @@ const projectCommandUuid = Crypto.Crypto.pipe(
 );
 
 const layerProjectCliRuntime = RuntimeLayer.layerProjectService.pipe(
+  Layer.provideMerge(ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer))),
   Layer.provideMerge(ProjectEnrichmentService.layer),
   Layer.provideMerge(RepositoryIdentityResolver.layer),
   Layer.provideMerge(

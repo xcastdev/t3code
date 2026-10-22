@@ -1,6 +1,7 @@
 export type ComposerTriggerKind =
   | "path"
   | "pull-request"
+  | "issue"
   | "slash-command"
   | "slash-model"
   | "skill";
@@ -12,6 +13,9 @@ export interface ComposerTrigger {
   rangeStart: number;
   rangeEnd: number;
 }
+
+/** `#issue:` or `#iss:` followed by the search text, which never contains whitespace. */
+export const COMPOSER_ISSUE_TOKEN = /^#(?:issue|iss):(\S*)$/iu;
 
 function composerFileLinkBasename(path: string): string {
   const separatorIndex = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
@@ -122,6 +126,15 @@ export function detectComposerTrigger(
       rangeEnd: cursor,
     };
   }
+  // Bare `#` stays the pull request picker; issues need an explicit filter.
+  const issueMatch = COMPOSER_ISSUE_TOKEN.exec(token);
+  if (issueMatch)
+    return {
+      kind: "issue",
+      query: issueMatch[1] ?? "",
+      rangeStart: tokenStart,
+      rangeEnd: cursor,
+    };
   const pullRequestMatch = /^#([\p{L}\p{N}][\p{L}\p{N}_-]*)?$/u.exec(token);
   if (pullRequestMatch)
     return {

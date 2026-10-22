@@ -92,6 +92,7 @@ import {
 import { runOutcome } from "../orchestration-v2/RestartBackgroundNote.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as RunAdmission from "../orchestration-v2/RunAdmission.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
@@ -977,6 +978,7 @@ function timelineItem(input: {
 
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
+  const admission = yield* RunAdmission.RunAdmission;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
@@ -1100,6 +1102,29 @@ const make = Effect.gen(function* () {
     const threadScope = yield* requireThreadScope(scope, operation);
     const parent = yield* loadProjection(threadScope.thread.threadId);
     return { scope: threadScope, parent } as const;
+  });
+
+  const assertNoOwnerEscape = Effect.fn("OrchestratorMcpService.assertNoOwnerEscape")(function* (
+    scope: McpInvocationScope,
+  ) {
+    if (scope.thread === undefined) return;
+    const decision = yield* admission
+      .check({
+        threadId: scope.thread.threadId,
+        operation: "escape",
+        now: DateTime.formatIso(yield* DateTime.now),
+      })
+      .pipe(
+        Effect.mapError(() =>
+          failure("orchestration_error", "Run ownership could not be verified."),
+        ),
+      );
+    if (decision._tag !== "ordinary") {
+      return yield* failure(
+        "capability_denied",
+        "Owned runs must use permitted delegation and cannot create top-level threads or scheduled tasks.",
+      );
+    }
   });
 
   const resolveProjectTarget = (
@@ -1722,6 +1747,7 @@ const make = Effect.gen(function* () {
   return OrchestratorMcpService.of({
     scheduleTask: Effect.fn("OrchestratorMcpService.scheduleTask")(function* (scope, input) {
       const { parent, limits } = yield* loadCaller(scope);
+      yield* assertNoOwnerEscape(scope);
       const projectId = yield* resolveProjectTarget(parent, input.projectId);
       yield* assertLiveCallerForOtherProject(scope, parent, projectId);
       const project = yield* requireProject(projectId);
@@ -1797,6 +1823,13 @@ const make = Effect.gen(function* () {
     updateScheduledTask: Effect.fn("OrchestratorMcpService.updateScheduledTask")(
       function* (scope, input) {
         const { parent, limits } = yield* loadCaller(scope);
+        const onlyDisabling =
+          input.enabled === false &&
+          input.prompt === undefined &&
+          input.title === undefined &&
+          input.schedule === undefined &&
+          input.bindToCurrentThread === undefined;
+        if (!onlyDisabling) yield* assertNoOwnerEscape(scope);
         const existing = yield* loadScheduledTask(input.scheduledTaskId, limits);
         yield* assertLiveCallerForOtherProject(scope, parent, existing.projectId);
         if (
@@ -1863,128 +1896,257 @@ const make = Effect.gen(function* () {
         return { scheduledTaskId: existing.id, deleted: true };
       },
     ),
-    requestSecret: Effect.fn("OrchestratorMcpService.requestSecret")(function* (scope, input) {
-      const { scope: threadScope, parent } = yield* loadThreadCaller(scope, "request_secret");
-      const threadId = threadScope.thread.threadId;
-      const run = ThreadManagementService.latestActiveRun(parent);
-      if (
-        run === undefined ||
-        run.rootNodeId === null ||
-        run.providerInstanceId !== threadScope.thread.providerInstanceId
-      ) {
-        return yield* failure(
-          "parent_not_active",
-          "Asking for a secret requires an active run owned by this MCP provider session.",
-        );
-      }
-      const runId = run.id;
-      const nodeId = run.rootNodeId;
-      const key = yield* requestKey(input.clientRequestId);
-      const turnItemId = TurnItemId.make(
-        `turn-item:secret-request:${stablePart(threadId)}:${stablePart(key)}`,
-      );
-      const record = (secretStatus: "pending" | "cancelled") =>
-        threadManagement
-          .dispatch({
-            type: "secret_request.record",
-            commandId: stableCommandId({
-              scope,
-              requestKey: key,
-              operation: `secret-${secretStatus}`,
-            }),
-            threadId: threadId,
-            runId,
-            nodeId,
-            turnItemId,
-            label: input.label,
-            reason: input.reason,
-            ...(input.placeholder === undefined ? {} : { placeholder: input.placeholder }),
-            secretStatus,
+    requestSecret: Effect.fn("OrchestratorMcpService.requestSecret")(function (scope, input) {
+      let originalExecution: SecretRequests.SecretRequestExecution | undefined;
+      const guardResponse = Effect.fn("OrchestratorMcpService.guardSecretResponse")(function* () {
+        if (scope.thread === undefined) return;
+        const execution = originalExecution;
+        const records =
+          execution === undefined
+            ? undefined
+            : yield* threadManagement
+                .getThreadRecords(scope.thread.threadId, [
+                  "runs",
+                  "providerThreads",
+                  "providerSessions",
+                ])
+                .pipe(Effect.option);
+        const checked = yield* admission
+          .check({
+            threadId: scope.thread.threadId,
+            ...(execution === undefined
+              ? {}
+              : {
+                  runId: execution.runId,
+                  originSessionId: execution.providerSessionId,
+                  nativeTarget: {
+                    runAttemptId: execution.runAttemptId,
+                    providerThreadId: execution.providerThreadId,
+                    providerSessionId: execution.providerSessionId,
+                    nodeId: execution.nodeId,
+                  },
+                }),
+            operation: "continue",
+            now: DateTime.formatIso(yield* DateTime.now),
           })
-          .pipe(
-            Effect.mapError((error) =>
-              failure(
-                "orchestration_error",
-                `Could not record the secret request: ${errorMessage(error)}`,
+          .pipe(Effect.option);
+        if (Option.isSome(checked) && checked.value._tag === "ordinary") return;
+        const current = records !== undefined && Option.isSome(records) ? records.value : undefined;
+        const run = current?.runs.find((run) => run.id === execution?.runId);
+        const providerThread = current?.providerThreads.find(
+          (thread) => thread.id === execution?.providerThreadId,
+        );
+        const session = current?.providerSessions.find(
+          (session) => session.id === execution?.providerSessionId,
+        );
+        if (
+          execution !== undefined &&
+          Option.isSome(checked) &&
+          checked.value._tag === "admitted" &&
+          checked.value.owner.runId === execution.runId &&
+          checked.value.owner.runAttemptId === execution.runAttemptId &&
+          run !== undefined &&
+          !ThreadManagementService.isTerminalRunStatus(run.status) &&
+          run.activeAttemptId === execution.runAttemptId &&
+          run.rootNodeId === execution.nodeId &&
+          run.providerThreadId === execution.providerThreadId &&
+          providerThread?.providerSessionId === execution.providerSessionId &&
+          session !== undefined &&
+          session.status !== "stopped" &&
+          session.status !== "error"
+        )
+          return;
+        if (execution !== undefined) {
+          yield* threadManagement
+            .stopExactRun({
+              commandId: CommandId.make(
+                `secret-response-stop:${scope.thread.threadId}:${execution.runId}:${execution.runAttemptId}`,
               ),
-            ),
+              threadId: scope.thread.threadId,
+              runId: execution.runId,
+              runAttemptId: execution.runAttemptId,
+              rootNodeId: execution.nodeId,
+              providerThreadId: execution.providerThreadId,
+              providerSessionId: execution.providerSessionId,
+            })
+            .pipe(
+              Effect.catch(() =>
+                Effect.logWarning("Secret response stop could not be confirmed", {
+                  threadId: scope.thread?.threadId,
+                  runId: execution.runId,
+                }),
+              ),
+            );
+        }
+        // A tool error or decline also releases a native wait. Keep every outcome
+        // pending until the exact provider request aborts; a stop receipt alone
+        // cannot prove that native cancellation has completed.
+        return yield* Effect.never;
+      });
+      return Effect.gen(function* () {
+        const { scope: threadScope, parent } = yield* loadThreadCaller(scope, "request_secret");
+        const threadId = threadScope.thread.threadId;
+        const run = ThreadManagementService.latestActiveRun(parent);
+        const retained =
+          (run?.providerInstanceId === threadScope.thread.providerInstanceId ? run : undefined) ??
+          parent.runs
+            .filter(
+              (candidate) => candidate.providerInstanceId === threadScope.thread.providerInstanceId,
+            )
+            .reduce<OrchestrationV2Run | undefined>(
+              (latest, candidate) =>
+                latest === undefined || candidate.ordinal > latest.ordinal ? candidate : latest,
+              undefined,
+            );
+        const retainedProviderThread = parent.providerThreads.find(
+          (thread) => thread.id === retained?.providerThreadId,
+        );
+        if (
+          retained !== undefined &&
+          retained.rootNodeId !== null &&
+          retained.activeAttemptId !== null &&
+          retainedProviderThread?.providerSessionId != null
+        ) {
+          originalExecution = {
+            runId: retained.id,
+            runAttemptId: retained.activeAttemptId,
+            nodeId: retained.rootNodeId,
+            providerThreadId: retainedProviderThread.id,
+            providerSessionId: retainedProviderThread.providerSessionId,
+          };
+        }
+        if (scope.client?.access === "read-only")
+          return yield* failure("capability_denied", "This MCP client cannot request secrets.");
+        yield* assertLiveCaller(scope, parent);
+        if (
+          run === undefined ||
+          run.rootNodeId === null ||
+          run.providerInstanceId !== threadScope.thread.providerInstanceId
+        ) {
+          return yield* failure(
+            "parent_not_active",
+            "Asking for a secret requires an active run owned by this MCP provider session.",
           );
-      yield* record("pending");
-      // Only this call can hand the agent its ref, so the card must not
-      // outlive it: a timeout, a failed wait or an aborted call closes it as
-      // cancelled.
-      const closeCard = record("cancelled").pipe(
-        Effect.catch((error) =>
-          Effect.logWarning("Could not close a secret request card", { error: error.message }),
-        ),
-      );
-
-      const answered = yield* Effect.gen(function* () {
-        while (true) {
-          const projection = yield* threadManagement
-            .getThreadRecords(threadId, ["runs", "turnItems"], {
-              turnItemTypes: ["secret_request"],
-              messageRoles: [],
+        }
+        const runId = run.id;
+        const nodeId = run.rootNodeId;
+        const execution = originalExecution;
+        const key = yield* requestKey(input.clientRequestId);
+        const turnItemId = TurnItemId.make(
+          `turn-item:secret-request:${stablePart(threadId)}:${stablePart(key)}`,
+        );
+        const record = (secretStatus: "pending" | "cancelled") =>
+          threadManagement
+            .dispatch({
+              type: "secret_request.record",
+              commandId: stableCommandId({
+                scope,
+                requestKey: key,
+                operation: `secret-${secretStatus}`,
+              }),
+              threadId: threadId,
+              runId,
+              nodeId,
+              turnItemId,
+              label: input.label,
+              reason: input.reason,
+              ...(input.placeholder === undefined ? {} : { placeholder: input.placeholder }),
+              secretStatus,
             })
             .pipe(
               Effect.mapError((error) =>
                 failure(
                   "orchestration_error",
-                  `Unable to read the secret request: ${errorMessage(error)}`,
+                  `Could not record the secret request: ${errorMessage(error)}`,
                 ),
               ),
             );
-          const item = projection.turnItems.find((candidate) => candidate.id === turnItemId);
-          if (item?.type === "secret_request" && item.secretStatus !== "pending") {
-            return item.secretStatus;
-          }
-          const current = projection.runs.find((candidate) => candidate.id === runId);
-          if (
-            current === undefined ||
-            ThreadManagementService.isTerminalRunStatus(current.status)
-          ) {
-            yield* record("cancelled");
-            return "cancelled" as const;
-          }
-          yield* Effect.sleep(Duration.millis(SECRET_REQUEST_POLL_INTERVAL_MS));
-        }
-      }).pipe(
-        Effect.timeoutOption(
-          Duration.millis(
-            Math.min(input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+        yield* record("pending");
+        // Only this call can hand the agent its ref, so the card must not
+        // outlive it: a timeout, a failed wait or an aborted call closes it as
+        // cancelled.
+        const closeCard = record("cancelled").pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not close a secret request card", { error: error.message }),
           ),
-        ),
-        Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : closeCard)),
-      );
-      if (Option.isNone(answered)) yield* closeCard;
-      const status = Option.isSome(answered)
-        ? answered.value
-        : yield* threadManagement
-            .getThreadRecords(threadId, ["turnItems"], {
-              turnItemTypes: ["secret_request"],
-              messageRoles: [],
-            })
-            .pipe(
-              Effect.map((records) => {
-                const item = records.turnItems.find((candidate) => candidate.id === turnItemId);
-                return item?.type === "secret_request" &&
-                  (item.secretStatus === "saved" || item.secretStatus === "declined")
-                  ? item.secretStatus
-                  : ("timed_out" as const);
-              }),
-              Effect.orElseSucceed(() => "timed_out" as const),
-            );
-      yield* Effect.annotateCurrentSpan({ "secret_request.status": status });
-      yield* Metrics.increment(Metrics.secretRequestsTotal, { status });
-      if (status !== "saved") return { status };
-      const secretRef = yield* secretRequests.savedRef({ threadId: threadId, turnItemId });
-      if (Option.isNone(secretRef)) {
-        return yield* failure(
-          "orchestration_error",
-          "The user saved the secret, but it could not be read. Ask again with a new clientRequestId.",
         );
-      }
-      return { status, secretRef: secretRef.value };
+
+        const answered = yield* Effect.gen(function* () {
+          while (true) {
+            const projection = yield* threadManagement
+              .getThreadRecords(threadId, ["runs", "turnItems"], {
+                turnItemTypes: ["secret_request"],
+                messageRoles: [],
+              })
+              .pipe(
+                Effect.mapError((error) =>
+                  failure(
+                    "orchestration_error",
+                    `Unable to read the secret request: ${errorMessage(error)}`,
+                  ),
+                ),
+              );
+            const item = projection.turnItems.find((candidate) => candidate.id === turnItemId);
+            if (item?.type === "secret_request" && item.secretStatus !== "pending") {
+              return item.secretStatus;
+            }
+            const current = projection.runs.find((candidate) => candidate.id === runId);
+            if (
+              current === undefined ||
+              ThreadManagementService.isTerminalRunStatus(current.status)
+            ) {
+              yield* record("cancelled");
+              return "cancelled" as const;
+            }
+            yield* Effect.sleep(Duration.millis(SECRET_REQUEST_POLL_INTERVAL_MS));
+          }
+        }).pipe(
+          Effect.timeoutOption(
+            Duration.millis(
+              Math.min(input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+            ),
+          ),
+          Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : closeCard)),
+        );
+        if (Option.isNone(answered)) yield* closeCard;
+        const status = Option.isSome(answered)
+          ? answered.value
+          : yield* threadManagement
+              .getThreadRecords(threadId, ["turnItems"], {
+                turnItemTypes: ["secret_request"],
+                messageRoles: [],
+              })
+              .pipe(
+                Effect.map((records) => {
+                  const item = records.turnItems.find((candidate) => candidate.id === turnItemId);
+                  return item?.type === "secret_request" &&
+                    (item.secretStatus === "saved" || item.secretStatus === "declined")
+                    ? item.secretStatus
+                    : ("timed_out" as const);
+                }),
+                Effect.orElseSucceed(() => "timed_out" as const),
+              );
+        yield* Effect.annotateCurrentSpan({ "secret_request.status": status });
+        yield* Metrics.increment(Metrics.secretRequestsTotal, { status });
+        if (status !== "saved") return { status };
+        const secretRef = yield* secretRequests.savedRef({
+          threadId: threadId,
+          turnItemId,
+          ...(execution === undefined ? {} : { execution }),
+        });
+        if (Option.isNone(secretRef)) {
+          return yield* failure(
+            "orchestration_error",
+            "The user saved the secret, but it could not be read. Ask again with a new clientRequestId.",
+          );
+        }
+        return { status, secretRef: secretRef.value };
+      }).pipe(
+        Effect.matchCauseEffect({
+          onFailure: (cause) => guardResponse().pipe(Effect.andThen(Effect.failCause(cause))),
+          onSuccess: (result) => guardResponse().pipe(Effect.as(result)),
+        }),
+      );
     }),
 
     capabilities: Effect.fn("OrchestratorMcpService.capabilities")(function* (scope) {
@@ -2424,6 +2586,7 @@ const make = Effect.gen(function* () {
     createThreads: Effect.fn("OrchestratorMcpService.createThreads")(
       function* (callerScope, input) {
         const { scope, parent } = yield* loadThreadCaller(callerScope, "create_threads");
+        yield* assertNoOwnerEscape(scope);
         const parentRun = ThreadManagementService.latestActiveRun(parent);
         if (
           parentRun === undefined ||
@@ -2842,6 +3005,7 @@ export const layer: Layer.Layer<
   OrchestratorMcpService,
   never,
   | Crypto.Crypto
+  | RunAdmission.RunAdmission
   | ThreadManagementService.ThreadManagementService
   | ThreadLaunchService.ThreadLaunchService
   | GitVcsDriver.GitVcsDriver

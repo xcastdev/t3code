@@ -30,13 +30,22 @@ import {
 } from "@t3tools/contracts";
 
 import * as GitManager from "./GitManager.ts";
+import * as GitIndexOperations from "./GitIndexOperations.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 
+type GitIndexOperationsService = Effect.Success<typeof GitIndexOperations.make>;
+
 export class GitWorkflowService extends Context.Service<
   GitWorkflowService,
   {
+    readonly discoverRepositories: GitIndexOperationsService["discoverRepositories"];
+    readonly indexStatus: GitIndexOperationsService["indexStatus"];
+    readonly mutateIndex: GitIndexOperationsService["mutateIndex"];
+    readonly commitStaged: GitIndexOperationsService["commitStaged"];
+    readonly history: GitIndexOperationsService["history"];
+    readonly historyDiff: GitIndexOperationsService["historyDiff"];
     readonly isRepository: (cwd: string) => Effect.Effect<boolean, GitManagerServiceError>;
     readonly hasCommit: (input: {
       readonly cwd: string;
@@ -174,6 +183,7 @@ export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
   const fileSystem = yield* FileSystem.FileSystem;
+  const index = yield* GitIndexOperations.make;
 
   // Nested projects and path aliases must share the checkout's branch-mutation lease.
   const withCheckoutLease = <A, E, R>(rootPath: string, effect: Effect.Effect<A, E, R>) =>
@@ -298,7 +308,93 @@ export const make = Effect.gen(function* () {
     (input: Input) =>
       ensureGit(operation, input.cwd).pipe(Effect.andThen(run(input)));
 
+  const runReviewedPush = Effect.fn("GitWorkflowService.runReviewedPush")(function* (
+    input: GitRunStackedActionInput,
+    options?: GitManager.GitRunStackedActionOptions,
+  ): Effect.fn.Return<GitRunStackedActionResult, GitCommandError> {
+    const reviewed = input.reviewedPush;
+    if (
+      reviewed === undefined ||
+      input.action !== "push" ||
+      input.featureBranch ||
+      input.commitMessage !== undefined ||
+      input.filePaths !== undefined
+    ) {
+      return yield* new GitCommandError({
+        operation: "GitWorkflowService.runReviewedPush",
+        command: "git",
+        cwd: input.cwd,
+        detail: "Reviewed push recovery cannot be combined with another Git action.",
+      });
+    }
+    const base = {
+      actionId: options?.actionId ?? input.actionId,
+      cwd: input.cwd,
+      action: input.action,
+    };
+    yield* (
+      options?.progressReporter?.publish({ ...base, kind: "action_started", phases: ["push"] }) ??
+        Effect.void
+    );
+    yield* (
+      options?.progressReporter?.publish({
+        ...base,
+        kind: "phase_started",
+        phase: "push",
+        label: "Pushing reviewed commit...",
+      }) ?? Effect.void
+    );
+    const push = yield* git.pushCurrentBranch(input.cwd, null, { reviewed }).pipe(
+      Effect.tapError(
+        () =>
+          options?.progressReporter?.publish({
+            ...base,
+            kind: "action_failed",
+            phase: "push",
+            message: "Reviewed push failed. The completed commit is available to retry.",
+          }) ?? Effect.void,
+      ),
+    );
+    const result: GitRunStackedActionResult = {
+      action: "push",
+      branch: { status: "skipped_not_requested" },
+      commit: { status: "skipped_not_requested" },
+      push,
+      pr: { status: "skipped_not_requested" },
+      toast: { title: `Pushed ${push.branch}`, cta: { kind: "none" } },
+    };
+    yield* (
+      options?.progressReporter?.publish({ ...base, kind: "action_finished", result }) ??
+        Effect.void
+    );
+    return result;
+  });
+
   return GitWorkflowService.of({
+    discoverRepositories: index.discoverRepositories,
+    indexStatus: Effect.fn("GitWorkflowService.indexStatus")((input) =>
+      ensureGitCommand("indexStatus", input.cwd).pipe(Effect.andThen(index.indexStatus(input))),
+    ),
+    history: Effect.fn("GitWorkflowService.history")((input) =>
+      ensureGitCommand("history", input.cwd).pipe(Effect.andThen(index.history(input))),
+    ),
+    historyDiff: Effect.fn("GitWorkflowService.historyDiff")((input) =>
+      ensureGitCommand("historyDiff", input.cwd).pipe(Effect.andThen(index.historyDiff(input))),
+    ),
+    mutateIndex: Effect.fn("GitWorkflowService.mutateIndex")((input) =>
+      ensureGitCommand("mutateIndex", input.cwd).pipe(
+        Effect.andThen(index.mutateIndex(input)),
+        Effect.tap((result) => gitManager.invalidateLocalStatus(result.fingerprint.rootPath)),
+        Effect.tap(() => gitManager.invalidateLocalStatus(input.cwd)),
+      ),
+    ),
+    commitStaged: Effect.fn("GitWorkflowService.commitStaged")((input) =>
+      ensureGitCommand("commitStaged", input.cwd).pipe(
+        Effect.andThen(index.commitStaged(input)),
+        Effect.tap(() => gitManager.invalidateStatus(input.expected.rootPath)),
+        Effect.tap(() => gitManager.invalidateStatus(input.cwd)),
+      ),
+    ),
     isRepository: (cwd) =>
       registry.detect({ cwd }).pipe(
         Effect.map((handle) => handle?.kind === "git"),
@@ -368,17 +464,25 @@ export const make = Effect.gen(function* () {
     invalidateStatus: gitManager.invalidateStatus,
     pullCurrentBranch: (cwd) =>
       ensureGitCommand("GitWorkflowService.pullCurrentBranch", cwd).pipe(
-        Effect.andThen(git.pullCurrentBranch(cwd)),
+        Effect.flatMap((handle) =>
+          withCheckoutLease(handle.repository.rootPath, git.pullCurrentBranch(cwd)),
+        ),
       ),
     runStackedAction: (input, options) =>
       ensureGit("GitWorkflowService.runStackedAction", input.cwd).pipe(
         Effect.flatMap((handle) =>
-          input.featureBranch
-            ? withCheckoutLease(
-                handle.repository.rootPath,
-                gitManager.runStackedAction(input, options),
-              )
-            : gitManager.runStackedAction(input, options),
+          withCheckoutLease(
+            handle.repository.rootPath,
+            input.reviewedPush === undefined
+              ? gitManager.runStackedAction(input, options)
+              : runReviewedPush(input, options).pipe(
+                  Effect.ensuring(
+                    gitManager
+                      .invalidateStatus(handle.repository.rootPath)
+                      .pipe(Effect.andThen(gitManager.invalidateStatus(input.cwd))),
+                  ),
+                ),
+          ),
         ),
       ),
     resolvePullRequest: routeGitManager(
@@ -462,7 +566,9 @@ export const make = Effect.gen(function* () {
       ),
     renameBranch: (input) =>
       ensureGit("GitWorkflowService.renameBranch", input.cwd).pipe(
-        Effect.andThen(git.renameBranch(input)),
+        Effect.flatMap((handle) =>
+          withCheckoutLease(handle.repository.rootPath, git.renameBranch(input)),
+        ),
       ),
   });
 });

@@ -32,6 +32,7 @@ import {
   ChevronRight,
   FileDiff,
   Files,
+  GitBranch,
   Globe2,
   Plus,
   TerminalSquare,
@@ -137,6 +138,8 @@ interface RightPanelTabsProps {
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
   onAddDevice: () => void;
+  /** Absent where there is no workspace to inspect, such as the pull request list. */
+  onAddSourceControl?: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -167,6 +170,7 @@ const SURFACE_DISABLED_REASONS = {
   terminal: "Terminal surfaces are only available from a project thread.",
   files: "Files are only available when a project is open.",
   diff: "Diff is only available for server threads in Git repositories.",
+  sourceControl: "Source control is only available when a project is open.",
   pullRequest: "This thread's branch has no pull request yet.",
   pullRequests: "No linked pull requests are available for this thread.",
   device: "Devices are only available from a thread.",
@@ -191,6 +195,7 @@ const SURFACE_UNAVAILABLE_HINTS = {
   terminal: "Available when a project is open.",
   files: "Available when a project is open.",
   diff: "Available for Git repositories.",
+  sourceControl: "Available when a project is open.",
   pullRequest: "No pull request on this branch yet.",
   pullRequests: "No linked pull requests available.",
   device: "Available from a thread.",
@@ -315,6 +320,8 @@ function RightPanelEmptyState(props: {
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
   onAddDevice: () => void;
+  /** Absent where there is no workspace to inspect, such as the pull request list. */
+  onAddSourceControl?: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -357,6 +364,14 @@ function RightPanelEmptyState(props: {
       available: props.diffAvailable,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.diff,
       onClick: props.onAddDiff,
+    },
+    {
+      label: "Source control",
+      icon: GitBranch,
+      shortcut: "G",
+      available: props.onAddSourceControl !== undefined,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.sourceControl,
+      onClick: () => props.onAddSourceControl?.(),
     },
     {
       label: "Pull request",
@@ -565,6 +580,8 @@ function surfaceTitle(
       return `#${surface.number}`;
     case "pull-requests":
       return "Pull requests";
+    case "source-control":
+      return "Source control";
     case "device":
       return surface.title ?? surface.target?.name ?? "Device";
     case "preview": {
@@ -655,6 +672,8 @@ function SurfaceIcon({
       );
     case "pull-requests":
       return <PullRequestGlyph.link className="size-3 shrink-0" />;
+    case "source-control":
+      return <GitBranch className="size-3 shrink-0" />;
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -1061,6 +1080,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       onClick: props.onAddDiff,
     },
     {
+      label: "Source control",
+      icon: GitBranch,
+      shortcut: "G",
+      available: props.onAddSourceControl !== undefined,
+      disabledReason: SURFACE_DISABLED_REASONS.sourceControl,
+      onClick: () => props.onAddSourceControl?.(),
+    },
+    {
       label: "Pull request",
       icon: PullRequestGlyph.pullRequest,
       shortcut: "P",
@@ -1457,6 +1484,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddPullRequest={props.onAddPullRequest}
             onAddPullRequests={props.onAddPullRequests}
             onAddDevice={props.onAddDevice}
+            {...(props.onAddSourceControl ? { onAddSourceControl: props.onAddSourceControl } : {})}
             browserAvailable={props.browserAvailable}
             terminalAvailable={props.terminalAvailable}
             diffAvailable={props.diffAvailable}

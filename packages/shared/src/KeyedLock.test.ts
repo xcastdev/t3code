@@ -5,6 +5,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 
 import * as KeyedLock from "./KeyedLock.ts";
@@ -112,3 +113,44 @@ describe("KeyedLock", () => {
     }),
   );
 });
+
+it.effect("tries a busy key without joining its queue or blocking other keys", () =>
+  Effect.gen(function* () {
+    const lock = yield* KeyedLock.make<string>();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const holder = yield* lock
+      .withLock(
+        "a",
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      )
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Deferred.await(entered);
+    const skipped = yield* lock.tryWithLock(
+      "a",
+      Ref.update(events, (rows) => [...rows, "must-not-run"]),
+    );
+    assert.isTrue(Option.isNone(skipped));
+    assert.isTrue(
+      Option.isSome(
+        yield* lock.tryWithLock(
+          "b",
+          Ref.update(events, (rows) => [...rows, "b"]),
+        ),
+      ),
+    );
+    yield* Deferred.succeed(release, undefined);
+    yield* Fiber.join(holder);
+    assert.isTrue(
+      Option.isSome(
+        yield* lock.tryWithLock(
+          "a",
+          Ref.update(events, (rows) => [...rows, "a"]),
+        ),
+      ),
+    );
+    assert.deepEqual(yield* Ref.get(events), ["b", "a"]);
+    assert.deepEqual(yield* lock.activeKeys, []);
+  }),
+);

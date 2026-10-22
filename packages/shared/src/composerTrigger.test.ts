@@ -32,6 +32,30 @@ describe("detectComposerTrigger", () => {
     (text) => expect(detectComposerTrigger(text, text.length)).toBeNull(),
   );
 
+  it.each(["#issue:login", "#iss:login", "#ISSUE:login"])(
+    "detects the explicit issue filter in %j",
+    (token) => {
+      const text = `Fix ${token}`;
+      expect(detectComposerTrigger(text, text.length)).toEqual({
+        kind: "issue",
+        query: "login",
+        rangeStart: 4,
+        rangeEnd: text.length,
+      });
+    },
+  );
+
+  it("keeps bare # as the pull request picker", () => {
+    expect(detectComposerTrigger("See #12", 7)).toMatchObject({
+      kind: "pull-request",
+      query: "12",
+    });
+    expect(detectComposerTrigger("See #issue", 10)).toMatchObject({
+      kind: "pull-request",
+      query: "issue",
+    });
+  });
+
   it.each(["$", "€", "𑿝"])("detects %s skill prefixes and their source range", (prefix) => {
     const text = `Use ${prefix}review`;
     expect(detectComposerTrigger(text, text.length)).toEqual({

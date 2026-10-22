@@ -1,3 +1,5 @@
+import { ContextHandoffEpoch } from "./ContextHandoffEpoch.ts";
+import * as Option from "effect/Option";
 import {
   OrchestrationV2ContextHandoff,
   type OrchestrationV2TurnItem,
@@ -229,6 +231,78 @@ function providerMessageWithContextHandoffs(input: {
 const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffService.layer")(
   function* () {
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
+    const epoch = yield* Effect.serviceOption(ContextHandoffEpoch);
+    const epochFields = Effect.fn("ContextHandoffService.memoryEpoch")(
+      function* (input: {
+        threadId: ThreadId;
+        targetRunId: RunId;
+        toProviderThreadId: ProviderThreadId;
+        fromProviderThreadIds?: ReadonlyArray<ProviderThreadId>;
+      }) {
+        const value = Option.isSome(epoch) ? yield* epoch.value.current(input.threadId) : undefined;
+        return value ?? {};
+      },
+      (effect, input) =>
+        effect.pipe(
+          Effect.mapError(
+            (cause) =>
+              new ContextHandoffPrepareError({
+                ...input,
+                fromProviderThreadIds: Array.from(input.fromProviderThreadIds ?? []),
+                cause,
+              }),
+          ),
+        ),
+    );
+    const captureHistory = Effect.fn("ContextHandoffService.captureHistory")(
+      function* (
+        input: {
+          threadId: ThreadId;
+          targetRunId: RunId;
+          toProviderThreadId: ProviderThreadId;
+          fromProviderThreadIds?: ReadonlyArray<ProviderThreadId>;
+        },
+        items: ReadonlyArray<OrchestrationV2TurnItem>,
+      ) {
+        const safe = Option.isSome(epoch)
+          ? yield* epoch.value.capture({ threadId: input.threadId, items })
+          : { items, omittedItems: 0 };
+        return {
+          ...safe,
+          stamp: {
+            ...(safe.memoryEpoch !== undefined && safe.omittedItems > 0
+              ? { protectedHistoryOmissions: true }
+              : {}),
+            ...(safe.memoryEpoch === undefined ? {} : { memoryEpoch: safe.memoryEpoch }),
+            ...(safe.memoryContextHash === undefined
+              ? {}
+              : { memoryContextHash: safe.memoryContextHash }),
+          },
+        };
+      },
+      (effect, input) =>
+        effect.pipe(
+          Effect.mapError(
+            (cause) =>
+              new ContextHandoffPrepareError({
+                ...input,
+                fromProviderThreadIds: Array.from(input.fromProviderThreadIds ?? []),
+                cause,
+              }),
+          ),
+        ),
+    );
+    const omittedCoverage = (count: number) =>
+      count === 0
+        ? ""
+        : `\n${count} historical items omitted by current memory source/derived-context policy or its 512-item bound. Visible history is unchanged; current retained memory is supplied separately. Do not restore excluded personal information from retained history.`;
+    const policyCoverage = (coverage: string, count: number) =>
+      count === 0
+        ? coverage
+        : coverage
+            .split("\n")
+            .filter((line) => !line.startsWith("Recover omitted history"))
+            .join("\n") + omittedCoverage(count);
     const tokenCap = yield* handoffTokenCapConfig.pipe(
       Effect.orElseSucceed(() => DEFAULT_HANDOFF_TOKEN_CAP),
     );
@@ -242,6 +316,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
         readonly createdAt: DateTime.Utc;
       }) {
+        const safe = yield* captureHistory(input, input.items);
         const handoffId = yield* idAllocator.allocate
           .contextHandoff({
             threadId: input.threadId,
@@ -260,9 +335,12 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
                 }),
             ),
           );
-        const coverage = handoffCoverage({ ...input, coveredRunOrdinals: { from: 1, to: 1 } });
+        const coverage = policyCoverage(
+          handoffCoverage({ ...input, items: safe.items, coveredRunOrdinals: { from: 1, to: 1 } }),
+          safe.omittedItems,
+        );
         const selected = selectHistory({
-          messages: input.items.flatMap((item) => {
+          messages: safe.items.flatMap((item) => {
             const message = historicalMessage(item);
             return message === null ? [] : [message];
           }),
@@ -279,12 +357,13 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           coveredRunOrdinals: { from: 1, to: 1 },
           strategy: "manual_context",
           status: "ready",
+          ...safe.stamp,
           summaryMessageId: null,
-          summaryText: makeLegacyImportSummary(input.items),
+          summaryText: makeLegacyImportSummary(safe.items),
           history: {
             messages: selected.messages,
             coverage,
-            omittedItems: selected.omittedItems,
+            omittedItems: selected.omittedItems + safe.omittedItems,
             omittedItemIds: selected.omittedItemIds,
           },
           createdByProviderInstanceId: null,
@@ -331,6 +410,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         status: "ready",
         summaryMessageId: null,
         summaryText: "Manual context handoff.",
+        ...(yield* epochFields(input)),
         createdByProviderInstanceId: null,
         createdAt: now,
         updatedAt: now,
@@ -351,6 +431,10 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         readonly deltaItems: ReadonlyArray<OrchestrationV2TurnItem>;
         readonly createdAt: DateTime.Utc;
       }) {
+        const safe = yield* captureHistory(
+          { ...input, threadId: input.targetThreadId },
+          input.deltaItems,
+        );
         const handoffId = yield* idAllocator.allocate
           .contextHandoff({
             threadId: input.targetThreadId,
@@ -369,13 +453,16 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
                 }),
             ),
           );
-        const coverage = handoffCoverage({
-          threadId: input.sourceThreadId,
-          coveredRunOrdinals: input.coveredRunOrdinals,
-          items: input.deltaItems,
-        });
+        const coverage = policyCoverage(
+          handoffCoverage({
+            threadId: input.sourceThreadId,
+            coveredRunOrdinals: input.coveredRunOrdinals,
+            items: safe.items,
+          }),
+          safe.omittedItems,
+        );
         const selected = selectHistory({
-          messages: input.deltaItems.flatMap((item) => {
+          messages: safe.items.flatMap((item) => {
             const message = historicalMessage(item);
             return message === null ? [] : [message];
           }),
@@ -393,11 +480,12 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           strategy: "fork_delta_summary",
           status: "ready",
           summaryMessageId: null,
-          summaryText: makeForkDeltaSummary(input),
+          summaryText: makeForkDeltaSummary({ ...input, deltaItems: safe.items }),
+          ...safe.stamp,
           history: {
             messages: selected.messages,
             coverage,
-            omittedItems: selected.omittedItems,
+            omittedItems: selected.omittedItems + safe.omittedItems,
             omittedItemIds: selected.omittedItemIds,
           },
           createdByProviderInstanceId: null,
@@ -426,6 +514,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
       readonly items: ReadonlyArray<OrchestrationV2TurnItem>;
       readonly createdAt: DateTime.Utc;
     }) {
+      const safe = yield* captureHistory(input, input.items);
       const handoffId = yield* idAllocator.allocate
         .contextHandoff({
           threadId: input.threadId,
@@ -445,9 +534,12 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
           ),
         );
       const runStatuses = new Map(input.runs?.map((run) => [run.id, run.status]));
-      const coverage = handoffCoverage(input);
+      const coverage = policyCoverage(
+        handoffCoverage({ ...input, items: safe.items }),
+        safe.omittedItems,
+      );
       const selected = selectHistory({
-        messages: input.items.flatMap((item) => {
+        messages: safe.items.flatMap((item) => {
           const message = historicalMessage(item);
           return message === null
             ? []
@@ -473,10 +565,11 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         status: "ready",
         summaryMessageId: null,
         summaryText: renderHistory(selected.messages, selected.context),
+        ...safe.stamp,
         history: {
           messages: selected.messages,
           coverage,
-          omittedItems: selected.omittedItems,
+          omittedItems: selected.omittedItems + safe.omittedItems,
           omittedItemIds: selected.omittedItemIds,
         },
         createdByProviderInstanceId: null,

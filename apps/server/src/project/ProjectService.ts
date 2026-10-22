@@ -1,3 +1,4 @@
+import * as TerminalManager from "../terminal/Manager.ts";
 import {
   CommandId,
   type OrchestrationProjectShell,
@@ -142,6 +143,7 @@ export class ProjectService extends Context.Service<
 
 export const make = Effect.gen(function* () {
   const projects = yield* ProjectStore.ProjectStoreV2;
+  const terminals = yield* Effect.serviceOption(TerminalManager.TerminalManager);
   const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
   const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
   const threadProjections = yield* ProjectionStore.ProjectionStoreV2;
@@ -327,6 +329,22 @@ export const make = Effect.gen(function* () {
 
   const create: ProjectService["Service"]["create"] = Effect.fn("ProjectService.create")(
     function* (input) {
+      yield* eventSink
+        .assertProjectCommand({
+          commandId: input.commandId,
+          projectId: input.projectId,
+          commandType: "project.create",
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProjectOperationError({
+                operation: "dispatch-project-command",
+                projectId: input.projectId,
+                cause,
+              }),
+          ),
+        );
       const workspaceRoot = yield* normalizeWorkspaceRoot({
         projectId: input.projectId,
         workspaceRoot: input.workspaceRoot,
@@ -347,6 +365,22 @@ export const make = Effect.gen(function* () {
 
   const update: ProjectService["Service"]["update"] = Effect.fn("ProjectService.update")(
     function* (input) {
+      yield* eventSink
+        .assertProjectCommand({
+          commandId: input.commandId,
+          projectId: input.projectId,
+          commandType: "project.meta.update",
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProjectOperationError({
+                operation: "dispatch-project-command",
+                projectId: input.projectId,
+                cause,
+              }),
+          ),
+        );
       const existing = yield* readRow(input.projectId);
       if (Option.isNone(existing)) {
         return yield* new ProjectNotFoundError({ projectId: input.projectId });
@@ -474,11 +508,7 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  // A machine-disabled provider instance that a deleted project's override
-  // once turned on must not stay probed and alive forever. Nothing else
-  // removes the entry, so deletion is where it goes; best-effort because a
-  // settings write failure should not block the deletion it is cleaning up
-  // after, and a server crash before a replay never revisits this project.
+  // Deleted projects must not keep an otherwise disabled provider instance alive.
   const clearProjectSettingsOverrides = (projectId: ProjectId) =>
     serverSettings.updateSettings({ projectSettingsOverrides: { [projectId]: null } }).pipe(
       Effect.asVoid,
@@ -493,6 +523,22 @@ export const make = Effect.gen(function* () {
   const deleteProject: ProjectService["Service"]["delete"] = Effect.fn("ProjectService.delete")(
     function* (input) {
       const { projectId } = input;
+      yield* eventSink
+        .assertProjectCommand({
+          commandId: input.commandId,
+          projectId,
+          commandType: "project.delete",
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProjectOperationError({
+                operation: "dispatch-project-command",
+                projectId,
+                cause,
+              }),
+          ),
+        );
       // A deleted row still reaches commit, so a retried command id replays its
       // receipt and any other command id is rejected as not found.
       const existing = yield* readRow(projectId, { includeDeleted: true });
@@ -505,9 +551,18 @@ export const make = Effect.gen(function* () {
         yield* deleteChildThreads(input);
       }
       yield* commit({ type: "project.delete", commandId: input.commandId, projectId });
-      if (isFirstDelete) {
-        yield* clearProjectSettingsOverrides(projectId);
-      }
+      yield* clearProjectSettingsOverrides(projectId);
+      if (Option.isSome(terminals))
+        yield* terminals.value.closeProject(projectId).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProjectOperationError({
+                operation: "dispatch-project-command",
+                projectId,
+                cause,
+              }),
+          ),
+        );
       yield* projectEnrichment.invalidate([existing.value.workspaceRoot]);
       return yield* readCommitted(projectId);
     },

@@ -1,4 +1,8 @@
-import { PRIMARY_LOCAL_ENVIRONMENT_ID, type DesktopEnvironmentBootstrap } from "@t3tools/contracts";
+import {
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type DesktopAttachedBackendTarget,
+  type DesktopEnvironmentBootstrap,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
@@ -7,6 +11,7 @@ const PrimaryEnvironmentTargetSource = Schema.Literals([
   "configured",
   "window-origin",
   "desktop-managed",
+  "desktop-attached",
 ]);
 type PrimaryEnvironmentTargetSource = typeof PrimaryEnvironmentTargetSource.Type;
 
@@ -59,6 +64,24 @@ export class DesktopEnvironmentBootstrapIncompleteError extends Schema.TaggedErr
   }
 }
 
+export class DesktopAttachedBootstrapIncompleteError extends Schema.TaggedError<DesktopAttachedBootstrapIncompleteError>()(
+  "DesktopAttachedBootstrapIncompleteError",
+  {},
+) {
+  override get message(): string {
+    return "The attached T3 Code server is missing its identity. Open Settings → Connections to refresh or detach it.";
+  }
+}
+
+export class DesktopAttachmentUnavailableError extends Schema.TaggedError<DesktopAttachmentUnavailableError>()(
+  "DesktopAttachmentUnavailableError",
+  { reason: Schema.String },
+) {
+  override get message(): string {
+    return `The saved attached server can't be used: ${this.reason}. Attach it again or switch back to the bundled server.`;
+  }
+}
+
 export class PrimaryEnvironmentDisabledError extends Schema.TaggedError<PrimaryEnvironmentDisabledError>()(
   "PrimaryEnvironmentDisabledError",
   {},
@@ -74,6 +97,12 @@ export interface PrimaryEnvironmentTarget {
     readonly httpBaseUrl: string;
     readonly wsBaseUrl: string;
   };
+  /**
+   * The desktop attachment this target was read from. Every credential request for an
+   * attached server carries it, so the main process can refuse a token minted for a
+   * different endpoint, identity or attachment revision.
+   */
+  readonly attached?: DesktopAttachedBackendTarget;
 }
 
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
@@ -144,7 +173,8 @@ export function isLoopbackHostname(hostname: string): boolean {
 function resolveHttpRequestBaseUrl(primaryTarget: PrimaryEnvironmentTarget): string {
   const httpBaseUrl = primaryTarget.target.httpBaseUrl;
   const configuredDevServerUrl = import.meta.env.VITE_DEV_SERVER_URL?.trim();
-  if (!configuredDevServerUrl) {
+  // The dev proxy forwards to the desktop-managed backend, never to an attached server.
+  if (!configuredDevServerUrl || primaryTarget.source === "desktop-attached") {
     return httpBaseUrl;
   }
 
@@ -239,7 +269,40 @@ function resolveWindowOriginPrimaryTarget(): PrimaryEnvironmentTarget {
   };
 }
 
+let unavailableAttachment: DesktopAttachmentUnavailableError | null = null;
+let attachmentCheck: Promise<void> | null = null;
+
+/**
+ * An unusable saved attachment leaves the desktop with no primary bootstrap, which reads
+ * the same as a managed backend that is still starting. Only the main process knows which
+ * it is, so the async entry points ask once before anything falls back to the page origin.
+ * Attaching and detaching relaunch the app, so the answer holds for this page.
+ */
+export function verifyDesktopPrimaryAttachment(): Promise<void> {
+  attachmentCheck ??= (async () => {
+    const bridge = window.desktopBridge;
+    if (bridge === undefined || isLocalEnvironmentDisabled()) return;
+    if (getDesktopLocalEnvironmentBootstrap() !== null) return;
+    const state = await bridge.getPrimaryBackendState();
+    if (state.mode === "invalid-attached") {
+      unavailableAttachment = new DesktopAttachmentUnavailableError({ reason: state.reason });
+    }
+  })().catch((cause: unknown) => {
+    attachmentCheck = null;
+    throw cause;
+  });
+  return attachmentCheck.then(() => {
+    if (unavailableAttachment !== null) throw unavailableAttachment;
+  });
+}
+
+export function __resetDesktopPrimaryAttachmentForTests(): void {
+  unavailableAttachment = null;
+  attachmentCheck = null;
+}
+
 function resolveDesktopPrimaryTarget(): PrimaryEnvironmentTarget | null {
+  if (unavailableAttachment !== null) throw unavailableAttachment;
   const desktopBootstrap = getDesktopLocalEnvironmentBootstrap();
   if (!desktopBootstrap) {
     return null;
@@ -252,6 +315,33 @@ function resolveDesktopPrimaryTarget(): PrimaryEnvironmentTarget | null {
       hasHttpBaseUrl: Boolean(desktopBootstrap.httpBaseUrl),
       hasWsBaseUrl: Boolean(desktopBootstrap.wsBaseUrl),
     });
+  }
+
+  if (desktopBootstrap.ownership === "attached") {
+    if (!desktopBootstrap.environmentId || !desktopBootstrap.attachmentRevision) {
+      throw new DesktopAttachedBootstrapIncompleteError();
+    }
+    const httpBaseUrl = normalizeBaseUrl(
+      desktopBootstrap.httpBaseUrl,
+      "desktop-attached",
+      "http-base-url",
+    );
+    const wsBaseUrl = normalizeBaseUrl(
+      desktopBootstrap.wsBaseUrl,
+      "desktop-attached",
+      "websocket-base-url",
+    );
+    return {
+      source: "desktop-attached",
+      target: { httpBaseUrl, wsBaseUrl },
+      // The main process compares these verbatim, so they stay exactly as the bridge sent them.
+      attached: {
+        httpBaseUrl: desktopBootstrap.httpBaseUrl,
+        wsBaseUrl: desktopBootstrap.wsBaseUrl,
+        environmentId: desktopBootstrap.environmentId,
+        attachmentRevision: desktopBootstrap.attachmentRevision,
+      },
+    };
   }
 
   return {

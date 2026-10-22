@@ -1,6 +1,13 @@
-import { ProjectId, ThreadId, type ThreadPullRequestLink } from "@t3tools/contracts";
+import {
+  AssistantId,
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
+  type ThreadPullRequestLink,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
+import { scopeProject } from "./models.ts";
 import { v2Project, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 import {
   applyShellStreamEvent,
@@ -27,6 +34,25 @@ const otherIdentity = {
 };
 
 describe("applyShellStreamEvent", () => {
+  it("retains project ownership from live updates through environment scoping and enrichment", () => {
+    const assistantId = AssistantId.make("retained-assistant");
+    const updated = applyShellStreamEvent(v2ShellSnapshot, {
+      kind: "project.updated",
+      sequence: 1,
+      project: { ...v2Project, assistantId },
+    });
+    const enriched = mergeShellSnapshotProjects(
+      updated,
+      { ...updated, projects: [{ ...v2Project, repositoryIdentity }] },
+      { resolvedRepositoryIdentityRoots: [v2Project.workspaceRoot] },
+    );
+    const project = enriched.projects[0]!;
+    expect(scopeProject(EnvironmentId.make("owner-environment"), project).assistantId).toBe(
+      assistantId,
+    );
+    expect(project.repositoryIdentity).toEqual(repositoryIdentity);
+  });
+
   it("ignores stale project updates without mutating the snapshot", () => {
     const snapshotWithProject = {
       ...v2ShellSnapshot,

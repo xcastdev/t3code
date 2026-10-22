@@ -63,6 +63,7 @@ import {
 import { ReviewCommentComposerSheet } from "./features/review/ReviewCommentComposerSheet";
 import { ReviewSheet } from "./features/review/ReviewSheet";
 import { ThreadTerminalRouteScreen } from "./features/terminal/ThreadTerminalRouteScreen";
+import { ProjectTerminalRouteScreen } from "./features/terminal/ProjectTerminalRouteScreen";
 import { DevicePreviewRouteScreen } from "./features/devices/DevicePreviewRouteScreen";
 import { BrowserPreviewRouteScreen } from "./features/browser/BrowserPreviewRouteScreen";
 import { GitBranchesSheet } from "./features/threads/git/GitBranchesSheet";
@@ -71,6 +72,7 @@ import { GitConfirmSheet } from "./features/threads/git/GitConfirmSheet";
 import { GitOverviewSheet } from "./features/threads/git/GitOverviewSheet";
 import { ThreadPullRequestsSheet } from "./features/threads/ThreadPullRequestsSheet";
 import { ThreadAgentsSheet } from "./features/threads/ThreadAgentsSheet";
+import { ThreadHistorySheet } from "./features/thread-history/ThreadHistorySheet";
 import { ThreadBackgroundWorkSheet } from "./features/threads/ThreadBackgroundWorkSheet";
 import { ThreadQueueSheet } from "./features/threads/ThreadQueueControl";
 import { ThreadRouteScreen } from "./features/threads/ThreadRouteScreen";
@@ -129,9 +131,26 @@ import { SettingsProjectGroupingRouteScreen } from "./features/settings/Settings
 import { SettingsProjectOverviewRouteScreen } from "./features/settings/SettingsProjectOverviewRouteScreen";
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
+import {
+  SettingsWorkProjectRouteScreen,
+  SettingsWorkRouteScreen,
+} from "./features/work/WorkScreens";
+import { SettingsWorkTaskRouteScreen } from "./features/work/WorkTaskScreen";
+import {
+  SettingsAgentRouteScreen,
+  SettingsAgentsRouteScreen,
+} from "./features/assistants/AssistantScreens";
 import { SettingsAboutRouteScreen } from "./features/settings/SettingsAboutRouteScreen";
 import { SettingsNotificationsRouteScreen } from "./features/settings/SettingsNotificationsRouteScreen";
 import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
+import {
+  SettingsResourceScopeRouteScreen,
+  SettingsResourcesRouteScreen,
+  SettingsSkillEditorRouteScreen,
+  SettingsSkillInstallRouteScreen,
+  SettingsTextResourceEditorRouteScreen,
+  SettingsThreadResourcesRouteScreen,
+} from "./features/settings/SettingsResourcesRouteScreen";
 import { SettingsThreadsRouteScreen } from "./features/settings/SettingsThreadsRouteScreen";
 import { SettingsEnvironmentFilterProvider } from "./features/settings/settings-environment-filter";
 import { ShowcaseCaptureCoordinator } from "./features/showcase/ShowcaseCaptureCoordinator";
@@ -418,6 +437,61 @@ const SettingsContentStack = createV5SheetStackNavigator({
         title: "Usage",
       },
     }),
+    SettingsWork: createNativeStackScreen({
+      screen: SettingsWorkRouteScreen,
+      linking: "work",
+      options: { title: "Work" },
+    }),
+    SettingsWorkProject: createNativeStackScreen({
+      screen: SettingsWorkProjectRouteScreen,
+      linking: "work/:environmentId/:projectId",
+      options: { title: "Work" },
+    }),
+    SettingsWorkTask: createNativeStackScreen({
+      screen: SettingsWorkTaskRouteScreen,
+      linking: "work/:environmentId/:projectId/:taskId",
+      options: { title: "Task" },
+    }),
+    SettingsAgents: createNativeStackScreen({
+      screen: SettingsAgentsRouteScreen,
+      linking: "agents",
+      options: { title: "Agents" },
+    }),
+    SettingsAgent: createNativeStackScreen({
+      screen: SettingsAgentRouteScreen,
+      linking: "agents/:environmentId/:assistantId",
+      options: { title: "Agent" },
+    }),
+    SettingsResources: createNativeStackScreen({
+      screen: SettingsResourcesRouteScreen,
+      linking: "resources",
+      options: { title: "Skills and commands" },
+    }),
+    SettingsResourceScope: createNativeStackScreen({
+      screen: SettingsResourceScopeRouteScreen,
+      linking: "resources/:environmentId",
+      options: { title: "Skills and commands" },
+    }),
+    SettingsSkillEditor: createNativeStackScreen({
+      screen: SettingsSkillEditorRouteScreen,
+      linking: "resources/:environmentId/skill",
+      options: { title: "Skill" },
+    }),
+    SettingsTextResourceEditor: createNativeStackScreen({
+      screen: SettingsTextResourceEditorRouteScreen,
+      linking: "resources/:environmentId/text",
+      options: { title: "Command" },
+    }),
+    SettingsSkillInstall: createNativeStackScreen({
+      screen: SettingsSkillInstallRouteScreen,
+      linking: "resources/:environmentId/install",
+      options: { title: "Install skill" },
+    }),
+    SettingsThreadResources: createNativeStackScreen({
+      screen: SettingsThreadResourcesRouteScreen,
+      linking: "resources/:environmentId/thread/:threadId",
+      options: { title: "Thread skills and commands" },
+    }),
   },
 });
 
@@ -559,6 +633,7 @@ const WORKSPACE_OVERLAY_ROUTES = new Set([
   "SettingsLegal",
   "SettingsSheet",
   "ThreadAgents",
+  "ThreadHistory",
   "ThreadBackgroundWork",
   "ThreadPullRequests",
   "ThreadQueue",
@@ -783,6 +858,12 @@ const RootStackConfig = createWorkspaceStackNavigator({
       linking: `${THREAD_LINKING_PREFIX}/terminal`,
       options: SOLID_HEADER_OPTIONS,
     }),
+    // Project-owned terminals are a separate route and controller from thread terminals.
+    ProjectTerminals: createNativeStackScreen({
+      screen: ProjectTerminalRouteScreen,
+      linking: "projects/:environmentId/:projectId/terminals",
+      options: SOLID_HEADER_OPTIONS,
+    }),
     ThreadDevicePreview: createNativeStackScreen({
       screen: DevicePreviewRouteScreen,
       linking: `${THREAD_LINKING_PREFIX}/devices`,
@@ -886,6 +967,15 @@ const RootStackConfig = createWorkspaceStackNavigator({
         ...FORM_SHEET_PRESENTATION_OPTIONS,
         headerShown: false,
         sheetAllowedDetents: [0.5, 0.9],
+        sheetGrabberVisible: true,
+      },
+    }),
+    ThreadHistory: createNativeStackScreen({
+      screen: ThreadHistorySheet,
+      options: {
+        ...FORM_SHEET_PRESENTATION_OPTIONS,
+        headerShown: false,
+        sheetAllowedDetents: [0.6, 0.95],
         sheetGrabberVisible: true,
       },
     }),

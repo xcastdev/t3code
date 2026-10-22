@@ -1,4 +1,13 @@
+import { AssistantEventBus } from "../assistants/AssistantEventBus.ts";
+import { AssistantRoutineAuthorization } from "../assistants/AssistantRoutineAuthorization.ts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Stable owner fire IDs bind retained trigger identity.
+import * as NodeCrypto from "node:crypto";
+import { AssistantError, AssistantRepository } from "../assistants/AssistantRepository.ts";
+import { AssistantRoutineRepository } from "../assistants/AssistantRoutineRepository.ts";
+import { AssistantRoutineMutation } from "../assistants/AssistantRoutineMutation.ts";
+import { assertOrdinaryAssistantDestination } from "../assistants/AssistantGuards.ts";
 import {
+  canonicalProjectWorkPayload,
   CommandId,
   MessageId,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -159,6 +168,8 @@ export type WebhookTriggerResult =
     }
   | { readonly _tag: "expired" };
 
+const isAssistantError = Schema.is(AssistantError);
+
 const webhookFilters = (filters: ReadonlyArray<ScheduledTaskWebhookFilter> | undefined) =>
   filters?.length ? { filters } : {};
 
@@ -226,6 +237,9 @@ interface WebhookDeliveryRow {
 export class ScheduledTaskService extends Context.Service<
   ScheduledTaskService,
   {
+    readonly get: (input: {
+      readonly id: ScheduledTaskId;
+    }) => Effect.Effect<ScheduledTask | null, ScheduledTaskError>;
     readonly list: () => Effect.Effect<ScheduledTaskListResult, ScheduledTaskError>;
     readonly subscribeList: () => Stream.Stream<ScheduledTaskListResult, ScheduledTaskError>;
     readonly upsert: (
@@ -400,6 +414,59 @@ export const layer = Layer.effect(
   ScheduledTaskService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const assistantBus = yield* Effect.serviceOption(AssistantEventBus);
+    const assertOrdinary = (input: Parameters<typeof assertOrdinaryAssistantDestination>[0]) =>
+      assertOrdinaryAssistantDestination(input).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+    const assistantRepository = yield* Effect.serviceOption(AssistantRepository);
+    const routineRepository = yield* Effect.serviceOption(AssistantRoutineRepository);
+    const assertMutation = Effect.fn("ScheduledTaskService.assertMutation")(function* (
+      taskId: ScheduledTaskId,
+      target: {
+        readonly projectId: ScheduledTask["projectId"];
+        readonly threadId?: string | null | undefined;
+      },
+    ) {
+      yield* yield* AssistantRoutineAuthorization;
+      const capability = yield* Effect.serviceOption(AssistantRoutineMutation);
+      const retained = Option.isSome(routineRepository)
+        ? yield* routineRepository.value
+            .find(taskId)
+            .pipe(
+              Effect.mapError((cause) =>
+                taskError("Could not check routine ownership.", { taskId, cause }),
+              ),
+            )
+        : null;
+      if (Option.isSome(capability)) {
+        if (capability.value.taskId !== taskId || Option.isNone(assistantRepository))
+          return yield* taskError("Routine mutation target is not authorized.", { taskId });
+        const owner = yield* assistantRepository.value
+          .get(capability.value.scope)
+          .pipe(
+            Effect.mapError((cause) => taskError("Assistant is unavailable.", { taskId, cause })),
+          );
+        const binding = owner.detail.summary.binding;
+        if (
+          target.projectId !== binding.backingProjectId ||
+          target.threadId !== binding.canonicalThreadId ||
+          (retained !== null &&
+            (retained.environmentId !== capability.value.scope.environmentId ||
+              retained.assistantId !== capability.value.scope.assistantId))
+        )
+          return yield* taskError("Routine must remain bound to its canonical assistant.", {
+            taskId,
+          });
+        return;
+      }
+      if (retained !== null)
+        return yield* taskError("Use the assistant routine controls.", { taskId });
+      yield* assertOrdinary({
+        projectId: target.projectId,
+        ...(target.threadId == null ? {} : { threadId: ThreadId.make(target.threadId) }),
+      }).pipe(Effect.mapError((cause) => taskError(cause.message, { taskId, cause })));
+    });
     const crypto = yield* Crypto.Crypto;
     const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
@@ -731,7 +798,41 @@ export const layer = Layer.effect(
         readonly prompt: string;
         readonly dispatched: Ref.Ref<boolean>;
       },
+      manualCommandId?: CommandId,
     ) {
+      const routine = Option.isSome(routineRepository)
+        ? yield* routineRepository.value
+            .find(task.id)
+            .pipe(
+              Effect.mapError((cause) =>
+                taskError("Assistant routine is unavailable.", { taskId: task.id, cause }),
+              ),
+            )
+        : null;
+      if (routine === null)
+        yield* assertOrdinary({
+          projectId: task.projectId,
+          ...(task.threadId === null ? {} : { threadId: task.threadId }),
+        }).pipe(Effect.mapError((cause) => taskError(cause.message, { taskId: task.id, cause })));
+      if (routine !== null && trigger === "manual" && manualCommandId === undefined)
+        return yield* taskError("Assistant run-now requires a retained command identity.", {
+          taskId: task.id,
+        });
+      if (
+        routine !== null &&
+        trigger === "manual" &&
+        manualCommandId !== undefined &&
+        Option.isSome(routineRepository)
+      ) {
+        const retained = yield* routineRepository.value
+          .recoverTask(task.id, { trigger, triggerIdentity: manualCommandId })
+          .pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not recover assistant manual fire.", { taskId: task.id, cause }),
+            ),
+          );
+        if (retained?.receiptStatus === "accepted") return { task, threadId: retained.threadId };
+      }
       const reserved = yield* Ref.modify(activeRuns, (active) => {
         if (active.has(task.id)) return [false, active] as const;
         const next = new Set(active);
@@ -795,33 +896,97 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
-        if (webhook === undefined) yield* markRunning(active.id, startedAtIso);
-        else
-          yield* sql
-            .withTransaction(
-              Effect.gen(function* () {
-                yield* markRunning(active.id, startedAtIso, webhook.deliveryId);
-                // Recovery must distinguish this delivery from other windows waiting on the same task.
-                yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'running' WHERE delivery_id = ${webhook.deliveryId}`;
-              }),
-            )
+        const triggerIdentity =
+          trigger === "manual"
+            ? (manualCommandId ?? startedAtIso)
+            : trigger === "webhook"
+              ? webhook!.deliveryId
+              : (active.nextRunAt ?? startedAtIso);
+        const fireKey =
+          routine === null
+            ? webhook === undefined
+              ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
+              : `${active.id}:webhook:${webhook.deliveryId}`
+            : `assistant-routine:${NodeCrypto.createHash("sha256")
+                .update(canonicalProjectWorkPayload([active.id, trigger, triggerIdentity]))
+                .digest("hex")}`;
+        const commandId = CommandId.make(routine === null ? `scheduled-task:${fireKey}` : fireKey);
+        const messageId = MessageId.make(
+          routine === null ? `scheduled-task-message:${fireKey}` : `${fireKey}:message`,
+        );
+        const prompt = webhook?.prompt ?? active.prompt;
+        if (routine !== null && Option.isSome(routineRepository)) {
+          const retained = yield* routineRepository.value
+            .recoverTask(active.id, { trigger, triggerIdentity })
             .pipe(
               Effect.mapError((cause) =>
-                taskError("Could not start webhook run.", { taskId: task.id, cause }),
+                taskError("Could not recover assistant routine.", { taskId: active.id, cause }),
               ),
             );
-
+          if (retained?.fireKey === fireKey) {
+            if (retained.receiptStatus === "accepted") {
+              if (webhook !== undefined) yield* Ref.set(webhook.dispatched, true);
+              return { task: active, threadId: retained.threadId };
+            }
+            return yield* taskError(
+              "This assistant fire is already retained; inspect its dispatch status before trying again.",
+              { taskId: active.id },
+            );
+          }
+        }
+        if (routine !== null && Option.isSome(routineRepository))
+          yield* routineRepository.value
+            .assertRunnable(active.id)
+            .pipe(
+              Effect.mapError((cause) =>
+                taskError("Assistant routine is not runnable.", { taskId: active.id, cause }),
+              ),
+            );
+        const claim = Effect.gen(function* () {
+          yield* yield* AssistantRoutineAuthorization;
+          if (routine !== null && Option.isSome(routineRepository))
+            yield* routineRepository.value.beginFire({
+              taskId: active.id,
+              fireKey,
+              trigger,
+              triggerIdentity,
+              commandId,
+              messageId,
+              startedAt: startedAtIso,
+              promptHash: NodeCrypto.createHash("sha256").update(prompt).digest("hex"),
+            });
+          yield* markRunning(active.id, startedAtIso, webhook?.deliveryId);
+          if (webhook !== undefined)
+            yield* sql`UPDATE scheduled_task_webhook_pending SET state = 'running' WHERE delivery_id = ${webhook.deliveryId}`;
+        });
+        if (routine !== null || webhook !== undefined)
+          yield* sql.withTransaction(claim).pipe(
+            Effect.catch((cause) =>
+              Effect.gen(function* () {
+                if (
+                  isAssistantError(cause) &&
+                  cause.reason === "needs-repair" &&
+                  Option.isSome(routineRepository)
+                )
+                  yield* routineRepository.value.pause(active.id).pipe(
+                    Effect.mapError((pauseCause) =>
+                      taskError("Could not pause invalid assistant routine.", {
+                        taskId: active.id,
+                        cause: pauseCause,
+                      }),
+                    ),
+                  );
+                return yield* taskError("Could not claim schedule fire.", {
+                  taskId: active.id,
+                  cause,
+                });
+              }),
+            ),
+          );
+        else yield* markRunning(active.id, startedAtIso);
         yield* notifyChanged;
 
-        const fireKey =
-          webhook === undefined
-            ? `${active.id}:${DateTime.toEpochMillis(startedAt)}:${trigger}`
-            : `${active.id}:webhook:${webhook.deliveryId}`;
-        const commandId = CommandId.make(`scheduled-task:${fireKey}`);
-        const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
-        // A webhook prompt was rendered from the row when the request arrived.
-        const prompt = webhook?.prompt ?? active.prompt;
-
+        yield* yield* AssistantRoutineAuthorization;
         // Effect.exit (not Effect.result) so defects and interruptions in the
         // dispatch are also captured and recorded as a failed run instead of
         // aborting before markCompleted.
@@ -843,8 +1008,8 @@ export const layer = Layer.effect(
                       text: prompt,
                       attachments: [],
                     },
-                    createdBy: active.createdBy,
-                    creationSource: active.creationSource,
+                    createdBy: routine === null ? active.createdBy : "system",
+                    creationSource: routine === null ? active.creationSource : "server",
                   })
                   .pipe(Effect.map((launched) => launched.threadId)),
               )
@@ -861,14 +1026,25 @@ export const layer = Layer.effect(
                     text: prompt,
                     attachments: [],
                     mode: "queue",
-                    createdBy: active.createdBy,
-                    creationSource: active.creationSource,
+                    createdBy: routine === null ? active.createdBy : "system",
+                    creationSource: routine === null ? active.creationSource : "server",
                   })
                   .pipe(Effect.as(ThreadId.make(active.threadId))),
               );
 
         const runSucceeded = result._tag === "Success";
         if (webhook !== undefined && runSucceeded) yield* Ref.set(webhook.dispatched, true);
+        if (routine !== null && Option.isSome(assistantBus))
+          yield* assistantBus.value.publish(routine);
+        if (runSucceeded && routine !== null && Option.isSome(routineRepository))
+          yield* routineRepository.value.markDispatched(fireKey).pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not retain assistant dispatch acknowledgement.", {
+                taskId: active.id,
+                cause,
+              }),
+            ),
+          );
         const completedAt = yield* localNow;
         const lastRunStatus = runSucceeded ? ("succeeded" as const) : ("failed" as const);
         const lastRunError = runSucceeded ? null : errorMessage(result.cause);
@@ -990,6 +1166,21 @@ export const layer = Layer.effect(
         stuck,
         (row) =>
           Effect.gen(function* () {
+            if (Option.isSome(routineRepository)) {
+              const binding = yield* routineRepository.value.find(
+                ScheduledTaskId.make(row.task_id),
+              );
+              if (binding !== null) {
+                const retained = yield* routineRepository.value.recoverTask(binding.taskId);
+                const decoded = yield* decodeRow(row);
+                const accepted = retained?.receiptStatus === "accepted";
+                yield* sql`UPDATE scheduled_tasks SET last_run_status=${accepted ? "succeeded" : "failed"},last_run_error=${accepted ? null : "Assistant fire has no accepted receipt; it will not be replayed."},next_run_at=${nextRunAt(decoded, now)},updated_at=${iso(now)},run_count=run_count+1 WHERE task_id=${row.task_id} AND last_run_status='running'`;
+                if (retained !== null && accepted)
+                  yield* routineRepository.value.markDispatched(retained.fireKey);
+                yield* sql`UPDATE scheduled_task_webhook_pending SET state=${accepted ? "completed" : "failed"} WHERE task_id=${row.task_id} AND state='running'`;
+                return;
+              }
+            }
             const decoded = yield* Effect.result(decodeRow(row));
             if (Result.isSuccess(decoded)) {
               yield* sql`
@@ -1077,6 +1268,8 @@ export const layer = Layer.effect(
       // keep their run history, and so real load failures propagate instead
       // of silently resetting an existing row.
       const existingTask = yield* findTask(id);
+      yield* assertMutation(id, input);
+      if (existingTask !== null) yield* assertMutation(id, existingTask);
       // Keep the existing next_run_at when the schedule itself is untouched:
       // editing a title or prompt must not postpone (or resurrect) a due
       // run — only schedule/enabled changes restart the clock.
@@ -1187,6 +1380,7 @@ export const layer = Layer.effect(
       "ScheduledTaskService.setEnabled",
     )(function* (input) {
       const existing = yield* loadTask(input.id);
+      yield* assertMutation(input.id, existing);
       if (existing.enabled === input.enabled) return { task: existing };
       const now = yield* localNow;
       const next = nextRunAt({ enabled: input.enabled, schedule: existing.schedule }, now);
@@ -1245,16 +1439,23 @@ export const layer = Layer.effect(
         { discard: true },
       );
 
-    const deleteTask: ScheduledTaskService["Service"]["delete"] = (input) =>
-      deleteRow(input.id).pipe(
-        Effect.andThen(forgetWebhookTask(input.id)),
-        Effect.andThen(notifyChanged),
-        Effect.as({ id: input.id }),
-      );
+    const deleteTask: ScheduledTaskService["Service"]["delete"] = Effect.fn(
+      "ScheduledTaskService.delete",
+    )(function* (input) {
+      const existing = yield* findTask(input.id);
+      if (existing !== null) yield* assertMutation(input.id, existing);
+      yield* deleteRow(input.id);
+      yield* forgetWebhookTask(input.id);
+      yield* notifyChanged;
+      return { id: input.id };
+    });
 
     const deleteForThread = Effect.fn("ScheduledTaskService.deleteForThread")(function* (
       threadId: ThreadId,
     ) {
+      yield* assertOrdinary({ threadId }).pipe(
+        Effect.mapError((cause) => taskError(cause.message, { cause })),
+      );
       // Check the current binding in the transaction: an automation may have
       // been unbound or moved since thread deletion queued this cleanup.
       const removed = yield* sql
@@ -1284,12 +1485,13 @@ export const layer = Layer.effect(
       "ScheduledTaskService.runNow",
     )(function* (input: ScheduledTaskRunNowInput) {
       const task = yield* loadTask(input.id);
+      yield* assertMutation(input.id, task);
       if (task.schedule.type === "webhook") {
         return yield* taskError("Webhook tasks run when their URL receives a request.", {
           taskId: input.id,
         });
       }
-      return yield* runTask(task, "manual").pipe(
+      return yield* runTask(task, "manual", undefined, input.commandId).pipe(
         Effect.mapError((cause) =>
           taskError("Could not run schedule task.", { taskId: input.id, cause }),
         ),
@@ -1300,6 +1502,7 @@ export const layer = Layer.effect(
       "ScheduledTaskService.rotateWebhookToken",
     )(function* (input) {
       const task = yield* loadTask(input.id);
+      yield* assertMutation(input.id, task);
       if (task.schedule.type !== "webhook") {
         return yield* taskError("Only webhook tasks have a URL token.", { taskId: input.id });
       }
@@ -1563,8 +1766,27 @@ export const layer = Layer.effect(
 
     const serviceScope = yield* Effect.scope;
 
+    const retainedAssistantDelivery = Effect.fn("ScheduledTaskService.retainedAssistantDelivery")(
+      function* (deliveryId: string) {
+        if (Option.isNone(routineRepository)) return null;
+        const row = (yield* sql<{
+          task_id: ScheduledTaskId;
+        }>`SELECT task_id FROM t3_workflow_v2_assistant_routine_fires WHERE trigger_kind='webhook' AND trigger_identity=${deliveryId} LIMIT 1`)[0];
+        return row === undefined
+          ? null
+          : yield* routineRepository.value.recoverTask(row.task_id, {
+              trigger: "webhook",
+              triggerIdentity: deliveryId,
+            });
+      },
+      Effect.mapError(dedupeError),
+    );
+
     const releaseFailedDelivery = Effect.fn("ScheduledTaskService.releaseFailedDelivery")(
       function* (deliveryId: string) {
+        // A retained fire may already own an accepted V2 command even when its callback was lost.
+        // Uncertain retained fires also keep their replay identity until explicitly reconciled.
+        if ((yield* retainedAssistantDelivery(deliveryId)) !== null) return;
         yield* releaseReplay(deliveryId);
         yield* sql`DELETE FROM scheduled_task_webhook_relay_deliveries WHERE relay_delivery_id IN (
           SELECT substr(value, ${"delivery:relay:".length + 1}) FROM scheduled_task_webhook_pending, json_each(delivery_ids_json)
@@ -1591,12 +1813,16 @@ export const layer = Layer.effect(
       const dispatched = yield* Ref.make(false);
       return yield* runTask(task, "webhook", { deliveryId, prompt, dispatched }).pipe(
         Effect.flatMap(({ task: completed }) =>
-          completed.lastRunStatus === "failed"
-            ? runOutcome("failed").pipe(
-                Effect.andThen(markDeliveryFailed(deliveryId, "The run failed to start.")),
-                Effect.andThen(releaseFailedDelivery(deliveryId)),
-              )
-            : runOutcome("started"),
+          Effect.gen(function* () {
+            const accepted =
+              (yield* retainedAssistantDelivery(deliveryId))?.receiptStatus === "accepted";
+            if (accepted) yield* Ref.set(dispatched, true);
+            if (completed.lastRunStatus === "failed" && !accepted) {
+              yield* runOutcome("failed");
+              yield* markDeliveryFailed(deliveryId, "The run failed to start.");
+              yield* releaseFailedDelivery(deliveryId);
+            } else yield* runOutcome("started");
+          }),
         ),
         Effect.catchTags({
           WebhookDeliverySkipped: (skipped) =>
@@ -1609,7 +1835,8 @@ export const layer = Layer.effect(
         // Dispatch success owns the replay key even if later bookkeeping fails.
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
-            const started = yield* Ref.get(dispatched);
+            const retained = yield* retainedAssistantDelivery(deliveryId);
+            const started = (yield* Ref.get(dispatched)) || retained?.receiptStatus === "accepted";
             yield* Effect.logWarning("Webhook dispatch failed", { taskId: task.id, cause });
             yield* runOutcome(started ? "started" : "failed");
             yield* markDeliveryFailed(
@@ -2149,6 +2376,7 @@ export const layer = Layer.effect(
     yield* scheduler.register("webhook-coalescing", dispatchPending());
 
     return ScheduledTaskService.of({
+      get: (input) => findTask(input.id),
       list,
       subscribeList,
       upsert,

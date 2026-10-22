@@ -2,6 +2,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 
@@ -49,7 +51,7 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
     const resolved = yield* registry.resolve(token);
     expect(resolved?.thread.threadId).toBe(threadId);
     expect(resolved?.capabilities).toEqual(
-      new Set(["preview", "orchestration", "worktree", "pull-requests"]),
+      new Set(["preview", "orchestration", "worktree", "pull-requests", "terminal"]),
     );
 
     yield* registry.revokeThread(threadId);
@@ -86,17 +88,20 @@ it.effect("always grants pull-requests and gates browser and device access indep
       "orchestration",
       "preview",
       "pull-requests",
+      "terminal",
       "worktree",
     ]);
     expect(yield* capabilitiesOf(withoutPreview)).toEqual([
       "orchestration",
       "pull-requests",
+      "terminal",
       "worktree",
     ]);
     expect(yield* capabilitiesOf(withDevice)).toEqual([
       "device",
       "orchestration",
       "pull-requests",
+      "terminal",
       "worktree",
     ]);
   }),
@@ -219,4 +224,80 @@ it.effect.each(["provider-session", "thread", "all"] as const)(
       yield* registry.touch(threadId);
       expect(yield* registry.resolve(token)).toBeUndefined();
     }),
+);
+
+it.effect("a native binding paused in cleanup cannot resurrect a revoked credential", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1000);
+    const threadId = ThreadId.make("binding-race");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const issued = yield* registry.issue({ threadId, providerInstanceId });
+    const binding = {
+      threadId,
+      providerInstanceId,
+      providerSessionId: issued.config.providerSessionId,
+      runtimeId: "native1",
+    };
+    yield* registry.bindNativeRuntime(binding);
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let pause = true;
+    yield* registry.onRevoke(() =>
+      Effect.gen(function* () {
+        if (pause) {
+          pause = false;
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(resume);
+        }
+      }),
+    );
+    const replacing = yield* registry
+      .bindNativeRuntime({ ...binding, runtimeId: "native2" })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* registry.revokeProviderSession(binding.providerSessionId);
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(replacing);
+    expect(yield* registry.resolveNativeRuntime(binding.providerSessionId)).toBeUndefined();
+    expect(
+      yield* registry.resolve(issued.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+    ).toBeUndefined();
+  }),
+);
+it.effect("an older paused replacement cannot overwrite a newer native binding", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1000);
+    const threadId = ThreadId.make("binding-replacement-race");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const issued = yield* registry.issue({ threadId, providerInstanceId });
+    const binding = {
+      threadId,
+      providerInstanceId,
+      providerSessionId: issued.config.providerSessionId,
+      runtimeId: "native1",
+    };
+    yield* registry.bindNativeRuntime(binding);
+    const entered = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    let pause = true;
+    yield* registry.onRevoke(() =>
+      Effect.gen(function* () {
+        if (pause) {
+          pause = false;
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(resume);
+        }
+      }),
+    );
+    const replacing = yield* registry
+      .bindNativeRuntime({ ...binding, runtimeId: "native2" })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* registry.bindNativeRuntime({ ...binding, runtimeId: "native3" });
+    yield* Deferred.succeed(resume, undefined);
+    yield* Fiber.join(replacing);
+    expect((yield* registry.resolveNativeRuntime(binding.providerSessionId))?.runtimeId).toBe(
+      "native3",
+    );
+  }),
 );

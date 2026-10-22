@@ -127,6 +127,12 @@ export const GitRunStackedActionInput = Schema.Struct({
   actionId: TrimmedNonEmptyStringSchema,
   cwd: TrimmedNonEmptyStringSchema,
   action: GitStackedAction,
+  reviewedPush: Schema.optional(
+    Schema.Struct({
+      branchRef: TrimmedNonEmptyStringSchema,
+      commitSha: TrimmedNonEmptyStringSchema,
+    }),
+  ),
   commitMessage: Schema.optional(TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000))),
   featureBranch: Schema.optional(Schema.Boolean),
   filePaths: Schema.optional(Schema.Array(GitFilePath).check(Schema.isMinLength(1))),
@@ -493,3 +499,83 @@ export const GitActionProgressEvent = Schema.Union([
   GitActionFailedEvent,
 ]);
 export type GitActionProgressEvent = typeof GitActionProgressEvent.Type;
+
+// Fingerprints bind index actions to the exact repository state the client reviewed.
+export const GitIndexFingerprint = Schema.Struct({
+  rootPath: TrimmedNonEmptyString,
+  headCommit: Schema.NullOr(TrimmedNonEmptyString),
+  headRef: Schema.NullOr(TrimmedNonEmptyString),
+  index: TrimmedNonEmptyString,
+  worktree: TrimmedNonEmptyString,
+});
+export type GitIndexFingerprint = typeof GitIndexFingerprint.Type;
+export const GitIndexFile = Schema.Struct({ path: GitFilePath, status: Schema.String });
+export const GitIndexStatusInput = Schema.Struct({ cwd: TrimmedNonEmptyString });
+export type GitIndexStatusInput = typeof GitIndexStatusInput.Type;
+export const GitIndexStatusResult = Schema.Struct({
+  fingerprint: GitIndexFingerprint,
+  staged: Schema.Array(GitIndexFile),
+  unstaged: Schema.Array(GitIndexFile),
+});
+export type GitIndexStatusResult = typeof GitIndexStatusResult.Type;
+export const GitMutateIndexInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  expected: GitIndexFingerprint,
+  action: Schema.Literals(["stage", "unstage"]),
+  paths: Schema.Array(GitFilePath).check(Schema.isMinLength(1), Schema.isMaxLength(500)),
+});
+export type GitMutateIndexInput = typeof GitMutateIndexInput.Type;
+export const GitCommitStagedInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  expected: GitIndexFingerprint,
+  message: TrimmedNonEmptyString,
+  push: Schema.optional(Schema.Boolean),
+});
+export type GitCommitStagedInput = typeof GitCommitStagedInput.Type;
+export const GitCommitStagedResult = Schema.Struct({
+  commitSha: TrimmedNonEmptyString,
+  branchRef: TrimmedNonEmptyString,
+  headChanged: Schema.Boolean,
+  push: Schema.Literals(["not_requested", "succeeded", "failed"]),
+  // A failed push leaves the completed commit available for a later push action.
+  recovery: Schema.NullOr(Schema.Literals(["push"])),
+});
+export type GitCommitStagedResult = typeof GitCommitStagedResult.Type;
+export const GitDiscoverRepositoriesInput = Schema.Struct({ cwd: TrimmedNonEmptyString });
+export type GitDiscoverRepositoriesInput = typeof GitDiscoverRepositoriesInput.Type;
+export const GitDiscoverRepositoriesResult = Schema.Struct({
+  repositories: Schema.Array(Schema.Struct({ rootPath: TrimmedNonEmptyString })),
+  truncated: Schema.Boolean,
+});
+export type GitDiscoverRepositoriesResult = typeof GitDiscoverRepositoriesResult.Type;
+export const GitHistoryInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  cursor: Schema.optional(Schema.String),
+  limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
+});
+export type GitHistoryInput = typeof GitHistoryInput.Type;
+export const GitHistoryResult = Schema.Struct({
+  commits: Schema.Array(
+    Schema.Struct({
+      sha: TrimmedNonEmptyString,
+      parents: Schema.Array(TrimmedNonEmptyString),
+      subject: Schema.String,
+      author: Schema.String,
+      authoredAt: Schema.String,
+    }),
+  ),
+  nextCursor: Schema.NullOr(Schema.String),
+  stale: Schema.Boolean,
+});
+export type GitHistoryResult = typeof GitHistoryResult.Type;
+export const GitHistoryDiffInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  commitSha: TrimmedNonEmptyString,
+  path: Schema.optional(GitFilePath),
+});
+export type GitHistoryDiffInput = typeof GitHistoryDiffInput.Type;
+export const GitHistoryDiffResult = Schema.Struct({
+  patch: Schema.String,
+  truncated: Schema.Boolean,
+});
+export type GitHistoryDiffResult = typeof GitHistoryDiffResult.Type;

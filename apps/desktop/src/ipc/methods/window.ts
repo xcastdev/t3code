@@ -2,6 +2,7 @@ import {
   ContextMenuItemSchema,
   DesktopAppBrandingSchema,
   DesktopEnvironmentBootstrapSchema,
+  DesktopAttachedBackendTargetSchema,
   DesktopThemeSchema,
   EDITORS,
   EditorId,
@@ -23,6 +24,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
+import * as DesktopAttachedBackend from "../../backend/DesktopAttachedBackend.ts";
 import * as DesktopBackendConfiguration from "../../backend/DesktopBackendConfiguration.ts";
 import * as DesktopBackendPool from "../../backend/DesktopBackendPool.ts";
 import * as DesktopLocalEnvironmentAuth from "../../backend/DesktopLocalEnvironmentAuth.ts";
@@ -105,6 +107,26 @@ export const getLocalEnvironmentBootstraps = DesktopIpc.makeSyncIpcMethod({
   handler: Effect.fn("desktop.ipc.window.getLocalEnvironmentBootstraps")(function* () {
     const pool = yield* DesktopBackendPool.DesktopBackendPool;
     const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+    const attached = yield* Effect.serviceOption(DesktopAttachedBackend.DesktopAttachedBackend);
+    const attachedState = Option.isSome(attached)
+      ? yield* attached.value.getState
+      : { mode: "managed" as const };
+    const settings = yield* Effect.serviceOption(DesktopAppSettings.DesktopAppSettings);
+    if (Option.isSome(settings) && !(yield* settings.value.get).localEnvironmentEnabled) return [];
+    if (attachedState.mode === "attached")
+      return [
+        {
+          ownership: "attached" as const,
+          environmentId: attachedState.environmentId,
+          attachmentRevision: attachedState.attachmentRevision,
+          id: PRIMARY_LOCAL_ENVIRONMENT_ID,
+          label: attachedState.label,
+          runningDistro: null,
+          httpBaseUrl: attachedState.httpBaseUrl,
+          wsBaseUrl: attachedState.httpBaseUrl.replace(/^http:/, "ws:"),
+        },
+      ];
+    if (attachedState.mode === "invalid-attached") return [];
     const instances = yield* pool.list;
     const bootstraps: DesktopEnvironmentBootstrap[] = [];
     for (const instance of instances) {
@@ -162,11 +184,11 @@ function extractWslDistroFromEnvironmentId(envId: string): string | null {
 
 export const getLocalEnvironmentBearerToken = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.GET_LOCAL_ENVIRONMENT_BEARER_TOKEN_CHANNEL,
-  payload: Schema.Void,
+  payload: Schema.UndefinedOr(DesktopAttachedBackendTargetSchema),
   result: Schema.String,
-  handler: Effect.fn("desktop.ipc.window.getLocalEnvironmentBearerToken")(function* () {
+  handler: Effect.fn("desktop.ipc.window.getLocalEnvironmentBearerToken")(function* (target) {
     const localAuth = yield* DesktopLocalEnvironmentAuth.DesktopLocalEnvironmentAuth;
-    return yield* localAuth.getBearerToken;
+    return yield* localAuth.getBearerTokenForTarget(target);
   }),
 });
 

@@ -58,6 +58,11 @@ export interface ProjectSetupScriptRunnerInput {
   readonly projectCwd?: string;
   readonly worktreePath: string;
   readonly preferredTerminalId?: string;
+  readonly onTerminalAllocated?: (
+    terminalId: string,
+    capture: TerminalManager.TerminalDrainHandle,
+  ) => Effect.Effect<void>;
+  readonly retainTerminalForDrain?: boolean;
   readonly trigger?: "setup" | "settle";
   readonly project?: {
     readonly id: ProjectId;
@@ -208,6 +213,7 @@ export const make = Effect.gen(function* () {
       const promptReturned = yield* Deferred.make<void>();
       let lineBuffer = "";
       let settled = false;
+      let invalidated = false;
 
       const settle = (exitCode: number | null) =>
         Effect.suspend(() => {
@@ -244,6 +250,16 @@ export const make = Effect.gen(function* () {
         if (event.threadId !== input.threadId || event.terminalId !== input.terminalId) {
           return Effect.void;
         }
+        if (invalidated) return Effect.void;
+        if (
+          event.type === "started" ||
+          event.type === "restarted" ||
+          event.type === "exited" ||
+          event.type === "closed"
+        ) {
+          invalidated = true;
+          return settle(null).pipe(Effect.andThen(Deferred.succeed(promptReturned, undefined)));
+        }
         if (event.type === "output") {
           lineBuffer += event.data;
           // A bare carriage return is how installers redraw a progress line in
@@ -265,9 +281,6 @@ export const make = Effect.gen(function* () {
               ),
             ),
           );
-        }
-        if (event.type === "exited" || event.type === "closed") {
-          return settle(null).pipe(Effect.andThen(Deferred.succeed(promptReturned, undefined)));
         }
         return Effect.void;
       });
@@ -377,15 +390,21 @@ export const make = Effect.gen(function* () {
           )
         : script.command;
 
-    yield* terminalManager
-      .open({
+    // Capture under the terminal's open lock; masking preserves the handoff if cancellation races spawn.
+    const allocation = yield* Effect.gen(function* () {
+      const terminalInput = {
         threadId: input.threadId,
         terminalId,
         cwd,
         worktreePath: input.worktreePath,
         env: { ...env, NO_COLOR: "1", FORCE_COLOR: "0" },
-      })
-      .pipe(
+      };
+      const allocation = yield* Effect.gen(function* () {
+        if (input.onTerminalAllocated)
+          return (yield* terminalManager.openCaptured(terminalInput)).capture;
+        yield* terminalManager.open(terminalInput);
+        return undefined;
+      }).pipe(
         Effect.mapError(
           (cause) =>
             new ProjectSetupScriptOperationError({
@@ -395,6 +414,10 @@ export const make = Effect.gen(function* () {
             }),
         ),
       );
+      if (input.onTerminalAllocated && allocation !== undefined)
+        yield* input.onTerminalAllocated(terminalId, allocation);
+      return allocation;
+    }).pipe(Effect.uninterruptible);
     // Subscribe before writing so the sentinel cannot race past the listener.
     const observed =
       observe && completionToken
@@ -408,27 +431,30 @@ export const make = Effect.gen(function* () {
           })
         : undefined;
 
-    yield* terminalManager
-      .write({
+    yield* Effect.gen(function* () {
+      const writeInput = {
         threadId: input.threadId,
         terminalId,
         data: projectScriptTerminalInput(commandLine),
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProjectSetupScriptOperationError({
-              ...errorContext,
-              operation: "writeCommand",
-              cause,
-            }),
-        ),
-        Effect.tapError(() => Effect.sync(() => observed?.unsubscribe())),
-      );
+      };
+      if (allocation !== undefined)
+        yield* terminalManager.writeCaptured({ ...writeInput, capture: allocation });
+      else yield* terminalManager.write(writeInput);
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProjectSetupScriptOperationError({
+            ...errorContext,
+            operation: "writeCommand",
+            cause,
+          }),
+      ),
+      Effect.onError(() => Effect.sync(() => observed?.unsubscribe())),
+    );
 
     const completion = observed?.completion.pipe(
       Effect.tap(({ exitCode }) =>
-        exitCode === 0
+        exitCode === 0 && !input.retainTerminalForDrain
           ? terminalManager.closeIdle({ threadId: input.threadId, terminalId })
           : Effect.void,
       ),

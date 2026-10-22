@@ -87,7 +87,8 @@ const handlers = {
       return yield* service.deleteScheduledTask(scope, input);
     }),
   ),
-  request_secret: McpToolAccess.actsAsCaller((input) =>
+  // Secret responses must reach the execution guard even after the caller stops.
+  request_secret: McpToolAccess.readsAsCaller((input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;

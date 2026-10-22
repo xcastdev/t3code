@@ -19,6 +19,7 @@ import {
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import * as OwnerDeadlineControl from "./OwnerDeadlineControl.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -60,7 +61,7 @@ export interface OrchestrationEffectExecutorV2Shape {
   readonly execute: (
     effect: EffectOutbox.OrchestrationEffectV2,
     options?: { readonly willRetry: boolean },
-  ) => Effect.Effect<void, OrchestrationEffectExecutionError>;
+  ) => Effect.Effect<void | { readonly rescheduleAt?: string }, OrchestrationEffectExecutionError>;
 }
 
 export class OrchestrationEffectExecutorV2 extends Context.Service<
@@ -80,6 +81,7 @@ export const layerExecutor: Layer.Layer<
   | ThreadTitleRegenerationService.ThreadTitleRegenerationService
   | ThreadManagementService.ThreadManagementService
   | ServerSettings.ServerSettingsService
+  | OwnerDeadlineControl.OwnerDeadlineControl
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
   Effect.gen(function* () {
@@ -94,10 +96,22 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    const ownerDeadlines = yield* OwnerDeadlineControl.OwnerDeadlineControl;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
+          case "owner-deadline.expire":
+            return ownerDeadlines.handle(effect.request.control).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
             return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(
@@ -556,7 +570,13 @@ const isOrchestrationEffectWorkerError = Schema.is(OrchestrationEffectWorkerErro
 
 export interface OrchestrationEffectWorkerV2Shape {
   readonly awaitWork: Effect.Effect<void>;
+  readonly awaitControlWork: Effect.Effect<void>;
   readonly runOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
+  readonly runControlOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
+  readonly nextControlClaimableAt: Effect.Effect<
+    Option.Option<DateTime.Utc>,
+    OrchestrationEffectWorkerError
+  >;
   readonly runRecoveryOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly nextClaimableAt: Effect.Effect<
     Option.Option<DateTime.Utc>,
@@ -683,9 +703,12 @@ export const layerWithOptions = (
 
       // The worker probes for work repeatedly, including when the outbox is empty.
       const runOnce = Effect.fnUntraced(
-        function* (excludeRestartContinuations = false) {
+        function* (
+          excludeRestartContinuations = false,
+          consumer: EffectOutbox.EffectConsumer = "normal",
+        ) {
           const claimExit = yield* Effect.exit(
-            outbox.claimNext({ workerId, leaseDurationMs, excludeRestartContinuations }),
+            outbox.claimNext({ workerId, leaseDurationMs, excludeRestartContinuations, consumer }),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
             result: Exit.isFailure(claimExit)
@@ -734,16 +757,34 @@ export const layerWithOptions = (
 
           const execution = executor
             .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
-            .pipe(Effect.as("executed" as const));
-          const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
+            .pipe(Effect.map((result) => ({ result })));
+          // Controls only validate SQL authority and commit exact-target stops.
+          // Settlement can cancel their own row during that finite sequence;
+          // observe its result so a later descendant write failure stays visible.
+          const executionOrCancellation =
+            effect.request.type === "owner-deadline.expire"
+              ? execution
+              : Effect.raceFirst(execution, cancellation);
+          const exit = yield* Effect.exit(executionOrCancellation).pipe(
             Effect.ensuring(outbox.clearCancellation(effect.id)),
           );
-          if (Exit.isSuccess(exit) && exit.value === "cancelled") {
-            return true;
-          }
           if (Exit.isSuccess(exit)) {
+            if (exit.value === "cancelled") return true;
+            const rescheduleAt = exit.value.result?.rescheduleAt;
             return yield* Effect.gen(function* () {
-              const completed = yield* outbox.succeed({ effectId: effect.id, workerId });
+              const completed =
+                rescheduleAt === undefined
+                  ? yield* outbox.succeed({ effectId: effect.id, workerId })
+                  : yield* outbox.retry({
+                      effectId: effect.id,
+                      workerId,
+                      error: "Retained owner deadline is not due.",
+                      delayMs: Math.max(
+                        0,
+                        DateTime.toEpochMillis(DateTime.makeUnsafe(rescheduleAt)) -
+                          DateTime.toEpochMillis(yield* DateTime.now),
+                      ),
+                    });
               if (!completed) {
                 if (yield* wasCancelled(effect.id)) return true;
                 return yield* new OrchestrationEffectWorkerError({
@@ -765,11 +806,18 @@ export const layerWithOptions = (
             nonRetryable,
             error,
           });
+          if (effect.request.type === "owner-deadline.expire" && (yield* wasCancelled(effect.id))) {
+            return yield* new OrchestrationEffectWorkerError({
+              operation: "cancelled-control-commit",
+              effectId: effect.id,
+              cause: exit.cause,
+            });
+          }
           const updated = nonRetryable
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : effect.request.type !== "owner-deadline.expire" && effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
@@ -791,7 +839,7 @@ export const layerWithOptions = (
           }
           return true;
         },
-        (effect, _excludeRestartContinuations?: boolean) =>
+        (effect, _excludeRestartContinuations?: boolean, _consumer?: EffectOutbox.EffectConsumer) =>
           effect.pipe(
             Effect.mapError((cause) =>
               isOrchestrationEffectWorkerError(cause)
@@ -803,8 +851,18 @@ export const layerWithOptions = (
 
       return OrchestrationEffectWorkerV2.of({
         awaitWork: outbox.awaitAvailable,
+        awaitControlWork: outbox.awaitControlAvailable,
         runOnce: runOnce(),
         runRecoveryOnce: runOnce(true),
+        runControlOnce: runOnce(false, "owner-deadline"),
+        nextControlClaimableAt: outbox
+          .nextClaimableAtFor("owner-deadline")
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationEffectWorkerError({ operation: "next-control-claimable", cause }),
+            ),
+          ),
         nextClaimableAt: outbox.nextClaimableAt.pipe(
           Effect.mapError(
             (cause) =>
@@ -816,7 +874,10 @@ export const layerWithOptions = (
         ),
         drain: Effect.fn("EffectWorker.drain")(function* (maxEffects = Number.MAX_SAFE_INTEGER) {
           let completed = 0;
-          while (completed < maxEffects && (yield* runOnce())) {
+          while (
+            completed < maxEffects &&
+            ((yield* runOnce()) || (yield* runOnce(false, "owner-deadline")))
+          ) {
             completed += 1;
           }
           return completed;
@@ -851,9 +912,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Post-commit notifications are the low-latency path. `availableAt` is the
       // durable retry schedule, and the long liveness poll only recovers from a
       // missed in-process notification or work inserted by another process.
-      const runWorker = Effect.gen(function* () {
+      const runWorker = Effect.fn("EffectWorker.consume")(function* (control: boolean) {
         while (true) {
-          const outcome = yield* worker.runOnce.pipe(
+          const outcome = yield* (control ? worker.runControlOnce : worker.runOnce).pipe(
             Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
             Effect.catchCause((cause) =>
               Effect.logWarning("Orchestration effect worker failed", cause).pipe(
@@ -873,7 +934,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             continue;
           }
 
-          const nextClaimableAt = yield* worker.nextClaimableAt.pipe(
+          const nextClaimableAt = yield* (
+            control ? worker.nextControlClaimableAt : worker.nextClaimableAt
+          ).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning(
                 "Failed to read the next orchestration effect deadline",
@@ -890,14 +953,16 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             },
           });
           yield* Effect.raceFirst(
-            worker.awaitWork.pipe(Effect.as("notified" as const)),
+            (control ? worker.awaitControlWork : worker.awaitWork).pipe(
+              Effect.as("notified" as const),
+            ),
             Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
           );
         }
       });
 
       return yield* Effect.all(
-        Array.from({ length: concurrency }, () => runWorker),
+        [...Array.from({ length: concurrency }, () => runWorker(false)), runWorker(true)],
         {
           concurrency: "unbounded",
           discard: true,

@@ -1,3 +1,4 @@
+import * as TerminalManager from "../terminal/Manager.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -7,6 +8,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TerminalToolError,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -527,4 +529,70 @@ it.effect(
         assert.isUndefined(settingsAfterDelete.projectSettingsOverrides[projectId]);
       }).pipe(Effect.provide(layerServices));
     }).pipe(Effect.provide(layerDatabase)),
+);
+
+it.effect("retries project-owned terminal cleanup after the project deletion receipt commits", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:terminal-cleanup");
+    const instanceId = ProviderInstanceId.make("codex_work");
+    const input = { projectId, commandId: CommandId.make("command:terminal-cleanup") };
+    yield* seedProject(projectId);
+    const closed: ProjectId[] = [];
+    yield* Effect.gen(function* () {
+      const projects = yield* ProjectStore.ProjectStoreV2;
+      const settings = yield* ServerSettings.ServerSettingsService;
+      yield* settings.updateSettings({
+        projectSettingsOverrides: {
+          [projectId]: { providerInstances: { [instanceId]: { enabled: true } } },
+        },
+      });
+      let settingsAttempts = 0;
+      const service = yield* ProjectService.make.pipe(
+        Effect.provideService(ServerSettings.ServerSettingsService, {
+          ...settings,
+          updateSettings: (patch) =>
+            Effect.suspend(() => {
+              settingsAttempts++;
+              return settingsAttempts === 1
+                ? Effect.die(new Error("Injected settings cleanup failure"))
+                : settings.updateSettings(patch);
+            }),
+        }),
+      );
+      const first = yield* service.delete(input).pipe(Effect.flip);
+      assert.equal(first._tag, "ProjectOperationError");
+      assert.isTrue(Option.isNone(yield* projects.get(projectId)));
+      const deleted = yield* service.delete(input);
+      assert.isNotNull(deleted.deletedAt);
+      assert.deepEqual(closed, [projectId, projectId]);
+      assert.equal(settingsAttempts, 2);
+      assert.isUndefined((yield* settings.getSettings).projectSettingsOverrides[projectId]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerServices,
+          Layer.mock(TerminalManager.TerminalManager)({
+            closeProject: (id) =>
+              Effect.sync(() => {
+                closed.push(id);
+              }).pipe(
+                Effect.andThen(
+                  Effect.suspend(() =>
+                    closed.length === 1
+                      ? Effect.fail(
+                          new TerminalToolError({
+                            operation: "close",
+                            reason: "cleanup-failed",
+                            projectId,
+                          }),
+                        )
+                      : Effect.void,
+                  ),
+                ),
+              ),
+          }),
+        ),
+      ),
+    );
+  }).pipe(Effect.provide(layerDatabase)),
 );

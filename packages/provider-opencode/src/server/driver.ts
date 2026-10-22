@@ -1,3 +1,8 @@
+import {
+  skillInstallTargets,
+  externalOpenCodeInstallTargets,
+  verifyExternalOpenCodeInstallTargets,
+} from "@t3tools/provider-core/server/driver";
 import { ProviderDriverKind } from "@t3tools/contracts";
 import { OpenCodeSettings } from "../settings.ts";
 import * as Crypto from "effect/Crypto";
@@ -134,6 +139,11 @@ function selectOpenCodeRuntimeTextGeneration(
   v2: ProviderTextGeneration,
 ): ProviderTextGeneration {
   return {
+    extractMemoryFacts: (input) =>
+      byOpenCodeRuntime(probe.get, {
+        v1: v1.extractMemoryFacts(input),
+        v2: v2.extractMemoryFacts(input),
+      }),
     generateCommitMessage: (input) =>
       byOpenCodeRuntime(probe.get, {
         v1: v1.generateCommitMessage(input),
@@ -470,6 +480,44 @@ export const OpenCodeDriver: ProviderDriver<
     return {
       instanceId,
       driverKind: DRIVER_KIND,
+      nativeSkillContentAccess: effectiveConfig.serverUrl.trim() ? "external" : "local",
+      resolveSkillInstallTargets: Effect.fn("OpenCodeDriver.resolveSkillInstallTargets")(function* (
+        projectRoot?: string,
+      ) {
+        const targets = skillInstallTargets({
+          driverKind: DRIVER_KIND,
+          environment: processEnv,
+          ...(projectRoot ? { projectRoot } : {}),
+        });
+        if (!effectiveConfig.serverUrl.trim()) return targets;
+        const directory = projectRoot ?? host.paths.cwd;
+        const client = openCodeRuntime.createOpenCodeSdkClient({
+          baseUrl: effectiveConfig.serverUrl,
+          directory,
+          ...(effectiveConfig.serverPassword
+            ? { serverPassword: effectiveConfig.serverPassword }
+            : {}),
+        });
+        return yield* Effect.gen(function* () {
+          const response = yield* Effect.tryPromise(() => client.path.get({ directory }));
+          if (!response.data) return [];
+          const candidates = externalOpenCodeInstallTargets({
+            targets,
+            configPath: response.data.config,
+            directory: response.data.directory,
+            ...(projectRoot ? { projectRoot } : {}),
+          });
+          return yield* verifyExternalOpenCodeInstallTargets({
+            targets: candidates,
+            fileSystem,
+            path: pathService,
+            readFile: async (probe, probeDirectory) => {
+              const result = await client.file.read({ path: probe, directory: probeDirectory });
+              return result.data;
+            },
+          });
+        }).pipe(Effect.orElseSucceed(() => []));
+      }),
       continuationIdentity,
       displayName,
       accentColor,

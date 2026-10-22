@@ -68,6 +68,26 @@ function readJsonRpcRequests(
 }
 
 it.layer(layerGrokTextGenerationTest)("GrokTextGeneration", (it) => {
+  it.effect("extracts facts through the native Grok ACP model", () =>
+    withFakeAcpGrok(
+      {
+        T3_ACP_PROMPT_RESPONSE_TEXT:
+          '{"facts":[{"key":"storage","body":"SQLite is authoritative.","quote":"SQLite is authoritative."}]}',
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const result = yield* textGeneration.extractMemoryFacts({
+            cwd: process.cwd(),
+            sourceText: "SQLite is authoritative.",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("grok-second"),
+              "grok-mock-alt",
+            ),
+          });
+          expect(result.facts[0]?.key).toBe("storage");
+        }),
+    ),
+  );
   it.effect("uses ACP with disabled tool capabilities and forwards the requested model id", () => {
     const requestLogDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-grok-text-log-"),

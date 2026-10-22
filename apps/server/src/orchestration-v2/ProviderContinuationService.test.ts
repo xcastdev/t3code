@@ -1,3 +1,4 @@
+import * as RunAdmission from "./RunAdmission.ts";
 import { assert, describe, it } from "@effect/vitest";
 import {
   MessageId,
@@ -33,6 +34,7 @@ const delegatedMessageId = MessageId.make("message-provider-continuation-delegat
 const projection = {
   thread: { archivedAt: null, deletedAt: null },
   messages: [],
+  runs: [],
 } as unknown as OrchestrationV2ThreadProjection;
 
 const request = (
@@ -52,6 +54,7 @@ const delegatedProjection = (disposition: "open" | "stopped" | "disposed" = "ope
     runs: [
       {
         id: parentRunId,
+        providerThreadId,
         delegatedCompletion: {
           disposition,
           nextGeneration: 2,
@@ -91,6 +94,7 @@ const makeGuard = Effect.fnUntraced(function* (completed?: Deferred.Deferred<voi
 });
 
 function layerTest(input: {
+  readonly admissionCheck?: RunAdmission.RunAdmission["Service"]["check"];
   readonly dispatched: Queue.Queue<unknown>;
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
 }) {
@@ -100,7 +104,14 @@ function layerTest(input: {
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
     Layer.provide(
-      Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+      Layer.mergeAll(
+        Layer.mock(RunAdmission.RunAdmission)({
+          check: input.admissionCheck ?? (() => Effect.succeed({ _tag: "ordinary" })),
+        }),
+        IdAllocator.layer,
+        ProviderContinuationRequests.layer,
+        layerThreads,
+      ),
     ),
   );
   return Layer.merge(ProviderContinuationRequests.layer, layerWorker);
@@ -279,7 +290,12 @@ describe("ProviderContinuationService", () => {
         });
         const layerWorker = ProviderContinuationService.layer.pipe(
           Layer.provide(
-            Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+            Layer.mergeAll(
+              RunAdmission.layerOrdinary,
+              IdAllocator.layer,
+              ProviderContinuationRequests.layer,
+              layerThreads,
+            ),
           ),
         );
 
@@ -345,7 +361,12 @@ describe("ProviderContinuationService", () => {
         });
         const layerWorker = ProviderContinuationService.layer.pipe(
           Layer.provide(
-            Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+            Layer.mergeAll(
+              RunAdmission.layerOrdinary,
+              IdAllocator.layer,
+              ProviderContinuationRequests.layer,
+              layerThreads,
+            ),
           ),
         );
 
@@ -398,7 +419,12 @@ describe("ProviderContinuationService", () => {
         });
         const layerWorker = ProviderContinuationService.layer.pipe(
           Layer.provide(
-            Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
+            Layer.mergeAll(
+              RunAdmission.layerOrdinary,
+              IdAllocator.layer,
+              ProviderContinuationRequests.layer,
+              layerThreads,
+            ),
           ),
         );
 
@@ -593,3 +619,42 @@ describe("ProviderContinuationService", () => {
     });
   });
 });
+
+it.effect.each([false, true])(
+  "clears an inactive owner wake without inference (delegated=%s)",
+  (delegated) =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const cleared = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        yield* requests.offer({
+          ...request(),
+          ...(delegated
+            ? {
+                delegatedCompletion: {
+                  parentRunId,
+                  generation: 1,
+                  messageId: delegatedMessageId,
+                },
+              }
+            : {}),
+          clearIfCurrent: () => Deferred.succeed(cleared, undefined).pipe(Effect.asVoid),
+        });
+        yield* Deferred.await(cleared);
+        assert.equal(yield* Queue.size(dispatched), 0);
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            getThreadRecords: () => Effect.succeed(delegated ? delegatedProjection() : projection),
+            admissionCheck: (input) => {
+              assert.equal(input.threadId, threadId);
+              assert.equal(input.operation, "continue");
+              return Effect.succeed({ _tag: "denied", reason: "revoked" });
+            },
+          }),
+        ),
+      );
+    }),
+);

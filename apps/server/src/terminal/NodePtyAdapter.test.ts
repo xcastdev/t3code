@@ -5,6 +5,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as TestClock from "effect/testing/TestClock";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Scheduler from "effect/Scheduler";
@@ -196,4 +198,74 @@ it.effect("replays an exit to late subscribers and respects unsubscription", () 
     assert.deepEqual(late.mock.calls, [[{ exitCode: 7, signal: 2 }]]);
     assert.equal(nativeProcess.events.listenerCount("exit"), 0);
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.live.each(["win32", "darwin", "linux"] as const)(
+  "does not advertise unproved owned-session drain on %s",
+  (platform) =>
+    Effect.gen(function* () {
+      const adapter = yield* PtyAdapter.PtyAdapter;
+      const process = yield* adapter.spawn(spawnInput);
+      assert.isUndefined(process.signalOwned);
+      assert.isUndefined(process.awaitOwnedExit);
+    }).pipe(Effect.provide(layerTestFor(platform))),
+);
+
+it.effect(
+  "reconfirms a disappearing parent census and observes its inherited-session child before caching drain",
+  () =>
+    Effect.gen(function* () {
+      const milestone = yield* Deferred.make<"child-observed" | "completed">();
+      let enumerations = 0;
+      let leaderPresent = true;
+      let childExited = false;
+      const stat = (pid: number, state: string, start: string) => {
+        const fields = Array.from({ length: 20 }, () => "0");
+        fields[0] = state;
+        fields[2] = "42";
+        fields[3] = "42";
+        fields[19] = start;
+        return `${pid} (setup) ${fields.join(" ")}`;
+      };
+      const drain = NodePtyAdapter.makeLinuxSessionDrain(
+        { pid: 42, group: 42, session: 42, start: "100", state: "S" },
+        {
+          readdirSync: () => {
+            enumerations++;
+            if (enumerations === 1) {
+              // The inherited child appears after enumeration; its parent exits before stat.
+              leaderPresent = false;
+              return ["42"];
+            }
+            return ["43"];
+          },
+          readFileSync: (path) => {
+            if (path === "/proc/42/stat") {
+              if (leaderPresent) return stat(42, "S", "100");
+              throw Object.assign(new Error("parent exited"), { code: "ENOENT" });
+            }
+            if (path === "/proc/43/stat") {
+              const currentStat = stat(43, childExited ? "Z" : "S", "101");
+              Deferred.doneUnsafe(milestone, Effect.succeed("child-observed"));
+              return currentStat;
+            }
+            throw new Error("unexpected process lookup");
+          },
+        },
+      );
+      yield* drain.signalOwned("SIGTERM");
+      const awaiting = yield* drain.awaitOwnedExit.pipe(
+        Effect.onExit(() => Deferred.succeed(milestone, "completed")),
+        Effect.forkChild,
+      );
+      assert.equal(yield* Deferred.await(milestone), "child-observed");
+      assert.isUndefined(awaiting.pollUnsafe());
+      childExited = true;
+      yield* TestClock.adjust("20 millis");
+      yield* Fiber.join(awaiting);
+      const completedEnumerations = enumerations;
+      yield* drain.awaitOwnedExit;
+      assert.equal(enumerations, completedEnumerations);
+      assert.isAtLeast(enumerations, 4);
+    }),
 );

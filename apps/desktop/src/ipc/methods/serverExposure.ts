@@ -1,3 +1,5 @@
+import * as DesktopAppSettings from "../../settings/DesktopAppSettings.ts";
+import { DesktopPrimaryBackendNotManagedError } from "../../backend/DesktopAttachedBackend.ts";
 import {
   AdvertisedEndpoint,
   DesktopServerExposureModeSchema,
@@ -31,6 +33,9 @@ export const setServerExposureMode = DesktopIpc.makeIpcMethod({
   payload: DesktopServerExposureModeSchema,
   result: DesktopServerExposureStateSchema,
   handler: Effect.fn("desktop.ipc.serverExposure.setMode")(function* (mode) {
+    const primarySettings = yield* (yield* DesktopAppSettings.DesktopAppSettings).get;
+    if ((primarySettings.primaryBackend?.mode ?? "managed") !== "managed")
+      return yield* new DesktopPrimaryBackendNotManagedError({ operation: "setMode" });
     const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const change = yield* serverExposure.setMode(mode);
@@ -46,6 +51,11 @@ export const setTailscaleServeEnabled = DesktopIpc.makeIpcMethod({
   payload: SetTailscaleServeEnabledInput,
   result: DesktopServerExposureStateSchema,
   handler: Effect.fn("desktop.ipc.serverExposure.setTailscaleServeEnabled")(function* (input) {
+    const primarySettings = yield* (yield* DesktopAppSettings.DesktopAppSettings).get;
+    if ((primarySettings.primaryBackend?.mode ?? "managed") !== "managed")
+      return yield* new DesktopPrimaryBackendNotManagedError({
+        operation: "setTailscaleServeEnabled",
+      });
     const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const change = yield* serverExposure.setTailscaleServeEnabled(input);

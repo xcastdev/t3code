@@ -22,6 +22,7 @@ import { environmentThreadDetails } from "../../state/threads";
 import { NativeStackScreenOptions, nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
 import { NativeHeader, NativeScreen } from "../../native/ThemedScreenStack";
 import { SubagentRow } from "./SubagentRow";
+import { TURN_WORK_RETENTION_LABELS, deriveTurnAgentWork } from "./threadAgentsPresentation";
 import { ScreenContent } from "../../components/ui/ScreenContent";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 
@@ -49,6 +50,14 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
   const turn = useThreadTurnSubagents(target);
   const subagents = turn?.subagents ?? [];
   const hasLiveAgent = (turn?.liveCount ?? 0) > 0;
+  // Same thread detail the agents come from; nothing new is subscribed or paged in.
+  const thread = useAtomValue(environmentThreadDetails.threadAtom(target));
+  const history = useAtomValue(environmentThreadDetails.historyAtom(target));
+  const work = deriveTurnAgentWork({
+    runId: turn?.runId ?? null,
+    projection: thread?.projection ?? null,
+    history,
+  });
 
   const openChildThread = (childThreadId: ThreadId) => {
     void Haptics.selectionAsync();
@@ -72,6 +81,13 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
       contentContainerClassName="px-5 pb-6"
       contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
     >
+      {work ? (
+        <Text className="pt-3 text-xs text-foreground-muted">
+          This turn: {work.messageCount} messages · {work.commandCount} commands ·{" "}
+          {work.toolCallCount} tool calls · {work.subagentCount} agents ·{" "}
+          {TURN_WORK_RETENTION_LABELS[work.retention]}
+        </Text>
+      ) : null}
       {subagents.length === 0 ? (
         <Text className="pt-6 text-center text-sm text-foreground-muted">
           No agents in this turn.

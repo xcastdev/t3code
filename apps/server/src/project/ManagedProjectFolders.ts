@@ -1,4 +1,5 @@
 import {
+  type AssistantId,
   CommandId,
   type GitManagerServiceError,
   ProjectId,
@@ -20,6 +21,7 @@ import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
+import * as ProcessRunner from "../processRunner.ts";
 import * as ServerConfig from "../config.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -98,6 +100,13 @@ export class ManagedProjectFolders extends Context.Service<
       readonly text: string;
     }) => Effect.Effect<Option.Option<string>, ScratchFolderError>;
     readonly namedProjectsRoot: string;
+    readonly validateAssistantRepository: (input: {
+      readonly assistantId: AssistantId;
+      readonly workspaceRoot: string;
+    }) => Effect.Effect<void, NamedProjectFolderError>;
+    readonly ensureAssistantRepository: (input: {
+      readonly assistantId: AssistantId;
+    }) => Effect.Effect<{ readonly workspaceRoot: string }, NamedProjectFolderError>;
     /**
      * The folder is removed when the create fails or is cancelled before the
      * project exists, never once another project owns it.
@@ -199,6 +208,7 @@ function describeCommitFailure(stderr: string): string {
   return lines.at(-1) ?? "Git could not make the first commit.";
 }
 
+const isNamedProjectFolderError = Schema.is(NamedProjectFolderError);
 const isVcsProcessSpawnError = Schema.is(VcsProcessSpawnError);
 
 // Spawning a `git` that is not on PATH fails with NotFound, on Windows too.
@@ -208,7 +218,93 @@ const isGitMissing = (error: GitManagerServiceError) =>
   PlatformError.isPlatformError(error.cause.cause) &&
   error.cause.cause.reason._tag === "NotFound";
 
+export const makeAssistantRepositoryValidator = Effect.gen(function* () {
+  const config = yield* ServerConfig.ServerConfig;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const runner = yield* ProcessRunner.ProcessRunner;
+  return Effect.fn("ManagedProjectFolders.validateAssistantRepository")(function* (input: {
+    readonly assistantId: AssistantId;
+    readonly workspaceRoot: string;
+  }) {
+    const root = path.resolve(config.baseDir, "assistants");
+    const folder = path.join(root, input.assistantId);
+    const validate = Effect.gen(function* () {
+      if (
+        !/^assistant-[a-f0-9]{64}$/.test(input.assistantId) ||
+        input.workspaceRoot !== folder ||
+        (yield* fileSystem.realPath(root)) !== root ||
+        (yield* fileSystem.realPath(folder)) !== folder
+      )
+        return yield* new NamedProjectFolderError({
+          folder,
+          cause: "Managed assistant root changed",
+        });
+      for (const marker of [
+        path.join(root, `${input.assistantId}.claim`),
+        path.join(folder, ".t3-assistant-owner"),
+      ]) {
+        if (
+          (yield* fileSystem.realPath(marker)) !== marker ||
+          (yield* fileSystem.stat(marker)).type !== "File" ||
+          (yield* fileSystem.readFileString(marker)) !== input.assistantId
+        )
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Managed assistant ownership changed",
+          });
+      }
+      const dotGit = path.join(folder, ".git");
+      if (
+        (yield* fileSystem.realPath(dotGit)) !== dotGit ||
+        (yield* fileSystem.stat(dotGit)).type !== "Directory"
+      )
+        return yield* new NamedProjectFolderError({
+          folder,
+          cause: "Managed assistant Git directory changed",
+        });
+      for (const [argument, expected] of [
+        ["--show-toplevel", folder],
+        ["--absolute-git-dir", dotGit],
+        ["--git-common-dir", dotGit],
+      ] as const) {
+        const result = yield* runner.run({
+          command: "git",
+          cwd: folder,
+          args: ["rev-parse", argument],
+          maxOutputBytes: 4096,
+          timeout: 10_000,
+        });
+        if (result.code !== 0 || path.resolve(folder, result.stdout.trim()) !== expected)
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Managed assistant Git identity changed",
+          });
+      }
+      const head = yield* runner.run({
+        command: "git",
+        cwd: folder,
+        args: ["rev-parse", "--verify", "HEAD^{commit}"],
+        maxOutputBytes: 4096,
+        timeout: 10_000,
+      });
+      // Ordinary assistant commits advance HEAD; only its validity and ownership matter.
+      if (head.code !== 0 || !/^[a-f0-9]{40,64}$/.test(head.stdout.trim()))
+        return yield* new NamedProjectFolderError({
+          folder,
+          cause: "Managed assistant checkpoint foundation is missing",
+        });
+    });
+    return yield* validate.pipe(
+      Effect.mapError((cause) =>
+        isNamedProjectFolderError(cause) ? cause : new NamedProjectFolderError({ folder, cause }),
+      ),
+    );
+  });
+});
+
 const make = Effect.gen(function* () {
+  const validateAssistantRepository = yield* makeAssistantRepositoryValidator;
   const config = yield* ServerConfig.ServerConfig;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -475,6 +571,171 @@ const make = Effect.gen(function* () {
     };
   });
 
+  const ensureAssistantRepository = Effect.fn("ManagedProjectFolders.ensureAssistantRepository")(
+    function* (input: { readonly assistantId: AssistantId }) {
+      const root = path.resolve(config.baseDir, "assistants");
+      const folder = path.join(root, input.assistantId);
+      const prepare = Effect.gen(function* () {
+        // Check before claiming storage; missing Git must never leave an active home.
+        yield* git.execute({
+          operation: "ManagedProjectFolders.assistantGitProbe",
+          cwd: config.baseDir,
+          args: ["--version"],
+          timeoutMs: 10_000,
+        });
+        if (!/^assistant-[a-f0-9]{64}$/.test(input.assistantId))
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Invalid managed assistant identity",
+          });
+        yield* fileSystem.makeDirectory(root, { recursive: true });
+        if ((yield* fileSystem.realPath(root)) !== root)
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Assistant storage cannot contain symlinks",
+          });
+        const marker = path.join(folder, ".t3-assistant-owner");
+        const claim = path.join(root, `${input.assistantId}.claim`);
+        if (!(yield* fileSystem.exists(claim))) {
+          if (yield* fileSystem.exists(folder))
+            return yield* new NamedProjectFolderError({
+              folder,
+              cause: "Preexisting assistant folder has no ownership claim",
+            });
+          yield* fileSystem.writeFileString(claim, input.assistantId, { flag: "wx" }).pipe(
+            Effect.catchIf(
+              (error) => error.reason._tag === "AlreadyExists",
+              () => Effect.void,
+            ),
+          );
+        }
+        if (
+          (yield* fileSystem.realPath(claim)) !== claim ||
+          (yield* fileSystem.readFileString(claim)) !== input.assistantId
+        )
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Assistant storage claim mismatch",
+          });
+        yield* fileSystem.makeDirectory(folder).pipe(
+          Effect.catchIf(
+            (error) => error.reason._tag === "AlreadyExists",
+            () => Effect.void,
+          ),
+        );
+        if (!(yield* fileSystem.exists(marker))) {
+          // The durable claim precedes mkdir so a crash in between can resume, but
+          // an unmarked directory containing files is never adopted.
+          if ((yield* fileSystem.readDirectory(folder)).length !== 0)
+            return yield* new NamedProjectFolderError({
+              folder,
+              cause: "Unmarked assistant folder is not empty",
+            });
+          yield* fileSystem.writeFileString(marker, input.assistantId, { flag: "wx" }).pipe(
+            Effect.catchIf(
+              (error) => error.reason._tag === "AlreadyExists",
+              () => Effect.void,
+            ),
+          );
+        }
+        if (
+          (yield* fileSystem.realPath(folder)) !== folder ||
+          (yield* fileSystem.realPath(marker)) !== marker ||
+          (yield* fileSystem.readFileString(marker)) !== input.assistantId
+        )
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Assistant folder ownership mismatch",
+          });
+        const dotGit = path.join(folder, ".git");
+        if (!(yield* fileSystem.exists(dotGit))) {
+          yield* git.execute({
+            operation: "ManagedProjectFolders.assistantInit",
+            cwd: folder,
+            args: ["init", "--initial-branch=main", "--template="],
+            timeoutMs: 10_000,
+          });
+        }
+        if (
+          (yield* fileSystem.realPath(dotGit)) !== dotGit ||
+          (yield* fileSystem.stat(dotGit)).type !== "Directory"
+        )
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Managed repository cannot use an external Git directory",
+          });
+        const top = yield* git.execute({
+          operation: "ManagedProjectFolders.assistantRoot",
+          cwd: folder,
+          args: ["rev-parse", "--show-toplevel"],
+          timeoutMs: 10_000,
+        });
+        if (path.resolve(top.stdout.trim()) !== folder)
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Assistant repository root mismatch",
+          });
+        const common = yield* git.execute({
+          operation: "ManagedProjectFolders.assistantCommonRoot",
+          cwd: folder,
+          args: ["rev-parse", "--git-common-dir"],
+          timeoutMs: 10_000,
+        });
+        if (path.resolve(folder, common.stdout.trim()) !== dotGit)
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Managed repository cannot use an external common Git directory",
+          });
+        const configFile = path.join(dotGit, "config");
+        if ((yield* fileSystem.realPath(configFile)) !== configFile)
+          return yield* new NamedProjectFolderError({
+            folder,
+            cause: "Managed repository configuration cannot be external",
+          });
+        for (const [key, value] of [
+          ["user.name", "T3 Assistant"],
+          ["user.email", "assistant@localhost"],
+          ["commit.gpgsign", "false"],
+          ["core.hooksPath", path.join(dotGit, "t3-no-hooks")],
+        ] as const) {
+          yield* git.execute({
+            operation: "ManagedProjectFolders.assistantIdentity",
+            cwd: folder,
+            args: ["config", "--local", key, value],
+            timeoutMs: 10_000,
+          });
+        }
+        const head = yield* git.execute({
+          operation: "ManagedProjectFolders.assistantHead",
+          cwd: folder,
+          args: ["rev-parse", "--verify", "HEAD"],
+          allowNonZeroExit: true,
+          timeoutMs: 10_000,
+        });
+        if (head.exitCode !== 0) {
+          yield* git.execute({
+            operation: "ManagedProjectFolders.assistantAdd",
+            cwd: folder,
+            args: ["add", "--force", "--", ".t3-assistant-owner"],
+            timeoutMs: 10_000,
+          });
+          yield* git.execute({
+            operation: "ManagedProjectFolders.assistantCommit",
+            cwd: folder,
+            args: ["commit", "--message", "Initialize assistant workspace"],
+            timeoutMs: 30_000,
+          });
+        }
+        return { workspaceRoot: folder };
+      });
+      return yield* prepare.pipe(
+        Effect.mapError((cause) =>
+          isNamedProjectFolderError(cause) ? cause : new NamedProjectFolderError({ folder, cause }),
+        ),
+      );
+    },
+  );
+
   return ManagedProjectFolders.of({
     scratchRoot,
     ensureScratchProject,
@@ -482,6 +743,8 @@ const make = Effect.gen(function* () {
     folderForThread,
     namedProjectsRoot,
     createNamedProject,
+    ensureAssistantRepository,
+    validateAssistantRepository,
   });
 });
 

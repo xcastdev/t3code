@@ -15,6 +15,11 @@ import { useSystemWorkspaceTabBar } from "./useSystemWorkspaceTabBar";
 
 const PULL_REQUEST_ICON = require("../../../assets/icons/pull-request.png");
 const COMPOSE_TAB = "compose";
+const TAB_LABELS: Record<WorkspaceTab, { title: string; accessibilityLabel: string }> = {
+  threads: { title: "Threads", accessibilityLabel: "Threads" },
+  pullRequests: { title: "Pulls", accessibilityLabel: "Pull requests" },
+  work: { title: "Work", accessibilityLabel: "Work" },
+};
 
 /** Retain each native controller tree; removing its root can leave RNS's stack empty. */
 function RetainedWorkspaceTab(props: {
@@ -82,7 +87,7 @@ export function WorkspaceNativeTabs(props: {
         }}
         onTabSelected={({ nativeEvent }: NativeSyntheticEvent<TabSelectedEvent>) => {
           const tab = nativeEvent.selectedScreenKey;
-          if (tab !== "threads" && tab !== "pullRequests") return;
+          if (tab !== "threads" && tab !== "pullRequests" && tab !== "work") return;
           setProvenance(nativeEvent.provenance);
           if (nativeEvent.actionOrigin === "programmatic-js" || tab === selectedTab) return;
           Keyboard.dismiss();
@@ -90,17 +95,19 @@ export function WorkspaceNativeTabs(props: {
           workspace.dispatch({ type: "select", tab });
         }}
       >
-        {(["threads", "pullRequests"] as const).map((tab: WorkspaceTab) => (
+        {(["threads", "pullRequests", "work"] as const).map((tab: WorkspaceTab) => (
           <Tabs.Screen
             key={tab}
             screenKey={tab}
-            title={tab === "threads" ? "Threads" : "Pulls"}
-            tabBarItemAccessibilityLabel={tab === "threads" ? "Threads" : "Pull requests"}
+            title={TAB_LABELS[tab].title}
+            tabBarItemAccessibilityLabel={TAB_LABELS[tab].accessibilityLabel}
             ios={{
               icon:
                 tab === "threads"
                   ? { type: "sfSymbol", name: "text.bubble" }
-                  : { type: "templateSource", templateSource: PULL_REQUEST_ICON },
+                  : tab === "work"
+                    ? { type: "sfSymbol", name: "checklist" }
+                    : { type: "templateSource", templateSource: PULL_REQUEST_ICON },
               selectedIcon:
                 tab === "threads" ? { type: "sfSymbol", name: "text.bubble.fill" } : undefined,
               overrideScrollViewContentInsetAdjustmentBehavior: false,

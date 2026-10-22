@@ -155,5 +155,24 @@ export function mapSettingsSecrets(
       ) as EasDeviceHostConfig,
   );
 
-  return { ...settings, providerInstances, sourceControlHosts, usageLimitSources, easDeviceHosts };
+  const externalNotifications = {
+    destinations: settings.externalNotifications.destinations.map((destination) => {
+      const result = map({
+        secretName: `notification-webhook-${encode(destination.id)}`,
+        kind: "field",
+        value: destination.webhookUrl,
+        redacted: destination.webhookUrl === SECRET_REDACTED,
+        sensitive: true,
+      });
+      return { ...destination, webhookUrl: result.redacted ? SECRET_REDACTED : result.value };
+    }),
+  };
+  return {
+    ...settings,
+    providerInstances,
+    sourceControlHosts,
+    usageLimitSources,
+    easDeviceHosts,
+    externalNotifications,
+  };
 }

@@ -1,5 +1,6 @@
-import { assert, it } from "@effect/vitest";
+import { assert, it, vi } from "@effect/vitest";
 import {
+  MessageId,
   type ModelSelection,
   NodeId,
   type OrchestrationV2ProviderThread,
@@ -15,6 +16,8 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -24,6 +27,7 @@ import * as Stream from "effect/Stream";
 
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as RunAdmission from "./RunAdmission.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -280,7 +284,9 @@ it.effect(
         }),
       );
       const layerControl = ProviderTurnControlService.layer.pipe(
-        Layer.provide(Layer.merge(layerProjection, layerSessionManager)),
+        Layer.provide(
+          Layer.mergeAll(layerProjection, layerSessionManager, RunAdmission.layerOrdinary),
+        ),
       );
 
       const [ordinaryInterrupt, unrelatedRestart] = yield* Effect.gen(function* () {
@@ -327,5 +333,182 @@ it.effect(
       assert.equal(interrupted?.providerSessionId, oldSessionId);
       assert.equal(interrupted?.id, providerThreadId);
       assert.equal(interrupted?.nativeThreadRef?.nativeId, "native-thread:restart-session");
+    }),
+);
+
+it.effect.each(["ordinary", "revoked"] as const)(
+  "checks %s ownership at the native steer boundary",
+  (state) => {
+    const threadId = ThreadId.make("owned-steer-thread");
+    const providerSessionId = ProviderSessionId.make("owned-steer-session");
+    const providerThreadId = ProviderThreadId.make("owned-steer-provider-thread");
+    const providerTurnId = ProviderTurnId.make("owned-steer-turn");
+    const runId = RunId.make("owned-steer-run");
+    const messageId = MessageId.make("owned-steer-message");
+    let revoked = false;
+    const steerTurn = vi.fn(() => Effect.void);
+    const check = vi.fn(() =>
+      Effect.sync(() =>
+        revoked
+          ? { _tag: "denied" as const, reason: "owner archived" }
+          : { _tag: "ordinary" as const },
+      ),
+    );
+    const layer = ProviderTurnControlService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(RunAdmission.RunAdmission)({ check }),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getProviderControlContext: () =>
+              Effect.succeed({
+                providerThread: { id: providerThreadId, providerSessionId },
+                providerTurn: { id: providerTurnId, providerThreadId, status: "running" },
+                run: { id: runId },
+                message: { id: messageId, text: "Continue", attachments: [] },
+              } as never),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+            get: () =>
+              Effect.sync(() => {
+                revoked = state === "revoked";
+                return Option.some({ steerTurn } as never);
+              }),
+          }),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const service = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+      const exit = yield* Effect.exit(
+        service.steer({ threadId, providerSessionId, providerThreadId, providerTurnId, messageId }),
+      );
+      assert.equal(exit._tag, state === "revoked" ? "Failure" : "Success");
+      assert.equal(steerTurn.mock.calls.length, state === "revoked" ? 0 : 1);
+      assert.equal(check.mock.calls.length, 1);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each(["attempt", "session", "final-check"] as const)(
+  "rejects an old steer when the %s changes across native authorization",
+  (replacement) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("steer-race-thread");
+      const providerSessionId = ProviderSessionId.make("steer-race-old-session");
+      const providerThreadId = ProviderThreadId.make("steer-race-provider-thread");
+      const providerTurnId = ProviderTurnId.make("steer-race-old-turn");
+      const runId = RunId.make("steer-race-run");
+      const oldAttempt = RunAttemptId.make("steer-race-old-attempt");
+      const newAttempt = RunAttemptId.make("steer-race-new-attempt");
+      const messageId = MessageId.make("steer-race-message");
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const finalEntered = yield* Deferred.make<void>();
+      const finalRelease = yield* Deferred.make<void>();
+      let checkCount = 0;
+      let lastNativeTarget: RunAdmission.NativeTarget | undefined;
+      let attempt = oldAttempt;
+      let currentSession = providerSessionId;
+      const steerTurn = vi.fn(() => Effect.void);
+      const layer = ProviderTurnControlService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(RunAdmission.RunAdmission)({
+              check: (checkInput) =>
+                Effect.gen(function* () {
+                  checkCount += 1;
+                  if (replacement === "final-check" && checkCount === 2) {
+                    yield* Deferred.succeed(finalEntered, undefined);
+                    yield* Deferred.await(finalRelease);
+                  }
+                  lastNativeTarget = checkInput.nativeTarget;
+                  if (
+                    checkInput.nativeTarget !== undefined &&
+                    checkInput.nativeTarget.providerSessionId !== currentSession
+                  ) {
+                    return { _tag: "denied" as const, reason: "native-target-stale" };
+                  }
+                  return {
+                    _tag: "admitted" as const,
+                    owner: {
+                      projectId: ProjectId.make("race-project"),
+                      bindingId: "race-binding",
+                      rootId: "race-root",
+                      generation: 2,
+                      fence: 2,
+                      threadId,
+                      runId,
+                      runAttemptId: attempt,
+                      expiresAt: "2099-01-01T00:00:00Z",
+                      configuration: {
+                        providerInstanceId: "codex",
+                        model: "gpt-5.4",
+                        instructionsHash: "hash",
+                        toolIds: [],
+                        skillIds: [],
+                        runtimeVersion: "v1",
+                        maxTokens: 1000,
+                        maxDurationMs: 1000,
+                        paidFallback: false,
+                      },
+                    },
+                  };
+                }),
+            }),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getProviderControlContext: () =>
+                Effect.succeed({
+                  providerThread: { id: providerThreadId, providerSessionId: currentSession },
+                  providerTurn: {
+                    id: providerTurnId,
+                    providerThreadId,
+                    runAttemptId: oldAttempt,
+                    status: "running",
+                  },
+                  run: { id: runId },
+                  message: { id: messageId, text: "Continue", attachments: [] },
+                } as never),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              get: () =>
+                Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(Option.some({ steerTurn } as never)),
+                ),
+            }),
+          ),
+        ),
+      );
+      const operation = Effect.gen(function* () {
+        yield* (yield* ProviderTurnControlService.ProviderTurnControlServiceV2).steer({
+          threadId,
+          providerSessionId,
+          providerThreadId,
+          providerTurnId,
+          messageId,
+        });
+      }).pipe(Effect.provide(layer));
+      const fiber = yield* operation.pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      if (replacement === "final-check") {
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(finalEntered);
+        currentSession = ProviderSessionId.make("replacement-session");
+        yield* Deferred.succeed(finalRelease, undefined);
+      } else {
+        if (replacement === "attempt") attempt = newAttempt;
+        else currentSession = ProviderSessionId.make("replacement-session");
+        yield* Deferred.succeed(release, undefined);
+      }
+      assert.equal((yield* Fiber.await(fiber))._tag, "Failure");
+      assert.equal(steerTurn.mock.calls.length, 0);
+      if (replacement === "final-check") {
+        assert.deepEqual(lastNativeTarget, {
+          runAttemptId: oldAttempt,
+          providerThreadId,
+          providerSessionId,
+          providerTurnId,
+        });
+      }
     }),
 );

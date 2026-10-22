@@ -28,6 +28,7 @@ import {
 import { AuthOrchestrationOperateScope, type EnvironmentMachineKind } from "@t3tools/contracts";
 import { canSnooze, resolveSnoozePresets } from "@t3tools/client-runtime/state/thread-settled";
 import type { MenuAction } from "@react-native-menu/menu";
+import { useNavigation } from "@react-navigation/native";
 import { memo, useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
 import { Pressable, useWindowDimensions, View } from "react-native";
 import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
@@ -542,6 +543,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly simultaneousSwipeGesture?: ComponentProps<typeof ThreadSwipeable>["simultaneousWith"];
 }) {
   const { width: windowWidth } = useWindowDimensions();
+  const navigation = useNavigation();
   const {
     thread,
     variant,
@@ -756,6 +758,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const titleMenuItems = useMemo<MenuAction[]>(
     () => [
       { id: "rename", title: "Rename", image: "square.and.pencil" },
+      { id: "thread-resources", title: "Skills and commands", image: "sparkles" },
+      { id: "history", title: "History", image: "clock.arrow.circlepath" },
       ...buildThreadTitleRegenerationMenuItems({
         supported: props.titleRegenerationSupported,
         isRegenerating: thread.titleRegeneration != null,
@@ -838,6 +842,20 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       if (nativeEvent.event === "move-down") handleMoveDown();
       if (nativeEvent.event === "archive") handleArchive();
       if (nativeEvent.event === "rename") handleRename();
+      if (nativeEvent.event === "thread-resources")
+        // Settings screens share one nested stack, as with the project resource links.
+        (navigation.navigate as (name: string, params: object) => void)("SettingsSheet", {
+          screen: "SettingsContent",
+          params: {
+            screen: "SettingsThreadResources",
+            params: { environmentId: thread.environmentId, threadId: thread.id },
+          },
+        });
+      if (nativeEvent.event === "history")
+        navigation.navigate("ThreadHistory", {
+          environmentId: thread.environmentId,
+          threadId: thread.id,
+        });
       if (nativeEvent.event === "regenerate-title") handleRegenerateTitle();
       if (nativeEvent.event === "copy-thread-id") {
         copyTextWithHaptic(thread.id, { target: "thread-id" });
@@ -864,6 +882,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     [
       onNewThreadOnBranch,
       thread,
+      navigation,
       handleArchive,
       handleDelete,
       handleRegenerateTitle,

@@ -1,10 +1,12 @@
 import { StackActions, useNavigation } from "@react-navigation/native";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useMemo } from "react";
 import { isDuoDevice } from "../../lib/device-type";
 import type { AppNativeStackNavigationOptions } from "../../native/StackHeader";
 import { useDeviceType } from "../../native/native-layout-metrics";
 import { useNativeWorkspaceColumnsSupported } from "../../native/NativeWorkspaceColumns";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
+import { useAgentThreadLink } from "../assistants/useAgentThreadLink";
 import { withNativeGlassHeaderItem } from "../layout/native-glass-header-items";
 import {
   ThreadGitControls,
@@ -27,8 +29,52 @@ export function useThreadHeaderOptions(props: {
   const usesDuoHeader = usesNativeWorkspaceColumns && isDuoDevice(deviceType);
   const navigation = useNavigation();
   const { layout, panes, togglePrimarySidebar } = useAdaptiveWorkspaceLayout();
-  const threadCenterHeaderItems = useThreadGitCenterHeaderItems(props.gitControls);
-  const compactRightHeaderItems = useThreadGitRightHeaderItems(props.gitControls);
+  const gitCenterHeaderItems = useThreadGitCenterHeaderItems(props.gitControls);
+  const gitRightHeaderItems = useThreadGitRightHeaderItems(props.gitControls);
+  const historyEnvironmentId = EnvironmentId.make(String(props.gitControls.environmentId));
+  const historyThreadId = ThreadId.make(String(props.gitControls.threadId));
+  const historyHeaderItem = useMemo(
+    () =>
+      withNativeGlassHeaderItem({
+        accessibilityLabel: "Thread history",
+        icon: { name: "clock.arrow.circlepath", type: "sfSymbol" as const },
+        identifier: "thread-right-history",
+        label: "History",
+        onPress: () =>
+          navigation.navigate("ThreadHistory", {
+            environmentId: historyEnvironmentId,
+            threadId: historyThreadId,
+          }),
+        type: "button" as const,
+      }),
+    [navigation, historyEnvironmentId, historyThreadId],
+  );
+  // A chat owned by an agent links to that agent; ordinary chats show nothing extra.
+  const agentLink = useAgentThreadLink(historyEnvironmentId, historyThreadId);
+  const agentHeaderItems = useMemo<NativeHeaderItems>(
+    () =>
+      agentLink === null
+        ? []
+        : [
+            withNativeGlassHeaderItem({
+              accessibilityLabel: agentLink.label,
+              icon: { name: "person.crop.circle", type: "sfSymbol" as const },
+              identifier: "thread-right-agent",
+              label: "Agent",
+              onPress: agentLink.open,
+              type: "button" as const,
+            }),
+          ],
+    [agentLink],
+  );
+  const threadCenterHeaderItems = useMemo<NativeHeaderItems>(
+    () => [...agentHeaderItems, historyHeaderItem, ...gitCenterHeaderItems],
+    [agentHeaderItems, historyHeaderItem, gitCenterHeaderItems],
+  );
+  const compactRightHeaderItems = useMemo<NativeHeaderItems>(
+    () => [...agentHeaderItems, historyHeaderItem, ...gitRightHeaderItems],
+    [agentHeaderItems, historyHeaderItem, gitRightHeaderItems],
+  );
   const splitLeftHeaderItems = useMemo<NativeHeaderItems>(
     () => [
       ...(!usesDuoHeader

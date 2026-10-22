@@ -17,7 +17,10 @@ import * as Schema from "effect/Schema";
 import { createMuseSdkHost, createMuseSdkHostEffect, type MuseSdkHost } from "./sdk.ts";
 import { museModelCapabilities, resolveMuseReasoningEffort } from "./modelCatalog.ts";
 import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
-import { investigationUnsupported } from "@t3tools/provider-core/server/textGenerationOperations";
+import {
+  fromRunner,
+  investigationUnsupported,
+} from "@t3tools/provider-core/server/textGenerationOperations";
 import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
@@ -280,8 +283,13 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
         }),
       ),
     );
-    const decodeOutput = Schema.decodeEffect(input.outputSchema);
-    return yield* decodeJson(extractJsonObject(response)).pipe(
+    const decodeOutput = Schema.decodeEffect(
+      input.outputSchema,
+      operation === "extractMemoryFacts" ? { onExcessProperty: "error" } : undefined,
+    );
+    return yield* decodeJson(
+      operation === "extractMemoryFacts" ? response : extractJsonObject(response),
+    ).pipe(
       Effect.flatMap(decodeOutput),
       Effect.mapError(
         (cause) =>
@@ -343,6 +351,7 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
   const generateReviewGuide: ProviderTextGeneration["generateReviewGuide"] = () =>
     Effect.fail(investigationUnsupported("generateReviewGuide", "Muse Code"));
   return {
+    extractMemoryFacts: fromRunner("MuseTextGeneration", runMuseJson).extractMemoryFacts,
     generateCommitMessage,
     generatePrContent,
     generateBranchName,

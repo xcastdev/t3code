@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Revalidate captured /proc identity and signal without an async gap.
+import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeNet from "node:net";
 
@@ -165,12 +167,174 @@ const killStartingWindowsPty = (process: import("node-pty").IPty) =>
     ),
   );
 
+const isPtyDrainError = Schema.is(PtyAdapter.PtyDrainError);
+
+interface LinuxProcessFileSystem {
+  readFileSync(path: string, encoding: "utf8"): string;
+  readdirSync(path: string): ReadonlyArray<string>;
+}
+
+interface LinuxProcessIdentity {
+  pid: number;
+  group: number;
+  session: number;
+  start: string;
+  state: string;
+}
+
+const readLinuxIdentity = (
+  pid: number,
+  fileSystem: LinuxProcessFileSystem = NodeFS,
+): LinuxProcessIdentity | undefined => {
+  let stat: string;
+  try {
+    stat = fileSystem.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch (cause) {
+    if (
+      cause instanceof Error &&
+      "code" in cause &&
+      (cause.code === "ENOENT" || cause.code === "ESRCH")
+    )
+      return undefined;
+    throw cause;
+  }
+  // comm is parenthesized and may itself contain spaces or parentheses.
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  const group = Number(fields[2]);
+  const session = Number(fields[3]);
+  const start = fields[19];
+  const state = fields[0];
+  if (!Number.isSafeInteger(group) || !Number.isSafeInteger(session) || !start || !state) {
+    throw new PtyAdapter.PtyDrainError({ reason: "inspection-failed" });
+  }
+  return { pid, group, session, start, state };
+};
+
+const captureLinuxSession = Effect.fn("NodePtyAdapter.captureLinuxSession")(
+  function* (pid: number) {
+    const initial = yield* Effect.try(() => readLinuxIdentity(pid));
+    if (!initial) return undefined;
+    // forkpty's child establishes its session before exec; the parent may return first.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const current = yield* Effect.try(() => readLinuxIdentity(pid));
+      if (!current || current.start !== initial.start) return undefined;
+      if (current.session === pid && current.group === pid) return current;
+      yield* Effect.sleep("10 millis");
+    }
+    return undefined;
+  },
+  Effect.orElseSucceed(() => undefined),
+);
+
+export const makeLinuxSessionDrain = (
+  leader: LinuxProcessIdentity,
+  fileSystem: LinuxProcessFileSystem = NodeFS,
+) => {
+  let drained = false;
+  const assertLeader = () => {
+    const current = readLinuxIdentity(leader.pid, fileSystem);
+    if (current && (current.start !== leader.start || current.session !== leader.session)) {
+      throw new PtyAdapter.PtyDrainError({ reason: "ownership-changed" });
+    }
+  };
+  const snapshot = () => {
+    if (drained) return { members: [], complete: true };
+    assertLeader();
+    const members: LinuxProcessIdentity[] = [];
+    let complete = true;
+    for (const entry of fileSystem.readdirSync("/proc")) {
+      if (!/^[1-9][0-9]*$/.test(entry)) continue;
+      const member = readLinuxIdentity(Number(entry), fileSystem);
+      if (!member) complete = false;
+      else if (member.session === leader.session) members.push(member);
+    }
+    assertLeader();
+    return { members, complete };
+  };
+  const failure = (cause: unknown) =>
+    isPtyDrainError(cause)
+      ? cause
+      : new PtyAdapter.PtyDrainError({ reason: "inspection-failed", cause });
+  const signalOwned = Effect.fn("NodePtyAdapter.signalOwned")(function* (
+    signal: "SIGTERM" | "SIGKILL",
+  ) {
+    yield* Effect.try({
+      try: () => {
+        const { members } = snapshot();
+        // Keep the captured leader until its foreground/background job groups are signalled.
+        const groups = [...new Set(members.map((member) => member.group))].sort((a, b) =>
+          a === leader.group ? 1 : b === leader.group ? -1 : a - b,
+        );
+        for (const group of groups) {
+          if (!Number.isSafeInteger(group) || group <= 1) {
+            throw new PtyAdapter.PtyDrainError({ reason: "ownership-changed" });
+          }
+          const owned = members.some((member) => {
+            if (member.group !== group) return false;
+            const current = readLinuxIdentity(member.pid, fileSystem);
+            if (!current) return false;
+            if (
+              current.start !== member.start ||
+              current.session !== leader.session ||
+              current.group !== group
+            ) {
+              throw new PtyAdapter.PtyDrainError({ reason: "ownership-changed" });
+            }
+            return current.state !== "Z" && current.state !== "X";
+          });
+          if (!owned) continue;
+          assertLeader();
+          try {
+            process.kill(-group, signal);
+          } catch (cause) {
+            if (cause instanceof Error && "code" in cause && cause.code === "ESRCH") continue;
+            throw new PtyAdapter.PtyDrainError({ reason: "signal-failed", cause });
+          }
+        }
+      },
+      catch: failure,
+    });
+  });
+  const awaitOwnedExit = Effect.gen(function* () {
+    if (drained) return;
+    let previousEmpty: string | undefined;
+    while (true) {
+      const census = yield* Effect.try({ try: snapshot, catch: failure });
+      const hasLiveMember = census.members.some(
+        (member) => member.state !== "Z" && member.state !== "X",
+      );
+      if (census.complete && !hasLiveMember) {
+        // A parent may fork after readdir and exit before stat. Keep zombie identities:
+        // only matching complete censuses prove no unseen child replaced that parent.
+        const identities = census.members
+          .map((member) => `${member.pid}:${member.start}`)
+          .sort()
+          .join(",");
+        if (identities === previousEmpty) {
+          drained = true;
+          return;
+        }
+        previousEmpty = identities;
+      } else previousEmpty = undefined;
+      yield* Effect.sleep("10 millis");
+    }
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: "2 seconds",
+      orElse: () => Effect.fail(new PtyAdapter.PtyDrainError({ reason: "deadline" })),
+    }),
+  );
+  return { signalOwned, awaitOwnedExit };
+};
+
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
   private readonly platform: NodeJS.Platform;
   private exitEvent: PtyAdapter.PtyExitEvent | undefined;
   private readonly exitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
   private readonly exitSubscription: import("node-pty").IDisposable;
+  signalOwned?: NonNullable<PtyAdapter.PtyProcess["signalOwned"]>;
+  awaitOwnedExit?: NonNullable<PtyAdapter.PtyProcess["awaitOwnedExit"]>;
 
   constructor(process: import("node-pty").IPty, platform: NodeJS.Platform) {
     this.process = process;
@@ -288,6 +452,14 @@ const make = Effect.fn("NodePtyAdapter.make")(function* () {
             ),
           ),
         );
+      }
+      if (platform === "linux") {
+        const ownership = yield* captureLinuxSession(ptyProcess.process.pid);
+        if (ownership) {
+          const drain = makeLinuxSessionDrain(ownership);
+          ptyProcess.process.signalOwned = drain.signalOwned;
+          ptyProcess.process.awaitOwnedExit = drain.awaitOwnedExit;
+        }
       }
       return ptyProcess.process;
     }),

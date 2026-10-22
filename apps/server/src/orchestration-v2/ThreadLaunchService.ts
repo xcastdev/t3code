@@ -22,14 +22,18 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as Semaphore from "effect/Semaphore";
+import * as RunAdmission from "./RunAdmission.ts";
 import {
   buildTemporaryWorktreeBranchName,
   flattenTemporaryWorktreeBranchName,
@@ -103,7 +107,20 @@ type PreparationInput = Pick<
   "commandId" | "projectId" | "workspaceStrategy" | "initialMessage"
 > & {
   readonly reusedWorktree?: { readonly baseRef: string };
+  readonly ownedPreparation?: RunAdmission.AdmittedOwner;
 };
+
+interface OwnedSetupResource {
+  readonly input: PreparationInput;
+  readonly threadId: ThreadId;
+  readonly runId: RunId | null;
+  readonly terminalId: string;
+  readonly capture: TerminalManager.TerminalDrainHandle;
+  readonly lock: Semaphore.Semaphore;
+  drained: boolean;
+  preparationFinished: boolean;
+  stopRequested: boolean;
+}
 
 export interface ThreadLaunchPreparationInput {
   readonly commandId: CommandId;
@@ -181,6 +198,9 @@ export class ThreadLaunchService extends Context.Service<
       | ThreadManagement.ThreadManagementProviderInstanceDisabledError
     >;
     readonly prepareRun: (input: ThreadLaunchPreparationInput) => Effect.Effect<void>;
+    readonly preparationActive: (threadId: ThreadId) => Effect.Effect<boolean>;
+    readonly requestPreparationStop: (threadId: ThreadId) => Effect.Effect<void>;
+    readonly preparationChanges: Stream.Stream<ThreadId>;
   }
 >()("t3/orchestration-v2/ThreadLaunchService") {}
 
@@ -195,7 +215,13 @@ function failureDetail(error: unknown): string {
   return `Workspace preparation failed: ${error instanceof Error ? error.message : String(error)}`;
 }
 
+const isSetupProjectNotFound = Schema.is(
+  ProjectSetupScriptRunner.ProjectSetupScriptProjectNotFoundError,
+);
+const isSetupOperationError = Schema.is(ProjectSetupScriptRunner.ProjectSetupScriptOperationError);
+
 const make = Effect.gen(function* () {
+  const admission = yield* RunAdmission.RunAdmission;
   const projects = yield* ProjectService.ProjectService;
   const setupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
   const cloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
@@ -210,8 +236,60 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
   const preparationScope = yield* Scope.make("sequential");
-  const scheduledLaunches = yield* Ref.make<ReadonlySet<CommandId>>(new Set());
+  const scheduledLaunches = yield* Ref.make<ReadonlyMap<CommandId, ThreadId>>(new Map());
+  const preparationChanges = yield* PubSub.sliding<ThreadId>(1);
+  const stoppingPreparations = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
+  const ownedSetupResources = yield* Ref.make<ReadonlyMap<string, OwnedSetupResource>>(new Map());
   yield* Effect.addFinalizer(() => Scope.close(preparationScope, Exit.void));
+
+  const preparationKey = (input: PreparationInput, threadId: ThreadId, runId: RunId | null) =>
+    `${threadId}:${runId ?? input.commandId}`;
+  const recordPreparationDrained = Effect.fn("ThreadLaunchService.recordPreparationDrained")(
+    function* (input: PreparationInput, threadId: ThreadId, runId: RunId | null) {
+      yield* receipts.insertIfAbsent({
+        commandId: CommandId.make(
+          runId === null
+            ? `${input.commandId}:preparation-drained`
+            : `v2-preparation-drained:${threadId}:${runId}`,
+        ),
+        threadId,
+        commandType: "thread.preparation.drained",
+        acceptedAt: yield* DateTime.now,
+        resultSequence: yield* threads.getThreadEventSequence(threadId),
+        status: "accepted",
+        error: null,
+      });
+    },
+  );
+  const drainOwnedSetup = Effect.fn("ThreadLaunchService.drainOwnedSetup")(
+    (resource: OwnedSetupResource, deleteHistory: boolean) =>
+      resource.lock.withPermits(1)(
+        Effect.gen(function* () {
+          if (resource.drained) return;
+          yield* terminals.closeAndDrain({
+            threadId: resource.threadId,
+            terminalId: resource.terminalId,
+            capture: resource.capture,
+            deleteHistory,
+          });
+          resource.drained = true;
+        }),
+      ),
+  );
+  const releaseOwnedSetup = Effect.fn("ThreadLaunchService.releaseOwnedSetup")(function* (
+    resource: OwnedSetupResource,
+  ) {
+    if (!resource.drained || !resource.preparationFinished) return;
+    yield* recordPreparationDrained(resource.input, resource.threadId, resource.runId);
+    yield* Ref.update(ownedSetupResources, (current) => {
+      const key = preparationKey(resource.input, resource.threadId, resource.runId);
+      if (current.get(key) !== resource) return current;
+      const next = new Map(current);
+      next.delete(key);
+      return next;
+    });
+    yield* PubSub.publish(preparationChanges, resource.threadId);
+  });
 
   const mapError =
     (input: PreparationInput, operation: ThreadLaunchError["operation"], threadId?: ThreadId) =>
@@ -306,11 +384,22 @@ const make = Effect.gen(function* () {
     const tracked = input.workspaceStrategy.type === "worktree" || reused !== undefined;
     let createdWorktreePath: string | null = null;
     let setupTerminalId: string | null = null;
+    const managed = input.ownedPreparation !== undefined;
+    let ownedSetup: OwnedSetupResource | undefined;
+    let preparationFailed = false;
+    let preparationCancelled = false;
     let workspaceRecorded = false;
     let runReleased = false;
-    // The background branch rename records the worktree again when it lands,
-    // so cleanup stops it before forgetting a removed worktree.
+    // Branch metadata mutations remain owned until this preparation joins or interrupts them.
     let branchRename: Fiber.Fiber<unknown> | null = null;
+    let terminalDrained = false;
+    const drainSetupTerminal = Effect.fn("ThreadLaunchService.drainSetupTerminal")(function* () {
+      if (!managed || setupTerminalId === null || terminalDrained) return;
+      if (ownedSetup === undefined)
+        return yield* Effect.die("Setup terminal drain ownership was not captured.");
+      yield* drainOwnedSetup(ownedSetup, preparationCancelled).pipe(Effect.orDie);
+      terminalDrained = true;
+    });
     if (input.workspaceStrategy.type === "worktree") {
       yield* setupTracker.begin({
         threadId,
@@ -573,6 +662,34 @@ const make = Effect.gen(function* () {
           : yield* setupScripts
               .runForThread({
                 threadId,
+                ...(managed
+                  ? {
+                      retainTerminalForDrain: true,
+                      onTerminalAllocated: Effect.fn("ThreadLaunchService.captureSetupTerminal")(
+                        function* (
+                          terminalId: string,
+                          capture: TerminalManager.TerminalDrainHandle,
+                        ) {
+                          setupTerminalId = terminalId;
+                          ownedSetup = {
+                            input,
+                            threadId,
+                            runId,
+                            terminalId,
+                            capture,
+                            lock: yield* Semaphore.make(1),
+                            drained: false,
+                            preparationFinished: false,
+                            stopRequested: (yield* Ref.get(stoppingPreparations)).has(threadId),
+                          };
+                          const resource = ownedSetup;
+                          yield* Ref.update(ownedSetupResources, (current) =>
+                            new Map(current).set(preparationKey(input, threadId, runId), resource),
+                          );
+                        },
+                      ),
+                    }
+                  : {}),
                 projectId: input.projectId,
                 projectCwd: project.workspaceRoot,
                 worktreePath,
@@ -635,7 +752,7 @@ const make = Effect.gen(function* () {
       } else {
         yield* setupTracker.stageStatus(threadId, "setup-script", "skipped");
       }
-      yield* setupTracker.markUncancellable(threadId);
+      if (!managed) yield* setupTracker.markUncancellable(threadId);
       yield* setupTracker.stageStatus(threadId, "agent", "running");
       if (runId !== null) {
         yield* threads
@@ -657,26 +774,37 @@ const make = Effect.gen(function* () {
       }
       yield* setupTracker.stageStatus(threadId, "agent", "done");
       yield* awaitAsyncSetup;
+      if (managed && branchRename !== null) yield* Fiber.join(branchRename);
       yield* setupTracker.finish(threadId, "done");
     }).pipe(
       Effect.onError((cause) =>
         Effect.gen(function* () {
           const cancelled = Cause.hasInterruptsOnly(cause);
+          preparationCancelled = cancelled;
+          preparationFailed = true;
+          if (
+            branchRename !== null &&
+            (managed ||
+              (tracked &&
+                createdWorktreePath &&
+                ((cancelled && !runReleased) || !workspaceRecorded)))
+          )
+            yield* Fiber.interrupt(branchRename);
+          yield* drainSetupTerminal();
+          if (!managed && cancelled && setupTerminalId !== null)
+            yield* terminals
+              .close({ threadId, terminalId: setupTerminalId, deleteHistory: true })
+              .pipe(Effect.ignore);
           yield* setupTracker.finish(
             threadId,
             cancelled ? "cancelled" : "failed",
             cancelled ? null : failureDetail(Cause.squash(cause)),
           );
-          if (cancelled && setupTerminalId)
-            yield* terminals
-              .close({ threadId, terminalId: setupTerminalId, deleteHistory: true })
-              .pipe(Effect.ignore);
           if (
             tracked &&
             createdWorktreePath &&
             ((cancelled && !runReleased) || !workspaceRecorded)
           ) {
-            if (branchRename !== null) yield* Fiber.interrupt(branchRename);
             const removedPath = createdWorktreePath;
             // The thread forgets the worktree only once it is gone; a failed
             // removal leaves the directory for the user to clean up rather than
@@ -705,6 +833,12 @@ const make = Effect.gen(function* () {
                 ),
               );
           }
+        }),
+      ),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          if (managed && branchRename !== null) yield* Fiber.interrupt(branchRename);
+          if (preparationFailed || ownedSetup?.stopRequested) yield* drainSetupTerminal();
         }),
       ),
     );
@@ -746,26 +880,85 @@ const make = Effect.gen(function* () {
             ),
           );
 
-  const reservePreparation = (commandId: CommandId) =>
+  const reservePreparation = (commandId: CommandId, threadId: ThreadId) =>
     Ref.modify(scheduledLaunches, (scheduled) => {
       if (scheduled.has(commandId)) return [false, scheduled] as const;
-      const next = new Set(scheduled);
-      next.add(commandId);
+      const next = new Map(scheduled);
+      next.set(commandId, threadId);
       return [true, next] as const;
     });
-
-  const releasePreparation = (commandId: CommandId) =>
-    Ref.update(scheduledLaunches, (scheduled) => {
-      const next = new Set(scheduled);
+  const releasePreparation = Effect.fn("ThreadLaunchService.releasePreparation")(function* (
+    commandId: CommandId,
+  ) {
+    const threadId = yield* Ref.modify(scheduledLaunches, (scheduled) => {
+      const threadId = scheduled.get(commandId);
+      const next = new Map(scheduled);
       next.delete(commandId);
-      return next;
+      return [threadId, next] as const;
     });
-
+    if (threadId !== undefined) yield* PubSub.publish(preparationChanges, threadId);
+  });
+  const preparationActive = Effect.fn("ThreadLaunchService.preparationActive")(
+    (threadId: ThreadId) =>
+      Effect.gen(function* () {
+        if ([...(yield* Ref.get(scheduledLaunches)).values()].includes(threadId)) return true;
+        return [...(yield* Ref.get(ownedSetupResources)).values()].some(
+          (resource) => resource.threadId === threadId,
+        );
+      }),
+  );
+  const requestPreparationStop = Effect.fn("ThreadLaunchService.requestPreparationStop")(function* (
+    threadId: ThreadId,
+  ) {
+    const acquired = yield* Ref.modify(stoppingPreparations, (current) =>
+      current.has(threadId)
+        ? ([false, current] as const)
+        : ([true, new Set([...current, threadId])] as const),
+    );
+    if (!acquired) return;
+    // Cancellation joins the captured canonical preparation fiber in its own lane; callers never wait on its finalizer.
+    yield* Effect.gen(function* () {
+      for (const resource of (yield* Ref.get(ownedSetupResources)).values())
+        if (resource.threadId === threadId) resource.stopRequested = true;
+      yield* setupTracker.cancel(threadId);
+      for (const resource of (yield* Ref.get(ownedSetupResources)).values()) {
+        if (resource.threadId !== threadId) continue;
+        yield* drainOwnedSetup(resource, false);
+        yield* releaseOwnedSetup(resource);
+      }
+    }).pipe(
+      Effect.ensuring(
+        Ref.update(stoppingPreparations, (current) => {
+          const next = new Set(current);
+          next.delete(threadId);
+          return next;
+        }),
+      ),
+      Effect.forkIn(preparationScope),
+    );
+  });
   const schedulePreparation = Effect.fn("ThreadLaunchService.schedulePreparation")(function* (
     input: PreparationInput,
     threadId: ThreadId,
     runId: RunId | null,
   ) {
+    const authority =
+      runId === null
+        ? { _tag: "ordinary" as const }
+        : yield* admission
+            .check({
+              threadId,
+              runId,
+              now: DateTime.formatIso(yield* DateTime.now),
+              operation: "preparation",
+            })
+            .pipe(Effect.orDie);
+    if (authority._tag !== "ordinary" && authority._tag !== "admitted")
+      return yield* Effect.die("Workspace preparation ownership is unavailable.");
+    input = {
+      ...input,
+      ...(authority._tag === "admitted" ? { ownedPreparation: authority.owner } : {}),
+    };
     const preparation = Effect.gen(function* () {
       const prepare = prepareInBackground(input, threadId, runId);
       if (
@@ -800,6 +993,44 @@ const make = Effect.gen(function* () {
           runId,
           Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
         ),
+      ),
+      Effect.onExit((exit) =>
+        Effect.gen(function* () {
+          if (input.ownedPreparation === undefined) return;
+          const resource = (yield* Ref.get(ownedSetupResources)).get(
+            preparationKey(input, threadId, runId),
+          );
+          if (resource !== undefined) {
+            resource.preparationFinished = true;
+            yield* releaseOwnedSetup(resource);
+            return;
+          }
+          if (
+            Exit.isFailure(exit) &&
+            !Cause.hasInterruptsOnly(exit.cause) &&
+            !(
+              Cause.hasFails(exit.cause) &&
+              exit.cause.reasons.every((reason) => {
+                if (
+                  !Cause.isFailReason(reason) ||
+                  !isThreadLaunchError(reason.error) ||
+                  reason.error.operation !== "run-setup-script"
+                )
+                  return false;
+                const setupFailure = reason.error.cause;
+                // These Runner reads precede native allocation; other external failures remain unproved.
+                return (
+                  isSetupProjectNotFound(setupFailure) ||
+                  (isSetupOperationError(setupFailure) &&
+                    (setupFailure.operation === "readSettings" ||
+                      setupFailure.operation === "resolveProject"))
+                );
+              })
+            )
+          )
+            return;
+          yield* recordPreparationDrained(input, threadId, runId);
+        }),
       ),
       Effect.ignoreCause,
       Effect.ensuring(releasePreparation(input.commandId)),
@@ -1006,7 +1237,7 @@ const make = Effect.gen(function* () {
               }
             : workspaceStrategy;
         if (shouldSchedule) {
-          const ownsPreparation = yield* reservePreparation(input.commandId);
+          const ownsPreparation = yield* reservePreparation(input.commandId, threadId);
           if (ownsPreparation) {
             yield* Effect.gen(function* () {
               const preparationStillRequired =
@@ -1048,7 +1279,7 @@ const make = Effect.gen(function* () {
       const run = projection.runs.find((candidate) => candidate.id === input.runId);
       const workspacePreparation = run?.workspacePreparation;
       if (run?.status !== "preparing" || workspacePreparation === undefined) return;
-      if (!(yield* reservePreparation(input.commandId))) return;
+      if (!(yield* reservePreparation(input.commandId, input.threadId))) return;
       yield* scheduleRunPreparation(input, projection, run, workspacePreparation).pipe(
         Effect.onError(() => releasePreparation(input.commandId)),
       );
@@ -1112,7 +1343,15 @@ const make = Effect.gen(function* () {
     );
   };
 
-  return ThreadLaunchService.of({ launch, checkWorktreeBase, retryPreparation, prepareRun });
+  return ThreadLaunchService.of({
+    launch,
+    checkWorktreeBase,
+    retryPreparation,
+    prepareRun,
+    preparationActive,
+    requestPreparationStop,
+    preparationChanges: Stream.fromPubSub(preparationChanges),
+  });
 });
 
 export const layer = Layer.effect(ThreadLaunchService, make);

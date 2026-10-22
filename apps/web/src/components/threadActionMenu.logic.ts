@@ -5,6 +5,8 @@ export type ThreadActionMenuId =
   | "new-thread-on-branch"
   | "filter-by-project"
   | "project-settings"
+  | "thread-resources"
+  | "history"
   | "pin"
   | "unpin"
   | "settle"
@@ -93,6 +95,8 @@ export function threadActionRequiresOperate(action: ThreadActionMenuId): boolean
   return ![
     "new-thread-on-branch",
     "project-settings",
+    "thread-resources",
+    "history",
     "mark-unread",
     "copy",
     "copy-path",
@@ -205,6 +209,8 @@ export function buildThreadActionMenuItems(
       ],
     },
     { id: "project-settings", label: "Project settings", icon: "settings" },
+    { id: "thread-resources", label: "Skills, commands and MCP", icon: "settings" },
+    { id: "history", label: "History", icon: "clock" },
     {
       id: "archive",
       label: "Archive thread",

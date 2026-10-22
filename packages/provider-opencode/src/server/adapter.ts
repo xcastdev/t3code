@@ -64,6 +64,10 @@ import {
 } from "@t3tools/provider-core/server/nativeProtocolLogging";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orchestrationInstructions";
+import {
+  freezeInstructionSnapshot,
+  instructionSnapshotText,
+} from "@t3tools/provider-core/server/instructionSnapshot";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import * as OpenCodeRuntime from "./OpenCodeRuntime.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -114,6 +118,7 @@ const makeOpenCodeMessageId = Effect.fnUntraced(function* (
  * authoritative terminal signal.
  */
 const OpenCodeProviderCapabilitiesV2 = {
+  instructionDelivery: { mode: "turn", supportsSessionReplacement: true },
   sessions: {
     // The current adapter owns one directory-bound client/server per session.
     // Keep it isolated until its runtime is made safe for cross-thread pooling.
@@ -972,6 +977,27 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           );
         }
 
+        if (hasT3Mcp && mcpSession.catalogEndpoint !== undefined) {
+          const installed = yield* OpenCodeRuntime.runOpenCodeSdk("mcp.add.catalog", (signal) =>
+            client.mcp.add(
+              {
+                name: "t3_catalog",
+                config: {
+                  type: "remote",
+                  url: mcpSession.catalogEndpoint!,
+                  headers: { Authorization: mcpSession.authorizationHeader },
+                  oauth: false,
+                },
+              },
+              { signal, throwOnError: true },
+            ),
+          ).pipe(
+            Effect.map((response) => response.data?.t3_catalog?.status === "connected"),
+            Effect.orElseSucceed(() => false),
+          );
+          if (installed) yield* mcpSessions.acknowledgeCatalogEndpoint(mcpSession);
+        }
+
         const now = yield* DateTime.now;
         let sessionEntity: OrchestrationV2ProviderSession = {
           id: input.providerSessionId,
@@ -1045,6 +1071,20 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             ),
           );
 
+        const confirmAbort = Effect.fn("OpencodeAdapter.confirmAbort")(function* (
+          sessionId: string,
+        ) {
+          const response = yield* sdkCall("session.abort", { sessionID: sessionId }, (signal) =>
+            client.session.abort({ sessionID: sessionId }, { signal }),
+          );
+          if (response.data !== true) {
+            return yield* new OpenCodeRuntime.OpenCodeRuntimeError({
+              operation: "session.abort",
+              detail: "OpenCode did not confirm termination.",
+            });
+          }
+        });
+
         const abortDescendants = Effect.fn("OpencodeAdapter.abortDescendants")(function* (
           rootId: string,
         ) {
@@ -1055,9 +1095,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             abort: boolean,
           ): Effect.fn.Return<OpenCodeRuntime.OpenCodeRuntimeError | undefined> {
             const abortResult = abort
-              ? yield* sdkCall("session.abort", { sessionID: sessionId }, (signal) =>
-                  client.session.abort({ sessionID: sessionId }, { signal }),
-                ).pipe(
+              ? yield* confirmAbort(sessionId).pipe(
                   semaphore.withPermit,
                   Effect.catchIf(isOpenCodeNotFound, () => Effect.void),
                   Effect.result,
@@ -2749,31 +2787,6 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           );
         }
 
-        if (connection.external) {
-          yield* Scope.addFinalizer(
-            scope,
-            Effect.suspend(() =>
-              Effect.forEach(
-                Array.from(threads.values()).filter((state) => state.parentSubagent === null),
-                (state) =>
-                  sdkCall("session.abort", { sessionID: state.nativeSessionId }, (signal) =>
-                    client.session.abort({ sessionID: state.nativeSessionId }, { signal }),
-                  ).pipe(
-                    Effect.timeout("1 second"),
-                    Effect.ignore({ log: true }),
-                    Effect.andThen(
-                      abortDescendants(state.nativeSessionId).pipe(
-                        Effect.timeout("1 second"),
-                        Effect.ignore({ log: true }),
-                      ),
-                    ),
-                  ),
-                { concurrency: 8, discard: true },
-              ),
-            ),
-          );
-        }
-
         yield* Scope.addFinalizer(
           scope,
           Effect.sync(() => {
@@ -2908,6 +2921,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             sessionID: string;
           },
           abortController: AbortController,
+          managedInstructions: boolean,
         ) {
           const text = payload.parts
             ?.filter((part) => part.type === "text")
@@ -2928,6 +2942,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               }),
             ).pipe(Effect.asVoid);
           }
+          if (managedInstructions)
+            return yield* protocolError(
+              "OpenCode native commands do not support managed instructions.",
+            );
           const receipt = Deferred.makeUnsafe<void>();
           commandReceipts.set(payload.messageID, receipt);
           const controllers =
@@ -2989,7 +3007,37 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
           );
         });
 
+        const instructionAttempts = new Map<string, symbol>();
+        const appliedInstructions = new Map<
+          string,
+          NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"]>
+        >();
         const runtimeSession: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+          detachThreadPolicy: connection.external ? "detach" : "interrupt",
+          terminateSession: Effect.suspend(() =>
+            !connection.external
+              ? Effect.void
+              : Effect.forEach(
+                  [...threads.values()].filter((state) => state.parentSubagent === null),
+                  (state) =>
+                    confirmAbort(state.nativeSessionId).pipe(
+                      Effect.andThen(abortDescendants(state.nativeSessionId)),
+                    ),
+                  { discard: true },
+                ),
+          ).pipe(
+            Effect.timeout("15 seconds"),
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: OPENCODE_PROVIDER,
+                  detail: "OpenCode session termination was not confirmed",
+                  cause,
+                }),
+            ),
+          ),
+          getAppliedInstructions: ({ providerThread }) =>
+            Effect.sync(() => appliedInstructions.get(providerThread.id)),
           instanceId: options.instanceId,
           driver: OPENCODE_PROVIDER,
           providerSessionId: input.providerSessionId,
@@ -3087,6 +3135,14 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             }),
           startTurn: Effect.fn("OpencodeAdapter.startTurn")(
             function* (turnInput) {
+              turnInput = {
+                ...turnInput,
+                ...(turnInput.instructionSnapshot === undefined
+                  ? {}
+                  : {
+                      instructionSnapshot: freezeInstructionSnapshot(turnInput.instructionSnapshot),
+                    }),
+              };
               if (nativeStreamFailure !== null) {
                 return yield* protocolError(
                   "OpenCode event stream has ended; reconnect the provider session before starting another turn.",
@@ -3104,6 +3160,9 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   reason: "previous_turn_active",
                 });
               }
+              const instructionAttempt = Symbol();
+              instructionAttempts.set(turnInput.providerThread.id, instructionAttempt);
+              appliedInstructions.delete(turnInput.providerThread.id);
               const parsedModel = OpenCodeRuntime.parseOpenCodeModelSlug(
                 turnInput.modelSelection.model,
               );
@@ -3115,6 +3174,10 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               const isCompaction =
                 turnInput.message.text.trim() === "/compact" &&
                 turnInput.message.attachments.length === 0;
+              if (isCompaction && turnInput.instructionSnapshot !== undefined)
+                return yield* protocolError(
+                  "OpenCode compaction does not support managed instructions.",
+                );
               const parts = isCompaction ? [] : resolvePromptParts(turnInput);
               const startedAt = yield* DateTime.now;
               const syntheticNativeTurnId = `${sessionId}:attempt:${turnInput.attemptId}`;
@@ -3226,7 +3289,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 );
                 return;
               }
+              const snapshot =
+                turnInput.instructionSnapshot === undefined
+                  ? undefined
+                  : freezeInstructionSnapshot(turnInput.instructionSnapshot);
               const systemPrompt = [
+                ...(snapshot === undefined ? [] : [instructionSnapshotText(snapshot)]),
                 orchestrationSystemPrompt,
                 buildRuntimeInstructions({
                   harness: "OpenCode",
@@ -3255,6 +3323,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   parts,
                 },
                 admissionAbortController!,
+                snapshot !== undefined,
               ).pipe(
                 Effect.tapError((cause) =>
                   admissionAbortController!.signal.aborted
@@ -3277,6 +3346,16 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   ]).pipe(Effect.asVoid),
                 ),
               );
+              if (
+                !turn.interrupted &&
+                instructionAttempts.get(turnInput.providerThread.id) === instructionAttempt
+              ) {
+                if (snapshot === undefined) appliedInstructions.delete(turnInput.providerThread.id);
+                else {
+                  appliedInstructions.set(turnInput.providerThread.id, snapshot);
+                  yield* turnInput.onInstructionsApplied?.(snapshot) ?? Effect.void;
+                }
+              }
               if (state.activeTurn === turn && !turn.finalized && !turn.interrupted) {
                 const admissionAction = advanceOpenCodePromptAdmission(turn, "accepted");
                 if (admissionAction === "reconcile-idle") {
@@ -3355,9 +3434,26 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   sessionID: sessionId,
                   messageID: turn.admissionMessageId,
                   model: parsedModel,
+                  system: [
+                    orchestrationSystemPrompt,
+                    buildRuntimeInstructions({
+                      harness: "OpenCode",
+                      model: turn.modelSelection.model,
+                    }),
+                    ...(appliedInstructions.get(steerInput.providerThread.id) === undefined
+                      ? []
+                      : [
+                          instructionSnapshotText(
+                            appliedInstructions.get(steerInput.providerThread.id)!,
+                          ),
+                        ]),
+                  ]
+                    .filter(Boolean)
+                    .join("\n\n"),
                   parts,
                 },
                 admissionAbortController!,
+                appliedInstructions.has(steerInput.providerThread.id),
               ).pipe(
                 Effect.ensuring(
                   Effect.all([
@@ -3401,6 +3497,7 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
               ) {
                 for (const controller of commandControllers.get(sessionId) ?? [])
                   controller.abort();
+                yield* confirmAbort(sessionId);
                 yield* abortDescendants(sessionId);
                 return;
               }
@@ -3426,17 +3523,13 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                   Effect.ignore,
                 );
               }
-              yield* sdkCall("session.abort", { sessionID: sessionId }, (signal) =>
-                client.session.abort({ sessionID: sessionId }, { signal }),
-              ).pipe(
+              yield* confirmAbort(sessionId).pipe(
                 Effect.timeout("10 seconds"),
                 Effect.catch((cause) =>
-                  turn.finalized
-                    ? Effect.void
-                    : Effect.suspend(() => {
-                        turn.interrupted = false;
-                        return Effect.fail(cause);
-                      }),
+                  Effect.suspend(() => {
+                    turn.interrupted = false;
+                    return Effect.fail(cause);
+                  }),
                 ),
               );
               // Root abort does not stop child sessions. Report incomplete cleanup

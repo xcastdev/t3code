@@ -58,6 +58,11 @@ import * as OpenCode2Client from "./OpenCode2Client.ts";
 import * as OpenCode2Server from "./OpenCode2Server.ts";
 import * as OpenCodeRuntime from "../OpenCodeRuntime.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
+import {
+  freezeInstructionSnapshot,
+  instructionSnapshotText,
+} from "@t3tools/provider-core/server/instructionSnapshot";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orchestrationInstructions";
 import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
@@ -90,6 +95,7 @@ import { OPENCODE_PROVIDER, openCodePermissionRequestKind } from "../adapter.ts"
 import { openCodeToolTurnItem } from "../toolItems.ts";
 
 const OpenCode2ProviderCapabilities = {
+  instructionDelivery: { mode: "turn", supportsSessionReplacement: true },
   sessions: {
     supportsMultipleProviderThreadsPerSession: true,
     supportsModelSwitchInSession: true,
@@ -320,7 +326,12 @@ interface ThreadState {
   readonly stoppedChildren: Set<string>;
   readonly strandedSteers: Set<string>;
   mcp:
-    | { readonly name: string; readonly directory: string; readonly credential: string }
+    | {
+        readonly name: string;
+        readonly directory: string;
+        readonly credential: string;
+        readonly catalogEndpoint: string | undefined;
+      }
     | undefined;
   instructions: string | undefined;
 }
@@ -364,7 +375,8 @@ const rule = (action: string, effect: Rule["effect"]): Rule => ({ action, resour
  */
 export const t3McpServerName = Effect.fn("t3McpServerName")(function* (threadId: string) {
   const name = `t3-code-${threadId.replaceAll(/[^a-zA-Z0-9_-]/g, "_")}`;
-  if (name.length <= 64) return name;
+  // Reserve the suffix for the companion catalog server's tool namespace.
+  if (name.length <= 56) return name;
   const crypto = yield* Crypto.Crypto;
   const digest = yield* crypto
     .digest("SHA-256", new TextEncoder().encode(threadId))
@@ -739,6 +751,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     };
     const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event, Cause.Done>();
     const threads = new Map<string, ThreadState>();
+    // Native MCP connections outlive individual conversation threads and may cache tools
+    // even when installation confirmation fails. Preserve each possibly installed
+    // config's first revision: failed transitions can leave older connections alive.
+    const catalogConfigurations = new Map<string, Map<string, Array<McpProviderSessionConfig>>>();
     const childOwners = new Map<string, ThreadState>();
     const announced = new Map<string, EventOf<"session.created">["data"]>();
     const strays = new Map<string, ThreadState>();
@@ -2658,8 +2674,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         }
       }
       // Stopped off the lock this reconcile holds; one still running waits for a Stop.
-      for (const thread of new Set([...strays.values()].map(rootOf))) {
-        yield* Effect.forkIn(stopStrays(thread), sessionScope);
+      if (!connection.external) {
+        for (const thread of new Set([...strays.values()].map(rootOf))) {
+          yield* Effect.forkIn(stopStrays(thread), sessionScope);
+        }
       }
       const listed = new Map<string, Set<string>>();
       for (const sessionId of Object.keys(active)) {
@@ -2743,21 +2761,6 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       );
     // Subscribed before any session or prompt call, so no event of theirs is missed.
     yield* follow(yield* connection.events).pipe(Effect.forkScoped);
-
-    // A server T3 did not start keeps running after T3 stops, so stop the turns
-    // it would otherwise finish unseen. A spawned server stops with its owner.
-    if (connection.external) {
-      yield* Effect.addFinalizer(() =>
-        Effect.forEach(
-          [...threads].filter(([, state]) => state.active !== undefined),
-          ([sessionId]) =>
-            client.session
-              .interrupt({ sessionID: Session.ID.make(sessionId) })
-              .pipe(Effect.timeout("1 second"), Effect.ignore({ log: true })),
-          { concurrency: 8, discard: true },
-        ),
-      );
-    }
 
     const readModels = (directory: string) =>
       Effect.suspend(() => {
@@ -3073,10 +3076,19 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       return files;
     });
 
-    const removeMcp = (mcp: { readonly name: string; readonly directory: string }) =>
-      Effect.suspend(() =>
-        client.mcp.remove({ server: mcp.name, location: { directory: mcp.directory } }),
-      ).pipe(Effect.timeout("5 seconds"), Effect.ignore({ log: true }));
+    const removeMcp = (mcp: {
+      readonly name: string;
+      readonly directory: string;
+      readonly catalogEndpoint: string | undefined;
+    }) =>
+      Effect.forEach(
+        mcp.catalogEndpoint === undefined ? [mcp.name] : [mcp.name, `${mcp.name}_catalog`],
+        (server) =>
+          Effect.suspend(() =>
+            client.mcp.remove({ server, location: { directory: mcp.directory } }),
+          ).pipe(Effect.timeout("5 seconds"), Effect.ignore),
+        { discard: true },
+      );
 
     yield* Effect.addFinalizer(() =>
       Effect.forEach(
@@ -3095,15 +3107,21 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const directory = turnInput.runtimePolicy.cwd ?? host.paths.cwd;
       const name = yield* mcpServerNameFor(turnInput.threadId);
       // An external server may not reach T3's MCP endpoint, as with 1.x.
-      const wanted =
+      const wanted: ThreadState["mcp"] =
         mcpSession === undefined || connection.external
           ? undefined
-          : { name, directory, credential: mcpSession.authorizationHeader };
+          : {
+              name,
+              directory,
+              credential: mcpSession.authorizationHeader,
+              catalogEndpoint: mcpSession.catalogEndpoint,
+            };
       if (
         state.mcp !== undefined &&
         (wanted === undefined ||
           state.mcp.directory !== wanted.directory ||
-          state.mcp.credential !== wanted.credential)
+          state.mcp.credential !== wanted.credential ||
+          state.mcp.catalogEndpoint !== wanted.catalogEndpoint)
       ) {
         yield* removeMcp(state.mcp);
         state.mcp = undefined;
@@ -3132,11 +3150,62 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               ),
             ),
           );
-        if (mcpAvailable) state.mcp = wanted;
+        if (mcpAvailable) {
+          state.mcp = wanted;
+          if (wanted.catalogEndpoint !== undefined) {
+            const catalogName = `${name}_catalog`;
+            let configurations = catalogConfigurations.get(directory);
+            if (configurations === undefined) {
+              configurations = new Map();
+              catalogConfigurations.set(directory, configurations);
+            }
+            let history = configurations.get(catalogName);
+            if (history === undefined) {
+              history = [];
+              configurations.set(catalogName, history);
+            }
+            const previousCatalog = history.find(
+              (config) =>
+                config.catalogEndpoint === wanted.catalogEndpoint &&
+                config.authorizationHeader === wanted.credential,
+            );
+            const attemptedCatalog = previousCatalog ?? mcpSession!;
+            if (previousCatalog === undefined) history.push(attemptedCatalog);
+            const installed = yield* client.mcp
+              .add({
+                server: catalogName,
+                location: { directory },
+                config: new Mcp.RemoteConfig({
+                  type: "remote",
+                  url: wanted.catalogEndpoint,
+                  headers: { Authorization: wanted.credential },
+                  oauth: false,
+                }),
+              })
+              .pipe(
+                Effect.andThen(client.mcp.list({ location: { directory } })),
+                Effect.map((response) =>
+                  response.data.some(
+                    (server) => server.name === catalogName && server.status.status === "connected",
+                  ),
+                ),
+                Effect.timeout(INVENTORY_TIMEOUT),
+                Effect.orElseSucceed(() => false),
+              );
+            // Re-adding an identical native config keeps its connection and cached tools.
+            // A new gateway revision therefore needs a fresh runtime before acknowledging it.
+            if (installed && attemptedCatalog.catalogRevision === mcpSession!.catalogRevision) {
+              yield* mcpSessions.acknowledgeCatalogEndpoint(mcpSession!);
+            }
+          }
+        }
       }
       const instructions = [
         buildRuntimeInstructions({ harness: "OpenCode", model: turnInput.modelSelection.model }),
         t3OrchestrationSystemPrompt(mcpAvailable),
+        ...(turnInput.instructionSnapshot === undefined
+          ? []
+          : [instructionSnapshotText(turnInput.instructionSnapshot)]),
       ]
         .filter((part) => part !== undefined && part.length > 0)
         .join("\n\n");
@@ -3382,8 +3451,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const bare = turnInput.message.attachments.length === 0;
       const id = turnPromptId(sessionId, turnInput.attemptId);
       if (bare && text === "/compact") {
-        if (!sending()) return;
-        return yield* client.session.compact({ sessionID, id }).pipe(Effect.asVoid);
+        if (!sending()) return false;
+        return yield* client.session.compact({ sessionID, id }).pipe(Effect.as(true));
       }
       const location = { directory: turnInput.runtimePolicy.cwd ?? host.paths.cwd };
       const command = bare ? commandOf(text) : undefined;
@@ -3398,8 +3467,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           // so the turn remembers where the history stood before it.
           const newest = yield* client.message.list({ sessionID, order: "desc", limit: 1 });
           yield* markBefore(sessionId, newest.data[0]?.id ?? null);
-          if (!sending()) return;
-          return yield* client.session.command({ sessionID, ...command });
+          if (!sending()) return false;
+          return yield* client.session.command({ sessionID, ...command }).pipe(Effect.as(true));
         }
       }
       const skills = SKILL_MENTION.test(text)
@@ -3413,7 +3482,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           )
         : [];
       const files = yield* promptFiles(turnInput.message.attachments);
-      if (!sending()) return;
+      if (!sending()) return false;
       return yield* client.session
         .prompt({
           sessionID,
@@ -3424,10 +3493,81 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             ? {}
             : { skills: skills.map((id) => ({ id: Skill.ID.make(id) })) }),
         })
-        .pipe(Effect.asVoid);
+        .pipe(Effect.as(true));
     });
 
+    const confirmTermination = Effect.fn("OpenCode2Adapter.confirmTermination")(function* (
+      sessionId: string,
+    ) {
+      const reply = yield* client.session
+        .interrupt({ sessionID: Session.ID.make(sessionId) })
+        .pipe(Effect.timeout(INTERRUPT_TIMEOUT));
+      if (!reply.interrupted) {
+        const active = yield* client.session.active().pipe(Effect.timeout(ACTIVE_CHECK_TIMEOUT));
+        if (sessionId in active)
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "OpenCode session termination was not confirmed",
+          });
+      }
+      return reply.interrupted;
+    });
+    const terminateThreadTree = Effect.fn("OpenCode2Adapter.terminateThreadTree")(
+      function* (rootId: string) {
+        const visited = new Set<string>();
+        const pending = [rootId];
+        let rootInterrupted = false;
+        for (let index = 0; index < pending.length; index++) {
+          const sessionId = pending[index]!;
+          if (visited.has(sessionId)) continue;
+          visited.add(sessionId);
+          const interrupted = yield* confirmTermination(sessionId);
+          if (sessionId === rootId) rootInterrupted = interrupted;
+          // Enumerate native children too: a disconnected stream may have missed their creation.
+          let cursor: NonNullable<Parameters<typeof client.session.list>[0]>["cursor"];
+          do {
+            const page = yield* client.session.list({
+              parentID: Session.ID.make(sessionId),
+              ...(cursor === undefined ? {} : { cursor }),
+            });
+            pending.push(...page.data.map((child) => child.id));
+            cursor = page.cursor.next;
+          } while (cursor !== undefined);
+        }
+        return rootInterrupted;
+      },
+      Effect.timeout("15 seconds"),
+      Effect.mapError((cause) =>
+        isProviderAdapterError(cause)
+          ? cause
+          : new ProviderAdapter.ProviderAdapterProtocolError({
+              driver,
+              detail: "OpenCode session termination was not confirmed",
+              cause,
+            }),
+      ),
+    );
+
+    const instructionAttempts = new Map<string, symbol>();
+    const appliedInstructions = new Map<
+      string,
+      NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"]>
+    >();
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+      get detachThreadPolicy() {
+        return connection.external ? "detach" : "interrupt";
+      },
+      terminateSession: Effect.suspend(() =>
+        !connection.external
+          ? Effect.void
+          : Effect.forEach(
+              [...threads.values()].filter((state) => state.subagent === undefined),
+              (state) => terminateThreadTree(state.sessionId),
+              { discard: true },
+            ),
+      ),
+      getAppliedInstructions: ({ providerThread }) =>
+        Effect.sync(() => appliedInstructions.get(providerThread.id)),
       instanceId,
       driver,
       providerSessionId: input.providerSessionId,
@@ -3572,6 +3712,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         runtime.startTurn({ ...turnInput, message: { ...turnInput.message, text: "/compact" } }),
       startTurn: Effect.fn("OpenCode2Adapter.startTurn")(
         function* (turnInput) {
+          turnInput = {
+            ...turnInput,
+            ...(turnInput.instructionSnapshot === undefined
+              ? {}
+              : { instructionSnapshot: freezeInstructionSnapshot(turnInput.instructionSnapshot) }),
+          };
           // Waited out before the session's gate, so a rollback or fork is not
           // held behind a reconnect.
           if (streamFailure !== undefined) {
@@ -3584,6 +3730,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               cause: streamFailure,
             });
           }
+          const instructionAttempt = Symbol();
           // Its checks and setup take the session's gate, so a rollback or
           // fork sees either no turn or this one installed; the prompt after
           // it does not hold the gate.
@@ -3604,6 +3751,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   reason: "previous_turn_active",
                 });
               }
+              instructionAttempts.set(turnInput.providerThread.id, instructionAttempt);
+              appliedInstructions.delete(turnInput.providerThread.id);
               if (isContinuation(turnInput)) return yield* runWake(state, turnInput);
               const afterUnsettled = state.unsettled;
               let stillStopping = false;
@@ -3684,7 +3833,25 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           );
           if (started === undefined) return;
           const { state, sessionId, turn } = started;
+          const snapshot =
+            turnInput.instructionSnapshot === undefined
+              ? undefined
+              : freezeInstructionSnapshot(turnInput.instructionSnapshot);
           yield* submit(sessionId, turnInput, state, turn).pipe(
+            Effect.tap((accepted) =>
+              Effect.gen(function* () {
+                if (
+                  accepted !== true ||
+                  instructionAttempts.get(turnInput.providerThread.id) !== instructionAttempt
+                )
+                  return;
+                if (snapshot === undefined) appliedInstructions.delete(turnInput.providerThread.id);
+                else {
+                  appliedInstructions.set(turnInput.providerThread.id, snapshot);
+                  yield* turnInput.onInstructionsApplied?.(snapshot) ?? Effect.void;
+                }
+              }),
+            ),
             // Deleted outside T3: the thread is broken, and forgetting it makes
             // the next turn resume, fail, and recreate it with a handoff.
             Effect.catchTags({
@@ -3814,6 +3981,35 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           const state = threads.get(sessionId);
           if (state === undefined) return;
           const turn = state.active;
+          if (turn !== undefined && turn.providerTurn.id !== interruptInput.providerTurnId) return;
+          if (connection.external && interruptInput.requestRuntimeRestart === true) {
+            if (turn !== undefined) turn.interrupted = true;
+            const nativeInterrupted = yield* terminateThreadTree(sessionId).pipe(
+              Effect.tapError(() =>
+                Effect.sync(() => {
+                  if (turn !== undefined) turn.interrupted = false;
+                }),
+              ),
+            );
+            const cancelSteers = yield* lock.withPermit(
+              Effect.gen(function* () {
+                if (state.active !== turn) return false;
+                const pendingNativeEnd = nativeInterrupted || busy.has(sessionId);
+                if (turn === undefined) {
+                  if (pendingNativeEnd) markUnsettled(state);
+                  return false;
+                }
+                const heldEnd = turn.heldEnd !== undefined;
+                if (!heldEnd && !turn.unsent) return false;
+                // A stopped native execution can still send its terminal after this local turn settles.
+                if (heldEnd || pendingNativeEnd) markUnsettled(state);
+                yield* finishTurn(state, { status: "interrupted" });
+                return heldEnd;
+              }),
+            );
+            if (cancelSteers) yield* cancelStrandedSteers(state);
+            return;
+          }
           // OpenCode stops a foreground subagent with its parent, but not a
           // background one: a user Stop (`requestRuntimeRestart`) stops those
           // too, and the execution OpenCode starts to report them. A turn
@@ -3835,7 +4031,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             );
           if (reply._tag === "None") {
             markUnsettled(state);
-            return yield* lock.withPermit(finishTurn(state, { status: "interrupted" }));
+            turn.interrupted = false;
+            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+              driver,
+              detail: `OpenCode session ${sessionId} termination was not confirmed`,
+            });
           }
           // Between the executions a late steer spans nothing runs yet. The
           // steers are taken back, and a run they already started is skipped.

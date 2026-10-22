@@ -1,6 +1,7 @@
 import { ScreenScrollView as ScrollView } from "../../components/ui/ScreenScrollView";
 import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
+import { ListRow } from "../../components/ui/ListRow";
 import { ProjectFavicon } from "../../components/ProjectFavicon";
 import * as Dialog from "../../components/ui/Dialog";
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
@@ -322,6 +323,8 @@ function ProjectOverviewContent(props: {
           );
         })}
       </SettingsSection>
+      <ProjectWorkLinks members={props.members} environments={props.environments} />
+      <ProjectResourceLinks members={props.members} environments={props.environments} />
       <SettingsSection title="Danger">
         <SettingsActionRow
           icon="trash"
@@ -346,6 +349,84 @@ function ProjectOverviewContent(props: {
         />
       </SettingsSection>
     </>
+  );
+}
+
+/** Work belongs to one checkout, so each checkout opens its own Work. */
+function ProjectWorkLinks(props: {
+  readonly members: readonly EnvironmentProject[];
+  readonly environments: readonly SettingsTarget[];
+}) {
+  const navigation = useNavigation();
+  return (
+    <SettingsSection title="Work">
+      {props.members.map((member) => (
+        <ListRow
+          key={`${member.environmentId}:${member.id}`}
+          icon="checkmark.circle"
+          label="Open Work"
+          description={`${
+            props.environments.find((entry) => entry.environmentId === member.environmentId)
+              ?.label ?? "Environment"
+          } · ${member.workspaceRoot}`}
+          onPress={() =>
+            navigation.navigate("SettingsSheet", {
+              screen: "SettingsContent",
+              params: {
+                screen: "SettingsWorkProject",
+                params: { environmentId: member.environmentId, projectId: member.id },
+              },
+            })
+          }
+        />
+      ))}
+    </SettingsSection>
+  );
+}
+
+/** Each checkout has its own skills, commands and project terminals. */
+function ProjectResourceLinks(props: {
+  readonly members: readonly EnvironmentProject[];
+  readonly environments: readonly SettingsTarget[];
+}) {
+  const navigation = useNavigation();
+  const label = (member: EnvironmentProject) =>
+    `${
+      props.environments.find((entry) => entry.environmentId === member.environmentId)?.label ??
+      "Environment"
+    } · ${member.workspaceRoot}`;
+  return (
+    <SettingsSection title="Agent resources">
+      {props.members.map((member) => (
+        <View key={`${member.environmentId}:${member.id}`}>
+          <ListRow
+            icon="sparkles"
+            label="Skills and commands"
+            description={label(member)}
+            onPress={() =>
+              navigation.navigate("SettingsSheet", {
+                screen: "SettingsContent",
+                params: {
+                  screen: "SettingsResourceScope",
+                  params: { environmentId: member.environmentId, projectId: member.id },
+                },
+              })
+            }
+          />
+          <ListRow
+            icon="terminal"
+            label="Project terminals"
+            description={label(member)}
+            onPress={() =>
+              navigation.navigate("ProjectTerminals", {
+                environmentId: member.environmentId,
+                projectId: member.id,
+              })
+            }
+          />
+        </View>
+      ))}
+    </SettingsSection>
   );
 }
 

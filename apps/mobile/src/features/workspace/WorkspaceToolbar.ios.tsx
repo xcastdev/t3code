@@ -49,12 +49,14 @@ export function WorkspaceToolbar(props: {
     workspace.dispatch({ type: "search", tab: selectedTab });
     if (props.sidebar && !panes.primarySidebarVisible) togglePrimarySidebar();
   }, [workspace, selectedTab, props.sidebar, panes.primarySidebarVisible, togglePrimarySidebar]);
+  // Work has no list search; its pane carries its own navigation.
+  const searchable = selectedTab !== "work";
   const focusSearch = useCallback(() => {
-    if (!workspace.isTabActive(selectedTab)) return false;
+    if (!searchable || !workspace.isTabActive(selectedTab)) return false;
     if (!NATIVE_LIQUID_GLASS_SUPPORTED) enterSearch();
     searchRef.current?.focus();
     return true;
-  }, [workspace, selectedTab, enterSearch]);
+  }, [workspace, selectedTab, enterSearch, searchable]);
   useHardwareKeyboardCommand("focusSearch", focusSearch);
   const restoreSearch = useCallback(() => {
     if (isTabActive(selectedTab) && tab.searchMode !== "resting")
@@ -74,12 +76,12 @@ export function WorkspaceToolbar(props: {
   return (
     <>
       <NativeStackScreenOptions
-        optionsVersion={[selectedTab, tab.searchMode]}
+        optionsVersion={[selectedTab, tab.searchMode, searchable]}
         options={{
           // Liquid Glass keeps search mounted as UIKit's own header button, which
           // morphs into the field; swapping a stacked bar in and out cannot animate.
           headerSearchBarOptions:
-            NATIVE_LIQUID_GLASS_SUPPORTED || tab.searchMode !== "resting"
+            searchable && (NATIVE_LIQUID_GLASS_SUPPORTED || tab.searchMode !== "resting")
               ? {
                   ref: searchRef,
                   autoFocus: tab.searchMode === "active",
@@ -124,7 +126,7 @@ export function WorkspaceToolbar(props: {
             })
           }
         />
-        {NATIVE_LIQUID_GLASS_SUPPORTED ? null : (
+        {NATIVE_LIQUID_GLASS_SUPPORTED || !searchable ? null : (
           <Toolbar.Button
             accessibilityLabel={
               selectedTab === "pullRequests" ? "Search pull requests" : "Search threads"
@@ -151,6 +153,15 @@ export function WorkspaceToolbar(props: {
             icon={{ type: "image", source: PULL_REQUEST_ICON, tinted: true }}
             tintColor={selectedTab === "pullRequests" ? selectedTint : undefined}
             onPress={() => selectTab("pullRequests")}
+          />
+        ) : null}
+        {sidebarTabs === "toolbar" ? (
+          <Toolbar.Button
+            identifier="workspace-tab-work"
+            accessibilityLabel="Work"
+            icon={selectedTab === "work" ? "checklist.checked" : "checklist"}
+            tintColor={selectedTab === "work" ? selectedTint : undefined}
+            onPress={() => selectTab("work")}
           />
         ) : null}
         {nativeToolbarCompose ? <Toolbar.Spacer flexible /> : null}

@@ -1,6 +1,14 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { CommandId, ProjectId, ThreadId, VcsProcessSpawnError } from "@t3tools/contracts";
+import {
+  AssistantId,
+  EnvironmentId,
+  CommandId,
+  GitCommandError,
+  ProjectId,
+  ThreadId,
+  VcsProcessSpawnError,
+} from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -11,6 +19,7 @@ import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Scope from "effect/Scope";
 
+import * as Environment from "../environment/ServerEnvironment.ts";
 import * as ServerConfig from "../config.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
@@ -76,6 +85,13 @@ const layer = (baseDir: string, options?: HarnessOptions) =>
     Layer.provideMerge(SqlitePersistence.layerMemory),
     Layer.provideMerge(ServerSettings.layerTest()),
     Layer.provideMerge(ServerConfig.layerTest(baseDir, baseDir)),
+    Layer.provideMerge(
+      Layer.succeed(Environment.ServerEnvironment, {
+        getEnvironmentId: Effect.succeed(EnvironmentId.make("managed-test")),
+        getDescriptor: Effect.die("unused"),
+      }),
+    ),
+    Layer.provideMerge(ProcessRunner.layer),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -532,4 +548,181 @@ it.effect("removes the folder when the create is cancelled before the project ex
       },
     );
   }),
+);
+
+it.live(
+  "assistant repositories use a local identity and keep one owned Git root inside an outer checkout",
+  () =>
+    withScratch(({ baseDir }) =>
+      Effect.gen(function* () {
+        yield* git(baseDir, ["init"]);
+        const folders = yield* ManagedProjectFolders.ManagedProjectFolders;
+        const assistantId = AssistantId.make(`assistant-${"a".repeat(64)}`);
+        const first = yield* folders.ensureAssistantRepository({ assistantId });
+        const second = yield* folders.ensureAssistantRepository({ assistantId });
+        assert.equal(first.workspaceRoot, second.workspaceRoot);
+        assert.equal(
+          (yield* git(first.workspaceRoot, ["config", "--local", "user.name"])).stdout.trim(),
+          "T3 Assistant",
+        );
+        assert.equal(
+          (yield* git(first.workspaceRoot, ["rev-parse", "--show-toplevel"])).stdout.trim(),
+          first.workspaceRoot,
+        );
+        assert.equal(
+          (yield* git(first.workspaceRoot, ["rev-list", "--count", "HEAD"])).stdout.trim(),
+          "1",
+        );
+      }),
+    ),
+);
+
+it.live("assistant repositories refuse preexisting and symlinked folders", () =>
+  withScratch(({ baseDir }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const folders = yield* ManagedProjectFolders.ManagedProjectFolders;
+      const assistantId = AssistantId.make(`assistant-${"b".repeat(64)}`);
+      const root = path.join(baseDir, "assistants");
+      const folder = path.join(root, assistantId);
+      yield* fs.makeDirectory(folder, { recursive: true });
+      assert.equal(
+        (yield* folders.ensureAssistantRepository({ assistantId }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+      yield* fs.remove(folder, { recursive: true });
+      yield* fs.symlink(baseDir, folder);
+      assert.equal(
+        (yield* folders.ensureAssistantRepository({ assistantId }).pipe(Effect.result))._tag,
+        "Failure",
+      );
+    }),
+  ),
+);
+
+it.effect("missing Git refuses assistant setup before storage is claimed", () =>
+  withScratch(
+    ({ baseDir }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const folders = yield* ManagedProjectFolders.ManagedProjectFolders;
+        const result = yield* folders
+          .ensureAssistantRepository({
+            assistantId: AssistantId.make(`assistant-${"c".repeat(64)}`),
+          })
+          .pipe(Effect.result);
+        assert.equal(result._tag, "Failure");
+        assert.isFalse(yield* fs.exists(path.join(baseDir, "assistants")));
+      }),
+    {
+      git: Layer.mock(GitVcsDriver.GitVcsDriver)({
+        execute: () =>
+          Effect.fail(
+            new GitCommandError({
+              operation: "probe",
+              command: "git",
+              cwd: "/test",
+              detail: "unavailable",
+            }),
+          ),
+      }),
+    },
+  ),
+);
+
+it.live("assistant folder claims survive interruption before the ownership marker", () =>
+  withScratch(({ baseDir }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const folders = yield* ManagedProjectFolders.ManagedProjectFolders;
+      const assistantId = AssistantId.make(`assistant-${"d".repeat(64)}`);
+      const root = path.join(baseDir, "assistants");
+      yield* fs.makeDirectory(path.join(root, assistantId), { recursive: true });
+      yield* fs.writeFileString(path.join(root, `${assistantId}.claim`), assistantId, {
+        flag: "wx",
+      });
+      const result = yield* folders.ensureAssistantRepository({ assistantId });
+      assert.equal(
+        (yield* git(result.workspaceRoot, ["rev-list", "--count", "HEAD"])).stdout.trim(),
+        "1",
+      );
+    }),
+  ),
+);
+
+it.live(
+  "read-only assistant validation accepts ordinary HEAD advances without editing Git configuration",
+  () =>
+    withScratch(() =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const folders = yield* ManagedProjectFolders.ManagedProjectFolders;
+        const assistantId = AssistantId.make(`assistant-${"e".repeat(64)}`);
+        const owned = yield* folders.ensureAssistantRepository({ assistantId });
+        const configPath = `${owned.workspaceRoot}/.git/config`;
+        const before = yield* fs.readFileString(configPath);
+        yield* git(owned.workspaceRoot, ["commit", "--allow-empty", "-m", "Normal assistant work"]);
+        yield* folders.validateAssistantRepository({
+          assistantId,
+          workspaceRoot: owned.workspaceRoot,
+        });
+        assert.equal(yield* fs.readFileString(configPath), before);
+        assert.equal(
+          (yield* git(owned.workspaceRoot, ["rev-list", "--count", "HEAD"])).stdout.trim(),
+          "2",
+        );
+      }),
+    ),
+);
+
+it.live.each([
+  "marker",
+  "claim",
+  "git-symlink",
+  "git-file",
+  "missing-head",
+  "foreign-common-dir",
+] as const)("read-only assistant validation refuses retained %s damage", (damage) =>
+  withScratch(({ baseDir }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const folders = yield* ManagedProjectFolders.ManagedProjectFolders;
+      const assistantId = AssistantId.make(`assistant-${"f".repeat(64)}`);
+      const { workspaceRoot } = yield* folders.ensureAssistantRepository({ assistantId });
+      const dotGit = path.join(workspaceRoot, ".git");
+      const originalConfig = yield* fs.readFileString(path.join(dotGit, "config"));
+      const marker = path.join(workspaceRoot, ".t3-assistant-owner");
+      const claim = path.join(baseDir, "assistants", `${assistantId}.claim`);
+      if (damage === "marker") yield* fs.remove(marker);
+      if (damage === "claim") yield* fs.remove(claim);
+      if (damage === "git-symlink" || damage === "git-file") {
+        const moved = path.join(baseDir, "foreign-git");
+        yield* fs.rename(dotGit, moved);
+        if (damage === "git-symlink") yield* fs.symlink(moved, dotGit);
+        else yield* fs.writeFileString(dotGit, `gitdir: ${moved}\n`);
+      }
+      if (damage === "missing-head")
+        yield* fs.writeFileString(path.join(dotGit, "HEAD"), "ref: refs/heads/missing\n");
+      if (damage === "foreign-common-dir") {
+        const other = path.join(baseDir, "foreign");
+        yield* fs.makeDirectory(other);
+        yield* git(other, ["init"]);
+        yield* fs.writeFileString(path.join(dotGit, "commondir"), path.join(other, ".git"));
+      }
+      assert.equal(
+        (yield* folders
+          .validateAssistantRepository({ assistantId, workspaceRoot })
+          .pipe(Effect.result))._tag,
+        "Failure",
+      );
+      if (damage === "marker") assert.isFalse(yield* fs.exists(marker));
+      if (damage === "claim") assert.isFalse(yield* fs.exists(claim));
+      if (damage !== "git-file")
+        assert.equal(yield* fs.readFileString(path.join(dotGit, "config")), originalConfig);
+    }),
+  ),
 );
