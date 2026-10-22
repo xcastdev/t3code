@@ -10,6 +10,7 @@ import {
   NodeId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSetupError,
@@ -288,6 +289,14 @@ function makeLocalCommandHarness(input: {
   readonly afterRunningRead?: Effect.Effect<void>;
   readonly beforeNativeStart?: Effect.Effect<void>;
   readonly interruptNative?: ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"];
+  readonly previousTurn?: {
+    readonly runStatus: "failed" | "completed";
+    readonly turnStatus: "running" | "completed" | "interrupted";
+    readonly differentThread?: boolean;
+    readonly liveSession?: boolean;
+    readonly interruptFailure?: boolean;
+    readonly interruptCurrentRun?: boolean;
+  };
 }) {
   const now = DateTime.makeUnsafe("2026-09-04T12:00:00Z");
   const threadId = ThreadId.make("thread-native-account-command");
@@ -473,6 +482,74 @@ function makeLocalCommandHarness(input: {
       ),
     };
   }
+  const previousTurnId = ProviderTurnId.make("previous-provider-turn");
+  if (input.previousTurn !== undefined) {
+    const previousRunId = RunId.make("previous-failed-run");
+    const previousAttemptId = RunAttemptId.make("previous-failed-attempt");
+    const previousProviderThreadId = input.previousTurn.differentThread
+      ? oldProviderThreadId
+      : providerThreadId;
+    projection = {
+      ...projection,
+      runs: [
+        {
+          ...run,
+          id: previousRunId,
+          ordinal: 1,
+          status: input.previousTurn.runStatus,
+          rootNodeId: NodeId.make("previous-root"),
+          activeAttemptId: previousAttemptId,
+          providerThreadId: previousProviderThreadId,
+          completedAt: now,
+        },
+        run,
+      ],
+      providerThreads: [
+        {
+          ...providerThread,
+          nativeThreadRef: {
+            driver: providerThread.driver,
+            nativeId: "existing-native-conversation",
+            strength: "strong",
+          },
+        },
+      ],
+      providerTurns: [
+        {
+          id: previousTurnId,
+          providerThreadId: previousProviderThreadId,
+          nodeId: NodeId.make("previous-root"),
+          runAttemptId: previousAttemptId,
+          ordinal: 1,
+          nativeTurnRef: null,
+          status: input.previousTurn.turnStatus,
+          startedAt: now,
+          completedAt: input.previousTurn.turnStatus === "running" ? null : now,
+        },
+      ],
+    };
+  }
+  let providerBusy =
+    input.previousTurn?.runStatus === "failed" &&
+    input.previousTurn.turnStatus === "running" &&
+    !input.previousTurn.differentThread &&
+    input.previousTurn.liveSession !== false;
+  const interruptTurn = vi.fn((request: ProviderAdapter.ProviderAdapterV2InterruptInput) =>
+    Effect.gen(function* () {
+      expect(request.providerTurnId).toBe(previousTurnId);
+      expect(request.providerThread.id).toBe(providerThreadId);
+      if (input.previousTurn?.interruptFailure) {
+        return yield* new ProviderAdapter.ProviderAdapterInterruptError({
+          driver: providerThread.driver,
+          providerThreadId,
+          providerTurnId: request.providerTurnId,
+          cause: "provider interrupt failed",
+        });
+      }
+      providerBusy = false;
+      if (input.previousTurn?.interruptCurrentRun) interruptRun();
+    }),
+  );
   const events: Array<OrchestrationV2DomainEvent> = [];
   const interruptRun = () => {
     projection = {
@@ -562,7 +639,7 @@ function makeLocalCommandHarness(input: {
                       ),
                     ),
                   )
-                : input.failReadsAfterRunning === true
+                : input.failReadsAfterRunning === true || input.previousTurn !== undefined
                   ? Effect.succeed({
                       driver: providerThread.driver,
                       providerSession: {
@@ -578,6 +655,7 @@ function makeLocalCommandHarness(input: {
                         lastError: null,
                       },
                       ensureThread: () => Effect.succeed(providerThread),
+                      resumeThread: () => Effect.succeed(projection.providerThreads[0]),
                     } as never)
                   : Effect.die("A local command must not open a native session."),
   );
@@ -611,8 +689,12 @@ function makeLocalCommandHarness(input: {
                 ),
               ),
           )
-        : input.failReadsAfterRunning === true
-          ? Effect.void
+        : input.failReadsAfterRunning === true || input.previousTurn !== undefined
+          ? Effect.suspend(() =>
+              providerBusy
+                ? Effect.die("The previous provider turn is still running.")
+                : Effect.void,
+            )
           : Effect.die("A local command must not start a native turn."),
   );
   const failReadIfRunning = Effect.suspend(() =>
@@ -728,7 +810,19 @@ function makeLocalCommandHarness(input: {
               }),
             ),
         }),
-        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
+        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+          open,
+          get: () =>
+            Effect.succeed(
+              input.previousTurn?.liveSession === false
+                ? Option.none()
+                : Option.some({
+                    driver: providerThread.driver,
+                    providerSessionId,
+                    interruptTurn,
+                  } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime),
+            ),
+        }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
         Layer.mock(RunExecutionService.RunExecutionServiceV2)({ startRootRun }),
         Layer.mock(RuntimePolicy.RuntimePolicyV2)({
@@ -748,6 +842,7 @@ function makeLocalCommandHarness(input: {
     open,
     writeIfRunCurrent,
     startRootRun,
+    interruptTurn,
     tryHandlePromptCommand,
     events,
     oldInstanceId,
@@ -766,6 +861,106 @@ function makeLocalCommandHarness(input: {
     }).pipe(Effect.provide(layer)),
   };
 }
+
+effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      previousTurn: { runStatus: "failed", turnStatus: "running" },
+    });
+
+    yield* harness.start;
+
+    expect(harness.interruptTurn).toHaveBeenCalledOnce();
+    expect(harness.projection().runs.at(-1)?.status).toBe("running");
+    expect(harness.projection().providerTurns[0]).toMatchObject({
+      status: "interrupted",
+      completedAt: expect.anything(),
+    });
+    expect(harness.startRootRun).toHaveBeenCalledOnce();
+    expect(harness.startRootRun.mock.calls[0]?.[0].providerThread.nativeThreadRef?.nativeId).toBe(
+      "existing-native-conversation",
+    );
+  }),
+);
+
+effectIt.effect.each([
+  { runStatus: "failed", turnStatus: "completed" },
+  { runStatus: "completed", turnStatus: "completed" },
+  { runStatus: "failed", turnStatus: "running", differentThread: true },
+  { runStatus: "failed", turnStatus: "running", liveSession: false },
+  { runStatus: "failed", turnStatus: "interrupted", interruptFailure: true },
+] as const)("continues without interrupting when recovery does not apply: %j", (previousTurn) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue", previousTurn });
+
+    yield* harness.start;
+
+    expect(harness.interruptTurn).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("running");
+  }),
+);
+
+effectIt.effect("does not start another turn when abandoned-turn cleanup fails", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      previousTurn: { runStatus: "failed", turnStatus: "running", interruptFailure: true },
+    });
+
+    yield* harness.start;
+
+    expect(harness.interruptTurn).toHaveBeenCalledOnce();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+  }),
+);
+
+effectIt.effect("retries abandoned-turn cleanup without failing the continuation early", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      previousTurn: { runStatus: "failed", turnStatus: "running", interruptFailure: true },
+    });
+
+    const error = yield* harness.startWithRetry.pipe(Effect.flip);
+
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(harness.open).not.toHaveBeenCalled();
+  }),
+);
+
+effectIt.effect("does not start the continuation if recording recovery fails", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      previousTurn: { runStatus: "failed", turnStatus: "running" },
+      writeFailure: new Error("database unavailable"),
+    });
+
+    const error = yield* harness.start.pipe(Effect.flip);
+
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(harness.projection().providerTurns[0]?.status).toBe("running");
+    expect(harness.open).not.toHaveBeenCalled();
+  }),
+);
+
+effectIt.effect("does not resume a continuation stopped while recovery was in flight", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      previousTurn: { runStatus: "failed", turnStatus: "running", interruptCurrentRun: true },
+    });
+
+    yield* harness.start;
+
+    expect(harness.projection().runs.at(-1)?.status).toBe("interrupted");
+    expect(harness.open).not.toHaveBeenCalled();
+  }),
+);
 
 effectIt.effect.each(["cleanup-first", "startup-first"])(
   "coordinates provider startup with %s",
@@ -1216,6 +1411,31 @@ effectIt.effect.each(["denied", "expired"] as const)(
       expect(harness.open).not.toHaveBeenCalled();
       expect(nativeStart).not.toHaveBeenCalled();
     }),
+);
+
+effectIt.effect("rechecks ownership after recovering an abandoned native turn", () =>
+  Effect.gen(function* () {
+    const admission = ownedStartAdmission();
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      admission: admission.service,
+      previousTurn: { runStatus: "failed", turnStatus: "running" },
+    });
+    const interrupt = harness.interruptTurn.getMockImplementation()!;
+    harness.interruptTurn.mockImplementation((request) =>
+      interrupt(request).pipe(
+        Effect.andThen(
+          Effect.sync(() => admission.set({ _tag: "denied", reason: "grant revoked" })),
+        ),
+        Effect.as(undefined),
+      ),
+    );
+
+    expect((yield* Effect.exit(harness.start))._tag).toBe("Failure");
+    expect(harness.interruptTurn).toHaveBeenCalledOnce();
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+  }),
 );
 
 effectIt.effect("rechecks revocation after awaited session preparation", () =>
