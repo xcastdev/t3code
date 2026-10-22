@@ -37,6 +37,8 @@
       "entry": [
         "src/bin.ts!",
         "src/claude-history-worker.ts!",
+        // The controlled-upgrade fixture is an opt-in CLI, not an imported module.
+        "src/testUtils/runControlledUpgradeFixture.ts",
         "scripts/cli.ts",
         "scripts/evaluate-thread-titles.ts",
         "scripts/fetch-expo-schema.ts",
