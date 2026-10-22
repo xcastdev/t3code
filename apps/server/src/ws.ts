@@ -650,7 +650,44 @@ const resourceRpcMethods = [
   WS_METHODS.projectTerminalKill,
   WS_METHODS.issuesSearch,
 ] as const;
-const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
+// Keep the core handler generic small enough to preserve its inferred service requirements.
+const pullRequestRpcMethods = [
+  WS_METHODS.pullRequestsList,
+  WS_METHODS.pullRequestsListStats,
+  WS_METHODS.pullRequestsRoutingIdentity,
+  WS_METHODS.pullRequestsRouting,
+  WS_METHODS.pullRequestsSummary,
+  WS_METHODS.pullRequestsStack,
+  WS_METHODS.pullRequestsLinkedThreads,
+  WS_METHODS.pullRequestsDetail,
+  WS_METHODS.pullRequestsPreview,
+  WS_METHODS.pullRequestsChecks,
+  WS_METHODS.pullRequestsActivity,
+  WS_METHODS.pullRequestsReviewGuide,
+  WS_METHODS.pullRequestsGenerateReviewGuide,
+  WS_METHODS.pullRequestsThreadComments,
+  WS_METHODS.pullRequestsDiffFileContents,
+  WS_METHODS.pullRequestsFilesViewed,
+  WS_METHODS.pullRequestsChangeBreakdown,
+  WS_METHODS.pullRequestsSetFilesViewed,
+  WS_METHODS.pullRequestsRunAction,
+  WS_METHODS.pullRequestsUpdate,
+  WS_METHODS.pullRequestsComment,
+  WS_METHODS.pullRequestsUpdateComment,
+  WS_METHODS.pullRequestsSubmitReview,
+  WS_METHODS.pullRequestsReplyToThread,
+  WS_METHODS.pullRequestsSetThreadResolution,
+  WS_METHODS.pullRequestsSetReaction,
+  WS_METHODS.pullRequestsReportState,
+  WS_METHODS.pullRequestsInvalidate,
+  WS_METHODS.pullRequestsSubscribeRefreshes,
+  WS_METHODS.pullRequestsReviewerCandidates,
+  WS_METHODS.pullRequestsRequestReviewers,
+  WS_METHODS.pullRequestsLabelCandidates,
+  WS_METHODS.pullRequestsSetLabels,
+] as const;
+export const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...pullRequestRpcMethods,
   ...resourceRpcMethods,
   WS_METHODS.mcpCatalogSessionSubscribeForThread,
   WS_METHODS.mcpCatalogSessionForThread,
@@ -687,6 +724,14 @@ const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
   WS_METHODS.projectWorkRead,
   WS_METHODS.projectWorkWrite,
   WS_METHODS.projectWorkSubscribe,
+);
+export const PullRequestServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...[...ServerWsRpcGroup.requests.keys()].filter(
+    (
+      tag,
+    ): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof pullRequestRpcMethods)[number]> =>
+      !(pullRequestRpcMethods as ReadonlyArray<string>).includes(tag),
+  ),
 );
 const catalogRpcMethods = [
   WS_METHODS.mcpCatalogSessionSubscribeForThread,
@@ -1856,7 +1901,7 @@ const layerCoreWsRpc = (
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   serverBrowser: ServerBrowser.ServerBrowser["Service"],
 ) =>
-  CoreServerWsRpcGroup.toLayer(
+  Layer.unwrap(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const sql = yield* SqlClient.SqlClient;
@@ -3144,94 +3189,6 @@ const layerCoreWsRpc = (
                 Effect.forkScoped,
               ),
           ),
-        [WS_METHODS.pullRequestsList]: (input) => pullRequests.list(input),
-        [WS_METHODS.pullRequestsListStats]: (input) => pullRequests.listStats(input),
-        [WS_METHODS.pullRequestsRoutingIdentity]: (input) => pullRequests.routingIdentity(input),
-        [WS_METHODS.pullRequestsRouting]: (input) => pullRequests.routing(input),
-        [WS_METHODS.pullRequestsSummary]: (input) =>
-          withPullRequestViewer(input, pullRequests.summary(input)),
-        [WS_METHODS.pullRequestsStack]: (input) =>
-          withPullRequestViewer(input, pullRequests.stack(input)),
-        [WS_METHODS.pullRequestsLinkedThreads]: (input) =>
-          resolvePullRequestSyncKey(input).pipe(
-            Effect.flatMap((key) =>
-              key === null
-                ? Effect.succeed({ threads: [] })
-                : listLinkedPullRequestThreads(key).pipe(
-                    Effect.provideService(SqlClient.SqlClient, sql),
-                  ),
-            ),
-          ),
-        [WS_METHODS.pullRequestsDetail]: (input) =>
-          withPullRequestViewer(input, pullRequests.detail(input)),
-        [WS_METHODS.pullRequestsPreview]: (input) =>
-          withPullRequestViewer(input, pullRequests.preview(input)),
-        [WS_METHODS.pullRequestsChecks]: (input) =>
-          withPullRequestViewer(input, pullRequests.checks(input)),
-        [WS_METHODS.pullRequestsActivity]: (input) =>
-          withPullRequestViewer(input, pullRequests.activity(input)),
-        [WS_METHODS.pullRequestsReviewGuide]: (input) =>
-          withPullRequestViewer(input, reviewGuides.get(input)),
-        [WS_METHODS.pullRequestsGenerateReviewGuide]: (input) =>
-          withPullRequestViewer(input, reviewGuides.generate(input)),
-        [WS_METHODS.pullRequestsThreadComments]: (input) =>
-          withPullRequestViewer(input, pullRequests.threadComments(input)),
-        [WS_METHODS.pullRequestsDiffFileContents]: (input) =>
-          withPullRequestViewer(input, pullRequests.diffFileContents(input)),
-        [WS_METHODS.pullRequestsFilesViewed]: (input) =>
-          withPullRequestViewer(input, pullRequests.filesViewed(input)),
-        [WS_METHODS.pullRequestsChangeBreakdown]: (input) =>
-          withPullRequestViewer(input, pullRequests.changeBreakdown(input)),
-        [WS_METHODS.pullRequestsSetFilesViewed]: (input) =>
-          withPullRequestViewer(input, pullRequests.setFilesViewed(input)),
-        [WS_METHODS.pullRequestsRunAction]: (input) =>
-          withPullRequestViewer(input, pullRequests.runAction(input)).pipe(
-            Effect.tap(() =>
-              resolvePullRequestSyncKey(input).pipe(
-                Effect.flatMap((key) =>
-                  key === null ? Effect.void : pullRequestSync.requestSync(key),
-                ),
-              ),
-            ),
-          ),
-        [WS_METHODS.pullRequestsUpdate]: (input) =>
-          withPullRequestViewer(input, pullRequests.update(input)),
-        [WS_METHODS.pullRequestsComment]: (input) =>
-          withPullRequestViewer(input, pullRequests.comment(input)),
-        [WS_METHODS.pullRequestsUpdateComment]: (input) =>
-          withPullRequestViewer(input, pullRequests.updateComment(input)),
-        [WS_METHODS.pullRequestsSubmitReview]: (input) =>
-          withPullRequestViewer(input, pullRequests.submitReview(input)),
-        [WS_METHODS.pullRequestsReplyToThread]: (input) =>
-          withPullRequestViewer(input, pullRequests.replyToThread(input)),
-        [WS_METHODS.pullRequestsSetThreadResolution]: (input) =>
-          withPullRequestViewer(input, pullRequests.setThreadResolution(input)),
-        [WS_METHODS.pullRequestsSetReaction]: (input) =>
-          withPullRequestViewer(input, pullRequests.setReaction(input)),
-        [WS_METHODS.pullRequestsReportState]: (input) => pullRequests.reportState(input),
-        [WS_METHODS.pullRequestsInvalidate]: (input) =>
-          pullRequests
-            .invalidate(input, { notifyReaders: true })
-            .pipe(
-              Effect.andThen(
-                input.reference === undefined || input.filesViewedOnly === true
-                  ? Effect.void
-                  : resolvePullRequestSyncKey(input.reference).pipe(
-                      Effect.flatMap((key) =>
-                        key === null ? Effect.void : pullRequestSync.requestSync(key),
-                      ),
-                    ),
-              ),
-            ),
-        [WS_METHODS.pullRequestsSubscribeRefreshes]: () => pullRequests.subscribeRefreshes,
-        [WS_METHODS.pullRequestsReviewerCandidates]: (input) =>
-          withPullRequestViewer(input, pullRequests.reviewerCandidates(input)),
-        [WS_METHODS.pullRequestsRequestReviewers]: (input) =>
-          withPullRequestViewer(input, pullRequests.requestReviewers(input)),
-        [WS_METHODS.pullRequestsLabelCandidates]: (input) =>
-          withPullRequestViewer(input, pullRequests.labelCandidates(input)),
-        [WS_METHODS.pullRequestsSetLabels]: (input) =>
-          withPullRequestViewer(input, pullRequests.setLabels(input)),
         [WS_METHODS.sourceControlLookupRepository]: (input) =>
           sourceControlRepositories.lookupRepository(input),
         [WS_METHODS.sourceControlCloneRepository]: (input) =>
@@ -3827,7 +3784,100 @@ const layerCoreWsRpc = (
             ),
           ),
       });
-      return handlers;
+      const pullRequestHandlers = PullRequestServerWsRpcGroup.of({
+        [WS_METHODS.pullRequestsList]: (input) => pullRequests.list(input),
+        [WS_METHODS.pullRequestsListStats]: (input) => pullRequests.listStats(input),
+        [WS_METHODS.pullRequestsRoutingIdentity]: (input) => pullRequests.routingIdentity(input),
+        [WS_METHODS.pullRequestsRouting]: (input) => pullRequests.routing(input),
+        [WS_METHODS.pullRequestsSummary]: (input) =>
+          withPullRequestViewer(input, pullRequests.summary(input)),
+        [WS_METHODS.pullRequestsStack]: (input) =>
+          withPullRequestViewer(input, pullRequests.stack(input)),
+        [WS_METHODS.pullRequestsLinkedThreads]: (input) =>
+          resolvePullRequestSyncKey(input).pipe(
+            Effect.flatMap((key) =>
+              key === null
+                ? Effect.succeed({ threads: [] })
+                : listLinkedPullRequestThreads(key).pipe(
+                    Effect.provideService(SqlClient.SqlClient, sql),
+                  ),
+            ),
+          ),
+        [WS_METHODS.pullRequestsDetail]: (input) =>
+          withPullRequestViewer(input, pullRequests.detail(input)),
+        [WS_METHODS.pullRequestsPreview]: (input) =>
+          withPullRequestViewer(input, pullRequests.preview(input)),
+        [WS_METHODS.pullRequestsChecks]: (input) =>
+          withPullRequestViewer(input, pullRequests.checks(input)),
+        [WS_METHODS.pullRequestsActivity]: (input) =>
+          withPullRequestViewer(input, pullRequests.activity(input)),
+        [WS_METHODS.pullRequestsReviewGuide]: (input) =>
+          withPullRequestViewer(input, reviewGuides.get(input)),
+        [WS_METHODS.pullRequestsGenerateReviewGuide]: (input) =>
+          withPullRequestViewer(input, reviewGuides.generate(input)),
+        [WS_METHODS.pullRequestsThreadComments]: (input) =>
+          withPullRequestViewer(input, pullRequests.threadComments(input)),
+        [WS_METHODS.pullRequestsDiffFileContents]: (input) =>
+          withPullRequestViewer(input, pullRequests.diffFileContents(input)),
+        [WS_METHODS.pullRequestsFilesViewed]: (input) =>
+          withPullRequestViewer(input, pullRequests.filesViewed(input)),
+        [WS_METHODS.pullRequestsChangeBreakdown]: (input) =>
+          withPullRequestViewer(input, pullRequests.changeBreakdown(input)),
+        [WS_METHODS.pullRequestsSetFilesViewed]: (input) =>
+          withPullRequestViewer(input, pullRequests.setFilesViewed(input)),
+        [WS_METHODS.pullRequestsRunAction]: (input) =>
+          withPullRequestViewer(input, pullRequests.runAction(input)).pipe(
+            Effect.tap(() =>
+              resolvePullRequestSyncKey(input).pipe(
+                Effect.flatMap((key) =>
+                  key === null ? Effect.void : pullRequestSync.requestSync(key),
+                ),
+              ),
+            ),
+          ),
+        [WS_METHODS.pullRequestsUpdate]: (input) =>
+          withPullRequestViewer(input, pullRequests.update(input)),
+        [WS_METHODS.pullRequestsComment]: (input) =>
+          withPullRequestViewer(input, pullRequests.comment(input)),
+        [WS_METHODS.pullRequestsUpdateComment]: (input) =>
+          withPullRequestViewer(input, pullRequests.updateComment(input)),
+        [WS_METHODS.pullRequestsSubmitReview]: (input) =>
+          withPullRequestViewer(input, pullRequests.submitReview(input)),
+        [WS_METHODS.pullRequestsReplyToThread]: (input) =>
+          withPullRequestViewer(input, pullRequests.replyToThread(input)),
+        [WS_METHODS.pullRequestsSetThreadResolution]: (input) =>
+          withPullRequestViewer(input, pullRequests.setThreadResolution(input)),
+        [WS_METHODS.pullRequestsSetReaction]: (input) =>
+          withPullRequestViewer(input, pullRequests.setReaction(input)),
+        [WS_METHODS.pullRequestsReportState]: (input) => pullRequests.reportState(input),
+        [WS_METHODS.pullRequestsInvalidate]: (input) =>
+          pullRequests
+            .invalidate(input, { notifyReaders: true })
+            .pipe(
+              Effect.andThen(
+                input.reference === undefined || input.filesViewedOnly === true
+                  ? Effect.void
+                  : resolvePullRequestSyncKey(input.reference).pipe(
+                      Effect.flatMap((key) =>
+                        key === null ? Effect.void : pullRequestSync.requestSync(key),
+                      ),
+                    ),
+              ),
+            ),
+        [WS_METHODS.pullRequestsSubscribeRefreshes]: () => pullRequests.subscribeRefreshes,
+        [WS_METHODS.pullRequestsReviewerCandidates]: (input) =>
+          withPullRequestViewer(input, pullRequests.reviewerCandidates(input)),
+        [WS_METHODS.pullRequestsRequestReviewers]: (input) =>
+          withPullRequestViewer(input, pullRequests.requestReviewers(input)),
+        [WS_METHODS.pullRequestsLabelCandidates]: (input) =>
+          withPullRequestViewer(input, pullRequests.labelCandidates(input)),
+        [WS_METHODS.pullRequestsSetLabels]: (input) =>
+          withPullRequestViewer(input, pullRequests.setLabels(input)),
+      });
+      return Layer.mergeAll(
+        CoreServerWsRpcGroup.toLayer(handlers),
+        PullRequestServerWsRpcGroup.toLayer(pullRequestHandlers),
+      );
     }),
   );
 

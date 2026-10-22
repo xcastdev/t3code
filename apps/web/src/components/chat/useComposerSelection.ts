@@ -28,7 +28,8 @@ import {
 interface ComposerSelectionInput {
   readonly agentConfigured: boolean;
   readonly onAgentConfigured: () => void;
-  readonly confirmComposerSettings: () => boolean;
+  readonly ownerSettingsPending: boolean;
+  readonly onOwnerSettingsPending: () => void;
   readonly environmentId: EnvironmentId;
   readonly composerDraftTarget: ComposerThreadTarget;
   readonly draftThread: DraftSessionState | null;
@@ -95,7 +96,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
 
   const handleRuntimeModeChange = (mode: RuntimeMode) => {
     if (input.agentConfigured) return input.onAgentConfigured();
-    if (!input.confirmComposerSettings()) return;
+    if (input.ownerSettingsPending) return input.onOwnerSettingsPending();
     if (mode === runtimeMode) return;
     setComposerDraftRuntimeMode(composerDraftTarget, mode);
     if (isLocalDraftThread) {
@@ -107,7 +108,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
 
   const handleInteractionModeChange = (mode: ProviderInteractionMode) => {
     if (input.agentConfigured) return input.onAgentConfigured();
-    if (!input.confirmComposerSettings()) return;
+    if (input.ownerSettingsPending) return input.onOwnerSettingsPending();
     if (mode === "plan" && !interactionModeEnabled) return;
     if (mode === interactionMode) return;
     setComposerDraftInteractionMode(composerDraftTarget, mode);
@@ -153,7 +154,7 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     options?: { focusComposer?: boolean },
   ) => {
     if (input.agentConfigured) return input.onAgentConfigured();
-    if (!input.confirmComposerSettings()) return;
+    if (input.ownerSettingsPending) return input.onOwnerSettingsPending();
     if (!activeThread) return;
     const entry = providerStatuses.find((snapshot) => snapshot.instanceId === instanceId);
     const resolvedDriverKind = entry?.driver ?? null;

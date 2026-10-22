@@ -2866,7 +2866,9 @@ export default function ChatView(props: ChatViewProps) {
   } = useComposerSelection({
     agentConfigured: agentHome !== null,
     onAgentConfigured: reportAgentConfigured,
-    confirmComposerSettings,
+    ownerSettingsPending:
+      assistantOwnership.kind === "unknown" || assistantOwnership.kind === "offline",
+    onOwnerSettingsPending: reportOwnerSettingsPending,
     environmentId,
     composerDraftTarget,
     draftThread,

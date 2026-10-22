@@ -17,6 +17,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  AuthOrchestrationReadScope,
+  WsRpcGroup,
   EnvironmentId,
   ProjectId,
   ThreadId,
@@ -37,6 +39,8 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { Headers } from "effect/http";
 import { RpcGroup, RpcMessage, RpcServer } from "effect/rpc";
+import * as RpcTest from "effect/rpc/RpcTest";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -125,12 +129,25 @@ import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
 import {
   layerWsRpc,
+  CoreServerWsRpcGroup,
+  PullRequestServerWsRpcGroup,
   subscribeOrchestrationV2Shell,
   subscribeOrchestrationV2Thread,
   WS_RPC_SERVER_OPTIONS,
   projectTerminalMetadataListener,
   withLateEditorConfig,
 } from "./ws.ts";
+
+it("partitions pull-request handlers from the core RPC group", () => {
+  const pullRequestTags = new Set(PullRequestServerWsRpcGroup.requests.keys());
+  assert.deepEqual(
+    pullRequestTags,
+    new Set([...WsRpcGroup.requests.keys()].filter((tag) => tag.startsWith("pullRequests."))),
+  );
+  for (const tag of CoreServerWsRpcGroup.requests.keys()) {
+    assert.isFalse(pullRequestTags.has(tag));
+  }
+});
 
 const snapshotConfig = (fields: Partial<ServerConfig>) =>
   ({ availableEditors: [], settings: {}, ...fields }) as unknown as ServerConfig;
@@ -401,6 +418,113 @@ const layerConfigSources = Layer.mergeAll(
     ),
   ),
   Layer.provideMerge(NodeServices.layer),
+);
+
+it.effect(
+  "registers every production RPC and preserves pull-request authorization and streams",
+  () =>
+    Effect.gen(function* () {
+      const calls: Array<string> = [];
+      const result = {
+        viewers: {},
+        providers: [],
+        entries: [],
+        errors: [],
+        truncated: false,
+        nextCursors: {},
+      };
+      const services = Layer.mergeAll(
+        layerUnusedConfigRpcServices,
+        Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+        Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+        Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+        Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+          namedProjectsRoot: process.cwd(),
+        }),
+        Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+        Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+        Layer.mock(PullRequestService.PullRequestService)({
+          list: (input) =>
+            Effect.sync(() => {
+              calls.push(input.state);
+              return result;
+            }),
+          subscribeRefreshes: Stream.suspend(() => {
+            calls.push("subscribe");
+            return Stream.make(11, 12);
+          }),
+        }),
+      );
+      const handlers = layerWsRpc(
+        {
+          sessionId: AuthSessionId.make("registration-test"),
+          subject: "registration-test",
+          method: "browser-session-cookie",
+          scopes: [],
+        },
+        {},
+        {},
+        yield* PreviewAutomationBroker.PreviewAutomationBroker,
+        yield* ServerBrowser.ServerBrowser,
+        yield* ProjectWorkGateway.ProjectWorkGateway,
+      ).pipe(Layer.provide(services));
+      const context = yield* Layer.build(handlers);
+      assert.deepEqual(
+        new Set([...context.mapUnsafe.keys()].filter((key) => key.startsWith("effect/rpc/Rpc/"))),
+        new Set([...WsRpcGroup.requests.values()].map((rpc) => rpc.key)),
+      );
+      for (const [tag, rpc] of WsRpcGroup.requests) {
+        const handler: unknown = context.mapUnsafe.get(rpc.key);
+        assert.isObject(handler);
+        if (typeof handler !== "object" || handler === null || !("handler" in handler)) {
+          return yield* Effect.die(`Missing production handler for ${tag}`);
+        }
+        if ("tag" in handler) assert.equal(handler.tag, tag);
+        assert.isFunction(handler.handler);
+      }
+      for (const allowed of [true, false]) {
+        const client = yield* RpcTest.makeClient(WsRpcGroup).pipe(
+          Effect.provide(
+            Layer.merge(
+              handlers,
+              RpcAuthorization.layer(allowed ? [AuthOrchestrationReadScope] : []),
+            ),
+          ),
+        );
+        if (allowed) {
+          assert.deepEqual(yield* client[WS_METHODS.pullRequestsList]({ state: "open" }), result);
+          assert.deepEqual(
+            yield* client[WS_METHODS.pullRequestsSubscribeRefreshes]({}).pipe(Stream.runCollect),
+            [11, 12],
+          );
+        } else {
+          assert.equal(
+            (yield* client[WS_METHODS.pullRequestsList]({ state: "open" }).pipe(Effect.flip))._tag,
+            "EnvironmentAuthorizationError",
+          );
+          assert.equal(
+            (yield* client[WS_METHODS.pullRequestsSubscribeRefreshes]({}).pipe(
+              Stream.runCollect,
+              Effect.flip,
+            ))._tag,
+            "EnvironmentAuthorizationError",
+          );
+        }
+      }
+      assert.deepEqual(calls, ["open", "subscribe"]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.fresh(layerConfigSources),
+          Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
+          Layer.mock(ServerBrowser.ServerBrowser)({}),
+          Layer.mock(ProjectWorkGateway.ProjectWorkGateway)({}),
+        ),
+      ),
+      Effect.scoped,
+    ),
 );
 
 it.effect(

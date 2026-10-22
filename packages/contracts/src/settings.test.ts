@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { expectTypeOf } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
 import { type CommandId, ProjectId } from "./baseSchemas.ts";
@@ -136,6 +137,8 @@ describe("custom model settings", () => {
 });
 
 describe("resolveIdleCompaction", () => {
+  const modes = ["onReturn", "beforeCacheExpires", "off"] as const;
+
   it("lets a Claude instance override the global default", () => {
     const settings = decodeServerSettings({
       compactIdleThreads: "off",
@@ -151,11 +154,81 @@ describe("resolveIdleCompaction", () => {
     expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claudeAgent"))).toBe("off");
   });
 
-  it("keeps the legacy beta switch's behavior", () => {
-    expect(decodeServerSettings({ compactIdleThreads: true }).compactIdleThreads).toBe(
+  it.each([
+    ["true", { compactIdleThreads: true }, "beforeCacheExpires"],
+    ["false", { compactIdleThreads: false }, "onReturn"],
+    ["omitted", {}, "onReturn"],
+  ] as const)("decodes legacy compact-idle input %s", (_input, input, expected) => {
+    expect(decodeServerSettings(input).compactIdleThreads).toBe(expected);
+  });
+
+  it.each(modes)("decodes and encodes the explicit global mode %s", (mode) => {
+    const settings = decodeServerSettings({ compactIdleThreads: mode });
+
+    expect(settings.compactIdleThreads).toBe(mode);
+    expect(encodeServerSettings(settings).compactIdleThreads).toBe(mode);
+  });
+
+  it.each(modes)("uses the global mode when a Claude instance inherits %s", (mode) => {
+    const settings = decodeServerSettings({
+      compactIdleThreads: mode,
+      providerInstances: {
+        claude_work: { driver: "claudeAgent", config: { idleCompaction: "default" } },
+      },
+    });
+
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claude_work"))).toBe(mode);
+  });
+
+  it.each(modes)("honors the explicit Claude instance override %s", (mode) => {
+    const settings = decodeServerSettings({
+      compactIdleThreads: mode === "off" ? "onReturn" : "off",
+      providerInstances: {
+        claude_work: { driver: "claudeAgent", config: { idleCompaction: mode } },
+      },
+    });
+
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claude_work"))).toBe(mode);
+  });
+
+  it("falls back to the global mode for missing or invalid instance config", () => {
+    const settings = decodeServerSettings({
+      compactIdleThreads: "beforeCacheExpires",
+      providerInstances: {
+        claude_missing_config: { driver: "claudeAgent" },
+        claude_invalid_config: {
+          driver: "claudeAgent",
+          config: { idleCompaction: "not-a-mode" },
+        },
+      },
+    });
+
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claude_missing_config"))).toBe(
       "beforeCacheExpires",
     );
-    expect(decodeServerSettings({}).compactIdleThreads).toBe("onReturn");
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claude_invalid_config"))).toBe(
+      "beforeCacheExpires",
+    );
+    expect(resolveIdleCompaction(settings, ProviderInstanceId.make("claude_unconfigured"))).toBe(
+      "beforeCacheExpires",
+    );
+  });
+
+  it("keeps legacy booleans out of settings patches", () => {
+    for (const compactIdleThreads of [true, false]) {
+      expect(() => decodeServerSettingsPatch({ compactIdleThreads })).toThrow();
+    }
+  });
+
+  it("keeps idle-compaction codec types and requirements precise", () => {
+    expectTypeOf<ServerSettings["compactIdleThreads"]>().toEqualTypeOf<
+      "onReturn" | "beforeCacheExpires" | "off"
+    >();
+    expectTypeOf<Schema.Codec.Encoded<typeof ServerSettings>["compactIdleThreads"]>().toEqualTypeOf<
+      "onReturn" | "beforeCacheExpires" | "off" | boolean | undefined
+    >();
+    expectTypeOf<(typeof ServerSettings)["DecodingServices"]>().toEqualTypeOf<never>();
+    expectTypeOf<(typeof ServerSettings)["EncodingServices"]>().toEqualTypeOf<never>();
   });
 });
 
