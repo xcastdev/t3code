@@ -256,6 +256,7 @@ const random = () => {
 };
 
 const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAuthConfig) {
+  const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
   const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
   const byId = new Map(config.servers.map((server) => [server.serverId, server]));
   const pendingStateOwners = new Map<string, Set<McpServerId>>();
@@ -299,7 +300,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
     }
     const configured = byId.get(id);
     if (configured) return configured;
-    const persisted = await Effect.runPromise(current(id));
+    const persisted = await runPromise(current(id));
     if (persisted) {
       return {
         serverId: id,
@@ -470,12 +471,12 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
         const authorization = options?.authorization;
         const stateLease = options?.stateLease;
         const server = await serverFor(id, supplied);
-        const initial = await Effect.runPromise(current(id, server, stateLease));
+        const initial = await runPromise(current(id, server, stateLease));
         const generation =
           authorization?.generation ?? initial?.generation ?? generations.get(id) ?? 0;
         const readRecord = async () => {
           try {
-            const record = await Effect.runPromise(current(id, server, stateLease));
+            const record = await runPromise(current(id, server, stateLease));
             return (record?.generation ?? 0) === generation ? record : undefined;
           } catch (cause) {
             if (isOAuthStateUnavailable(cause)) return undefined;
@@ -593,7 +594,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
                 fetchFn,
               });
               const next = { ...refreshed, issuer: record.issuer };
-              const saved = await Effect.runPromise(
+              const saved = await runPromise(
                 updateIfCurrent(
                   id,
                   server,
@@ -615,7 +616,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
             }
           },
           saveClientInformation: async (client) => {
-            await Effect.runPromise(
+            await runPromise(
               updateIfCurrent(
                 id,
                 server,
@@ -637,7 +638,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
           },
           saveTokens: async (tokens) => {
             const completedGeneration = authorization === undefined ? undefined : random();
-            const saved = await Effect.runPromise(
+            const saved = await runPromise(
               updateIfCurrent(
                 id,
                 server,
@@ -679,7 +680,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
             const state = canonicalUrl.searchParams.get("state");
             if (!state) throw new Error("OAuth authorization URL did not include state");
             const scope = canonicalUrl.searchParams.get("scope") ?? undefined;
-            const saved = await Effect.runPromise(
+            const saved = await runPromise(
               updateIfCurrent(
                 id,
                 server,
@@ -698,7 +699,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
             if (!saved) throw new Error("OAuth authorization state is stale");
           },
           saveCodeVerifier: async (codeVerifier) => {
-            await Effect.runPromise(
+            await runPromise(
               updateIfCurrent(
                 id,
                 server,
@@ -718,7 +719,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
           },
           state: () => random(),
           saveDiscoveryState: async (discovery) => {
-            const saved = await Effect.runPromise(
+            const saved = await runPromise(
               updateIfCurrent(
                 id,
                 server,
@@ -742,7 +743,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
             return new URL(resource);
           },
           invalidateCredentials: async (scope) => {
-            await Effect.runPromise(
+            await runPromise(
               updateIfCurrent(
                 id,
                 server,
@@ -947,12 +948,12 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
         expiresAt: new Date(now() + STATE_TTL_MS).toISOString(),
       };
     }).pipe(
-      Effect.catch((cause) =>
-        isProjectMcpOAuthError(cause)
-          ? Effect.fail(cause)
-          : Effect.fail(
-              new ProjectMcpOAuthError({ operation: "begin", cause: redactedOAuthCause(cause) }),
-            ),
+      Effect.catchIf(
+        (cause) => !isProjectMcpOAuthError(cause),
+        (cause) =>
+          Effect.fail(
+            new ProjectMcpOAuthError({ operation: "begin", cause: redactedOAuthCause(cause) }),
+          ),
       ),
     );
   };
@@ -1093,7 +1094,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
     setAuthorizedHandler: (handler) => {
       authorizedHandler = handler;
     },
-    disconnect: (id) =>
+    disconnect: Effect.fn("ProjectMcpOAuth.disconnect")((id) =>
       mutex.withPermits(1)(
         Effect.gen(function* () {
           nextGeneration(id);
@@ -1109,6 +1110,7 @@ const make = Effect.fn("ProjectMcpOAuth.make")(function* (config: ProjectMcpOAut
           forgetPendingStatesFor(id);
         }),
       ),
+    ),
   });
 });
 

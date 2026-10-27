@@ -50,7 +50,7 @@ const setup = Effect.gen(function* () {
         };
       }),
     issue: () => Effect.die("unused"),
-    resolve: () => Effect.succeed(undefined),
+    resolve: () => Effect.sync(() => undefined),
     touch: () => Effect.void,
     revokeProviderSession: (identity) =>
       Effect.gen(function* () {

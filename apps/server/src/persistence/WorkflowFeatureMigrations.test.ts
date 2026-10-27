@@ -136,25 +136,29 @@ it.effect(
     }).pipe(Effect.provide(memory)),
 );
 
-it.effect("allows synthetic upstream 68 after independent feature 68", () =>
+it.effect("allows the same migration id in upstream and independent feature history", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* runMigrations();
+    const nextId = Math.max(...migrationManifest.map(([id]) => id)) + 1;
     const futureFeature = [
       ...workflowFeatureMigrations,
-      { id: 68, name: "Feature68", statements: [], objects: [] },
+      { id: nextId, name: "FutureFeature", statements: [], objects: [] },
     ];
     yield* runWorkflowFeatureMigrations(futureFeature);
     yield* Migrator.make({})({
-      loader: Migrator.fromRecord({ "68_Upstream68": sql`CREATE TABLE upstream_68 (id INTEGER)` }),
+      loader: Migrator.fromRecord({
+        [`${nextId}_FutureUpstream`]: sql`CREATE TABLE future_upstream (id INTEGER)`,
+      }),
     });
     assert.equal(
-      (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = 68`)[0]?.name,
-      "Upstream68",
+      (yield* sql`SELECT name FROM effect_sql_migrations WHERE migration_id = ${nextId}`)[0]?.name,
+      "FutureUpstream",
     );
     assert.equal(
-      (yield* sql`SELECT name FROM t3_workflow_v2_migrations WHERE migration_id = 68`)[0]?.name,
-      "Feature68",
+      (yield* sql`SELECT name FROM t3_workflow_v2_migrations WHERE migration_id = ${nextId}`)[0]
+        ?.name,
+      "FutureFeature",
     );
     const before = yield* sql`SELECT type,name,sql FROM sqlite_master ORDER BY name`;
     assert.equal((yield* Effect.result(assertUpstreamUpgradeCompatibility))._tag, "Failure");
@@ -162,7 +166,6 @@ it.effect("allows synthetic upstream 68 after independent feature 68", () =>
       yield* sql`SELECT type,name,sql FROM sqlite_master ORDER BY name`,
       before,
     );
-    assert.equal(migrationManifest.at(-1)?.[0], 67);
   }).pipe(Effect.provide(memory)),
 );
 

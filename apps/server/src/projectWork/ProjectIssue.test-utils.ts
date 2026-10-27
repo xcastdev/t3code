@@ -1,3 +1,4 @@
+import { SourceControlProviderKind } from "@t3tools/contracts";
 import { EventId, ProjectId } from "@t3tools/contracts";
 import * as GitHubIssueApi from "@t3tools/source-control-github/server/GitHubIssueApi";
 import * as Effect from "effect/Effect";
@@ -51,10 +52,12 @@ export function testLayer(
   } = {},
 ) {
   const api = Layer.succeed(GitHubIssueApi.GitHubIssueApi, {
-    getAccount: () => Effect.succeed(account),
-    lookupRepository: () =>
+    getAccount: Effect.fn("GitHubIssueApi.GitHubIssueApi.getAccount")(() =>
+      Effect.succeed(account),
+    ),
+    lookupRepository: Effect.fn("GitHubIssueApi.GitHubIssueApi.lookupRepository")(() =>
       Effect.succeed({
-        status: "changed",
+        status: "changed" as const,
         etag: null,
         data: {
           ...repository,
@@ -62,25 +65,28 @@ export function testLayer(
           updatedAt: "1970-01-01T00:00:00Z",
         },
       }),
-    searchIssues: () => Effect.succeed([]),
-    readIssuesPage: () =>
+    ),
+    searchIssues: Effect.fn("GitHubIssueApi.GitHubIssueApi.searchIssues")(() => Effect.succeed([])),
+    readIssuesPage: Effect.fn("GitHubIssueApi.GitHubIssueApi.readIssuesPage")(() =>
       Effect.succeed({
-        status: "changed",
+        status: "changed" as const,
         etag: '"page-1"',
         repository,
         entries: [issue],
         nextPage: null,
         rawEntryCount: 1,
       }),
-    readCommentsPage: () =>
+    ),
+    readCommentsPage: Effect.fn("GitHubIssueApi.GitHubIssueApi.readCommentsPage")(() =>
       Effect.succeed({
-        status: "changed",
+        status: "changed" as const,
         etag: null,
         repository,
         entries: [],
         nextPage: null,
         rawEntryCount: 0,
       }),
+    ),
     ...options.api,
   });
   const identity = Layer.succeed(Identity.RepositoryIdentityResolver, {
@@ -89,7 +95,7 @@ export function testLayer(
       (() =>
         Effect.succeed({
           canonicalKey: "github.com/owner/repo",
-          provider: "github",
+          provider: SourceControlProviderKind.make("github"),
           displayName: "owner/repo",
           locator: {
             source: "git-remote",

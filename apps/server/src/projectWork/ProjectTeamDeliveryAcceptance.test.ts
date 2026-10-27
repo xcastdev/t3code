@@ -18,7 +18,7 @@ import {
 import { assertDeliveryAcceptanceCurrent } from "./ProjectTeamDeliveryAcceptanceState.ts";
 import { publicationHash } from "./ProjectWorkPublicationJournal.ts";
 import { decision, at, principal } from "./ProjectWorkPublication.testkit.ts";
-const task = Schema.decodeUnknownSync(ProjectWorkTask)({
+const task = Schema.decodeSync(ProjectWorkTask)({
   taskId: "task",
   projectId: "project",
   title: "Task",

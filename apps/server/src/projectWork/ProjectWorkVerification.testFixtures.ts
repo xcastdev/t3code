@@ -119,7 +119,7 @@ export const setup = Effect.fn("VerificationFixture.setup")(function* (
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       return ProcessRunner.of({
-        run: (request) =>
+        run: Effect.fn("ProcessRunner.run")((request) =>
           request.command === "git"
             ? Effect.gen(function* () {
                 yield* beforeGit(request);
@@ -131,6 +131,7 @@ export const setup = Effect.fn("VerificationFixture.setup")(function* (
                 }).pipe(Effect.orDie);
               })
             : run(request).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+        ),
       });
     }),
   );

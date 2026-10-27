@@ -322,6 +322,7 @@ it("readThread and sendToThread reach threads in other projects", async () => {
     messages: [],
     contextTransfers: [],
     subagents: [],
+    providerThreads: [],
     updatedAt: now,
   } as unknown as OrchestrationV2ThreadProjection;
   const foreignProjection = (threadId: ThreadId) =>
@@ -470,7 +471,6 @@ it("readThread and sendToThread reach threads in other projects", async () => {
       .pipe(Effect.flip);
     expect(staleDelete.code).toBe("parent_not_active");
 
-    // A background item keeps only its owning instance live, even after a switch.
     const backgroundTasks = [
       {
         taskId: "background-subagent",
@@ -514,7 +514,6 @@ it("readThread and sendToThread reach threads in other projects", async () => {
       .pipe(Effect.flip);
     expect(mismatched.code).toBe("parent_not_active");
 
-    // A fresh active run wins over the earlier inactive projection and empty roster.
     parentShell = liveThreadShell(parentThreadId);
     const restarted = yield* service.sendToThread(makeScope(), {
       threadId: foreignThreadId,

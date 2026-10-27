@@ -144,7 +144,7 @@ const make = Effect.gen(function* () {
       Effect.catchTags({
         ProjectMemoryError: (error) =>
           error.reason === "stale" || error.reason === "forbidden"
-            ? Effect.succeed(undefined)
+            ? Effect.void
             : Effect.fail(error),
       }),
     ),
@@ -168,7 +168,7 @@ const make = Effect.gen(function* () {
       Effect.catchTags({
         ProjectMemoryError: (error) =>
           error.reason === "stale" || error.reason === "forbidden"
-            ? Effect.succeed(undefined)
+            ? Effect.void
             : Effect.fail(error),
       }),
     );
@@ -507,10 +507,16 @@ const make = Effect.gen(function* () {
   }, Effect.mapError(storage));
   return ProjectMemoryProcessing.of({
     enqueueExtraction,
-    run: (key) => lock.withPermit(run(key)),
-    index: (key, destination) => lock.withPermit(index(key, destination)),
-    reconcile: (after) => lock.withPermit(reconcile(after ?? "")),
-    cleanup: (after) => lock.withPermit(cleanup(after ?? "")),
+    run: Effect.fn("ProjectMemoryProcessing.run")((key) => lock.withPermit(run(key))),
+    index: Effect.fn("ProjectMemoryProcessing.index")((key, destination) =>
+      lock.withPermit(index(key, destination)),
+    ),
+    reconcile: Effect.fn("ProjectMemoryProcessing.reconcile")((after) =>
+      lock.withPermit(reconcile(after ?? "")),
+    ),
+    cleanup: Effect.fn("ProjectMemoryProcessing.cleanup")((after) =>
+      lock.withPermit(cleanup(after ?? "")),
+    ),
   });
 });
 export const layer = Layer.effect(ProjectMemoryProcessing, make);

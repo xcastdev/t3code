@@ -134,13 +134,7 @@ export function SettingsWorkTaskRouteScreen({ route }: Props) {
             scope={{ environmentId, projectId, checkoutPath: project.workspaceRoot }}
             taskId={taskId}
             onOpenTask={(next) =>
-              navigation.navigate("SettingsSheet", {
-                screen: "SettingsContent",
-                params: {
-                  screen: "SettingsWorkTask",
-                  params: { environmentId, projectId, taskId: next },
-                },
-              })
+              navigation.navigate("SettingsWorkTask", { environmentId, projectId, taskId: next })
             }
           />
         )}
@@ -472,6 +466,7 @@ function Scope({ surface }: { surface: Surface }) {
   const submit = async () => {
     const selected = review.selected;
     if (selected === null) return;
+    // oxlint-disable-next-line react/purity -- The timestamp is captured when the form submit handler runs.
     const now = new Date().toISOString();
     const specification = {
       objective: objective.trim(),
@@ -1118,6 +1113,7 @@ function Relationships({ surface }: { surface: Surface }) {
         projectId: scope.projectId,
         expectedRevision: selected.revision,
         relationshipId: relationship.relationshipId,
+        // oxlint-disable-next-line react/purity -- The timestamp belongs to the confirmed unlink handler.
         unlinkedAt: new Date().toISOString(),
       },
     );
@@ -1285,6 +1281,7 @@ function Controls({ surface }: { surface: Surface }) {
       taskId: task.taskId,
       expectedRevision: selected.revision,
       blockerId,
+      // oxlint-disable-next-line react/purity -- The timestamp belongs to the blocker button handler.
       resolvedAt: new Date().toISOString(),
     });
   };

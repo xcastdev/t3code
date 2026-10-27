@@ -1,4 +1,6 @@
 import * as Layer from "effect/Layer";
+import * as DocumentText from "../provider/DocumentText.ts";
+import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as Effect from "effect/Effect";
 import * as SkillDeployment from "../skills/SkillDeploymentService.ts";
 import * as SkillCatalog from "../skills/SkillCatalogService.ts";
@@ -65,6 +67,8 @@ import { AssistantMemoryGateway } from "../assistants/AssistantMemoryGateway.ts"
 
 // Unrelated native and external operations fail on use; no live layer is installed.
 export const layerControlledFixtureBoundaries = Layer.mergeAll(
+  Layer.mock(DocumentText.DocumentText)({}),
+  Layer.mock(GuestShareService.GuestShareService)({}),
   Layer.mock(AssistantRuntime.AssistantRuntime)({}),
   Layer.mock(AssistantMemoryGateway)({}),
   Layer.mock(SkillCatalog.SkillCatalogService)({

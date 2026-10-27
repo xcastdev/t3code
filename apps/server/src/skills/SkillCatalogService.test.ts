@@ -40,7 +40,7 @@ const registry = Layer.effect(
   Effect.gen(function* () {
     const changes = yield* PubSub.unbounded<void>();
     return ProviderInstanceRegistry.of({
-      getInstance: () => Effect.succeed(undefined),
+      getInstance: () => Effect.as(Effect.void, undefined),
       listInstances: Effect.succeed([]),
       listUnavailable: Effect.succeed([]),
       streamChanges: Stream.fromPubSub(changes),

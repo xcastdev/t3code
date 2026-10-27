@@ -7,7 +7,6 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as Secrets from "../../auth/ServerSecretStore.ts";
@@ -46,7 +45,7 @@ const fixture = (onRequest: (request: HttpClientRequestForTest) => Response) =>
     ),
     Layer.provide(
       Layer.succeed(Secrets.ServerSecretStore, {
-        get: () => Effect.succeed(Option.some(new TextEncoder().encode("private-key"))),
+        get: () => Effect.succeedSome(new TextEncoder().encode("private-key")),
         set: () => Effect.void,
         create: () => Effect.void,
         getOrCreateRandom: () => Effect.die("unused"),

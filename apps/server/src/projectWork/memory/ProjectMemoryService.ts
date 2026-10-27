@@ -360,7 +360,7 @@ const make = Effect.gen(function* () {
           yield* sql`SELECT 1 FROM t3_workflow_v2_memory_grants WHERE environment_id=${input.environmentId} AND owner_kind=${hit.owner.kind} AND owner_id=${ownerId(hit.owner)} AND owner_revision=${hit.ownerRevision} AND source_id=${hit.sourceId} AND source_revision=${hit.sourceRevision} AND recipient_kind=${input.owner.kind} AND recipient_id=${ownerId(input.owner)} AND recipient_revision=${input.ownerRevision} AND revoked_at IS NULL LIMIT 1`;
         if (!grants.length) continue;
       }
-      const source = yield* current(hit).pipe(Effect.catch(() => Effect.succeed(undefined)));
+      const source = yield* current(hit).pipe(Effect.orElseSucceed(() => undefined));
       if (
         source !== undefined &&
         (Option.isNone(factPolicy) ||
@@ -420,7 +420,7 @@ const make = Effect.gen(function* () {
   return ProjectMemoryService.of({
     capture,
     captureRetained,
-    correct: (input) =>
+    correct: Effect.fn("ProjectMemoryService.correct")((input) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
@@ -446,21 +446,32 @@ const make = Effect.gen(function* () {
           }),
         )
         .pipe(Effect.mapError(unavailable)),
-    retract: (tuple) =>
+    ),
+    retract: Effect.fn("ProjectMemoryService.retract")((tuple) =>
       sql.withTransaction(invalidate(tuple, "retracted")).pipe(Effect.mapError(unavailable)),
-    readSource: (tuple) => current(tuple).pipe(Effect.mapError(unavailable)),
+    ),
+    readSource: Effect.fn("ProjectMemoryService.readSource")((tuple) =>
+      current(tuple).pipe(Effect.mapError(unavailable)),
+    ),
     applyCurrent,
-    listCurrentPage: (input) => list(input),
-    recallTextPage: (input) => list(input, input.query),
-    listCurrent: (input) => list(input).pipe(Effect.map((page) => page.items)),
-    recallText: (input) => list(input, input.query).pipe(Effect.map((page) => page.items)),
-    hydrateCurrentHits: (input) =>
+    listCurrentPage: Effect.fn("ProjectMemoryService.listCurrentPage")((input) => list(input)),
+    recallTextPage: Effect.fn("ProjectMemoryService.recallTextPage")((input) =>
+      list(input, input.query),
+    ),
+    listCurrent: Effect.fn("ProjectMemoryService.listCurrent")((input) =>
+      list(input).pipe(Effect.map((page) => page.items)),
+    ),
+    recallText: Effect.fn("ProjectMemoryService.recallText")((input) =>
+      list(input, input.query).pipe(Effect.map((page) => page.items)),
+    ),
+    hydrateCurrentHits: Effect.fn("ProjectMemoryService.hydrateCurrentHits")((input) =>
       sql.withTransaction(hydrateCurrentHits(input)).pipe(Effect.mapError(unavailable)),
+    ),
     grant,
     revoke,
     listGrants,
     enqueueCleanup,
-    deleteOwner: (scope) =>
+    deleteOwner: Effect.fn("ProjectMemoryService.deleteOwner")((scope) =>
       sql
         .withTransaction(
           Effect.gen(function* () {
@@ -492,6 +503,7 @@ const make = Effect.gen(function* () {
           }),
         )
         .pipe(Effect.mapError(unavailable)),
+    ),
   });
 });
 export const layer = Layer.effect(ProjectMemoryService, make);

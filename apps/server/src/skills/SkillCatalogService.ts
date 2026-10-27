@@ -1176,7 +1176,7 @@ export const make = Effect.gen(function* () {
   return SkillCatalogService.of({
     recordPreparedResources,
     watchScope,
-    notifyApplicationChanged: (input) =>
+    notifyApplicationChanged: Effect.fn("SkillCatalogService.notifyApplicationChanged")((input) =>
       Ref.get(revision).pipe(
         Effect.flatMap((current) =>
           publishChange({
@@ -1188,39 +1188,64 @@ export const make = Effect.gen(function* () {
         ),
         Effect.asVoid,
       ),
+    ),
     currentRevision: Ref.get(revision).pipe(Effect.map(SkillCatalogRevision.make)),
     list,
     content,
     source,
     nativeContent,
     history,
-    createGlobal: (input) => mutationLock.withPermits(1)(createGlobal(input)),
-    updateGlobal: (input) => mutationLock.withPermits(1)(updateGlobal(input)),
-    deleteGlobal: (input) => mutationLock.withPermits(1)(deleteGlobal(input)),
-    renameGlobal: (input) => mutationLock.withPermits(1)(renameGlobal(input)),
-    rollbackGlobal: (input) => mutationLock.withPermits(1)(rollbackGlobal(input)),
-    importNative: (input) => mutationLock.withPermits(1)(importNative(input)),
-    setProjectOverride: (input) => mutationLock.withPermits(1)(setProjectOverride(input)),
-    setProjectDisabled: (input) => mutationLock.withPermits(1)(setProjectDisabled(input)),
-    deleteProjectState: (input) => mutationLock.withPermits(1)(deleteProjectState(input)),
-    renameProject: (input) => mutationLock.withPermits(1)(renameProject(input)),
-    setSessionEnabled: (input) =>
+    createGlobal: Effect.fn("SkillCatalogService.createGlobal")((input) =>
+      mutationLock.withPermits(1)(createGlobal(input)),
+    ),
+    updateGlobal: Effect.fn("SkillCatalogService.updateGlobal")((input) =>
+      mutationLock.withPermits(1)(updateGlobal(input)),
+    ),
+    deleteGlobal: Effect.fn("SkillCatalogService.deleteGlobal")((input) =>
+      mutationLock.withPermits(1)(deleteGlobal(input)),
+    ),
+    renameGlobal: Effect.fn("SkillCatalogService.renameGlobal")((input) =>
+      mutationLock.withPermits(1)(renameGlobal(input)),
+    ),
+    rollbackGlobal: Effect.fn("SkillCatalogService.rollbackGlobal")((input) =>
+      mutationLock.withPermits(1)(rollbackGlobal(input)),
+    ),
+    importNative: Effect.fn("SkillCatalogService.importNative")((input) =>
+      mutationLock.withPermits(1)(importNative(input)),
+    ),
+    setProjectOverride: Effect.fn("SkillCatalogService.setProjectOverride")((input) =>
+      mutationLock.withPermits(1)(setProjectOverride(input)),
+    ),
+    setProjectDisabled: Effect.fn("SkillCatalogService.setProjectDisabled")((input) =>
+      mutationLock.withPermits(1)(setProjectDisabled(input)),
+    ),
+    deleteProjectState: Effect.fn("SkillCatalogService.deleteProjectState")((input) =>
+      mutationLock.withPermits(1)(deleteProjectState(input)),
+    ),
+    renameProject: Effect.fn("SkillCatalogService.renameProject")((input) =>
+      mutationLock.withPermits(1)(renameProject(input)),
+    ),
+    setSessionEnabled: Effect.fn("SkillCatalogService.setSessionEnabled")((input) =>
       mutationLock.withPermits(1)(authorizedSqlMutation(setSessionEnabled(input))),
-    resetSession: (input) =>
+    ),
+    resetSession: Effect.fn("SkillCatalogService.resetSession")((input) =>
       mutationLock.withPermits(1)(authorizedSqlMutation(resetSession(input))),
+    ),
     describeSession,
     prepareSession,
     disposeSession,
-    notifyInstalledSkillChanged: (readers, key) =>
-      mutationLock.withPermits(1)(
-        Effect.gen(function* () {
-          const available = yield* instances.listInstances;
-          for (const instance of available) {
-            if (readers.includes(instance.driverKind))
-              yield* publish("provider", instance.instanceId, [key]);
-          }
-        }).pipe(Effect.orDie),
-      ),
+    notifyInstalledSkillChanged: Effect.fn("SkillCatalogService.notifyInstalledSkillChanged")(
+      (readers, key) =>
+        mutationLock.withPermits(1)(
+          Effect.gen(function* () {
+            const available = yield* instances.listInstances;
+            for (const instance of available) {
+              if (readers.includes(instance.driverKind))
+                yield* publish("provider", instance.instanceId, [key]);
+            }
+          }).pipe(Effect.orDie),
+        ),
+    ),
     subscribe,
     changes: subscribe().pipe(Stream.orDie),
   });

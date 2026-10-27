@@ -8,7 +8,7 @@ import * as Environment from "../environment/ServerEnvironment.ts";
 import { assistantMigration } from "../persistence/AssistantMigration.ts";
 import * as Repository from "./AssistantRepository.ts";
 export const environmentId = EnvironmentId.make("assistant-test");
-export const configuration = Schema.decodeUnknownSync(AssistantConfiguration)({
+export const configuration = Schema.decodeSync(AssistantConfiguration)({
   name: "Research",
   rules: "Ask before publishing.",
   prompt: "Help with research.",
@@ -24,7 +24,7 @@ export const configuration = Schema.decodeUnknownSync(AssistantConfiguration)({
     externalIndexing: null,
   },
 });
-export const input = Schema.decodeUnknownSync(AssistantCreateInput)({
+export const input = Schema.decodeSync(AssistantCreateInput)({
   environmentId,
   commandId: "create",
   configuration,

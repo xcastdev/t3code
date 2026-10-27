@@ -77,9 +77,14 @@ it.live(
           env: { BASH_ENV: "/untrusted/startup" },
         });
         const exited = yield* Deferred.make<void>();
+        const readyForExit = yield* Deferred.make<void>();
         let output = "";
         const offData = child.onData((data) => {
           output += data;
+          const marker = "\rp21-fixture-terminal\r\n";
+          const markerAt = output.indexOf(marker);
+          if (markerAt >= 0 && output.indexOf("fixture> ", markerAt + marker.length) >= 0)
+            Deferred.doneUnsafe(readyForExit, Effect.void);
         });
         const offExit = child.onExit(() => Deferred.doneUnsafe(exited, Effect.void));
         yield* Effect.addFinalizer(() =>
@@ -90,6 +95,7 @@ it.live(
         );
         assert.throws(() => child.write("touch /tmp/not-fixture\r"));
         for (const fragment of controlledTerminalInput) child.write(fragment);
+        yield* Deferred.await(readyForExit);
         child.write("\u0004");
         yield* Deferred.await(exited);
         assert.include(output, "\rp21-fixture-terminal\r\n");

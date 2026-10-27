@@ -434,7 +434,7 @@ const make = Effect.gen(function* () {
   });
   return Admission.RunAdmission.of({
     ...previous,
-    validatePhysical: (threadId) =>
+    validatePhysical: Effect.fn("Admission.RunAdmission.validatePhysical")((threadId) =>
       wrap(
         "validatePhysical",
         Effect.gen(function* () {
@@ -443,8 +443,11 @@ const make = Effect.gen(function* () {
           else yield* previous.validatePhysical?.(threadId) ?? Effect.void;
         }),
       ),
-    guardEvents: (input) => wrap("guardEvents", guardEvents(input)),
-    guardProject: (input) =>
+    ),
+    guardEvents: Effect.fn("Admission.RunAdmission.guardEvents")((input) =>
+      wrap("guardEvents", guardEvents(input)),
+    ),
+    guardProject: Effect.fn("Admission.RunAdmission.guardProject")((input) =>
       wrap(
         "guardProject",
         Effect.gen(function* () {
@@ -461,7 +464,8 @@ const make = Effect.gen(function* () {
             });
         }),
       ),
-    prepareResources: (input) =>
+    ),
+    prepareResources: Effect.fn("Admission.RunAdmission.prepareResources")((input) =>
       wrap(
         "prepareResources",
         Effect.gen(function* () {
@@ -469,7 +473,7 @@ const make = Effect.gen(function* () {
             (yield* ownerOf(input.threadId, input.projectId)) ??
             (input.originThreadId === undefined ? null : yield* ownerOf(input.originThreadId));
           if (record === null)
-            return yield* previous.prepareResources?.(input) ?? Effect.succeed(undefined);
+            return yield* previous.prepareResources?.(input) ?? Effect.sync(() => undefined);
           if (input.operation === "bind-thread") return undefined;
           if (!(yield* current(record))) return undefined;
           yield* physical(record);
@@ -480,7 +484,8 @@ const make = Effect.gen(function* () {
           };
         }),
       ),
-    commit: (input) =>
+    ),
+    commit: Effect.fn("Admission.RunAdmission.commit")((input) =>
       wrap(
         "commit",
         Effect.gen(function* () {
@@ -581,7 +586,8 @@ const make = Effect.gen(function* () {
           return admitted(record, input, captured.snapshot);
         }),
       ),
-    check: (input) =>
+    ),
+    check: Effect.fn("Admission.RunAdmission.check")((input) =>
       wrap(
         "check",
         Effect.gen(function* () {
@@ -589,7 +595,8 @@ const make = Effect.gen(function* () {
           return record === null ? yield* previous.check(input) : yield* retained(record, input);
         }),
       ),
-    reconcileNative: (input) =>
+    ),
+    reconcileNative: Effect.fn("Admission.RunAdmission.reconcileNative")((input) =>
       wrap(
         "reconcileNative",
         Effect.gen(function* () {
@@ -599,14 +606,16 @@ const make = Effect.gen(function* () {
             : yield* retained(record, { ...input, operation: "continue" });
         }),
       ),
-    settle: (input) =>
+    ),
+    settle: Effect.fn("Admission.RunAdmission.settle")((input) =>
       wrap(
         "settle",
         Effect.gen(function* () {
           return (yield* ownerOf(input.threadId)) === null ? yield* previous.settle(input) : [];
         }),
       ),
-    observeNativeTurn: (input) =>
+    ),
+    observeNativeTurn: Effect.fn("Admission.RunAdmission.observeNativeTurn")((input) =>
       wrap(
         "observeNativeTurn",
         Effect.gen(function* () {
@@ -619,6 +628,7 @@ const make = Effect.gen(function* () {
           return { stop: checked._tag !== "admitted", cancelControlIds: [] };
         }),
       ),
+    ),
   });
 });
 export const layer = Layer.effect(Admission.RunAdmission, make);

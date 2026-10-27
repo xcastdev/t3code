@@ -129,6 +129,7 @@ it.effect(
         });
         const rpcSession: RpcSession = {
           client,
+          inboundFrames: Effect.succeed(0),
           initialConfig: Effect.die("unused"),
           subscribeServerConfig: () => Stream.die("unused"),
           ready: Effect.void,

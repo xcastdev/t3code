@@ -345,7 +345,9 @@ const make = Effect.gen(function* () {
         return resumed;
       }),
     ),
-    prepareIntent: (input) => protect(prepareIntent(input)),
+    prepareIntent: Effect.fn("ThreadHistoryArchiveService.prepareIntent")((input) =>
+      protect(prepareIntent(input)),
+    ),
     prepare: Effect.fn("ThreadHistoryArchive.prepare")((input) =>
       protect(prepareIntent(input).pipe(Effect.andThen(resumePreparation(input)))),
     ),
@@ -373,12 +375,17 @@ const make = Effect.gen(function* () {
         }),
       ),
     ),
-    beginExternal: (input) => protect(changeState(input, "ready", "executing")),
-    completeExternal: (input) => protect(changeState(input, "executing", "completed")),
-    reconcileExternal: (input) =>
+    beginExternal: Effect.fn("ThreadHistoryArchiveService.beginExternal")((input) =>
+      protect(changeState(input, "ready", "executing")),
+    ),
+    completeExternal: Effect.fn("ThreadHistoryArchiveService.completeExternal")((input) =>
+      protect(changeState(input, "executing", "completed")),
+    ),
+    reconcileExternal: Effect.fn("ThreadHistoryArchiveService.reconcileExternal")((input) =>
       protect(
         changeState(input, "executing", input.outcome === "completed" ? "completed" : "ready"),
       ),
+    ),
     release: Effect.fn("ThreadHistoryArchive.release")((input) =>
       protect(
         Effect.gen(function* () {
@@ -413,18 +420,20 @@ const make = Effect.gen(function* () {
         }),
       ),
     ),
-    isCheckpointRetained: (ref) =>
+    isCheckpointRetained: Effect.fn("ThreadHistoryArchiveService.isCheckpointRetained")((ref) =>
       protect(
         sql`SELECT 1 FROM t3_workflow_v2_history_archive_refs r JOIN t3_workflow_v2_history_archives a USING(archive_id) WHERE r.source_ref=${ref} AND a.state!='released' LIMIT 1`.pipe(
           Effect.map((rows) => rows.length > 0),
         ),
       ),
-    isAttachmentRetained: (id) =>
+    ),
+    isAttachmentRetained: Effect.fn("ThreadHistoryArchiveService.isAttachmentRetained")((id) =>
       protect(
         sql`SELECT 1 FROM t3_workflow_v2_history_archive_attachments r JOIN t3_workflow_v2_history_archives a USING(archive_id) WHERE r.attachment_id=${id} AND a.state!='released' LIMIT 1`.pipe(
           Effect.map((rows) => rows.length > 0),
         ),
       ),
+    ),
   });
 });
 export const layer = Layer.effect(ThreadHistoryArchiveService, make);

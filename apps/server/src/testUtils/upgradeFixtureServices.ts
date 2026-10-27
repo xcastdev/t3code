@@ -1,7 +1,6 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -53,23 +52,40 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
         ProviderSessionManager.ProviderSessionManagerV2,
         ProviderSessionManager.ProviderSessionManagerV2.of({
           shutdown: Effect.void,
-          open: () => refuse("provider.open"),
-          get: () => Effect.succeedNone,
-          isLive: () => Effect.succeed(false),
-          close: () => refuse("provider.close"),
-          closeInstance: () => refuse("provider.closeInstance"),
-          release: () => refuse("provider.release"),
-          detach: () => refuse("provider.detach"),
+          open: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.open")(() =>
+            refuse("provider.open"),
+          ),
+          get: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.get")(
+            () => Effect.succeedNone,
+          ),
+          isLive: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.isLive")(() =>
+            Effect.succeed(false),
+          ),
+          close: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.close")(() =>
+            refuse("provider.close"),
+          ),
+          closeInstance: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.closeInstance")(
+            () => refuse("provider.closeInstance"),
+          ),
+          release: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.release")(() =>
+            refuse("provider.release"),
+          ),
+          detach: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.detach")(() =>
+            refuse("provider.detach"),
+          ),
         }),
       );
       const registry = Layer.succeed(
         ProviderAdapterRegistry.ProviderAdapterRegistryV2,
         ProviderAdapterRegistry.ProviderAdapterRegistryV2.of({
-          list: () => Effect.succeed([]),
-          get: (instanceId) =>
+          list: Effect.fn("ProviderAdapterRegistry.ProviderAdapterRegistryV2.list")(() =>
+            Effect.succeed([]),
+          ),
+          get: Effect.fn("ProviderAdapterRegistry.ProviderAdapterRegistryV2.get")((instanceId) =>
             Effect.fail(
               new ProviderAdapterRegistry.ProviderAdapterRegistryLookupError({ instanceId }),
             ),
+          ),
         }),
       );
       const fakes = Layer.mergeAll(
@@ -97,13 +113,7 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
         Scheduler.Scheduler.of({
           register: Effect.fn("UpgradeFixtureScheduler.register")(function* (name, work) {
             const context = yield* Effect.context<Effect.Services<typeof work>>();
-            callbacks.set(
-              name,
-              work.pipe(
-                Effect.provideContext(context),
-                Effect.catchCause(() => Effect.void),
-              ),
-            );
+            callbacks.set(name, work.pipe(Effect.provideContext(context), Effect.ignoreCause));
           }),
         }),
       );
@@ -133,9 +143,11 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
                 runOnce: Effect.succeed(false),
                 runControlOnce: Effect.succeed(false),
                 runRecoveryOnce: Effect.succeed(false),
-                nextClaimableAt: Effect.succeed(Option.none()),
-                nextControlClaimableAt: Effect.succeed(Option.none()),
-                drain: () => Effect.succeed(0),
+                nextClaimableAt: Effect.succeedNone,
+                nextControlClaimableAt: Effect.succeedNone,
+                drain: Effect.fn("EffectWorker.OrchestrationEffectWorkerV2.drain")(() =>
+                  Effect.succeed(0),
+                ),
               }),
             )
           : EffectWorker.layer.pipe(
@@ -143,7 +155,9 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
                 Layer.succeed(
                   EffectWorker.OrchestrationEffectExecutorV2,
                   EffectWorker.OrchestrationEffectExecutorV2.of({
-                    execute: () => refuse("effect.execute"),
+                    execute: Effect.fn("EffectWorker.OrchestrationEffectExecutorV2.execute")(() =>
+                      refuse("effect.execute"),
+                    ),
                   }),
                 ),
               ),
@@ -155,7 +169,9 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
           ? Layer.succeed(
               ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService,
               ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService.of({
-                reconcile: () =>
+                reconcile: Effect.fn(
+                  "ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService.reconcile",
+                )(() =>
                   Effect.succeed({
                     terminalizedRuns: 0,
                     stoppedSessions: 0,
@@ -163,6 +179,7 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
                     retiredEffects: 0,
                     requeuedEffects: 0,
                   }),
+                ),
                 prepareForShutdown: Effect.void,
                 recover: Effect.succeed({
                   terminalizedRuns: 0,
@@ -190,13 +207,27 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
                 const service = yield* ScheduledTaskService.ScheduledTaskService;
                 return ScheduledTaskService.ScheduledTaskService.of({
                   ...service,
-                  upsert: () => refuse("schedule.upsert"),
-                  setEnabled: () => refuse("schedule.setEnabled"),
-                  delete: () => refuse("schedule.delete"),
-                  deleteForThread: () => refuse("schedule.deleteForThread"),
-                  runNow: () => refuse("schedule.runNow"),
-                  rotateWebhookToken: () => refuse("schedule.rotateWebhookToken"),
-                  triggerWebhook: () => refuse("webhook.trigger"),
+                  upsert: Effect.fn("ScheduledTaskService.ScheduledTaskService.upsert")(() =>
+                    refuse("schedule.upsert"),
+                  ),
+                  setEnabled: Effect.fn("ScheduledTaskService.ScheduledTaskService.setEnabled")(
+                    () => refuse("schedule.setEnabled"),
+                  ),
+                  delete: Effect.fn("ScheduledTaskService.ScheduledTaskService.delete")(() =>
+                    refuse("schedule.delete"),
+                  ),
+                  deleteForThread: Effect.fn(
+                    "ScheduledTaskService.ScheduledTaskService.deleteForThread",
+                  )(() => refuse("schedule.deleteForThread")),
+                  runNow: Effect.fn("ScheduledTaskService.ScheduledTaskService.runNow")(() =>
+                    refuse("schedule.runNow"),
+                  ),
+                  rotateWebhookToken: Effect.fn(
+                    "ScheduledTaskService.ScheduledTaskService.rotateWebhookToken",
+                  )(() => refuse("schedule.rotateWebhookToken")),
+                  triggerWebhook: Effect.fn(
+                    "ScheduledTaskService.ScheduledTaskService.triggerWebhook",
+                  )(() => refuse("webhook.trigger")),
                 });
               }),
             ).pipe(Layer.provide(tasks))

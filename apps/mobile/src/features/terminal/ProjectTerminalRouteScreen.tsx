@@ -146,6 +146,7 @@ function ProjectTerminalPane({
     setStreamError,
   );
   // A reconnect marker means this reader missed output; reattaching yields a fresh snapshot.
+  // oxlint-disable-next-line t3code/react-effect-budget -- A reconnect marker reattaches the external terminal stream.
   useEffect(() => {
     if (state.phase === "reconnecting") registry.refresh(attachAtom);
   }, [state.phase, attachAtom, registry]);
@@ -232,6 +233,7 @@ function ProjectTerminalPane({
         className="flex-1"
         terminalKey={`project:${environmentId}:${handle.projectId}:${handle.terminalId}:${shownGeneration}`}
         buffer={state.terminal === null ? null : state.history}
+        output={null}
         isRunning={live}
         readOnly={!canWrite || !typing || !live}
         autoFocus={false}

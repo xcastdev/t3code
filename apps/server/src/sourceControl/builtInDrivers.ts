@@ -1,52 +1,43 @@
-import * as GitHubIssueApi from "@t3tools/source-control-github/server/GitHubIssueApi";
-import * as AzureDevOpsCli from "@t3tools/source-control-azure-devops/server/AzureDevOpsCli";
-import * as AzureDevOpsPullRequestCli from "@t3tools/source-control-azure-devops/server/AzureDevOpsPullRequestCli";
-import * as AzureDevOpsDriver from "@t3tools/source-control-azure-devops/server/driver";
-import * as BitbucketApi from "@t3tools/source-control-bitbucket/server/BitbucketApi";
-import * as BitbucketPullRequestApi from "@t3tools/source-control-bitbucket/server/BitbucketPullRequestApi";
-import * as BitbucketDriver from "@t3tools/source-control-bitbucket/server/driver";
-import * as ForgejoCli from "@t3tools/source-control-forgejo/server/ForgejoCli";
-import * as ForgejoDriver from "@t3tools/source-control-forgejo/server/driver";
-import * as GitCafeApi from "@t3tools/source-control-gitcafe/server/GitCafeApi";
-import * as GitCafeCredentials from "@t3tools/source-control-gitcafe/server/GitCafeCredentials";
-import * as GitCafeDriver from "@t3tools/source-control-gitcafe/server/driver";
-import * as GitHubRest from "@t3tools/source-control-github/server/GitHubRest";
-import * as GitHubPullRequestApi from "@t3tools/source-control-github/server/GitHubPullRequestApi";
+import type {
+  SourceControlDriver,
+  SourceControlDriverInstance,
+} from "@t3tools/source-control-core/server/driver";
+import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import * as GitHubDriver from "@t3tools/source-control-github/server/driver";
-import * as GitLabCli from "@t3tools/source-control-gitlab/server/GitLabCli";
-import * as GitLabPullRequestCli from "@t3tools/source-control-gitlab/server/GitLabPullRequestCli";
-import * as GitLabDriver from "@t3tools/source-control-gitlab/server/driver";
-import type { SourceControlDriver } from "@t3tools/source-control-core/server/driver";
+import * as GitHubIssueApi from "@t3tools/source-control-github/server/GitHubIssueApi";
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import * as ServerSourceControlHost from "./ServerSourceControlHost.ts";
+import { BUILT_IN_SOURCE_CONTROL_DRIVER_LIST } from "./sourceControlDefinitions.ts";
 
-const drivers = [
-  GitHubDriver.driver,
-  GitLabDriver.driver,
-  AzureDevOpsDriver.driver,
-  BitbucketDriver.driver,
-  ForgejoDriver.driver,
-  GitCafeDriver.driver,
-];
+export interface SourceControlDriverEntry {
+  readonly driver: Pick<SourceControlDriver, "kind" | "definition">;
+  readonly instance: SourceControlDriverInstance;
+}
 
-export type BuiltInSourceControlDriversEnv =
-  (typeof drivers)[number] extends SourceControlDriver<infer R> ? R : never;
+/** Every driver's instance, in registry order. Everything that reads a host reads it here. */
+export class SourceControlDrivers extends Context.Service<
+  SourceControlDrivers,
+  ReadonlyArray<SourceControlDriverEntry>
+>()("t3/sourceControl/builtInDrivers/SourceControlDrivers") {}
 
-export const BUILT_IN_SOURCE_CONTROL_DRIVERS: ReadonlyArray<
-  SourceControlDriver<BuiltInSourceControlDriversEnv>
-> = drivers;
+const make = Effect.gen(function* () {
+  const github = yield* GitHubDriver.makeWithIssueApi;
+  const drivers = yield* Effect.forEach(BUILT_IN_SOURCE_CONTROL_DRIVER_LIST, (driver) =>
+    Effect.gen(function* () {
+      const instance =
+        driver.kind === GitHubDriver.driver.kind ? github.instance : yield* driver.make;
+      return { driver, instance };
+    }),
+  );
+  return Context.make(SourceControlDrivers, drivers).pipe(
+    Context.add(GitHubIssueApi.GitHubIssueApi, github.issueApi),
+  );
+});
 
-export const layer = Layer.mergeAll(
-  // `GitHubRest.layerWithDependencies` carries the quota reserve and rate-limit pause every GitHub
-  // reader shares, so the server builds it once, here.
-  GitHubIssueApi.layer.pipe(
-    Layer.provideMerge(GitHubPullRequestApi.layer),
-    Layer.provideMerge(GitHubRest.layerWithDependencies),
-  ),
-  AzureDevOpsPullRequestCli.layer.pipe(Layer.provideMerge(AzureDevOpsCli.layer)),
-  BitbucketPullRequestApi.layer.pipe(Layer.provideMerge(BitbucketApi.layer)),
-  ForgejoCli.layer,
-  GitCafeApi.layer.pipe(Layer.provideMerge(GitCafeCredentials.layer)),
-  GitLabPullRequestCli.layer.pipe(Layer.provideMerge(GitLabCli.layer)),
-).pipe(Layer.provideMerge(ServerSourceControlHost.layer));
+export const layer = Layer.effectContext(make).pipe(
+  Layer.provideMerge(ServerSourceControlHost.layer),
+  Layer.provideMerge(SourceControlRateLimit.layer),
+);

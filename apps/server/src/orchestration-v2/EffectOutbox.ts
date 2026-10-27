@@ -16,6 +16,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -99,6 +100,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerSessionId: ProviderSessionId,
     requestId: RuntimeRequestId,
     decision: Schema.optional(ProviderApprovalDecision),
+    feedback: Schema.optional(Schema.String),
     answers: Schema.optional(ProviderUserInputAnswers),
   }),
   Schema.Struct({
@@ -171,12 +173,7 @@ export const OrchestrationEffectStatusV2 = Schema.Literals([
 ]);
 export type OrchestrationEffectStatusV2 = typeof OrchestrationEffectStatusV2.Type;
 
-/**
- * Command retries are deduplicated by their receipts first, and a run's effects
- * are re-enqueued only around one server restart, so a week is far longer than
- * either and leaves recent history for debugging. Failed rows are kept: storage
- * cleanup keeps a deleted thread's worktree while any of its effects failed.
- */
+/** Receipts deduplicate retries, and restart re-enqueues need far less than a week. Retain failed rows to keep deleted-thread worktrees. */
 export const SETTLED_EFFECT_RETENTION = Duration.days(7);
 const PRUNE_BATCH_SIZE = 500;
 
@@ -471,11 +468,10 @@ export const layerWithOptions = ({
           WHERE effect_id = ${effectId}
           LIMIT 1
         `.pipe(
+            NodeSqliteClient.readOnly,
             Effect.flatMap((rows) => {
               const row = rows[0];
-              return row === undefined
-                ? Effect.succeed(Option.none())
-                : rowToEffect(row).pipe(Effect.map(Option.some));
+              return row === undefined ? Effect.succeedNone : rowToEffect(row).pipe(Effect.asSome);
             }),
             Effect.mapError(
               (cause) => new EffectOutboxError({ operation: "get", effectId, cause }),
@@ -491,6 +487,7 @@ export const layerWithOptions = ({
           WHERE command_id = ${commandId}
           ORDER BY created_at ASC, effect_id ASC
         `.pipe(
+            NodeSqliteClient.readOnly,
             Effect.flatMap((rows) => decodeRows("list", rows)),
             Effect.mapError((cause) =>
               isEffectOutboxError(cause)
@@ -650,7 +647,7 @@ export const layerWithOptions = ({
           SELECT MIN(candidate.available_at) AS available_at
           FROM orchestration_v2_effect_outbox AS candidate
           WHERE ${claimableCandidatePredicate(undefined, false, consumer)}
-        `.pipe(Effect.withTracerEnabled(false));
+        `.pipe(NodeSqliteClient.readOnly, Effect.withTracerEnabled(false));
             const availableAt = rows[0]?.available_at;
             if (availableAt === undefined || availableAt === null) return Option.none();
             const parsed = DateTime.make(availableAt);

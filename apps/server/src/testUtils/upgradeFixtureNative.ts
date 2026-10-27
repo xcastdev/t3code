@@ -188,7 +188,7 @@ export function layerFixtureNative(
       return UpgradeFixtureNative.of({
         mode,
         attempts: Effect.sync(() => [...attempts]),
-        run: (input) =>
+        run: Effect.fn("UpgradeFixtureNative.run")((input) =>
           guardedEffect(
             input.command,
             Effect.gen(function* () {
@@ -222,7 +222,8 @@ export function layerFixtureNative(
               }
             }),
           ),
-        terminal: (projectId) =>
+        ),
+        terminal: Effect.fn("UpgradeFixtureNative.terminal")((projectId) =>
           guarded("terminal", async () => {
             const cwd = rootFor(projectId);
             const pty = await import("node-pty");
@@ -248,6 +249,7 @@ export function layerFixtureNative(
               terminal.write("printf 'fixture-terminal\\n'; exit\n");
             });
           }),
+        ),
         endpoint: guarded("loopback-endpoint", async () => {
           const token = NodeCrypto.randomBytes(32).toString("hex");
           const server = NodeHttp.createServer((request, response) => {

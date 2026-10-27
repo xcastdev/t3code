@@ -110,14 +110,15 @@ export const readCurrentState = Effect.fn("ProjectWorkRepository.readCurrentStat
     const events = yield* readProjectWorkEvents(sql, projectId);
     return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
   }
-  let state: ProjectWorkReducerState;
-  try {
+  const decoded = yield* Effect.try(() => {
     // @effect-diagnostics-next-line preferSchemaOverJson:off -- validated derived checkpoint with event-log fallback.
-    state = JSON.parse(String(checkpoint.stateJson)) as ProjectWorkReducerState;
-  } catch {
+    return JSON.parse(String(checkpoint.stateJson)) as ProjectWorkReducerState;
+  }).pipe(Effect.option);
+  if (Option.isNone(decoded)) {
     const events = yield* readProjectWorkEvents(sql, projectId);
     return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
   }
+  const state = decoded.value;
   if (
     (state as ProjectWorkReducerState & { checkpointVersion?: number }).checkpointVersion !==
       PROJECT_WORK_CHECKPOINT_VERSION ||

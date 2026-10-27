@@ -181,7 +181,7 @@ export function layerFixtureWorkspace(
   const known = Layer.succeed(
     KnownWorkspaces.KnownWorkspaces,
     KnownWorkspaces.KnownWorkspaces.of({
-      contains: (path) =>
+      contains: Effect.fn("KnownWorkspaces.KnownWorkspaces.contains")((path) =>
         Effect.sync(() => {
           try {
             mapPath(path);
@@ -190,13 +190,15 @@ export function layerFixtureWorkspace(
             return false;
           }
         }),
-      assertContains: (path) =>
+      ),
+      assertContains: Effect.fn("KnownWorkspaces.KnownWorkspaces.assertContains")((path) =>
         Effect.try({
           try: () => {
             mapPath(path);
           },
           catch: () => new KnownWorkspaces.UnknownWorkspaceError({ cwd: path }),
         }),
+      ),
     }),
   );
   const implementation = WorkspaceFileSystem.layer.pipe(
@@ -213,12 +215,13 @@ export function layerFixtureWorkspace(
     Effect.gen(function* () {
       const files = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       return WorkspaceFileSystem.WorkspaceFileSystem.of({
-        getMetadata: (input) =>
+        getMetadata: Effect.fn("WorkspaceFileSystem.WorkspaceFileSystem.getMetadata")((input) =>
           files.getMetadata({
             ...input,
             paths: input.paths.map((path) => mapPath(path)),
           }),
-        readFile: (input) =>
+        ),
+        readFile: Effect.fn("WorkspaceFileSystem.WorkspaceFileSystem.readFile")((input) =>
           Effect.suspend(() =>
             files.readFile({
               ...input,
@@ -233,7 +236,8 @@ export function layerFixtureWorkspace(
               ),
             }),
           ),
-        writeFile: (input) =>
+        ),
+        writeFile: Effect.fn("WorkspaceFileSystem.WorkspaceFileSystem.writeFile")((input) =>
           Effect.suspend(() =>
             files.writeFile({
               ...input,
@@ -244,6 +248,7 @@ export function layerFixtureWorkspace(
               ),
             }),
           ),
+        ),
       });
     }),
   ).pipe(Layer.provide(implementation));

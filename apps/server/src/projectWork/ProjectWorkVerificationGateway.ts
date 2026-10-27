@@ -207,9 +207,9 @@ const make = Effect.gen(function* () {
           return yield* verificationError("changed-target");
         return output.stdout.trim();
       });
-      const dispatch = yield* Schema.decodeUnknownEffect(
-        Schema.fromJsonString(importedDispatchSchema),
-      )(journals[0]!.request_json);
+      const dispatch = yield* Schema.decodeEffect(Schema.fromJsonString(importedDispatchSchema))(
+        journals[0]!.request_json,
+      );
       const head = yield* git(["rev-parse", "HEAD"]);
       const base = yield* git([
         "rev-parse",

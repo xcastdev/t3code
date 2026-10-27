@@ -75,7 +75,12 @@ export const preservationScheduleLayer = ScheduledTasks.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       NodeCrypto.layer,
-      Layer.succeed(Scheduler.Scheduler, Scheduler.Scheduler.of({ register: () => Effect.void })),
+      Layer.succeed(
+        Scheduler.Scheduler,
+        Scheduler.Scheduler.of({
+          register: Effect.fn("Scheduler.Scheduler.register")(() => Effect.void),
+        }),
+      ),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
       Layer.mock(ThreadManagement.ThreadManagementService)({}),
       Layer.mock(ManagedFolders.ManagedProjectFolders)({
@@ -106,7 +111,7 @@ export function preservationSettingsLayer(root: string) {
   return ServerSettings.layer.pipe(
     Layer.provide(
       Layer.mock(ServerSecretStore.ServerSecretStore)({
-        get: () => Effect.succeed(Option.none()),
+        get: () => Effect.succeedNone,
       }),
     ),
     Layer.provide(config),

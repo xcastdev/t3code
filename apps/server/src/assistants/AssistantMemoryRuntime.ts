@@ -55,13 +55,7 @@ export const workerLayer = Layer.effectDiscard(
       }
     });
     yield* (yield* activity.subscribe).pipe(
-      Stream.runForEach(() =>
-        drain.pipe(
-          Effect.catch((cause) =>
-            Effect.logWarning("Assistant memory processing remains pending.", { cause }),
-          ),
-        ),
-      ),
+      Stream.runForEach(() => drain),
       Effect.forkScoped,
     );
     yield* recover.pipe(

@@ -257,9 +257,11 @@ it.live("runs assistant chat, automatic memory and staged-only Git over a contro
       NodeFS.writeFileSync(configPath, originalConfig);
     }).pipe(
       Effect.provide(
-        EffectWorker.layer
-          .pipe(Layer.provideMerge(automatic))
-          .pipe(Layer.provide(infrastructure), Layer.provide(NodeServices.layer)),
+        EffectWorker.layer.pipe(
+          Layer.provideMerge(automatic),
+          Layer.provide(infrastructure),
+          Layer.provide(NodeServices.layer),
+        ),
       ),
     );
   }).pipe(Effect.scoped),

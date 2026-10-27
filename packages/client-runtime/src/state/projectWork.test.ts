@@ -475,7 +475,7 @@ describe("Work environment atoms", () => {
               },
               { immediate: true },
             );
-          yield* Effect.all(ready.map(Deferred.await));
+          yield* Effect.forEach(ready, Deferred.await);
           expect([...cursors.entries()]).toEqual([
             [first, 7],
             [second, 19],

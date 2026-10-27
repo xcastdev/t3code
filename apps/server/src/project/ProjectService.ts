@@ -18,6 +18,7 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
+import { withCommandMetrics } from "../observability/Metrics.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
@@ -268,8 +269,7 @@ export const make = Effect.gen(function* () {
         `Command ${command.commandId} was already used by ${receipt.commandType} for ${receipt.projectId}.`,
       );
     }
-    // A retried command re-plans against the state it already produced, so its
-    // first receipt, not the new plan, decides the outcome.
+    // Retries re-plan against their own effects; the first receipt determines the outcome.
     if (receipt.status === "accepted") return;
     const rejection = Option.getOrUndefined(decodeProjectCommandRejection(receipt.error));
     switch (rejection?._tag) {
@@ -286,7 +286,7 @@ export const make = Effect.gen(function* () {
           rejection ?? receipt.error ?? "The command was previously rejected.",
         );
     }
-  });
+  }, withCommandMetrics);
 
   const readCommitted = Effect.fn("ProjectService.readCommitted")(function* (projectId: ProjectId) {
     const row = yield* readRow(projectId, { includeDeleted: true });
@@ -508,7 +508,7 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  // Deleted projects must not keep an otherwise disabled provider instance alive.
+  // Best-effort cleanup releases disabled instances kept alive by overrides; crashes have no replay to revisit deletion.
   const clearProjectSettingsOverrides = (projectId: ProjectId) =>
     serverSettings.updateSettings({ projectSettingsOverrides: { [projectId]: null } }).pipe(
       Effect.asVoid,
@@ -539,8 +539,7 @@ export const make = Effect.gen(function* () {
               }),
           ),
         );
-      // A deleted row still reaches commit, so a retried command id replays its
-      // receipt and any other command id is rejected as not found.
+      // Read deleted rows so retries replay receipts and other command ids fail as not found.
       const existing = yield* readRow(projectId, { includeDeleted: true });
       if (Option.isNone(existing)) {
         return yield* new ProjectNotFoundError({ projectId });

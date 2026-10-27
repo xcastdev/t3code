@@ -1,3 +1,4 @@
+import { SourceControlProviderKind } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import { CommandId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 import * as GitHubIssueApi from "@t3tools/source-control-github/server/GitHubIssueApi";
@@ -388,7 +389,7 @@ it.effect("identity rejects a canonical repository changed during GitHub lookup"
         resolve: () =>
           Effect.sync(() => ({
             canonicalKey: changed ? "github.com/other/repo" : "github.com/owner/repo",
-            provider: "github" as const,
+            provider: SourceControlProviderKind.make("github"),
             displayName: changed ? "other/repo" : "owner/repo",
             locator: {
               source: "git-remote" as const,
@@ -485,7 +486,7 @@ it.effect.each([false, true])(
         testLayer({
           resolve: () =>
             Effect.sync(() => ({
-              provider: "github" as const,
+              provider: SourceControlProviderKind.make("github"),
               canonicalKey: remoteChanged ? "github.com/changed/repo" : "github.com/owner/repo",
               displayName: remoteChanged ? "changed/repo" : "owner/repo",
               locator: {

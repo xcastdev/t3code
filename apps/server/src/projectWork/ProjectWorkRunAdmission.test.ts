@@ -236,9 +236,7 @@ const admit = (commandId = "launch", target = threadId, run = runId, originThrea
       operation: "create",
       ...(originThreadId === undefined ? {} : { originThreadId }),
     };
-    const preparedResources = yield* (
-      admission.prepareResources?.(input) ?? Effect.succeed(undefined)
-    );
+    const preparedResources = yield* admission.prepareResources?.(input) ?? Effect.void;
     return yield* sql.withTransaction(
       admission.commit({
         ...input,

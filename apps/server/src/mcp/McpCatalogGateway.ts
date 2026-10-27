@@ -267,6 +267,7 @@ const makeServer = (
 };
 
 const make = Effect.gen(function* () {
+  const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
   const resourcePolicy = yield* AssistantResources.AssistantNativeResources;
   const proxy = yield* Proxy.ProjectMcpProxyRegistry;
   const registry = yield* Registry.McpSessionRegistry;
@@ -386,12 +387,15 @@ const make = Effect.gen(function* () {
   return McpCatalogGateway.of({
     registerCatalogSession: apply,
     applyCatalogRevision: apply,
-    resolveCatalogSession: (id) => Effect.sync(() => sessions.get(id)?.session),
-    resolveProviderSession: (identity, id) =>
+    resolveCatalogSession: Effect.fn("McpCatalogGateway.resolveCatalogSession")((id) =>
+      Effect.sync(() => sessions.get(id)?.session),
+    ),
+    resolveProviderSession: Effect.fn("McpCatalogGateway.resolveProviderSession")((identity, id) =>
       Effect.sync(() => {
         const session = sessions.get(id)?.session;
         return session?.providerSessionId === identity ? session : undefined;
       }),
+    ),
     revokeRuntime,
     disposeCatalogSession,
     revokeAll,
@@ -424,9 +428,7 @@ const make = Effect.gen(function* () {
       active.active += 1;
       const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
       const server = makeServer(active, () =>
-        Effect.runPromise(
-          resourcePolicy.tools(active.session.threadId, active.session.providerSessionId),
-        ),
+        runPromise(resourcePolicy.tools(active.session.threadId, active.session.providerSessionId)),
       );
       return yield* Effect.tryPromise({
         try: async () => {
@@ -435,7 +437,7 @@ const make = Effect.gen(function* () {
         },
         catch: () => new McpCatalogGatewayError(),
       }).pipe(
-        Effect.catch(() => Effect.succeed(new Response(null, { status: 502 }))),
+        Effect.orElseSucceed(() => new Response(null, { status: 502 })),
         Effect.ensuring(
           Effect.promise(() => server.close().catch(() => undefined)).pipe(
             Effect.andThen(

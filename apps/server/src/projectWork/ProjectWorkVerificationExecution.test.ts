@@ -39,15 +39,15 @@ it.live("executes the exact approved invocation once and atomically applies reta
               checks++;
             }),
           applyEvidence: (_result, _manifest, markApplied) =>
-            Effect.gen(function* () {
-              yield* sql.withTransaction(
+            sql
+              .withTransaction(
                 Effect.gen(function* () {
                   yield* markApplied;
                   assert.isTrue(Option.isSome(yield* Effect.serviceOption(sql.transactionService)));
                   applied++;
                 }),
-              );
-            }).pipe(Effect.mapError(() => verificationError("storage"))),
+              )
+              .pipe(Effect.mapError(() => verificationError("storage"))),
         };
         const first = yield* service.execute(manifest.projectId, manifest.jobId, authority);
         assert.equal(first.stage, "applied");

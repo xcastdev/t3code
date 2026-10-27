@@ -406,6 +406,7 @@ it.effect("closes the last mounted catalog stream and remounts with current dest
         },
       });
       const rpcSession: RpcSession = {
+        inboundFrames: Effect.succeed(0),
         client,
         initialConfig: Effect.die("unused"),
         subscribeServerConfig: () => Stream.die("unused"),

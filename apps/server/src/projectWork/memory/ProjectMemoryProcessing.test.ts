@@ -93,9 +93,9 @@ const fixture = (
             ? Effect.fail(new ProjectMemoryError({ reason: "stale" }))
             : apply(source),
         enqueueCleanup: (tuple, key) =>
-          Effect.gen(function* () {
-            yield* sql`INSERT OR REPLACE INTO t3_workflow_v2_memory_cleanup VALUES(${key},'env','project','project',0,'source',0,0,${source.contentHash},'pending',${JSON.stringify(tuple)})`;
-          }).pipe(Effect.mapError(() => new ProjectMemoryError({ reason: "unavailable" }))),
+          sql`INSERT OR REPLACE INTO t3_workflow_v2_memory_cleanup VALUES(${key},'env','project','project',0,'source',0,0,${source.contentHash},'pending',${JSON.stringify(tuple)})`.pipe(
+            Effect.mapError(() => new ProjectMemoryError({ reason: "unavailable" })),
+          ),
       });
     }),
   ).pipe(Layer.provide(Sqlite.layerMemory));

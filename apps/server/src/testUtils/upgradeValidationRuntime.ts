@@ -85,7 +85,7 @@ function makeUpgradeValidationRuntime(
         faviconPath: null,
       });
       return ProjectStore.ProjectStoreV2.of({
-        apply: (event) =>
+        apply: Effect.fn("ProjectStore.ProjectStoreV2.apply")((event) =>
           Effect.suspend(() => {
             if (mode !== "controlled-fixture")
               return Effect.die(new UpgradeValidationDenied({ operation: "project mutation" }));
@@ -99,13 +99,22 @@ function makeUpgradeValidationRuntime(
               );
             return store.apply(event);
           }),
-        get: (id, options) => store.get(id, options).pipe(Effect.map(Option.map(overlay))),
-        list: (options) =>
+        ),
+        get: Effect.fn("ProjectStore.ProjectStoreV2.get")((id, options) =>
+          store.get(id, options).pipe(Effect.map(Option.map(overlay))),
+        ),
+        list: Effect.fn("ProjectStore.ProjectStoreV2.list")((options) =>
           store.list(options).pipe(Effect.map((projects) => projects.map(overlay))),
-        getShell: (id) => store.getShell(id).pipe(Effect.map(Option.map(shellOverlay))),
-        listShells: (options) =>
+        ),
+        getShell: Effect.fn("ProjectStore.ProjectStoreV2.getShell")((id) =>
+          store.getShell(id).pipe(Effect.map(Option.map(shellOverlay))),
+        ),
+        listShells: Effect.fn("ProjectStore.ProjectStoreV2.listShells")((options) =>
           store.listShells(options).pipe(Effect.map((projects) => projects.map(shellOverlay))),
-        findActiveByWorkspaceRoot: (root) =>
+        ),
+        findActiveByWorkspaceRoot: Effect.fn(
+          "ProjectStore.ProjectStoreV2.findActiveByWorkspaceRoot",
+        )((root) =>
           store
             .list()
             .pipe(
@@ -115,6 +124,7 @@ function makeUpgradeValidationRuntime(
                 ).pipe(Option.map(overlay)),
               ),
             ),
+        ),
       });
     }),
   ).pipe(Layer.provide(ProjectStore.layer));
@@ -192,13 +202,22 @@ function makeUpgradeValidationRuntime(
       ProviderRegistry.ProviderRegistry,
       ProviderRegistry.ProviderRegistry.of({
         getProviders: Effect.succeed([]),
-        refresh: () => Effect.succeed([]),
-        refreshInstance: () => Effect.succeed([]),
-        refreshAfterUpdate: () => Effect.succeed([]),
-        refreshWorkspaceSnapshot: () => Effect.succeed([]),
-        getProviderMaintenanceCapabilitiesForInstance: () =>
-          Effect.die(new UpgradeValidationDenied({ operation: "provider maintenance" })),
-        setProviderMaintenanceActionState: () => Effect.succeed([]),
+        refresh: Effect.fn("ProviderRegistry.ProviderRegistry.refresh")(() => Effect.succeed([])),
+        refreshInstance: Effect.fn("ProviderRegistry.ProviderRegistry.refreshInstance")(() =>
+          Effect.succeed([]),
+        ),
+        refreshAfterUpdate: Effect.fn("ProviderRegistry.ProviderRegistry.refreshAfterUpdate")(() =>
+          Effect.succeed([]),
+        ),
+        refreshWorkspaceSnapshot: Effect.fn(
+          "ProviderRegistry.ProviderRegistry.refreshWorkspaceSnapshot",
+        )(() => Effect.succeed([])),
+        getProviderMaintenanceCapabilitiesForInstance: Effect.fn(
+          "ProviderRegistry.ProviderRegistry.getProviderMaintenanceCapabilitiesForInstance",
+        )(() => Effect.die(new UpgradeValidationDenied({ operation: "provider maintenance" }))),
+        setProviderMaintenanceActionState: Effect.fn(
+          "ProviderRegistry.ProviderRegistry.setProviderMaintenanceActionState",
+        )(() => Effect.succeed([])),
         streamChanges: Stream.empty,
       }),
     ),
@@ -207,7 +226,9 @@ function makeUpgradeValidationRuntime(
       Effect.gen(function* () {
         const changes = yield* PubSub.unbounded<void>();
         return ProviderInstanceRegistry.ProviderInstanceRegistry.of({
-          getInstance: () => Effect.succeed(undefined),
+          getInstance: Effect.fn("ProviderInstanceRegistry.ProviderInstanceRegistry.getInstance")(
+            () => Effect.as(Effect.void, undefined),
+          ),
           listInstances: Effect.succeed([]),
           listUnavailable: Effect.succeed([]),
           streamChanges: Stream.empty,
@@ -218,7 +239,7 @@ function makeUpgradeValidationRuntime(
     Layer.succeed(
       UpgradeValidationEffects,
       UpgradeValidationEffects.of({
-        readFile: (id, relativePath) =>
+        readFile: Effect.fn("UpgradeValidationEffects.readFile")((id, relativePath) =>
           Effect.try({
             try: () => {
               if (NodePath.isAbsolute(relativePath))
@@ -231,6 +252,7 @@ function makeUpgradeValidationRuntime(
             },
             catch: () => new UpgradeValidationDenied({ operation: "filesystem read" }),
           }),
+        ),
       }),
     ),
   );

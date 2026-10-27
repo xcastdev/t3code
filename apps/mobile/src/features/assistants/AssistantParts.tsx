@@ -1,15 +1,14 @@
 import type { EnvironmentId, ModelSelection } from "@t3tools/contracts";
 import { useMemo, useState } from "react";
-import { Platform, View } from "react-native";
+import { View } from "react-native";
 
 import { AppText as Text, AppTextInput } from "../../components/ui/AppText";
-import { useNavigation } from "@react-navigation/native";
 
 import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
 import { ListRow } from "../../components/ui/ListRow";
 import { buildModelOptions } from "../../lib/modelOptions";
 import { useEnvironmentServerConfig } from "../../state/entities";
-import { useAndroidWorkspaceSelection } from "../workspace/useAndroidWorkspaceSelection";
+import { useSelectWorkspaceDetail } from "../workspace/useSelectWorkspaceDetail";
 import type { AssistantTone } from "@t3tools/client-runtime/assistant-presentation";
 
 export const TONE_PREFIX: Record<AssistantTone, string> = {
@@ -111,10 +110,7 @@ export function AgentInput(props: {
 }
 
 export function useOpenAgentChat() {
-  const navigation = useNavigation();
-  const selectAndroidWorkspace = useAndroidWorkspaceSelection();
-  return (destination: { readonly environmentId: string; readonly threadId: string }) => {
-    if (Platform.OS === "android") selectAndroidWorkspace({ name: "Thread", params: destination });
-    else navigation.navigate("Thread", destination);
-  };
+  const selectDetail = useSelectWorkspaceDetail();
+  return (destination: { readonly environmentId: string; readonly threadId: string }) =>
+    selectDetail({ name: "Thread", params: destination });
 }

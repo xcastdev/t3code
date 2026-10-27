@@ -894,7 +894,7 @@ const makeProjectWorkQuery = Effect.gen(function* () {
       const result: BriefingKnowledge = { records };
       return result;
     },
-    Effect.catch(() => Effect.succeed(omittedBriefingKnowledge("knowledge-unavailable"))),
+    Effect.orElseSucceed(() => omittedBriefingKnowledge("knowledge-unavailable")),
   );
 
   const briefingSnapshot: ProjectWorkQueryShape["briefingSnapshot"] = (projectId, maxKnowledge) =>

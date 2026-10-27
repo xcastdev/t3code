@@ -181,7 +181,7 @@ const make = Effect.gen(function* () {
     const confirmation =
       merged._tag === "Success"
         ? merged.success
-        : yield* host.reconcileMerge(operation).pipe(Effect.catch(() => Effect.succeed(undefined)));
+        : yield* host.reconcileMerge(operation).pipe(Effect.orElseSucceed(() => undefined));
     const next: Journal.DeliveryOperation = {
       ...operation,
       stage: confirmation && mergeMatches(operation, confirmation) ? "confirmed" : "uncertain",

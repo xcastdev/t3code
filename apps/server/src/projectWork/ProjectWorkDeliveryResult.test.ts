@@ -5,11 +5,11 @@ import { publicDeliveryResult } from "./ProjectWorkDeliveryGateway.ts";
 import { publicationHash } from "./ProjectWorkPublicationJournal.ts";
 import { operation, confirmation } from "./ProjectWorkPublication.testkit.ts";
 
+const decodeDeliveryResult = Schema.decodeSync(ProjectWorkDeliveryResult);
+
 it("exposes only the opaque retained confirmed merge receipt required for acceptance", () => {
   const retained = { ...operation("merge", "confirmed"), merge: confirmation };
-  const result = Schema.decodeUnknownSync(ProjectWorkDeliveryResult)(
-    publicDeliveryResult(retained),
-  );
+  const result = decodeDeliveryResult(publicDeliveryResult(retained));
   expect(result.receiptHash).toBe(publicationHash(retained));
   expect(JSON.stringify(result)).not.toMatch(
     /fingerprint|owned\/workspace|principal|authorizationRecordIds/,

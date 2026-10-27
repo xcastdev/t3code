@@ -83,11 +83,7 @@ function useScrollInsets() {
 function useOpenSettingsScreen() {
   const navigation = useNavigation();
   return (screen: string, params: Record<string, string>) =>
-    // Settings screens share one nested stack; this mirrors the Work links.
-    (navigation.navigate as (name: string, params: object) => void)("SettingsSheet", {
-      screen: "SettingsContent",
-      params: { screen, params },
-    });
+    (navigation.navigate as (name: string, params: object) => void)(screen, params);
 }
 
 const targetParams = (target: MobileResourceTarget): Record<string, string> => ({
@@ -1232,6 +1228,7 @@ export function SettingsSkillEditorRouteScreen({ route }: SkillEditorProps) {
 /** Mounted state for async work that must not land after the editor is gone. */
 function useMountedRef() {
   const mounted = useRef(true);
+  // oxlint-disable-next-line t3code/react-effect-budget -- Async editor requests must stop committing after unmount.
   useEffect(() => {
     mounted.current = true;
     return () => {

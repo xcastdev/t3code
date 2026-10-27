@@ -740,11 +740,8 @@ export const persistProjectWorkState = Effect.fn("ProjectWorkProjection.persistP
     for (const attention of state.attention)
       yield* sql`INSERT INTO t3_workflow_v2_work_attention (project_id, task_id, reason, detail, seen_at, resolved_at, revision) VALUES (${projectId}, ${attention.taskId}, ${attention.reason}, ${attention.detail ?? null}, ${attention.seenAt ?? null}, ${attention.resolvedAt ?? null}, ${attention.revision})`;
 
-    // FTS is a derived read model. Rebuild just this project while the
-    // normalized projection is being replaced so a committed command and a
-    // projection rebuild expose the same searchable snapshot. Provenance is
-    // JSON rather than a flattened string because clients need the source and
-    // revision information alongside bounded snippets.
+    // Replace FTS with the project projection so command and rebuild snapshots agree.
+    // Keep provenance as JSON for source and revision metadata alongside snippets.
     if (previous === undefined)
       yield* sql`DELETE FROM t3_workflow_v2_work_search_fts WHERE project_id = ${projectId}`;
     yield* sql`

@@ -149,6 +149,7 @@ it.effect(
           },
         });
         const session: RpcSession = {
+          inboundFrames: Effect.succeed(0),
           client: {
             [WS_METHODS.threadHistoryRecover]: (input: { threadId: ThreadId; archiveId: string }) =>
               Effect.suspend(() => {

@@ -270,11 +270,7 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
         const otherOverrideId = credentialId(otherOverride.transport);
         const retiredBaseId = credentialId(first.transport);
         const secretFiles = yield* ServerSecretStore.ServerSecretStore;
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            yield* secrets.acquireLease(serverA, [retiredBaseId]);
-          }),
-        );
+        yield* Effect.scoped(secrets.acquireLease(serverA, [retiredBaseId]));
         // Closing a lease before reconciliation must not erase a retired
         // version that another durable catalog reference may still use.
         assert.isTrue(

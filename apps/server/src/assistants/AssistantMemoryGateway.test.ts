@@ -8,7 +8,6 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import { AuthSessionRepository } from "../persistence/AuthSessions.ts";
 import { AssistantMemoryGateway, layer } from "./AssistantMemoryGateway.ts";
 import * as Activity from "./AssistantMemoryActivity.ts";
@@ -25,29 +24,27 @@ const gatewayFixture = layer.pipe(
   Layer.provide(
     Layer.mock(AuthSessionRepository)({
       getById: ({ sessionId }) =>
-        Effect.succeed(
-          Option.some({
-            sessionId,
-            subject: "human",
-            scopes:
-              sessionId === "operator"
-                ? [AuthOrchestrationReadScope, AuthOrchestrationOperateScope]
-                : [AuthOrchestrationReadScope],
-            method: "browser-session-cookie",
-            client: {
-              label: null,
-              ipAddress: null,
-              userAgent: null,
-              deviceType: "unknown",
-              os: null,
-              browser: null,
-            },
-            issuedAt: DateTime.makeUnsafe("1970-01-01T00:00:00.000Z"),
-            expiresAt: DateTime.makeUnsafe("2100-01-01T00:00:00.000Z"),
-            lastConnectedAt: null,
-            revokedAt: null,
-          }),
-        ),
+        Effect.succeedSome({
+          sessionId,
+          subject: "human",
+          scopes:
+            sessionId === "operator"
+              ? [AuthOrchestrationReadScope, AuthOrchestrationOperateScope]
+              : [AuthOrchestrationReadScope],
+          method: "browser-session-cookie",
+          client: {
+            label: null,
+            ipAddress: null,
+            userAgent: null,
+            deviceType: "unknown",
+            os: null,
+            browser: null,
+          },
+          issuedAt: DateTime.makeUnsafe("1970-01-01T00:00:00.000Z"),
+          expiresAt: DateTime.makeUnsafe("2100-01-01T00:00:00.000Z"),
+          lastConnectedAt: null,
+          revokedAt: null,
+        }),
     }),
   ),
 );

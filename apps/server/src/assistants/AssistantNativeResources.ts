@@ -53,7 +53,7 @@ const make = Effect.gen(function* () {
         );
         return snapshot.toolIds.filter((id) => current.has(id));
       },
-      Effect.catch(() => Effect.succeed([])),
+      Effect.orElseSucceed(() => []),
     ),
   });
 });

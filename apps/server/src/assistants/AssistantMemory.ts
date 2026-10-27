@@ -153,7 +153,7 @@ export const makeAssistantMemorySourceAuthority = Effect.gen(function* () {
       (input: MemorySourceTuple & { source: ProjectMemorySource }) =>
         authorizeCapture(input).pipe(
           Effect.as(true),
-          Effect.catch(() => Effect.succeed(false)),
+          Effect.orElseSucceed(() => false),
         ),
     ),
   };
@@ -375,10 +375,12 @@ const make = Effect.gen(function* () {
     const page = yield* sources.discover({ ...(after === undefined ? {} : { after }), limit: 32 });
     for (const evidence of page.items.slice(0, 32))
       yield* capture(evidence).pipe(
-        Effect.catch((error) =>
-          error.reason === "forbidden" || error.reason === "stale" || error.reason === "forgotten"
-            ? Effect.void
-            : Effect.fail(error),
+        Effect.catchIf(
+          (error) =>
+            error.reason === "forbidden" ||
+            error.reason === "stale" ||
+            error.reason === "forgotten",
+          () => Effect.void,
         ),
       );
     return page.nextCursor;

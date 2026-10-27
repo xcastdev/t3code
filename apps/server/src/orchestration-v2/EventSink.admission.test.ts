@@ -162,12 +162,10 @@ it.effect(
               Effect.gen(function* () {
                 yield* sql`INSERT INTO admission_probe (thread_id) VALUES (${input.threadId})`;
                 if (yield* Ref.get(fail))
-                  return yield* Effect.fail(
-                    new RunAdmission.RunAdmissionError({
-                      operation: "injected-crash",
-                      cause: "crash after binding",
-                    }),
-                  );
+                  return yield* new RunAdmission.RunAdmissionError({
+                    operation: "injected-crash",
+                    cause: "crash after binding",
+                  });
                 return { _tag: "ordinary" as const };
               }).pipe(
                 Effect.mapError((cause) =>

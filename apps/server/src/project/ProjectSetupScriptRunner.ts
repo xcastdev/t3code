@@ -33,9 +33,7 @@ export interface ProjectSetupScriptRunnerResultStarted {
   readonly terminalId: string;
   readonly cwd: string;
   readonly async: boolean;
-  /**
-   * The exit code is null when the terminal exited or was closed before the sentinel arrived.
-   */
+  /** Null exit code means the terminal exited or closed before the sentinel. */
   readonly completion?: Effect.Effect<ProjectSetupScriptCompletion>;
 }
 
@@ -81,7 +79,7 @@ export class ProjectSetupScriptOperationError extends Schema.TaggedError<Project
     projectId: Schema.optional(Schema.String),
     projectCwd: Schema.optional(Schema.String),
     worktreePath: Schema.String,
-    operation: Schema.Literals(["resolveProject", "readSettings", "openTerminal", "writeCommand"]),
+    operation: Schema.Literals(["resolveProject", "readSettings", "openTerminal"]),
     cause: Schema.Defect(),
   },
 ) {
@@ -119,11 +117,8 @@ export class ProjectSetupScriptRunner extends Context.Service<
   }
 >()("t3/project/ProjectSetupScriptRunner") {}
 
-/** @public Service construction is part of the canonical Effect module API. */
-/**
- * Each run gets its own random token so script output cannot spoof completion, and the sentinel
- * pattern is built per run from it.
- */
+/** @public */
+// Random per-run tokens prevent script output from spoofing completion.
 const COMPLETION_SENTINEL_PREFIX = "__T3_SETUP_DONE__";
 const OUTPUT_LINE_MAX_LENGTH = 400;
 const PARTIAL_LINE_MAX_LENGTH = 4_096;
@@ -137,16 +132,24 @@ function completionSentinelPattern(token: string): RegExp {
 }
 
 function stripTerminalControl(text: string): string {
-  return (
-    text
-      .replace(
-        // eslint-disable-next-line no-control-regex -- ANSI escape sequences start with ESC.
-        /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]/g,
-        "",
-      )
-      // eslint-disable-next-line no-control-regex -- removing control characters is the point.
-      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
-  );
+  return text
+    .replace(
+      /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>]/g,
+      "",
+    )
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+}
+
+// Line editors (zsh, fish, bash 5.1+) enable bracketed paste when they start reading a command.
+const BRACKETED_PASTE_ON = "\x1b[?2004h";
+const BRACKETED_PASTE_OFF = "\x1b[?2004l";
+// Longer than one subprocess poll plus its ps timeout, so a startup prompt is seen as busy first.
+const SHELL_QUIET_FALLBACK = "3 seconds";
+
+function lineEditorReading(text: string, previous: boolean): boolean {
+  const on = text.lastIndexOf(BRACKETED_PASTE_ON);
+  const off = text.lastIndexOf(BRACKETED_PASTE_OFF);
+  return on === off ? previous : on > off;
 }
 
 type CompletionShell = "posix" | "fish" | "powershell";
@@ -163,12 +166,7 @@ function resolveCompletionShell(
   return "posix";
 }
 
-/**
- * The command runs inside a block and the block closes on its own line, so a trailing `# comment`
- * or a heredoc terminator in the command cannot swallow the sentinel. The shell reads the whole
- * block before running any of it, so a script that reads stdin cannot consume the sentinel line
- * either.
- */
+// A block with its own closing line protects the sentinel from trailing comments, heredocs and scripts reading stdin.
 function wrapCommandForCompletion(
   command: string,
   shell: CompletionShell,
@@ -185,12 +183,13 @@ function wrapCommandForCompletion(
   }
 }
 
-/** @public Service construction is part of the canonical Effect module API. */
+/** @public */
 export const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const terminalManager = yield* TerminalManager.TerminalManager;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const crypto = yield* Crypto.Crypto;
+  const serviceScope = yield* Effect.scope;
   const completionShell = resolveCompletionShell(
     yield* HostProcess.Platform,
     yield* HostProcess.Environment,
@@ -208,12 +207,12 @@ export const make = Effect.gen(function* () {
     }) {
       const startedAtMs = yield* Clock.currentTimeMillis;
       const done = yield* Deferred.make<ProjectSetupScriptCompletion>();
-      // The shell redraws its prompt just after the sentinel. Closing before
-      // that would read the redraw as new activity and keep an idle shell.
+      // Wait for the prompt redraw; closing earlier mistakes it for activity and preserves an idle shell.
       const promptReturned = yield* Deferred.make<void>();
       let lineBuffer = "";
       let settled = false;
       let invalidated = false;
+      let allocated = false;
 
       const settle = (exitCode: number | null) =>
         Effect.suspend(() => {
@@ -252,8 +251,7 @@ export const make = Effect.gen(function* () {
         }
         if (invalidated) return Effect.void;
         if (
-          event.type === "started" ||
-          event.type === "restarted" ||
+          (allocated && (event.type === "started" || event.type === "restarted")) ||
           event.type === "exited" ||
           event.type === "closed"
         ) {
@@ -262,13 +260,10 @@ export const make = Effect.gen(function* () {
         }
         if (event.type === "output") {
           lineBuffer += event.data;
-          // A bare carriage return is how installers redraw a progress line in
-          // place; each redraw becomes a short line of its own instead of being
-          // glued into one long one.
+          // Bare CR redraws progress in place; split redraws instead of growing one line.
           const lines = lineBuffer.split(/\r\n|\r|\n/);
           lineBuffer = lines.pop() ?? "";
-          // A script that never prints a newline must not grow this forever.
-          // The sentinel is always on its own line, so keeping the tail is safe.
+          // Bound newline-free output; the sentinel has its own line, so retaining the tail is safe.
           if (lineBuffer.length > PARTIAL_LINE_MAX_LENGTH) {
             lineBuffer = lineBuffer.slice(-PARTIAL_LINE_MAX_LENGTH);
           }
@@ -290,7 +285,75 @@ export const make = Effect.gen(function* () {
         Effect.tap(() => Deferred.await(promptReturned).pipe(Effect.timeoutOption("1 second"))),
         Effect.ensuring(Effect.sync(() => unsubscribe())),
       );
-      return { completion, unsubscribe };
+      // A startup prompt waits for input on a line that has no newline yet.
+      const flushPartialLine = Effect.suspend(() => {
+        const partial = lineBuffer;
+        lineBuffer = "";
+        return handleLine(partial);
+      });
+      const abandon = settle(null).pipe(
+        Effect.andThen(Deferred.succeed(promptReturned, undefined)),
+      );
+      return {
+        completion,
+        unsubscribe,
+        flushPartialLine,
+        abandon,
+        activate: () => {
+          allocated = true;
+        },
+      };
+    },
+  );
+
+  // Input typed during shell startup can be read by an rc-file prompt (fnm, nvm) instead of the
+  // shell, which loses the command. Subscribe before the terminal opens so no activity is missed.
+  const watchShellReadiness = Effect.fn("ProjectSetupScriptRunner.watchShellReadiness")(
+    function* (input: {
+      readonly threadId: string;
+      readonly terminalId: string;
+      readonly onStartupPrompt: Effect.Effect<void>;
+    }) {
+      const outcome = yield* Deferred.make<"ready" | "exited">();
+      let reading = false;
+      let carry = "";
+      let busy = false;
+      let activity = 0;
+      const unsubscribe = yield* terminalManager.subscribe((event) => {
+        if (event.threadId !== input.threadId || event.terminalId !== input.terminalId) {
+          return Effect.void;
+        }
+        activity += 1;
+        // A new shell process starts idle; the manager resets its subprocess state without an event.
+        if (event.type === "started" || event.type === "restarted") {
+          busy = false;
+          reading = false;
+          carry = "";
+        }
+        if (event.type === "activity") busy = event.hasRunningSubprocess;
+        if (event.type === "output") {
+          const text = carry + event.data;
+          carry = text.slice(-(BRACKETED_PASTE_ON.length - 1));
+          reading = lineEditorReading(text, reading);
+        }
+        if (event.type === "exited" || event.type === "closed") {
+          return Deferred.succeed(outcome, "exited").pipe(Effect.asVoid);
+        }
+        return reading ? Deferred.succeed(outcome, "ready").pipe(Effect.asVoid) : Effect.void;
+      });
+      // A startup prompt runs as a child process, so a busy shell keeps waiting for the user.
+      const quiet = Effect.gen(function* () {
+        while (true) {
+          const seen = activity;
+          yield* Effect.sleep(SHELL_QUIET_FALLBACK);
+          if (activity !== seen) continue;
+          if (!busy) return "ready" as const;
+          yield* input.onStartupPrompt;
+        }
+      });
+      // Restored history can hold a previous shell's line editor state, so only live output counts.
+      const wait = Deferred.await(outcome).pipe(Effect.raceFirst(quiet));
+      return { wait, unsubscribe };
     },
   );
 
@@ -360,8 +423,7 @@ export const make = Effect.gen(function* () {
       } as const;
     }
 
-    // A thread settles again after it is resumed, and an earlier settle shell
-    // may still be busy; typing into it would feed its foreground program.
+    // Earlier settle shells may still run foreground programs; do not type resumed settles into them.
     const terminalId =
       input.preferredTerminalId ??
       (trigger === "settle"
@@ -373,8 +435,7 @@ export const make = Effect.gen(function* () {
         project: { cwd: project.workspaceRoot },
         worktreePath: input.worktreePath,
       }),
-      // Setup can run before a client attaches. Truecolor probes in tools such
-      // as Vite+ wait for terminal replies that nobody can send at that point.
+      // Before client attachment, truecolor probes wait for terminal replies nobody can send.
       COLORTERM: "",
     };
     const observe = input.observeCompletion;
@@ -390,35 +451,7 @@ export const make = Effect.gen(function* () {
           )
         : script.command;
 
-    // Capture under the terminal's open lock; masking preserves the handoff if cancellation races spawn.
-    const allocation = yield* Effect.gen(function* () {
-      const terminalInput = {
-        threadId: input.threadId,
-        terminalId,
-        cwd,
-        worktreePath: input.worktreePath,
-        env: { ...env, NO_COLOR: "1", FORCE_COLOR: "0" },
-      };
-      const allocation = yield* Effect.gen(function* () {
-        if (input.onTerminalAllocated)
-          return (yield* terminalManager.openCaptured(terminalInput)).capture;
-        yield* terminalManager.open(terminalInput);
-        return undefined;
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProjectSetupScriptOperationError({
-              ...errorContext,
-              operation: "openTerminal",
-              cause,
-            }),
-        ),
-      );
-      if (input.onTerminalAllocated && allocation !== undefined)
-        yield* input.onTerminalAllocated(terminalId, allocation);
-      return allocation;
-    }).pipe(Effect.uninterruptible);
-    // Subscribe before writing so the sentinel cannot race past the listener.
+    // Subscribe before opening so neither startup activity nor the sentinel can race the listeners.
     const observed =
       observe && completionToken
         ? yield* observeTerminalCompletion({
@@ -430,26 +463,80 @@ export const make = Effect.gen(function* () {
             onOutputLine: observe.onOutputLine,
           })
         : undefined;
+    // PowerShell has no line-editor signal; keep its immediate write.
+    const readiness =
+      completionShell === "powershell"
+        ? undefined
+        : yield* watchShellReadiness({
+            threadId: input.threadId,
+            terminalId,
+            onStartupPrompt: observed?.flushPartialLine ?? Effect.void,
+          });
 
-    yield* Effect.gen(function* () {
-      const writeInput = {
-        threadId: input.threadId,
-        terminalId,
-        data: projectScriptTerminalInput(commandLine),
-      };
-      if (allocation !== undefined)
-        yield* terminalManager.writeCaptured({ ...writeInput, capture: allocation });
-      else yield* terminalManager.write(writeInput);
+    const terminalInput = {
+      threadId: input.threadId,
+      terminalId,
+      cwd,
+      worktreePath: input.worktreePath,
+      env: { ...env, NO_COLOR: "1", FORCE_COLOR: "0" },
+    };
+    // Mask only the captured allocation handoff, so cancellation cannot lose its drain handle.
+    const allocation = yield* Effect.gen(function* () {
+      const onTerminalAllocated = input.onTerminalAllocated;
+      if (onTerminalAllocated === undefined) {
+        yield* terminalManager.open(terminalInput);
+        return undefined;
+      }
+      return yield* Effect.gen(function* () {
+        const { capture } = yield* terminalManager.openCaptured(terminalInput);
+        yield* onTerminalAllocated(terminalId, capture);
+        return capture;
+      }).pipe(Effect.uninterruptible);
     }).pipe(
       Effect.mapError(
         (cause) =>
           new ProjectSetupScriptOperationError({
             ...errorContext,
-            operation: "writeCommand",
+            operation: "openTerminal",
             cause,
           }),
       ),
-      Effect.onError(() => Effect.sync(() => observed?.unsubscribe())),
+      Effect.onError(() =>
+        Effect.sync(() => {
+          observed?.unsubscribe();
+          readiness?.unsubscribe();
+        }),
+      ),
+    );
+    observed?.activate();
+
+    // Return once the terminal exists so callers can show it while a startup prompt waits.
+    yield* (readiness?.wait ?? Effect.succeed("ready" as const)).pipe(
+      Effect.flatMap((shell) =>
+        shell === "exited"
+          ? Effect.void
+          : allocation === undefined
+            ? terminalManager.write({
+                threadId: input.threadId,
+                terminalId,
+                data: projectScriptTerminalInput(commandLine),
+              })
+            : terminalManager.writeCaptured({
+                threadId: input.threadId,
+                terminalId,
+                data: projectScriptTerminalInput(commandLine),
+                capture: allocation,
+              }),
+      ),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("project script command was not written", {
+          ...errorContext,
+          terminalId,
+          cause,
+        }).pipe(Effect.andThen(observed?.abandon ?? Effect.void)),
+      ),
+      Effect.ensuring(Effect.sync(() => readiness?.unsubscribe())),
+      Effect.forkIn(serviceScope),
     );
 
     const completion = observed?.completion.pipe(

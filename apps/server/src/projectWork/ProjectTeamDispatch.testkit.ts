@@ -112,7 +112,7 @@ export function makeHarness(options: HarnessOptions) {
     }),
     Layer.mock(ProjectService.ProjectService)({
       getById: (id) => Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
-      getByWorkspaceRoot: () => Effect.succeed(Option.some(project)),
+      getByWorkspaceRoot: () => Effect.succeedSome(project),
     }),
     Layer.mock(GitWorkflow.GitWorkflowService)({
       createWorktree,
@@ -138,7 +138,7 @@ export function makeHarness(options: HarnessOptions) {
     Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
       namedProjectsRoot: "/projects",
       isScratchProject: () => Effect.succeed(false),
-      folderForThread: () => Effect.succeed(Option.none()),
+      folderForThread: () => Effect.succeedNone,
     }),
   );
   const layerLaunch = ThreadLaunch.layer.pipe(

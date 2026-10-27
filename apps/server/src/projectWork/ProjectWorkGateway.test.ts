@@ -15,10 +15,10 @@ const decodeRead = Schema.decodeUnknownSync(
 const decodeWrite = Schema.decodeUnknownSync(
   ProjectWorkToolkit.tools.t3_project_work_write.parametersSchema,
 );
-const decodeRevoke = Schema.decodeUnknownSync(ProjectWorkCriterionRevokeWaiverCommand);
-const decodeRefinement = Schema.decodeUnknownSync(ProjectWorkIssueRefineCommand);
-const decodeProposal = Schema.decodeUnknownSync(ProjectWorkDecisionProposeCommand);
-const execution = Schema.decodeUnknownSync(ProjectWorkTaskCompleteCommand)({
+const decodeRevoke = Schema.decodeSync(ProjectWorkCriterionRevokeWaiverCommand);
+const decodeRefinement = Schema.decodeSync(ProjectWorkIssueRefineCommand);
+const decodeProposal = Schema.decodeSync(ProjectWorkDecisionProposeCommand);
+const execution = Schema.decodeSync(ProjectWorkTaskCompleteCommand)({
   type: "project-work.task.complete",
   commandId: "complete",
   projectId: "project",

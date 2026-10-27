@@ -1,3 +1,4 @@
+import { SourceControlProviderKind } from "@t3tools/contracts";
 import * as TestClock from "effect/testing/TestClock";
 import * as WorkRepository from "./ProjectWorkRepository.ts";
 import * as GitHubIssueApi from "@t3tools/source-control-github/server/GitHubIssueApi";
@@ -322,7 +323,7 @@ it.effect(
         Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
           resolve: () =>
             Effect.succeed({
-              provider: "github",
+              provider: SourceControlProviderKind.make("github"),
               canonicalKey: "github.com/owner/repo",
               displayName: "owner/repo",
               locator: {

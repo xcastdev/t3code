@@ -135,9 +135,7 @@ const make = Effect.gen(function* () {
     const outcome =
       created._tag === "Success"
         ? created.success
-        : yield* host
-            .reconcilePublication(operation)
-            .pipe(Effect.catch(() => Effect.succeed(undefined)));
+        : yield* host.reconcilePublication(operation).pipe(Effect.orElseSucceed(() => undefined));
     const next: Journal.DeliveryOperation = {
       ...operation,
       stage: outcome && publicationMatches(operation, outcome) ? "confirmed" : "uncertain",

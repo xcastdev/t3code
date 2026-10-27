@@ -311,7 +311,7 @@ export const makeWith = Effect.fn("ManagedSkillRepository.make")(function* (
       Effect.catchTags({
         ManagedSkillNodeError: (error) =>
           (error.cause as NodeJS.ErrnoException).code === "ENOENT"
-            ? Effect.succeed(undefined)
+            ? Effect.void
             : Effect.fail(
                 repositoryError(`Could not inspect managed skill path '${filePath}'.`, error.cause),
               ),
@@ -570,18 +570,16 @@ export const makeWith = Effect.fn("ManagedSkillRepository.make")(function* (
         expectedKey: directoryName,
         expectedScope,
       }).pipe(
-        Effect.catch(() =>
-          Effect.succeed({
-            validity: "invalid" as const,
-            diagnostics: [
-              {
-                code: "filesystem_read_failure",
-                message: `Could not inspect managed skill entry '${directoryName}'.`,
-                path: currentPath,
-              },
-            ],
-          }),
-        ),
+        Effect.orElseSucceed(() => ({
+          validity: "invalid" as const,
+          diagnostics: [
+            {
+              code: "filesystem_read_failure",
+              message: `Could not inspect managed skill entry '${directoryName}'.`,
+              path: currentPath,
+            },
+          ],
+        })),
       );
       inspected.push({ packagePath: currentPath, directoryName, ...inspection });
     }
@@ -1941,19 +1939,39 @@ export const makeWith = Effect.fn("ManagedSkillRepository.make")(function* (
     subscribeInvalidations: PubSub.subscribe(invalidations),
     listGlobal,
     readGlobal,
-    createGlobal: (input) => invalidateGlobal(createGlobal(input)),
-    importGlobal: (input) => invalidateGlobal(importGlobal(input)),
-    updateGlobal: (input) => invalidateGlobal(updateGlobal(input)),
-    deleteGlobal: (input) => invalidateGlobal(deleteGlobal(input)),
-    renameGlobal: (input) => invalidateGlobal(renameGlobal(input)),
-    rollbackGlobal: (input) => invalidateGlobal(rollbackGlobal(input)),
+    createGlobal: Effect.fn("ManagedSkillRepository.createGlobal")((input) =>
+      invalidateGlobal(createGlobal(input)),
+    ),
+    importGlobal: Effect.fn("ManagedSkillRepository.importGlobal")((input) =>
+      invalidateGlobal(importGlobal(input)),
+    ),
+    updateGlobal: Effect.fn("ManagedSkillRepository.updateGlobal")((input) =>
+      invalidateGlobal(updateGlobal(input)),
+    ),
+    deleteGlobal: Effect.fn("ManagedSkillRepository.deleteGlobal")((input) =>
+      invalidateGlobal(deleteGlobal(input)),
+    ),
+    renameGlobal: Effect.fn("ManagedSkillRepository.renameGlobal")((input) =>
+      invalidateGlobal(renameGlobal(input)),
+    ),
+    rollbackGlobal: Effect.fn("ManagedSkillRepository.rollbackGlobal")((input) =>
+      invalidateGlobal(rollbackGlobal(input)),
+    ),
     listGlobalHistory,
     listProject,
     readProject,
-    setProjectOverride: (input) => invalidateProject(input.projectRoot, setProjectOverride(input)),
-    setProjectDisabled: (input) => invalidateProject(input.projectRoot, setProjectDisabled(input)),
-    deleteProjectState: (input) => invalidateProject(input.projectRoot, deleteProjectState(input)),
-    renameProject: (input) => invalidateProject(input.projectRoot, renameProject(input)),
+    setProjectOverride: Effect.fn("ManagedSkillRepository.setProjectOverride")((input) =>
+      invalidateProject(input.projectRoot, setProjectOverride(input)),
+    ),
+    setProjectDisabled: Effect.fn("ManagedSkillRepository.setProjectDisabled")((input) =>
+      invalidateProject(input.projectRoot, setProjectDisabled(input)),
+    ),
+    deleteProjectState: Effect.fn("ManagedSkillRepository.deleteProjectState")((input) =>
+      invalidateProject(input.projectRoot, deleteProjectState(input)),
+    ),
+    renameProject: Effect.fn("ManagedSkillRepository.renameProject")((input) =>
+      invalidateProject(input.projectRoot, renameProject(input)),
+    ),
   });
 });
 

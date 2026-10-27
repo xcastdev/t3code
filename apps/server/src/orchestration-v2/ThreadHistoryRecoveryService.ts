@@ -379,7 +379,7 @@ const make = Effect.gen(function* () {
                   cwd: ref.cwd,
                   checkpointRef: CheckpointRef.make(ref.retained_ref),
                 });
-              }).pipe(Effect.catch(() => Effect.succeed(false)));
+              }).pipe(Effect.orElseSucceed(() => false));
               if (available) retainedCheckpointIds.push(CheckpointId.make(ref.checkpoint_id));
             }
             const run = yield* archivedSourceRun(input);
@@ -392,7 +392,7 @@ const make = Effect.gen(function* () {
               restoreFiles: executing.length === 0 && retainedCheckpointIds.length > 0,
               retainedCheckpointIds,
             };
-          }).pipe(Effect.catch(() => Effect.succeed(unavailable)));
+          }).pipe(Effect.orElseSucceed(() => unavailable));
         }),
       ),
     ),

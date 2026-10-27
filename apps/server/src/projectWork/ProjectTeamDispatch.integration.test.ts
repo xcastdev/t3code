@@ -709,6 +709,9 @@ it.effect(
         const preparationChanged = yield* Stream.toPull(
           launches.preparationChanges.pipe(
             Stream.filter((threadId) => threadId === binding.threadId),
+            Stream.filterEffect(() =>
+              launches.preparationActive(binding.threadId).pipe(Effect.map((active) => !active)),
+            ),
           ),
         );
         const preparationFinished = yield* preparationChanged.pipe(
@@ -1014,6 +1017,7 @@ it.effect(
             }),
           ),
           Effect.provide(runnerServices),
+          Effect.scoped,
         ),
     });
     const runtime = Runtime.executionLayer.pipe(

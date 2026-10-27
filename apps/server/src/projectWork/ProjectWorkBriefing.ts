@@ -127,7 +127,7 @@ const taskLine = (
     (entry) => String(entry.taskId) === taskId && entry.resolvedAt === undefined,
   );
   let line = `- [${task.state}] ${oneLine(task.title)}`;
-  if (task.summary) line += ` — ${oneLine(task.summary)}`;
+  if (task.summary) line += `: ${oneLine(task.summary)}`;
   if (snapshot.constraintsOmittedReason !== undefined) return `${line}; constraints incomplete`;
   if (attention) line += ` (attention: ${attention.reason})`;
   if (kind !== "compact" && unresolvedCriteria > 0)
@@ -140,12 +140,12 @@ const taskLine = (
 const knowledgeLine = (knowledge: ProjectWorkKnowledge, kind: ProjectWorkBriefingKind): string => {
   const body = oneLine(knowledge.body);
   if (kind === "detailed")
-    return `- ${oneLine(knowledge.title)} — ${body} (source: ${knowledge.sourceKind}/${knowledge.sourceId})`;
-  return `- ${oneLine(knowledge.title)} — ${body}`;
+    return `- ${oneLine(knowledge.title)}: ${body} (source: ${knowledge.sourceKind}/${knowledge.sourceId})`;
+  return `- ${oneLine(knowledge.title)}: ${body}`;
 };
 
 const decisionLine = (decision: ProjectWorkDecision): string => {
-  let line = `- [${oneLine(String(decision.decisionId))}; revision ${decision.revision}] ${oneLine(decision.title)} — ${oneLine(decision.body)}`;
+  let line = `- [${oneLine(String(decision.decisionId))}; revision ${decision.revision}] ${oneLine(decision.title)}: ${oneLine(decision.body)}`;
   const transition = decision.stateTransitionAttribution;
   if (transition) {
     const actor = `${transition.actor.kind}${transition.actor.id ? `/${oneLine(transition.actor.id)}` : ""}${transition.actor.displayName ? ` (${oneLine(transition.actor.displayName)})` : ""}`;

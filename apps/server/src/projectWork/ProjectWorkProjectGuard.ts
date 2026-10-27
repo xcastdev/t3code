@@ -25,11 +25,9 @@ export const makeProjectWorkProjectGuard = Effect.gen(function* () {
       .get(ProjectId.make(projectId))
       .pipe(Effect.mapError(toPersistenceSqlError("ProjectWork.assertProjectActive")));
     if (Option.isNone(project))
-      return yield* Effect.fail(
-        new PersistenceSqlError({
-          operation: "ProjectWork.assertProjectActive",
-          detail: "Project does not exist or has been deleted",
-        }),
-      );
+      return yield* new PersistenceSqlError({
+        operation: "ProjectWork.assertProjectActive",
+        detail: "Project does not exist or has been deleted",
+      });
   });
 });

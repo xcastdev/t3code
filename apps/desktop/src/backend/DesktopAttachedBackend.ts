@@ -277,22 +277,15 @@ export const make = Effect.gen(function* () {
         ),
       ),
   );
-  const decryptBearer = Effect.fn("desktop.attachedBackend.decryptBearer")(function* (
-    preference: AttachedPreference,
-  ) {
-    const bytes = yield* Effect.fromResult(Base64.decode(preference.encryptedBearerToken)).pipe(
-      Effect.mapError(
-        () => new DesktopAttachedProbeError({ cause: "Attached backend operation failed." }),
-      ),
-    );
-    return yield* safeStorage
-      .decryptString(bytes)
-      .pipe(
-        Effect.mapError(
-          () => new DesktopAttachedProbeError({ cause: "Attached backend operation failed." }),
-        ),
-      );
-  });
+  const decryptBearer = Effect.fn("desktop.attachedBackend.decryptBearer")(
+    function* (preference: AttachedPreference) {
+      const bytes = yield* Effect.fromResult(Base64.decode(preference.encryptedBearerToken));
+      return yield* safeStorage.decryptString(bytes);
+    },
+    Effect.mapError(
+      () => new DesktopAttachedProbeError({ cause: "Attached backend operation failed." }),
+    ),
+  );
   const persist = Effect.fn("desktop.attachedBackend.persist")(function* (input: {
     readonly descriptor: ExecutionEnvironmentDescriptor;
     readonly httpBaseUrl: string;

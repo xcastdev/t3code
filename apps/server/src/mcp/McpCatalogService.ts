@@ -121,7 +121,7 @@ const make = Effect.gen(function* () {
       Effect.mapError(() => fail("Invalid persisted MCP catalog.")),
     );
   const decodeJson = <S extends Schema.Top>(schema: S, value: string) =>
-    Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(value).pipe(
+    Schema.decodeEffect(Schema.fromJsonString(schema))(value).pipe(
       Effect.mapError(() => fail("Invalid persisted MCP catalog.")),
     );
   const mapSqlErrors = <A, E, R>(program: Effect.Effect<A, E, R>) =>

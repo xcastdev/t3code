@@ -9,12 +9,15 @@ import {
   ClientSettingsPatch,
   ClaudeSettings,
   DEFAULT_SERVER_SETTINGS,
+  globalIdleCompaction,
+  idleCompactionPatch,
   requiredScopesForProjectMutation,
   resolveIdleCompaction,
   resolveProjectProviderInstanceEnabled,
   resolveProviderInstanceEnabled,
   ServerSettings,
   ServerSettingsPatch,
+  withIdleCompaction,
 } from "./settings.ts";
 
 const decodeClientSettings = Schema.decodeUnknownSync(ClientSettingsSchema);
@@ -141,7 +144,7 @@ describe("resolveIdleCompaction", () => {
 
   it("lets a Claude instance override the global default", () => {
     const settings = decodeServerSettings({
-      compactIdleThreads: "off",
+      idleCompaction: "off",
       providerInstances: {
         claude_work: { driver: "claudeAgent", config: { idleCompaction: "onReturn" } },
         claude_personal: { driver: "claudeAgent" },
@@ -159,19 +162,19 @@ describe("resolveIdleCompaction", () => {
     ["false", { compactIdleThreads: false }, "onReturn"],
     ["omitted", {}, "onReturn"],
   ] as const)("decodes legacy compact-idle input %s", (_input, input, expected) => {
-    expect(decodeServerSettings(input).compactIdleThreads).toBe(expected);
+    expect(globalIdleCompaction(decodeServerSettings(input))).toBe(expected);
   });
 
   it.each(modes)("decodes and encodes the explicit global mode %s", (mode) => {
-    const settings = decodeServerSettings({ compactIdleThreads: mode });
+    const settings = decodeServerSettings({ idleCompaction: mode });
 
-    expect(settings.compactIdleThreads).toBe(mode);
-    expect(encodeServerSettings(settings).compactIdleThreads).toBe(mode);
+    expect(globalIdleCompaction(settings)).toBe(mode);
+    expect(encodeServerSettings(settings).idleCompaction).toBe(mode);
   });
 
   it.each(modes)("uses the global mode when a Claude instance inherits %s", (mode) => {
     const settings = decodeServerSettings({
-      compactIdleThreads: mode,
+      idleCompaction: mode,
       providerInstances: {
         claude_work: { driver: "claudeAgent", config: { idleCompaction: "default" } },
       },
@@ -182,7 +185,7 @@ describe("resolveIdleCompaction", () => {
 
   it.each(modes)("honors the explicit Claude instance override %s", (mode) => {
     const settings = decodeServerSettings({
-      compactIdleThreads: mode === "off" ? "onReturn" : "off",
+      idleCompaction: mode === "off" ? "onReturn" : "off",
       providerInstances: {
         claude_work: { driver: "claudeAgent", config: { idleCompaction: mode } },
       },
@@ -193,7 +196,7 @@ describe("resolveIdleCompaction", () => {
 
   it("falls back to the global mode for missing or invalid instance config", () => {
     const settings = decodeServerSettings({
-      compactIdleThreads: "beforeCacheExpires",
+      idleCompaction: "beforeCacheExpires",
       providerInstances: {
         claude_missing_config: { driver: "claudeAgent" },
         claude_invalid_config: {
@@ -215,20 +218,54 @@ describe("resolveIdleCompaction", () => {
   });
 
   it("keeps legacy booleans out of settings patches", () => {
-    for (const compactIdleThreads of [true, false]) {
-      expect(() => decodeServerSettingsPatch({ compactIdleThreads })).toThrow();
+    for (const idleCompaction of [true, false]) {
+      expect(() => decodeServerSettingsPatch({ idleCompaction })).toThrow();
     }
   });
 
   it("keeps idle-compaction codec types and requirements precise", () => {
-    expectTypeOf<ServerSettings["compactIdleThreads"]>().toEqualTypeOf<
+    expectTypeOf<NonNullable<ServerSettings["idleCompaction"]>>().toEqualTypeOf<
       "onReturn" | "beforeCacheExpires" | "off"
     >();
-    expectTypeOf<Schema.Codec.Encoded<typeof ServerSettings>["compactIdleThreads"]>().toEqualTypeOf<
-      "onReturn" | "beforeCacheExpires" | "off" | boolean | undefined
+    expectTypeOf<Schema.Codec.Encoded<typeof ServerSettings>["idleCompaction"]>().toEqualTypeOf<
+      "onReturn" | "beforeCacheExpires" | "off" | undefined
     >();
     expectTypeOf<(typeof ServerSettings)["DecodingServices"]>().toEqualTypeOf<never>();
     expectTypeOf<(typeof ServerSettings)["EncodingServices"]>().toEqualTypeOf<never>();
+  });
+
+  it("reads the mode from the legacy switch, in either form servers saved it", () => {
+    expect(globalIdleCompaction(decodeServerSettings({ compactIdleThreads: true }))).toBe(
+      "beforeCacheExpires",
+    );
+    expect(globalIdleCompaction(decodeServerSettings({ compactIdleThreads: "off" }))).toBe("off");
+    expect(globalIdleCompaction(decodeServerSettings({}))).toBe("onReturn");
+  });
+
+  it("keeps the legacy switch a boolean, as shipped clients decode it", () => {
+    const encode = Schema.encodeSync(Schema.toCodecJson(ServerSettings));
+    for (const mode of ["onReturn", "beforeCacheExpires", "off"] as const) {
+      const encoded = encode(withIdleCompaction(DEFAULT_SERVER_SETTINGS, mode)) as {
+        readonly compactIdleThreads: unknown;
+        readonly idleCompaction: unknown;
+      };
+      expect(encoded.compactIdleThreads).toBe(mode === "beforeCacheExpires");
+      expect(encoded.idleCompaction).toBe(mode);
+    }
+  });
+
+  it("patches the field the server reads", () => {
+    expect(
+      idleCompactionPatch({ compactIdleThreads: false, idleCompaction: "onReturn" }, "off"),
+    ).toEqual({
+      idleCompaction: "off",
+    });
+    expect(idleCompactionPatch({ compactIdleThreads: "onReturn" }, "off")).toEqual({
+      compactIdleThreads: "off",
+    });
+    expect(idleCompactionPatch({ compactIdleThreads: false }, "beforeCacheExpires")).toEqual({
+      compactIdleThreads: true,
+    });
   });
 });
 

@@ -90,26 +90,33 @@ class ControlledClientHttpApi extends HttpApi.make("environment").add(
 export const layerControlledFreshSecrets = Layer.sync(ServerSecretStore.ServerSecretStore, () => {
   const secrets = new Map<string, Uint8Array>();
   return ServerSecretStore.ServerSecretStore.of({
-    get: (name) => Effect.sync(() => Option.fromNullishOr(secrets.get(name))),
-    set: (name, value) =>
+    get: Effect.fn("ServerSecretStore.ServerSecretStore.get")((name) =>
+      Effect.sync(() => Option.fromNullishOr(secrets.get(name))),
+    ),
+    set: Effect.fn("ServerSecretStore.ServerSecretStore.set")((name, value) =>
       Effect.sync(() => {
         secrets.set(name, value);
       }),
-    create: (name, value) =>
+    ),
+    create: Effect.fn("ServerSecretStore.ServerSecretStore.create")((name, value) =>
       Effect.sync(() => {
         if (secrets.has(name)) throw new Error("Fixture secret already exists");
         secrets.set(name, value);
       }),
-    getOrCreateRandom: (name, bytes) =>
-      Effect.sync(() => {
-        const value = secrets.get(name) ?? NodeCrypto.randomBytes(bytes);
-        secrets.set(name, value);
-        return value;
-      }),
-    remove: (name) =>
+    ),
+    getOrCreateRandom: Effect.fn("ServerSecretStore.ServerSecretStore.getOrCreateRandom")(
+      (name, bytes) =>
+        Effect.sync(() => {
+          const value = secrets.get(name) ?? NodeCrypto.randomBytes(bytes);
+          secrets.set(name, value);
+          return value;
+        }),
+    ),
+    remove: Effect.fn("ServerSecretStore.ServerSecretStore.remove")((name) =>
       Effect.sync(() => {
         secrets.delete(name);
       }),
+    ),
   });
 });
 
@@ -176,12 +183,14 @@ export function controlledUpgradeApplicationLayer(
     Layer.succeed(ServerStartup.ServerRuntimeStartup, {
       awaitCommandReady: Effect.void,
       markHttpListening: Effect.void,
-      enqueueCommand: (effect) => effect,
+      enqueueCommand: Effect.fn("ServerStartup.ServerRuntimeStartup.enqueueCommand")(
+        <A, E>(effect: Effect.Effect<A, E>) => effect,
+      ),
     }),
     ServerLifecycleEvents.layer,
     Layer.mock(ExternalLauncher.ExternalLauncher)({
       resolveAvailableEditors: () => Effect.succeed([]),
-      resolveFileManagerRevealKind: () => Effect.succeed(undefined),
+      resolveFileManagerRevealKind: () => Effect.as(Effect.void, undefined),
     }),
     Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({ resolveTargets: () => Effect.succeed([]) }),
     Layer.mock(DirectEndpoints.DirectEndpoints)({ resolve: () => Effect.succeed([]) }),
@@ -245,7 +254,9 @@ export function controlledUpgradeApplicationLayer(
             const actual = yield* AssistantMemory;
             return AssistantMemory.of({
               ...actual,
-              process: (key) => actual.process(key).pipe(Effect.tap(() => observeMemory(key))),
+              process: Effect.fn("AssistantMemory.process")((key) =>
+                actual.process(key).pipe(Effect.tap(() => observeMemory(key))),
+              ),
             });
           }),
         ).pipe(Layer.provideMerge(worker));

@@ -446,46 +446,48 @@ export const inspectSkillPackage = Effect.fn("SkillPackage.inspect")(function* (
   if (rawManifestBytes === undefined) {
     diagnostics.push({ code: "manifest_missing", message: "t3-skill.json is missing." });
   } else {
-    try {
-      const rawManifest = new TextDecoder().decode(rawManifestBytes);
-      const unknownManifest = decodeJson(rawManifest);
-      manifest = decodeManifest(unknownManifest);
-      const rawProjectState = Predicate.isObject(unknownManifest)
-        ? unknownManifest.projectState
-        : undefined;
-      if (rawProjectState === "override" || rawProjectState === "disabled") {
-        projectState = rawProjectState;
-      }
-      if (manifest.ownership !== "t3") {
-        diagnostics.push({ code: "ownership_invalid", message: "Package is not owned by T3." });
-      }
-      if (input.expectedScope !== undefined && manifest.scope !== input.expectedScope) {
-        diagnostics.push({
-          code: "scope_invalid",
-          message: "Manifest scope does not match its root.",
-        });
-      }
-      if (manifest.scope === "global" && rawProjectState !== undefined) {
-        diagnostics.push({
-          code: "project_state_invalid",
-          message: "Global packages cannot have project state.",
-        });
-      }
-      if (manifest.scope === "project" && projectState === undefined) {
-        diagnostics.push({
-          code: "project_state_invalid",
-          message: "Project packages require project state.",
-        });
-      }
-      if (input.expectedKey !== undefined && manifest.key !== input.expectedKey) {
-        diagnostics.push({
-          code: "manifest_key_mismatch",
-          message: "Manifest key does not match its directory.",
-        });
-      }
-    } catch {
-      diagnostics.push({ code: "manifest_invalid", message: "t3-skill.json is malformed." });
-    }
+    const decoded = yield* Effect.try({
+      try: () => {
+        const rawManifest = new TextDecoder().decode(rawManifestBytes);
+        const unknownManifest = decodeJson(rawManifest);
+        manifest = decodeManifest(unknownManifest);
+        const rawProjectState = Predicate.isObject(unknownManifest)
+          ? unknownManifest.projectState
+          : undefined;
+        if (rawProjectState === "override" || rawProjectState === "disabled") {
+          projectState = rawProjectState;
+        }
+        if (manifest.ownership !== "t3") {
+          diagnostics.push({ code: "ownership_invalid", message: "Package is not owned by T3." });
+        }
+        if (input.expectedScope !== undefined && manifest.scope !== input.expectedScope) {
+          diagnostics.push({
+            code: "scope_invalid",
+            message: "Manifest scope does not match its root.",
+          });
+        }
+        if (manifest.scope === "global" && rawProjectState !== undefined) {
+          diagnostics.push({
+            code: "project_state_invalid",
+            message: "Global packages cannot have project state.",
+          });
+        }
+        if (manifest.scope === "project" && projectState === undefined) {
+          diagnostics.push({
+            code: "project_state_invalid",
+            message: "Project packages require project state.",
+          });
+        }
+        if (input.expectedKey !== undefined && manifest.key !== input.expectedKey) {
+          diagnostics.push({
+            code: "manifest_key_mismatch",
+            message: "Manifest key does not match its directory.",
+          });
+        }
+      },
+      catch: () => ({ code: "manifest_invalid", message: "t3-skill.json is malformed." }),
+    }).pipe(Effect.result);
+    if (Result.isFailure(decoded)) diagnostics.push(decoded.failure);
   }
 
   let content: ManagedSkillContent | undefined;
@@ -495,32 +497,31 @@ export const inspectSkillPackage = Effect.fn("SkillPackage.inspect")(function* (
       diagnostics.push({ code: "skill_missing", message: "SKILL.md is missing." });
     }
   } else {
-    try {
-      const rawSkill = new TextDecoder().decode(rawSkillBytes);
-      const parsed = parsePortableSkillDocument(rawSkill);
-      const key = manifest?.key ?? input.expectedKey;
-      if (key !== undefined) {
-        if (parsed.frontmatter.name !== key) {
-          diagnostics.push({
-            code: "frontmatter_key_mismatch",
-            message: "Frontmatter name does not match the portable key.",
-          });
+    const decoded = yield* Effect.try({
+      try: () => {
+        const rawSkill = new TextDecoder().decode(rawSkillBytes);
+        const parsed = parsePortableSkillDocument(rawSkill);
+        const key = manifest?.key ?? input.expectedKey;
+        if (key !== undefined) {
+          if (parsed.frontmatter.name !== key) {
+            diagnostics.push({
+              code: "frontmatter_key_mismatch",
+              message: "Frontmatter name does not match the portable key.",
+            });
+          }
+          content = {
+            key: key as ManagedSkillContent["key"],
+            name: parsed.frontmatter.description,
+            body: parsed.body,
+            ...(Object.keys(portableSkillFrontmatterExtensions(parsed.frontmatter)).length === 0
+              ? {}
+              : { frontmatter: portableSkillFrontmatterExtensions(parsed.frontmatter) }),
+          };
         }
-        content = {
-          key: key as ManagedSkillContent["key"],
-          name: parsed.frontmatter.description,
-          body: parsed.body,
-          ...(Object.keys(portableSkillFrontmatterExtensions(parsed.frontmatter)).length === 0
-            ? {}
-            : { frontmatter: portableSkillFrontmatterExtensions(parsed.frontmatter) }),
-        };
-      }
-    } catch {
-      diagnostics.push({
-        code: "frontmatter_invalid",
-        message: "SKILL.md frontmatter is malformed.",
-      });
-    }
+      },
+      catch: () => ({ code: "frontmatter_invalid", message: "SKILL.md frontmatter is malformed." }),
+    }).pipe(Effect.result);
+    if (Result.isFailure(decoded)) diagnostics.push(decoded.failure);
   }
 
   if (

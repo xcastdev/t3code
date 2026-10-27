@@ -109,16 +109,10 @@ export function SettingsWorkRouteScreen() {
       >
         <WorkProjectList
           onOpenProject={(environmentId, projectId) =>
-            navigation.navigate("SettingsSheet", {
-              screen: "SettingsContent",
-              params: { screen: "SettingsWorkProject", params: { environmentId, projectId } },
-            })
+            navigation.navigate("SettingsWorkProject", { environmentId, projectId })
           }
           onOpenTask={(environmentId, projectId, taskId) =>
-            navigation.navigate("SettingsSheet", {
-              screen: "SettingsContent",
-              params: { screen: "SettingsWorkTask", params: { environmentId, projectId, taskId } },
-            })
+            navigation.navigate("SettingsWorkTask", { environmentId, projectId, taskId })
           }
         />
       </ScrollView>
@@ -157,13 +151,7 @@ export function SettingsWorkProjectRouteScreen({ route }: ProjectProps) {
             section={section}
             onSectionChange={setSection}
             onOpenTask={(taskId) =>
-              navigation.navigate("SettingsSheet", {
-                screen: "SettingsContent",
-                params: {
-                  screen: "SettingsWorkTask",
-                  params: { environmentId, projectId, taskId },
-                },
-              })
+              navigation.navigate("SettingsWorkTask", { environmentId, projectId, taskId })
             }
           />
         )}
@@ -940,6 +928,7 @@ function Bindings({
   const [notice, setNotice] = useState<string | null>(null);
   const [binding, setBinding] = useState(false);
   const [detaching, setDetaching] = useState<string | null>(null);
+  // oxlint-disable-next-line t3code/react-effect-budget -- Issue bindings are fetched from the environment when the checkout changes.
   useEffect(() => {
     let live = true;
     void projectWorkEnvironment.issue

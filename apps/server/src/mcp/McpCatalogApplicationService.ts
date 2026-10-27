@@ -18,6 +18,7 @@ import { ProjectMcpOAuth } from "./ProjectMcpOAuth.ts";
 import { resolveSessionCatalog } from "./McpCatalogResolver.ts";
 
 const make = Effect.gen(function* () {
+  const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
   const catalog = yield* McpCatalogService;
   const gateway = yield* McpCatalogGateway;
   const sessions = yield* McpProviderSessions;
@@ -221,12 +222,12 @@ const make = Effect.gen(function* () {
         (snapshot) =>
           prepareLock.withLock(
             snapshot.threadId,
-            Effect.gen(function* () {
-              yield* catalog.requestApplication({
+            catalog
+              .requestApplication({
                 threadId: snapshot.threadId,
                 mcpCatalogSessionId: snapshot.catalogSessionId,
-              });
-            }),
+              })
+              .pipe(Effect.asVoid),
           ),
         { concurrency: "unbounded", discard: true },
       );
@@ -306,9 +307,7 @@ const make = Effect.gen(function* () {
   );
   yield* Effect.acquireRelease(
     Effect.sync(() => {
-      oauth.setAuthorizedHandler?.(() =>
-        Effect.runPromise(service.reconnect().pipe(Effect.ignore)),
-      );
+      oauth.setAuthorizedHandler?.(() => runPromise(service.reconnect().pipe(Effect.ignore)));
     }),
     () =>
       Effect.sync(() => {

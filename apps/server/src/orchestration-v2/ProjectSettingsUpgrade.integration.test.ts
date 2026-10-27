@@ -148,13 +148,12 @@ const layerRuntime = (dbPath: string) => {
     ),
   );
   return Layer.mergeAll(
-    RuntimeLayer.layer
-      .pipe(
-        Layer.provide(
-          Layer.mock(TerminalManager.TerminalManager)({ closeProjectOwner: () => Effect.void }),
-        ),
-      )
-      .pipe(Layer.provide(RuntimeLayer.layerProjectService)),
+    RuntimeLayer.layer.pipe(
+      Layer.provide(
+        Layer.mock(TerminalManager.TerminalManager)({ closeProjectOwner: () => Effect.void }),
+      ),
+      Layer.provide(RuntimeLayer.layerProjectService),
+    ),
     RuntimeLayer.layerProjectService,
   ).pipe(
     Layer.provide(
@@ -177,6 +176,7 @@ const layerRuntime = (dbPath: string) => {
     Layer.provide(ServerSettings.layerTest()),
     Layer.provide(
       Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+        // @effect-diagnostics-next-line effectSucceedWithVoid:off - This optional result requires undefined, not the wider void type.
         getInstance: () => Effect.succeed(undefined),
         listInstances: Effect.succeed([]),
         listUnavailable: Effect.succeed([]),

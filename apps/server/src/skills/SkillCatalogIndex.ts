@@ -368,10 +368,13 @@ export const make = Effect.gen(function* () {
     getGlobal: Ref.get(global.snapshot),
     acquireProject,
     releaseProject,
-    getProject: (projectRoot) =>
+    getProject: Effect.fn("SkillCatalogIndex.getProject")((projectRoot) =>
       Effect.flatMap(findProject(projectRoot), (record) => Ref.get(record.snapshot)),
+    ),
     refreshGlobal: refreshRecord(global),
-    refreshProject: (projectRoot) => Effect.flatMap(findProject(projectRoot), refreshRecord),
+    refreshProject: Effect.fn("SkillCatalogIndex.refreshProject")((projectRoot) =>
+      Effect.flatMap(findProject(projectRoot), refreshRecord),
+    ),
     subscribe: PubSub.subscribe(changes),
   });
   ownedAcquisitions.set(service, acquireProjectOwnedImpl);

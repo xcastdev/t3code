@@ -1128,15 +1128,13 @@ it.live.each(["acknowledgment-write", "postcommit-callback"] as const)(
       const original = threads.sendToThread;
       using spy = vi.spyOn(threads, "sendToThread").mockImplementation((input) =>
         original(input).pipe(
-          Effect.flatMap((result) =>
-            fault === "postcommit-callback"
-              ? Effect.fail(
-                  new Threads.ThreadManagementThreadNotFoundError({
-                    projectId: input.projectId,
-                    threadId: input.threadId,
-                  }),
-                )
-              : Effect.succeed(result),
+          Effect.filterOrFail(
+            () => fault !== "postcommit-callback",
+            () =>
+              new Threads.ThreadManagementThreadNotFoundError({
+                projectId: input.projectId,
+                threadId: input.threadId,
+              }),
           ),
         ),
       );

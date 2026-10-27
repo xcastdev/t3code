@@ -290,24 +290,25 @@ const makeProjectWorkSearch = Effect.gen(function* () {
       .withTransaction(refreshSearchIndex(sql, projectId))
       .pipe(Effect.mapError(toPersistenceSqlError("ProjectWorkSearch.rebuild")));
 
-  const search: ProjectWorkSearchShape["search"] = (input) => {
-    const page = bounds(input);
-    const ftsQuery = toProjectWorkFtsQuery(input.query);
-    if (ftsQuery.length === 0)
-      return Effect.succeed({
-        projectId: input.projectId,
-        query: input.query,
-        items: [],
-        results: [],
-        total: 0,
-        limit: page.limit,
-        offset: page.offset,
-        hasMore: false,
-      });
-    const kinds = normalizeKinds(input);
-    const matchClause =
-      ftsQuery === "*" ? sql`` : sql`AND t3_workflow_v2_work_search_fts MATCH ${ftsQuery}`;
-    const filters = sql`
+  const search: ProjectWorkSearchShape["search"] = Effect.fn("ProjectWorkSearch.search")(
+    function* (input) {
+      const page = bounds(input);
+      const ftsQuery = toProjectWorkFtsQuery(input.query);
+      if (ftsQuery.length === 0)
+        return {
+          projectId: input.projectId,
+          query: input.query,
+          items: [],
+          results: [],
+          total: 0,
+          limit: page.limit,
+          offset: page.offset,
+          hasMore: false,
+        };
+      const kinds = normalizeKinds(input);
+      const matchClause =
+        ftsQuery === "*" ? sql`` : sql`AND t3_workflow_v2_work_search_fts MATCH ${ftsQuery}`;
+      const filters = sql`
       WHERE project_id = ${input.projectId}
         ${matchClause}
         ${kinds.length === 0 ? sql`` : sql`AND record_kind IN (SELECT value FROM json_each(${json(kinds)}))`}
@@ -318,16 +319,16 @@ const makeProjectWorkSearch = Effect.gen(function* () {
         ${input.afterRevision === undefined ? sql`` : sql`AND revision > ${Math.max(0, Math.floor(input.afterRevision))}`}
         ${input.beforeRevision === undefined ? sql`` : sql`AND revision < ${Math.max(0, Math.floor(input.beforeRevision))}`}
     `;
-    return Effect.gen(function* () {
-      const countRows = yield* query(
-        sql<Record<string, unknown>>`
+      return yield* Effect.gen(function* () {
+        const countRows = yield* query(
+          sql<Record<string, unknown>>`
           SELECT COUNT(*) AS totalMatched
           FROM t3_workflow_v2_work_search_fts
           ${filters}
         `,
-      );
-      const rows = yield* query(
-        sql<Record<string, unknown>>`
+        );
+        const rows = yield* query(
+          sql<Record<string, unknown>>`
           SELECT project_id AS projectId, record_kind AS recordKind, record_id AS recordId,
             title, body, provenance_json AS provenanceJson, revision,
             ${
@@ -341,41 +342,44 @@ const makeProjectWorkSearch = Effect.gen(function* () {
             record_kind ASC, record_id ASC
           LIMIT ${page.limit} OFFSET ${page.offset}
         `,
-      );
-      const total = Number(countRows[0]?.totalMatched ?? 0);
-      return {
-        rows,
-        total,
-      };
-    }).pipe(
-      Effect.map(({ rows, total }) => {
-        const items = rows.map((row) => {
-          const recordKind = String(row.recordKind) as ProjectWorkSearchRecordKind;
-          return {
-            projectId: String(row.projectId),
-            recordKind,
-            kind: recordKind,
-            recordId: String(row.recordId),
-            title: clip(String(row.title ?? ""), page.snippetCharacters),
-            snippet: clip(String(row.matchedSnippet ?? row.body ?? ""), page.snippetCharacters),
-            provenance: parseJson(row.provenanceJson),
-            revision: Number(row.revision),
-          } satisfies ProjectWorkSearchResultItem;
-        });
+        );
+        const total = Number(countRows[0]?.totalMatched ?? 0);
         return {
-          projectId: input.projectId,
-          query: input.query,
-          items,
-          results: items,
+          rows,
           total,
-          limit: page.limit,
-          offset: page.offset,
-          hasMore: page.offset + items.length < total,
-          ...(page.offset + items.length < total ? { nextOffset: page.offset + items.length } : {}),
-        } satisfies ProjectWorkSearchResult;
-      }),
-    );
-  };
+        };
+      }).pipe(
+        Effect.map(({ rows, total }) => {
+          const items = rows.map((row) => {
+            const recordKind = String(row.recordKind) as ProjectWorkSearchRecordKind;
+            return {
+              projectId: String(row.projectId),
+              recordKind,
+              kind: recordKind,
+              recordId: String(row.recordId),
+              title: clip(String(row.title ?? ""), page.snippetCharacters),
+              snippet: clip(String(row.matchedSnippet ?? row.body ?? ""), page.snippetCharacters),
+              provenance: parseJson(row.provenanceJson),
+              revision: Number(row.revision),
+            } satisfies ProjectWorkSearchResultItem;
+          });
+          return {
+            projectId: input.projectId,
+            query: input.query,
+            items,
+            results: items,
+            total,
+            limit: page.limit,
+            offset: page.offset,
+            hasMore: page.offset + items.length < total,
+            ...(page.offset + items.length < total
+              ? { nextOffset: page.offset + items.length }
+              : {}),
+          } satisfies ProjectWorkSearchResult;
+        }),
+      );
+    },
+  );
 
   const traverseRelationships: ProjectWorkSearchShape["traverseRelationships"] = (input) => {
     const depth = boundedInt(input.depth, 1, PROJECT_WORK_SEARCH_MAX_TRAVERSAL_DEPTH);

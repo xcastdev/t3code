@@ -15,6 +15,7 @@ import { getProviderModelCapabilities } from "../providerModels";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
 import type {
   EnvironmentThread,
+  ThreadStructure,
   EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/shell";
 import {
@@ -30,7 +31,6 @@ import {
   type MessageId,
   type ModelSelection,
   type OrchestrationMessageContext,
-  type OrchestrationV2ProjectedTurnItem,
   type PreviewAnnotationPayload,
   type ProviderInteractionMode,
   ProviderDriverKind,
@@ -48,7 +48,6 @@ import {
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { worktreeSetupAgentStarted } from "@t3tools/client-runtime/worktree-setup";
 import * as DateTime from "effect/DateTime";
-import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import {
   squashAtomCommandFailure,
@@ -108,11 +107,12 @@ import {
 } from "../providerInstances";
 
 type ThreadProjection = EnvironmentThread["projection"];
+type ThreadStructureRow = ThreadStructure["visibleTurnItems"][number];
 
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 
-const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
+export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
 
 export function agentControlledBrowserCloseConfirmation(
   surfaces: readonly RightPanelSurface[],
@@ -239,12 +239,8 @@ export function resolveProactiveTurnDiffAction(input: {
   return input.checkpoint.files.length >= 3 || changedLines >= 50 ? "open" : "ignore";
 }
 
-/**
- * Clicking back to an existing Diff tab resumes the review in progress, so the
- * generic-open reset to Changes must skip it. A diff that is already active is
- * left unmarked: the reset never runs for it, and the marker would linger into
- * the next generic open.
- */
+/** Mark reactivated Diff tabs to preserve review scope. Already-active tabs must not leave a marker for
+ * the next open. */
 export function resolveExplicitDiffOpenOnActivate(input: {
   readonly surfaceKind: RightPanelSurface["kind"];
   readonly diffOpen: boolean;
@@ -347,23 +343,16 @@ export function resolveDraftHeroState(input: {
   );
 }
 
-/**
- * Remounting LegendList (or handing it an empty first paint) punches a hole
- * through the chat pane — white in light mode — so cmd+1/2/3 spam flashes even
- * when the destination is already cached.
- */
+/** Remounting or initially emptying LegendList flashes the chat pane, even for cached threads. */
 export type HeldThreadTimeline<T extends readonly unknown[]> = {
   threadKey: string | null;
   entries: T;
-  markdownCwd?: string | null;
-  workspaceRoot?: string | null;
 };
 
 const MAX_REMEMBERED_THREAD_TIMELINES = 16;
 
 let rememberedThreadTimelines = new Map<string, HeldThreadTimeline<readonly unknown[]>>();
 let rememberedThreadTimelineOrder: string[] = [];
-let lastReadyThreadKey: string | null = null;
 
 function rememberThreadTimelineEntries(held: HeldThreadTimeline<readonly unknown[]>): void {
   if (held.threadKey === null) {
@@ -380,7 +369,6 @@ function rememberThreadTimelineEntries(held: HeldThreadTimeline<readonly unknown
       rememberedThreadTimelines.delete(evicted);
     }
   }
-  lastReadyThreadKey = held.threadKey;
 }
 
 export function rememberReadyThreadTimeline<T extends readonly unknown[]>(
@@ -401,41 +389,9 @@ export function peekRememberedThreadTimeline<T extends readonly unknown[]>(
   return (rememberedThreadTimelines.get(threadKey)?.entries as T | undefined) ?? null;
 }
 
-export function peekHeldThreadTimeline<
-  T extends readonly unknown[],
->(): HeldThreadTimeline<T> | null {
-  if (lastReadyThreadKey === null) {
-    return null;
-  }
-  const held = rememberedThreadTimelines.get(lastReadyThreadKey);
-  if (held === undefined || held.entries.length === 0) {
-    return null;
-  }
-  return held as HeldThreadTimeline<T>;
-}
-
 export function resetHeldThreadTimeline(): void {
   rememberedThreadTimelines = new Map();
   rememberedThreadTimelineOrder = [];
-  lastReadyThreadKey = null;
-}
-
-export function threadKeysShareEnvironment(left: string | null, right: string | null): boolean {
-  if (left === null || right === null) {
-    return false;
-  }
-  const leftRef = parseScopedThreadKey(left);
-  const rightRef = parseScopedThreadKey(right);
-  return leftRef !== null && rightRef !== null && leftRef.environmentId === rightRef.environmentId;
-}
-
-export function isPaintOnlyThreadTimeline(
-  displayThreadKey: string | null,
-  activeThreadKey: string | null,
-): boolean {
-  return (
-    displayThreadKey !== null && activeThreadKey !== null && displayThreadKey !== activeThreadKey
-  );
 }
 
 export function resolveThreadSwitchTimeline<T extends readonly unknown[]>(input: {
@@ -443,49 +399,18 @@ export function resolveThreadSwitchTimeline<T extends readonly unknown[]>(input:
   activeThreadKey: string | null;
   nextEntries: T;
   rememberedForActive?: T | null;
-  lastReady?: HeldThreadTimeline<T> | null;
-}): { entries: T; displayThreadKey: string | null } {
+}): T {
   if (input.nextEntries.length > 0) {
-    return { entries: input.nextEntries, displayThreadKey: input.activeThreadKey };
+    return input.nextEntries;
   }
 
   const rememberedForActive =
     input.rememberedForActive ?? peekRememberedThreadTimeline<T>(input.activeThreadKey);
   if (input.loading && rememberedForActive !== null && rememberedForActive.length > 0) {
-    return { entries: rememberedForActive, displayThreadKey: input.activeThreadKey };
+    return rememberedForActive;
   }
 
-  return { entries: input.nextEntries, displayThreadKey: input.activeThreadKey };
-}
-
-export function resolveDraftPromotionNavigationTarget(input: {
-  serverThreadRef: ScopedThreadRef | null;
-  serverThread: Pick<Thread, "latestRun" | "latestUserMessageAt"> | null | undefined;
-  backgroundSubmissionPending: boolean;
-}): ScopedThreadRef | null {
-  if (input.backgroundSubmissionPending) {
-    return null;
-  }
-  const latestRun = input.serverThread?.latestRun ?? null;
-  const runStarted = latestRun?.startedAt != null;
-  const startupStopped =
-    latestRun?.status === "failed" ||
-    latestRun?.status === "interrupted" ||
-    latestRun?.status === "cancelled";
-  const messagePersisted = input.serverThread?.latestUserMessageAt != null;
-  return runStarted || startupStopped || messagePersisted ? input.serverThreadRef : null;
-}
-
-export function scheduleEnvironmentReconnectWarning(showWarning: () => void): () => void {
-  const timeoutId = globalThis.setTimeout(showWarning, ENVIRONMENT_RECONNECT_WARNING_GRACE_MS);
-  return () => globalThis.clearTimeout(timeoutId);
-}
-
-export function hasEnvironmentReconnectWarningGraceElapsed(
-  activeEnvironmentId: EnvironmentId | null,
-  elapsedEnvironmentId: EnvironmentId | null,
-): boolean {
-  return activeEnvironmentId !== null && activeEnvironmentId === elapsedEnvironmentId;
+  return input.nextEntries;
 }
 
 export function startNewThreadForProject(
@@ -744,13 +669,6 @@ export function resolveTerminalWorktreePath(input: {
   return input.threadWorktreePath;
 }
 
-export function revokeBlobPreviewUrl(previewUrl: string | undefined): void {
-  if (!previewUrl || typeof URL === "undefined" || !previewUrl.startsWith("blob:")) {
-    return;
-  }
-  URL.revokeObjectURL(previewUrl);
-}
-
 export async function resolveFileAttachmentUrl(input: {
   attachment: ChatFileAttachment;
   environmentId: EnvironmentId;
@@ -808,18 +726,6 @@ export async function prepareRevertedMessageAttachments(input: {
       return new File([await response.blob()], attachment.name, { type: attachment.mimeType });
     }),
   );
-}
-
-export function revokeUserMessagePreviewUrls(message: ChatMessage): void {
-  if (message.role !== "user" || !message.attachments) {
-    return;
-  }
-  for (const attachment of message.attachments) {
-    if (!isImageAttachment(attachment)) {
-      continue;
-    }
-    revokeBlobPreviewUrl(attachment.previewUrl);
-  }
 }
 
 export function timelineHasEphemeralPreviewUrls(
@@ -940,8 +846,7 @@ export function branchMismatchKey(
   return `${threadId}:${mismatch.threadBranch}:${mismatch.currentBranch}`;
 }
 
-// Draft content is the intent signal — composer focus is useless here because
-// ChatView autofocuses the composer on every thread open.
+// Composer autofocus makes focus unreliable as draft intent.
 export function shouldShowBranchMismatchBanner(input: {
   hasMismatch: boolean;
   isDismissed: boolean;
@@ -973,6 +878,10 @@ export function shouldShowPlanFollowUpPrompt(input: {
   );
 }
 
+// A typed `/compact`, with or without instructions, is already the compaction. Queueing a
+// bare one ahead of it would run an uninstructed compaction first and charge for two.
+const COMPACT_COMMAND_PATTERN = /^\/compact(?:\s|$)/i;
+
 const sessionDismissedBranchMismatchKeys = new Set<string>();
 
 export function dismissBranchMismatchForSession(key: string): void {
@@ -983,9 +892,7 @@ export function isBranchMismatchDismissedForSession(key: string | null): boolean
   return key !== null && sessionDismissedBranchMismatchKeys.has(key);
 }
 
-// Git status for a checkout arrives after the composer paints, and the branch
-// strip mounts on the assumption that a project is a Git repo. Without a
-// memory, a non-Git project would mount the strip and drop it on every visit.
+// Remember non-Git checkouts to avoid flashing the branch strip before delayed Git status arrives.
 const sessionCheckoutIsRepo = new Map<string, boolean>();
 
 function checkoutIsRepoKey(environmentId: EnvironmentId, cwd: string): string {
@@ -1009,7 +916,7 @@ export function recallCheckoutIsRepo(
     : sessionCheckoutIsRepo.get(checkoutIsRepoKey(environmentId, cwd));
 }
 
-export function threadHasStarted(thread: Thread | null | undefined): boolean {
+function threadHasStarted(thread: Thread | null | undefined): boolean {
   return Boolean(thread && (thread.latestRun !== null || thread.itemCount > 0 || thread.runtime));
 }
 
@@ -1025,8 +932,7 @@ export function threadShellHasStarted(
   );
 }
 
-// Imported history has no session until its first prompt. Resolve its instance
-// through the environment's provider catalog before locking to a driver.
+// Imported history lacks a session until its first prompt; resolve its instance before locking the driver.
 export function deriveLockedProvider(input: {
   thread: Thread | null | undefined;
   selectedProvider: string | null;
@@ -1040,8 +946,7 @@ export function deriveLockedProvider(input: {
   if (sessionProvider && isProviderDriverKind(sessionProvider)) {
     return sessionProvider;
   }
-  // Preserve the existing lock while an instance is missing from the catalog;
-  // a started thread must not silently fall back to a different driver.
+  // Missing catalog entries must not switch a started thread's driver.
   const threadProvider =
     input.providers.find((provider) => provider.instanceId === input.threadProvider)?.driver ??
     input.threadProvider;
@@ -1234,14 +1139,10 @@ export function createLocalDispatchSnapshot(
   };
 }
 
-/**
- * The timeline renders committed user rows from `visibleTurnItems`, but
- * `message.updated` can land in `projection.messages` one event earlier than
- * the matching `turn-item.updated`. Basing optimistic eviction on visible user
- * turn items avoids dropping steer rows in that gap.
- */
+/** Projection messages can precede visible turn items by one event; evict optimistic rows only when
+ * visible. */
 export function deriveCommittedServerUserMessageIds(
-  visibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
+  visibleTurnItems: ReadonlyArray<ThreadStructureRow>,
 ): ReadonlySet<ChatMessage["id"]> {
   return new Set(
     visibleTurnItems.flatMap((row) =>
@@ -1339,11 +1240,6 @@ export interface PlanFollowUpComposerSnapshot {
   readonly threadContexts: ReadonlyArray<ThreadContextRecord>;
 }
 
-/**
- * The caller clears the composer before awaiting the send, so every field it
- * held has to be written back here: a dropped field silently discards user
- * context.
- */
 export function restorePlanFollowUpComposer(input: {
   readonly snapshot: PlanFollowUpComposerSnapshot;
   readonly writePrompt: (prompt: string) => void;
@@ -1369,11 +1265,7 @@ export function restorePlanFollowUpComposer(input: {
   });
 }
 
-/**
- * Adds a directly sent preview annotation to the composer's images and
- * annotations. Its screenshot rides along only while the turn has room for
- * another attachment; over the cap the server rejects the whole turn.
- */
+/** Includes the annotation screenshot only within the attachment cap; exceeding it rejects the whole turn. */
 export function mergeDirectPreviewAnnotation(input: {
   readonly images: ReadonlyArray<ComposerImageAttachment>;
   readonly fileCount: number;
@@ -1405,8 +1297,6 @@ export function mergeDirectPreviewAnnotation(input: {
         ...input.previewAnnotations,
         {
           ...direct.annotation,
-          // Claim an attached crop only when the screenshot really rides
-          // along; a cap-dropped image must not produce a lying prompt.
           screenshot:
             direct.annotation.screenshot && (imageAppended || imageAlreadyAttached)
               ? { ...direct.annotation.screenshot, dataUrl: "" }
@@ -1583,7 +1473,7 @@ export function planComposerTurn(input: {
   const compactBeforeSend =
     input.resumeCompactionTokens !== null &&
     !input.keepFullHistory &&
-    input.messageText.toLowerCase() !== "/compact";
+    !COMPACT_COMMAND_PATTERN.test(input.messageText);
   return {
     // In worktree mode, require an explicit base branch so we don't silently
     // fall back to local execution when branch selection is missing.
@@ -1669,20 +1559,29 @@ export function sendTitleFallbackLabels(snapshot: ComposerSendSnapshot) {
   ];
 }
 
-/** A thread shell built from its loaded detail, for direct links that hydrate the detail first. */
+/**
+ * A thread shell built from its loaded detail, for direct links that hydrate the detail first.
+ * `updatedAt` and `lastVisitedAt` are passed live: the thread structure leaves them out.
+ */
 export function presentThreadShellFromProjection(
   environmentId: EnvironmentId,
   threadId: ThreadId,
-  projection: ThreadProjection,
+  projection: ThreadStructure,
+  live: {
+    readonly updatedAt: ThreadProjection["updatedAt"];
+    readonly lastVisitedAt: ThreadProjection["thread"]["lastVisitedAt"];
+  },
 ) {
+  const { updatedAt, lastVisitedAt } = live;
   const latestRun = deriveLatestThreadRun(projection);
-  const runtime = deriveThreadRuntime(projection);
+  const runtime = deriveThreadRuntime({ ...projection, updatedAt });
   const pendingRuntimeRequest =
     projection.runtimeRequests.findLast((request) => request.status === "pending") ?? null;
   // Direct links can hydrate detail before the thread enters the shell index.
   return {
     ...presentThreadShell(environmentId, {
       ...projection.thread,
+      lastVisitedAt,
       latestRunId: latestRun?.runId ?? null,
       activeRunId: runtime?.activeRunId ?? null,
       status: runtime?.status ?? "idle",
@@ -1706,7 +1605,7 @@ export function presentThreadShellFromProjection(
         )?.goal ?? null,
       itemCount: projection.turnItems.length,
       visibleItemCount: projection.visibleTurnItems.length,
-      updatedAt: projection.updatedAt,
+      updatedAt,
     }),
     latestRun,
     runtime,
@@ -1714,7 +1613,7 @@ export function presentThreadShellFromProjection(
 }
 
 /** Background work the provider still runs after the latest run ended. */
-export function deriveThreadPendingBackgroundTasks(projection: ThreadProjection | null) {
+export function deriveThreadPendingBackgroundTasks(projection: ThreadStructure | null) {
   if (projection === null) return [];
   const sessionError =
     projection.providerSessions.findLast(
@@ -1740,7 +1639,7 @@ export function deriveThreadPendingBackgroundTasks(projection: ThreadProjection 
  * active provider thread, plus 0 for the thread start. Empty without a live provider session
  * on the thread's selected instance.
  */
-export function deriveAvailableRevertTurnCounts(projection: ThreadProjection | null) {
+export function deriveAvailableRevertTurnCounts(projection: ThreadStructure | null) {
   const available = new Set<number>();
   const providerThread = projection?.providerThreads.find(
     (candidate) => candidate.id === projection.thread.activeProviderThreadId,
@@ -1783,7 +1682,7 @@ export function deriveAvailableRevertTurnCounts(projection: ThreadProjection | n
  * without reporting the paths it touched.
  */
 export function deriveWorkspaceMutationId(
-  visibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
+  visibleTurnItems: ReadonlyArray<ThreadStructureRow>,
   latestCheckpointCompletedAt: string | null,
 ) {
   let itemId: string | null = null;

@@ -121,8 +121,10 @@ const make = Effect.gen(function* () {
     },
   );
   return McpProviderSessions.of({
-    beginCatalogEndpointInstallation: (config) =>
-      Effect.sync(() => {
+    beginCatalogEndpointInstallation: Effect.fn(
+      "McpProviderSessions.beginCatalogEndpointInstallation",
+    )(function (config) {
+      return Effect.sync(() => {
         const current = Ref.getUnsafe(sessions);
         const actual = current.get(config.threadId);
         if (
@@ -149,56 +151,67 @@ const make = Effect.gen(function* () {
             }
           }),
         };
-      }),
-    onCatalogEndpointAcknowledged: (listener) =>
-      Effect.sync(() => {
-        catalogListeners.add(listener);
-        return () => {
-          catalogListeners.delete(listener);
-        };
-      }),
+      });
+    }),
+    onCatalogEndpointAcknowledged: Effect.fn("McpProviderSessions.onCatalogEndpointAcknowledged")(
+      function (listener) {
+        return Effect.sync(() => {
+          catalogListeners.add(listener);
+          return () => {
+            catalogListeners.delete(listener);
+          };
+        });
+      },
+    ),
     acknowledgeCatalogEndpoint,
-    replaceIfCurrent: (expected, replacement) =>
-      Ref.modify(sessions, (current) => {
-        const actual = current.get(expected.threadId);
-        if (
-          !actual ||
-          actual.providerSessionId !== expected.providerSessionId ||
-          (expected.nativeRuntimeId !== undefined &&
-            actual.nativeRuntimeId !== expected.nativeRuntimeId)
-        )
-          return [false, current] as const;
-        const next = new Map(current);
-        if (replacement) next.set(expected.threadId, replacement);
-        else next.delete(expected.threadId);
-        if (
-          !replacement ||
-          actual.providerSessionId !== replacement.providerSessionId ||
-          actual.nativeRuntimeId !== replacement.nativeRuntimeId ||
-          actual.catalogEndpoint !== replacement.catalogEndpoint
-        ) {
-          catalogReceipts.delete(expected.threadId);
-          catalogInstallations.delete(expected.threadId);
-        }
-        return [true, next] as const;
-      }).pipe(
-        Effect.tap((swapped) =>
-          swapped
-            ? Ref.update(htmlRenders, (current) => {
-                const actual = Ref.getUnsafe(sessions).get(expected.threadId);
-                if (
-                  actual?.providerSessionId !== replacement?.providerSessionId ||
-                  actual?.nativeRuntimeId !== replacement?.nativeRuntimeId
-                )
-                  return current;
-                const next = new Map(current);
-                next.delete(expected.threadId);
-                return next;
-              })
-            : Effect.void,
-        ),
-      ),
-    readCatalogEndpointReceipt: (threadId) => Effect.sync(() => catalogReceipts.get(threadId)),
+    replaceIfCurrent: Effect.fn("McpProviderSessions.replaceIfCurrent")(
+      function (expected, replacement) {
+        return Ref.modify(sessions, (current) => {
+          const actual = current.get(expected.threadId);
+          if (
+            !actual ||
+            actual.providerSessionId !== expected.providerSessionId ||
+            (expected.nativeRuntimeId !== undefined &&
+              actual.nativeRuntimeId !== expected.nativeRuntimeId)
+          )
+            return [false, current] as const;
+          const next = new Map(current);
+          if (replacement) next.set(expected.threadId, replacement);
+          else next.delete(expected.threadId);
+          if (
+            !replacement ||
+            actual.providerSessionId !== replacement.providerSessionId ||
+            actual.nativeRuntimeId !== replacement.nativeRuntimeId ||
+            actual.catalogEndpoint !== replacement.catalogEndpoint
+          ) {
+            catalogReceipts.delete(expected.threadId);
+            catalogInstallations.delete(expected.threadId);
+          }
+          return [true, next] as const;
+        }).pipe(
+          Effect.tap((swapped) =>
+            swapped
+              ? Ref.update(htmlRenders, (current) => {
+                  const actual = Ref.getUnsafe(sessions).get(expected.threadId);
+                  if (
+                    actual?.providerSessionId !== replacement?.providerSessionId ||
+                    actual?.nativeRuntimeId !== replacement?.nativeRuntimeId
+                  )
+                    return current;
+                  const next = new Map(current);
+                  next.delete(expected.threadId);
+                  return next;
+                })
+              : Effect.void,
+          ),
+        );
+      },
+    ),
+    readCatalogEndpointReceipt: Effect.fn("McpProviderSessions.readCatalogEndpointReceipt")(
+      function (threadId) {
+        return Effect.sync(() => catalogReceipts.get(threadId));
+      },
+    ),
     set: Effect.fn("McpProviderSessions.set")(function* (config) {
       const current = yield* Ref.get(sessions);
       const previous = current.get(config.threadId);
@@ -219,9 +232,11 @@ const make = Effect.gen(function* () {
       }
       yield* Ref.update(sessions, (current) => new Map(current).set(config.threadId, config));
     }),
-    read: (threadId) => Ref.get(sessions).pipe(Effect.map((current) => current.get(threadId))),
-    clear: (threadId) =>
-      Effect.sync(() => {
+    read: Effect.fn("McpProviderSessions.read")(function (threadId) {
+      return Ref.get(sessions).pipe(Effect.map((current) => current.get(threadId)));
+    }),
+    clear: Effect.fn("McpProviderSessions.clear")(function (threadId) {
+      return Effect.sync(() => {
         catalogReceipts.delete(threadId);
         catalogInstallations.delete(threadId);
       }).pipe(
@@ -240,46 +255,53 @@ const make = Effect.gen(function* () {
             ),
           ),
         ),
-      ),
-    recordHtmlRender: (threadId, input, reference) =>
-      Ref.update(htmlRenders, (current) =>
-        new Map(current).set(
-          threadId,
-          [
-            ...(current.get(threadId) ?? []),
-            {
-              title: input.title,
-              height: input.height,
-              htmlLength: input.html.length,
-              htmlHash: hashHtml(input.html),
-              // Copy the tail so its backing storage cannot retain the entire HTML string.
-              htmlEnd: Buffer.from(input.html.slice(-KEPT_HTML_END_LENGTH), "utf16le").toString(
-                "utf16le",
-              ),
-              reference,
-            },
-          ].slice(-MAX_KEPT_HTML_RENDERS),
-        ),
-      ),
-    takeHtmlRender: (threadId, input, reported) =>
-      Ref.modify(htmlRenders, (current) => {
-        const kept = current.get(threadId) ?? [];
-        const index =
-          reported === undefined
-            ? matchingPageIndex(kept, input)
-            : kept.findIndex((page) => page.reference.attachmentId === reported.attachmentId);
-        if (index === -1) {
-          return [undefined, current];
-        }
-        const rest = kept.filter((_, keptIndex) => keptIndex !== index);
-        const next = new Map(current);
-        if (rest.length === 0) {
-          next.delete(threadId);
-        } else {
-          next.set(threadId, rest);
-        }
-        return [kept[index]!.reference, next];
-      }),
+      );
+    }),
+    recordHtmlRender: Effect.fn("McpProviderSessions.recordHtmlRender")(
+      function (threadId, input, reference) {
+        return Ref.update(htmlRenders, (current) =>
+          new Map(current).set(
+            threadId,
+            [
+              ...(current.get(threadId) ?? []),
+              {
+                title: input.title,
+                height: input.height,
+                htmlLength: input.html.length,
+                htmlHash: hashHtml(input.html),
+                // Copy the tail so its backing storage cannot retain the entire HTML string.
+                htmlEnd: Buffer.from(input.html.slice(-KEPT_HTML_END_LENGTH), "utf16le").toString(
+                  "utf16le",
+                ),
+                reference,
+              },
+            ].slice(-MAX_KEPT_HTML_RENDERS),
+          ),
+        );
+      },
+    ),
+    takeHtmlRender: Effect.fn("McpProviderSessions.takeHtmlRender")(
+      function (threadId, input, reported) {
+        return Ref.modify(htmlRenders, (current) => {
+          const kept = current.get(threadId) ?? [];
+          const index =
+            reported === undefined
+              ? matchingPageIndex(kept, input)
+              : kept.findIndex((page) => page.reference.attachmentId === reported.attachmentId);
+          if (index === -1) {
+            return [undefined, current];
+          }
+          const rest = kept.filter((_, keptIndex) => keptIndex !== index);
+          const next = new Map(current);
+          if (rest.length === 0) {
+            next.delete(threadId);
+          } else {
+            next.set(threadId, rest);
+          }
+          return [kept[index]!.reference, next];
+        });
+      },
+    ),
   });
 });
 

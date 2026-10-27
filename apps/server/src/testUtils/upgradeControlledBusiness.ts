@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect";
+import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as Layer from "effect/Layer";
 import * as McpAppContext from "../mcpApps/McpAppModelContext.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -81,6 +82,7 @@ import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 /** Actual services without startup recovery, copied outbox consumption or provider subprocesses. */
 export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
   const boundaries = Layer.mergeAll(
+    PreviewAgentActivity.layer,
     Layer.succeed(HostProcess.Environment, {}),
     Layer.mock(SourceControl.SourceControlProviderRegistry)({
       discover: Effect.succeed([]),
@@ -103,10 +105,14 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
       },
     }),
     Layer.succeed(Favicon.ProjectFaviconResolver, {
-      resolvePath: () => Effect.succeed(null),
-      invalidate: () => Effect.void,
+      resolvePath: Effect.fn("Favicon.ProjectFaviconResolver.resolvePath")(() =>
+        Effect.succeed(null),
+      ),
+      invalidate: Effect.fn("Favicon.ProjectFaviconResolver.invalidate")(() => Effect.void),
     }),
-    Layer.succeed(Identity.RepositoryIdentityResolver, { resolve: () => Effect.succeed(null) }),
+    Layer.succeed(Identity.RepositoryIdentityResolver, {
+      resolve: Effect.fn("Identity.RepositoryIdentityResolver.resolve")(() => Effect.succeed(null)),
+    }),
     WorktreeSetupTracker.layer,
     CloneTracker.layer.pipe(
       Layer.provide(Layer.mock(SourceRepositories.SourceControlRepositoryService)({})),
@@ -115,12 +121,13 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
   const native = layerControlledProcessRunner(snapshot).pipe(Layer.provideMerge(boundaries));
   const vcs = layerControlledVcsProcess.pipe(Layer.provideMerge(native));
   const config = Layer.succeed(VcsConfig.VcsProjectConfig, {
-    resolveKind: (input) =>
+    resolveKind: Effect.fn("VcsConfig.VcsProjectConfig.resolveKind")((input) =>
       Effect.succeed(
         input.requestedKind === undefined || input.requestedKind === "auto"
           ? "git"
           : input.requestedKind,
       ),
+    ),
   }).pipe(Layer.provideMerge(vcs));
   const git = Layer.mergeAll(
     Git.layer,
@@ -135,9 +142,10 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
   ).pipe(Layer.provideMerge(git));
   const memory = AssistantMemoryLayers.layerInstructionContext.pipe(Layer.provideMerge(ids));
   const resources = AssistantResources.layer.pipe(Layer.provideMerge(memory));
-  const workAdmission = WorkAdmission.layer
-    .pipe(Layer.provide(WorkBus.ProjectWorkEventBusLive))
-    .pipe(Layer.provideMerge(resources));
+  const workAdmission = WorkAdmission.layer.pipe(
+    Layer.provide(WorkBus.ProjectWorkEventBusLive),
+    Layer.provideMerge(resources),
+  );
   const admission = AssistantAdmission.layer.pipe(Layer.provideMerge(workAdmission));
   const sink = Layer.fresh(EventSink.layerWithAdmission).pipe(Layer.provideMerge(admission));
   const commands = ThreadCommandExecutor.layer.pipe(Layer.provideMerge(sink));
@@ -225,7 +233,9 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
   const title = Layer.succeed(
     ThreadTitleRegenerationService.ThreadTitleRegenerationService,
     ThreadTitleRegenerationService.ThreadTitleRegenerationService.of({
-      execute: () => Effect.void,
+      execute: Effect.fn("ThreadTitleRegenerationService.ThreadTitleRegenerationService.execute")(
+        () => Effect.void,
+      ),
     }),
   ).pipe(Layer.provideMerge(rollback));
   const executor = EffectWorker.layerExecutor.pipe(Layer.provideMerge(title));

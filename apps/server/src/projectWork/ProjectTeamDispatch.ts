@@ -117,7 +117,7 @@ const make = Effect.gen(function* () {
     const advance = journal.advance(snapshot, stage, at);
     return yield* advance.pipe(
       Effect.catchTags({
-        ProjectTeamDispatchJournalError: (error) =>
+        ProjectTeamDispatchJournalError: Effect.fn("ProjectTeamDispatchJournalError")((error) =>
           Effect.gen(function* () {
             if (error.reason !== "stale-fence") return yield* error;
             const current = yield* journal.read(snapshot.dispatchId);
@@ -134,6 +134,7 @@ const make = Effect.gen(function* () {
               return yield* journal.advance(current.value, stage, at);
             return yield* error;
           }),
+        ),
       }),
     );
   });

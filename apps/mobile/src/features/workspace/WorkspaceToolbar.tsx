@@ -1,9 +1,7 @@
 import { useFocusEffect } from "@react-navigation/native";
-import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  BackHandler,
   Keyboard,
-  Platform,
   Pressable,
   View,
   useWindowDimensions,
@@ -14,18 +12,20 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { SymbolView, type AppSymbolName } from "../../components/ui/AppSymbol";
 import { GlassSurface } from "../../components/ui/GlassSurface";
+import { useHardwareBack } from "../../lib/backHandler";
 import { useHardwareKeyboardCommand } from "../keyboard/hardwareKeyboardCommands";
 import { WorkspaceDock } from "./WorkspaceDock";
 import { WorkspaceSearchField } from "./WorkspaceSearchField";
 import { useWorkspaceTabs } from "./WorkspaceTabsContext";
-import { WORKSPACE_TOOLBAR, type WorkspaceTab } from "./workspace-tabs-state";
-import { PullRequestGlyph } from "../pull-requests/pullRequestGlyphs";
+import { WORKSPACE_TOOLBAR } from "./workspace-tabs-state";
+import { NAVIGATION_TAB_ICONS, WORKSPACE_TAB_LABELS } from "./navigation-tabs";
+import { NAVIGATION_TAB_ORDER } from "./navigation-tab-order";
 
-const TABS: ReadonlyArray<{ id: WorkspaceTab; label: string; icon: AppSymbolName }> = [
-  { id: "threads", label: "Threads", icon: "text.bubble" },
-  { id: "pullRequests", label: "PRs", icon: PullRequestGlyph.pullRequest },
-  { id: "work", label: "Work", icon: "checkmark.circle" },
-];
+const TABS = NAVIGATION_TAB_ORDER.map((id) => ({
+  id,
+  label: WORKSPACE_TAB_LABELS[id],
+  icon: NAVIGATION_TAB_ICONS[id],
+}));
 
 function ToolbarButton(props: {
   label: string;
@@ -80,18 +80,14 @@ export function WorkspaceToolbar(props: {
       );
     workspace?.dispatch({ type: "cancel" });
   }, [workspace]);
-  const handleBack = useEffectEvent(() => {
-    if (!workspace || workspace.state.tabs[workspace.state.selectedTab].searchMode === "resting")
-      return false;
+  const searchOpen =
+    workspace !== null &&
+    workspace.state.tabs[workspace.state.selectedTab].searchMode !== "resting";
+  useHardwareBack(searchOpen, () => {
     if (keyboardVisible) Keyboard.dismiss();
     else cancelSearch();
     return true;
   });
-  useEffect(() => {
-    if (Platform.OS !== "android") return;
-    const subscription = BackHandler.addEventListener("hardwareBackPress", handleBack);
-    return () => subscription.remove();
-  }, []);
   useEffect(() => {
     if (focusRequest > 0) input.current?.focus();
   }, [focusRequest]);

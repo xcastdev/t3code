@@ -289,11 +289,10 @@ const make = Effect.gen(function* () {
         binding.leaseGeneration !== current.fence
       )
         return denied("owner-fence-stale");
-      try {
-        assertProjectTeamRunAuthority(state, binding, role, binding.status === "reserved");
-      } catch {
-        return denied("owner-authority-revoked");
-      }
+      const authorized = yield* Effect.try(() =>
+        assertProjectTeamRunAuthority(state, binding, role, binding.status === "reserved"),
+      ).pipe(Effect.isSuccess);
+      if (!authorized) return denied("owner-authority-revoked");
       if (
         (state.foundationRecords ?? []).some(
           (record) =>
@@ -645,11 +644,10 @@ const make = Effect.gen(function* () {
       (record) => record.kind === "role-revision" && record.recordId === rootBinding.roleRevisionId,
     );
     if (role?.kind !== "role-revision") return denied("owner-role-unavailable");
-    try {
-      assertProjectTeamRunAuthority(state, rootBinding, role, rootBinding.status === "reserved");
-    } catch {
-      return denied("owner-authority-revoked");
-    }
+    const authorized = yield* Effect.try(() =>
+      assertProjectTeamRunAuthority(state, rootBinding, role, rootBinding.status === "reserved"),
+    ).pipe(Effect.isSuccess);
+    if (!authorized) return denied("owner-authority-revoked");
     const prior =
       yield* sql<Row>`SELECT * FROM t3_workflow_v2_run_admissions WHERE binding_id=${rootBinding.recordId} ORDER BY generation DESC LIMIT 1`;
     const workLineage = workTaskLineage(state, rootBinding.taskId);
@@ -1155,7 +1153,7 @@ const make = Effect.gen(function* () {
       Effect.mapError((cause) => new RunAdmission.RunAdmissionError({ operation, cause })),
     );
   return RunAdmission.RunAdmission.of({
-    prepareResources: (input) =>
+    prepareResources: Effect.fn("RunAdmission.RunAdmission.prepareResources")((input) =>
       wrap(
         "prepareResources",
         Effect.gen(function* () {
@@ -1187,14 +1185,27 @@ const make = Effect.gen(function* () {
           return prepared;
         }),
       ),
-    commit: (input) => wrap("commit", commit(input)),
-    check: (input) => wrap("check", sql.withTransaction(check(input))),
-    reconcileNative: (input) => wrap("reconcileNative", reconcileNative(input)),
-    deadline: (input) => wrap("deadline", deadline(input)),
-    settle: (input) => wrap("settle", settle(input)),
-    validateDeadlineStop: (input) => wrap("validateDeadlineStop", validateDeadlineStop(input)),
-    observeNativeTurn: (input) => wrap("observeNativeTurn", observeNativeTurn(input)),
-    publishCommitted: (commandId) => publishCommitted(commandId).pipe(Effect.ignore),
+    ),
+    commit: Effect.fn("RunAdmission.RunAdmission.commit")((input) => wrap("commit", commit(input))),
+    check: Effect.fn("RunAdmission.RunAdmission.check")((input) =>
+      wrap("check", sql.withTransaction(check(input))),
+    ),
+    reconcileNative: Effect.fn("RunAdmission.RunAdmission.reconcileNative")((input) =>
+      wrap("reconcileNative", reconcileNative(input)),
+    ),
+    deadline: Effect.fn("RunAdmission.RunAdmission.deadline")((input) =>
+      wrap("deadline", deadline(input)),
+    ),
+    settle: Effect.fn("RunAdmission.RunAdmission.settle")((input) => wrap("settle", settle(input))),
+    validateDeadlineStop: Effect.fn("RunAdmission.RunAdmission.validateDeadlineStop")((input) =>
+      wrap("validateDeadlineStop", validateDeadlineStop(input)),
+    ),
+    observeNativeTurn: Effect.fn("RunAdmission.RunAdmission.observeNativeTurn")((input) =>
+      wrap("observeNativeTurn", observeNativeTurn(input)),
+    ),
+    publishCommitted: Effect.fn("RunAdmission.RunAdmission.publishCommitted")((commandId) =>
+      publishCommitted(commandId).pipe(Effect.ignore),
+    ),
   });
 });
 export const layer = Layer.effect(RunAdmission.RunAdmission, make);

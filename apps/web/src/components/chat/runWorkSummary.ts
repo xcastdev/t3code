@@ -2,7 +2,7 @@ import {
   RETENTION_LABELS,
   savedEffortLabel,
 } from "@t3tools/client-runtime/state/thread-history-presentation";
-import type { OrchestrationV2Run, OrchestrationV2TurnItem } from "@t3tools/contracts";
+import type { OrchestrationV2Run } from "@t3tools/contracts";
 import { deriveTurnWorkCounts, type TurnWorkCounts } from "@t3tools/shared/turnWorkCounts";
 
 export interface RunWorkSummary {
@@ -20,7 +20,7 @@ const plural = (count: number, one: string, many: string) => `${count} ${count =
  */
 export function latestRunWork(input: {
   readonly runs: ReadonlyArray<OrchestrationV2Run>;
-  readonly turnItems: ReadonlyArray<OrchestrationV2TurnItem>;
+  readonly turnItems: Parameters<typeof deriveTurnWorkCounts>[0]["turnItems"];
   readonly hasMoreHistory: boolean;
 }): RunWorkSummary | null {
   const latest = input.runs.at(-1);

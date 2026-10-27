@@ -84,6 +84,8 @@ it.effect(
       );
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE orchestration_v2_projection_runs(status TEXT,thread_id TEXT,run_id TEXT)`;
+        yield* sql`CREATE TABLE orchestration_events(stream_id TEXT,metadata_json TEXT,sequence INTEGER,aggregate_kind TEXT,command_id TEXT)`;
         yield* runWorkflowFeatureMigrations();
         yield* sql`CREATE TABLE projection_projects(project_id TEXT PRIMARY KEY, deleted_at TEXT)`;
         yield* sql`CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT PRIMARY KEY,project_id TEXT NOT NULL,deleted_at TEXT)`;
@@ -361,6 +363,8 @@ it.effect(
       const base = Layer.merge(NodeSqliteClient.layer({ filename: ":memory:" }), NodeCrypto.layer);
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TABLE orchestration_v2_projection_runs(status TEXT,thread_id TEXT,run_id TEXT)`;
+        yield* sql`CREATE TABLE orchestration_events(stream_id TEXT,metadata_json TEXT,sequence INTEGER,aggregate_kind TEXT,command_id TEXT)`;
         yield* runWorkflowFeatureMigrations();
         yield* sql`CREATE TABLE projection_projects(project_id TEXT PRIMARY KEY, deleted_at TEXT)`;
         yield* sql`CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT PRIMARY KEY,project_id TEXT NOT NULL,deleted_at TEXT)`;

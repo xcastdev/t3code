@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ProjectId } from "@t3tools/contracts";
+import { ProjectId, SourceControlProviderKind } from "@t3tools/contracts";
 import * as GitHubIssueApi from "@t3tools/source-control-github/server/GitHubIssueApi";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -62,7 +62,7 @@ function harness(
           calls.push(cwd);
           return {
             canonicalKey: `${account.host}/owner/repo`,
-            provider: options.provider ?? "github",
+            provider: SourceControlProviderKind.make(options.provider ?? "github"),
             displayName: "owner/repo",
             locator: {
               source: "git-remote" as const,

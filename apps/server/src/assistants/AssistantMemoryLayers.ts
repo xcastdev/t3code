@@ -32,10 +32,11 @@ export const layerOwnerAuthority = Layer.effect(
     const authority = yield* Memory.makeAssistantMemorySourceAuthority;
     return ProjectMemoryOwnerAuthority.of({
       ...authority,
-      assertCurrent: (scope) =>
+      assertCurrent: Effect.fn("ProjectMemoryOwnerAuthority.assertCurrent")((scope) =>
         ownership
           .assertCurrent(scope)
           .pipe(Effect.mapError((cause) => new ProjectMemoryError({ reason: "forbidden", cause }))),
+      ),
     });
   }),
 ).pipe(Layer.provideMerge(Ownership.layer), Layer.provideMerge(layerSources));
@@ -61,10 +62,11 @@ export const layerInstructionContext = Layer.effect(
   Effect.gen(function* () {
     const context = yield* Memory.makeAssistantMemoryContext;
     return AssistantInstructionEpoch.of({
-      context: (record) =>
+      context: Effect.fn("AssistantInstructionEpoch.context")((record) =>
         context(record).pipe(
           Effect.mapError((cause) => new AssistantError({ reason: "unavailable", cause })),
         ),
+      ),
     });
   }),
 ).pipe(

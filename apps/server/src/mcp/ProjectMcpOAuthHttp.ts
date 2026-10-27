@@ -23,13 +23,12 @@ export const handleProjectMcpOAuthCallbackRequest = Effect.fn("ProjectMcpOAuthHt
     const oauth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
     const webRequest = yield* HttpServerRequest.toWeb(request);
     const response = yield* oauth.completeCallback(webRequest).pipe(
-      Effect.catch(() =>
-        Effect.succeed(
+      Effect.orElseSucceed(
+        () =>
           new Response("OAuth authorization could not be completed.", {
             status: 400,
             headers: { "cache-control": "no-store" },
           }),
-        ),
       ),
     );
     return HttpServerResponse.fromWeb(response);

@@ -59,10 +59,10 @@ export const fixture = (
     }),
   ).pipe(Layer.provideMerge(repository));
   const sources = Layer.succeed(AssistantMemorySources, {
-    verify: (e) =>
-      e.content.startsWith("ASSISTANT:")
-        ? Effect.fail(new ProjectMemoryError({ reason: "forbidden" }))
-        : Effect.void,
+    verify: Effect.fn("AssistantMemorySources.verify")(function* (e) {
+      if (e.content.startsWith("ASSISTANT:"))
+        return yield* new ProjectMemoryError({ reason: "forbidden" });
+    }),
     discover: discover ?? (() => Effect.succeed({ items: [], nextCursor: null })),
   });
   const bridge = Layer.effect(
@@ -117,13 +117,17 @@ export const fixture = (
     ),
     Layer.provideMerge(
       Layer.succeed(ProjectMemoryConfiguration, {
-        read: () => Effect.succeed({ revision: 0, configuration: processingConfiguration }),
+        read: Effect.fn("ProjectMemoryConfiguration.read")(() =>
+          Effect.succeed({ revision: 0, configuration: processingConfiguration }),
+        ),
         set: unused,
       }),
     ),
     Layer.provide(
       Layer.succeed(ProjectMemoryModelRoutes, {
-        extract: (_scope, _route, sourceText) => extract({ sourceText }),
+        extract: Effect.fn("ProjectMemoryModelRoutes.extract")((_scope, _route, sourceText) =>
+          extract({ sourceText }),
+        ),
         embed: unused,
       }),
     ),

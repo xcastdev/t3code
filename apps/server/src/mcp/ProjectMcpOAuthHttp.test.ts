@@ -17,64 +17,58 @@ const requestFor = (url: string) =>
   );
 
 it.effect("returns a generic non-cacheable response when callback validation fails", () =>
-  ProjectMcpOAuthHttp.handleProjectMcpOAuthCallbackRequest()
-    .pipe(
-      Effect.provideService(
-        HttpServerRequest.HttpServerRequest,
-        requestFor("http://127.0.0.1/oauth/project-mcp/callback"),
-      ),
-      Effect.provideService(ProjectMcpOAuth.ProjectMcpOAuth, {
-        status: () => Effect.succeed("not-connected"),
-        providerFor: () => Effect.die("unused"),
-        begin: () => Effect.die("unused"),
-        continuePending: () => Effect.die("unused"),
-        completeCallback: () =>
-          Effect.fail(
-            new ProjectMcpOAuth.ProjectMcpOAuthError({
-              operation: "test",
-              cause: "sensitive provider failure",
-            }),
-          ),
-        disconnect: () => Effect.die("unused"),
-      }),
-    )
-    .pipe(
-      Effect.map(HttpServerResponse.toWeb),
-      Effect.tap((response) =>
-        Effect.sync(() => {
-          if (response.status !== 400) throw new Error(`expected 400, received ${response.status}`);
-          if (response.headers.get("cache-control") !== "no-store") {
-            throw new Error("OAuth callback response must not be cached");
-          }
-        }),
-      ),
+  ProjectMcpOAuthHttp.handleProjectMcpOAuthCallbackRequest().pipe(
+    Effect.provideService(
+      HttpServerRequest.HttpServerRequest,
+      requestFor("http://127.0.0.1/oauth/project-mcp/callback"),
     ),
+    Effect.provideService(ProjectMcpOAuth.ProjectMcpOAuth, {
+      status: () => Effect.succeed("not-connected"),
+      providerFor: () => Effect.die("unused"),
+      begin: () => Effect.die("unused"),
+      continuePending: () => Effect.die("unused"),
+      completeCallback: () =>
+        Effect.fail(
+          new ProjectMcpOAuth.ProjectMcpOAuthError({
+            operation: "test",
+            cause: "sensitive provider failure",
+          }),
+        ),
+      disconnect: () => Effect.die("unused"),
+    }),
+    Effect.map(HttpServerResponse.toWeb),
+    Effect.tap((response) =>
+      Effect.sync(() => {
+        if (response.status !== 400) throw new Error(`expected 400, received ${response.status}`);
+        if (response.headers.get("cache-control") !== "no-store") {
+          throw new Error("OAuth callback response must not be cached");
+        }
+      }),
+    ),
+  ),
 );
 
 it.effect("passes a successful OAuth callback response through unchanged", () =>
-  ProjectMcpOAuthHttp.handleProjectMcpOAuthCallbackRequest()
-    .pipe(
-      Effect.provideService(
-        HttpServerRequest.HttpServerRequest,
-        requestFor("http://127.0.0.1/oauth/project-mcp/callback?state=s&code=c"),
-      ),
-      Effect.provideService(ProjectMcpOAuth.ProjectMcpOAuth, {
-        status: () => Effect.succeed("not-connected"),
-        providerFor: () => Effect.die("unused"),
-        begin: () => Effect.die("unused"),
-        continuePending: () => Effect.die("unused"),
-        completeCallback: () => Effect.succeed(new Response("complete", { status: 200 })),
-        disconnect: () => Effect.die("unused"),
-      }),
-    )
-    .pipe(
-      Effect.map(HttpServerResponse.toWeb),
-      Effect.tap((response) =>
-        Effect.sync(() => {
-          if (response.status !== 200) throw new Error(`expected 200, received ${response.status}`);
-        }),
-      ),
+  ProjectMcpOAuthHttp.handleProjectMcpOAuthCallbackRequest().pipe(
+    Effect.provideService(
+      HttpServerRequest.HttpServerRequest,
+      requestFor("http://127.0.0.1/oauth/project-mcp/callback?state=s&code=c"),
     ),
+    Effect.provideService(ProjectMcpOAuth.ProjectMcpOAuth, {
+      status: () => Effect.succeed("not-connected"),
+      providerFor: () => Effect.die("unused"),
+      begin: () => Effect.die("unused"),
+      continuePending: () => Effect.die("unused"),
+      completeCallback: () => Effect.succeed(new Response("complete", { status: 200 })),
+      disconnect: () => Effect.die("unused"),
+    }),
+    Effect.map(HttpServerResponse.toWeb),
+    Effect.tap((response) =>
+      Effect.sync(() => {
+        if (response.status !== 200) throw new Error(`expected 200, received ${response.status}`);
+      }),
+    ),
+  ),
 );
 
 it.effect("serves an HTTPS Client ID Metadata Document without secrets", () =>

@@ -666,7 +666,7 @@ it.effect("routes coincident assistant IDs to independent environments", () =>
           },
           { immediate: true },
         );
-      yield* Effect.all(ready.map(Deferred.await));
+      yield* Effect.forEach(ready, Deferred.await);
       expect([...results.entries()]).toEqual([
         [environmentId, "First"],
         [otherEnvironment, "Second"],

@@ -8,7 +8,7 @@ export const layer = Layer.succeed(
   McpSessionRegistry.McpSessionRegistry,
   McpSessionRegistry.McpSessionRegistry.of({
     bindNativeRuntime: () => Effect.void,
-    resolveNativeRuntime: () => Effect.succeed(undefined),
+    resolveNativeRuntime: () => Effect.sync(() => undefined),
     onRevoke: () => Effect.succeed(() => {}),
     issue: ({ threadId, providerInstanceId }) =>
       Effect.succeed({
@@ -22,7 +22,7 @@ export const layer = Layer.succeed(
           browserToolsAvailable: true,
         },
       }),
-    resolve: () => Effect.succeed(undefined),
+    resolve: () => Effect.sync(() => undefined),
     touch: () => Effect.void,
     revokeProviderSession: () => Effect.void,
     revokeThread: () => Effect.void,

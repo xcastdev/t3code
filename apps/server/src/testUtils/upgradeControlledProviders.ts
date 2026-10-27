@@ -237,13 +237,24 @@ export const layerControlledProviders = Layer.unwrap(
         ProviderRegistry.ProviderRegistry,
         ProviderRegistry.ProviderRegistry.of({
           getProviders: Effect.succeed(visible),
-          refresh: () => Effect.succeed(visible),
-          refreshInstance: () => Effect.succeed(visible),
-          refreshAfterUpdate: () => Effect.succeed(visible),
-          refreshWorkspaceSnapshot: () => Effect.succeed(visible),
-          getProviderMaintenanceCapabilitiesForInstance: () =>
-            Effect.die("Fixture provider maintenance is disabled"),
-          setProviderMaintenanceActionState: () => Effect.succeed(visible),
+          refresh: Effect.fn("ProviderRegistry.ProviderRegistry.refresh")(() =>
+            Effect.succeed(visible),
+          ),
+          refreshInstance: Effect.fn("ProviderRegistry.ProviderRegistry.refreshInstance")(() =>
+            Effect.succeed(visible),
+          ),
+          refreshAfterUpdate: Effect.fn("ProviderRegistry.ProviderRegistry.refreshAfterUpdate")(
+            () => Effect.succeed(visible),
+          ),
+          refreshWorkspaceSnapshot: Effect.fn(
+            "ProviderRegistry.ProviderRegistry.refreshWorkspaceSnapshot",
+          )(() => Effect.succeed(visible)),
+          getProviderMaintenanceCapabilitiesForInstance: Effect.fn(
+            "ProviderRegistry.ProviderRegistry.getProviderMaintenanceCapabilitiesForInstance",
+          )(() => Effect.die("Fixture provider maintenance is disabled")),
+          setProviderMaintenanceActionState: Effect.fn(
+            "ProviderRegistry.ProviderRegistry.setProviderMaintenanceActionState",
+          )(() => Effect.succeed(visible)),
           streamChanges: Stream.empty,
         }),
       ),

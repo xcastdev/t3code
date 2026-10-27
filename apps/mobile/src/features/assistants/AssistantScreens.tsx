@@ -150,12 +150,9 @@ function EnvironmentAgents(props: {
               label={assistant.name}
               description={`${TONE_PREFIX[status.tone]}${status.label}${status.detail ? ` · ${status.detail}` : ""}`}
               onPress={() =>
-                navigation.navigate("SettingsSheet", {
-                  screen: "SettingsContent",
-                  params: {
-                    screen: "SettingsAgent",
-                    params: { environmentId, assistantId: assistant.assistantId },
-                  },
+                navigation.navigate("SettingsAgent", {
+                  environmentId,
+                  assistantId: assistant.assistantId,
                 })
               }
             />
@@ -240,15 +237,9 @@ function CreateAgentForm(props: {
             // The agent exists either way; a form left meanwhile must not navigate anywhere.
             if (result === null || !mounted.current) return;
             props.onDone();
-            navigation.navigate("SettingsSheet", {
-              screen: "SettingsContent",
-              params: {
-                screen: "SettingsAgent",
-                params: {
-                  environmentId: props.environmentId,
-                  assistantId: result.summary.assistantId,
-                },
-              },
+            navigation.navigate("SettingsAgent", {
+              environmentId: props.environmentId,
+              assistantId: result.summary.assistantId,
             });
           }}
         />
@@ -300,6 +291,7 @@ export function SettingsAgentRouteScreen({
   const detail = detailQuery.data;
   const selection = currentAssistantSelection(detail, connection.epoch);
   const latest = useRef(selection);
+  // oxlint-disable-next-line t3code/react-effect-budget -- Pending confirmations must read the latest committed remote revision.
   useEffect(() => {
     latest.current = selection;
   });

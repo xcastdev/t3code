@@ -185,18 +185,25 @@ export class RunAdmission extends Context.Service<
 export const layerOrdinary = Layer.succeed(
   RunAdmission,
   RunAdmission.of({
-    commit: (input) =>
+    commit: Effect.fn("RunAdmission.commit")((input) =>
       Effect.succeed(
         input.retainedOwner === undefined || input.retainedOwner === null
           ? { _tag: "ordinary" }
           : { _tag: "denied", reason: "retained-owner-unavailable" },
       ),
-    check: () => Effect.succeed({ _tag: "ordinary" }),
-    reconcileNative: () => Effect.succeed({ _tag: "ordinary" }),
-    deadline: () => Effect.succeed({ _tag: "stale" }),
-    settle: () => Effect.succeed([]),
-    validateDeadlineStop: () => Effect.succeed(false),
-    observeNativeTurn: () => Effect.succeed({ stop: false, cancelControlIds: [] }),
-    publishCommitted: () => Effect.void,
+    ),
+    check: Effect.fn("RunAdmission.check")(() => Effect.succeed({ _tag: "ordinary" })),
+    reconcileNative: Effect.fn("RunAdmission.reconcileNative")(() =>
+      Effect.succeed({ _tag: "ordinary" }),
+    ),
+    deadline: Effect.fn("RunAdmission.deadline")(() => Effect.succeed({ _tag: "stale" })),
+    settle: Effect.fn("RunAdmission.settle")(() => Effect.succeed([])),
+    validateDeadlineStop: Effect.fn("RunAdmission.validateDeadlineStop")(() =>
+      Effect.succeed(false),
+    ),
+    observeNativeTurn: Effect.fn("RunAdmission.observeNativeTurn")(() =>
+      Effect.succeed({ stop: false, cancelControlIds: [] }),
+    ),
+    publishCommitted: Effect.fn("RunAdmission.publishCommitted")(() => Effect.void),
   }),
 );

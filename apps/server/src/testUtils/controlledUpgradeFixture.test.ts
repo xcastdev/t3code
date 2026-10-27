@@ -59,18 +59,16 @@ const decodeRpcExit = Schema.decodeUnknownSync(
   Schema.Struct({
     requestId: Schema.String,
     exit: Schema.Union([
-      Schema.Struct({ _tag: Schema.Literal("Success"), value: Schema.Unknown }),
-      Schema.Struct({ _tag: Schema.Literal("Failure") }),
+      Schema.TaggedStruct("Success", { value: Schema.Unknown }),
+      Schema.TaggedStruct("Failure", {}),
     ]),
   }),
 );
 const decodeRpcJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeConfigExit = Schema.decodeUnknownSync(
-  Schema.Struct({
-    _tag: Schema.Literal("Exit"),
+  Schema.TaggedStruct("Exit", {
     requestId: Schema.String,
-    exit: Schema.Struct({
-      _tag: Schema.Literal("Success"),
+    exit: Schema.TaggedStruct("Success", {
       value: Schema.Struct({
         environment: Schema.Struct({ label: Schema.String, environmentId: Schema.String }),
         providers: Schema.Array(Schema.Unknown),
@@ -81,32 +79,27 @@ const decodeConfigExit = Schema.decodeUnknownSync(
 
 const decodeRequestId = Schema.decodeUnknownSync(Schema.Struct({ requestId: Schema.String }));
 const decodeNotificationExit = Schema.decodeUnknownSync(
-  Schema.Struct({
-    _tag: Schema.Literal("Exit"),
+  Schema.TaggedStruct("Exit", {
     requestId: Schema.Literal("fixture-notification"),
-    exit: Schema.Struct({
-      _tag: Schema.Literal("Success"),
+    exit: Schema.TaggedStruct("Success", {
       value: Schema.Struct({ status: Schema.Literal("delivered") }),
     }),
   }),
 );
 const decodeLifecycleChunk = Schema.decodeUnknownSync(
-  Schema.Struct({
-    _tag: Schema.Literal("Chunk"),
+  Schema.TaggedStruct("Chunk", {
     requestId: Schema.Literal("fixture-lifecycle"),
     values: Schema.Array(ServerLifecycleStreamEvent),
   }),
 );
 const decodeConfigChunk = Schema.decodeUnknownSync(
-  Schema.Struct({
-    _tag: Schema.Literal("Chunk"),
+  Schema.TaggedStruct("Chunk", {
     requestId: Schema.Literal("fixture-config-stream"),
     values: Schema.Array(ServerConfigStreamEvent),
   }),
 );
 const decodeShellChunk = Schema.decodeUnknownSync(
-  Schema.Struct({
-    _tag: Schema.Literal("Chunk"),
+  Schema.TaggedStruct("Chunk", {
     requestId: Schema.Literal("fixture-shell"),
     values: Schema.Array(OrchestrationV2ShellStreamItem),
   }),
