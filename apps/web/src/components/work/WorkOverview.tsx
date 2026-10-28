@@ -7,23 +7,19 @@ import { ProjectWorkAttentionRead, type ProjectWorkTaskId } from "@t3tools/contr
 import * as Schema from "effect/Schema";
 import { useState } from "react";
 
-import { Badge } from "../ui/badge";
+import { Collapsible, CollapsibleTrigger, CollapsiblePanel } from "../ui/collapsible";
+import { WorkStatus } from "./WorkStatus";
 import { Button } from "../ui/button";
 import { WorkEmpty, WorkMeta, WorkRevision, WorkRow, WorkSection } from "./WorkLayout";
 import { WorkNotice, WorkPager } from "./WorkNotice";
 import { WorkTaskLink } from "./WorkTaskRefs";
-import { WorkInbox, WorkSupervision } from "./WorkSupervision";
-import { WorkTeam } from "./WorkTeam";
+import { WorkInbox, WorkSupervision, WorkProgress } from "./WorkSupervision";
+import { WorkTeamRail } from "./WorkTeamRoster";
 import { useWorkRead } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
 import type { WorkWriter } from "./useWorkWriter";
 import { pageWindow } from "./workLogic";
-import {
-  isMissionRecord,
-  workStateLabel,
-  workStateVariant,
-  type WorkMissionRecord,
-} from "./workModel";
+import { isMissionRecord, type WorkMissionRecord } from "./workModel";
 
 const isAttention = Schema.is(ProjectWorkAttentionRead);
 const REQUIRED_TASK_WINDOW = 10;
@@ -32,11 +28,14 @@ export function WorkOverview({
   scope,
   writer,
   onOpenTask,
+  onOpenTeam,
 }: {
   readonly scope: ProjectWorkScope;
   readonly writer: WorkWriter;
   readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
+  readonly onOpenTeam: () => void;
 }) {
+  const [briefOpen, setBriefOpen] = useState(false);
   const briefingView = useWorkRead(scope.environmentId, {
     projectId: scope.projectId,
     operation: "briefing",
@@ -45,7 +44,7 @@ export function WorkOverview({
   const attention = useWorkPage(
     scope.environmentId,
     { projectId: scope.projectId, operation: "attention" },
-    32,
+    6,
   );
   const missions = useWorkPage(
     scope.environmentId,
@@ -63,89 +62,92 @@ export function WorkOverview({
   });
 
   return (
-    <div className="flex min-w-0 flex-col gap-6">
-      <WorkSection
-        title="Brief"
-        description={
-          briefing ? (
-            <>
-              Generated from project revision{" "}
-              <WorkRevision>r{briefing.sourceRevision}</WorkRevision>
-            </>
-          ) : undefined
-        }
+    <div className="grid min-w-0 items-start gap-6 @5xl/work:grid-cols-[minmax(0,1fr)_19rem]">
+      <div className="min-w-0 @5xl/work:col-start-1 @5xl/work:row-start-1">
+        <WorkSupervision scope={scope} onOpenTask={onOpenTask}>
+          {attention.view.status !== "ready" ? (
+            <WorkRow>
+              <WorkNotice view={attention.view} subject="attention" />
+            </WorkRow>
+          ) : null}
+          {attentionItems.map((entry) => (
+            <WorkRow key={`${entry.taskId}:${entry.reason}`} className="gap-2 py-3.5">
+              <WorkStatus state={entry.reason} />
+              <WorkTaskLink scope={scope} taskId={entry.taskId} onOpen={onOpenTask} />
+              {entry.detail ? <WorkMeta>{entry.detail}</WorkMeta> : null}
+            </WorkRow>
+          ))}
+          {attentionItems.length === 0 && attention.view.page ? (
+            <WorkRow>
+              <WorkMeta>No other decisions on this page.</WorkMeta>
+            </WorkRow>
+          ) : null}
+          <WorkPager pager={attention} noun="Decisions" />
+        </WorkSupervision>
+      </div>
+      <aside
+        className="flex min-w-0 flex-col gap-6 @5xl/work:col-start-2 @5xl/work:row-span-2 @5xl/work:row-start-1"
+        aria-label="Team and progress"
       >
-        {briefing === null ? (
-          <WorkRow>
-            <WorkNotice view={briefingView} subject="the brief" />
-            {briefingView.status === "ready" ? (
-              <WorkMeta>No brief is available yet.</WorkMeta>
+        <WorkTeamRail scope={scope} onManage={onOpenTeam} onOpenTask={onOpenTask} />
+        <WorkProgress scope={scope} />
+      </aside>
+      <div className="min-w-0 @5xl/work:col-start-1 @5xl/work:row-start-2">
+        <WorkInbox scope={scope} writer={writer} onOpenTask={onOpenTask} />
+      </div>
+      <div className="min-w-0 @5xl/work:col-span-2">
+        <WorkSection
+          title="Missions"
+          description="Groups of tasks toward one outcome. New missions come from refining an issue in Intake."
+        >
+          {missions.view.status !== "ready" ? (
+            <WorkRow>
+              <WorkNotice view={missions.view} subject="missions" />
+            </WorkRow>
+          ) : null}
+          {missionItems.length === 0 && missions.view.page !== null ? (
+            <WorkEmpty title={missions.offset === 0 ? "No missions" : "No more missions"} />
+          ) : null}
+          {missionItems.map((mission) => (
+            <MissionRow
+              key={mission.recordId}
+              scope={scope}
+              mission={mission}
+              onOpenTask={onOpenTask}
+            />
+          ))}
+          <WorkPager pager={missions} noun="Missions" />
+        </WorkSection>
+      </div>
+      <div className="min-w-0 rounded-xl border border-border/60 bg-card/40 @5xl/work:col-span-2">
+        <Collapsible open={briefOpen} onOpenChange={setBriefOpen}>
+          <div className="flex flex-wrap items-center justify-between gap-2 p-4">
+            <CollapsibleTrigger render={<Button size="sm" variant="ghost" />}>
+              {briefOpen ? "Hide project brief" : "Project brief"}
+            </CollapsibleTrigger>
+            {briefing ? (
+              <WorkMeta>
+                Generated from project <WorkRevision>r{briefing.sourceRevision}</WorkRevision>
+              </WorkMeta>
             ) : null}
-          </WorkRow>
-        ) : (
-          <WorkRow className="gap-2">
-            <p className="max-w-3xl text-sm whitespace-pre-wrap break-words">
+          </div>
+          {!briefOpen && briefing ? (
+            <p className="line-clamp-2 px-4 pb-4 text-sm text-muted-foreground">
               {briefing.narrative ?? briefing.text}
             </p>
-            {briefing.omittedReasons.length > 0 ? (
-              <WorkMeta>Shortened: {briefing.omittedReasons.join(" · ")}</WorkMeta>
-            ) : null}
-          </WorkRow>
-        )}
-      </WorkSection>
-
-      <WorkSupervision scope={scope} onOpenTask={onOpenTask} />
-      <WorkInbox scope={scope} writer={writer} onOpenTask={onOpenTask} />
-
-      <WorkSection title="Needs attention">
-        {attention.view.status !== "ready" ? (
-          <WorkRow>
-            <WorkNotice view={attention.view} subject="attention" />
-          </WorkRow>
-        ) : null}
-        {attentionItems.length === 0 && attention.view.page !== null ? (
-          <WorkEmpty
-            title={attention.offset === 0 ? "Nothing needs attention" : "Nothing open on this page"}
-          />
-        ) : null}
-        {attentionItems.map((entry) => (
-          <WorkRow key={`${entry.taskId}:${entry.reason}`} className="flex-row items-center gap-3">
-            <div className="min-w-0 flex-1">
-              <p className="text-sm">{workStateLabel(entry.reason)}</p>
-              {entry.detail ? <WorkMeta className="break-words">{entry.detail}</WorkMeta> : null}
+          ) : null}
+          <CollapsiblePanel animate={false}>
+            <div className="px-4 pb-4">
+              <WorkNotice view={briefingView} subject="the brief" />
+              {briefing ? (
+                <p className="max-w-3xl text-sm whitespace-pre-wrap break-words text-muted-foreground">
+                  {briefing.narrative ?? briefing.text}
+                </p>
+              ) : null}
             </div>
-            <Button size="xs" variant="outline" onClick={() => onOpenTask(entry.taskId)}>
-              Open task
-            </Button>
-          </WorkRow>
-        ))}
-        <WorkPager pager={attention} noun="Items" />
-      </WorkSection>
-
-      <WorkSection
-        title="Missions"
-        description="Groups of tasks toward one outcome. New missions come from refining an issue in Intake."
-      >
-        {missions.view.status !== "ready" ? (
-          <WorkRow>
-            <WorkNotice view={missions.view} subject="missions" />
-          </WorkRow>
-        ) : null}
-        {missionItems.length === 0 && missions.view.page !== null ? (
-          <WorkEmpty title={missions.offset === 0 ? "No missions" : "No more missions"} />
-        ) : null}
-        {missionItems.map((mission) => (
-          <MissionRow
-            key={mission.recordId}
-            scope={scope}
-            mission={mission}
-            onOpenTask={onOpenTask}
-          />
-        ))}
-        <WorkPager pager={missions} noun="Missions" />
-      </WorkSection>
-
-      <WorkTeam scope={scope} writer={writer} />
+          </CollapsiblePanel>
+        </Collapsible>
+      </div>
     </div>
   );
 }
@@ -173,7 +175,7 @@ function MissionRow({
     <WorkRow className="gap-2">
       <div className="flex flex-wrap items-center gap-2">
         <p className="min-w-0 flex-1 text-sm font-medium break-words">{mission.title}</p>
-        <Badge variant={workStateVariant(mission.status)}>{workStateLabel(mission.status)}</Badge>
+        <WorkStatus state={mission.status} />
       </div>
       {mission.objective ? (
         <p className="text-sm whitespace-pre-wrap break-words text-muted-foreground">

@@ -3,12 +3,11 @@ import type { ProjectWorkTaskId, ProjectWorkTaskRead } from "@t3tools/contracts"
 import { CheckIcon } from "lucide-react";
 
 import { cn } from "../../lib/utils";
-import { Badge } from "../ui/badge";
+import { WorkStatus } from "./WorkStatus";
 import { useWorkRead } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
 import { WorkMeta, WorkRevision } from "./WorkLayout";
 import { WorkNotice, WorkPager } from "./WorkNotice";
-import { workStateLabel, workStateVariant } from "./workModel";
 
 const NO_TASKS: ReadonlyArray<ProjectWorkTaskId> = [];
 const rowClass =
@@ -46,11 +45,7 @@ export function WorkTaskLink({
               ? "Task unavailable"
               : `Task ${taskId.slice(0, 8)}`}
       </span>
-      {known ? (
-        <Badge size="sm" variant={workStateVariant(task.state)}>
-          {workStateLabel(task.state)}
-        </Badge>
-      ) : null}
+      {known ? <WorkStatus state={task.state} /> : null}
     </button>
   );
 }

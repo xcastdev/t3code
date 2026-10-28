@@ -3,6 +3,9 @@ import type { ProjectTeamRecordRead } from "@t3tools/contracts";
 import { useState } from "react";
 
 import { randomUUID } from "../../lib/utils";
+import { WorkMemberAvatar, WorkMemberName } from "./WorkMemberAvatar";
+import { WorkStatus } from "./WorkStatus";
+import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -52,6 +55,11 @@ import { guidedFields, teamFields, useWorkReview, type WorkTaskSurface } from ".
  */
 export function WorkTaskTeam({ surface }: { surface: WorkTaskSurface }) {
   if (!surface.model.guided) return null;
+  return <GuidedTaskTeam surface={surface} />;
+}
+
+function GuidedTaskTeam({ surface }: { surface: WorkTaskSurface }) {
+  const { roster } = useWorkTeamRoster(surface.scope);
   const bindings = recordsOfKind(surface.records, "run-binding").toSorted((a, b) =>
     b.updatedAt.localeCompare(a.updatedAt),
   );
@@ -63,11 +71,16 @@ export function WorkTaskTeam({ surface }: { surface: WorkTaskSurface }) {
       {bindings.length === 0 ? <WorkEmpty title="No worker has run this task yet" /> : null}
       {bindings.slice(0, 8).map((binding) => {
         const phase = bindingPhase(binding.status);
+        const member = roster.find((member) => member.recordId === binding.memberId);
         return (
           <WorkRow key={binding.recordId}>
             <div className="flex flex-wrap items-center gap-2">
-              <Badge variant={phase.tone}>{phase.label}</Badge>
-              <span className="min-w-0 truncate text-sm">{binding.model}</span>
+              {member ? <WorkMemberAvatar member={member} /> : null}
+              <span className="text-sm font-medium">{member?.name ?? "Team member"}</span>
+              <WorkStatus state={binding.status} label={phase.label} tone={phase.tone} />
+              <span className="min-w-0 truncate text-xs text-muted-foreground">
+                {binding.model}
+              </span>
               <WorkRevision className="text-muted-foreground">r{binding.revision}</WorkRevision>
               <span className="min-w-0 flex-1" />
               <WorkMeta>
@@ -92,8 +105,8 @@ export function WorkTaskTeam({ surface }: { surface: WorkTaskSurface }) {
       })}
       <ProposeWork surface={surface} />
       <StartWorker surface={surface} />
-      <WorkQuestions surface={surface} />
-      <WorkMessages surface={surface} />
+      <WorkQuestions surface={surface} roster={roster} />
+      <WorkMessages surface={surface} roster={roster} />
     </WorkSection>
   );
 }
@@ -221,7 +234,7 @@ function StartWorker({ surface }: { surface: WorkTaskSurface }) {
                   disabled={entry.ineligible !== null}
                 >
                   {entry.member.name} · {entry.role.role} · {entry.role.model}
-                  {entry.ineligible !== null ? ` — ${entry.ineligible}` : ""}
+                  {entry.ineligible !== null ? ` · ${entry.ineligible}` : ""}
                 </SelectItem>
               ))}
             </SelectPopup>
@@ -416,7 +429,7 @@ function ProposeWork({ surface }: { surface: WorkTaskSurface }) {
       {kind === "execution" ? (
         <WorkMeta>
           Authorizes one worker to deliver this task under the approved scope and plan, r
-          {context.task.specRevision}/{model.plan?.planRevision ?? "—"}.
+          {context.task.specRevision}/{model.plan?.planRevision ?? "not proposed"}.
         </WorkMeta>
       ) : (
         <>
@@ -500,7 +513,13 @@ function ProposeWork({ surface }: { surface: WorkTaskSurface }) {
   );
 }
 
-function WorkQuestions({ surface }: { surface: WorkTaskSurface }) {
+function WorkQuestions({
+  surface,
+  roster,
+}: {
+  surface: WorkTaskSurface;
+  roster: ReturnType<typeof useWorkTeamRoster>["roster"];
+}) {
   const questions = recordsOfKind(surface.records, "question").toSorted((a, b) =>
     b.updatedAt.localeCompare(a.updatedAt),
   );
@@ -509,7 +528,12 @@ function WorkQuestions({ surface }: { surface: WorkTaskSurface }) {
   return (
     <>
       {pending.map((question) => (
-        <QuestionRow key={question.recordId} surface={surface} question={question} />
+        <QuestionRow
+          key={question.recordId}
+          surface={surface}
+          question={question}
+          sender={roster.find((member) => member.recordId === question.senderId)}
+        />
       ))}
       {answered.map((question) => (
         <WorkRow key={question.recordId}>
@@ -526,9 +550,11 @@ function WorkQuestions({ surface }: { surface: WorkTaskSurface }) {
 function QuestionRow({
   surface,
   question,
+  sender,
 }: {
   surface: WorkTaskSurface;
   question: WorkQuestionRecord;
+  sender: ReturnType<typeof useWorkTeamRoster>["roster"][number] | undefined;
 }) {
   const { writer } = surface;
   const [answer, setAnswer] = useState("");
@@ -549,10 +575,11 @@ function QuestionRow({
   };
   return (
     <WorkRow className="gap-2">
-      <div className="flex items-center gap-2">
-        <Badge variant="warning">Waiting for you</Badge>
+      <div className="flex flex-wrap items-center gap-2">
+        <WorkMemberName member={sender} />
+        <WorkStatus state="waiting" label="Waiting for you" tone="warning" />
         <WorkMeta>
-          From {question.senderId} · <WorkTime value={question.updatedAt} />
+          <WorkTime value={question.updatedAt} />
         </WorkMeta>
       </div>
       <p className="text-sm whitespace-pre-wrap break-words">{question.body}</p>
@@ -681,7 +708,13 @@ const MESSAGE_ACTION_LABEL: Record<WorkMessageAction, string> = {
   resolve: "Resolve",
 };
 
-function WorkMessages({ surface }: { surface: WorkTaskSurface }) {
+function WorkMessages({
+  surface,
+  roster,
+}: {
+  surface: WorkTaskSurface;
+  roster: ReturnType<typeof useWorkTeamRoster>["roster"];
+}) {
   const { writer, model } = surface;
   const messages = openMessages(surface.records).slice(0, 8);
   const blocked = model.blockedReason ?? surface.blocked;
@@ -721,8 +754,11 @@ function WorkMessages({ surface }: { surface: WorkTaskSurface }) {
       {messages.map((message) => (
         <WorkRow key={message.recordId} className="gap-1.5">
           <div className="flex flex-wrap items-center gap-2">
+            <WorkMemberName
+              member={roster.find((member) => member.recordId === message.senderId)}
+            />
             <WorkMeta>
-              {message.senderId} · <WorkTime value={message.updatedAt} />
+              <WorkTime value={message.updatedAt} />
             </WorkMeta>
             {message.status === "uncertain" ? (
               <Badge variant="error">Delivery unknown</Badge>

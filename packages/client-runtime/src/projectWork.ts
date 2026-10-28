@@ -523,3 +523,13 @@ export function prepareProjectWorkRecoveredDelivery(input: {
     },
   };
 }
+
+export {
+  agentFace,
+  generateAgentAvatar,
+  sameAgentAvatar,
+  switchAgentAvatarMode,
+  AGENT_AVATAR_TONES,
+  AGENT_AVATAR_MOODS,
+  type AgentAvatarShape,
+} from "./agentAvatar.ts";

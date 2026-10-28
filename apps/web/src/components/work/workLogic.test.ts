@@ -23,6 +23,7 @@ import {
   decisionChanged,
   decisionSnapshot,
   emptyTeamConfiguration,
+  fillPresetNames,
   existingTaskRefineChanged,
   existingTaskRefineFields,
   existingTaskRefineSnapshot,
@@ -269,6 +270,79 @@ describe("recordedTeamConfiguration", () => {
     ]);
   });
 
+  it("round-trips custom member names through team edits", () => {
+    const records = installedTeam(3, "disabled");
+    const named = recordedTeamConfiguration([
+      ...records,
+      decodeRecord({
+        ...teamFields,
+        recordId: "member:coordinator",
+        revision: 2,
+        generation: 3,
+        kind: "member",
+        status: "paused",
+        name: "Atlas",
+        coordinator: true,
+        roleRevisionId: "role:coordinator:3",
+      }),
+    ]);
+    expect(named.kind).toBe("configured");
+    if (named.kind !== "configured") return;
+    expect(named.values.profiles[0]).toHaveProperty("name", "Atlas");
+    const built = buildTeamConfigurationIntent({
+      values: named.values,
+      recorded: named.values,
+      commandId: CommandId.make("rename"),
+      projectId: ProjectId.make("project-1"),
+      expectedRevision: 10,
+      expectedConfigurationGeneration: 3,
+      availableModels: new Set(["model-a"]),
+    });
+    expect("intent" in built && built.intent.profiles[0]).toHaveProperty("name", "Atlas");
+  });
+
+  it("keeps saved avatar settings through edits and carries an explicit initials reset", () => {
+    const avatar = {
+      kind: "generated",
+      version: 1,
+      seed: 42,
+      tone: "paper",
+      expression: "curious",
+      motion: true,
+    };
+    const result = recordedTeamConfiguration([
+      ...installedTeam(3, "disabled"),
+      decodeRecord({
+        ...teamFields,
+        recordId: "member:coordinator",
+        revision: 2,
+        generation: 3,
+        kind: "member",
+        status: "paused",
+        name: "Atlas",
+        coordinator: true,
+        roleRevisionId: "role:coordinator:3",
+        avatar,
+      }),
+    ]);
+    expect(result.kind).toBe("configured");
+    if (result.kind !== "configured") return;
+    expect(result.values.profiles[0]).toHaveProperty("avatar", avatar);
+    const built = buildTeamConfigurationIntent({
+      values: {
+        ...result.values,
+        profiles: result.values.profiles.map((p, i) => (i === 0 ? { ...p, avatar: null } : p)),
+      },
+      recorded: result.values,
+      commandId: CommandId.make("reset-avatar"),
+      projectId: ProjectId.make("project-1"),
+      expectedRevision: 10,
+      expectedConfigurationGeneration: 3,
+      availableModels: new Set(["model-a"]),
+    });
+    expect("intent" in built && built.intent.profiles[0]).toHaveProperty("avatar", null);
+  });
+
   it("stays read-only when a referenced profile is missing", () => {
     const [limits, ...roles] = installedTeam(2);
     expect(recordedTeamConfiguration([limits!, ...roles.slice(1)]).kind).toBe("unreadable");
@@ -305,6 +379,50 @@ describe("buildTeamConfigurationIntent", () => {
       expectedConfigurationGeneration: 3,
       modelPolicies: [{ model: "m1" }],
     });
+  });
+
+  it("resolves blank names to their role and preserves deliberate overrides", () => {
+    const draft = {
+      ...values,
+      profiles: values.profiles.map((p, at) => ({ ...p, name: at === 0 ? "  My lead  " : " " })),
+    };
+    const built = buildTeamConfigurationIntent({
+      ...base,
+      values: draft,
+      recorded: null,
+      availableModels: new Set(["m1"]),
+    });
+    expect("intent" in built && built.intent.profiles.map((p) => p.name)).toEqual([
+      "My lead",
+      "investigator",
+      "planner",
+      "implementer",
+      "reviewer",
+      "integrator",
+    ]);
+    const filled = fillPresetNames(draft);
+    expect(filled.profiles[0]?.name).toBe("  My lead  ");
+    expect(filled.profiles[1]?.name).toBe("Iris");
+    expect(filled.profiles[1]?.model).toBe("m1");
+    expect(filled.modelPolicies).toEqual(values.modelPolicies);
+    expect(filled.providerInstanceId).toBe(values.providerInstanceId);
+    expect(filled.profiles.map(({ name: _name, ...p }) => p)).toEqual(
+      values.profiles.map(({ name: _name, ...p }) => p),
+    );
+  });
+
+  it("rejects duplicate names including a custom name matching a blank role", () => {
+    const duplicate = {
+      ...values,
+      profiles: values.profiles.map((p, at) => ({ ...p, name: at === 0 ? " PLANNER " : "" })),
+    };
+    const built = buildTeamConfigurationIntent({
+      ...base,
+      values: duplicate,
+      recorded: null,
+      availableModels: new Set(["m1"]),
+    });
+    expect(built).toHaveProperty("reason");
   });
 
   it("refuses a model the provider no longer offers", () => {

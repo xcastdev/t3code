@@ -48,6 +48,7 @@ import {
   EMPTY_MCP_SERVER_FORM,
   mcpApplicationSummary,
   mcpCatalogRows,
+  matchesResourceQuery,
   mcpDefinitionInputFromForm,
   mcpFormFromDefinition,
   mcpOverrideFieldsFromRow,
@@ -179,7 +180,13 @@ export function useMcpCatalogView(target: ResourceSettingsTarget) {
  * its live MCP session, once the thread has one. Delivered state is shown only
  * where the server reports it.
  */
-export function McpCatalogSettings({ target }: { target: ResourceSettingsTarget }) {
+export function McpCatalogSettings({
+  target,
+  query = "",
+}: {
+  target: ResourceSettingsTarget;
+  query?: string;
+}) {
   const environmentId = target.environmentId;
   const { globalRead, projectRead, threadSession, snapshot, sessionRead, view } =
     useMcpCatalogView(target);
@@ -196,6 +203,7 @@ export function McpCatalogSettings({ target }: { target: ResourceSettingsTarget 
     view?.own?.data && view.scope ? { ...view.scope, revision: view.own.data.revision } : null;
   const writable = canWrite && baseline !== null;
   const rows = view?.rows ?? [];
+  const visibleRows = rows.filter((row) => matchesResourceQuery(query, row.name));
   const sessionScope = baseline?.scope === "session";
   const inheritedFrom = sessionScope ? "From the project" : "From environment";
 
@@ -447,12 +455,14 @@ export function McpCatalogSettings({ target }: { target: ResourceSettingsTarget 
           }}
         />
       ) : null}
-      {view !== null && rows.length === 0 ? (
+      {view !== null && visibleRows.length === 0 ? (
         <ResourceEmpty>
-          No MCP servers. Servers added here reach only the providers you assign them to.
+          {query.trim()
+            ? "No MCP servers match this filter."
+            : "No MCP servers. Servers added here reach only the providers you assign them to."}
         </ResourceEmpty>
       ) : null}
-      {rows.map((row) => (
+      {visibleRows.map((row) => (
         <McpServerRow
           key={row.definition.definitionId}
           row={row}

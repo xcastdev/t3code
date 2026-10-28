@@ -3938,7 +3938,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               ),
             );
           if (reply._tag === "None") {
-            markUnsettled(state);
+            // The retained turn owns its eventual native end; it must not be fenced off as stale.
             turn.interrupted = false;
             return yield* new ProviderAdapter.ProviderAdapterProtocolError({
               driver,

@@ -2,6 +2,7 @@
 // @t3tools/client-runtime/project-work (see the P4a UI API notes).
 import {
   PROJECT_TEAM_DEFAULT_LIMITS,
+  PROJECT_TEAM_PRESETS,
   ProjectTeamConfigurationIntent,
   ProjectWorkCriterion,
   projectWorkPayloadFingerprint,
@@ -254,7 +255,15 @@ export function recordedTeamConfiguration(
       !MEMORY_ACCESS.includes(role.memoryAccess as never)
     )
       return unreadable("A role profile is from a newer server.");
+    const member = records.find(
+      (record): record is Member =>
+        isMemberRecord(record) &&
+        record.roleRevisionId === role.recordId &&
+        record.status !== "retired",
+    );
     profiles.push({
+      ...(member && member.name !== role.role ? { name: member.name } : {}),
+      ...(member?.avatar ? { avatar: member.avatar } : {}),
       role: role.role as TeamRole,
       instructions: role.instructions,
       skills: role.skills,
@@ -291,6 +300,8 @@ export function emptyTeamConfiguration(): TeamConfigurationValues {
     projectPriority: 0,
     taskPriorities: [],
     profiles: TEAM_ROLES.map((role) => ({
+      name: PROJECT_TEAM_PRESETS[role].name,
+      avatar: PROJECT_TEAM_PRESETS[role].avatar,
       role,
       instructions: "",
       skills: [],
@@ -301,6 +312,17 @@ export function emptyTeamConfiguration(): TeamConfigurationValues {
     })),
     modelPolicies: [],
     ...PROJECT_TEAM_DEFAULT_LIMITS,
+  };
+}
+
+export function fillPresetNames(values: TeamConfigurationValues): TeamConfigurationValues {
+  return {
+    ...values,
+    profiles: values.profiles.map((profile) =>
+      profile.name?.trim()
+        ? profile
+        : { ...profile, name: PROJECT_TEAM_PRESETS[profile.role].name },
+    ),
   };
 }
 
@@ -334,13 +356,7 @@ export function isRecordedTeamDisable(
   );
 }
 
-/**
- * The exact wire intent, or the reason it can't be sent. `availableModels` is
- * the chosen provider's live catalog, or null when that provider isn't enabled
- * here. Disabling the recorded team skips the catalog: the server accepts the
- * recorded configuration as is, and the way out must not depend on a provider
- * or model that has since disappeared. Anything that could run again is checked.
- */
+/** Only the exact recorded disable can bypass a provider catalog that disappeared. */
 export function buildTeamConfigurationIntent(input: {
   readonly values: TeamConfigurationValues;
   /** The configured values the draft was opened from, or null for a new team. */
@@ -352,6 +368,14 @@ export function buildTeamConfigurationIntent(input: {
   readonly availableModels: ReadonlySet<string> | null;
 }): { readonly intent: ConfigurationIntent } | { readonly reason: string } {
   const { values, availableModels } = input;
+  const profiles = values.profiles.map((profile) => ({
+    ...profile,
+    name: profile.name?.trim() || profile.role,
+    avatar: profile.avatar ?? null,
+  }));
+  const names = profiles.map((profile) => profile.name.toLocaleLowerCase());
+  if (new Set(names).size !== names.length)
+    return { reason: "Give each team member a different name." };
   if (!values.providerInstanceId) return { reason: "Choose a provider." };
   if (values.profiles.some((profile) => !profile.model))
     return { reason: "Choose a model for every role." };
@@ -365,6 +389,7 @@ export function buildTeamConfigurationIntent(input: {
   }
   const decoded = decodeConfiguration({
     ...values,
+    profiles,
     type: "project-team.configure",
     commandId: input.commandId,
     projectId: input.projectId,

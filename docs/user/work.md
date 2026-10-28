@@ -37,17 +37,22 @@ approved, choose **Start worker** and confirm the team member. Approval never st
 itself. Workers can ask questions, send messages or block on a task; answer questions and resolve
 messages from the task or the overview.
 
-The overview's **Team activity** summarizes open, running, in-review and blocked work. **Inbox**
-shows messages from workers, and **Needs attention** links to tasks waiting on you.
+The overview starts with **Needs you**, which links to questions, blockers and decisions. **Inbox**
+shows messages from workers, and the team roster shows who is working, paused or waiting. Use the
+status filters in **Tasks** to focus on work in one state.
 
 If a task changes while you are editing it, your text is kept and Work asks you to review the
 current revision before sending.
 
 ## Team
 
-**Overview → Team** sets up the project's team: a provider, a model, memory access and
+On web and desktop, the **Team** tab sets up the project's team: a provider, a model, memory access and
 instructions for each of the six roles, and the limits each model runs under. You can edit it, or
-disable and enable it again. Saving only records the configuration; no worker starts.
+disable and enable it again. New teams start with six named agents; override their names, models
+and instructions in **Edit team**. Leave a name blank to use the role name. Names are labels and
+don't change a role's permissions. Saving only records the configuration; no worker starts. In **Edit team**, generate a face for each
+agent, adjust its color and mood, or switch back to initials. Animation plays briefly on preview or
+hover and respects reduced-motion settings.
 
 ## Review and delivery
 
@@ -66,7 +71,7 @@ or rejects them; an accepted decision can be superseded by a new proposal.
 
 ## All projects
 
-Choose **All projects** to see team work across connected environments. Open a project to return
+On web and desktop, choose **Work** in the breadcrumb to see **All projects** across connected environments. Open a project to return
 to its Work overview.
 
 ## GitHub issue intake

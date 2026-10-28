@@ -3,186 +3,154 @@ import {
   type ProjectWorkScope,
   type ProjectWorkSelection,
 } from "@t3tools/client-runtime/project-work";
+import type { ReactNode } from "react";
 import type { ProjectTeamRecordRead, ProjectWorkTaskId } from "@t3tools/contracts";
 
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import {
-  WorkEmpty,
-  WorkFormStatus,
-  WorkMeta,
-  WorkRevision,
-  WorkRow,
-  WorkSection,
-  WorkTime,
-} from "./WorkLayout";
+import { WorkEmpty, WorkFormStatus, WorkMeta, WorkRow, WorkSection, WorkTime } from "./WorkLayout";
 import { WorkNotice, WorkPager } from "./WorkNotice";
-import { useWorkRead, workWriteBlockedReason } from "./useWorkRead";
+import { workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
 import type { WorkWriter } from "./useWorkWriter";
 import {
-  accountingSummary,
-  bindingPhase,
   makeMessageAttentionIntent,
   messageActions,
   openMessages,
-  SUPERVISION_UNAVAILABLE,
   supervisionCounts,
   type WorkMessageAction,
   type WorkMessageRecord,
 } from "./workPresentation";
+import { WorkTaskLink } from "./WorkTaskRefs";
+import { WorkStatus } from "./WorkStatus";
+import { WorkMemberAvatar } from "./WorkMemberAvatar";
+import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { newCommandId } from "./workTaskSurface";
 
 const COUNT_LABELS = [
-  ["open", "Open"],
-  ["active", "Running"],
-  ["review", "In review"],
-  ["blocked", "Blocked or failed"],
-  ["done", "Done"],
+  ["open", "Open", "draft"],
+  ["active", "In progress", "in-progress"],
+  ["review", "In review", "in-review"],
+  ["blocked", "Blocked or failed", "blocked"],
+  ["done", "Done", "completed"],
 ] as const;
 
-/** Who is working on what right now, from one bounded summary read. */
-export function WorkSupervision({
-  scope,
-  onOpenTask,
-}: {
-  readonly scope: ProjectWorkScope;
-  readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
-}) {
-  const view = useWorkRead(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "supervision",
-  });
-  const summary = view.special?.operation === "supervision" ? view.special.value : null;
-
-  if (summary === null || summary.availability !== "available")
+export function WorkProgress({ scope }: { scope: ProjectWorkScope }) {
+  const { summary, view } = useWorkTeamRoster(scope);
+  if (!summary)
     return (
-      <WorkSection title="Team activity">
+      <WorkSection title="Progress">
         <WorkRow>
-          <WorkNotice view={view} subject="team activity" />
-          {summary !== null ? (
-            <WorkMeta>{SUPERVISION_UNAVAILABLE[summary.availability]}</WorkMeta>
-          ) : view.status === "ready" ? (
-            <WorkMeta>Team activity isn't available on this environment.</WorkMeta>
-          ) : null}
+          <WorkNotice view={view} subject="progress" />
         </WorkRow>
       </WorkSection>
     );
-
   const counts = supervisionCounts(summary);
-  const coordinator =
-    summary.coordinator !== undefined && "name" in summary.coordinator
-      ? summary.coordinator.name
-      : null;
+  return (
+    <WorkSection title="Progress">
+      <div className="grid grid-cols-2 gap-px">
+        {COUNT_LABELS.map(([key, label, state]) => (
+          <div key={key} className="flex flex-col gap-2 p-4">
+            <span className="text-2xl font-semibold tabular-nums tracking-tight">
+              {counts[key]}
+            </span>
+            <WorkStatus state={state} label={label} />
+          </div>
+        ))}
+        {counts.unknown > 0 ? (
+          <WorkRow>
+            <WorkMeta>{counts.unknown} unrecognized</WorkMeta>
+          </WorkRow>
+        ) : null}
+      </div>
+    </WorkSection>
+  );
+}
 
+export function WorkSupervision({
+  scope,
+  onOpenTask,
+  children,
+}: {
+  readonly scope: ProjectWorkScope;
+  readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
+  readonly children?: ReactNode;
+}) {
+  const { summary, view, roster } = useWorkTeamRoster(scope);
+  const questions = summary?.questions.items ?? [];
+  const blockers = summary?.blockers.items ?? [];
+  const recovery = (summary?.bindings.items ?? []).filter((b) => b.status === "quarantined");
   return (
     <WorkSection
-      title="Team activity"
-      description={
-        <>
-          {coordinator ? `Coordinated by ${coordinator} · ` : ""}project{" "}
-          <WorkRevision>r{summary.revision}</WorkRevision>
-        </>
-      }
+      title="Needs you"
+      description="Questions, blockers and decisions waiting on your input."
     >
       {view.status !== "ready" ? (
         <WorkRow>
           <WorkNotice view={view} subject="team activity" />
         </WorkRow>
       ) : null}
-      <WorkRow className="flex-row flex-wrap gap-x-5 gap-y-1">
-        {COUNT_LABELS.map(([key, label]) => (
-          <span key={key} className="text-sm">
-            <span className="font-medium tabular-nums">{counts[key]}</span>{" "}
-            <span className="text-muted-foreground">{label}</span>
-          </span>
-        ))}
-        {counts.unknown > 0 ? (
-          <span className="text-sm text-muted-foreground">
-            <span className="tabular-nums">{counts.unknown}</span> unrecognized
-          </span>
-        ) : null}
-      </WorkRow>
-      {summary.bindings.items.length === 0 ? (
-        <WorkEmpty title="No workers running" />
-      ) : (
-        summary.bindings.items.map((binding) => {
-          if (!("taskId" in binding))
-            return (
-              <WorkRow key={binding.recordId}>
-                <WorkMeta>A worker record this client can't read.</WorkMeta>
-              </WorkRow>
-            );
-          const phase = bindingPhase(binding.status);
-          const usage = accountingSummary(binding.accounting);
-          return (
-            <WorkRow key={binding.recordId} className="flex-row items-center gap-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge variant={phase.tone}>{phase.label}</Badge>
-                  <span className="truncate text-sm">
-                    {binding.profile && "role" in binding.profile
-                      ? `${binding.profile.role} · `
-                      : ""}
-                    {binding.model}
-                  </span>
-                </div>
-                {usage ? (
-                  <WorkMeta className={usage.uncertain ? "text-warning-foreground" : undefined}>
-                    {usage.text}
-                  </WorkMeta>
-                ) : null}
-              </div>
+      {summary === null && view.status === "ready" ? (
+        <WorkRow>
+          <WorkMeta>Team activity isn't available on this environment.</WorkMeta>
+        </WorkRow>
+      ) : null}
+      {questions.map((question) =>
+        "taskId" in question ? (
+          <WorkRow key={question.recordId} className="gap-2 py-3.5">
+            <div className="flex items-center gap-2">
+              <WorkStatus state="waiting" label="Answer needed" tone="warning" />
+              <span className="flex-1" />
               <Button
                 size="xs"
                 variant="outline"
-                onClick={() => onOpenTask(binding.taskId as ProjectWorkTaskId)}
+                onClick={() => onOpenTask(question.taskId as ProjectWorkTaskId)}
               >
-                Open task
+                Answer
               </Button>
-            </WorkRow>
-          );
-        })
-      )}
-      {summary.bindings.hasMore ? (
-        <WorkRow>
-          <WorkMeta>More workers are active than shown here.</WorkMeta>
-        </WorkRow>
-      ) : null}
-      {summary.questions.items.map((question) =>
-        "taskId" in question ? (
-          <WorkRow key={question.recordId} className="flex-row items-center gap-3">
-            <p className="min-w-0 flex-1 text-sm">A worker is waiting for an answer.</p>
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => onOpenTask(question.taskId as ProjectWorkTaskId)}
-            >
-              Answer
-            </Button>
+            </div>
+            <WorkTaskLink
+              scope={scope}
+              taskId={question.taskId as ProjectWorkTaskId}
+              onOpen={onOpenTask}
+            />
+            <WorkMeta>
+              {roster.find((m) => m.recordId === question.senderId)?.name ?? "A team member"} is
+              waiting for your answer.
+            </WorkMeta>
           </WorkRow>
         ) : null,
       )}
-      {summary.blockers.items.map((blocker) => (
-        <WorkRow key={blocker.recordId} className="flex-row items-center gap-3">
-          <div className="min-w-0 flex-1">
-            <p className="text-sm break-words">{blocker.reason}</p>
-            <WorkMeta>Blocked · {blocker.resolver}</WorkMeta>
-          </div>
-          <Button
-            size="xs"
-            variant="outline"
-            onClick={() => onOpenTask(blocker.taskId as ProjectWorkTaskId)}
-          >
-            Open task
-          </Button>
+      {blockers.map((blocker) => (
+        <WorkRow key={blocker.recordId} className="gap-2 py-3.5">
+          <WorkStatus state="blocked" label={`Waiting on ${blocker.resolver}`} />
+          <WorkTaskLink
+            scope={scope}
+            taskId={blocker.taskId as ProjectWorkTaskId}
+            onOpen={onOpenTask}
+          />
+          <WorkMeta>{blocker.reason}</WorkMeta>
         </WorkRow>
       ))}
-      {summary.questions.hasMore || summary.blockers.hasMore ? (
+      {recovery.map((binding) =>
+        "taskId" in binding ? (
+          <WorkRow key={binding.recordId}>
+            <WorkStatus state="quarantined" label="Worker needs recovery" />
+            <WorkTaskLink
+              scope={scope}
+              taskId={binding.taskId as ProjectWorkTaskId}
+              onOpen={onOpenTask}
+            />
+          </WorkRow>
+        ) : null,
+      )}
+      {summary &&
+      (summary.questions.hasMore || summary.blockers.hasMore || summary.bindings.hasMore) ? (
         <WorkRow>
-          <WorkMeta>More questions or blockers are open than shown here.</WorkMeta>
+          <WorkMeta>This summary is bounded. Open a task to see its full activity.</WorkMeta>
         </WorkRow>
       ) : null}
+      {children}
     </WorkSection>
   );
 }
@@ -202,6 +170,7 @@ export function WorkInbox({
   readonly writer: WorkWriter;
   readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
 }) {
+  const { roster } = useWorkTeamRoster(scope);
   const pager = useWorkPage(
     scope.environmentId,
     { projectId: scope.projectId, operation: "foundation-records", recordKind: "message" },
@@ -233,6 +202,7 @@ export function WorkInbox({
         <InboxRow
           key={message.recordId}
           message={message}
+          sender={roster.find((member) => member.recordId === message.senderId)}
           current={current}
           blocked={blocked}
           writer={writer}
@@ -246,12 +216,14 @@ export function WorkInbox({
 
 function InboxRow({
   message,
+  sender,
   current,
   blocked,
   writer,
   onOpenTask,
 }: {
   readonly message: WorkMessageRecord;
+  readonly sender: ReturnType<typeof useWorkTeamRoster>["roster"][number] | undefined;
   readonly current: ProjectWorkSelection | null;
   readonly blocked: string | null;
   readonly writer: WorkWriter;
@@ -279,7 +251,11 @@ function InboxRow({
   return (
     <WorkRow>
       <div className="flex flex-wrap items-center gap-2">
-        <Badge variant={message.status === "uncertain" ? "error" : "secondary"}>
+        {sender ? <WorkMemberAvatar member={sender} /> : null}
+        <span className="min-w-0 truncate text-sm font-medium">
+          {sender?.name ?? "A team member"}
+        </span>
+        <Badge variant={message.status === "uncertain" ? "error" : "info"}>
           {message.status === "uncertain"
             ? "Delivery unknown"
             : message.status === "acknowledged"
@@ -287,8 +263,11 @@ function InboxRow({
               : "New"}
         </Badge>
         <WorkMeta>
-          From {message.senderId} · <WorkTime value={message.updatedAt} />
+          <WorkTime value={message.updatedAt} />
         </WorkMeta>
+      </div>
+      <p className="text-sm whitespace-pre-wrap break-words">{message.body}</p>
+      <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
         <span className="min-w-0 flex-1" />
         {message.taskId ? (
           <Button size="xs" variant="ghost" onClick={() => onOpenTask(message.taskId!)}>
@@ -308,7 +287,6 @@ function InboxRow({
           </Button>
         ))}
       </div>
-      <p className="text-sm whitespace-pre-wrap break-words">{message.body}</p>
       {message.status === "uncertain" ? (
         <WorkMeta>Work can't confirm this reached its recipient, so it stays open.</WorkMeta>
       ) : null}

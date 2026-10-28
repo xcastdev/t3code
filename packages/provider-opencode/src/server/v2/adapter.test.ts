@@ -24,6 +24,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Exit from "effect/Exit";
+import * as TestClock from "effect/testing/TestClock";
 import * as Schema from "effect/Schema";
 import { OpenCodeEvent } from "@opencode/protocol/groups/event";
 import * as Stream from "effect/Stream";
@@ -62,6 +63,7 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
     rejectInstructions?: boolean;
     rejectPrompt?: boolean;
     interrupted?: boolean;
+    hangInterrupt?: boolean;
     running?: boolean;
     delayFirstPrompt?: boolean;
   } = {},
@@ -89,6 +91,7 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
       yield* Queue.offer(nativeEvents, { event, done });
       yield* Deferred.await(done);
     });
+  const interruptEntered = yield* Deferred.make<void>();
   const commandEntered = yield* Deferred.make<void>();
   const commandRelease = yield* Deferred.make<void>();
   const firstPromptSubmitted = yield* Deferred.make<void>();
@@ -213,6 +216,11 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
             });
       return HttpClientResponse.fromWeb(request, response);
     }).pipe(
+      Effect.tap(() =>
+        options.hangInterrupt && url.pathname.endsWith("/interrupt")
+          ? Deferred.succeed(interruptEntered, undefined).pipe(Effect.andThen(Effect.never))
+          : Effect.void,
+      ),
       Effect.tap(() =>
         url.pathname.startsWith("/api/experimental/mcp/") &&
         url.pathname.endsWith("_catalog") &&
@@ -349,6 +357,7 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
         runtimePolicy,
       });
     }),
+    interruptEntered: Deferred.await(interruptEntered),
     commandEntered: Deferred.await(commandEntered),
     commandRelease: Deferred.succeed(commandRelease, undefined),
     firstPromptSubmitted: Deferred.await(firstPromptSubmitted),
@@ -931,4 +940,148 @@ it.effect.each(["endpoint", "credential"] as const)(
       assert.notEqual((yield* sessions.readCatalogEndpointReceipt(threadId))?.catalogRevision, 2);
       assert.equal(test.calls.filter((call) => call.path.endsWith("/prompt")).length, 3);
     }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.effect.each(["interrupted", "succeeded", "failed"] as const)(
+  "OpenCode 2 reconciles a timed-out Stop with its late native %s outcome once",
+  (outcome) =>
+    Effect.gen(function* () {
+      const test = yield* fixture({ external: false, hangInterrupt: true });
+      yield* test.start(snapshot);
+      const active = yield* test.runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        ),
+        Stream.runHead,
+      );
+      if (active._tag !== "Some" || active.value.type !== "provider_turn.updated")
+        throw new Error("Missing active turn");
+      const firstTurnId = active.value.providerTurn.id;
+      const ended = yield* test.runtime.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      const stopping = yield* test.runtime
+        .interruptTurn({
+          providerThread: test.providerThread,
+          providerTurnId: firstTurnId,
+        })
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* test.interruptEntered;
+      yield* TestClock.adjust("11 seconds");
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(stopping)));
+      assert.isTrue(Exit.isFailure(yield* test.start(snapshot).pipe(Effect.exit)));
+      assert.equal(test.calls.filter((call) => call.path.endsWith("/prompt")).length, 1);
+      yield* test.publish(
+        decodeNativeEvent({
+          id: "evt_late_stop_end",
+          type: `session.execution.${outcome}`,
+          created: 1,
+          durable: { aggregateID: "ses_root", seq: 1, version: 1 },
+          data: {
+            sessionID: "ses_root",
+            ...(outcome === "interrupted" ? { reason: "user" } : {}),
+            ...(outcome === "failed"
+              ? { error: { type: "provider", message: "Late native failure" } }
+              : {}),
+          },
+        }),
+      );
+      yield* test.start(snapshot);
+      assert.isTrue(Exit.isFailure(yield* test.start(snapshot).pipe(Effect.exit)));
+      assert.equal(test.calls.filter((call) => call.path.endsWith("/prompt")).length, 2);
+      yield* test.publish(
+        decodeNativeEvent({
+          id: "evt_successor_end",
+          type: "session.execution.succeeded",
+          created: 2,
+          durable: { aggregateID: "ses_root", seq: 2, version: 1 },
+          data: { sessionID: "ses_root" },
+        }),
+      );
+      const terminals = [...(yield* Fiber.join(ended))];
+      assert.deepEqual(
+        terminals.map((event) => event.status),
+        [outcome === "succeeded" ? "completed" : outcome, "completed"],
+      );
+      assert.equal(terminals[0]?.providerTurnId, firstTurnId);
+      assert.notEqual(terminals[1]?.providerTurnId, firstTurnId);
+      const persisted = yield* test.runtime.readThreadSnapshot({
+        providerThread: test.providerThread,
+      });
+      assert.deepEqual(
+        persisted.providerTurns.map((turn) => turn.status),
+        [outcome === "succeeded" ? "completed" : outcome, "completed"],
+      );
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.effect("OpenCode 2 cannot fence a successor when its predecessor's Stop times out late", () =>
+  Effect.gen(function* () {
+    const test = yield* fixture({ external: false, hangInterrupt: true });
+    yield* test.start(snapshot);
+    const active = yield* test.runtime.events.pipe(
+      Stream.filter(
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+      ),
+      Stream.runHead,
+    );
+    if (active._tag !== "Some" || active.value.type !== "provider_turn.updated")
+      throw new Error("Missing active turn");
+    const firstTurnId = active.value.providerTurn.id;
+    const ended = yield* test.runtime.events.pipe(
+      Stream.filter((event) => event.type === "turn.terminal"),
+      Stream.take(2),
+      Stream.runCollect,
+      Effect.forkScoped,
+    );
+    const stopping = yield* test.runtime
+      .interruptTurn({
+        providerThread: test.providerThread,
+        providerTurnId: firstTurnId,
+      })
+      .pipe(Effect.exit, Effect.forkScoped);
+    yield* test.interruptEntered;
+    yield* test.publish(
+      decodeNativeEvent({
+        id: "evt_original_end",
+        type: "session.execution.interrupted",
+        created: 1,
+        durable: { aggregateID: "ses_root", seq: 1, version: 1 },
+        data: { sessionID: "ses_root", reason: "user" },
+      }),
+    );
+    yield* test.start(snapshot);
+    yield* TestClock.adjust("11 seconds");
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(stopping)));
+    yield* test.publish(
+      decodeNativeEvent({
+        id: "evt_successor_end",
+        type: "session.execution.succeeded",
+        created: 2,
+        durable: { aggregateID: "ses_root", seq: 2, version: 1 },
+        data: { sessionID: "ses_root" },
+      }),
+    );
+    const persisted = yield* test.runtime.readThreadSnapshot({
+      providerThread: test.providerThread,
+    });
+    assert.deepEqual(
+      persisted.providerTurns.map((turn) => turn.status),
+      ["interrupted", "completed"],
+    );
+    const terminals = [...(yield* Fiber.join(ended))];
+    assert.deepEqual(
+      terminals.map((event) => event.status),
+      ["interrupted", "completed"],
+    );
+    assert.equal(terminals[0]?.providerTurnId, firstTurnId);
+    assert.notEqual(terminals[1]?.providerTurnId, firstTurnId);
+    yield* test.start(snapshot);
+    assert.equal(test.calls.filter((call) => call.path.endsWith("/prompt")).length, 3);
+  }).pipe(Effect.scoped, Effect.provide(layer)),
 );

@@ -1,39 +1,24 @@
-import { composeManagedResourceInventory } from "@t3tools/client-runtime/state/managedResources";
 import { ThreadId, type EnvironmentId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { XIcon } from "lucide-react";
 import { useState } from "react";
 
 import { useThreadShell } from "../../state/entities";
-import { useEnvironmentQuery } from "../../state/query";
-import {
-  managedTextEnvironment,
-  skillsEnvironment,
-  useResourceCatalogSubscriptions,
-} from "../../state/resources";
-import { Badge } from "../ui/badge";
+import { useResourceCatalogSubscriptions } from "../../state/resources";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
-import { McpCatalogSettings, useMcpCatalogView } from "./McpCatalogSettings";
+import { McpCatalogSettings } from "./McpCatalogSettings";
 import { ResourceEmpty, ResourceHint, ResourceRow } from "./ResourceSettingsParts";
 import {
-  effectiveMcpDefinitions,
-  filterInventoryRows,
-  INVENTORY_KIND_LABELS,
-  inventoryScopeLabel,
   resolveResourceCheckout,
-  resourceCatalogInput,
-  skillApplicationLabel,
   type InventoryKindFilter,
   type ResourceSettingsTarget,
 } from "./resourceInventory";
-import { SettingsPageContainer, SettingsSection } from "./settingsLayout";
+import { SettingsPageContainer, SettingsSection, useSettingsSearchTarget } from "./settingsLayout";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { SkillsSettings } from "./SkillsSettings";
 import { TextResourcesSettings } from "./TextResourcesSettings";
-
-const INVENTORY_VISIBLE_ROWS = 200;
 
 /**
  * Settings → Resources. One destination at a time: the selected environment,
@@ -158,6 +143,9 @@ function ThreadTargetNotice({
 }
 
 function ResourcesContent({ target }: { target: ResourceSettingsTarget }) {
+  const [query, setQuery] = useState("");
+  const [kind, setKind] = useState<InventoryKindFilter>("all");
+  const filterRef = useSettingsSearchTarget<HTMLDivElement>("resource-inventory");
   useResourceCatalogSubscriptions({
     environmentId: target.environmentId,
     ...(target.projectId === null ? {} : { projectId: target.projectId }),
@@ -165,155 +153,55 @@ function ResourcesContent({ target }: { target: ResourceSettingsTarget }) {
   });
   return (
     <>
-      <ResourceInventory target={target} />
-      <McpCatalogSettings target={target} />
-      <SkillsSettings target={target} />
-      <TextResourcesSettings target={target} />
-    </>
-  );
-}
-
-/**
- * A read-only view across the three catalogs for this destination. It holds
- * no bodies, transports or secrets, and the catalogs remain the only stores.
- */
-function ResourceInventory({ target }: { target: ResourceSettingsTarget }) {
-  const input = resourceCatalogInput(target);
-  const skillInput = {
-    ...input,
-    ...(target.threadId !== null && target.providerInstanceId !== null
-      ? { providerInstanceId: target.providerInstanceId }
-      : {}),
-  };
-  const skills = useEnvironmentQuery(
-    skillsEnvironment.catalog({ environmentId: target.environmentId, input: skillInput }),
-  );
-  const text = useEnvironmentQuery(
-    managedTextEnvironment.catalog({ environmentId: target.environmentId, input }),
-  );
-  const mcpView = useMcpCatalogView(target);
-  const [query, setQuery] = useState("");
-  const [kind, setKind] = useState<InventoryKindFilter>("all");
-  // What this destination effectively gets, overrides applied, not every raw definition.
-  const mcp =
-    mcpView.view === null
-      ? null
-      : {
-          revision: mcpView.view.own?.data?.revision ?? 0,
-          definitions: effectiveMcpDefinitions(mcpView.view.rows),
-          overrides: [],
-        };
-  const inventory =
-    skills.data === null || text.data === null || mcp === null
-      ? null
-      : composeManagedResourceInventory({ skills: skills.data, text: text.data, mcp });
-  const rows = inventory === null ? [] : filterInventoryRows(inventory.rows, query, kind);
-  const loadFailed = [skills, text, mcpView.globalRead, mcpView.projectRead].some(
-    (view) => view.error !== null,
-  );
-
-  return (
-    <SettingsSection
-      id="resource-inventory"
-      title="Overview"
-      headerAction={
-        inventory === null ? null : (
-          <span className="text-xs text-muted-foreground">
-            {inventory.rows.length}
-            {inventory.truncated ? "+" : ""} resources
-          </span>
-        )
-      }
-    >
-      <div className="flex flex-wrap items-center gap-2 px-3 py-2.5 sm:px-4">
-        <Input
-          size="sm"
-          type="search"
-          aria-label="Filter resources"
-          placeholder="Filter by name or key"
-          className="max-w-64"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-        />
-        <ToggleGroup
-          aria-label="Resource kind"
-          size="sm"
-          value={[kind]}
-          onValueChange={(next) => {
-            const value = next[0];
-            if (
-              value === "all" ||
-              value === "skill" ||
-              value === "command" ||
-              value === "snippet" ||
-              value === "mcp"
-            )
-              setKind(value);
-          }}
-        >
-          <Toggle value="all">All</Toggle>
-          <Toggle value="mcp">MCP</Toggle>
-          <Toggle value="skill">Skills</Toggle>
-          <Toggle value="command">Commands</Toggle>
-          <Toggle value="snippet">Snippets</Toggle>
-        </ToggleGroup>
-      </div>
-      {inventory === null ? (
-        <ResourceEmpty>
-          {loadFailed
-            ? "Some catalogs couldn't load; see their sections below."
-            : "Loading resources…"}
-        </ResourceEmpty>
-      ) : rows.length === 0 ? (
-        <ResourceEmpty>
-          {inventory.rows.length === 0
-            ? "Nothing configured here yet."
-            : "No resource matches this filter."}
-        </ResourceEmpty>
-      ) : (
-        rows.slice(0, INVENTORY_VISIBLE_ROWS).map((row) => (
-          <ResourceRow
-            key={row.id}
-            title={
-              <>
-                <span className="font-medium">{row.name}</span>
-                <code className="text-xs text-muted-foreground">
-                  {row.kind === "skill" ? "$" : row.kind === "mcp" ? "" : "/"}
-                  {row.key}
-                </code>
-              </>
-            }
-            badges={
-              <>
-                <Badge size="sm" variant="secondary">
-                  {INVENTORY_KIND_LABELS[row.kind]}
-                </Badge>
-                <Badge size="sm" variant="outline">
-                  {inventoryScopeLabel(row)}
-                </Badge>
-                {!row.enabled ? (
-                  <Badge size="sm" variant="outline">
-                    Off
-                  </Badge>
-                ) : null}
-              </>
-            }
-            meta={
-              row.kind === "skill" && row.application
-                ? skillApplicationLabel(row.application)
-                : undefined
-            }
+      <div
+        id="resource-inventory"
+        ref={filterRef}
+        tabIndex={-1}
+        className="flex flex-wrap items-center gap-3 px-3 sm:px-4"
+      >
+        <div className="w-full sm:w-64">
+          <Input
+            size="sm"
+            type="search"
+            aria-label="Filter resources"
+            placeholder="Filter by name or key"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
           />
-        ))
-      )}
-      {inventory?.truncated || rows.length > INVENTORY_VISIBLE_ROWS ? (
-        <div className="px-3 py-2 sm:px-4">
-          <ResourceHint>
-            Showing the first {Math.min(rows.length, INVENTORY_VISIBLE_ROWS)}. Filter to find
-            others; each section below lists its full catalog.
-          </ResourceHint>
         </div>
+        <div className="max-w-full">
+          <ToggleGroup
+            aria-label="Resource kind"
+            size="sm"
+            wrap
+            value={[kind]}
+            onValueChange={(next) => {
+              const value = next[0];
+              if (
+                value === "all" ||
+                value === "mcp" ||
+                value === "skill" ||
+                value === "command" ||
+                value === "snippet"
+              )
+                setKind(value);
+            }}
+          >
+            <Toggle value="all">All</Toggle>
+            <Toggle value="mcp">MCP</Toggle>
+            <Toggle value="skill">Skills</Toggle>
+            <Toggle value="command">Commands</Toggle>
+            <Toggle value="snippet">Snippets</Toggle>
+          </ToggleGroup>
+        </div>
+      </div>
+      {kind === "all" || kind === "mcp" ? (
+        <McpCatalogSettings target={target} query={query} />
       ) : null}
-    </SettingsSection>
+      {kind === "all" || kind === "skill" ? <SkillsSettings target={target} query={query} /> : null}
+      {kind === "all" || kind === "command" || kind === "snippet" ? (
+        <TextResourcesSettings target={target} query={query} kind={kind === "all" ? null : kind} />
+      ) : null}
+    </>
   );
 }

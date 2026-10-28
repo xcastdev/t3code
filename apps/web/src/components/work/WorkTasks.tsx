@@ -4,11 +4,10 @@ import {
   type ProjectWorkSelection,
 } from "@t3tools/client-runtime/project-work";
 import { ProjectWorkTaskId, type ProjectWorkTaskRead } from "@t3tools/contracts";
-import { PlusIcon } from "lucide-react";
+import { PlusIcon, ListTodoIcon } from "lucide-react";
 import { useState } from "react";
 
 import { cn, randomUUID } from "../../lib/utils";
-import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -19,16 +18,17 @@ import {
   WorkField,
   WorkFormStatus,
   WorkMeta,
-  WorkRevision,
   WorkRow,
   WorkSection,
+  WorkTime,
 } from "./WorkLayout";
 import { WorkNotice, WorkPager } from "./WorkNotice";
 import { WorkTaskDetail } from "./WorkTaskDetail";
-import { WORK_PAGE_SIZE, workWriteBlockedReason } from "./useWorkRead";
+import { useWorkRead, WORK_PAGE_SIZE, workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
 import type { WorkWriter } from "./useWorkWriter";
-import { workStateLabel, workStateVariant } from "./workModel";
+import { workStateLabel } from "./workModel";
+import { WorkStatusGlyph } from "./WorkStatus";
 import { newCommandId } from "./workTaskSurface";
 
 const DELIVERABLES = {
@@ -41,6 +41,20 @@ const DELIVERABLES = {
 } as const;
 type Deliverable = keyof typeof DELIVERABLES;
 
+const TASK_FILTERS = [
+  "all",
+  "in-progress",
+  "in-review",
+  "blocked",
+  "failed",
+  "ready",
+  "specified",
+  "draft",
+  "completed",
+  "canceled",
+] as const;
+type TaskFilter = (typeof TASK_FILTERS)[number];
+
 export function WorkTasks({
   scope,
   writer,
@@ -52,10 +66,117 @@ export function WorkTasks({
   readonly taskId: ProjectWorkTaskId | undefined;
   readonly onSelectTask: (taskId: ProjectWorkTaskId | undefined) => void;
 }) {
+  const [filter, setFilter] = useState<TaskFilter>("all");
+  const view = useWorkRead(scope.environmentId, {
+    projectId: scope.projectId,
+    operation: "supervision",
+  });
+  const rawSummary = view.special?.operation === "supervision" ? view.special.value : null;
+  const summary =
+    view.status === "ready" && rawSummary?.availability === "available" ? rawSummary : null;
+  return (
+    <div className="flex min-w-0 flex-col gap-5">
+      <div
+        className={cn(
+          "max-w-full overflow-x-auto pb-1",
+          taskId !== undefined && "hidden @3xl/work:block",
+        )}
+      >
+        <ToggleGroup
+          aria-label="Filter tasks by status"
+          value={[filter]}
+          onValueChange={(next) => {
+            const value = TASK_FILTERS.find((f) => f === next[0]);
+            if (value) setFilter(value);
+          }}
+        >
+          {TASK_FILTERS.map((state) => {
+            const count =
+              summary === null
+                ? undefined
+                : state === "all"
+                  ? summary.taskCounts.total
+                  : summary.taskCounts[state];
+            if (count === 0 && state !== "all" && state !== filter) return null;
+            return (
+              <Toggle
+                key={state}
+                value={state}
+                aria-label={`${state === "all" ? "All" : workStateLabel(state)}${count === undefined ? "" : ` ${count}`}`}
+              >
+                {state === "all" ? (
+                  <ListTodoIcon aria-hidden="true" />
+                ) : (
+                  <WorkStatusGlyph state={state} />
+                )}
+                {state === "all" ? "All" : workStateLabel(state)}
+                {count === undefined ? null : (
+                  <span className="text-xs tabular-nums text-muted-foreground">{count}</span>
+                )}
+              </Toggle>
+            );
+          })}
+        </ToggleGroup>
+      </div>
+      <div className="grid min-w-0 items-start gap-6 @3xl/work:grid-cols-[minmax(17rem,22rem)_minmax(0,1fr)]">
+        <div className={cn("min-w-0", taskId !== undefined && "hidden @3xl/work:block")}>
+          <TaskList
+            key={filter}
+            scope={scope}
+            writer={writer}
+            taskId={taskId}
+            filter={filter}
+            onSelectTask={onSelectTask}
+            onShowAll={() => setFilter("all")}
+          />
+        </div>
+        <div className={cn("min-w-0", taskId === undefined && "hidden @3xl/work:block")}>
+          {taskId === undefined ? (
+            <div className="flex min-h-72 items-center justify-center rounded-xl border border-dashed border-border/70 bg-card/20">
+              <WorkEmpty
+                title="Your next step starts here"
+                detail="Select a task to review its scope, approvals and team activity."
+              />
+            </div>
+          ) : (
+            <WorkTaskDetail
+              key={taskId}
+              scope={scope}
+              taskId={taskId}
+              writer={writer}
+              onOpenTask={onSelectTask}
+              onBack={() => onSelectTask(undefined)}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TaskList({
+  scope,
+  writer,
+  taskId,
+  filter,
+  onSelectTask,
+  onShowAll,
+}: {
+  scope: ProjectWorkScope;
+  writer: WorkWriter;
+  taskId: ProjectWorkTaskId | undefined;
+  filter: TaskFilter;
+  onSelectTask: (id: ProjectWorkTaskId) => void;
+  onShowAll: () => void;
+}) {
   const [creating, setCreating] = useState(false);
   const pager = useWorkPage(
     scope.environmentId,
-    { projectId: scope.projectId, operation: "tasks" },
+    {
+      projectId: scope.projectId,
+      operation: "tasks",
+      ...(filter === "all" ? {} : { state: filter }),
+    },
     WORK_PAGE_SIZE,
   );
   const view = pager.view;
@@ -65,130 +186,90 @@ export function WorkTasks({
     return task === null || task.projectId !== scope.projectId ? [] : [task];
   });
   const unknown = (view.page?.items.length ?? 0) - tasks.length;
-
   return (
-    <div className="grid min-w-0 gap-5 @3xl/work:grid-cols-[minmax(15rem,19rem)_minmax(0,1fr)]">
-      <div
-        className={cn(
-          "flex min-w-0 flex-col gap-3",
-          taskId !== undefined && "hidden @3xl/work:flex",
-        )}
-      >
-        <WorkSection
-          title="Tasks"
-          actions={
-            creating ? null : (
-              <Button
-                size="xs"
-                disabled={createBlocked !== null}
-                title={createBlocked ?? undefined}
-                onClick={() => setCreating(true)}
-              >
-                <PlusIcon /> New task
-              </Button>
-            )
-          }
-        >
-          {creating && view.page ? (
-            <NewTaskForm
-              scope={scope}
-              writer={writer}
-              selection={{ ...scope, revision: view.page.revision, taskRevision: 0 }}
-              blocked={createBlocked}
-              onCancel={() => setCreating(false)}
-              onCreated={(created) => {
-                setCreating(false);
-                onSelectTask(created);
-              }}
-            />
-          ) : null}
-          {view.status !== "ready" ? (
-            <WorkRow>
-              <WorkNotice view={view} subject="tasks" />
-            </WorkRow>
-          ) : null}
-          {pager.offset === 0 && view.page !== null && view.page.items.length === 0 ? (
-            <WorkEmpty
-              title="No tasks yet"
-              detail="Start with a title. Scope, plan and approvals come next."
-            />
-          ) : null}
-          {tasks.map((task) => (
-            <TaskRow
-              key={task.taskId}
-              task={task}
-              selected={task.taskId === taskId}
-              onSelect={() => onSelectTask(task.taskId)}
-            />
-          ))}
-          {unknown > 0 ? (
-            <WorkRow>
-              <WorkMeta>{unknown} records from a newer server can't be shown here.</WorkMeta>
-            </WorkRow>
-          ) : null}
-          <WorkPager pager={pager} noun="Tasks" />
-        </WorkSection>
-      </div>
-      <div className={cn("min-w-0", taskId === undefined && "hidden @3xl/work:block")}>
-        {taskId === undefined ? (
-          <WorkEmpty
-            title="Select a task"
-            detail="Open a task to review its scope, plan and approvals."
-          />
-        ) : (
-          <WorkTaskDetail
-            key={taskId}
-            scope={scope}
-            taskId={taskId}
-            writer={writer}
-            onOpenTask={onSelectTask}
-            onBack={() => onSelectTask(undefined)}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-function TaskRow({
-  task,
-  selected,
-  onSelect,
-}: {
-  readonly task: ProjectWorkTaskRead;
-  readonly selected: boolean;
-  readonly onSelect: () => void;
-}) {
-  const approval =
-    task.specification === undefined
-      ? null
-      : task.approval?.specRevision === task.specRevision
-        ? "approved"
-        : null;
-  return (
-    // A semantic row, not a styled control: the whole row opens the task.
-    <button
-      type="button"
-      aria-current={selected ? "page" : undefined}
-      onClick={onSelect}
-      className={cn(
-        "flex w-full min-w-0 flex-col gap-1 px-3 py-2.5 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-4",
-        selected && "bg-accent/60",
-      )}
+    <WorkSection
+      title={filter === "all" ? "Tasks" : `${workStateLabel(filter)} tasks`}
+      actions={
+        creating ? null : (
+          <Button
+            size="xs"
+            disabled={createBlocked !== null}
+            title={createBlocked ?? undefined}
+            onClick={() => setCreating(true)}
+          >
+            <PlusIcon /> New task
+          </Button>
+        )
+      }
     >
-      <span className="line-clamp-2 text-sm font-medium break-words">{task.title}</span>
-      <span className="flex flex-wrap items-center gap-1.5">
-        <Badge size="sm" variant={workStateVariant(task.state)}>
-          {workStateLabel(task.state)}
-        </Badge>
-        {approval ? (
-          <Badge size="sm" variant="success">
-            Scope approved
-          </Badge>
-        ) : null}
-        <WorkRevision className="text-muted-foreground">r{task.revision}</WorkRevision>
-      </span>
-    </button>
+      {creating && view.page ? (
+        <NewTaskForm
+          scope={scope}
+          writer={writer}
+          selection={{ ...scope, revision: view.page.revision, taskRevision: 0 }}
+          blocked={createBlocked}
+          onCancel={() => setCreating(false)}
+          onCreated={(id) => {
+            setCreating(false);
+            onSelectTask(id);
+          }}
+        />
+      ) : null}
+      {view.status !== "ready" ? (
+        <WorkRow>
+          <WorkNotice view={view} subject="tasks" />
+        </WorkRow>
+      ) : null}
+      {view.page !== null && view.page.items.length === 0 ? (
+        <WorkRow>
+          <WorkEmpty
+            title={
+              filter === "all" ? "No tasks yet" : `No ${workStateLabel(filter).toLowerCase()} tasks`
+            }
+            detail={
+              filter === "all"
+                ? "Start with a title. Scope, plan and approvals come next."
+                : "Try another status to find work."
+            }
+          />
+          {filter !== "all" ? (
+            <Button size="sm" variant="ghost" onClick={onShowAll}>
+              Show all tasks
+            </Button>
+          ) : null}
+        </WorkRow>
+      ) : null}
+      {tasks.map((task) => (
+        <button
+          key={task.taskId}
+          type="button"
+          aria-current={task.taskId === taskId ? "page" : undefined}
+          onClick={() => onSelectTask(task.taskId)}
+          className={cn(
+            "flex w-full min-w-0 items-start gap-3 px-4 py-3.5 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+            task.taskId === taskId && "bg-accent/60",
+          )}
+        >
+          <span className="pt-0.5">
+            <WorkStatusGlyph state={task.state} />
+          </span>
+          <span className="flex min-w-0 flex-1 flex-col gap-1.5">
+            <span className="line-clamp-2 text-sm font-medium break-words">{task.title}</span>
+            <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+              <span>{workStateLabel(task.state)}</span>
+              <span aria-hidden="true">·</span>
+              <WorkTime value={task.updatedAt} />
+            </span>
+          </span>
+        </button>
+      ))}
+      {unknown > 0 ? (
+        <WorkRow>
+          <WorkMeta>{unknown} records from a newer server can't be shown here.</WorkMeta>
+        </WorkRow>
+      ) : null}
+      <WorkPager pager={pager} noun="Tasks" />
+    </WorkSection>
   );
 }
 

@@ -41,6 +41,7 @@ import {
 import { resourceEditorConflict } from "@t3tools/client-runtime/resource-actions";
 import {
   resourceCatalogInput,
+  matchesResourceQuery,
   textResourceActions,
   type ResourceSettingsTarget,
 } from "./resourceInventory";
@@ -84,7 +85,15 @@ const DESTRUCTIVE = new Set<TextAction>(["delete", "disable", "disable-project",
 const entryId = (entry: ManagedTextResourceSummary) =>
   JSON.stringify([entry.kind, entry.scope, entry.scopeId, entry.key]);
 
-export function TextResourcesSettings({ target }: { target: ResourceSettingsTarget }) {
+export function TextResourcesSettings({
+  target,
+  query = "",
+  kind = null,
+}: {
+  target: ResourceSettingsTarget;
+  query?: string;
+  kind?: ManagedTextResourceKind | null;
+}) {
   const catalog = useEnvironmentQuery(
     managedTextEnvironment.catalog({
       environmentId: target.environmentId,
@@ -102,6 +111,12 @@ export function TextResourcesSettings({ target }: { target: ResourceSettingsTarg
   );
   const [dialog, setDialog] = useState<TextDialog | null>(null);
   const data = catalog.data;
+  const title =
+    kind === "command" ? "Commands" : kind === "snippet" ? "Snippets" : "Commands and snippets";
+  const entries = (data?.entries ?? []).filter(
+    (entry) =>
+      (kind === null || entry.kind === kind) && matchesResourceQuery(query, entry.name, entry.key),
+  );
   const context = { projectId: target.projectId, threadId: target.threadId };
   const overlays = new Set(
     (data?.threadOverlays ?? []).map((overlay) => `${overlay.kind}:${overlay.key}`),
@@ -207,39 +222,59 @@ export function TextResourcesSettings({ target }: { target: ResourceSettingsTarg
 
   const newMenu =
     target.threadId === null ? (
-      <Menu>
-        <MenuTrigger
-          render={<Button size="xs" variant="outline" disabled={!canWrite || data === null} />}
+      kind !== null ? (
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={!canWrite || data === null}
+          onClick={() =>
+            data &&
+            setDialog({ kind: "create", resourceKind: kind, catalogRevision: data.catalogRevision })
+          }
         >
           <PlusIcon className="size-3.5" />
-          New
-        </MenuTrigger>
-        <MenuPopup align="end">
-          {(["command", "snippet"] as const).map((resourceKind) => (
-            <MenuItem
-              key={resourceKind}
-              onClick={() =>
-                data &&
-                setDialog({ kind: "create", resourceKind, catalogRevision: data.catalogRevision })
-              }
-            >
-              {resourceKind === "command" ? "Command" : "Snippet"}
-            </MenuItem>
-          ))}
-        </MenuPopup>
-      </Menu>
+          {kind === "command" ? "New command" : "New snippet"}
+        </Button>
+      ) : (
+        <Menu>
+          <MenuTrigger
+            render={<Button size="xs" variant="outline" disabled={!canWrite || data === null} />}
+          >
+            <PlusIcon className="size-3.5" />
+            New
+          </MenuTrigger>
+          <MenuPopup align="end">
+            {(["command", "snippet"] as const).map((resourceKind) => (
+              <MenuItem
+                key={resourceKind}
+                onClick={() =>
+                  data &&
+                  setDialog({ kind: "create", resourceKind, catalogRevision: data.catalogRevision })
+                }
+              >
+                {resourceKind === "command" ? "Command" : "Snippet"}
+              </MenuItem>
+            ))}
+          </MenuPopup>
+        </Menu>
+      )
     ) : null;
 
   return (
-    <SettingsSection id="commands-snippets" title="Commands and snippets" headerAction={newMenu}>
-      <ResourceQueryNotice query={catalog} subject="commands and snippets" />
-      {data !== null && data.entries.length === 0 ? (
+    <SettingsSection id="commands-snippets" title={title} headerAction={newMenu}>
+      <ResourceQueryNotice query={catalog} subject={title.toLowerCase()} />
+      {data !== null && entries.length === 0 ? (
         <ResourceEmpty>
-          Commands expand from <code>/name</code> and snippets insert reusable text. Both become
-          ordinary draft text you can edit before sending.
+          {query.trim()
+            ? `No ${title.toLowerCase()} match this filter.`
+            : kind === "command"
+              ? "Commands expand from /name into draft text you can edit before sending."
+              : kind === "snippet"
+                ? "Snippets insert reusable text into your draft."
+                : "Commands expand from /name and snippets insert reusable text. Both become ordinary draft text you can edit before sending."}
         </ResourceEmpty>
       ) : null}
-      {data?.entries.map((entry) => {
+      {entries.map((entry) => {
         const key = entryId(entry);
         const actions = canWrite
           ? textResourceActions(entry, context, overlays.has(`${entry.kind}:${entry.key}`))

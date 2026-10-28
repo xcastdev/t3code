@@ -56,6 +56,7 @@ import {
 } from "@t3tools/client-runtime/resource-actions";
 import {
   resourceCatalogInput,
+  matchesResourceQuery,
   skillActions,
   skillEntryId,
   skillKeyCollisions,
@@ -118,7 +119,13 @@ const skillCatalogInput = (target: ResourceSettingsTarget) => ({
     : {}),
 });
 
-export function SkillsSettings({ target }: { target: ResourceSettingsTarget }) {
+export function SkillsSettings({
+  target,
+  query = "",
+}: {
+  target: ResourceSettingsTarget;
+  query?: string;
+}) {
   const input = skillCatalogInput(target);
   const catalog = useEnvironmentQuery(
     skillsEnvironment.catalog({ environmentId: target.environmentId, input }),
@@ -145,10 +152,12 @@ export function SkillsSettings({ target }: { target: ResourceSettingsTarget }) {
         : canWriteGlobal;
   const collisions = skillKeyCollisions(data?.entries ?? []);
   const managed = (data?.entries ?? []).filter(
-    (entry): entry is ManagedEntry => entry.origin === "managed",
+    (entry): entry is ManagedEntry =>
+      entry.origin === "managed" && matchesResourceQuery(query, entry.name, entry.key),
   );
   const native = (data?.entries ?? []).filter(
-    (entry): entry is NativeEntry => entry.origin === "native",
+    (entry): entry is NativeEntry =>
+      entry.origin === "native" && matchesResourceQuery(query, entry.name, entry.key),
   );
 
   // A row's failure shows on that row (keyed like its other actions); reset-all
@@ -266,8 +275,9 @@ export function SkillsSettings({ target }: { target: ResourceSettingsTarget }) {
       ) : null}
       {data !== null && managed.length === 0 && native.length === 0 ? (
         <ResourceEmpty>
-          No skills yet. Managed skills you create here are delivered to supported providers;
-          provider skills appear as each provider reports them.
+          {query.trim()
+            ? "No skills match this filter."
+            : "No skills yet. Managed skills you create here are delivered to supported providers; provider skills appear as each provider reports them."}
         </ResourceEmpty>
       ) : null}
       {managed.map((entry) => (
@@ -647,8 +657,8 @@ function SkillEditorForm({
         : `Edit ${dialog.entry.name}`;
 
   const registry = useContext(RegistryContext);
-  // Bumped by each reload and by unmount, so only the newest reload of this editor lands.
   const reloadRequestRef = useRef(0);
+  // oxlint-disable-next-line t3code/react-effect-budget -- Invalidate pending catalog reloads when the editor unmounts.
   useEffect(
     () => () => {
       reloadRequestRef.current++;

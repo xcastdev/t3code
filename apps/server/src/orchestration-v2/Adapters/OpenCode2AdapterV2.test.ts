@@ -650,18 +650,14 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
-  it.effect("stops running turns on an external server when the session closes", () =>
+  it.effect("detaches running turns on an external server when the session closes", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make();
       const { runtime, thread } = yield* resumed(
-        [
-          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-          promptAccepted,
-          out("session.interrupt", { sessionID: SESSION }),
-          reply("session.interrupt", { interrupted: true }),
-        ],
+        [out("session.prompt", { sessionID: SESSION, text: "<any>" }), promptAccepted],
         { external: true },
       ).pipe(Scope.provide(scope));
+      assert.equal(runtime.detachThreadPolicy, "detach");
       yield* runtime.startTurn(turnInput(thread));
       yield* Scope.close(scope, Exit.void);
     }),
@@ -1362,9 +1358,13 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* runtime.startTurn(turnInput(thread));
       const interrupt = yield* runtime
         .interruptTurn({ providerThread: thread, providerTurnId: yield* providerTurnId })
-        .pipe(Effect.forkScoped);
+        .pipe(Effect.exit, Effect.forkScoped);
       yield* TestClock.adjust("11 seconds");
-      yield* Fiber.join(interrupt);
+      const stopped = yield* Fiber.join(interrupt);
+      assert.isTrue(Exit.isFailure(stopped));
+      assert.deepInclude(Exit.isFailure(stopped) ? Cause.squash(stopped.cause) : undefined, {
+        _tag: "ProviderAdapterProtocolError",
+      });
     });
   const terminals = (runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime, count: number) =>
     runtime.events.pipe(
@@ -1379,23 +1379,39 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       Effect.forkScoped,
     );
 
-  it.effect("never lets a timed-out Stop's late end finish the next turn", () =>
+  it.effect("waits for a timed-out Stop's native end before admitting the next turn", () =>
     Effect.gen(function* () {
-      const { runtime, thread } = yield* resumed([
-        ...stopTimedOut,
-        out("session.active"),
-        reply("session.active", { data: {} }),
-        out("session.prompt", { sessionID: SESSION, text: "<any>" }),
-        promptAccepted,
-        event("session.execution.succeeded", { sessionID: SESSION }),
-        event("session.execution.started", { sessionID: SESSION }),
-        event("session.execution.failed", {
-          sessionID: SESSION,
-          error: { type: "provider", message: "second turn failed" },
-        }),
-      ]);
-      const ended = yield* terminals(runtime, 2);
+      const gate = makeProviderReplayGate(["stop-end"]);
+      const firstEnded = yield* Deferred.make<void>();
+      const { runtime, thread } = yield* resumed(
+        [
+          ...stopTimedOut,
+          event("session.execution.interrupted", { sessionID: SESSION }, "stop-end"),
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.execution.started", { sessionID: SESSION }),
+          event("session.execution.failed", {
+            sessionID: SESSION,
+            error: { type: "provider", message: "second turn failed" },
+          }),
+        ],
+        { replayGate: gate },
+      );
+      const ended = yield* runtime.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.tap(() => Deferred.succeed(firstEnded, undefined)),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
       yield* stopFirstTurn(runtime, thread);
+      const blocked = yield* runtime.startTurn(secondTurn(thread)).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(blocked));
+      assert.deepInclude(Exit.isFailure(blocked) ? Cause.squash(blocked.cause) : undefined, {
+        reason: "previous_turn_active",
+      });
+      gate.release("stop-end");
+      yield* Deferred.await(firstEnded);
       yield* runtime.startTurn(secondTurn(thread));
       const [first, second] = yield* Fiber.join(ended);
       assert.equal(first?.status, "interrupted");
@@ -1467,8 +1483,6 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           ...backgroundLaunch(CHILD),
           out("session.interrupt", { sessionID: SESSION }),
           reply("session.interrupt", "<hang>"),
-          out("session.active"),
-          replyData("session.active", { [SESSION]: { type: "running" } }),
           out("session.interrupt", { sessionID: SESSION }),
           reply("session.interrupt", { interrupted: true }),
           event("session.usage.updated", { sessionID: SESSION }, "drop"),
@@ -1476,6 +1490,8 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
           out("event.subscribe"),
           out("session.active"),
           replyData("session.active", { [CHILD]: { type: "running" } }),
+          out("message.list", { sessionID: SESSION, order: "desc", limit: "50" }),
+          reply("message.list", { data: [], cursor: {} }),
           out("permission.list", { sessionID: CHILD }),
           replyData("permission.list", []),
           out("session.form.list", { sessionID: CHILD }),
@@ -1539,10 +1555,17 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       yield* Deferred.await(attached);
       const interrupt = yield* runtime
         .interruptTurn({ providerThread: thread, providerTurnId: yield* providerTurnId })
-        .pipe(Effect.forkScoped);
+        .pipe(Effect.exit, Effect.forkScoped);
       yield* TestClock.adjust("11 seconds");
-      yield* Fiber.join(interrupt);
-      yield* runtime.startTurn({ ...secondTurn(thread), appThread: withLineage(thread).appThread });
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(interrupt)));
+      const blocked = yield* runtime
+        .startTurn({ ...secondTurn(thread), appThread: withLineage(thread).appThread })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(blocked));
+      yield* runtime.interruptTurn({
+        providerThread: thread,
+        providerTurnId: yield* providerTurnId,
+      });
       gate.release("drop");
       yield* runtime.startTurn({
         ...continuationTurn(thread, yield* Deferred.await(offered)),
@@ -1553,7 +1576,7 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       const events = [...(yield* Fiber.join(collected))];
       assert.deepEqual(
         events.flatMap((event) => (event.type === "turn.terminal" ? [event.status] : [])),
-        ["interrupted", "failed", "completed"],
+        ["interrupted", "completed"],
       );
       assert.include(
         events.flatMap((event) =>
@@ -3487,8 +3510,6 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
       const prompt = `msg_t3_turn_${SESSION}:attempt:opencode2-adapter`;
       const { runtime, thread } = yield* resumed([
         ...stopTimedOut,
-        out("session.active"),
-        reply("session.active", { data: running ? { [SESSION]: { type: "running" } } : {} }),
         ...(running
           ? []
           : [

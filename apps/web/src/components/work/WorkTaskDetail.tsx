@@ -9,7 +9,7 @@ import { ArrowLeftIcon } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { WorkApprovalRow } from "./WorkApprovalRow";
-import { WorkFormStatus, WorkMeta, WorkRevision } from "./WorkLayout";
+import { WorkFormStatus, WorkMeta, WorkRevision, WorkTime } from "./WorkLayout";
 import { WorkNotice, WorkRecordsNotice } from "./WorkNotice";
 import { WorkTaskActivity } from "./WorkTaskActivity";
 import { WorkTaskControls } from "./WorkTaskControls";
@@ -22,6 +22,7 @@ import { WorkTaskPlan, WorkTaskScope } from "./WorkTaskScope";
 import { useWorkRead, workWriteBlockedReason } from "./useWorkRead";
 import { useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
 import type { WorkWriter } from "./useWorkWriter";
+import { WorkStatus } from "./WorkStatus";
 import { deriveWorkTask, workStateLabel, workStateVariant } from "./workModel";
 import type { WorkTaskSurface } from "./workTaskSurface";
 
@@ -88,9 +89,9 @@ export function WorkTaskDetail({
         </p>
       ) : null}
       <WorkMeta>
-        Task <WorkRevision>r{task.revision}</WorkRevision> · project{" "}
-        <WorkRevision>r{context.revision}</WorkRevision> ·{" "}
-        <span className="break-all">{scope.checkoutPath}</span>
+        Updated <WorkTime value={task.updatedAt} /> · task{" "}
+        <WorkRevision>r{task.revision}</WorkRevision> · project{" "}
+        <WorkRevision>r{context.revision}</WorkRevision>
       </WorkMeta>
     </header>
   );
@@ -100,9 +101,7 @@ export function WorkTaskDetail({
     return (
       <article aria-labelledby={`work-task-${taskId}`} className="flex min-w-0 flex-col gap-4">
         {back}
-        <Badge variant={workStateVariant(task.state)} className="self-start">
-          {workStateLabel(task.state)}
-        </Badge>
+        <WorkStatus state={task.state} />
         {header}
         <WorkNotice view={contextView} subject="this task" />
         <WorkRecordsNotice set={records} subject="this task's team records" />
@@ -143,7 +142,7 @@ export function WorkTaskDetail({
       {back}
       <div className="flex flex-col gap-1.5">
         <div className="flex flex-wrap items-center gap-2">
-          <Badge variant={workStateVariant(task.state)}>{workStateLabel(task.state)}</Badge>
+          <WorkStatus state={task.state} />
           <Badge variant="outline">
             {model.guided
               ? model.membership
@@ -162,10 +161,10 @@ export function WorkTaskDetail({
       <WorkNotice view={contextView} subject="this task" />
       <WorkRecordsNotice set={records} subject="this task's team records" />
       <WorkApprovalRow surface={surface} />
+      <WorkTaskTeam surface={surface} />
       <WorkTaskScope surface={surface} />
       {model.guided ? <WorkTaskPlan surface={surface} onOpenTask={onOpenTask} /> : null}
       <WorkTaskRelationships surface={surface} onOpenTask={onOpenTask} />
-      <WorkTaskTeam surface={surface} />
       <WorkTaskReview surface={surface} />
       <WorkTaskDelivery surface={surface} />
       <WorkTaskMemory surface={surface} />

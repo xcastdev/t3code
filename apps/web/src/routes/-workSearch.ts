@@ -1,7 +1,14 @@
 import { ProjectWorkTaskId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-export const WORK_SECTIONS = ["overview", "tasks", "knowledge", "intake", "portfolio"] as const;
+export const WORK_SECTIONS = [
+  "overview",
+  "tasks",
+  "team",
+  "knowledge",
+  "intake",
+  "portfolio",
+] as const;
 export type WorkSection = (typeof WORK_SECTIONS)[number];
 
 export interface WorkRouteSearch {

@@ -1,14 +1,19 @@
 import {
-  asProjectTeamRecord,
   projectWorkSelectionIsCurrent,
   type ProjectWorkScope,
   type ProjectWorkSelection,
 } from "@t3tools/client-runtime/project-work";
-import { CommandId, type ProjectTeamRecordRead } from "@t3tools/contracts";
+import { CommandId, PROJECT_TEAM_PRESETS, type ProjectWorkTaskId } from "@t3tools/contracts";
 import { useId, useState } from "react";
 
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import { useEnvironmentProviders } from "../../state/environments";
+import { WorkTeamMembers } from "./WorkTeamRoster";
+import { useWorkTeamRoster } from "./useWorkTeamRoster";
+import { WorkAvatarEditor } from "./WorkAvatarEditor";
+import { WorkMemberAvatar } from "./WorkMemberAvatar";
+import { memberAvatarIdentity } from "./workTeamView";
+import { Input } from "../ui/input";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Label } from "../ui/label";
@@ -31,11 +36,12 @@ import {
   WorkSection,
 } from "./WorkLayout";
 import { WorkRecordsNotice, WorkReviewChanged } from "./WorkNotice";
-import { useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
+import { workRecordsBlockedReason } from "./useWorkRecords";
 import type { WorkWriter } from "./useWorkWriter";
 import {
   buildTeamConfigurationIntent,
   emptyTeamConfiguration,
+  fillPresetNames,
   MEMORY_ACCESS,
   recordedTeamConfiguration,
   syncModelPolicies,
@@ -69,22 +75,16 @@ interface Draft {
  * limits each model runs under. Saving records configuration only; workers
  * start one at a time from an approved task.
  */
-export function WorkTeam({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWriter }) {
-  const limits = useWorkRecords(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "foundation-records",
-    recordKind: "limits",
-  });
-  const roles = useWorkRecords(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "foundation-records",
-    recordKind: "role-revision",
-  });
-  const members = useWorkRecords(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "foundation-records",
-    recordKind: "member",
-  });
+export function WorkTeam({
+  scope,
+  writer,
+  onOpenTask,
+}: {
+  scope: ProjectWorkScope;
+  writer: WorkWriter;
+  onOpenTask: (id: ProjectWorkTaskId) => void;
+}) {
+  const { limits, roles, members, records } = useWorkTeamRoster(scope);
   const providersByEnvironment = useEnvironmentProviders();
   const [draft, setDraft] = useState<Draft | null>(null);
   const key = "team:configure";
@@ -93,12 +93,6 @@ export function WorkTeam({ scope, writer }: { scope: ProjectWorkScope; writer: W
   const complete = sets.every((set) => set.complete);
   const revision =
     complete && sets.every((set) => set.revision === limits.revision) ? limits.revision : null;
-  const records = sets.flatMap((set) =>
-    set.records.flatMap((value): ProjectTeamRecordRead[] => {
-      const record = asProjectTeamRecord(value);
-      return record === null ? [] : [record];
-    }),
-  );
   const recorded = revision === null ? null : recordedTeamConfiguration(records);
   const blocked =
     workRecordsBlockedReason(limits, "team limits") ??
@@ -160,6 +154,7 @@ export function WorkTeam({ scope, writer }: { scope: ProjectWorkScope; writer: W
   return (
     <WorkSection
       title="Team"
+      grouped={false}
       description="Roles, models and limits for managed work. Saving records them only; nothing starts."
       actions={
         draft === null && recorded !== null && recorded.kind !== "unreadable" ? (
@@ -193,7 +188,10 @@ export function WorkTeam({ scope, writer }: { scope: ProjectWorkScope; writer: W
         <WorkRecordsNotice set={roles} subject="role profiles" />
         <WorkRecordsNotice set={members} subject="team members" />
         {recorded === null ? null : recorded.kind === "none" ? (
-          <p className="text-sm">No team is configured for this project.</p>
+          <p className="text-sm">
+            Meet Quinn, Iris, Sage, Otto, Vera and Wren. Set up a provider and models, then override
+            any name or role instructions.
+          </p>
         ) : recorded.kind === "unreadable" ? (
           <WorkFormStatus tone="muted" message={recorded.reason} />
         ) : (
@@ -207,16 +205,6 @@ export function WorkTeam({ scope, writer }: { scope: ProjectWorkScope; writer: W
                 generation {recorded.generation}
               </WorkRevision>
             </div>
-            <dl className="grid gap-x-4 gap-y-0.5 text-sm sm:grid-cols-[8rem_minmax(0,1fr)]">
-              {recorded.values.profiles.map((profile) => (
-                <div key={profile.role} className="contents">
-                  <dt className="text-muted-foreground">{workStateLabel(profile.role)}</dt>
-                  <dd className="break-words">
-                    {profile.model} · {MEMORY_LABELS[profile.memoryAccess]}
-                  </dd>
-                </div>
-              ))}
-            </dl>
             <WorkMeta>
               {LIMIT_FIELDS.map(([field, label]) => `${label} ${recorded.values[field] ?? 0}`).join(
                 " · ",
@@ -228,8 +216,9 @@ export function WorkTeam({ scope, writer }: { scope: ProjectWorkScope; writer: W
           Enabling a team doesn't start anything. Each worker starts from an approved task.
         </WorkMeta>
       </WorkRow>
+      {configured ? <WorkTeamMembers scope={scope} onOpenTask={onOpenTask} /> : null}
       {draft !== null ? (
-        <WorkRow className="gap-4">
+        <WorkRow className="gap-4 rounded-xl border border-border/60 bg-card/40 py-4">
           {changed ? (
             <WorkReviewChanged
               onReview={() => {
@@ -245,6 +234,7 @@ export function WorkTeam({ scope, writer }: { scope: ProjectWorkScope; writer: W
           ) : (
             <TeamForm
               values={draft.values}
+              recorded={draft.recorded}
               providers={providers.map((entry) => ({
                 id: entry.instanceId,
                 label: entry.displayName,
@@ -289,10 +279,12 @@ interface ProviderChoice {
 
 function TeamForm({
   values,
+  recorded,
   providers,
   onChange,
 }: {
   readonly values: TeamConfigurationValues;
+  readonly recorded: TeamConfigurationValues | null;
   readonly providers: ReadonlyArray<ProviderChoice>;
   readonly onChange: (values: TeamConfigurationValues) => void;
 }) {
@@ -343,6 +335,17 @@ function TeamForm({
       {providers.length === 0 ? (
         <WorkMeta>No providers are enabled on this environment. Enable one in Settings.</WorkMeta>
       ) : null}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <WorkMeta>
+          Start with the predefined agents, then make them your own. Names don't change a role's
+          permissions.
+        </WorkMeta>
+        {values.profiles.some((p) => !p.name?.trim()) ? (
+          <Button size="sm" variant="outline" onClick={() => onChange(fillPresetNames(values))}>
+            Use preset names ({values.profiles.filter((p) => !p.name?.trim()).length})
+          </Button>
+        ) : null}
+      </div>
       <div className="flex flex-col gap-3">
         {values.profiles.map((profile, index) => {
           const set = (patch: Partial<typeof profile>) =>
@@ -357,7 +360,69 @@ function TeamForm({
               key={profile.role}
               className="grid gap-2 rounded-lg border border-border/60 p-3 sm:grid-cols-2"
             >
-              <legend className="px-1 text-sm font-medium">{workStateLabel(profile.role)}</legend>
+              <legend className="px-1 text-sm font-medium">
+                <span className="inline-flex items-center gap-2">
+                  <WorkMemberAvatar
+                    member={memberAvatarIdentity(
+                      profile.role,
+                      profile.name ?? profile.role,
+                      profile.avatar,
+                    )}
+                  />
+                  {profile.name?.trim() || workStateLabel(profile.role)} ·{" "}
+                  {workStateLabel(profile.role)}
+                </span>
+              </legend>
+              <p className="text-xs text-muted-foreground sm:col-span-2">
+                {PROJECT_TEAM_PRESETS[profile.role].specialty}
+              </p>
+              <WorkAvatarEditor
+                role={profile.role}
+                name={profile.name?.trim() || workStateLabel(profile.role)}
+                avatar={profile.avatar}
+                recorded={recorded?.profiles.find((p) => p.role === profile.role)?.avatar}
+                others={values.profiles.flatMap((p, at) =>
+                  at !== index && p.avatar ? [p.avatar] : [],
+                )}
+                onChange={(avatar) => set({ avatar })}
+              />
+              <WorkField label="Display name">
+                {(id) => (
+                  <Input
+                    id={id}
+                    maxLength={40}
+                    placeholder={workStateLabel(profile.role)}
+                    value={profile.name ?? ""}
+                    onChange={(event) => set({ name: event.target.value })}
+                  />
+                )}
+              </WorkField>
+              <div className="flex flex-wrap items-end gap-2">
+                {profile.name?.trim() &&
+                profile.name.trim() !== PROJECT_TEAM_PRESETS[profile.role].name ? (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => set({ name: PROJECT_TEAM_PRESETS[profile.role].name })}
+                  >
+                    Use {PROJECT_TEAM_PRESETS[profile.role].name}
+                  </Button>
+                ) : null}
+                {(profile.name ?? "") !==
+                (recorded?.profiles.find((p) => p.role === profile.role)?.name ?? "") ? (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    onClick={() =>
+                      set({
+                        name: recorded?.profiles.find((p) => p.role === profile.role)?.name ?? "",
+                      })
+                    }
+                  >
+                    Revert name
+                  </Button>
+                ) : null}
+              </div>
               <WorkField label="Model">
                 {(id) => (
                   <Select

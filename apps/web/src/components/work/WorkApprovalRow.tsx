@@ -2,7 +2,7 @@ import { ProjectWorkApprovalId } from "@t3tools/contracts";
 import { useState } from "react";
 
 import { randomUUID } from "../../lib/utils";
-import { Badge } from "../ui/badge";
+import { WorkStatus, WorkStatusGlyph } from "./WorkStatus";
 import { Button } from "../ui/button";
 import { makeProjectWorkSimpleTaskCommand } from "./workMutations";
 import {
@@ -20,7 +20,7 @@ import {
   type WorkDecisionResponse as Response,
   type WorkDecisionSnapshot,
 } from "./workLogic";
-import { gateResponses, shortHash, workStateVariant, type WorkApprovalStep } from "./workModel";
+import { gateResponses, shortHash, type WorkApprovalStep } from "./workModel";
 import { bindingPhase, recordsOfKind, startAvailability } from "./workPresentation";
 import { guidedFields, newCommandId, type WorkTaskSurface } from "./workTaskSurface";
 
@@ -101,13 +101,17 @@ export function WorkApprovalRow({ surface }: { surface: WorkTaskSurface }) {
         const deciding = pending?.step === step.id ? pending : null;
         const changed = deciding !== null && decisionChanged(deciding, step, surface.current);
         return (
-          <WorkRow key={step.id}>
+          <WorkRow key={step.id} className="relative gap-2 pl-10 sm:pl-10">
+            <span className="absolute top-3 left-4 bottom-0 flex flex-col items-center gap-2">
+              <WorkStatusGlyph state={step.state} />
+              <span className="min-h-3 w-px flex-1 bg-border/70" />
+            </span>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
               <span className="w-16 shrink-0 text-sm font-medium">{step.label}</span>
               <WorkRevision className="w-8 text-muted-foreground">
                 {step.revision === null ? "–" : `r${step.revision}`}
               </WorkRevision>
-              <Badge variant={workStateVariant(step.state)}>{STATE_LABEL[step.state]}</Badge>
+              <span className="text-xs font-medium">{STATE_LABEL[step.state]}</span>
               {step.hash ? (
                 <WorkRevision className="text-muted-foreground" title={step.hash}>
                   {shortHash(step.hash)}
@@ -166,7 +170,11 @@ export function WorkApprovalRow({ surface }: { surface: WorkTaskSurface }) {
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
             <span className="w-16 shrink-0 text-sm font-medium">Execution</span>
             <WorkRevision className="w-8 text-muted-foreground">–</WorkRevision>
-            <Badge variant={execution.tone}>{execution.label}</Badge>
+            <WorkStatus
+              state={execution.label === "Not started" ? "draft" : "running"}
+              label={execution.label}
+              tone={execution.tone}
+            />
           </div>
           <WorkMeta>{execution.detail}</WorkMeta>
         </WorkRow>

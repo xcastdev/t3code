@@ -9,8 +9,8 @@ To change a single thread, choose **Skills, commands and MCP** from the thread's
 sidebar or the command palette. On mobile, open **Settings → Skills and commands**, the
 project's overview, or **Skills and commands** in a thread's menu.
 
-**Overview** lists everything that applies to the selected scope from all three catalogs. Each
-entry is still edited in its own section.
+Use search and the resource type filter to narrow the catalogs. **All** shows each resource in
+its management section; **MCP**, **Skills**, **Commands** and **Snippets** show only that type.
 
 ## MCP servers
 

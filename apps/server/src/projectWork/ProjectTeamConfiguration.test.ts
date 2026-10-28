@@ -16,7 +16,7 @@ import {
   ProviderInstanceId,
   ProjectWorkTaskId,
   ProjectWorkCriterionId,
-  type ProjectTeamConfigurationIntent,
+  ProjectTeamConfigurationIntent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -31,6 +31,7 @@ import * as Gateway from "./ProjectWorkGateway.ts";
 import * as Runtime from "./ProjectWorkRuntime.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
 
+const decodeConfiguration = Schema.decodeEffect(ProjectTeamConfigurationIntent);
 const decodeTeamRecords = Schema.decodeUnknownEffect(Schema.Array(ProjectTeamRecord));
 const decodeEnvelope = Schema.decodeUnknownEffect(ProjectWorkBoundedReadEnvelope);
 const projectId = ProjectId.make("runtime-project");
@@ -156,6 +157,139 @@ it.effect("configuration and reverse controls persist once and never assign or s
     assert.deepStrictEqual(state.attempts, []);
     assert.equal((yield* Effect.result(gateway.write(configuration, human)))._tag, "Failure");
   }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("custom member names persist through configuration changes without starting work", () =>
+  Effect.gen(function* () {
+    const gateway = yield* seed;
+    const sql = yield* SqlClient.SqlClient;
+    const named = yield* decodeConfiguration({
+      ...configuration,
+      profiles: configuration.profiles.map((profile) => ({
+        ...profile,
+        name: profile.role === "coordinator" ? "Atlas" : `Agent ${profile.role}`,
+      })),
+    });
+    const saved = yield* gateway.write(named, human);
+    const installed = yield* readCurrentState(sql, projectId);
+    assert.equal(
+      installed.foundationRecords?.filter((r) => r.kind === "member").find((r) => r.coordinator)
+        ?.name,
+      "Atlas",
+    );
+    const next = yield* gateway.write(
+      {
+        ...configuration,
+        commandId: CommandId.make("rename"),
+        expectedRevision: saved.revision,
+        expectedConfigurationGeneration: 1,
+        enabled: false,
+        profiles: configuration.profiles.map((profile) => ({
+          ...profile,
+          ...(profile.role === "coordinator" ? { name: "Avery" } : {}),
+        })),
+      },
+      human,
+    );
+    const disabled = yield* readCurrentState(sql, projectId);
+    assert.equal(
+      disabled.foundationRecords?.filter((r) => r.kind === "member").find((r) => r.coordinator)
+        ?.name,
+      "Avery",
+    );
+    assert.equal(
+      disabled.foundationRecords?.find((r) => r.kind === "member" && r.name === "Agent reviewer")
+        ?.status,
+      "paused",
+    );
+    yield* gateway.write(
+      {
+        ...configuration,
+        commandId: CommandId.make("retain-names"),
+        expectedRevision: next.revision,
+        expectedConfigurationGeneration: 2,
+      },
+      human,
+    );
+    const retained = yield* readCurrentState(sql, projectId);
+    assert.equal(
+      retained.foundationRecords?.filter((r) => r.kind === "member").find((r) => r.coordinator)
+        ?.name,
+      "Avery",
+    );
+    assert.deepStrictEqual(retained.tasks, []);
+    assert.deepStrictEqual(retained.attempts, []);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "generated avatars persist, survive omitted fields and reset only when explicitly cleared",
+  () =>
+    Effect.gen(function* () {
+      const gateway = yield* seed;
+      const sql = yield* SqlClient.SqlClient;
+      const avatar = {
+        kind: "generated" as const,
+        version: 1 as const,
+        seed: 42,
+        tone: "paper" as const,
+        expression: "curious" as const,
+        motion: true,
+      };
+      const configured = yield* decodeConfiguration({
+        ...configuration,
+        profiles: configuration.profiles.map((p) => ({ ...p, avatar })),
+      });
+      const first = yield* gateway.write(configured, human);
+      const firstState = yield* readCurrentState(sql, projectId);
+      assert.deepStrictEqual(
+        firstState.foundationRecords?.filter((r) => r.kind === "member").find((r) => r.coordinator)
+          ?.avatar,
+        avatar,
+      );
+      const second = yield* gateway.write(
+        {
+          ...configuration,
+          commandId: CommandId.make("keep-avatar"),
+          expectedRevision: first.revision,
+          expectedConfigurationGeneration: 1,
+          enabled: false,
+        },
+        human,
+      );
+      const retained = yield* readCurrentState(sql, projectId);
+      assert.deepStrictEqual(
+        retained.foundationRecords?.filter((r) => r.kind === "member").find((r) => r.coordinator)
+          ?.avatar,
+        avatar,
+      );
+      yield* gateway.write(
+        {
+          ...configuration,
+          commandId: CommandId.make("clear-avatar"),
+          expectedRevision: second.revision,
+          expectedConfigurationGeneration: 2,
+          enabled: false,
+          profiles: configuration.profiles.map((p) => ({
+            ...p,
+            ...(p.role === "coordinator" ? { avatar: null } : {}),
+          })),
+        },
+        human,
+      );
+      const cleared = yield* readCurrentState(sql, projectId);
+      assert.isUndefined(
+        cleared.foundationRecords?.filter((r) => r.kind === "member").find((r) => r.coordinator)
+          ?.avatar,
+      );
+      assert.deepStrictEqual(
+        cleared.foundationRecords?.filter((r) => r.kind === "member").find((r) => !r.coordinator)
+          ?.avatar,
+        avatar,
+      );
+      assert.deepStrictEqual(cleared.tasks, []);
+      assert.deepStrictEqual(cleared.attempts, []);
+    }).pipe(Effect.provide(testLayer)),
 );
 
 it.effect("team writes require the current stored human session, including retries", () =>

@@ -26,6 +26,8 @@ import {
   syncModelPolicies,
   type TeamConfigurationValues,
 } from "./workLogic";
+import { WorkAvatarEditor } from "./WorkAvatarEditor";
+import { WorkAgentAvatar } from "./WorkAgentAvatar";
 import { workStateLabel } from "./workModel";
 
 const VALIDATION_COMMAND_ID = CommandId.make("validation");
@@ -161,10 +163,20 @@ export function WorkTeamSection({
                 {recorded.generation}
               </WorkText>
               {recorded.values.profiles.map((profile) => (
-                <WorkText key={profile.role} muted>
-                  {workStateLabel(profile.role)}: {profile.model} ·{" "}
-                  {MEMORY_LABELS[profile.memoryAccess]} memory
-                </WorkText>
+                <View key={profile.role} className="flex-row items-center gap-3">
+                  <WorkAgentAvatar
+                    role={profile.role}
+                    name={profile.name ?? profile.role}
+                    avatar={profile.avatar}
+                  />
+                  <View className="min-w-0 flex-1">
+                    <WorkText>{profile.name ?? workStateLabel(profile.role)}</WorkText>
+                    <WorkText muted>
+                      {workStateLabel(profile.role)} · {profile.model} ·{" "}
+                      {MEMORY_LABELS[profile.memoryAccess]} memory
+                    </WorkText>
+                  </View>
+                </View>
               ))}
             </>
           )}
@@ -203,6 +215,7 @@ export function WorkTeamSection({
           ) : (
             <TeamForm
               values={draft.values}
+              recorded={draft.recorded}
               providers={providers.map((entry) => ({
                 id: entry.instanceId,
                 label: entry.displayName ?? entry.instanceId,
@@ -237,10 +250,11 @@ interface ProviderChoice {
 
 function TeamForm(props: {
   values: TeamConfigurationValues;
+  recorded: TeamConfigurationValues | null;
   providers: ReadonlyArray<ProviderChoice>;
   onChange: (values: TeamConfigurationValues) => void;
 }) {
-  const { values, onChange } = props;
+  const { values, recorded, onChange } = props;
   const provider = props.providers.find((entry) => entry.id === values.providerInstanceId);
   const [choosingModel, setChoosingModel] = useState<string | null>(null);
   return (
@@ -304,7 +318,23 @@ function TeamForm(props: {
                   />
                 ))
               : null}
+            <WorkAvatarEditor
+              role={profile.role}
+              name={profile.name?.trim() || workStateLabel(profile.role)}
+              avatar={profile.avatar}
+              recorded={recorded?.profiles.find((p) => p.role === profile.role)?.avatar}
+              others={values.profiles.flatMap((p, at) =>
+                at !== index && p.avatar ? [p.avatar] : [],
+              )}
+              onChange={(avatar) => set({ avatar })}
+            />
             <WorkBlock>
+              <WorkInput
+                label="Display name"
+                value={profile.name ?? ""}
+                onChange={(name) => set({ name })}
+                maxLength={40}
+              />
               <SegmentedControl
                 size="compact"
                 options={MEMORY_ACCESS.map((access) => ({

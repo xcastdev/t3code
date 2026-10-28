@@ -1,4 +1,3 @@
-import type { ManagedResourceInventoryRow } from "@t3tools/client-runtime/state/managedResources";
 import {
   McpCatalogName,
   ProjectMcpCredentialName,
@@ -17,7 +16,6 @@ import {
   type ProjectId,
   type ProjectMcpTransport,
   type ProviderInstanceId,
-  type SkillApplicationSummary,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
@@ -574,63 +572,9 @@ export function mcpApplicationSummary(snapshot: McpCatalogSnapshot): {
   return { label: `Waiting for delivery (${revisions})`, tone: "info" };
 }
 
-export type InventoryKindFilter = "all" | ManagedResourceInventoryRow["kind"];
+export type InventoryKindFilter = "all" | "mcp" | "skill" | "command" | "snippet";
 
-export function filterInventoryRows(
-  rows: ReadonlyArray<ManagedResourceInventoryRow>,
-  query: string,
-  kind: InventoryKindFilter,
-): ReadonlyArray<ManagedResourceInventoryRow> {
+export function matchesResourceQuery(query: string, ...values: ReadonlyArray<string | undefined>) {
   const needle = query.trim().toLowerCase();
-  return rows.filter(
-    (row) =>
-      (kind === "all" || row.kind === kind) &&
-      (needle.length === 0 ||
-        row.key.toLowerCase().includes(needle) ||
-        row.name.toLowerCase().includes(needle)),
-  );
-}
-
-export const INVENTORY_KIND_LABELS: Readonly<Record<ManagedResourceInventoryRow["kind"], string>> =
-  {
-    skill: "Skill",
-    command: "Command",
-    snippet: "Snippet",
-    mcp: "MCP server",
-  };
-
-export function inventoryScopeLabel(
-  row: Pick<ManagedResourceInventoryRow, "kind" | "source" | "scope">,
-) {
-  if (row.source === "native") return "Provider";
-  switch (row.scope) {
-    case "global":
-    case "environment":
-      return "Environment";
-    case "project":
-      return "Project";
-    case "session":
-      return "Session";
-    default:
-      return row.scope;
-  }
-}
-
-/** Desired versus delivered skill revisions as the catalog reports them. */
-export function skillApplicationLabel(application: SkillApplicationSummary): string {
-  const revisions = `desired r${application.desiredRevision}, applied r${application.appliedRevision}`;
-  switch (application.status) {
-    case "applied":
-      return application.desiredRevision === application.appliedRevision
-        ? `Applied (${revisions})`
-        : `Waiting for delivery (${revisions})`;
-    case "pending_new_session":
-      return `Applies to new sessions (${revisions})`;
-    case "pending_restart":
-      return `Restart required (${revisions})`;
-    case "failed":
-      return `Delivery failed (${revisions})${application.failure ? `: ${application.failure.message}` : ""}`;
-    case "unsupported":
-      return "This provider can't receive managed skills";
-  }
+  return needle.length === 0 || values.some((value) => value?.toLowerCase().includes(needle));
 }

@@ -130,7 +130,18 @@ export const ProjectTeamRoleRevision = Schema.Struct({
   memoryAccess: Schema.Literals(["none", "project", "shared"]),
   delegationDepth: NonNegativeInt.check(Schema.isLessThanOrEqualTo(8)),
 });
+export const ProjectTeamAvatar = Schema.Struct({
+  kind: Schema.Literal("generated"),
+  version: Schema.Literal(1),
+  seed: NonNegativeInt.check(Schema.isLessThanOrEqualTo(4_294_967_295)),
+  tone: Schema.Literals(["paper", "sand", "sage", "slate"]),
+  expression: Schema.Literals(["smile", "focused", "curious"]),
+  motion: Schema.Boolean,
+});
+export type ProjectTeamAvatar = typeof ProjectTeamAvatar.Type;
+
 export const ProjectTeamMember = Schema.Struct({
+  avatar: Schema.optionalKey(ProjectTeamAvatar),
   ...Fields,
   kind: Schema.Literal("member"),
   status: Schema.Literals(["active", "paused", "retired"]),
@@ -717,6 +728,99 @@ export const ProjectTeamRecordPage = Schema.Struct({
     Schema.Array(ProjectTeamBindingAccounting).check(Schema.isMaxLength(128)),
   ),
 });
+export const PROJECT_TEAM_PRESETS = {
+  coordinator: {
+    color: "violet",
+    roleMonogram: "CO",
+    avatar: {
+      kind: "generated",
+      version: 1,
+      seed: 0,
+      tone: "paper",
+      expression: "smile",
+      motion: true,
+    },
+    name: "Quinn",
+    monogram: "Q",
+    specialty: "Leads the team. Splits approved work and routes it.",
+  },
+  investigator: {
+    color: "teal",
+    roleMonogram: "IV",
+    avatar: {
+      kind: "generated",
+      version: 1,
+      seed: 65793,
+      tone: "sage",
+      expression: "curious",
+      motion: true,
+    },
+    name: "Iris",
+    monogram: "I",
+    specialty: "Reads the code and reports what's there before anything changes.",
+  },
+  planner: {
+    color: "indigo",
+    roleMonogram: "PL",
+    avatar: {
+      kind: "generated",
+      version: 1,
+      seed: 131585,
+      tone: "slate",
+      expression: "focused",
+      motion: true,
+    },
+    name: "Sage",
+    monogram: "S",
+    specialty: "Turns a task into concrete steps that fit the scope.",
+  },
+  implementer: {
+    color: "fuchsia",
+    roleMonogram: "IM",
+    avatar: {
+      kind: "generated",
+      version: 1,
+      seed: 258,
+      tone: "sand",
+      expression: "focused",
+      motion: true,
+    },
+    name: "Otto",
+    monogram: "O",
+    specialty: "Writes the change in small, reviewable steps.",
+  },
+  reviewer: {
+    color: "cyan",
+    roleMonogram: "RV",
+    avatar: {
+      kind: "generated",
+      version: 1,
+      seed: 65537,
+      tone: "paper",
+      expression: "curious",
+      motion: true,
+    },
+    name: "Vera",
+    monogram: "V",
+    specialty: "Checks each change against the task before it moves on.",
+  },
+  integrator: {
+    color: "pink",
+    roleMonogram: "IG",
+    avatar: {
+      kind: "generated",
+      version: 1,
+      seed: 131074,
+      tone: "sage",
+      expression: "smile",
+      motion: true,
+    },
+    name: "Wren",
+    monogram: "W",
+    specialty: "Brings finished work together and lands it cleanly.",
+  },
+} as const;
+
 export const PROJECT_TEAM_DEFAULT_LIMITS = {
   environmentModelCalls: 2,
   projectWritableWorkers: 1,
@@ -746,6 +850,8 @@ const ConfiguredPositive = Schema.Int.check(
   Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
 );
 const Profile = Schema.Struct({
+  avatar: Schema.optionalKey(Schema.NullOr(ProjectTeamAvatar)),
+  name: Schema.optionalKey(Text),
   role: ProjectTeamRoleRevision.fields.role,
   instructions: Body,
   skills: Ids,

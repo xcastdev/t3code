@@ -26,7 +26,7 @@ import { resourceEditorConflict } from "@t3tools/client-runtime/resource-actions
 
 import {
   effectiveMcpDefinitions,
-  filterInventoryRows,
+  matchesResourceQuery,
   mcpApplicationSummary,
   mcpCatalogRows,
   mcpDefinitionInputFromForm,
@@ -657,33 +657,11 @@ describe("text resource actions", () => {
   });
 });
 
-describe("filterInventoryRows", () => {
-  it("filters by kind and by key or name", () => {
-    const rows = [
-      {
-        id: "1",
-        kind: "skill",
-        source: "managed",
-        key: "review",
-        name: "Review",
-        scope: "global",
-        scopeId: "e",
-        enabled: true,
-        revision: 1,
-      },
-      {
-        id: "2",
-        kind: "mcp",
-        source: "managed",
-        key: "docs",
-        name: "Docs",
-        scope: "project",
-        scopeId: "p",
-        enabled: true,
-        revision: 1,
-      },
-    ] as const;
-    expect(filterInventoryRows(rows, "doc", "all").map((row) => row.id)).toEqual(["2"]);
-    expect(filterInventoryRows(rows, "", "skill").map((row) => row.id)).toEqual(["1"]);
+describe("matchesResourceQuery", () => {
+  it("matches names and keys without case or surrounding whitespace", () => {
+    expect(matchesResourceQuery(" REVIEW-CODE ", "Code review", "review-code")).toBe(true);
+    expect(matchesResourceQuery("REVIEW", "Code review", "inspect")).toBe(true);
+    expect(matchesResourceQuery("", undefined, "inspect")).toBe(true);
+    expect(matchesResourceQuery("docs", undefined, "inspect")).toBe(false);
   });
 });

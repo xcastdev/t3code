@@ -45,7 +45,8 @@ import {
   existingTaskRefineSnapshot,
   type ExistingTaskRefineReview,
 } from "./workLogic";
-import { isIssueRecord, workStateLabel, workStateVariant, type WorkIssueRecord } from "./workModel";
+import { isIssueRecord, workStateLabel, type WorkIssueRecord } from "./workModel";
+import { WorkStatus } from "./WorkStatus";
 import { newCommandId, useWorkReview } from "./workTaskSurface";
 
 const decodeBindings = Schema.decodeUnknownOption(ProjectIssueRepositoryBindingsRead);
@@ -108,6 +109,7 @@ function IssueBindingsGeneration({
   const [bindings, setBindings] = useState<Bindings>({ status: "loading" });
   const [preparing, setPreparing] = useState(false);
 
+  // oxlint-disable-next-line t3code/react-effect-budget -- Repository queries cancel replies when this scope or connection changes.
   useEffect(() => {
     if (!writer.canIssue) return;
     let live = true;
@@ -521,7 +523,7 @@ function IssueRow(props: {
         <p className="min-w-0 flex-1 text-sm font-medium break-words">
           #{issue.identity.number} {issue.title}
         </p>
-        <Badge variant={workStateVariant(issue.status)}>{workStateLabel(issue.status)}</Badge>
+        <WorkStatus state={issue.status} />
         {linked ? <Badge variant="secondary">Refined</Badge> : null}
       </div>
       <WorkMeta>

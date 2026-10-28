@@ -91,7 +91,7 @@ export const compileProjectTeamConfiguration = (
     updatedAt: at,
   });
   const roles: Array<Role> = [];
-  for (const profile of intent.profiles) {
+  for (const { name, avatar, ...profile } of intent.profiles) {
     const roleId = idFor(intent.projectId, `role:${profile.role}`);
     const previous = current.filter(
       (record): record is Role => record.kind === "role-revision" && record.roleId === roleId,
@@ -128,11 +128,13 @@ export const compileProjectTeamConfiguration = (
               record.kind === "member" &&
               record.recordId === idFor(intent.projectId, `member:${profile.role}`),
           );
+    const selectedAvatar = avatar === undefined ? old?.avatar : avatar;
     records.push({
+      ...(selectedAvatar == null ? {} : { avatar: selectedAvatar }),
       ...fields(old?.recordId ?? idFor(intent.projectId, `member:${profile.role}`)),
       kind: "member",
       status: intent.enabled ? "active" : "paused",
-      name: old?.name ?? profile.role,
+      name: name ?? old?.name ?? profile.role,
       coordinator: profile.role === "coordinator",
       roleRevisionId: role.recordId,
       revision: old === undefined ? 0 : increment(old.revision),

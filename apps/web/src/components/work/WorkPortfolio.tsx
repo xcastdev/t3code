@@ -3,6 +3,10 @@ import { useState } from "react";
 
 import { useProjects } from "../../state/entities";
 import { useEnvironment } from "../../state/environments";
+import { MiddleTruncate } from "../ui/middle-truncate";
+import { ProjectMonogram } from "../ProjectMonogram";
+import { deriveProjectIdentity } from "../../projectIdentity";
+import { WorkStatusGlyph } from "./WorkStatus";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { WorkEmpty, WorkMeta, WorkRow, WorkSection } from "./WorkLayout";
@@ -94,8 +98,13 @@ function PortfolioRow(props: {
   ).length;
   const question = available?.questions.items.find((entry) => "taskId" in entry);
   return (
-    <WorkRow className="gap-1.5">
-      <div className="flex flex-wrap items-center gap-2">
+    <WorkRow className="gap-3 py-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <ProjectMonogram
+          text={deriveProjectIdentity(props.title).monogram}
+          color={deriveProjectIdentity(props.title).color}
+          className="size-8"
+        />
         <button
           type="button"
           className="min-w-0 flex-1 truncate rounded-sm text-left text-sm font-medium outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
@@ -106,18 +115,22 @@ function PortfolioRow(props: {
         {environment ? <Badge variant="outline">{environment.label}</Badge> : null}
       </div>
       <WorkMeta className="truncate" title={props.checkoutPath}>
-        {props.checkoutPath}
+        <MiddleTruncate value={props.checkoutPath} />
       </WorkMeta>
       {counts !== null ? (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-          <span>
+          <span className="inline-flex items-center gap-1.5">
+            <WorkStatusGlyph state="ready" />
             <span className="tabular-nums">{counts.open + counts.active + counts.review}</span>{" "}
             <span className="text-muted-foreground">open</span>
           </span>
-          <span>
-            <span className="tabular-nums">{running}</span>{" "}
-            <span className="text-muted-foreground">running</span>
-          </span>
+          {(running ?? 0) > 0 ? (
+            <span className="inline-flex items-center gap-1.5">
+              <WorkStatusGlyph state="running" tone="info" />
+              <span className="tabular-nums">{running}</span>
+              <span className="text-muted-foreground">running</span>
+            </span>
+          ) : null}
           {counts.blocked > 0 ? (
             <span className="text-destructive-foreground">
               <span className="tabular-nums">{counts.blocked}</span> blocked or failed

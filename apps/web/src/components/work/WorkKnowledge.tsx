@@ -38,7 +38,8 @@ import { workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage, useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
 import { knowledgeLineage } from "./workLogic";
 import type { WorkWriter } from "./useWorkWriter";
-import { workStateLabel, workStateVariant } from "./workModel";
+import { workStateLabel } from "./workModel";
+import { WorkStatus } from "./WorkStatus";
 import { newCommandId, useWorkReview } from "./workTaskSurface";
 
 const WORK_LIST_PAGE = 32;
@@ -52,7 +53,7 @@ const projectSelection = (scope: ProjectWorkScope, revision: number): ProjectWor
 /** Reviewed project knowledge and decisions; both stay as written until a human replaces them. */
 export function WorkKnowledge({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWriter }) {
   return (
-    <div className="flex min-w-0 flex-col gap-6">
+    <div className="grid min-w-0 items-start gap-6 @5xl/work:grid-cols-2">
       <KnowledgeList scope={scope} writer={writer} />
       <DecisionList scope={scope} writer={writer} />
     </div>
@@ -419,9 +420,7 @@ function DecisionList({ scope, writer }: { scope: ProjectWorkScope; writer: Work
           <WorkRow key={decision.decisionId}>
             <div className="flex flex-wrap items-center gap-2">
               <p className="min-w-0 flex-1 text-sm font-medium break-words">{decision.title}</p>
-              <Badge variant={workStateVariant(decision.state)}>
-                {workStateLabel(decision.state)}
-              </Badge>
+              <WorkStatus state={decision.state} />
             </div>
             {decision.body ? (
               <p className="text-sm whitespace-pre-wrap break-words">{decision.body}</p>

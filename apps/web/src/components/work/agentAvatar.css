@@ -1,0 +1,40 @@
+@keyframes work-agent-nod {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(6deg);
+  }
+  55% {
+    transform: rotate(-3deg);
+  }
+}
+@keyframes work-agent-blink {
+  0%,
+  40%,
+  65%,
+  100% {
+    transform: scaleY(1);
+  }
+  45%,
+  52% {
+    transform: scaleY(0.1);
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  [data-agent-card]:is(:hover, :focus-within)
+    [data-agent-avatar][data-interactive="true"][data-motion="true"]
+    [data-part="pose"],
+  [data-agent-avatar][data-preview="true"][data-motion="true"] [data-part="pose"] {
+    transform-origin: 20px 32px;
+    animation: work-agent-nod 900ms ease-in-out 1;
+  }
+  [data-agent-card]:is(:hover, :focus-within)
+    [data-agent-avatar][data-interactive="true"][data-motion="true"]
+    [data-part="eyes"],
+  [data-agent-avatar][data-preview="true"][data-motion="true"] [data-part="eyes"] {
+    transform-origin: 20px 20px;
+    animation: work-agent-blink 900ms ease-in-out 1;
+  }
+}
