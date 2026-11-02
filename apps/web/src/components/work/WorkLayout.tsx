@@ -76,10 +76,18 @@ export function WorkField({
 }
 
 export function WorkEmpty({ title, detail }: { readonly title: string; readonly detail?: string }) {
+  // A bare "nothing here" is one quiet line; only guidance earns the centered block.
+  if (!detail) {
+    return (
+      <WorkRow>
+        <WorkMeta>{title}</WorkMeta>
+      </WorkRow>
+    );
+  }
   return (
     <WorkRow className="py-6 text-center">
       <p className="text-sm font-medium">{title}</p>
-      {detail ? <WorkMeta>{detail}</WorkMeta> : null}
+      <WorkMeta>{detail}</WorkMeta>
     </WorkRow>
   );
 }

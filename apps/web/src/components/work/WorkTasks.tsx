@@ -16,7 +16,6 @@ import {
   PlusIcon,
   ShieldCheckIcon,
   ShieldIcon,
-  UserRoundIcon,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -38,7 +37,7 @@ import { WorkTaskDetail } from "./WorkTaskDetail";
 import { useWorkRead, WORK_PAGE_SIZE, workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
 import { useWorkTeamRoster } from "./useWorkTeamRoster";
-import { WorkMemberAvatar } from "./WorkMemberAvatar";
+import { type WorkRosterMember, WorkTaskAssignee } from "./WorkTaskAssignee";
 import type { WorkWriter } from "./useWorkWriter";
 import { workStateLabel } from "./workModel";
 import { WorkStatusGlyph } from "./WorkStatus";
@@ -402,46 +401,9 @@ function TaskList({
   );
 }
 
-type RosterMember = ReturnType<typeof useWorkTeamRoster>["roster"][number];
-
-/** Who is on the task: the team member working it, else whoever it is assigned to. */
-function TaskAssignee(props: {
-  readonly task: ProjectWorkTaskRead;
-  readonly worker: RosterMember | undefined;
-  readonly withName?: boolean;
-}) {
-  const name = props.worker?.name ?? props.task.assignee?.displayName ?? null;
-  return (
-    <span className="flex min-w-0 items-center gap-1.5">
-      {props.worker ? (
-        <WorkMemberAvatar member={props.worker} size="icon" />
-      ) : name ? (
-        <span
-          aria-hidden="true"
-          className="flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-2xs font-semibold text-muted-foreground"
-        >
-          {name.slice(0, 1).toUpperCase()}
-        </span>
-      ) : (
-        <span
-          aria-hidden="true"
-          className="flex size-5 shrink-0 items-center justify-center rounded-full border border-dashed border-muted-foreground/50"
-        >
-          <UserRoundIcon className="size-3 text-muted-foreground/70" />
-        </span>
-      )}
-      {props.withName === false ? null : (
-        <span className={cn("truncate", name === null && "text-muted-foreground/70")}>
-          {name ?? "Unassigned"}
-        </span>
-      )}
-    </span>
-  );
-}
-
 function TaskItem(props: {
   readonly task: ProjectWorkTaskRead;
-  readonly worker: RosterMember | undefined;
+  readonly worker: WorkRosterMember | undefined;
   readonly onSelectTask: (id: ProjectWorkTaskId, title?: string) => void;
 }) {
   const { task, worker } = props;
@@ -520,7 +482,7 @@ function TaskItem(props: {
         </span>
       ) : null}
       <span className="hidden min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 text-xs text-muted-foreground @3xl/work:flex">
-        <TaskAssignee task={task} worker={worker} />
+        <WorkTaskAssignee task={task} worker={worker} />
         <span className="shrink-0 tabular-nums">
           <RelativeTime timestamp={task.updatedAt} />
         </span>
