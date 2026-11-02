@@ -81,6 +81,13 @@ export function WorkTeamMembers({
                     </div>
                     <WorkMeta className="truncate">{workStateLabel(member.role)}</WorkMeta>
                   </div>
+                  <span className="shrink-0 pt-0.5">
+                    <WorkStatus
+                      state={member.activity.state}
+                      label={member.activity.label}
+                      tone={member.activity.tone}
+                    />
+                  </span>
                 </div>
                 {specialty ? (
                   <p className="line-clamp-2 min-h-[2lh] px-4 text-xs leading-relaxed text-muted-foreground">
@@ -112,27 +119,21 @@ export function WorkTeamMembers({
                     </>
                   ) : null}
                 </dl>
-                <div className="mt-auto flex min-w-0 flex-col gap-1.5 border-t border-border/50 px-4 py-2.5">
-                  <div className="flex min-w-0 items-center justify-between gap-2">
-                    <WorkStatus
-                      state={member.activity.state}
-                      label={member.activity.label}
-                      tone={member.activity.tone}
-                    />
-                    {member.taskId ? null : member.status !== member.activity.state ? (
-                      <WorkMeta>Member {workStateLabel(member.status).toLowerCase()}</WorkMeta>
-                    ) : (
-                      <WorkMeta>No task</WorkMeta>
-                    )}
-                  </div>
-                  {/* The task gets its own line so its title and state never squeeze the status. */}
+                {/* The footer is the member's task; their status sits in the header. */}
+                <div className="mt-auto flex min-h-11 min-w-0 items-center border-t border-border/50 px-2 py-1.5">
                   {member.taskId ? (
                     <WorkTaskLink
                       scope={scope}
                       taskId={member.taskId as ProjectWorkTaskId}
                       onOpen={onOpenTask}
                     />
-                  ) : null}
+                  ) : (
+                    <WorkMeta className="px-2">
+                      {member.status !== member.activity.state
+                        ? `Member ${workStateLabel(member.status).toLowerCase()}`
+                        : "No task"}
+                    </WorkMeta>
+                  )}
                 </div>
               </article>
             );
