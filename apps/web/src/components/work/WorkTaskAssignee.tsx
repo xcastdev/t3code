@@ -7,6 +7,18 @@ import { WorkMemberAvatar } from "./WorkMemberAvatar";
 
 export type WorkRosterMember = ReturnType<typeof useWorkTeamRoster>["roster"][number];
 
+/** The team member on a task: the one working it, else the member it is assigned to. */
+export function taskMember(
+  roster: ReadonlyArray<WorkRosterMember>,
+  task: Pick<ProjectWorkTaskRead, "taskId" | "assignee">,
+): WorkRosterMember | undefined {
+  const assigneeId = task.assignee?.id;
+  return (
+    roster.find((member) => member.taskId === task.taskId) ??
+    (assigneeId === undefined ? undefined : roster.find((member) => member.recordId === assigneeId))
+  );
+}
+
 /** Who is on the task: the team member working it, else whoever it is assigned to. */
 export function WorkTaskAssignee(props: {
   readonly task: Pick<ProjectWorkTaskRead, "assignee">;

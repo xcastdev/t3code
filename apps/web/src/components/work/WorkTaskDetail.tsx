@@ -25,7 +25,7 @@ import { WorkApprovalRow } from "./WorkApprovalRow";
 import { WorkFormStatus, WorkMeta, WorkRevision, WorkTime } from "./WorkLayout";
 import { WorkNotice, WorkRecordsNotice } from "./WorkNotice";
 import { WorkTaskActivity } from "./WorkTaskActivity";
-import { WorkTaskAssignee } from "./WorkTaskAssignee";
+import { taskMember, WorkTaskAssignee } from "./WorkTaskAssignee";
 import { WorkTaskControls } from "./WorkTaskControls";
 import { WorkTaskDelivery } from "./WorkTaskDelivery";
 import { WorkTaskMemory } from "./WorkTaskMemory";
@@ -237,7 +237,7 @@ function WorkTaskProperties(props: {
 }) {
   const { task } = props;
   const { roster } = useWorkTeamRoster(props.scope);
-  const worker = roster.find((member) => member.taskId === task.taskId);
+  const worker = taskMember(roster, task);
   const criteria = task.specification?.criterionIds.length ?? 0;
   const approved = task.approval !== undefined && task.approval.specRevision === task.specRevision;
   const watchers = task.watchers.flatMap((watcher) =>

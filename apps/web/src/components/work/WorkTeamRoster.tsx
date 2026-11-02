@@ -112,25 +112,27 @@ export function WorkTeamMembers({
                     </>
                   ) : null}
                 </dl>
-                <div className="mt-auto flex min-w-0 items-center justify-between gap-2 border-t border-border/50 px-4 py-2.5">
-                  <WorkStatus
-                    state={member.activity.state}
-                    label={member.activity.label}
-                    tone={member.activity.tone}
-                  />
+                <div className="mt-auto flex min-w-0 flex-col gap-1.5 border-t border-border/50 px-4 py-2.5">
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <WorkStatus
+                      state={member.activity.state}
+                      label={member.activity.label}
+                      tone={member.activity.tone}
+                    />
+                    {member.taskId ? null : member.status !== member.activity.state ? (
+                      <WorkMeta>Member {workStateLabel(member.status).toLowerCase()}</WorkMeta>
+                    ) : (
+                      <WorkMeta>No task</WorkMeta>
+                    )}
+                  </div>
+                  {/* The task gets its own line so its title and state never squeeze the status. */}
                   {member.taskId ? (
-                    <span className="min-w-0 truncate">
-                      <WorkTaskLink
-                        scope={scope}
-                        taskId={member.taskId as ProjectWorkTaskId}
-                        onOpen={onOpenTask}
-                      />
-                    </span>
-                  ) : member.status !== member.activity.state ? (
-                    <WorkMeta>Member {workStateLabel(member.status).toLowerCase()}</WorkMeta>
-                  ) : (
-                    <WorkMeta>No task</WorkMeta>
-                  )}
+                    <WorkTaskLink
+                      scope={scope}
+                      taskId={member.taskId as ProjectWorkTaskId}
+                      onOpen={onOpenTask}
+                    />
+                  ) : null}
                 </div>
               </article>
             );

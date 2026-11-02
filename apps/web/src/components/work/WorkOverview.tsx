@@ -14,6 +14,7 @@ import { WorkMeta, WorkRevision, WorkRow, WorkSection } from "./WorkLayout";
 import { WorkNotice, WorkPager } from "./WorkNotice";
 import { WorkTaskLink } from "./WorkTaskRefs";
 import { WorkInbox, WorkSupervision, WorkProgress } from "./WorkSupervision";
+import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { WorkTeamRail } from "./WorkTeamRoster";
 import { useWorkRead } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
@@ -52,10 +53,14 @@ export function WorkOverview({
     32,
   );
   const briefing = asProjectWorkBriefing(briefingView.value);
+  const { summary } = useWorkTeamRoster(scope);
+  // Needs you already lists each blocker with its owner and reason.
+  const listedBlockers = new Set((summary?.blockers.items ?? []).map((blocker) => blocker.taskId));
   const attentionItems = (attention.view.page?.items ?? [])
     .map((item) => item.value)
     .filter(isAttention)
-    .filter((entry) => entry.resolvedAt === undefined);
+    .filter((entry) => entry.resolvedAt === undefined)
+    .filter((entry) => entry.reason !== "blocked" || !listedBlockers.has(entry.taskId));
   const missionItems = (missions.view.page?.items ?? []).flatMap((item): WorkMissionRecord[] => {
     const record = asProjectTeamRecord(item.value);
     return record !== null && isMissionRecord(record) ? [record] : [];

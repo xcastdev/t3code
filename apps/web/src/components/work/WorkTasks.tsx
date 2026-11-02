@@ -37,7 +37,7 @@ import { WorkTaskDetail } from "./WorkTaskDetail";
 import { useWorkRead, WORK_PAGE_SIZE, workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
 import { useWorkTeamRoster } from "./useWorkTeamRoster";
-import { type WorkRosterMember, WorkTaskAssignee } from "./WorkTaskAssignee";
+import { taskMember, type WorkRosterMember, WorkTaskAssignee } from "./WorkTaskAssignee";
 import type { WorkWriter } from "./useWorkWriter";
 import { workStateLabel } from "./workModel";
 import { WorkStatusGlyph } from "./WorkStatus";
@@ -377,7 +377,7 @@ function TaskList({
                     <TaskItem
                       key={task.taskId}
                       task={task}
-                      worker={roster.find((member) => member.taskId === task.taskId)}
+                      worker={taskMember(roster, task)}
                       onSelectTask={onSelectTask}
                     />
                   ))}
