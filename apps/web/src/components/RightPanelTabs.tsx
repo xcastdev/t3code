@@ -40,10 +40,12 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  BookOpen,
   FileDiff,
   Files,
   GitBranch,
   Globe2,
+  LayoutDashboard,
   ListTodo,
   MessagesSquare,
   Plus,
@@ -344,24 +346,6 @@ function RightPanelEmptyState(props: {
 
   const actions = [
     {
-      label: "Browser",
-      group: "workspace",
-      icon: Globe2,
-      shortcut: "B",
-      available: props.browserAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.browser,
-      onClick: props.onAddBrowser,
-    },
-    {
-      label: "Files",
-      group: "workspace",
-      icon: Files,
-      shortcut: "F",
-      available: props.filesAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
-      onClick: props.onAddFiles,
-    },
-    {
       label: "Diff",
       group: "git",
       icon: FileDiff,
@@ -388,31 +372,11 @@ function RightPanelEmptyState(props: {
       disabledReason: SURFACE_UNAVAILABLE_HINTS.pullRequest,
       onClick: props.onAddPullRequest,
     },
-    {
-      label: "Device",
-      group: "device",
-      description: "Watch an iOS Simulator or Android Emulator.",
-      icon: Smartphone,
-      shortcut: "M",
-      available: props.deviceAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.device,
-      onClick: props.onAddDevice,
-    },
-    {
-      label: "Work",
-      group: "work",
-      description: "The project's tasks, team and knowledge.",
-      icon: ListTodo,
-      shortcut: "W",
-      available: props.onAddWork !== undefined,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
-      onClick: () => props.onAddWork?.("tasks"),
-    },
     ...(props.onAddSideChat
       ? [
           {
             label: "Side chat",
-            group: "chat",
+            group: "workspace",
             description: "Ask a side question while this thread keeps working.",
             icon: MessagesSquare,
             shortcut: "S",
@@ -422,6 +386,64 @@ function RightPanelEmptyState(props: {
           },
         ]
       : []),
+    {
+      label: "Files",
+      group: "workspace",
+      icon: Files,
+      shortcut: "F",
+      available: props.filesAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
+      onClick: props.onAddFiles,
+    },
+    {
+      label: "Browser",
+      group: "workspace",
+      icon: Globe2,
+      shortcut: "B",
+      available: props.browserAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.browser,
+      onClick: props.onAddBrowser,
+    },
+    {
+      label: "Device",
+      group: "workspace",
+      description: "Watch an iOS Simulator or Android Emulator.",
+      icon: Smartphone,
+      shortcut: "M",
+      available: props.deviceAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.device,
+      onClick: props.onAddDevice,
+    },
+    {
+      label: "Work overview",
+      group: "work",
+      description: "The project's work at a glance.",
+      icon: LayoutDashboard,
+      shortcut: "O",
+      available: props.onAddWork !== undefined,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
+      onClick: () => props.onAddWork?.("overview"),
+    },
+    {
+      label: "Tasks",
+      group: "work",
+      description: "The project's tasks.",
+      icon: ListTodo,
+      shortcut: "T",
+      available: props.onAddWork !== undefined,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
+      onClick: () => props.onAddWork?.("tasks"),
+    },
+    {
+      label: "Knowledge",
+      group: "work",
+      description: "What the project's agents have learned.",
+      icon: BookOpen,
+      shortcut: "K",
+      available: props.onAddWork !== undefined,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
+      onClick: () => props.onAddWork?.("knowledge"),
+    },
   ] as const;
 
   type SurfaceAction = (typeof actions)[number];
@@ -1266,22 +1288,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
 
   const addSurfaceActions = [
     {
-      label: "Browser",
-      icon: Globe2,
-      shortcut: "B",
-      available: props.browserAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.browser,
-      onClick: props.onAddBrowser,
-    },
-    {
-      label: "Files",
-      icon: Files,
-      shortcut: "F",
-      available: props.filesAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.files,
-      onClick: props.onAddFiles,
-    },
-    {
       label: "Diff",
       icon: FileDiff,
       shortcut: "D",
@@ -1305,6 +1311,34 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: SURFACE_DISABLED_REASONS.pullRequest,
       onClick: props.onAddPullRequest,
     },
+    ...(props.onAddSideChat
+      ? [
+          {
+            label: "Side chat",
+            icon: MessagesSquare,
+            shortcut: "S",
+            available: props.sideChatAvailable === true && !props.sideChatDisabledReason,
+            disabledReason: props.sideChatDisabledReason ?? SURFACE_DISABLED_REASONS.sideChat,
+            onClick: props.onAddSideChat,
+          },
+        ]
+      : []),
+    {
+      label: "Files",
+      icon: Files,
+      shortcut: "F",
+      available: props.filesAvailable,
+      disabledReason: SURFACE_DISABLED_REASONS.files,
+      onClick: props.onAddFiles,
+    },
+    {
+      label: "Browser",
+      icon: Globe2,
+      shortcut: "B",
+      available: props.browserAvailable,
+      disabledReason: SURFACE_DISABLED_REASONS.browser,
+      onClick: props.onAddBrowser,
+    },
     {
       label: "Device",
       icon: Smartphone,
@@ -1321,18 +1355,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: SURFACE_DISABLED_REASONS.work,
       onClick: () => props.onAddWork?.("tasks"),
     },
-    ...(props.onAddSideChat
-      ? [
-          {
-            label: "Side chat",
-            icon: MessagesSquare,
-            shortcut: "S",
-            available: props.sideChatAvailable === true && !props.sideChatDisabledReason,
-            disabledReason: props.sideChatDisabledReason ?? SURFACE_DISABLED_REASONS.sideChat,
-            onClick: props.onAddSideChat,
-          },
-        ]
-      : []),
   ] as const;
 
   const handleAddSurfaceMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
