@@ -2,7 +2,12 @@ import { assistantStatus } from "@t3tools/client-runtime/assistant-presentation"
 import { assistantHomeTarget } from "@t3tools/client-runtime/state/assistants";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import { threadRuntimeIsActive } from "@t3tools/client-runtime/state/models";
-import type { AssistantSummary, EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type {
+  AssistantSummary,
+  EnvironmentId,
+  EnvironmentMachineKind,
+  ThreadId,
+} from "@t3tools/contracts";
 import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
 import { AgentAvatar } from "../assistants/AgentAvatar";
 import * as Schema from "effect/Schema";
@@ -19,11 +24,18 @@ import { useState } from "react";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { cn, newThreadId } from "~/lib/utils";
 import { useQuietThreadShells } from "~/state/entities";
-import { useEnvironments, type EnvironmentPresentation } from "~/state/environments";
+import {
+  useEnvironmentMachines,
+  useEnvironments,
+  type EnvironmentPresentation,
+} from "~/state/environments";
 import { threadEnvironment } from "~/state/threads";
 import { useOrchestrationCommand } from "~/state/use-orchestration-command";
 
 import { useAssistantConnection, useAssistantRoster } from "../assistants/useAssistants";
+import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
+import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
+import { Tooltip, TooltipTrigger } from "../ui/tooltip";
 import {
   Menu,
   MenuCheckboxItem,
@@ -65,7 +77,7 @@ export function SidebarAgentsList(props: {
   readonly filter: AgentSidebarFilter;
   readonly onNavigate: () => void;
 }) {
-  const { environments, isReady } = useEnvironments();
+  const { environments } = useEnvironments();
   const threads = useQuietThreadShells();
   const [collapsed, setCollapsed] = useLocalStorage(
     COLLAPSED_AGENTS_KEY,
@@ -77,18 +89,18 @@ export function SidebarAgentsList(props: {
       current.includes(key) ? current.filter((entry) => entry !== key) : [...current, key],
     );
   const shown = environmentsWithAgents(environments, props.filter);
+  const machines = useEnvironmentMachines();
+  // One list across environments; an environment without agents, or whose roster fails, adds nothing.
   return (
     <SidebarGroup className="flex-1" role="presentation">
-      {environments.length === 0 ? (
-        <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-          {isReady ? "Connect an environment to use agents." : "Loading agents…"}
-        </p>
-      ) : (
-        shown.map((environment) => (
+      <div className="flex flex-col gap-px">
+        {shown.map((environment) => (
           <EnvironmentAgents
             key={environment.environmentId}
             environment={environment}
-            showEnvironment={environments.length > 1}
+            machine={
+              environments.length > 1 ? (machines.get(environment.environmentId) ?? "server") : null
+            }
             threads={threads}
             query={props.query}
             filter={props.filter}
@@ -96,15 +108,16 @@ export function SidebarAgentsList(props: {
             onToggleCollapsed={toggleCollapsed}
             onNavigate={props.onNavigate}
           />
-        ))
-      )}
+        ))}
+      </div>
     </SidebarGroup>
   );
 }
 
 function EnvironmentAgents(props: {
   readonly environment: EnvironmentPresentation;
-  readonly showEnvironment: boolean;
+  /** Shown only when several environments are connected. */
+  readonly machine: EnvironmentMachineKind | null;
   readonly threads: ReadonlyArray<EnvironmentThreadShell>;
   readonly query: string;
   readonly filter: AgentSidebarFilter;
@@ -125,43 +138,24 @@ function EnvironmentAgents(props: {
     );
     return matching.length > 0 ? [{ agent, chats: matching }] : [];
   });
-  return (
-    <div className="flex flex-col gap-px pb-2">
-      {props.showEnvironment ? (
-        <p className="px-2 pt-1 pb-0.5 text-2xs font-medium text-muted-foreground">
-          {props.environment.label}
-        </p>
-      ) : null}
-      {roster.data === null ? (
-        <p className="px-2 py-1.5 text-xs text-muted-foreground">
-          {roster.error ? "Couldn't load agents." : "Loading agents…"}
-        </p>
-      ) : agents.length === 0 ? (
-        <p className="px-2 py-1.5 text-xs text-muted-foreground">
-          {query.length > 0 || agentFilterIsActive(props.filter)
-            ? "No matching agents."
-            : "No agents yet."}
-        </p>
-      ) : (
-        agents.map(({ agent, chats }) => (
-          <SidebarAgent
-            key={agent.assistantId}
-            agent={agent}
-            chats={chats}
-            connected={connection.connected}
-            expanded={query.length > 0 || !props.collapsed.includes(agentKey(agent))}
-            onToggle={() => props.onToggleCollapsed(agentKey(agent))}
-            onNavigate={props.onNavigate}
-          />
-        ))
-      )}
-    </div>
-  );
+  return agents.map(({ agent, chats }) => (
+    <SidebarAgent
+      key={agent.assistantId}
+      agent={agent}
+      chats={chats}
+      environment={{ label: props.environment.label, machine: props.machine }}
+      connected={connection.connected}
+      expanded={query.length > 0 || !props.collapsed.includes(agentKey(agent))}
+      onToggle={() => props.onToggleCollapsed(agentKey(agent))}
+      onNavigate={props.onNavigate}
+    />
+  ));
 }
 
 function SidebarAgent(props: {
   readonly agent: AssistantSummary;
   readonly chats: ReadonlyArray<EnvironmentThreadShell>;
+  readonly environment: { readonly label: string; readonly machine: EnvironmentMachineKind | null };
   readonly connected: boolean;
   readonly expanded: boolean;
   readonly onToggle: () => void;
@@ -187,43 +181,81 @@ function SidebarAgent(props: {
   return (
     <div>
       <div className="relative">
-        <SidebarMenuButton
-          isActive={pathname === `/${home.environmentId}/${home.threadId}`}
-          onClick={() => {
-            // An agent still being set up has no chat yet; its page shows the progress.
-            if (!ready) {
-              props.onNavigate();
-              void navigate({
-                to: "/agents/$environmentId/$assistantId",
-                params: { environmentId: agent.environmentId, assistantId: agent.assistantId },
-                search: { section: "overview" },
-              });
-              return;
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <SidebarMenuButton
+                isActive={pathname === `/${home.environmentId}/${home.threadId}`}
+                onClick={() => {
+                  // An agent still being set up has no chat yet; its page shows the progress.
+                  if (!ready) {
+                    props.onNavigate();
+                    void navigate({
+                      to: "/agents/$environmentId/$assistantId",
+                      params: {
+                        environmentId: agent.environmentId,
+                        assistantId: agent.assistantId,
+                      },
+                      search: { section: "overview" },
+                    });
+                    return;
+                  }
+                  if (!props.expanded) props.onToggle();
+                  openThread(home.threadId);
+                }}
+              >
+                <AgentAvatar agent={agent} size="icon" />
+                <span className="min-w-0 flex-1 truncate font-medium">{agent.name}</span>
+                {status.tone === "neutral" || status.tone === "success" ? (
+                  <span className="sr-only">{status.label}</span>
+                ) : (
+                  <span
+                    className={cn(
+                      "shrink-0 text-2xs",
+                      status.tone === "info"
+                        ? "text-info"
+                        : status.tone === "warning"
+                          ? "text-warning"
+                          : "text-destructive",
+                    )}
+                  >
+                    {status.label}
+                  </span>
+                )}
+                {props.environment.machine === null ? null : (
+                  <EnvironmentMachineIcon
+                    aria-hidden
+                    kind={props.environment.machine}
+                    className="size-3.5 shrink-0 text-sidebar-muted-foreground"
+                  />
+                )}
+                {ready ? <span aria-hidden className="size-5 shrink-0" /> : null}
+              </SidebarMenuButton>
             }
-            if (!props.expanded) props.onToggle();
-            openThread(home.threadId);
-          }}
-        >
-          <AgentAvatar agent={agent} size="icon" />
-          <span className="min-w-0 flex-1 truncate font-medium">{agent.name}</span>
-          {status.tone === "neutral" || status.tone === "success" ? (
-            <span className="sr-only">{status.label}</span>
-          ) : (
-            <span
-              className={cn(
-                "shrink-0 text-2xs",
-                status.tone === "info"
-                  ? "text-info"
-                  : status.tone === "warning"
-                    ? "text-warning"
-                    : "text-destructive",
-              )}
-            >
-              {status.label}
-            </span>
-          )}
-          {ready ? <span aria-hidden className="size-5 shrink-0" /> : null}
-        </SidebarMenuButton>
+          />
+          <ThreadHoverCardPopup side="right" align="start" sideOffset={4}>
+            <ThreadHoverCard title={agent.name}>
+              <div className="flex min-w-0 items-center gap-2">
+                <EnvironmentMachineIcon
+                  kind={props.environment.machine ?? "server"}
+                  className="size-3 shrink-0 stroke-muted-foreground"
+                />
+                <div className="min-w-0 truncate text-foreground/75">{props.environment.label}</div>
+              </div>
+              <div className="min-w-0 truncate">
+                {status.label}
+                {status.detail ? ` · ${status.detail}` : ""}
+              </div>
+              {ready ? (
+                <div>
+                  {props.chats.length === 0
+                    ? "Home only"
+                    : `Home and ${props.chats.length} ${props.chats.length === 1 ? "chat" : "chats"}`}
+                </div>
+              ) : null}
+            </ThreadHoverCard>
+          </ThreadHoverCardPopup>
+        </Tooltip>
         {ready ? (
           <button
             type="button"
