@@ -36,7 +36,6 @@ import {
 } from "./ThreadDetailsSections";
 import { ThreadAutomationsPanel } from "./ThreadAutomationsPanel";
 import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
-import { ThreadServersPanel } from "./ThreadServersPanel";
 import { resolveThreadDetailsVisibility, THREAD_DETAILS_ITEMS } from "./threadDetailsItems";
 import {
   THREAD_DETAILS_PANEL_ICON_CLASS,
@@ -165,6 +164,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                 environmentId={props.environmentId}
                 threadId={props.threadId}
                 pendingBackgroundTasks={props.pendingBackgroundTasks}
+                showServers={!props.draftId && visible.servers}
               />
             ) : null}
             {density !== "essential" ? (
@@ -266,11 +266,8 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   environmentId={props.environmentId}
                   threadId={props.threadId}
                   pendingBackgroundTasks={props.pendingBackgroundTasks}
+                  showServers={!props.draftId && visible.servers}
                 />
-              ) : null}
-
-              {density === "full" && !props.draftId && visible.servers ? (
-                <ThreadServersPanel environmentId={props.environmentId} threadId={props.threadId} />
               ) : null}
 
               {density === "full" && serverThread ? (

@@ -19,6 +19,7 @@ import {
 import { formatContextWindowTokens, type ContextWindowSnapshot } from "~/lib/contextWindow";
 import { revealThreadTerminal } from "~/lib/revealThreadTerminal";
 import { cn } from "~/lib/utils";
+import { useThreadDiscoveredPorts } from "~/portDiscoveryState";
 import { useKnownTerminalSessions } from "~/state/terminalSessions";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -28,6 +29,7 @@ import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
 import { latestTodoList } from "./ThreadDetailsSections.logic";
+import { ThreadServerRows } from "./ThreadServersPanel";
 import {
   THREAD_DETAILS_PANEL_ICON_CLASS,
   THREAD_DETAILS_PANEL_LABEL_CLASS,
@@ -262,15 +264,28 @@ export function ThreadDetailsTasksSection(props: {
   );
 }
 
+const BACKGROUND_WORK_KIND_LABELS: Partial<Record<string, string>> = {
+  command: "Command",
+  monitor: "Monitor",
+  background_task: "Background task",
+};
+
 export function ThreadDetailsBackgroundShellsSection(props: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly pendingBackgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>;
+  /** The "Servers" item in "Choose what to show". */
+  readonly showServers: boolean;
 }) {
   const terminals = useKnownTerminalSessions({
     environmentId: props.environmentId,
     threadId: props.threadId,
   });
+  const discoveredServers = useThreadDiscoveredPorts({
+    environmentId: props.environmentId,
+    threadId: props.threadId,
+  });
+  const servers = props.showServers ? discoveredServers : [];
   const shells = (terminals ?? []).filter((session) => session.state.status !== "closed");
   // Subagents are listed under Agents, so this section keeps to shells and commands.
   const backgroundWork = presentPendingBackgroundWork(
@@ -278,8 +293,9 @@ export function ThreadDetailsBackgroundShellsSection(props: {
   );
   const running =
     shells.filter((session) => session.state.hasRunningSubprocess).length +
-    (backgroundWork?.items.length ?? 0);
-  if (shells.length === 0 && backgroundWork === null) return null;
+    (backgroundWork?.items.length ?? 0) +
+    servers.length;
+  if (shells.length === 0 && backgroundWork === null && servers.length === 0) return null;
   return (
     <ThreadDetailsSection
       headingId="thread-details-background-shells-heading"
@@ -322,11 +338,13 @@ export function ThreadDetailsBackgroundShellsSection(props: {
                 )}
               />
             </span>
-            <span className="flex min-w-0 flex-1 flex-col text-left">
-              <span className="truncate font-mono text-xs">
+            <span className="flex min-w-0 flex-1 flex-col gap-0.5 text-left">
+              <span className="truncate text-sm font-medium leading-4 text-foreground/85">
                 {summary?.label || getTerminalLabel(session.target.terminalId)}
               </span>
-              <span className="truncate text-2xs font-normal text-muted-foreground">{detail}</span>
+              <span className="truncate text-2xs font-normal leading-4 text-muted-foreground">
+                {detail}
+              </span>
             </span>
           </ThreadDetailsControl>
         );
@@ -334,15 +352,29 @@ export function ThreadDetailsBackgroundShellsSection(props: {
       {backgroundWork?.items.map((item) => (
         <div
           key={item.taskId}
-          className={cn("flex h-8 items-center rounded-lg", THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS)}
+          className={cn(
+            "flex min-h-8 items-center rounded-lg py-0.75",
+            THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS,
+          )}
         >
           <BotIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
-          <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground/80">
-            {item.label}
+          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <span className="truncate text-sm font-medium leading-4 text-foreground/85">
+              {item.label}
+            </span>
+            <span className="truncate text-2xs font-normal leading-4 text-muted-foreground">
+              Agent · {BACKGROUND_WORK_KIND_LABELS[item.kind] ?? "Background task"}
+            </span>
           </span>
-          <span className="text-2xs text-muted-foreground">Agent</span>
         </div>
       ))}
+      {servers.length > 0 ? (
+        <ThreadServerRows
+          environmentId={props.environmentId}
+          threadId={props.threadId}
+          servers={servers}
+        />
+      ) : null}
     </ThreadDetailsSection>
   );
 }
