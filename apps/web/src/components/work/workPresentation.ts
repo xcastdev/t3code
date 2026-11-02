@@ -109,14 +109,6 @@ export function supervisionCounts(
   };
 }
 
-export const SUPERVISION_UNAVAILABLE: Record<string, string> = {
-  missing: "This project isn't on the environment any more.",
-  deleted: "This project was deleted.",
-  archived: "This project is archived.",
-  tombstoned: "This project was removed.",
-  unsupported: "This environment can't summarize Work for this project.",
-};
-
 // ── Inbox: messages and questions ──────────────────────────────────────────
 
 export type WorkMessageAction = "acknowledge" | "resolve";
@@ -987,80 +979,4 @@ export function memoryShareRecipients(input: string, projectId: ProjectId) {
     owner: { kind: "project" as const, projectId: id as ProjectId },
     revision: 0,
   }));
-}
-
-// ── Portfolio ──────────────────────────────────────────────────────────────
-
-export const PORTFOLIO_PAGE = 8;
-
-export interface WorkPortfolioEntry {
-  readonly environmentId: string;
-  readonly projectId: string;
-  readonly title: string;
-  readonly checkoutPath: string;
-}
-
-/**
- * Scratch and assistant-owned backing workspaces are not Work projects and the
- * server denies their Work reads, so they are dropped before paging rather than
- * mounting a failed row in a page slot.
- */
-export function portfolioEntries<
-  P extends {
-    readonly environmentId: string;
-    readonly id: string;
-    readonly title: string;
-    readonly workspaceRoot: string;
-    readonly isScratch?: true;
-    readonly assistantId?: string | null | undefined;
-  },
->(
-  projects: ReadonlyArray<P>,
-): Array<{
-  readonly environmentId: P["environmentId"];
-  readonly projectId: P["id"];
-  readonly title: string;
-  readonly checkoutPath: string;
-}> {
-  return projects
-    .filter((project) => project.isScratch !== true && !project.assistantId)
-    .map((project) => ({
-      environmentId: project.environmentId,
-      projectId: project.id,
-      title: project.title,
-      checkoutPath: project.workspaceRoot,
-    }));
-}
-
-/**
- * Stable order and one fixed window: only the current page of projects mounts
- * a summary read. Moving pages replaces the window rather than growing it.
- */
-export function portfolioPage<T extends WorkPortfolioEntry>(
-  entries: ReadonlyArray<T>,
-  page: number,
-): {
-  readonly shown: T[];
-  readonly page: number;
-  readonly pageCount: number;
-  readonly first: number;
-  readonly total: number;
-} {
-  // Hermes lacks toSorted; sort a copy so callers' arrays are untouched.
-  const sorted = [...entries].sort(
-    (a, b) =>
-      a.title.localeCompare(b.title) ||
-      a.environmentId.localeCompare(b.environmentId) ||
-      a.checkoutPath.localeCompare(b.checkoutPath),
-  );
-  const pageCount = Math.max(1, Math.ceil(sorted.length / PORTFOLIO_PAGE));
-  const current = Math.min(Math.max(0, Math.floor(page)), pageCount - 1);
-  const first = current * PORTFOLIO_PAGE;
-  return {
-    shown: sorted.slice(first, first + PORTFOLIO_PAGE),
-    page: current,
-    pageCount,
-    first,
-    total: sorted.length,
-  };
 }

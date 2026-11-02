@@ -4,7 +4,13 @@ import {
   collectAttention,
   workAttentionFor,
 } from "@t3tools/client-runtime/state/attention";
-import type { EnvironmentId, ProjectId, ProjectWorkAttentionItem } from "@t3tools/contracts";
+import { deriveWorkHome, type WorkHome } from "@t3tools/client-runtime/state/work-home";
+import type {
+  EnvironmentId,
+  ProjectId,
+  ProjectWorkActivitySummary,
+  ProjectWorkAttentionItem,
+} from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 
@@ -57,4 +63,29 @@ export function useAllWorkAttentionKeys(): ReadonlyArray<string> {
   return useAtomValue(attentionEntriesAtom)
     .filter((entry) => entry.type === "work")
     .map((entry) => entry.key);
+}
+
+// The same per-environment stream carries what is moving; older servers send no activity.
+const workHomeAtom = Atom.make((get) =>
+  deriveWorkHome({
+    items: get(attentionEntriesAtom).flatMap((entry) =>
+      entry.type === "work" ? [{ environmentId: entry.environmentId, item: entry.item }] : [],
+    ),
+    activity: get(environmentSummaries.connectedEnvironmentIdsAtom).map((environmentId) => ({
+      environmentId,
+      activity: Option.match(
+        AsyncResult.value(get(projectWorkEnvironment.attention(environmentId))),
+        {
+          onNone: (): ProjectWorkActivitySummary | null => null,
+          onSome: (summary) => summary.activity ?? null,
+        },
+      ),
+    })),
+    projects: get(environmentProjects.projectsAtom),
+  }),
+).pipe(Atom.withLabel("web-work-home"));
+
+/** What waits on the user and what is moving, across every connected project. */
+export function useWorkHome(): WorkHome {
+  return useAtomValue(workHomeAtom);
 }

@@ -30,8 +30,6 @@ import {
   makeMessageAttentionIntent,
   messageActions,
   moveIntegrationSource,
-  portfolioEntries,
-  portfolioPage,
   reviewSummary,
   splitArguments,
   startAvailability,
@@ -227,59 +225,6 @@ it("forgets and shares memory by exact source revision, with an empty share list
   expect(
     prepareProjectWorkHumanMutation({ selected: project, current: project, intent: revoke }),
   ).not.toBeNull();
-});
-
-it("pages the portfolio by replacing one bounded window", () => {
-  const entries = Array.from({ length: 400 }, (_, index) => ({
-    environmentId: index % 2 ? "b" : "a",
-    projectId: `p${index}`,
-    title: `Project ${String(index).padStart(3, "0")}`,
-    checkoutPath: `/p${index}`,
-  }));
-  const first = portfolioPage(entries, 0);
-  expect(first.shown.map((entry) => entry.projectId)).toEqual(
-    Array.from({ length: 8 }, (_, index) => `p${index}`),
-  );
-  const third = portfolioPage(entries, 2);
-  expect(third.shown).toHaveLength(8);
-  expect(third.first).toBe(16);
-  expect(third.shown[0]?.projectId).toBe("p16");
-  // Past the end clamps to the last full window instead of mounting more.
-  const last = portfolioPage(entries, 999);
-  expect(last.page).toBe(49);
-  expect(last.shown).toHaveLength(8);
-});
-
-it("keeps assistant backing and scratch workspaces out of portfolio pages", () => {
-  const project = (
-    index: number,
-    extra: { isScratch?: true; assistantId?: string | null } = {},
-  ) => ({
-    environmentId: "env",
-    id: `p${index}`,
-    title: `Project ${String(index).padStart(2, "0")}`,
-    workspaceRoot: `/p${index}`,
-    ...extra,
-  });
-  const ordinary = Array.from({ length: 8 }, (_, index) => project(index));
-  const projects = [
-    project(90, { assistantId: "assistant-1" }),
-    ...ordinary.slice(0, 4),
-    project(91, { assistantId: "assistant-2" }),
-    project(92, { isScratch: true }),
-    ...ordinary.slice(4),
-    project(93, { assistantId: null }),
-  ];
-  const page = portfolioPage(portfolioEntries(projects), 0);
-  // Exactly one full page of ordinary projects: no failed rows, no second page.
-  expect(page.total).toBe(9);
-  expect(page.pageCount).toBe(2);
-  expect(page.shown.map((entry) => entry.projectId)).toEqual(
-    Array.from({ length: 8 }, (_, index) => `p${index}`),
-  );
-  expect(portfolioPage(portfolioEntries(projects), 1).shown.map((e) => e.projectId)).toEqual([
-    "p93",
-  ]);
 });
 
 it("splits arguments without a shell", () => {

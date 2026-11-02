@@ -6,9 +6,9 @@ import { SidebarInset } from "../ui/sidebar";
 import { WorkspaceBreadcrumb, WorkspaceBreadcrumbItem } from "../WorkspaceBreadcrumb";
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
-import { WorkPortfolio } from "./WorkPortfolio";
+import { WorkHomeOverview } from "./WorkHomeOverview";
 
-/** Work across every connected project; each project and task opens as its own page. */
+/** What waits on you and what is moving across every connected project. */
 export function WorkHomePage() {
   const navigate = useNavigate();
   return (
@@ -23,14 +23,14 @@ export function WorkHomePage() {
         </WorkspacePageHeader>
         <ScrollArea className="min-h-0 flex-1">
           <WorkspacePageContainer width="expanded" className="@container/work gap-6">
-            <WorkPortfolio
+            <WorkHomeOverview
               onOpen={(target) =>
                 void navigate({
                   to: "/work/$environmentId/$projectId",
                   params: { environmentId: target.environmentId, projectId: target.projectId },
                   search:
                     target.taskId === undefined
-                      ? { section: "overview" }
+                      ? { section: target.section }
                       : { section: "tasks", taskId: target.taskId },
                 })
               }
