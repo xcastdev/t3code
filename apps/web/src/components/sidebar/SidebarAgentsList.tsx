@@ -186,6 +186,13 @@ function SidebarAgent(props: {
   const { agent } = props;
   const home = assistantHomeTarget(agent.binding);
   const status = assistantStatus({ connected: props.connected, summary: agent });
+  // Disabled and archived describe the agent, not its work, so they sit with the environment.
+  const lifecycleNote =
+    agent.lifecycle === "active"
+      ? null
+      : agent.lifecycle.charAt(0).toUpperCase() + agent.lifecycle.slice(1);
+  // Idle is just "no work"; the time since the last activity says more.
+  const workStatus = status.label !== "Idle" && status.label !== lifecycleNote;
   const ready = agent.provisioningState === "ready";
   const openThread = (threadId: ThreadId) => {
     props.onNavigate();
@@ -239,7 +246,11 @@ function SidebarAgent(props: {
                               : "text-sidebar-muted-foreground",
                       )}
                     >
-                      {status.label} · <RelativeTimeLabel timestamp={props.lastActivityAt} />
+                      {workStatus ? (
+                        status.label
+                      ) : (
+                        <RelativeTimeLabel timestamp={props.lastActivityAt} />
+                      )}
                     </span>
                   </span>
                   <span className="flex min-w-0 items-center gap-1 text-2xs text-sidebar-muted-foreground">
@@ -251,11 +262,9 @@ function SidebarAgent(props: {
                     <span className="min-w-0 truncate">
                       {[
                         props.environment.label,
+                        lifecycleNote,
                         props.chats.length > 0
                           ? `${props.chats.length} ${props.chats.length === 1 ? "chat" : "chats"}`
-                          : null,
-                        agent.attention.waitingRuns > 0
-                          ? `${agent.attention.waitingRuns} waiting`
                           : null,
                       ]
                         .filter(Boolean)
