@@ -7044,6 +7044,40 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             return false;
           }),
+          stopBackgroundTask: Effect.fn("CodexAdapterV2.stopBackgroundTask")(function* ({
+            providerThread,
+            taskId,
+          }) {
+            const contexts = [
+              ...(yield* Ref.get(activeTurns)).values(),
+              ...(yield* Ref.get(settledTurns)).values(),
+            ];
+            const roots = contexts.filter(
+              (context) => context.providerThread.id === providerThread.id,
+            );
+            const commands = yield* Ref.get(runningCommandItemsByTurn);
+            for (const context of contexts) {
+              if (!roots.some((root) => context === root || isDescendantCodexTurn(context, root)))
+                continue;
+              const processId = commands.get(context.nativeTurnId)?.get(taskId)?.processId;
+              if (processId === undefined) continue;
+              yield* terminateBackgroundTerminal(
+                yield* getNativeThreadId(context.providerThread),
+                processId,
+              ).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CODEX_PROVIDER,
+                      detail: "Background terminal stop request failed",
+                      cause,
+                    }),
+                ),
+              );
+              return true;
+            }
+            return false;
+          }),
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
               Effect.andThen(mcpSessions.read(threadInput.threadId)),

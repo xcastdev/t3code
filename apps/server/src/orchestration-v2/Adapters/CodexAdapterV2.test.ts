@@ -4869,6 +4869,92 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ],
   });
 
+  const stopOneCommandTranscript = makeCodexReplayTranscript({
+    scenario: "codex-stop-one-background-command",
+    entries: [
+      ...codexReplayPreamble({
+        nativeThreadId: INTERRUPT_NATIVE_THREAD,
+        nativeTurnId: INTERRUPT_NATIVE_TURN,
+        prompt: INTERRUPT_PROMPT,
+      }),
+      {
+        type: "emit_inbound",
+        label: "item/started/command",
+        frame: {
+          method: "item/started",
+          params: {
+            item: interruptCommandItem("inProgress"),
+            threadId: INTERRUPT_NATIVE_THREAD,
+            turnId: INTERRUPT_NATIVE_TURN,
+            startedAtMs: 1782622440500,
+          },
+        },
+      },
+      {
+        type: "expect_outbound",
+        label: "thread/backgroundTerminals/terminate",
+        frame: {
+          id: 4,
+          method: "thread/backgroundTerminals/terminate",
+          params: { threadId: INTERRUPT_NATIVE_THREAD, processId: "57680" },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "thread/backgroundTerminals/terminate",
+        frame: { id: 4, result: { terminated: true } },
+      },
+    ],
+  });
+
+  it.effect("stops one background command by its item id without interrupting the turn", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeCodexReplayHarness(stopOneCommandTranscript);
+        const now = yield* DateTime.now;
+        const stopBackgroundTask = harness.runtime.stopBackgroundTask;
+        if (stopBackgroundTask === undefined) {
+          throw new Error("Codex adapter runtime must expose stopBackgroundTask.");
+        }
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-stop-one-command"),
+            text: INTERRUPT_PROMPT,
+          }),
+        );
+        yield* harness.until(() =>
+          harness.events.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "command_execution" &&
+              event.turnItem.status === "running",
+          ),
+        );
+
+        assert.isFalse(
+          yield* stopBackgroundTask({
+            providerThread: harness.providerThread,
+            taskId: "exec-not-running",
+          }),
+        );
+        assert.isTrue(
+          yield* stopBackgroundTask({
+            providerThread: harness.providerThread,
+            taskId: INTERRUPT_COMMAND_ITEM,
+          }),
+        );
+        assert.lengthOf(harness.terminalEvents(), 0);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("contains commands that start before and after the interrupt response", () =>
     Effect.scoped(
       Effect.gen(function* () {

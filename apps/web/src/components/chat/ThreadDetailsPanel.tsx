@@ -29,7 +29,7 @@ import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsItemsMenuItems } from "./ThreadDetailsItemsMenu";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
 import {
-  ThreadDetailsBackgroundShellsSection,
+  ThreadDetailsProcessesSection,
   ThreadDetailsContextSection,
   ThreadDetailsTasksSection,
   type ThreadDetailsContextProps,
@@ -160,9 +160,10 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
               />
             ) : null}
             {density !== "essential" && serverThread ? (
-              <ThreadDetailsBackgroundShellsSection
+              <ThreadDetailsProcessesSection
                 environmentId={props.environmentId}
                 threadId={props.threadId}
+                projectId={props.projectId}
                 pendingBackgroundTasks={props.pendingBackgroundTasks}
                 showServers={!props.draftId && visible.servers}
               />
@@ -262,9 +263,10 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
               ) : null}
 
               {density === "full" && serverThread ? (
-                <ThreadDetailsBackgroundShellsSection
+                <ThreadDetailsProcessesSection
                   environmentId={props.environmentId}
                   threadId={props.threadId}
+                  projectId={props.projectId}
                   pendingBackgroundTasks={props.pendingBackgroundTasks}
                   showServers={!props.draftId && visible.servers}
                 />

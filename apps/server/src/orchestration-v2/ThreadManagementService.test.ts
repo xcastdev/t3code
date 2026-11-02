@@ -558,6 +558,77 @@ it.effect.each(["live", "no-session", "unsupported-runtime"] as const)(
     }),
 );
 
+it.effect.each(["stopped", "not-running", "unsupported-runtime"] as const)(
+  "stops one background task on the thread's active provider thread with result %s",
+  (state) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread:background-stop");
+      const providerThreadId = ProviderThreadId.make("provider-thread:background-stop");
+      const providerSessionId = ProviderSessionId.make("provider-session:background-stop");
+      const driver = ProviderDriverKind.make("codex");
+      const providerThread = {
+        id: providerThreadId,
+        driver,
+        providerSessionId,
+        appThreadId: threadId,
+      } as unknown as OrchestrationV2ProviderThread;
+      const calls: Array<string> = [];
+      const runtime = {
+        driver,
+        providerSessionId,
+        ...(state === "unsupported-runtime"
+          ? {}
+          : {
+              stopBackgroundTask: (input: { readonly taskId: string }) =>
+                Effect.sync(() => {
+                  calls.push(input.taskId);
+                  return state === "stopped";
+                }),
+            }),
+      } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              getThreadRecords: () =>
+                Effect.succeed({
+                  thread: {
+                    id: threadId,
+                    deletedAt: null,
+                    activeProviderThreadId: providerThreadId,
+                  },
+                  providerThreads: [providerThread],
+                } as unknown as OrchestrationV2ThreadProjection),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              get: () => Effect.succeedSome(runtime),
+            }),
+          ),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+      const result = yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        return yield* service
+          .stopBackgroundTask({ threadId, taskId: "exec-dev-server" })
+          .pipe(Effect.result);
+      }).pipe(Effect.provide(Layer.merge(layerTest, ThreadCommandExecutor.layer)));
+
+      if (state === "stopped") {
+        expect(result._tag).toBe("Success");
+      } else {
+        expect(result).toMatchObject({
+          failure: {
+            _tag: "OrchestrationV2StopBackgroundTaskError",
+            reason: state === "not-running" ? "not-running" : "unsupported",
+          },
+        });
+      }
+      expect(calls).toEqual(state === "unsupported-runtime" ? [] : ["exec-dev-server"]);
+    }),
+);
+
 it.effect.each([
   { status: "completed" as const, settles: true },
   { status: "failed" as const, settles: false },

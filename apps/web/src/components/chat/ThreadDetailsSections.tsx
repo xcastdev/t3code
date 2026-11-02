@@ -1,18 +1,31 @@
+import { useAtomValue } from "@effect/atom-react";
+import {
+  isProjectTerminalRunning,
+  projectTerminalStatusLabel,
+} from "@t3tools/client-runtime/project-terminal-view";
 import type { ThreadStructure } from "@t3tools/client-runtime/state/models";
+import {
+  type AtomCommandResult,
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
 import { presentPendingBackgroundWork } from "@t3tools/client-runtime/state/thread-execution";
 import type {
   EnvironmentId,
   OrchestrationV2PendingBackgroundTask,
   OrchestrationV2PlanStep,
+  ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
+import { useNavigate } from "@tanstack/react-router";
 import {
-  BotIcon,
   CircleCheckIcon,
   CircleDashedIcon,
   CircleDotIcon,
+  CpuIcon,
   Minimize2Icon,
+  TerminalIcon,
   TerminalSquareIcon,
 } from "lucide-react";
 
@@ -20,15 +33,20 @@ import { formatContextWindowTokens, type ContextWindowSnapshot } from "~/lib/con
 import { revealThreadTerminal } from "~/lib/revealThreadTerminal";
 import { cn } from "~/lib/utils";
 import { useThreadDiscoveredPorts } from "~/portDiscoveryState";
+import { orchestrationEnvironment } from "~/state/orchestration";
+import { projectTerminalEnvironment, useProjectTerminalDock } from "~/state/projectTerminals";
+import { terminalEnvironment } from "~/state/terminal";
 import { useKnownTerminalSessions } from "~/state/terminalSessions";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
 
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
 import { latestTodoList } from "./ThreadDetailsSections.logic";
+import { ThreadProcessRow } from "./ThreadProcessRow";
 import { ThreadServerRows } from "./ThreadServersPanel";
 import {
   THREAD_DETAILS_PANEL_ICON_CLASS,
@@ -267,114 +285,228 @@ export function ThreadDetailsTasksSection(props: {
 const BACKGROUND_WORK_KIND_LABELS: Partial<Record<string, string>> = {
   command: "Command",
   monitor: "Monitor",
-  background_task: "Background task",
 };
 
-export function ThreadDetailsBackgroundShellsSection(props: {
+/**
+ * What runs for this thread: its terminals, terminals its agent opened, the provider's background
+ * work, and the local servers those started. Subagents are listed under Agents instead.
+ */
+export function ThreadDetailsProcessesSection(props: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
+  readonly projectId: ProjectId;
   readonly pendingBackgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>;
   /** The "Servers" item in "Choose what to show". */
   readonly showServers: boolean;
 }) {
+  const navigate = useNavigate();
   const terminals = useKnownTerminalSessions({
     environmentId: props.environmentId,
     threadId: props.threadId,
   });
+  const dock = useProjectTerminalDock(props.environmentId, props.projectId);
   const discoveredServers = useThreadDiscoveredPorts({
     environmentId: props.environmentId,
     threadId: props.threadId,
   });
+  const canInterruptTerminal = useAtomValue(
+    terminalEnvironment.write.permissionAtom(props.environmentId),
+  );
+  const canKillAgentShell = useAtomValue(
+    projectTerminalEnvironment.kill.permissionAtom(props.environmentId),
+  );
+  const canStopTask = useAtomValue(
+    orchestrationEnvironment.stopBackgroundTask.permissionAtom(props.environmentId),
+  );
+  const writeTerminal = useAtomCommand(terminalEnvironment.write, { reportFailure: false });
+  const killAgentShell = useAtomCommand(projectTerminalEnvironment.kill, {
+    reportFailure: false,
+  });
+  const stopTask = useAtomCommand(orchestrationEnvironment.stopBackgroundTask, {
+    reportFailure: false,
+  });
+
   const servers = props.showServers ? discoveredServers : [];
   const shells = (terminals ?? []).filter((session) => session.state.status !== "closed");
-  // Subagents are listed under Agents, so this section keeps to shells and commands.
+  const agentShells = dock.terminals.filter(
+    (terminal) =>
+      terminal.creatingThreadId === props.threadId &&
+      (isProjectTerminalRunning(terminal.status) || terminal.status === "stopping"),
+  );
   const backgroundWork = presentPendingBackgroundWork(
     props.pendingBackgroundTasks.filter((task) => task.kind !== "subagent"),
   );
   const running =
     shells.filter((session) => session.state.hasRunningSubprocess).length +
+    agentShells.length +
     (backgroundWork?.items.length ?? 0) +
     servers.length;
-  if (shells.length === 0 && backgroundWork === null && servers.length === 0) return null;
+  if (
+    shells.length === 0 &&
+    agentShells.length === 0 &&
+    backgroundWork === null &&
+    servers.length === 0
+  ) {
+    return null;
+  }
+
+  const reportFailure = (title: string, result: AtomCommandResult<unknown, unknown>) => {
+    if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+    const error = squashAtomCommandFailure(result);
+    toastManager.add(
+      stackedThreadToast({
+        type: "error",
+        title,
+        description: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  };
+
   return (
     <ThreadDetailsSection
-      headingId="thread-details-background-shells-heading"
-      title="Background shells"
+      headingId="thread-details-processes-heading"
+      title="Processes"
       actions={
         running > 0 ? (
           <span className="text-2xs text-muted-foreground tabular-nums">{running} running</span>
         ) : null
       }
     >
-      {shells.map((session) => {
-        const summary = session.state.summary;
-        const busy = session.state.hasRunningSubprocess;
-        const detail = busy
-          ? `Running${summary?.pid ? ` · pid ${summary.pid}` : ""}`
-          : summary?.exitCode !== null && summary?.exitCode !== undefined
-            ? `Exited ${summary.exitCode}`
-            : "Idle";
-        return (
-          <ThreadDetailsControl
-            key={session.target.terminalId}
-            variant="ghost"
-            size="sm"
-            part="row"
-            multiline
-            onClick={() =>
-              revealThreadTerminal(
-                { environmentId: props.environmentId, threadId: props.threadId },
-                session.target.terminalId,
-              )
-            }
-          >
-            <span className="relative inline-flex">
-              <TerminalSquareIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
-              <span
-                aria-hidden
-                className={cn(
-                  "absolute -right-1 -top-1 size-1.5 rounded-full",
-                  busy ? "bg-success" : "bg-muted-foreground/40",
-                )}
-              />
-            </span>
-            <span className="flex min-w-0 flex-1 flex-col gap-0.5 text-left">
-              <span className="truncate text-sm font-medium leading-4 text-foreground/85">
-                {summary?.label || getTerminalLabel(session.target.terminalId)}
-              </span>
-              <span className="truncate text-2xs font-normal leading-4 text-muted-foreground">
-                {detail}
-              </span>
-            </span>
-          </ThreadDetailsControl>
-        );
-      })}
-      {backgroundWork?.items.map((item) => (
-        <div
-          key={item.taskId}
-          className={cn(
-            "flex min-h-8 items-center rounded-lg py-0.75",
-            THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS,
-          )}
-        >
-          <BotIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
-          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <span className="truncate text-sm font-medium leading-4 text-foreground/85">
-              {item.label}
-            </span>
-            <span className="truncate text-2xs font-normal leading-4 text-muted-foreground">
-              Agent · {BACKGROUND_WORK_KIND_LABELS[item.kind] ?? "Background task"}
-            </span>
-          </span>
-        </div>
-      ))}
-      {servers.length > 0 ? (
-        <ThreadServerRows
-          environmentId={props.environmentId}
-          threadId={props.threadId}
-          servers={servers}
-        />
-      ) : null}
+      <ul className="m-0 list-none p-0">
+        {shells.map((session) => {
+          const summary = session.state.summary;
+          const busy = session.state.hasRunningSubprocess;
+          const terminalId = session.target.terminalId;
+          const status = busy
+            ? "Running"
+            : summary?.exitCode !== null && summary?.exitCode !== undefined
+              ? `Exited ${summary.exitCode}`
+              : null;
+          return (
+            <ThreadProcessRow
+              key={terminalId}
+              icon={
+                <span className="relative inline-flex">
+                  <TerminalSquareIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "absolute -right-1 -top-1 size-1.5 rounded-full",
+                      busy ? "bg-success" : "bg-muted-foreground/40",
+                    )}
+                  />
+                </span>
+              }
+              title={summary?.label || getTerminalLabel(terminalId)}
+              detail={["Terminal", status].filter(Boolean).join(" · ")}
+              open={{
+                tooltip: "Open in the terminal panel",
+                onOpen: () =>
+                  revealThreadTerminal(
+                    { environmentId: props.environmentId, threadId: props.threadId },
+                    terminalId,
+                  ),
+              }}
+              {...(busy && canInterruptTerminal
+                ? {
+                    stop: {
+                      label: `Stop what runs in ${summary?.label || getTerminalLabel(terminalId)}`,
+                      tooltip: "Stop the running command (Ctrl-C)",
+                      onStop: async () => {
+                        reportFailure(
+                          "Could not stop the command",
+                          await writeTerminal({
+                            environmentId: props.environmentId,
+                            input: { threadId: props.threadId, terminalId, data: "\u0003" },
+                          }),
+                        );
+                      },
+                    },
+                  }
+                : {})}
+            />
+          );
+        })}
+        {agentShells.map((terminal) => (
+          <ThreadProcessRow
+            key={terminal.terminalId}
+            icon={<TerminalSquareIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />}
+            title={terminal.label || terminal.terminalId}
+            detail={["Agent Shell", projectTerminalStatusLabel(terminal)].join(" · ")}
+            open={{
+              tooltip: "Open the agent's terminal",
+              onOpen: () =>
+                void navigate({
+                  to: "/terminals/$environmentId/$projectId",
+                  params: { environmentId: props.environmentId, projectId: props.projectId },
+                  search: { terminal: terminal.terminalId },
+                }),
+            }}
+            {...(canKillAgentShell && terminal.status !== "stopping"
+              ? {
+                  stop: {
+                    label: `Stop ${terminal.label || terminal.terminalId}`,
+                    tooltip: "Stop agent shell",
+                    onStop: async () => {
+                      reportFailure(
+                        "Could not stop the agent shell",
+                        await killAgentShell({
+                          environmentId: props.environmentId,
+                          input: {
+                            projectId: terminal.projectId,
+                            terminalId: terminal.terminalId,
+                            expectedGeneration: terminal.generation,
+                          },
+                        }),
+                      );
+                    },
+                  },
+                }
+              : {})}
+          />
+        ))}
+        {backgroundWork?.items.map((item) => {
+          const kind = BACKGROUND_WORK_KIND_LABELS[item.kind] ?? "Process";
+          return (
+            <ThreadProcessRow
+              key={item.taskId}
+              icon={
+                item.kind === "background_task" ? (
+                  <CpuIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
+                ) : (
+                  <TerminalIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
+                )
+              }
+              title={item.label}
+              detail={kind}
+              {...(canStopTask
+                ? {
+                    stop: {
+                      label: `Stop ${item.label}`,
+                      tooltip: `Stop ${kind.toLowerCase()}`,
+                      onStop: async () => {
+                        reportFailure(
+                          `Could not stop the ${kind.toLowerCase()}`,
+                          await stopTask({
+                            environmentId: props.environmentId,
+                            input: { threadId: props.threadId, taskId: item.taskId },
+                          }),
+                        );
+                      },
+                    },
+                  }
+                : {})}
+            />
+          );
+        })}
+        {servers.length > 0 ? (
+          <ThreadServerRows
+            environmentId={props.environmentId}
+            threadId={props.threadId}
+            servers={servers}
+          />
+        ) : null}
+      </ul>
     </ThreadDetailsSection>
   );
 }

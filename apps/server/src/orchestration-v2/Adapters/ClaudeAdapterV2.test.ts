@@ -8903,6 +8903,68 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect("stops one listed background task and reports others as not running", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const stopped: Array<string> = [];
+        const harness = yield* makeWakeHarnessWithOptions({
+          stopTask: (taskId) => Effect.sync(() => void stopped.push(taskId)),
+        });
+        const now = yield* DateTime.now;
+        const stopBackgroundTask = harness.runtime.stopBackgroundTask;
+        if (stopBackgroundTask === undefined) {
+          throw new Error("Claude adapter runtime must expose stopBackgroundTask.");
+        }
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-stop-background-task"),
+            text: "Run the tests and the dev server in the background.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [WAKE_TASK_ID, "dev-server"].map((taskId) => ({
+              task_id: taskId,
+              task_type: "local_bash",
+              description: taskId,
+            })),
+            uuid: "00000000-0000-4000-8000-000000000401",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        while (true) {
+          const { providerThread } = yield* Queue.take(harness.providerThreadReceipts);
+          if ((providerThread.pendingBackgroundTasks?.length ?? 0) === 2) break;
+        }
+
+        assert.isTrue(
+          yield* stopBackgroundTask({
+            providerThread: harness.providerThread,
+            taskId: "dev-server",
+          }),
+        );
+        assert.isFalse(
+          yield* stopBackgroundTask({
+            providerThread: harness.providerThread,
+            taskId: "already-finished",
+          }),
+        );
+        assert.deepStrictEqual(stopped, ["dev-server"]);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
   it.effect("holds only the background tasks the agent marks awaited, until they end", () =>
     Effect.scoped(
       Effect.gen(function* () {

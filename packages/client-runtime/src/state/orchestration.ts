@@ -114,6 +114,10 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       label: "environment-data:orchestration:stop-workflow",
       tag: ORCHESTRATION_V2_WS_METHODS.stopWorkflow,
     }),
+    stopBackgroundTask: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:orchestration:stop-background-task",
+      tag: ORCHESTRATION_V2_WS_METHODS.stopBackgroundTask,
+    }),
     forceStopThread: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:orchestration:force-stop-thread",
       tag: ORCHESTRATION_V2_WS_METHODS.forceStopThread,

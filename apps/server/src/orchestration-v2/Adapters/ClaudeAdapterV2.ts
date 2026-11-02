@@ -11385,6 +11385,37 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ),
             );
           }),
+          stopBackgroundTask: Effect.fn("ClaudeAdapterV2.stopBackgroundTask")(function* ({
+            providerThread,
+            taskId,
+          }) {
+            const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+            if (nativeThreadId == null) return false;
+            const roster = rosterForNativeThread(
+              yield* Ref.get(pendingBackgroundTasksByNativeThread),
+              nativeThreadId,
+            );
+            const liveQuery = yield* Ref.get(queryContext);
+            if (
+              !roster.has(taskId) ||
+              liveQuery === null ||
+              liveQuery.stopping ||
+              liveQuery.nativeThreadId !== nativeThreadId
+            ) {
+              return false;
+            }
+            yield* liveQuery.query.stopTask(taskId).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CLAUDE_PROVIDER,
+                    detail: "Background task stop request failed",
+                    cause,
+                  }),
+              ),
+            );
+            return true;
+          }),
           awaitBackgroundTasks: Effect.fn("ClaudeAdapterV2.awaitBackgroundTasks")(
             function* ({ providerThread, taskIds, awaited }) {
               const nativeThreadId = providerThread.nativeThreadRef?.nativeId;

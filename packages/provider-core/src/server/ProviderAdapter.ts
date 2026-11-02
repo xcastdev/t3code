@@ -633,6 +633,11 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Stops one pending background task by its `taskId`; false when none is running. */
+  readonly stopBackgroundTask?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly taskId: string;
+  }) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   /**
    * Marks or unmarks background tasks the agent will resume from, using the ids the agent saw.
    * Ids not running on this provider thread come back unmatched and change nothing.

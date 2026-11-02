@@ -3669,6 +3669,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   getWorkflowScript: "orchestration.getWorkflowScript",
   getNativeChildWork: "orchestration.getNativeChildWork",
   stopWorkflow: "orchestration.stopWorkflow",
+  stopBackgroundTask: "orchestration.stopBackgroundTask",
   forceStopThread: "orchestration.forceStopThread",
   getTurnItem: "orchestration.getTurnItem",
   launchThread: "orchestration.launchThread",
@@ -4057,6 +4058,37 @@ export class OrchestrationV2StopWorkflowError extends Schema.TaggedError<Orchest
   }
 }
 
+export const OrchestrationV2StopBackgroundTaskInput = Schema.Struct({
+  threadId: ThreadId,
+  /** A pending background task's `taskId`. */
+  taskId: TrimmedNonEmptyString,
+});
+export type OrchestrationV2StopBackgroundTaskInput =
+  typeof OrchestrationV2StopBackgroundTaskInput.Type;
+
+export class OrchestrationV2StopBackgroundTaskError extends Schema.TaggedError<OrchestrationV2StopBackgroundTaskError>()(
+  "OrchestrationV2StopBackgroundTaskError",
+  {
+    threadId: ThreadId,
+    taskId: TrimmedNonEmptyString,
+    reason: Schema.Literals(["not-running", "unsupported", "unavailable", "stop-failed"]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    switch (this.reason) {
+      case "not-running":
+        return "This background task is no longer running.";
+      case "unsupported":
+        return "This provider cannot stop a single background task. Stop the thread to end all of its background work.";
+      case "unavailable":
+        return "This thread has no live provider session.";
+      case "stop-failed":
+        return "Failed to stop the background task.";
+    }
+  }
+}
+
 export const OrchestrationV2ForceStopThreadInput = Schema.Struct({
   threadId: ThreadId,
   /** The run the user saw ignore Stop; Force stop refuses once a newer run has started. */
@@ -4323,6 +4355,10 @@ export const OrchestrationV2RpcSchemas = {
   },
   stopWorkflow: {
     input: OrchestrationV2StopWorkflowInput,
+    output: Schema.Void,
+  },
+  stopBackgroundTask: {
+    input: OrchestrationV2StopBackgroundTaskInput,
     output: Schema.Void,
   },
   forceStopThread: {

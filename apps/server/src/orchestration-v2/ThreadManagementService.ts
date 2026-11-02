@@ -15,6 +15,8 @@ import {
   MessageId,
   OrchestrationV2StopWorkflowError,
   type OrchestrationV2StopWorkflowInput,
+  OrchestrationV2StopBackgroundTaskError,
+  type OrchestrationV2StopBackgroundTaskInput,
   OrchestrationV2ForceStopThreadError,
   type OrchestrationV2ForceStopThreadInput,
   type OrchestrationV2ForceStopThreadResult,
@@ -463,6 +465,10 @@ export interface ThreadManagementServiceShape {
   readonly stopWorkflow: (
     input: OrchestrationV2StopWorkflowInput,
   ) => Effect.Effect<void, OrchestrationV2StopWorkflowError>;
+  /** Stops one of the thread's pending background tasks, leaving its other work running. */
+  readonly stopBackgroundTask: (
+    input: OrchestrationV2StopBackgroundTaskInput,
+  ) => Effect.Effect<void, OrchestrationV2StopBackgroundTaskError>;
   /**
    * Kills the thread's agent for a provider that no longer responds, then ends
    * its turn as interrupted. Never kills a process other working threads share.
@@ -1344,6 +1350,41 @@ const make = Effect.gen(function* () {
     (effect, input) => effect.pipe((effect) => threadDispatch.withLock(input.threadId, effect)),
   );
 
+  const stopBackgroundTask: ThreadManagementServiceShape["stopBackgroundTask"] = Effect.fn(
+    "ThreadManagementService.stopBackgroundTask",
+  )(function* (input) {
+    const fail = (reason: OrchestrationV2StopBackgroundTaskError["reason"], cause?: unknown) =>
+      new OrchestrationV2StopBackgroundTaskError({
+        ...input,
+        reason,
+        ...(cause === undefined ? {} : { cause }),
+      });
+    const records = yield* orchestrator
+      .getThreadRecords(input.threadId, ["providerThreads"])
+      .pipe(Effect.mapError((cause) => fail("unavailable", cause)));
+    const providerThread = records.providerThreads.find(
+      (candidate) =>
+        candidate.id === records.thread.activeProviderThreadId &&
+        candidate.appThreadId === input.threadId,
+    );
+    if (records.thread.deletedAt !== null || providerThread?.providerSessionId == null) {
+      return yield* fail("unavailable");
+    }
+    const runtime = yield* sessions
+      .get(providerThread.providerSessionId)
+      .pipe(Effect.mapError((cause) => fail("unavailable", cause)));
+    if (Option.isNone(runtime)) return yield* fail("unavailable");
+    if (runtime.value.stopBackgroundTask === undefined) return yield* fail("unsupported");
+    // Bounded so a provider that never answers cannot hold the request open.
+    const stopped = yield* runtime.value
+      .stopBackgroundTask({ providerThread, taskId: input.taskId })
+      .pipe(
+        Effect.timeout("15 seconds"),
+        Effect.mapError((cause) => fail("stop-failed", cause)),
+      );
+    if (!stopped) return yield* fail("not-running");
+  });
+
   const awaitBackgroundTasks: ThreadManagementServiceShape["awaitBackgroundTasks"] = Effect.fn(
     "ThreadManagementService.awaitBackgroundTasks",
   )(function* (input) {
@@ -1540,6 +1581,7 @@ const make = Effect.gen(function* () {
     interruptThread,
     stopDelegatedTasks,
     stopWorkflow,
+    stopBackgroundTask,
     forceStopThread,
     awaitBackgroundTasks,
     getThreadEventSequence: orchestrator.getThreadEventSequence,
