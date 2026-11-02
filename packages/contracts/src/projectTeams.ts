@@ -127,6 +127,10 @@ export const ProjectTeamRoleRevision = Schema.Struct({
   skills: Ids,
   tools: Ids,
   model: Text,
+  // Absent on roles recorded before members chose their own provider; those run on the
+  // provider their limits record names.
+  providerInstanceId: Schema.optionalKey(ProviderInstanceId),
+  options: Schema.optionalKey(ProviderOptionSelections),
   memoryAccess: Schema.Literals(["none", "project", "shared"]),
   delegationDepth: NonNegativeInt.check(Schema.isLessThanOrEqualTo(8)),
 });
@@ -857,6 +861,9 @@ const Profile = Schema.Struct({
   skills: Ids,
   tools: Ids,
   model: Text,
+  /** Defaults to the intent's `providerInstanceId`. */
+  providerInstanceId: Schema.optionalKey(ProviderInstanceId),
+  options: Schema.optionalKey(ProviderOptionSelections),
   memoryAccess: ProjectTeamRoleRevision.fields.memoryAccess,
   delegationDepth: ProjectTeamRoleRevision.fields.delegationDepth,
 });
@@ -870,6 +877,7 @@ export const ProjectTeamConfigurationIntent = Schema.Struct({
     Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
   ),
   enabled: Schema.Boolean,
+  /** The default provider for profiles and model policies that don't name their own. */
   providerInstanceId: ProviderInstanceId,
   projectPriority: Priority,
   taskPriorities: Schema.Array(
@@ -885,6 +893,7 @@ export const ProjectTeamConfigurationIntent = Schema.Struct({
   modelPolicies: Schema.Array(
     Schema.Struct({
       model: Text,
+      providerInstanceId: Schema.optionalKey(ProviderInstanceId),
       tokenLimit: ConfiguredPositive,
       durationLimitMs: ConfiguredPositive,
       modelCalls: ConfiguredPositive.check(Schema.isLessThanOrEqualTo(128)),
@@ -893,9 +902,11 @@ export const ProjectTeamConfigurationIntent = Schema.Struct({
     Schema.isMinLength(1),
     Schema.isMaxLength(6),
     Schema.makeFilter(
-      (policies) => new Set(policies.map((policy) => policy.model)).size === policies.length,
+      (policies) =>
+        new Set(policies.map((policy) => `${policy.providerInstanceId ?? ""}\u0000${policy.model}`))
+          .size === policies.length,
       {
-        message: "Model policies must be unique",
+        message: "Model policies must be unique per provider and model",
       },
     ),
   ),

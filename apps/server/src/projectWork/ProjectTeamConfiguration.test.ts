@@ -161,6 +161,73 @@ it.effect("configuration and reverse controls persist once and never assign or s
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect("members keep their own provider, model and effort, with one policy per route", () =>
+  Effect.gen(function* () {
+    const gateway = yield* seed;
+    const sql = yield* SqlClient.SqlClient;
+    const claude = ProviderInstanceId.make("claude");
+    const effort = [{ id: "effort", value: "high" }] as const;
+    const mixed = yield* decodeConfiguration({
+      ...configuration,
+      profiles: configuration.profiles.map((profile) =>
+        profile.role === "planner" || profile.role === "reviewer"
+          ? { ...profile, providerInstanceId: claude, options: effort }
+          : profile,
+      ),
+      // The same model slug on two providers is two routes with separate budgets.
+      modelPolicies: [
+        { model: "model", tokenLimit: 8192, durationLimitMs: 60000, modelCalls: 2 },
+        {
+          model: "model",
+          providerInstanceId: claude,
+          tokenLimit: 4096,
+          durationLimitMs: 60000,
+          modelCalls: 1,
+        },
+      ],
+    });
+    yield* gateway.write(mixed, human);
+    const records = (yield* readCurrentState(sql, projectId)).foundationRecords ?? [];
+    const roles = records.filter((record) => record.kind === "role-revision");
+    assert.deepStrictEqual(
+      Object.fromEntries(
+        roles.map((role) => [role.role, [role.providerInstanceId, role.options ?? null]]),
+      ) as Record<string, unknown>,
+      {
+        coordinator: ["codex", null],
+        investigator: ["codex", null],
+        planner: ["claude", effort],
+        implementer: ["codex", null],
+        reviewer: ["claude", effort],
+        integrator: ["codex", null],
+      },
+    );
+    const limits = records.filter((record) => record.kind === "limits");
+    assert.deepStrictEqual(
+      limits.map((record) => [record.providerInstanceId, record.model, record.modelCalls]).sort(),
+      [
+        ["claude", "model", 1],
+        ["codex", "model", 2],
+      ],
+    );
+    assert.equal(new Set(limits.map((record) => record.recordId)).size, 2);
+
+    const missingPolicy = yield* Effect.result(
+      gateway.write(
+        {
+          ...mixed,
+          commandId: CommandId.make("missing-claude-policy"),
+          expectedRevision: (yield* readCurrentState(sql, projectId)).revision,
+          expectedConfigurationGeneration: 1,
+          modelPolicies: [mixed.modelPolicies[0]!],
+        },
+        human,
+      ),
+    );
+    assert.equal(missingPolicy._tag, "Failure");
+  }).pipe(Effect.provide(testLayer)),
+);
+
 it.effect("custom member names persist through configuration changes without starting work", () =>
   Effect.gen(function* () {
     const gateway = yield* seed;

@@ -1,5 +1,6 @@
 import {
   ProjectId,
+  ProviderInstanceId,
   RunId,
   ProjectWorkTaskId,
   ProjectTeamLimits,
@@ -146,6 +147,49 @@ describe("resolveProjectTeamLimits", () => {
       limitsRecordId: "limits",
       limitsRevision: 3,
     });
+  });
+  it("resolves the policy for the member's own provider when two share a model slug", () => {
+    const codex = limits({
+      recordId: "codex-limits",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      modelCalls: 3,
+    });
+    const claude = limits({
+      recordId: "claude-limits",
+      providerInstanceId: ProviderInstanceId.make("claude"),
+      modelCalls: 1,
+    });
+    expect(
+      eligible(
+        fixture([
+          role({ providerInstanceId: ProviderInstanceId.make("claude") }),
+          codex,
+          claude,
+          membership(),
+        ]),
+      ),
+    ).toMatchObject({ limitsRecordId: "claude-limits", modelCalls: 1 });
+    expect(
+      eligible(
+        fixture([
+          role({ providerInstanceId: ProviderInstanceId.make("codex") }),
+          codex,
+          claude,
+          membership(),
+        ]),
+      ),
+    ).toMatchObject({ limitsRecordId: "codex-limits", modelCalls: 3 });
+  });
+  it("keeps a role recorded before per-member providers on its team provider's policy", () => {
+    expect(
+      eligible(
+        fixture([
+          role(),
+          limits({ providerInstanceId: ProviderInstanceId.make("codex") }),
+          membership(),
+        ]),
+      ),
+    ).toMatchObject({ limitsRecordId: "limits" });
   });
   it.each([
     [

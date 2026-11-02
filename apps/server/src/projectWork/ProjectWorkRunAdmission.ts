@@ -30,7 +30,7 @@ import {
 } from "../orchestration-v2/ResourceInstructionComposition.ts";
 import { appendAdmissionFoundationRecords, readCurrentState } from "./ProjectWorkRepository.ts";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
-import { assertProjectTeamRunAuthority } from "./ProjectTeamPolicy.ts";
+import { assertProjectTeamRunAuthority, projectTeamRouteMatches } from "./ProjectTeamPolicy.ts";
 import { resolveProjectTeamLimits } from "./ProjectTeamLimits.ts";
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
 import { decodeProjectWorkEvent } from "./ProjectWorkEventStore.ts";
@@ -297,7 +297,7 @@ const make = Effect.gen(function* () {
         (state.foundationRecords ?? []).some(
           (record) =>
             record.kind === "limits" &&
-            record.model === binding.model &&
+            projectTeamRouteMatches(record, binding) &&
             record.status === "disabled",
         )
       )
@@ -706,7 +706,8 @@ const make = Effect.gen(function* () {
         active.length >= policy.frozen.environmentModelCalls ||
         active.filter(
           (row) =>
-            row.project_id === projectId && ownerFor(row).configuration.model === rootBinding.model,
+            row.project_id === projectId &&
+            projectTeamRouteMatches(ownerFor(row).configuration, rootBinding),
         ).length >= policy.frozen.modelCalls
       )
         return denied("model-capacity-exhausted");

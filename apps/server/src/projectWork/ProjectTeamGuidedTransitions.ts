@@ -7,6 +7,7 @@ import {
 import {
   assertProjectTeamRunAuthority,
   assertProjectTeamOrdinarySuccessor,
+  projectTeamRouteMatches,
 } from "./ProjectTeamPolicy.ts";
 import {
   assertReviewResolution,
@@ -234,7 +235,7 @@ export const decideProjectTeamGuidedTransition = (
     binding.generation !== binding.leaseGeneration ||
     binding.runId !== undefined ||
     role?.kind !== "role-revision" ||
-    role.model !== binding.model ||
+    !projectTeamRouteMatches(role, binding) ||
     member?.kind !== "member" ||
     member.roleRevisionId !== role.recordId ||
     membership?.kind !== "task-membership" ||

@@ -5,6 +5,7 @@ import {
   type ProjectTeamRecord,
   type ProjectWorkAttribution,
   type ProjectWorkCommand,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
@@ -66,11 +67,20 @@ export const compileProjectTeamConfiguration = (
       reject("Task priorities require unique current project tasks");
     priorities.add(entry.taskId);
   }
-  const models = new Set(intent.modelPolicies.map((policy) => policy.model));
-  const selected = new Set(intent.profiles.map((profile) => profile.model));
+  // Each member may run on its own provider; a route is a model on one provider instance.
+  const providerOf = (entry: { readonly providerInstanceId?: ProviderInstanceId | undefined }) =>
+    entry.providerInstanceId ?? intent.providerInstanceId;
+  const routeKey = (entry: {
+    readonly model: string;
+    readonly providerInstanceId?: ProviderInstanceId;
+  }) => `${providerOf(entry)}\u0000${entry.model}`;
+  const routes = new Set(intent.modelPolicies.map(routeKey));
+  const selected = new Set(intent.profiles.map(routeKey));
   if (
-    models.size !== selected.size ||
-    [...selected].some((model) => !models.has(model) || model === "unconfigured")
+    routes.size !== intent.modelPolicies.length ||
+    routes.size !== selected.size ||
+    [...selected].some((route) => !routes.has(route)) ||
+    intent.profiles.some((profile) => profile.model === "unconfigured")
   )
     reject("Every selected profile needs exactly its configured model policy");
   for (const profile of intent.profiles) {
@@ -110,6 +120,7 @@ export const compileProjectTeamConfiguration = (
     const role: Role = {
       ...fields(idFor(intent.projectId, `role:${profile.role}:${nextGeneration}`)),
       ...profile,
+      providerInstanceId: providerOf(profile),
       kind: "role-revision",
       status: "available",
       roleId,
@@ -140,9 +151,9 @@ export const compileProjectTeamConfiguration = (
       revision: old === undefined ? 0 : increment(old.revision),
     });
   }
-  const replacementIds = new Set(
-    intent.modelPolicies.map((policy) => idFor(intent.projectId, `limits:${policy.model}`)),
-  );
+  const limitsIdFor = (policy: (typeof intent.modelPolicies)[number]) =>
+    idFor(intent.projectId, `limits:${providerOf(policy)}:${policy.model}`);
+  const replacementIds = new Set(intent.modelPolicies.map(limitsIdFor));
   for (const old of current.filter(
     (record): record is Limits =>
       record.kind === "limits" &&
@@ -151,7 +162,7 @@ export const compileProjectTeamConfiguration = (
   ))
     records.push({ ...old, status: "disabled", revision: increment(old.revision), updatedAt: at });
   for (const policy of intent.modelPolicies) {
-    const recordId = idFor(intent.projectId, `limits:${policy.model}`);
+    const recordId = limitsIdFor(policy);
     const old = current.find(
       (record): record is Limits => record.kind === "limits" && record.recordId === recordId,
     );
@@ -167,7 +178,7 @@ export const compileProjectTeamConfiguration = (
         intent.projectWritableWorkers ?? PROJECT_TEAM_DEFAULT_LIMITS.projectWritableWorkers,
       delegationDepth: intent.delegationDepth ?? PROJECT_TEAM_DEFAULT_LIMITS.delegationDepth,
       repairAllowance: intent.repairAllowance ?? PROJECT_TEAM_DEFAULT_LIMITS.repairAllowance,
-      providerInstanceId: intent.providerInstanceId,
+      providerInstanceId: providerOf(policy),
       projectPriority: intent.projectPriority,
       taskPriorities: intent.taskPriorities,
       profileRecordIds: roles.map((role) => role.recordId),

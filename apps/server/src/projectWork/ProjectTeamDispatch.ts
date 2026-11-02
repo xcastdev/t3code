@@ -33,7 +33,7 @@ import * as Registry from "../provider/ProviderRegistry.ts";
 import * as Environment from "../environment/ServerEnvironment.ts";
 import * as Repository from "./ProjectWorkRepository.ts";
 import * as Journal from "./ProjectTeamDispatchJournal.ts";
-import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
+import { projectTeamRouteMatches, projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import { projectTaskAssignment } from "./ProjectTaskResources.ts";
 import * as Recovery from "./ProjectTeamRecovery.ts";
 import * as Reviews from "./ProjectTeamReviewFreshness.ts";
@@ -239,7 +239,10 @@ const make = Effect.gen(function* () {
           member?.kind !== "member" ||
           member.revision !== input.expectedMemberRevision ||
           role?.kind !== "role-revision" ||
-          role.model !== input.modelSelection.model ||
+          !projectTeamRouteMatches(role, {
+            model: input.modelSelection.model,
+            providerInstanceId: input.modelSelection.instanceId,
+          }) ||
           task === undefined
         )
           return yield* rejected();
@@ -259,9 +262,13 @@ const make = Effect.gen(function* () {
         const limits = records.find(
           (record) =>
             record.kind === "limits" &&
-            record.model === role.model &&
+            projectTeamRouteMatches(record, role) &&
             record.status === "configured",
         );
+        // The member's chosen effort and traits apply unless this dispatch names its own.
+        const options = input.modelSelection.options ?? role.options;
+        const modelSelection =
+          options === undefined ? input.modelSelection : { ...input.modelSelection, options };
         const at = DateTime.formatIso(yield* DateTime.now);
         const generation =
           Math.max(
@@ -289,9 +296,7 @@ const make = Effect.gen(function* () {
           environmentId,
           model: role.model,
           configuration: {
-            ...(input.modelSelection.options === undefined
-              ? {}
-              : { options: input.modelSelection.options }),
+            ...(modelSelection.options === undefined ? {} : { options: modelSelection.options }),
             instructionsHash: hash(role.instructions),
             toolIds: role.tools,
             skillIds: role.skills,
@@ -420,7 +425,7 @@ const make = Effect.gen(function* () {
                 generation,
                 fingerprint,
                 assignment,
-                request: input,
+                request: { ...input, modelSelection },
                 result: result.writeResult,
                 stage: "reserved",
                 createdAt: at,

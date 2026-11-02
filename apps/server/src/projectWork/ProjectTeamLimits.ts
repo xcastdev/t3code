@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
+import { projectTeamRouteMatches } from "./ProjectTeamPolicy.ts";
 
 const SafeInteger = Schema.Number.check(
   Schema.isInt(),
@@ -120,7 +121,7 @@ export const resolveProjectTeamLimits = (input: {
     return blocked("invalid-role");
   const policies = records.filter(
     (r): r is typeof ProjectTeamLimits.Type =>
-      r.kind === "limits" && r.model === role.model && r.projectId === state.projectId,
+      r.kind === "limits" && projectTeamRouteMatches(r, role) && r.projectId === state.projectId,
   );
   const configuredPolicies = policies.filter((policy) => policy.status === "configured");
   if (configuredPolicies.length === 0 && policies.some((policy) => policy.status === "disabled"))

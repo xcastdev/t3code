@@ -17,6 +17,20 @@ const scopeDigest = (value: unknown) =>
 export const projectTeamDerivedRecordId = (commandId: string, suffix: string) =>
   `guided:${scopeDigest([commandId, suffix])}`;
 
+interface ModelRoute {
+  readonly model: string;
+  readonly providerInstanceId?: string | undefined;
+}
+/**
+ * Whether two records name the same model on the same provider. Records from before members chose
+ * their own provider carry none and match by model, as they always did.
+ */
+export const projectTeamRouteMatches = (a: ModelRoute, b: ModelRoute) =>
+  a.model === b.model &&
+  (a.providerInstanceId === undefined ||
+    b.providerInstanceId === undefined ||
+    a.providerInstanceId === b.providerInstanceId);
+
 /** Ordinary successors cannot replace the canonical semantic repair debit. */
 export const projectTeamRequiresSemanticRepair = (state: ProjectWorkState, taskId: string) => {
   const records = state.foundationRecords ?? [];

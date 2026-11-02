@@ -20,6 +20,7 @@ import {
   EventId,
   MessageId,
   ProjectWorkTaskId,
+  ProviderInstanceId,
   ProviderDriverKind,
   type ProjectTeamDispatchIntent,
   type ProjectTeamRecord,
@@ -101,6 +102,7 @@ const setup = (
 };
 const seed = Effect.fn("DispatchIntegration.seed")(function* (
   workspace: ProjectTeamDispatchIntent["workspace"] = { type: "root" },
+  roleOverrides: Partial<Extract<ProjectTeamRecord, { kind: "role-revision" }>> = {},
 ) {
   const sql = yield* SqlClient.SqlClient;
   const repository = yield* Repository.ProjectWorkRepository;
@@ -182,7 +184,13 @@ const seed = Effect.fn("DispatchIntegration.seed")(function* (
       projectId,
       "configure-member",
       [
-        { ...role, revision: role.revision + 1, model: modelSelection.model, delegationDepth: 2 },
+        {
+          ...role,
+          revision: role.revision + 1,
+          model: modelSelection.model,
+          delegationDepth: 2,
+          ...roleOverrides,
+        },
         member,
       ],
       at,
@@ -273,6 +281,35 @@ it.effect(
     }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
   },
 );
+
+it.effect("dispatch runs the member's own effort when the request names none", () => {
+  const harness = setup();
+  return Effect.gen(function* () {
+    const effort = [{ id: "effort", value: "high" }] as const;
+    const input = yield* seed(undefined, {
+      providerInstanceId: modelSelection.instanceId,
+      options: effort,
+    });
+    yield* (yield* Dispatch.ProjectTeamDispatch).dispatch(input, attribution);
+    const { binding, projection } = yield* awaitPreparation;
+    assert.equal(binding.providerInstanceId, modelSelection.instanceId);
+    assert.deepEqual(binding.configuration.options, effort);
+    assert.deepEqual(projection.thread.modelSelection.options, effort);
+  }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
+});
+
+it.effect("dispatch refuses a provider other than the member's own", () => {
+  const harness = setup();
+  return Effect.gen(function* () {
+    const input = yield* seed(undefined, { providerInstanceId: ProviderInstanceId.make("claude") });
+    const result = yield* Effect.result(
+      (yield* Dispatch.ProjectTeamDispatch).dispatch(input, attribution),
+    );
+    assert.equal(result._tag, "Failure");
+    const state = yield* Repository.readCurrentState(yield* SqlClient.SqlClient, projectId);
+    assert.isFalse(state.foundationRecords!.some((record) => record.kind === "run-binding"));
+  }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
+});
 
 it.effect("recovery observes canonical acceptance after the launch result is lost", () => {
   const harness = setup();
