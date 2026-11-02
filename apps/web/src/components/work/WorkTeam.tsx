@@ -238,8 +238,6 @@ export function WorkTeam({
         JSON.stringify(draft.values) !== JSON.stringify(syncModelPolicies(draft.recorded))));
   const editing =
     draft !== null && (draft.view.kind === "member" || draft.view.kind === "settings");
-  const providerLabel = (id: string) =>
-    providers.find((entry) => entry.instanceId === id)?.displayName ?? `${id} (unavailable)`;
 
   return (
     <WorkSection
@@ -247,20 +245,9 @@ export function WorkTeam({
         <span className="flex min-w-0 items-center gap-2">
           Team
           {configured && !editing ? (
-            <>
-              <Badge variant={configured.enabled ? "success" : "outline"}>
-                {configured.enabled ? "Enabled" : "Disabled"}
-              </Badge>
-              <span className="min-w-0 truncate text-xs font-normal text-muted-foreground">
-                {[
-                  ...new Set(
-                    configured.profiles.map((profile) =>
-                      providerLabel(teamProviderOf(configured, profile)),
-                    ),
-                  ),
-                ].join(" · ")}
-              </span>
-            </>
+            <Badge variant={configured.enabled ? "success" : "outline"}>
+              {configured.enabled ? "Enabled" : "Disabled"}
+            </Badge>
           ) : null}
         </span>
       }
